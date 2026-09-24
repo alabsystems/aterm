@@ -257,7 +257,7 @@ pub(crate) struct Config {
     /// swings across the tab bar like monkey bars while sharing a deeper tip
     /// (aterm features, shell tricks, Claude Code tricks), drops, and rests —
     /// then goes around again. His tips render as a speech bubble above his
-    /// head (the transient-notice pill, anchored to him). Typing `robi` or
+    /// head (`robi_bubble`, anchored to him). Typing `robi` or
     /// `robot` restarts his rounds at the greeting. His idle stands are
     /// static, so a resting Robi costs zero repaints. Hidden under reduced
     /// motion, serious mode, or the default OFF — never by focus or time.
@@ -1061,11 +1061,12 @@ pub(crate) struct Config {
     /// default, exactly like the embedded operator). `ATERM_FABRIC_COMMAND`
     /// overrides it. See [`FabricConfig`] and [`crate::fabric_launch`].
     pub(crate) fabric: Option<FabricConfig>,
-    /// In-app self-update channel (`[update]`): which GitHub repo the silent updater
-    /// pulls notarized releases from. Absent ⇒ the compiled-in default channel
-    /// (`alabsystems/aterm`, the PUBLIC mirror — readable with no token, which is
-    /// what lets a freshly installed machine update). The env vars `ATERM_UPDATE_OWNER`/`ATERM_UPDATE_REPO`
-    /// override these. The location is NOT the trust anchor — the compiled-in pinned
+    /// In-app self-update (`[update]`): whether the silent updater runs (`enabled`), how
+    /// a staged build applies (`auto_apply`), and — in a DEVELOPMENT build only — which
+    /// GitHub repo it pulls notarized releases from. Absent ⇒ on, and the compiled-in
+    /// default channel (`alabsystems/aterm`, the PUBLIC mirror — readable with no token,
+    /// which is what lets a freshly installed machine update). No environment variable
+    /// overrides any of it (2026-09-23). The location is NOT the trust anchor — the compiled-in pinned
     /// Team ID + Apple notarization are — so repointing the channel cannot get an
     /// untrusted build installed. macOS-only in effect; parsed (and inert) elsewhere.
     /// See [`UpdateConfig`], crate `aterm-update`, and `docs/RELEASING.md`.
@@ -1093,12 +1094,15 @@ pub(crate) struct Config {
     /// `[matrix_rain]`, which stays opt-in); `enabled = false` opts out. See
     /// [`OutputStreakConfig`], whose field docs carry the per-key laws.
     pub(crate) output_streak: Option<OutputStreakConfig>,
-    /// Bundled ALab toolchain manager (`[packages]`, the `atpkg` lane): the
-    /// background tools loop's master/auto flags plus the account/channel/
-    /// include/exclude/links keys the CO-LOCATED `atpkg` reads out of this SAME
-    /// file itself. Absent ⇒ today's behavior (loop on, update-only). See
-    /// [`PackagesConfig`].
+    /// Bundled ALab toolchain manager (`[packages]`, the `atpkg` lane): Automatic
+    /// updates (`enabled`), the install consent (`auto_install`) and the per-program
+    /// `exclude` the CO-LOCATED `atpkg` reads out of this SAME file itself. Absent ⇒ the
+    /// batteries-included default. See [`PackagesConfig`].
     pub(crate) packages: Option<PackagesConfig>,
+    /// The upstream-Rust reroute (`[reroute]`): whether a rerouted `cargo`/`rustc`/`tlc`
+    /// announces itself. Read by the CO-LOCATED `atpkg` (`atpkg::config::RerouteConfig`);
+    /// mirrored so Settings can offer the switch. See [`RerouteConfig`].
+    pub(crate) reroute: Option<RerouteConfig>,
     /// macOS consent posture (`[privacy]`, the TCC lane): the master switch, the
     /// silent full-disk-access probe, the one-time macOS access card, the owner-initiated
     /// folder warm-up and the protected-root set the consent tier shares with
@@ -1107,8 +1111,9 @@ pub(crate) struct Config {
     pub(crate) privacy: Option<PrivacyConfig>,
     /// macOS host settings (`[machine]`): Universal Control off for this host and
     /// cargo build output hidden from Spotlight. The CO-LOCATED `atpkg` reads the
-    /// SAME table out of this file and applies it at the top of every package pass
-    /// (and on `aterm pkg machine apply`); the GUI only displays and edits it.
+    /// SAME table out of this file and applies it from `aterm pkg machine apply` (run as
+    /// the window opens and by a terminal session once a day) and at a package pass after
+    /// an edit; the GUI only displays and edits it.
     /// Absent ⇒ both on. See [`MachineConfig`].
     pub(crate) machine: Option<MachineConfig>,
     /// The aterm WRAPPER's durable master switch (`[harness]`, design
@@ -2548,14 +2553,122 @@ pub(crate) struct PresenceConfig {
 /// machine has no `aterm.toml`, and reading that as "the owner switched it
 /// off" would make the product inert out of the box for a reason nothing
 /// displays.
-#[derive(Default, Clone, PartialEq, serde::Deserialize)]
-#[serde(default)]
+///
+/// THE SUPERVISOR'S POLICY lives in the same table (2026-09-23): every other
+/// key is one of [`aterm_agent::supervise::config::KEYS`], kept as written
+/// ([`Self::keys`]) and applied by [`Config::harness_policy`] — so the host and
+/// the engine read one struct, and a changed key makes a changed `Config` (a
+/// reload that only edits `[harness] continue` is not deduped away). The
+/// table parses whatever its values are: a value the policy refuses is a
+/// config notice ([`Config::harness_notices`]), never a failed load.
+#[derive(Default, Clone, PartialEq)]
 pub(crate) struct HarnessConfig {
     /// The master switch. Absent ⇒ ON; `false` re-renders the `agents/` twin
-    /// without the harness prelude, so the NEXT launch is plain. Sessions
-    /// already running keep what they launched with until they exit.
-    /// `$ATERM_NO_HARNESS` bypasses one session without writing anything.
+    /// without the harness prelude, so the NEXT launch is plain, and stops the
+    /// in-GUI supervisor at once. It is the one switch: the per-session
+    /// `$ATERM_NO_HARNESS` bypass is gone (2026-09-23).
     pub(crate) enabled: Option<bool>,
+    /// Every key the table holds, `enabled` included, in key order.
+    pub(crate) keys: Vec<(String, HarnessValue)>,
+}
+
+/// One `[harness]` value, as the policy's [`SupervisorConfig::set`] takes its
+/// text ([`Self::text`]).
+///
+/// [`SupervisorConfig::set`]: aterm_agent::supervise::SupervisorConfig::set
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HarnessValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    /// An array, each element as its text.
+    List(Vec<String>),
+    /// A table or a date: nothing the policy takes.
+    Other(&'static str),
+}
+
+impl HarnessValue {
+    /// The text [`SupervisorConfig::set`] parses: `true`/`false`, a decimal,
+    /// the string itself, an array's elements joined by `,`.
+    ///
+    /// [`SupervisorConfig::set`]: aterm_agent::supervise::SupervisorConfig::set
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Bool(b) => b.to_string(),
+            Self::Int(n) => n.to_string(),
+            Self::Float(f) => f.to_string(),
+            Self::Str(s) => s.clone(),
+            Self::List(items) => items.join(","),
+            Self::Other(what) => format!("<{what}>"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HarnessValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = HarnessValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a [harness] value")
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<HarnessValue, E> {
+                Ok(HarnessValue::Bool(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<HarnessValue, E> {
+                Ok(HarnessValue::Int(v))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<HarnessValue, E> {
+                Ok(i64::try_from(v).map_or(HarnessValue::Float(v as f64), HarnessValue::Int))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<HarnessValue, E> {
+                Ok(HarnessValue::Float(v))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<HarnessValue, E> {
+                Ok(HarnessValue::Str(v.to_string()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<HarnessValue, E> {
+                Ok(HarnessValue::Str(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<HarnessValue, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<HarnessValue>()? {
+                    items.push(item.text());
+                }
+                Ok(HarnessValue::List(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<HarnessValue, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(HarnessValue::Other("a table"))
+            }
+        }
+        d.deserialize_any(Visit)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HarnessConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let table: std::collections::BTreeMap<String, HarnessValue> =
+            serde::Deserialize::deserialize(d)?;
+        let enabled = match table.get("enabled") {
+            Some(HarnessValue::Bool(b)) => Some(*b),
+            _ => None,
+        };
+        Ok(Self {
+            enabled,
+            keys: table.into_iter().collect(),
+        })
+    }
 }
 
 /// The `[output_streak]` table — PRISM WAKE
@@ -2603,59 +2716,50 @@ pub(crate) struct OutputStreakConfig {
 
 /// The `[packages]` table (the bundled-ALab-toolchain `atpkg` lane,
 /// `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §11). Every field is optional;
-/// defaults live ONLY in the resolver ([`Config::packages_update_loop_enabled`])
-/// — an absent table is exactly today's behavior. The GUI consumes ONLY the
-/// loop-gate flags; the account/channel/include/exclude keys (and the
-/// `[packages.links]` sub-table, which this struct deliberately does not
-/// declare — serde tolerates unknown keys) are read by the co-located `atpkg`
-/// binary from this SAME file, so there is one config surface and no GUI copy
-/// to go stale. Env always wins on the atpkg side (`ATPKG_ACCOUNT` etc.); the
-/// loop interval keeps its own `ATPKG_UPDATE_INTERVAL_SECS` env override.
+/// defaults live ONLY in the resolvers ([`Config::packages_enabled`],
+/// [`Config::packages_auto_install`]) — an absent table is the batteries-included
+/// default. The keys (and the `[packages.links]` sub-table, which this struct
+/// deliberately does not declare — serde tolerates unknown keys) are read by the
+/// co-located `atpkg` binary from this SAME file, so there is one config surface; the
+/// GUI mirrors the two a person has, with atpkg's exact resolution
+/// (`atpkg::config::PackagesConfig::{enabled, auto_install}`, pinned equal by a test).
+/// There is NO environment alternative to any of it (2026-09-23, owner: "NOT ENV VARS
+/// those are for development"), and the loop's cadence is no knob at all (Phase 3).
 ///
 /// ```toml
 /// [packages]
-/// # enabled      = true    # master for the background tools loop (default true)
-/// # auto_update  = true    # run `atpkg update` on the 6h cadence (default true)
-/// # auto_install = false   # ALSO install missing default-set members (default
-/// #                        # FALSE — multi-GB toolchains need explicit consent)
-/// # seed_install = true    # the first-run FILL: record adoption and install the
-/// #                        # ALab toolset from the SIGNED NETWORK INDEX, unattended
-/// #                        # (default TRUE; no release since v0.63.0 seals a seed —
-/// #                        # false = announce-only, nothing adopted). atpkg-only key.
-/// # account      = "alabsystems"   # index owner override (default = compiled owner)
-/// # channel      = "stable"
-/// # include      = ["ay"]  # narrowing-only filters over the signed index set
-/// # exclude      = ["trust"]
-/// [packages.links]
-/// # ay  = "~/ay"              # local checkout -> managed dev-link (registry skipped)
-/// # orc = "alabsystems/orc"   # private-repo fetch override (signatures unchanged)
+/// # enabled      = true    # Automatic updates — THE switch (default true)
+/// # auto_install = true    # install the ALab toolset nobody named: the first-run
+/// #                        # fill and new members of the signed set (default TRUE,
+/// #                        # batteries included; uninstall/exclude/enabled=false win)
+/// # exclude      = ["trust"]   # per-program opt-out
 /// ```
+///
+/// Retired spellings, still honoured: `auto_update = false` reads as `enabled = false`,
+/// `seed_install` as `auto_install` when that is unset (`aterm pkg doctor --verbose` names
+/// both).
+/// `channel`/`include` are retired and ignored. `prefix`, `account` and the `owner/repo`
+/// form of `[packages.links]` are DEVELOPMENT settings a shipped binary drops.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct PackagesConfig {
-    /// Master for the background tools loop. Absent ⇒ ON (today's behavior).
+    /// Automatic updates — THE switch. Absent ⇒ ON.
     pub(crate) enabled: Option<bool>,
-    /// Run `atpkg update` on the background cadence. Absent ⇒ ON.
+    /// RETIRED 2026-09-23, folded into `enabled`: an `auto_update = false` still in a
+    /// file reads as off ([`Config::packages_enabled`]); Settings writes only `enabled`
+    /// and drops this key when it does.
     pub(crate) auto_update: Option<bool>,
-    /// ALSO install missing index default-set members on the update pass.
-    /// Absent ⇒ OFF (consent-gated — the Settings switch is the consent click).
-    /// Consumed by ATPKG (its own reader), not by the GUI loop gate.
+    /// THE install consent — may atpkg install toolset members nobody named (the
+    /// first-run fill, new members of the signed set)? Absent ⇒ ON, batteries included
+    /// ([`Config::packages_auto_install`]). Consumed by atpkg; mirrored for Settings.
     pub(crate) auto_install: Option<bool>,
-    /// `[packages].seed_install`: the first-run fill — record adoption and install the
-    /// ALab toolset from the signed network index, unattended (a pre-v0.63 seeded
-    /// bundle fills from its seal instead). Default TRUE (installing the app is the
-    /// consent). Consumed by atpkg, mirrored here so Settings can offer the switch —
-    /// the docs pointed at this key while the only way to set it was hand-editing a
-    /// file a new user does not have yet, which made the documented opt-out
-    /// unreachable by exactly the person it exists for.
+    /// RETIRED 2026-09-23, folded into `auto_install`: read in its place when
+    /// `auto_install` is unset; Settings drops it when it writes `auto_install`.
     pub(crate) seed_install: Option<bool>,
-    /// Index owner override — consumed by atpkg (`ATPKG_ACCOUNT` env beats it).
+    /// A DEVELOPMENT setting (index owner repoint), consumed by a development build's
+    /// atpkg only and shown nowhere in Settings.
     pub(crate) account: Option<String>,
-    /// Channel — consumed by atpkg (default "stable" there).
-    pub(crate) channel: Option<String>,
-    /// Narrowing-only include filter — consumed by atpkg.
-    pub(crate) include: Option<Vec<String>>,
-    /// Narrowing-only exclude filter — consumed by atpkg.
+    /// Narrowing-only exclude filter — the per-program opt-out, consumed by atpkg.
     pub(crate) exclude: Option<Vec<String>>,
 }
 
@@ -2838,6 +2942,18 @@ pub(crate) struct PrivacyConfig {
 /// Both readers of this table — this struct and `atpkg::config::MachineConfig` — must
 /// resolve the same defaults; `machine_defaults_agree_across_the_two_config_readers`
 /// pins that.
+/// The `[reroute]` table — one key, `announce` (default ON): a rerouted SIGNPOST name
+/// (`cargo`, `rustc`, `tlc`) prints its announcement before it runs the upstream tool
+/// unless this is `false`. The owner's 2026-09-08 ask ("some kind of printed message
+/// … that could be suppressed with a flag") made a SETTING on 2026-09-23, replacing
+/// `$ATERM_REROUTE_QUIET`. The co-located atpkg reads it; the GUI mirrors it for the
+/// Settings row, with atpkg's resolution (pinned equal by a test).
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct RerouteConfig {
+    pub(crate) announce: Option<bool>,
+}
+
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct MachineConfig {
@@ -2950,11 +3066,14 @@ pub(crate) struct FabricConfig {
     pub(crate) command: Option<String>,
 }
 
-/// The `[update]` table: where the in-app self-updater pulls releases from. Both
-/// fields optional; an absent table (or field) uses the compiled-in default
-/// channel (`alabsystems/aterm`, the public mirror). Resolution precedence is env > this config > default,
-/// applied by [`aterm_update::Source::resolve`] (the env vars are
-/// `ATERM_UPDATE_OWNER` / `ATERM_UPDATE_REPO`).
+/// The `[update]` table: whether the in-app self-updater runs (`enabled`, "Check for
+/// updates automatically"), whether a staged build applies itself (`auto_apply`), and —
+/// in a DEVELOPMENT build only — where it pulls releases from. Every field optional; an
+/// absent table (or field) is the default: on, applied at once, the compiled-in channel
+/// (`alabsystems/aterm`, the public mirror). A shipped binary reads its compiled channel
+/// whatever `owner`/`repo` say ([`aterm_update::Source::resolve`]), and there is no
+/// environment alternative to any key (2026-09-23: `ATERM_NO_AUTO_UPDATE`,
+/// `ATERM_NO_AUTO_APPLY`, `ATERM_UPDATE_OWNER`/`_REPO` are gone).
 ///
 /// ```toml
 /// [update]
@@ -2969,10 +3088,20 @@ pub(crate) struct FabricConfig {
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateConfig {
+    /// "Check for updates automatically" (Settings ▸ Terminal ▸ Updates). Absent ⇒ ON. Off
+    /// stops the BACKGROUND checker (`aterm_update::automatic`) in the window and every
+    /// terminal session; a check or an apply a person asks for still runs — the row says
+    /// "automatically". Read ONCE per process by
+    /// `aterm_update_core::settings::update_enabled` (the updater's own reader of this
+    /// same key, so the window and a terminal session agree), so a change applies from
+    /// the next launch. It replaces `ATERM_NO_AUTO_UPDATE` (2026-09-23).
+    pub(crate) enabled: Option<bool>,
     /// GitHub owner (the `OWNER` in `github.com/OWNER/REPO`). Absent ⇒ default
-    /// (`alabsystems`). `ATERM_UPDATE_OWNER` overrides.
+    /// (`alabsystems`). A DEVELOPMENT setting: only a development build honours it
+    /// (`aterm_update_core::REPOINT_IS_A_DEV_SEAM`), and Settings does not show it.
     pub(crate) owner: Option<String>,
-    /// GitHub repository name. Absent ⇒ default (`aterm`). `ATERM_UPDATE_REPO` overrides.
+    /// GitHub repository name. Absent ⇒ default (`aterm`). A development setting, like
+    /// `owner`.
     pub(crate) repo: Option<String>,
     /// Apply a freshly-staged update IMMEDIATELY (default ON): the seamless
     /// handoff carries every window/tab/split — shells, screens, layout — across
@@ -2981,8 +3110,7 @@ pub(crate) struct UpdateConfig {
     /// leaves applying it to a click (the Version menu's ⬆️ item, the palette's
     /// Version row, the tab-strip ↻, Settings ▸ Software Update) — still in
     /// place, still with the shells running; the next launch picks up a stage
-    /// only if no handoff ever ran. `ATERM_NO_AUTO_APPLY` forces it off for one
-    /// run.
+    /// only if no handoff ever ran.
     pub(crate) auto_apply: Option<bool>,
     /// OPT IN to Apple Developer-ID + notarization enforcement for self-updates.
     ///
@@ -3006,39 +3134,44 @@ pub(crate) struct UpdateConfig {
     /// It can only TIGHTEN: a build that already has a Team ID compiled in ignores
     /// this key entirely, so a config file can never downgrade a signed build's
     /// trust anchor. See `aterm_update::set_required_team_id`.
+    ///
+    /// A DEVELOPMENT setting since 2026-09-23 (a fork's self-hosted build): only a
+    /// development build installs it ([`update_required_team_id`]), and Settings does
+    /// not show it.
     pub(crate) require_team_id: Option<String>,
 }
 
-/// The `update.auto_apply` answer with its REASON kept: the status bar tells the
-/// user which of the two "off" cases they are in, because the remedy differs
-/// (edit the config, or unset the variable).
+/// `[update] require_team_id` as THIS build honours it: the configured Team ID in a
+/// development build (`debug_assertions`, or this crate's `dev-seams` feature, which
+/// the release cutter never enables); `None` in a shipped binary, whose compiled pin is
+/// its only anchor — one true path (2026-09-23).
+pub(crate) fn update_required_team_id(config: &Config) -> Option<&str> {
+    if !cfg!(any(debug_assertions, feature = "dev-seams")) {
+        return None;
+    }
+    config
+        .update
+        .as_ref()
+        .and_then(|u| u.require_team_id.as_deref())
+}
+
+/// The `update.auto_apply` answer. Two states: the environment veto that was the
+/// third (`ATERM_NO_AUTO_APPLY`, "off for this run") is gone (2026-09-23, owner: "NOT
+/// ENV VARS those are for development") — `[update] auto_apply` in Settings is the one
+/// control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AutoApplySetting {
     /// The default: the in-session lane applies a staged build by itself.
     On,
     /// `[update] auto_apply = false`.
     OffByConfig,
-    /// `ATERM_NO_AUTO_APPLY` is set for this run (env wins, as for every other
-    /// update setting).
-    OffByEnv,
 }
 
-/// Whether — and if not, why not — a staged update applies by itself: env
-/// `ATERM_NO_AUTO_APPLY` vetoes for a run, else config `update.auto_apply`
-/// (default TRUE). A plain environment read every time, never memoised: a
-/// `OnceLock` whose initializer asks its own owner parks the caller forever, and
-/// that shape hung every apply on 2026-08-30.
+/// Whether a staged update applies by itself: config `update.auto_apply` (default
+/// TRUE). A plain read of the config every time, never memoised: a `OnceLock` whose
+/// initializer asks its own owner parks the caller forever, and that shape hung every
+/// apply on 2026-08-30.
 pub(crate) fn update_auto_apply_setting(config: &Config) -> AutoApplySetting {
-    // Value semantics via the shared flag rule: unset, EMPTY and "0" do not
-    // veto (see `env_flag_engaged` — the empty-inherited-var species,
-    // 2026-09-01).
-    if aterm_types::control_socket::env_flag_engaged(
-        std::env::var_os("ATERM_NO_AUTO_APPLY")
-            .map(|v| v.to_string_lossy().into_owned())
-            .as_deref(),
-    ) {
-        return AutoApplySetting::OffByEnv;
-    }
     if config
         .update
         .as_ref()
@@ -3049,6 +3182,18 @@ pub(crate) fn update_auto_apply_setting(config: &Config) -> AutoApplySetting {
     } else {
         AutoApplySetting::OffByConfig
     }
+}
+
+/// "Check for updates automatically" as SAVED — `[update] enabled`, default ON. The
+/// updater reads the same key once per process (`aterm_update::automatic`); this is the
+/// saved value the next launch reads, from the config already in memory. Settings ▸
+/// Software Update names it beside the value this process runs (`App::update_checks_running`).
+pub(crate) fn update_checks_automatic(config: &Config) -> bool {
+    config
+        .update
+        .as_ref()
+        .and_then(|u| u.enabled)
+        .unwrap_or(true)
 }
 
 /// [`update_auto_apply_setting`] as the bool the lane's arm and poll read.
@@ -4659,81 +4804,153 @@ impl Config {
     /// The `[harness] enabled` RESOLVED bit (default TRUE): whether the aterm
     /// wrapper arms on the next launch.
     ///
-    /// The DURABLE half only. `$ATERM_NO_HARNESS` bypasses one session and is
-    /// deliberately NOT folded in here: this resolver answers "what does the
-    /// file say", which is what the Settings row seeds from and what
-    /// `aterm harness` reads out of the same file with no GUI in the path.
-    /// The per-session bypass is the harness's own read
-    /// (`aterm_agent::harness::mark`), so the switch the owner can see in
+    /// The one switch (the per-session `$ATERM_NO_HARNESS` bypass that used to sit
+    /// beside it is gone, 2026-09-23): this resolver answers "what does the file
+    /// say", which is what the Settings row seeds from and what `aterm harness`
+    /// reads out of the same file with no GUI in the path (`aterm_agent::harness::
+    /// mark`), so the switch the owner can see in
     /// Settings never silently means something else than the file.
+    ///
+    /// It is the SUPERVISOR'S bit ([`Self::harness_policy`]), so the launcher
+    /// and the supervisor cannot disagree: absent is ON, and a value the
+    /// policy refuses (`enabled = "no"`, `enabled = 0`) is OFF, as the
+    /// supervisor reads it — the owner wrote the key to say something, and
+    /// the switch that presses fails closed.
     pub(crate) fn harness_enabled(&self) -> bool {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.enabled)
-            .unwrap_or(true)
+        self.harness_policy().0.enabled
     }
 
-    /// The `[packages]` `auto_update` RESOLVED bit (default TRUE — today's 6h
-    /// cadence). One resolver so the Settings switch seed, the loop gate, and
-    /// the Packages page status card all read the same effective value.
-    pub(crate) fn packages_auto_update(&self) -> bool {
-        self.packages
-            .as_ref()
-            .and_then(|p| p.auto_update)
-            .unwrap_or(true)
+    /// The policy the supervisor host STARTS under: [`Self::harness_policy`]
+    /// — unless the launch could not load `aterm.toml` (`load_failed`,
+    /// [`launch_load_failed`]), when `self` is the defaults stand-in and
+    /// the host escalates only ([`SupervisorConfig::escalate_only`]) until a
+    /// load or reload supplies the owner's table. The defaults act on every
+    /// switch, so falling back to them would turn a typo anywhere in the
+    /// file into full autonomy (the safety review of 2026-09-24).
+    ///
+    /// [`SupervisorConfig::escalate_only`]: aterm_agent::supervise::SupervisorConfig::escalate_only
+    pub(crate) fn harness_policy_at_launch(
+        &self,
+        load_failed: bool,
+    ) -> aterm_agent::supervise::SupervisorConfig {
+        if load_failed {
+            aterm_agent::supervise::SupervisorConfig::escalate_only()
+        } else {
+            self.harness_policy().0
+        }
     }
 
-    /// The `[packages]` background-maintenance master bit (default TRUE).
-    /// Explicit package actions are still allowed while this is off; it gates
-    /// only the launch-time automatic updater thread.
+    /// The supervisor's policy: [`SupervisorConfig::default`] (the owner
+    /// decisions the 2026-09-23 audit adopted) with every `[harness]` key the
+    /// file sets applied by [`SupervisorConfig::set`], and the refusals, one
+    /// sentence each.
+    ///
+    /// It FAILS CLOSED, because every default that acts is ON: a switch whose
+    /// value is refused (`rm_breaker = "no"`, `enabled = 0`) resolves OFF,
+    /// `continue_per_hour` resolves to 0, and a key the policy does not know
+    /// (`rm_breakr = false` — the owner meant to say something about
+    /// pressing) turns every approval rule off, so nothing is pressed until
+    /// the file is fixed. Each refusal's sentence says what it resolved to.
+    /// The unknown key's own refusal is left to the config language's
+    /// ignored-key notice ([`collect_key_notices`]); what it did to the
+    /// approvals is [`Self::harness_notices`]'s.
+    ///
+    /// [`SupervisorConfig::default`]: aterm_agent::supervise::SupervisorConfig
+    /// [`SupervisorConfig::set`]: aterm_agent::supervise::SupervisorConfig::set
+    pub(crate) fn harness_policy(&self) -> (aterm_agent::supervise::SupervisorConfig, Vec<String>) {
+        use aterm_agent::supervise::{ApprovalToggles, config::KEYS};
+        let mut cfg = aterm_agent::supervise::SupervisorConfig::default();
+        let mut refused = Vec::new();
+        let mut unknown = Vec::new();
+        for (key, value) in self.harness.iter().flat_map(|h| h.keys.iter()) {
+            let Err(e) = cfg.set(key, &value.text()) else {
+                continue;
+            };
+            if !KEYS.contains(&key.as_str()) {
+                unknown.push(key.as_str());
+                refused.push(e);
+                continue;
+            }
+            // The one text key a value can be refused for, and the one
+            // count; every other refusable key is a switch.
+            let closed = match key.as_str() {
+                "continue_text" => None,
+                "continue_per_hour" => Some("0"),
+                _ => Some("false"),
+            };
+            match closed {
+                Some(off) if cfg.set(key, off).is_ok() => {
+                    refused.push(format!("{e}; {key} = {off} until it is fixed"));
+                }
+                _ => refused.push(e),
+            }
+        }
+        if !unknown.is_empty() {
+            cfg.approvals = ApprovalToggles::off();
+            refused.push(format!(
+                "[harness] {}: {} the supervisor does not know, so every approval rule is \
+                 off (nothing is pressed) until it is fixed or removed",
+                unknown.join(", "),
+                if unknown.len() == 1 { "a key" } else { "keys" },
+            ));
+        }
+        (cfg, refused)
+    }
+
+    /// The `[harness]` values the policy refused, as config notices (`config
+    /// [harness] <key>: …`), each with what it resolved to — and, for an
+    /// unknown key, that the approvals are off. The unknown key's bare
+    /// refusal is not repeated: the config language's ignored-key notice
+    /// already names it.
+    pub(crate) fn harness_notices(&self) -> Vec<String> {
+        // Everything but `SupervisorConfig::set`'s own unknown-key refusal,
+        // which the ignored-key notice already says.
+        let known = |line: &str| !line.contains(": not a harness key (known:");
+        self.harness_policy()
+            .1
+            .into_iter()
+            .filter(|line| known(line))
+            .map(|line| format!("config {line}"))
+            .collect()
+    }
+
+    /// `[packages] enabled` — Automatic updates, THE switch (default TRUE), with the
+    /// retired `auto_update` folded in exactly as atpkg folds it
+    /// (`atpkg::config::PackagesConfig::enabled`): an `auto_update = false` still in the
+    /// file reads as off. It gates the window's background loop (the launch pass, the
+    /// schedule, the head watch); a package action a person clicks still runs. The gate
+    /// is config-only (no environment kill switch since 2026-09-23), and the cadence has
+    /// no knob (Phase 3). The loop reads the same resolver's atpkg twin LIVE from the file
+    /// (Phase 4, `LiveSwitch` in lib.rs); this one seeds the Settings switch — the one
+    /// value it shows, on the Packages page and in Search — and the page's service line.
     pub(crate) fn packages_enabled(&self) -> bool {
         self.packages
             .as_ref()
-            .and_then(|p| p.enabled)
-            .unwrap_or(true)
+            .is_none_or(|p| p.enabled.unwrap_or(true) && p.auto_update != Some(false))
     }
 
-    /// The `[packages]` `auto_install` RESOLVED bit (default FALSE — multi-GB
-    /// toolchains need explicit consent; the Settings switch IS the consent
-    /// click, `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §11). Consumed by the
-    /// co-located `atpkg` from the same table; the GUI only displays/edits it.
-    /// The `[packages]` `seed_install` RESOLVED bit (default TRUE).
-    pub(crate) fn packages_seed_install(&self) -> bool {
-        self.packages
-            .as_ref()
-            .and_then(|p| p.seed_install)
-            .unwrap_or(true)
+    /// WHY [`Self::packages_enabled`] reads off, when the retired `auto_update = false` is
+    /// what holds it — `enabled` itself not written off — in atpkg's own words
+    /// (`atpkg::config::auto_update_note`, what doctor and the config editor say), so
+    /// Settings ▸ Packages explains an Off it did not write and never advises a spelling
+    /// that would turn the opt-out back on. Not a second switch: the state is
+    /// `packages_enabled` alone, and writing `enabled` drops the retired key
+    /// (`prefs::RETIRED_PACKAGES_SPELLINGS`).
+    pub(crate) fn packages_retired_switch_note(&self) -> Option<String> {
+        let packages = self.packages.as_ref()?;
+        (packages.auto_update == Some(false) && packages.enabled != Some(false))
+            .then(|| atpkg::config::auto_update_note(false, packages.enabled))
     }
 
+    /// `[packages] auto_install` — THE install consent (default TRUE, batteries
+    /// included), with the retired `seed_install` read in its place while it is unset,
+    /// exactly as atpkg resolves it (`atpkg::config::PackagesConfig::auto_install`).
+    /// Consumed by the co-located `atpkg`; the GUI displays and edits it.
     pub(crate) fn packages_auto_install(&self) -> bool {
         self.packages
             .as_ref()
-            .and_then(|p| p.auto_install)
-            .unwrap_or(false)
-    }
-
-    /// Whether the background TOOLS loop (`spawn_pkg_update_check` → the
-    /// co-located `atpkg update`) runs at all: `[packages]` `enabled` (the
-    /// master, default TRUE — today's behavior) AND `auto_update` (the 6h
-    /// cadence flag, default TRUE). `auto_install` is deliberately NOT read
-    /// here — the co-located `atpkg` reads the SAME `[packages]` table itself
-    /// and applies the default-set bootstrap on its own `update` pass (one
-    /// source of truth, no GUI copy to go stale). The interval keeps its
-    /// `ATPKG_UPDATE_INTERVAL_SECS` env override, but the gate is config-only.
-    pub(crate) fn packages_update_loop_enabled(&self) -> bool {
-        let p = self.packages.clone().unwrap_or_default();
-        // The remaining keys are atpkg's to consume (schema completeness here so
-        // the whole table round-trips through this struct in tests) — same idiom
-        // as the parsed-but-inert matrix-rain v1.1 keys.
-        let _ = (
-            p.auto_install,
-            p.seed_install,
-            p.account.as_deref(),
-            p.channel.as_deref(),
-            p.include.as_deref(),
-            p.exclude.as_deref(),
-        );
-        self.packages_enabled() && p.auto_update.unwrap_or(true)
+            .and_then(|p| p.auto_install.or(p.seed_install))
+            .unwrap_or(true)
     }
 
     /// `[machine] universal_control`, resolved with the SAME table as
@@ -6396,15 +6613,15 @@ fn warn_background_opacity_unimplemented_once() {
              floor still applies)"
         );
         // The stderr line above is invisible to any windowed launch (a
-        // Finder-launched .app, a Start-Menu launch — the same reason
-        // `config_notice` exists at all), and this is a key the user deliberately
-        // set and can watch do nothing. Give it the in-window banner too.
-        crate::config_notice::queue_deferred(
-            "background_opacity has no effect on the CPU renderer — it has no translucent \
-             present path, so the window stays solid. Enable the GPU renderer for real \
-             transparency."
-                .to_string(),
-        );
+        // Finder-launched .app, a Start-Menu launch — the same reason the
+        // message band exists at all), and this is a key the user deliberately
+        // set and can watch do nothing. Give it the band too (design R5), on
+        // the pre-App inbox: the first pin can run before `App` exists.
+        crate::message_inbox::queue_message(crate::message_reporters::cpu_renderer_no_effect(
+            "background_opacity",
+            "it has no translucent present path, so the window stays solid; enable the GPU \
+             renderer for real transparency",
+        ));
     });
 }
 
@@ -6424,11 +6641,11 @@ fn warn_background_material_unimplemented_once() {
         );
         // Same reasoning as its opacity sibling above: a deliberately-set key
         // doing nothing, explained only on a stream a windowed launch discards.
-        crate::config_notice::queue_deferred(
-            "background_material has no effect on the CPU renderer — it cannot composite \
-             over a window-level blur. Enable the GPU renderer to see the material."
-                .to_string(),
-        );
+        crate::message_inbox::queue_message(crate::message_reporters::cpu_renderer_no_effect(
+            "background_material",
+            "it cannot composite over a window-level blur; enable the GPU renderer to see \
+             the material",
+        ));
     });
 }
 
@@ -7658,30 +7875,9 @@ pub(crate) fn active_environment_override(key: &str) -> Option<ActiveEnvironment
         "net.key" => std::env::var("ATERM_NET_KEY")
             .ok()
             .map(|value| resolved("ATERM_NET_KEY", value)),
-        "update.owner" => std::env::var("ATERM_UPDATE_OWNER")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| aterm_update_core::is_valid_slug(value))
-            .map(|value| resolved("ATERM_UPDATE_OWNER", value)),
-        "update.repo" => std::env::var("ATERM_UPDATE_REPO")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| aterm_update_core::is_valid_slug(value))
-            .map(|value| resolved("ATERM_UPDATE_REPO", value)),
-        "update.auto_apply"
-            if aterm_types::control_socket::env_flag_engaged(
-                std::env::var_os("ATERM_NO_AUTO_APPLY")
-                    .map(|v| v.to_string_lossy().into_owned())
-                    .as_deref(),
-            ) =>
-        {
-            Some(resolved("ATERM_NO_AUTO_APPLY", "false".to_string()))
-        }
-        "packages.account" => std::env::var("ATPKG_ACCOUNT")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| aterm_update_core::is_valid_slug(value))
-            .map(|value| resolved("ATPKG_ACCOUNT", value)),
+        // No `update.*` or `packages.*` key has an environment override any more
+        // (2026-09-23: `ATERM_UPDATE_OWNER`/`_REPO`, `ATERM_NO_AUTO_APPLY` and
+        // `ATPKG_ACCOUNT` are gone), so none is resolved here.
         _ => None,
     }
 }
@@ -7756,9 +7952,11 @@ static LAUNCH_LOAD_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::n
 
 fn note_launch_load_failed(notice: String) {
     // First failure wins: `load_config` runs more than once per process, and the
-    // launch's own reason is the one the reports must name.
-    let _ = LAUNCH_LOAD_FAILURE.set(notice.clone());
-    crate::config_notice::queue_deferred(notice);
+    // launch's own reason is the one the reports must name. The band's row
+    // (design R3) rides the pre-App inbox — `load_config` runs before `App`
+    // exists — and the inbox folds the repeat on its own.
+    crate::message_inbox::queue_message(crate::message_reporters::launch_load_failure(&notice));
+    let _ = LAUNCH_LOAD_FAILURE.set(notice);
 }
 
 /// Whether this process launched WITHOUT its `aterm.toml` (unreadable or invalid
@@ -7805,6 +8003,41 @@ pub(crate) fn update_repoint_setting() -> (Option<String>, Option<String>) {
     match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
         Ok(observation) => update_repoint_from_text(&observation.text),
         Err(_) => (None, None),
+    }
+}
+
+/// Read source and application policy from ONE persisted config observation.
+/// Missing config keeps defaults; unreadable/malformed existing config refuses
+/// automatic work rather than silently turning a saved manual policy on.
+pub(crate) fn update_check_settings_setting() -> Option<aterm_update::CheckSettings> {
+    let config = if let Some(path) = config_path() {
+        match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
+            Ok(observation) => return update_check_settings_from_text(&observation.text),
+            Err(_) => match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+                _ => return None,
+            },
+        }
+    } else {
+        Config::default()
+    };
+    Some(update_check_settings(&config))
+}
+
+fn update_check_settings_from_text(text: &str) -> Option<aterm_update::CheckSettings> {
+    aterm_toml::from_str::<Config>(text)
+        .ok()
+        .map(|config| update_check_settings(&config))
+}
+
+pub(crate) fn update_check_settings(config: &Config) -> aterm_update::CheckSettings {
+    let update = config.update.as_ref();
+    aterm_update::CheckSettings {
+        source: aterm_update::Source::resolve(
+            update.and_then(|u| u.owner.as_deref()),
+            update.and_then(|u| u.repo.as_deref()),
+        ),
+        auto_apply: update.and_then(|u| u.auto_apply).unwrap_or(true),
     }
 }
 
@@ -7913,11 +8146,11 @@ pub(crate) fn resolve_want_gpu_with(
 /// for each that changed. Today that is the initial window grid (`columns`/`lines`): a
 /// live reload must not snap the now-freely-resizable window back to its configured
 /// size, so an edit lands on the *next* launch. Without this the edit is a silent
-/// no-op ("I changed `columns` and nothing happened"); the returned lines ride the same
-/// transient [`crate::config_notice::ConfigNotice`] banner as dropped-rule warnings.
+/// no-op ("I changed `columns` and nothing happened"); the returned lines become the
+/// `config.restart` row of the message band (`message_reporters::ConfigFamily::Restart`).
 ///
 /// PURE + total (no `self`, no I/O) so it unit-tests without a window — the same shape
-/// as the keybinding `*_warn` helpers that already feed the banner. Env overrides
+/// as the keybinding `*_warn` helpers that already feed the band. Env overrides
 /// (`ATERM_COLUMNS`/`ATERM_LINES`) are intentionally ignored: they are fixed for the
 /// process, so they can't change across a reload and never generate a spurious notice.
 pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
@@ -7939,34 +8172,49 @@ pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
     out
 }
 
-/// How many ignored-key lines the transient banner may carry before rolling the
-/// rest up. The banner paints at most `config_notice::MAX_NOTICE_ROWS` rows in
-/// total, and a config with a broken `[section]` can produce dozens of ignored
-/// leaves — without a cap they would evict every dropped-keybinding and
-/// restart-only line the same reload also needs to show.
-const MAX_BANNER_IGNORED_KEYS: usize = 3;
-
-/// The banner's view of [`crate::native_config_language::ignored_key_warnings`]:
-/// the keys `aterm.toml` sets that this build will do nothing with, capped, and
-/// carrying the `config …` prefix every other line on this banner uses.
+/// The band's view of [`crate::native_config_language::key_warnings`], added
+/// to `warns` in two families, every sentence carrying the `config …` prefix
+/// every config sentence uses on stderr:
 ///
-/// The whole point of the banner is that stderr reaches nobody who launched from
+/// * the keys `aterm.toml` sets that this build will do nothing with, every one
+///   of them (`message_reporters::ConfigFamily::IgnoredKeys`). The old
+///   three-line cap and its roll-up went with the overwrite banner: the family
+///   is ONE row now, with every sentence a detail line behind its Details
+///   press, so a broken `[section]` cannot evict the keybinding and
+///   restart-only rows the same reload also shows;
+/// * the retired and deprecated spellings, each still read or decided by a
+///   newer key (`ConfigFamily::RetiredKeys`), a record and never a row —
+///   counted with the first family, they were "not known to this build", and
+///   a working `auto_update = false` read that way invites the deletion that
+///   turns automatic updates back on (design ruling 42).
+///
+/// The whole point of the band is that stderr reaches nobody who launched from
 /// a dock, a Start-menu tile or Finder. A misspelled KEY is the silent no-op that
 /// most needs it — the setting simply never applies, and until the reader is told
 /// the near-miss spelling there is no way to find out why. Startup and reload
 /// both call this so a typo introduced by a live edit is reported exactly like
 /// one that was there at launch.
-pub(crate) fn ignored_key_notices(text: &str) -> Vec<String> {
-    capped_banner_notices(
-        crate::native_config_language::ignored_key_warnings(text),
-        "ignored key(s)",
-    )
+pub(crate) fn collect_key_notices(
+    warns: &mut crate::message_reporters::ConfigWarnings,
+    text: &str,
+) {
+    use crate::message_reporters::ConfigFamily;
+    let keys = crate::native_config_language::key_warnings(text);
+    warns.extend(ConfigFamily::IgnoredKeys, prefixed_notices(keys.ignored));
+    warns.extend(ConfigFamily::RetiredKeys, prefixed_notices(keys.retired));
 }
 
-/// The banner's view of
+/// The `IgnoredKeys` half of [`collect_key_notices`], for the tests that read
+/// its sentences.
+#[cfg(test)]
+pub(crate) fn ignored_key_notices(text: &str) -> Vec<String> {
+    prefixed_notices(crate::native_config_language::key_warnings(text).ignored)
+}
+
+/// The band's view of
 /// [`crate::native_config_language::unaccepted_value_warnings`]: keys whose
 /// authored VALUE this build does not accept, minus any that `already_told`
-/// explains, capped and prefixed like [`ignored_key_notices`].
+/// explains, prefixed like [`collect_key_notices`].
 ///
 /// The same silent no-op one level down, and the same reason for a window
 /// surface: `window_theme = "drak"` keeps the default and says so only on a
@@ -7975,29 +8223,20 @@ pub(crate) fn ignored_key_notices(text: &str) -> Vec<String> {
 /// reads them, and a key whose own resolver already named the value it refused
 /// must keep that fuller sentence instead of also getting the generic one.
 pub(crate) fn unaccepted_value_notices(text: &str, already_told: &[String]) -> Vec<String> {
-    capped_banner_notices(
-        crate::native_config_language::unaccepted_value_warnings(text, already_told),
-        "unaccepted value(s)",
-    )
+    prefixed_notices(crate::native_config_language::unaccepted_value_warnings(
+        text,
+        already_told,
+    ))
 }
 
-/// Cap one group of config lines to [`MAX_BANNER_IGNORED_KEYS`] and give them
-/// the `config …` prefix every other banner line uses, rolling the remainder up
-/// into a single line that names where the full list lives. Shared so the two
-/// groups cannot drift into different caps or different prefixes.
-fn capped_banner_notices(mut lines: Vec<String>, noun: &str) -> Vec<String> {
-    let overflow = lines.len().saturating_sub(MAX_BANNER_IGNORED_KEYS);
-    lines.truncate(MAX_BANNER_IGNORED_KEYS);
-    let mut notices = lines
+/// Give one group of config lines the `config …` prefix every other config
+/// sentence carries on stderr. Shared so the two groups cannot drift into
+/// different prefixes.
+fn prefixed_notices(lines: Vec<String>) -> Vec<String> {
+    lines
         .into_iter()
         .map(|line| format!("config {line}"))
-        .collect::<Vec<_>>();
-    if overflow > 0 {
-        notices.push(format!(
-            "config … and {overflow} more {noun} — run `aterm --validate-config` for the full list"
-        ));
-    }
-    notices
+        .collect()
 }
 
 /// Parse a non-zero `u16` from an environment variable, returning `None` when the
@@ -9081,7 +9320,7 @@ impl App {
     /// and the PTY is told — `on_resize` → `apply_term_resize`, a no-op when the
     /// count did not actually move). The chrome is GLOBAL, but
     /// `tab_segments`/`last_present` are per-window, hence the sweep. Shared by
-    /// the `tab_strip_rows` reload and [`Self::sync_status_bar_rows`] so the two
+    /// the `tab_strip_rows` reload and `App::sync_message_band_rows` so the two
     /// cannot re-grid by different laws.
     pub(crate) fn regrid_for_chrome_rows(&mut self) {
         let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
@@ -9105,120 +9344,6 @@ impl App {
                 w.request_redraw();
             }
         }
-    }
-
-    /// Commit the status bars' row count to the window geometry. `true` when
-    /// the count moved (and every window was re-gridded). The committed count
-    /// (`status_bar_rows`) is what [`Self::chrome_rows`] reads, so a bar's row is
-    /// reserved and released in the SAME step as the PTY resize — the compose
-    /// can never prepend a row the grid still owns, or vice versa.
-    pub(crate) fn sync_status_bar_rows(&mut self) -> bool {
-        let rows = self.status_bars.rows();
-        if rows == self.status_bar_rows {
-            return false;
-        }
-        // NEVER MID-HANDOFF. A seamless self-update parks the readers and hands
-        // the successor an exact window layout; a re-grid here moves `ws.rows`
-        // outside `window_event`, so at Commit the layout no longer matches and
-        // the handoff is refused as a topology change — after the user sat
-        // through the frozen echo. The bar keeps its row count until the handoff
-        // finishes (`Wake::UpdateHandoffFinished` re-syncs); the bars themselves
-        // keep updating, painted within the committed rows.
-        //
-        // BOTH SIDES OF THAT SEAM. The outgoing process holds
-        // `pending_update_handoff`; the INCOMING one holds
-        // `incoming_handoff_pending` instead, and its layout is the one the proof
-        // compares against what the parent captured. A bar appearing in the
-        // successor before Commit would move `ws.rows` there and refuse the very
-        // handoff that is revealing it. Today that is unreachable — the
-        // pre-Commit wake gate drops the progress wakes that would raise a bar —
-        // but the guard belongs here, next to its reason, rather than depending
-        // on a gate two files away that exists for a different purpose.
-        //
-        // AND NOT BEFORE IT EITHER — by design, and recorded here so nobody
-        // "fixes" it by deferring the bar. The "update staged" bar is raised
-        // when a build is ARMED, before any attempt exists, so its one row
-        // lands on every session seconds before the park: on 2026-09-22 it
-        // shrank 56-row sessions to 55, and a Claude Code tab whose DECSC slot
-        // sat on row 55 refused the visible-checkpoint set on every release
-        // from v0.87.0 to v0.90.0. The fix was the wire's bound on that slot
-        // (`seamless::checkpoint_meta_bound_violation`), not this shrink: a
-        // resize a second before a handoff is ordinary desk state the
-        // checkpoint must carry, and a 55-row refusal in the log under a
-        // 56-row window is this shrink, not a mystery.
-        if self.pending_update_handoff.is_some() || self.incoming_handoff_pending {
-            return false;
-        }
-        // …AND NEVER MORE ROWS THAN THE GLASS CAN SPARE. `grid_dims_for` floors
-        // the terminal at one row, so chrome that outgrows the window does not
-        // shrink the grid — it makes the COMPOSED frame taller than the window,
-        // and the surplus is simply clipped. A short window (a tiny split-off
-        // pane, a hand-resized strip of a window) with a 4-row tab strip plus
-        // two bars is the reachable case. The bars yield instead: they are
-        // chrome about background work, and background work never outranks the
-        // one row of terminal the user is actually looking at.
-        //
-        // Measured against what each window CURRENTLY affords — its terminal
-        // rows plus whatever bar rows are already committed — so the answer does
-        // not depend on the re-grid it is about to trigger. The smallest window
-        // decides, because the count is global.
-        let afford = self
-            .windows
-            .values()
-            .filter(|ws| ws.os_window.is_some())
-            .map(|ws| {
-                ws.rows
-                    .saturating_add(self.status_bar_rows)
-                    .saturating_sub(1)
-            })
-            .min();
-        let rows = afford.map_or(rows, |afford| rows.min(afford));
-        if rows == self.status_bar_rows {
-            return false;
-        }
-        self.status_bar_rows = rows;
-        self.regrid_for_chrome_rows();
-        true
-    }
-
-    /// After any status-bar input: retire what has expired, commit the row
-    /// count, and repaint every window (the bars are chrome in each of them; the
-    /// RepaintKey's quantized `status_bars_fp` keeps a byte-identical tick from
-    /// re-presenting).
-    pub(crate) fn sync_status_bars(&mut self) {
-        let _ = self.settle_status_bars(std::time::Instant::now());
-        let _ = self.sync_status_bar_rows();
-        self.request_redraw_all_windows();
-    }
-
-    /// Retire the bars that have expired. While a handoff is pending the HOLDS
-    /// are suspended: the row count is frozen for Commit
-    /// (`sync_status_bar_rows` refuses), so a bar folding on its hold would
-    /// paint the committed row as a hole for the rest of the freeze — the words
-    /// outlive it instead and fold on the trailing sync
-    /// (`Wake::UpdateHandoffFinished`, or Commit on the successor). The
-    /// STALENESS CAPS keep running: `incoming_handoff_pending` is cleared only
-    /// by Commit, so a successor whose Commit never arrives must not be left
-    /// holding a carried "finishing" row for the life of the process — that is
-    /// what `HANDOFF_STALE` is for. Returns whether the glass changed.
-    pub(crate) fn settle_status_bars(&mut self, now: std::time::Instant) -> bool {
-        self.status_bars
-            .settle_with(now, !self.status_bar_holds_frozen())
-    }
-
-    /// Whether a handoff is freezing the bars' holds right now
-    /// ([`Self::settle_status_bars`]). ONE predicate, read by the settle and by
-    /// the deadline that arms it ([`Self::status_bars_deadline`]), so the loop
-    /// can never arm a wake its own settle will decline to act on.
-    fn status_bar_holds_frozen(&self) -> bool {
-        self.pending_update_handoff.is_some() || self.incoming_handoff_pending
-    }
-
-    /// The next instant the status bars need the loop back — what
-    /// [`Self::settle_status_bars`] would act on, freeze included.
-    pub(crate) fn status_bars_deadline(&self) -> Option<std::time::Instant> {
-        self.status_bars
-            .deadline_with(!self.status_bar_holds_frozen())
     }
 
     /// The grid `(rows, cols)` window `wid` gets for raw window `size` — the
@@ -10437,26 +10562,43 @@ impl App {
             // a setting the user has never set before, typed wrong) parses
             // EQUAL, returned here, and said nothing — on stderr or in the
             // window — while the identical file at launch warns. That defeats
-            // `ignored_key_notices`'s own documented contract, that "startup
+            // `collect_key_notices`'s own documented contract, that "startup
             // and reload both call this so a typo introduced by a live edit is
             // reported exactly like one that was there at launch".
             //
-            // Emitting a possibly-EMPTY notice is also correct and is the
-            // second half of the fix: `ConfigNotice::new` clears a stale banner,
-            // so fixing the typo now takes the warning down even when the parse
-            // is otherwise unchanged.
-            let mut warns = ignored_key_notices(&config_snapshot.text);
-            warns.extend(unaccepted_value_notices(&config_snapshot.text, &warns));
-            for w in &warns {
+            // Posting a possibly-EMPTY set is also correct and is the second
+            // half of the fix: the replace first resolves the live rows of
+            // the families this path re-derives (and the launch load failure
+            // a file that now parses has answered), so fixing the typo takes
+            // the warning down even when the parse is otherwise unchanged.
+            // ONLY those rows: this path recomputes nothing from the parse,
+            // so the keybinding, font and trail rows the last full reload
+            // posted are still true, and a comment-only save must not resolve
+            // them — the `config.` prefix resolve did, and logged them fixed
+            // (Phase 3 review, ruling 28).
+            let mut warns = crate::message_reporters::ConfigWarnings::default();
+            collect_key_notices(&mut warns, &config_snapshot.text);
+            warns.extend(
+                crate::message_reporters::ConfigFamily::UnacceptedValues,
+                config.harness_notices(),
+            );
+            let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
+            warns.extend(
+                crate::message_reporters::ConfigFamily::UnacceptedValues,
+                unaccepted,
+            );
+            for w in warns.sentences() {
                 crate::logging::stderr_line!("aterm-gui: {w}");
             }
-            self.config_notice =
-                crate::config_notice::ConfigNotice::new(warns, std::time::Instant::now());
-            for ws in self.windows.values() {
-                if let Some(w) = ws.os_window.as_ref() {
-                    w.request_redraw();
-                }
-            }
+            self.replace_config_messages_keyed(
+                &[
+                    crate::message_reporters::ConfigFamily::IgnoredKeys.key(),
+                    crate::message_reporters::ConfigFamily::RetiredKeys.key(),
+                    crate::message_reporters::ConfigFamily::UnacceptedValues.key(),
+                    crate::message_reporters::KEY_LAUNCH_LOAD,
+                ],
+                warns.into_messages(),
+            );
             return;
         }
 
@@ -10533,6 +10675,12 @@ impl App {
             self.consent.invalidate();
         }
         self.config = config.clone();
+        // The supervisor's `[harness]` policy applies on reload: its workers
+        // restart under a changed policy, and `enabled = false` stops them
+        // within one wait (`harness_host`; a lock and a wake, no I/O here).
+        if let Some(host) = self.harness.as_ref() {
+            host.set_config(self.config.harness_policy().0);
+        }
         // Secure Keyboard Entry is PROCESS-level (Carbon secure input), so a
         // config commit records the wish here, once, beside the swap — not per
         // window or per session (engagement is focus-gated in secure_input).
@@ -10708,32 +10856,44 @@ impl App {
         // Clearing the user `[keybindings]` table now reverts to the platform defaults
         // (empty on macOS, where the hardcoded Cmd-* path is the convention); dropping
         // `option_as_meta` restores the default (Meta) — both diff-free when unchanged.
-        let (keybindings, mut warns) =
+        // The reload's config warnings, one family each
+        // (`message_reporters::ConfigWarnings`, design R4): the band's
+        // `config.*` rows are REPLACED as a set at the end of this reload.
+        use crate::message_reporters::ConfigFamily;
+        let mut warns = crate::message_reporters::ConfigWarnings::default();
+        let (keybindings, kb_warns) =
             keybinding::Keybindings::resolved_warn(config.keybindings.as_ref());
         let (key_sequences, ks_warns) =
             keybinding::KeySequences::from_config_warn(config.key_sequences.as_ref());
         self.keybindings = keybindings;
         self.key_sequences = key_sequences;
-        warns.extend(ks_warns);
-        // Restart-only edits (columns/lines) ride the SAME banner as dropped-rule
+        warns.extend(ConfigFamily::Keybindings, kb_warns);
+        warns.extend(ConfigFamily::Keybindings, ks_warns);
+        // Restart-only edits (columns/lines) ride the SAME band as dropped-rule
         // warnings — both are "your edit didn't fully take effect" messages.
-        warns.extend(restart_notices);
+        warns.extend(ConfigFamily::Restart, restart_notices);
         // …as does a key this build ignores. A hand edit that misspells the key
         // is the same class taken to its limit — the edit took no effect at all —
         // and it is the class the reader has no other way to discover, since the
         // parsed config the rest of this reload inspects has no record of it.
-        warns.extend(ignored_key_notices(&config_snapshot.text));
+        // (A retired or deprecated spelling is recorded, not shown:
+        // `collect_key_notices`.)
+        collect_key_notices(&mut warns, &config_snapshot.text);
         // …and so does a refused Secure Keyboard Entry transition (see the
         // apply site above): same class exactly — an edit that did not take.
         if let Some(status) = secure_input_refusal {
-            warns.push(format!(
-                "secure_keyboard_entry: the OS refused the change (OSStatus {status}) —                  Secure Keyboard Entry is NOT {}",
-                if self.config.secure_keyboard_entry_or_default() {
-                    "on"
-                } else {
-                    "off"
-                }
-            ));
+            warns.push(
+                ConfigFamily::SecureKeyboard,
+                format!(
+                    "secure_keyboard_entry: the OS refused the change (OSStatus {status}) \u{2014} \
+                     Secure Keyboard Entry is NOT {}",
+                    if self.config.secure_keyboard_entry_or_default() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+            );
         }
         // W5h: an unresolvable `font_family` warns (like themes) instead of
         // silently reducing to the built-in candidates. Uses the same
@@ -10762,11 +10922,12 @@ impl App {
             Some(prepared) => prepared.family.clone(),
             None => self.font_family.clone(),
         };
-        warns.append(&mut font_prepare_warnings);
+        warns.extend(ConfigFamily::Fonts, font_prepare_warnings.drain(..));
         // An unrecognized `cursor_trail_style` silently draws the DEFAULT style
-        // instead of the requested one — warn on the same banner, or the
+        // instead of the requested one — warn on the same band, or the
         // substitution has no surface at all.
         warns.extend(
+            ConfigFamily::CursorTrail,
             config_snapshot
                 .assets
                 .trail_packs
@@ -10775,7 +10936,7 @@ impl App {
                 .map(|warning| format!("config {warning}")),
         );
         if let Some(w) = config.cursor_trail_style_warning(&config_snapshot.assets.trail_packs) {
-            warns.push(format!("config {w}"));
+            warns.push(ConfigFamily::CursorTrail, format!("config {w}"));
         }
         if let Some(reason) = config_snapshot.assets.kitty_sprite.diagnostic() {
             let source = config_snapshot
@@ -10783,19 +10944,23 @@ impl App {
                 .kitty_sprite
                 .source_id()
                 .unwrap_or("configured source");
-            warns.push(format!(
-                "config cursor_nyan_sprite {source:?} invalid: {reason}"
-            ));
+            warns.push(
+                ConfigFamily::Assets,
+                format!("config cursor_nyan_sprite {source:?} invalid: {reason}"),
+            );
         }
         // An unadmittable wallpaper silently renders as no backdrop — surface
-        // the decode verdict on the same banner (the kitty-sprite rule).
+        // the decode verdict on the same band (the kitty-sprite rule).
         if let Some(reason) = config_snapshot.assets.wallpaper.diagnostic() {
             let source = config_snapshot
                 .assets
                 .wallpaper
                 .source_id()
                 .unwrap_or("configured source");
-            warns.push(format!("config wallpaper {source:?} invalid: {reason}"));
+            warns.push(
+                ConfigFamily::Assets,
+                format!("config wallpaper {source:?} invalid: {reason}"),
+            );
         }
         // W6: re-resolve the per-style / fallback font keys (families → paths),
         // riding the same banner for unresolvable entries. The diff against the
@@ -10804,25 +10969,25 @@ impl App {
             .as_ref()
             .map(|prepared| prepared.config.clone())
             .unwrap_or_else(|| self.font_config.clone());
-        // LAST on this banner, once every resolver above has had its say: a key
-        // spelled right whose VALUE this build does not accept keeps the default
-        // just as silently as a misspelled key ignores the edit. The filter reads
-        // the lines already collected, so a resolver that named the value it
-        // refused keeps its fuller sentence and this adds nothing for that key.
-        let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns);
-        warns.extend(unaccepted);
-        for w in &warns {
+        // LAST among the families, once every resolver above has had its say: a
+        // key spelled right whose VALUE this build does not accept keeps the
+        // default just as silently as a misspelled key ignores the edit. The
+        // filter reads the sentences already collected, so a resolver that named
+        // the value it refused keeps its fuller sentence and this adds nothing
+        // for that key.
+        // The supervisor's `[harness]` values it refused (a known key with a
+        // value it cannot take: `continue = "yes"`).
+        warns.extend(ConfigFamily::UnacceptedValues, config.harness_notices());
+        let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
+        warns.extend(ConfigFamily::UnacceptedValues, unaccepted);
+        for w in warns.sentences() {
             crate::logging::stderr_line!("aterm-gui: {w}");
         }
-        // Surface dropped rules / restart notices in-window. A fresh (possibly `None`)
-        // notice also CLEARS a stale banner once the config is fixed; repaint to reflect.
-        self.config_notice =
-            crate::config_notice::ConfigNotice::new(warns, std::time::Instant::now());
-        for ws in self.windows.values() {
-            if let Some(w) = ws.os_window.as_ref() {
-                w.request_redraw();
-            }
-        }
+        // Surface dropped rules / restart notices on the band, one row per
+        // family. A fresh (possibly empty) set first RESOLVES every live
+        // `config.` row, so a fixed config takes its warnings down; the sync
+        // repaints every window.
+        self.replace_config_messages(warns.into_messages());
         self.option_as_meta = config.option_as_meta_or_default();
         self.confirm_multiline_paste = config.confirm_multiline_paste_or_default();
         // Copy-on-select is a live input-policy toggle: a reload that flips it takes
@@ -11439,35 +11604,6 @@ impl App {
     // `cfg!(any(windows, target_os = "linux"))` for the same reason: on macOS
     // `ws.metrics.head` holds a real measured titlebar band, so letting the C3
     // write run there would clobber it with this law's 0.
-
-    /// THE HONESTY DRAIN. Move anything queued on the deferred notice lane
-    /// ([`crate::config_notice::queue_deferred`]) into the in-window banner — the
-    /// one surface a Start-Menu / Explorer launch actually has, since a
-    /// GUI-subsystem process's stderr is a closed handle there.
-    ///
-    /// Called from `about_to_wait`, i.e. on EVERY event-loop park, because the
-    /// queuing sites are spread across three contexts that cannot reach `App`: the
-    /// backend BUILD THREAD (GPU init failed → the backdrop is withdrawn), an
-    /// `AppRt` chrome call handed only a `&Window` (the material is styling the
-    /// caption only), and `run()` itself before `App` is constructed (hdr_glow and
-    /// the material are mutually exclusive). The check is one relaxed atomic load
-    /// when the lane is empty, which it is on every park but a handful per run.
-    ///
-    /// MERGES rather than replaces: the startup config banner may still be up, and
-    /// overwriting it would trade the user's typo'd keybinding warnings for one
-    /// chrome sentence.
-    pub(crate) fn drain_deferred_config_notices(&mut self) {
-        let lines = crate::config_notice::take_deferred();
-        if lines.is_empty() {
-            return;
-        }
-        let now = std::time::Instant::now();
-        match self.config_notice.as_mut().filter(|n| !n.is_expired(now)) {
-            Some(live) => live.extend(lines, now),
-            None => self.config_notice = crate::config_notice::ConfigNotice::new(lines, now),
-        }
-        self.request_redraw_all_windows();
-    }
 
     pub(crate) fn refresh_all_window_metrics(&mut self) {
         let pinned = self.font_px_explicit || resolve_force_scale().is_some();
@@ -12111,9 +12247,9 @@ window_title_format = "description"
 #[cfg(test)]
 mod cfg_engine_tests {
     use super::{
-        Config, KittySpriteAsset, MAX_BANNER_IGNORED_KEYS, MAX_KITTY_SPRITE_FILE_BYTES,
-        MAX_USER_THEME_FILE_BYTES, MAX_USER_THEME_FILES, ThemeCatalog, ThemeCatalogWatchError,
-        TrailPackCatalog, ignored_key_notices, open_regular_theme_file, unaccepted_value_notices,
+        Config, KittySpriteAsset, MAX_KITTY_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES,
+        MAX_USER_THEME_FILES, ThemeCatalog, ThemeCatalogWatchError, TrailPackCatalog,
+        ignored_key_notices, open_regular_theme_file, unaccepted_value_notices,
     };
     use aterm_core::config::BiDiMode;
 
@@ -12737,27 +12873,28 @@ mod cfg_engine_tests {
         );
     }
 
-    /// The banner has six rows for every config problem there is. A file whose
-    /// `[section]` header is misspelled produces one ignored leaf per entry, and
-    /// without a cap those would evict the dropped-keybinding and restart-only
-    /// lines that the same reload also needs to show.
+    /// A file whose `[section]` header is misspelled produces one ignored leaf
+    /// per entry, and EVERY one of them is reported: the family is one band
+    /// row with the sentences behind Details, so there is no longer a cap
+    /// that would hide nine of twelve and let the reader fix three. Each
+    /// carries the `config …` prefix the stderr echo uses.
     #[test]
-    fn ignored_key_notices_are_capped_so_one_bad_table_cannot_own_the_banner() {
+    fn ignored_key_notices_carry_every_key_and_the_config_prefix() {
         let many = (0..12)
             .map(|index| format!("not_a_key_{index} = 1"))
             .collect::<Vec<_>>()
             .join("\n");
         let notices = ignored_key_notices(&many);
-        assert_eq!(notices.len(), MAX_BANNER_IGNORED_KEYS + 1, "{notices:?}");
+        assert_eq!(notices.len(), 12, "{notices:?}");
         assert!(
             notices
-                .last()
-                .is_some_and(|line| line.contains("9 more") && line.contains("--validate-config")),
-            "the roll-up must say how many are hidden and where to read them: {notices:?}"
+                .iter()
+                .all(|line| line.starts_with("config ") && line.contains("not_a_key_")),
+            "{notices:?}"
         );
         assert!(
             ignored_key_notices("columns = 100\n").is_empty(),
-            "an accepted config raises no banner"
+            "an accepted config raises no row"
         );
     }
 
@@ -13387,7 +13524,10 @@ mod cfg_engine_tests {
     /// The empty case is asserted too, and is the second half of the fix rather
     /// than a formality: the notice must still be PUBLISHED when there is
     /// nothing to say, because that is what takes a stale banner down once the
-    /// typo is fixed — an edit which, again, parses equal.
+    /// typo is fixed — an edit which, again, parses equal. And ONLY the rows
+    /// this path re-derives come down: a row from a family it never recomputes
+    /// (the chord the last full reload skipped) is still true after a
+    /// comment-only save and stands (ruling 28).
     #[test]
     fn a_misspelled_key_added_by_a_live_edit_still_warns_through_the_dedupe() {
         fn apply(app: &mut crate::App, dir: &std::path::Path, text: &str) {
@@ -13421,23 +13561,46 @@ mod cfg_engine_tests {
         // A key this build does not know, and NOTHING else — so the parse is
         // equal to what is already applied and the dedupe fires.
         apply(&mut app, &dir, "windw_padding = 20\n");
-        let notice = app
-            .config_notice
-            .as_ref()
+        let ignored = app
+            .messages
+            .live_by_key(crate::message_reporters::ConfigFamily::IgnoredKeys.key())
             .expect("a misspelled key must warn even when the parse dedupes");
         assert!(
-            notice.lines.iter().any(|l| l.contains("windw_padding")),
-            "the banner names the key that was ignored: {:?}",
-            notice.lines
+            ignored
+                .msg
+                .detail
+                .iter()
+                .any(|l| l.contains("windw_padding")),
+            "the row names the key that was ignored: {:?}",
+            ignored.msg
         );
 
+        // A row from a family this path never re-derives — the chord the
+        // last FULL reload posted — stands in for every parse-derived row.
+        let mut chord = crate::message_reporters::ConfigWarnings::default();
+        chord.push(
+            crate::message_reporters::ConfigFamily::Keybindings,
+            "config keybindings: skipping \"ctrl+x\": unknown action \"foo\"".into(),
+        );
+        for msg in chord.into_messages() {
+            app.post_message(msg);
+        }
+
         // NEGATIVE CONTROL / the clearing half: fixing the typo also parses
-        // equal, and must take the banner back down rather than leave it up.
+        // equal, and must take ITS row back down rather than leave it up —
+        // and only its row: the chord's, not re-derived here, is still true.
         apply(&mut app, &dir, "# fixed\n");
         assert!(
-            app.config_notice.is_none(),
-            "removing the bad key clears the banner: {:?}",
-            app.config_notice.as_ref().map(|n| n.lines.clone())
+            app.messages
+                .live_by_key(crate::message_reporters::ConfigFamily::IgnoredKeys.key())
+                .is_none(),
+            "removing the bad key clears its row"
+        );
+        assert!(
+            app.messages
+                .live_by_key(crate::message_reporters::ConfigFamily::Keybindings.key())
+                .is_some(),
+            "a comment-only save leaves the chord's still-true row standing"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -14669,6 +14832,152 @@ mod output_streak_cfg_tests {
         );
     }
 
+    /// The safety review of 2026-09-24: an `aterm.toml` that does not parse
+    /// at launch leaves `Config::default()` standing in, whose `[harness]`
+    /// is absent — every act ON — so an owner's `continue = false` was lost
+    /// to a typo in any table. The host now STARTS escalate-only on a failed
+    /// launch load. Negative control: a load that worked starts under the
+    /// file's own policy (and a default-only file under the defaults).
+    #[test]
+    fn a_launch_that_could_not_load_the_file_starts_the_supervisor_escalate_only() {
+        use aterm_agent::supervise::{ApprovalToggles, SupervisorConfig};
+        let stand_in = Config::default();
+        let p = stand_in.harness_policy_at_launch(true);
+        assert_eq!(p, SupervisorConfig::escalate_only());
+        assert!(p.enabled && p.approvals == ApprovalToggles::off() && !p.continue_policy);
+        assert_eq!(
+            stand_in.harness_policy_at_launch(false),
+            SupervisorConfig::default()
+        );
+        let owner: Config =
+            aterm_toml::from_str("[harness]\ncontinue = false\n").expect("valid toml");
+        let p = owner.harness_policy_at_launch(false);
+        assert!(!p.continue_policy && p.approvals == ApprovalToggles::default());
+    }
+
+    /// THE SUPERVISOR'S POLICY is read out of `[harness]` with every key the
+    /// file sets applied (arrays flattened with `,`): a key a reload changes
+    /// makes a changed `Config` (so it is not deduped away), a value the
+    /// policy refuses is a config notice naming the key, and an unknown key is
+    /// left to the ignored-key notice — never a failed load, never silence.
+    #[test]
+    fn the_harness_table_is_the_supervisors_policy() {
+        let cfg = |text: &str| -> Config { aterm_toml::from_str(text).expect("valid toml") };
+        let (policy, refused) = Config::default().harness_policy();
+        assert_eq!(policy, aterm_agent::supervise::SupervisorConfig::default());
+        assert!(refused.is_empty());
+
+        let text = "[harness]\nenabled = true\nheadless = true\ncontinue = false\n\
+                    continue_per_hour = 2\ntrust_roots = [\"~/a*\", \"/b\"]\n\
+                    model_fallback = \"\"\n";
+        let set = cfg(text);
+        let (policy, refused) = set.harness_policy();
+        // Nothing refused, and nothing named "not applied yet": the engine
+        // reads every one of these keys since the engine lane's merge
+        // (no key is "not applied yet").
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!(policy.enabled && policy.headless && !policy.continue_policy);
+        assert_eq!(policy.continue_per_hour, 2);
+        assert_eq!(
+            policy.trust_roots,
+            vec!["~/a*".to_string(), "/b".to_string()]
+        );
+        assert_eq!(policy.model_fallback, None);
+        assert!(set.harness_enabled());
+        // A reload that changes only a policy key is a changed Config.
+        assert!(set != cfg(&text.replace("continue = false", "continue = true")));
+
+        // A refused VALUE is a notice naming the key; the load still stands and
+        // the rest of the table still applies.
+        let bad = cfg("[harness]\ncontinue = \"yes\"\nheadless = true\ncontine = true\n");
+        let (policy, refused) = bad.harness_policy();
+        assert!(policy.headless, "the other keys still apply");
+        assert!(!policy.continue_policy, "the refused switch is off");
+        // The refused value, the unknown key, and what the unknown key did.
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        let notices = bad.harness_notices();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices[0].starts_with("config [harness] continue:") && notices[0].contains("yes"),
+            "{notices:?}"
+        );
+        assert!(notices[1].contains("contine"), "{notices:?}");
+        // `upgrade` is a known key (the live agent upgrade's switch), so it
+        // is no unknown key that turns the approvals off.
+        let upgrade = cfg("[harness]\nupgrade = false\n");
+        let (policy, refused) = upgrade.harness_policy();
+        assert!(refused.is_empty() && !policy.upgrade, "{refused:?}");
+        assert_eq!(
+            policy.approvals,
+            aterm_agent::supervise::SupervisorConfig::default().approvals
+        );
+        // The unknown key is the config language's to report (once).
+        let ignored = crate::native_config_language::key_warnings(
+            "[harness]\ncontinue = \"yes\"\nheadless = true\ncontine = true\n",
+        )
+        .ignored;
+        assert!(ignored.iter().any(|l| l.contains("contine")), "{ignored:?}");
+        // `enabled` of the wrong type no longer fails the whole file: it is
+        // refused by name and the switch FAILS CLOSED — off for the launcher
+        // and the supervisor alike.
+        let wrong = cfg("[harness]\nenabled = \"no\"\n");
+        assert!(!wrong.harness_enabled());
+        assert!(!wrong.harness_policy().0.enabled);
+        assert!(wrong.harness_notices()[0].contains("enabled = false until it is fixed"));
+    }
+
+    /// A `[harness]` value the policy cannot read FAILS CLOSED: the owner
+    /// wrote the key to say something, and every default that acts is ON, so
+    /// a refused switch resolves OFF and an unknown key turns every approval
+    /// rule off — no box is pressed on a misread file. `SuperviseOpts`'s
+    /// `auto_reads` is the engine's one gate on pressing an approval.
+    /// NEGATIVE CONTROL: the same keys spelled right keep pressing on, and a
+    /// string `"false"` (which `set` reads) means what it says, so the
+    /// launcher and the supervisor agree on it.
+    #[test]
+    fn a_harness_value_the_policy_refuses_fails_closed() {
+        use aterm_agent::supervise::{ApprovalToggles, SuperviseOpts};
+        let cfg = |text: &str| -> Config { aterm_toml::from_str(text).expect("valid toml") };
+        let presses = |c: &Config| {
+            let (policy, _) = c.harness_policy();
+            policy.enabled && SuperviseOpts::hosted_with(&policy).auto_reads
+        };
+        let breaker = cfg("[harness]\nrm_breaker = \"no\"\n");
+        let (policy, _) = breaker.harness_policy();
+        assert!(!policy.approvals.rm_breaker, "a refused switch is off");
+        assert!(policy.approvals.auto_reads, "the others keep their value");
+        assert!(breaker.harness_notices()[0].contains("rm_breaker = false until it is fixed"));
+        for text in [
+            "[harness]\nenabled = 0\n",
+            "[harness]\nrm_breakr = false\n",
+            "[harness]\nauto_reads = 0\nrm_breaker = 0\nread_outside_cwd = 0\ntrust_dialog = 0\n",
+        ] {
+            assert!(!presses(&cfg(text)), "{text:?} still presses");
+        }
+        let typo = cfg("[harness]\nrm_breakr = false\n");
+        assert_eq!(typo.harness_policy().0.approvals, ApprovalToggles::off());
+        let notices = typo.harness_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("rm_breakr") && notices[0].contains("nothing is pressed"),
+            "{notices:?}"
+        );
+        assert_eq!(
+            cfg("[harness]\ncontinue_per_hour = \"lots\"\n")
+                .harness_policy()
+                .0
+                .continue_per_hour,
+            0
+        );
+        // NEGATIVE CONTROL: spelled right, it presses; `"false"` is read.
+        assert!(presses(&cfg(
+            "[harness]\nenabled = true\nrm_breaker = true\n"
+        )));
+        assert!(presses(&Config::default()));
+        let string_off = cfg("[harness]\nenabled = \"false\"\n");
+        assert!(!string_off.harness_enabled() && !presses(&string_off));
+    }
+
     /// The whole table round-trips through serde — the hot-reload contract.
     /// `Config` is replaced wholesale on a config-file generation and derives
     /// `PartialEq` through every embedded table, so a semantic no-op still
@@ -15001,63 +15310,6 @@ mod tab_band_height_tests {
              the only live call site on the excluded platforms and takes the whole chain \
              with it"
         );
-    }
-}
-
-/// THE HONESTY GAP — the deferred notice lane's App-side half. The queuing sites
-/// (the backend build thread, an `AppRt` chrome call, `run()` before `App` exists)
-/// cannot be driven from a unit test, but the drain they all feed can, and the
-/// drain is where the interesting policy lives.
-#[cfg(test)]
-mod deferred_config_notice_tests {
-    use crate::config_notice::{ConfigNotice, lane_test_guard, queue_deferred};
-
-    /// A late chrome explanation must not COST the user their config warnings.
-    /// The naive `self.config_notice = ConfigNotice::new(..)` (the shape every
-    /// other one-off notice site uses) would silently drop the startup banner's
-    /// contents to show one sentence about Mica.
-    #[test]
-    fn a_deferred_notice_merges_into_a_live_banner_instead_of_replacing_it() {
-        let _guard = lane_test_guard();
-        let _ = crate::config_notice::take_deferred();
-        let mut app = crate::App::headless_for_test();
-        app.config_notice = ConfigNotice::new(
-            vec!["config keybindings: dropped a bad chord".to_string()],
-            std::time::Instant::now(),
-        );
-        queue_deferred("background_material has no effect while hdr_glow is on".to_string());
-        app.drain_deferred_config_notices();
-        let notice = app.config_notice.as_ref().expect("banner still up");
-        assert!(
-            notice
-                .lines
-                .iter()
-                .any(|l| l.contains("dropped a bad chord")),
-            "the config warning survived: {:?}",
-            notice.lines
-        );
-        assert!(
-            notice.lines.iter().any(|l| l.contains("hdr_glow")),
-            "and the chrome explanation joined it: {:?}",
-            notice.lines
-        );
-    }
-
-    /// With NO banner up (the common case — the lane fires seconds after a clean
-    /// startup) the drain raises one, and an empty lane is a complete no-op so the
-    /// per-park cost is a single atomic load.
-    #[test]
-    fn the_drain_raises_a_banner_when_none_is_up_and_no_ops_when_the_lane_is_empty() {
-        let _guard = lane_test_guard();
-        let _ = crate::config_notice::take_deferred();
-        let mut app = crate::App::headless_for_test();
-        app.config_notice = None;
-        app.drain_deferred_config_notices();
-        assert!(app.config_notice.is_none(), "an empty lane raises nothing");
-        queue_deferred("the GPU was lost".to_string());
-        app.drain_deferred_config_notices();
-        let notice = app.config_notice.as_ref().expect("banner raised");
-        assert!(notice.lines.iter().any(|l| l.contains("GPU was lost")));
     }
 }
 
@@ -16328,43 +16580,71 @@ mod matrix_rain_cfg_tests {
         );
     }
 
-    /// The `[packages]` loop gate: an absent table (and an empty one) is exactly
-    /// today's behavior — the background tools loop runs; `enabled = false` OR
-    /// `auto_update = false` each stop it; and the whole table (including the
-    /// atpkg-consumed keys and the `[packages.links]` sub-table this struct
-    /// deliberately leaves to atpkg's own reader) round-trips through serde.
+    /// The `[packages]` switch (2026-09-23, one path): an absent table (and an empty
+    /// one) is the batteries-included default — the background tools loop runs and the
+    /// toolset installs; `enabled = false` stops the loop, and so does the retired
+    /// `auto_update = false`, still honoured; the retired `channel`/`include` are no
+    /// longer fields (unknown keys, ignored), and the rest of the table — including the
+    /// `[packages.links]` sub-table this struct deliberately leaves to atpkg's own
+    /// reader — round-trips through serde.
     #[test]
-    fn packages_loop_gate_resolves_defaults_and_flags() {
+    fn packages_switch_resolves_defaults_and_the_retired_spellings() {
         assert!(
-            Config::default().packages_update_loop_enabled(),
-            "absent [packages] table ⇒ the loop runs (pre-config behavior)"
+            Config::default().packages_enabled(),
+            "absent [packages] table ⇒ the loop runs"
+        );
+        assert!(
+            Config::default().packages_auto_install(),
+            "batteries included"
         );
         let empty = aterm_toml::from_str::<Config>("[packages]").unwrap();
-        assert!(empty.packages_update_loop_enabled());
+        assert!(empty.packages_enabled());
         let off = aterm_toml::from_str::<Config>("[packages]\nenabled = false").unwrap();
-        assert!(!off.packages_update_loop_enabled(), "master off ⇒ no loop");
-        let no_auto = aterm_toml::from_str::<Config>("[packages]\nauto_update = false").unwrap();
+        assert!(!off.packages_enabled(), "the switch off ⇒ no loop");
+        let retired = aterm_toml::from_str::<Config>("[packages]\nauto_update = false").unwrap();
         assert!(
-            !no_auto.packages_update_loop_enabled(),
-            "auto_update off ⇒ no loop (enabled alone is not enough)"
+            !retired.packages_enabled(),
+            "the retired auto_update = false still reads as off"
+        );
+        // …and Settings says why, in atpkg's words — only while the retired key is what
+        // holds it off (an `enabled = false` beside it is the switch's own Off).
+        assert_eq!(
+            retired.packages_retired_switch_note(),
+            Some(atpkg::config::auto_update_note(false, None))
+        );
+        let both =
+            aterm_toml::from_str::<Config>("[packages]\nenabled = true\nauto_update = false")
+                .unwrap();
+        assert!(!both.packages_enabled());
+        assert_eq!(
+            both.packages_retired_switch_note(),
+            Some(atpkg::config::auto_update_note(false, Some(true)))
+        );
+        for text in [
+            "[packages]\nenabled = false\nauto_update = false",
+            "[packages]\nauto_update = true",
+            "[packages]\nenabled = false",
+            "",
+        ] {
+            let config = aterm_toml::from_str::<Config>(text).unwrap();
+            assert_eq!(config.packages_retired_switch_note(), None, "{text:?}");
+        }
+        let seed = aterm_toml::from_str::<Config>("[packages]\nseed_install = false").unwrap();
+        assert!(
+            !seed.packages_auto_install(),
+            "the retired seed_install = false still keeps a machine bare"
         );
         let full = aterm_toml::from_str::<Config>(concat!(
-            "[packages]\nenabled = true\nauto_update = true\nauto_install = true\n",
-            "account = \"alabsystems\"\nchannel = \"stable\"\n",
-            "include = [\"ay\"]\nexclude = [\"trust\"]\n",
+            "[packages]\nenabled = true\nauto_install = false\n",
+            "account = \"alabsystems\"\nchannel = 7\ninclude = \"x\"\n",
+            "exclude = [\"trust\"]\n",
             "[packages.links]\nay = \"~/ay\"\norc = \"alabsystems/orc\"\n"
         ))
         .unwrap();
-        assert!(full.packages_update_loop_enabled());
+        assert!(full.packages_enabled());
+        assert!(!full.packages_auto_install());
         let p = full.packages.as_ref().expect("table parsed");
-        assert_eq!(
-            p.auto_install,
-            Some(true),
-            "the consent flag parses (atpkg reads it)"
-        );
         assert_eq!(p.account.as_deref(), Some("alabsystems"));
-        assert_eq!(p.channel.as_deref(), Some("stable"));
-        assert_eq!(p.include.as_deref(), Some(["ay".to_string()].as_slice()));
         assert_eq!(p.exclude.as_deref(), Some(["trust".to_string()].as_slice()));
     }
 
@@ -16372,40 +16652,91 @@ mod matrix_rain_cfg_tests {
     /// independent readers of the ONE table — this GUI `Config` (what the
     /// Settings switches and the status card display) and the co-located
     /// atpkg's own `PackagesConfig` (what the update pass actually does) —
-    /// must resolve identical defaults AND identical explicit values. A
-    /// default flipped on one side only (e.g. atpkg's `auto_install` to true)
-    /// fails HERE instead of shipping a switch that lies about the loop.
+    /// must resolve identical defaults AND identical explicit values, the retired
+    /// spellings included. A resolution changed on one side only fails HERE instead
+    /// of shipping a switch that lies about the loop. The `[reroute]` switch is pinned
+    /// the same way.
     #[test]
     fn packages_defaults_agree_across_the_two_config_readers() {
-        // Defaults: absent table on both sides.
-        let gui = Config::default();
-        let pkg = atpkg::PackagesConfig::default();
-        assert_eq!(
-            gui.packages_auto_install(),
-            pkg.auto_install(),
-            "auto_install default must agree (consent gate)"
-        );
-        assert!(!pkg.auto_install(), "consent defaults OFF everywhere");
+        for text in [
+            "",
+            "[packages]\n",
+            "[packages]\nenabled = false\n",
+            "[packages]\nauto_update = false\n",
+            "[packages]\nenabled = true\nauto_update = false\n",
+            "[packages]\nauto_update = true\n",
+            "[packages]\nauto_install = false\n",
+            "[packages]\nseed_install = false\n",
+            "[packages]\nseed_install = false\nauto_install = true\n",
+            "[packages]\nseed_install = true\nauto_install = false\n",
+        ] {
+            let gui = aterm_toml::from_str::<Config>(text).unwrap();
+            let pkg = atpkg::config::parse_packages(text);
+            assert_eq!(gui.packages_enabled(), pkg.enabled(), "enabled: {text:?}");
+            assert_eq!(
+                gui.packages_auto_install(),
+                pkg.auto_install(),
+                "auto_install: {text:?}"
+            );
+        }
+        let defaults = atpkg::PackagesConfig::default();
         assert!(
-            gui.packages_auto_update() && gui.packages_update_loop_enabled(),
-            "the loop defaults ON (pre-config behavior; atpkg leaves this gate to the GUI)"
+            defaults.enabled() && defaults.auto_install(),
+            "both default ON"
         );
-        assert_eq!(pkg.channel(), "stable", "atpkg's channel default");
-        // Explicit values: the SAME text resolves identically through both parsers.
-        let text = "[packages]\nauto_update = false\nauto_install = true\n";
-        let gui = aterm_toml::from_str::<Config>(text).unwrap();
-        let pkg = atpkg::config::parse_packages(text);
-        assert_eq!(gui.packages_auto_install(), pkg.auto_install());
+        for text in [
+            "",
+            "[reroute]\nannounce = true\n",
+            "[reroute]\nannounce = false\n",
+        ] {
+            let gui = aterm_toml::from_str::<Config>(text).unwrap();
+            assert_eq!(
+                gui.reroute
+                    .as_ref()
+                    .and_then(|r| r.announce)
+                    .unwrap_or(true),
+                atpkg::config::parse_reroute(text).announce(),
+                "reroute.announce: {text:?}"
+            );
+        }
+    }
+
+    /// `[update] enabled` — "Check for updates automatically" — is read by the updater
+    /// itself (`aterm_update_core::settings`), from the same file the GUI parses: the two
+    /// must agree, default ON.
+    #[test]
+    fn update_enabled_agrees_with_the_updaters_own_reader() {
+        for text in [
+            "",
+            "[update]\n",
+            "[update]\nenabled = true\n",
+            "[update]\nenabled = false\n",
+        ] {
+            let gui = aterm_toml::from_str::<Config>(text).unwrap();
+            assert_eq!(
+                gui.update.as_ref().and_then(|u| u.enabled).unwrap_or(true),
+                aterm_update_core::settings::parse_update_enabled(text),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// `[update] require_team_id` is a DEVELOPMENT setting: a test build is a
+    /// development build, so it is honoured here — and the gate is the cfg, which a
+    /// shipped build compiles off.
+    #[test]
+    fn a_required_team_id_is_honoured_by_a_development_build() {
+        let config =
+            aterm_toml::from_str::<Config>("[update]\nrequire_team_id = \"ABCDE12345\"\n").unwrap();
+        assert_eq!(super::update_required_team_id(&config), Some("ABCDE12345"));
+        let src = include_str!("app_config.rs");
+        let body = &src[src
+            .find("pub(crate) fn update_required_team_id(")
+            .expect("fn")..];
         assert!(
-            gui.packages_auto_install(),
-            "explicit consent lands on both"
+            body[..400].contains("cfg!(any(debug_assertions, feature = \"dev-seams\"))"),
+            "the development gate guards the read"
         );
-        assert_eq!(
-            gui.packages.as_ref().and_then(|p| p.auto_update),
-            pkg.auto_update,
-            "auto_update raw value agrees (atpkg carries it; the GUI gates on it)"
-        );
-        assert!(!gui.packages_auto_update());
     }
 
     /// The `[machine]` defaults, stated once: an ABSENT table is the shipping
@@ -17261,6 +17592,26 @@ mod agents_auto_prime_tests {
 #[cfg(test)]
 mod update_repoint_tests {
     use super::update_repoint_from_text;
+
+    #[test]
+    fn persisted_check_settings_bind_source_and_manual_policy_in_one_parse() {
+        let defaults = super::update_check_settings_from_text("").unwrap();
+        assert!(defaults.auto_apply);
+        assert_eq!(defaults.source, aterm_update::Source::resolve(None, None));
+        let manual = super::update_check_settings_from_text(
+            "[update]\nowner = \"private-org\"\nrepo = \"fork\"\nauto_apply = false\n",
+        )
+        .unwrap();
+        assert!(!manual.auto_apply);
+        assert_eq!(
+            manual.source,
+            aterm_update::Source::resolve(Some("private-org"), Some("fork"))
+        );
+        assert!(
+            super::update_check_settings_from_text("[update]\nauto_apply = invalid").is_none(),
+            "malformed existing policy must not fall back to automatic"
+        );
+    }
 
     #[test]
     fn the_repoint_reads_without_a_full_config_load() {

@@ -226,6 +226,9 @@ impl Fixture {
         env.trust_mc_sysroot = Some(self.root.join("no-trust-mc"));
         env.ay_bin_dir = Some(self.root.join("no-ay"));
         env.cargo_target_dir = None;
+        // Floor 0: a fixture builds nothing, and the real floor made these
+        // ladders refuse whenever the HOST volume held less than it (2026-09-23,
+        // 17.6 GiB free, 12 failures here). The preflight laws below set theirs.
         Ctx::new(
             self.root.clone(),
             Mode::Fast,
@@ -234,6 +237,7 @@ impl Fixture {
             env,
             self.scratch.clone(),
         )
+        .with_disk_floor(0)
     }
 
     fn run(&self, ctx: &Ctx) -> (String, i32) {
@@ -337,6 +341,7 @@ fn gate(
     path: &std::ffi::OsStr,
 ) -> (String, Option<i32>) {
     let out = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
+        .args(["--disk-floor", "0"])
         .arg("--fast")
         .args(extra)
         .arg("--root")
@@ -556,6 +561,7 @@ fn a_changed_run_selects_the_crate_an_index_flag_hides_an_edit_in() {
     let changed = |what: &str| {
         let root_arg = root.to_str().expect("utf-8");
         let out = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
+            .args(["--disk-floor", "0"])
             .args([
                 "--fast",
                 "--changed",
@@ -1053,6 +1059,7 @@ fn a_second_gate_on_a_held_snapshot_is_could_not_run() {
     let stage2 = c.base.join("stage2");
     script(&stage2.join("targo"), "echo \"argv: $*\"; exit 0");
     let out = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
+        .args(["--disk-floor", "0"])
         .args(["--fast", "--root"])
         .arg(&c.root)
         .env(snapshot::SNAPSHOT_ENV, c.snap())
@@ -1328,6 +1335,7 @@ fn the_gates_own_channels_never_reach_a_child() {
         "echo \"child: $* tim=${ATERM_VERIFY_TIMINGS-unset} snap=${ATERM_VERIFY_SNAPSHOT-unset}\"; exit 0",
     );
     let out = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
+        .args(["--disk-floor", "0"])
         .args(["--fast", "--in-place", "--root"])
         .arg(&repo.root)
         .env("TRUST_STAGE2_BIN", &repo.stage2)
@@ -1362,6 +1370,7 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
         .join("repo-verify.noindex");
 
     let out = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
+        .args(["--disk-floor", "0"])
         .args(["--fast", "--root"])
         .arg(&repo.root)
         .env("TRUST_STAGE2_BIN", &repo.stage2)
@@ -1482,6 +1491,7 @@ fn a_run_whose_ladder_is_redirected_into_the_checkout_still_decides() {
     let log = repo.root.join("gate-run.out");
 
     let status = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
+        .args(["--disk-floor", "0"])
         .args(["--fast", "--in-place", "--root"])
         .arg(&repo.root)
         .env("PATH", path_env())

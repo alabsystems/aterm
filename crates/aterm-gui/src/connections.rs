@@ -168,8 +168,10 @@ pub(crate) fn first_use_notice_should_show(config_path: Option<std::path::PathBu
 
 /// The §1.4#8 / §2.4 first-use notice body: names the AUTHORITY the preset just
 /// created (direction included — controlled vs controller invert who drives)
-/// and the UNDO. Rendered through the transient notice card's
-/// `"<marker> <title> — <detail>"` caption grammar (`notice.rs`).
+/// and the UNDO, in the `"<marker> <title> — <detail>"` shape the retired notice
+/// card rendered; since 2026-09-23 it is a record in the message log
+/// (`message_reporters::session_connection_created` splits it into a title and
+/// detail lines).
 pub(crate) fn first_use_notice_text(kind: ConnectedSpawnKind) -> String {
     let direction = match kind {
         ConnectedSpawnKind::Controlled => "this session can now type into and read the new one",

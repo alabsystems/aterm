@@ -71,10 +71,38 @@
 //! ARMED; a reviewer who believed it would think running the manager could not
 //! touch the fleet.)
 
+// EVERY LINE atpkg PRINTS STEPS AROUND THE TERMINAL METER ([`meter`]). These shadow the
+// standard `println!`, `eprintln!` and `print!` for the whole crate — declared before
+// every module, so every module sees them. With no meter running (a pipe, the window's
+// children, a host, a test) each is the std macro with the same bytes and the same panic
+// on a closed pipe; under a person's typed verb the meter's line is cleared first and
+// redrawn below.
+macro_rules! println {
+    () => {
+        $crate::meter::println(::std::format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::meter::println(::std::format_args!($($arg)*))
+    };
+}
+macro_rules! eprintln {
+    () => {
+        $crate::meter::eprintln(::std::format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::meter::eprintln(::std::format_args!($($arg)*))
+    };
+}
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::meter::print(::std::format_args!($($arg)*))
+    };
+}
+
 pub mod activate;
-pub mod appgate;
+#[cfg(target_os = "macos")]
+pub mod activation_notice;
 pub mod apply;
-pub mod bundled;
 pub mod cache;
 /// The shell that typed this command (2026-09-16): the parent process's executable when
 /// it is a shell, else `$SHELL` — what `doctor`/`which` key their in-place remedy on.
@@ -102,17 +130,16 @@ pub mod flow;
 pub mod freespace;
 pub mod gate;
 pub mod gc;
-/// THE ONE HOME of the harness family (`docs/DESIGN-aterm-wrapper-2026-09-17.md`): the
-/// §3.8 row words and the §1.3/§4.4 paths, which were two homes — `state.rs` and
-/// `store.rs` — until 2026-09-22.
-pub mod harness;
 pub mod hooks;
+/// Cheap, cross-process discovery of the next published toolchain index. A hit only
+/// wakes the ordinary signed update pass; it never authorizes an index by itself.
+pub mod index_probe;
 pub mod install;
 /// The `pkg` protocol's lane: a Developer-ID-signed macOS installer package, its
 /// signer team checked with `pkgutil`, applied by `installer` with elevation.
 pub mod installer_pkg;
-/// The landing wait (2026-09-16): what an agent program's `agents/` twin does while a
-/// NEWER pinned build of that program is being fetched, staged and activated.
+/// The retired landing wait (2026-09-16 to 2026-09-22): the `__landing` verb older twins
+/// still call, now an immediate silent `exec`, and the sweep of the markers they test for.
 pub mod landing;
 /// Laying executables (shims, stubs, tombstones) through the untracked launchd lane when
 /// this process is provenance-tracked — law m21: a tagged `#!/bin/sh` shim tracks the
@@ -121,15 +148,35 @@ pub mod lay;
 pub mod linkmode;
 pub mod lock;
 pub mod machine;
-/// Two thin 64-bit Mach-O files compared modulo their code signatures — how `doctor`
-/// tells one program under two ad-hoc signatures from two programs.
+/// The Mach-O files of a staged tree, found by magic, for the Developer ID stage gate.
+mod macho;
 pub mod manifest;
 mod metadata_io;
+/// The one-line progress meter under a person's typed verb, and the printing every line
+/// takes around it.
+mod meter;
 pub mod net;
 /// Spotlight exposure of Rust build output: discover target dirs, MEASURE whether one is
 /// really excluded (never assume), and migrate it to the `.noindex` form (§9).
 pub mod noindex;
+/// Where atpkg's unasked notices go: stderr in its own CLI, the host's log in the terminal
+/// session and the window, which call it beside a live shell.
+pub mod notice;
+/// OpenPGP detached-signature verification (vendor-direct design §1.2): a v4 RSA
+/// signature over a vendor's digest document, under a key compiled into this binary.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the vendor-direct lane, which lands separately; delete this attribute when it does"
+    )
+)]
+pub(crate) mod openpgp;
 pub mod ops;
+/// `packages.log` beside `aterm.log`: one whole line per pass and per program transition,
+/// written by every lane, rotated under the store lock — what Settings ▸ Packages' Activity
+/// reads (Phase 4).
+pub mod packages_log;
 pub mod pin;
 pub mod platform;
 pub mod progress;
@@ -139,7 +186,6 @@ pub mod protected;
 /// `com.apple.provenance`: the predicate (`listxattr`), the per-process tracking
 /// measurement, and the two sentences every refusal that names the tag shares.
 pub mod provenance;
-pub mod provisional;
 pub mod relocate;
 /// The `requires` relation's one gate (`unmet_requirement`, §17.10), shared by the
 /// set-completion pass, the OS-installed reconcile and the update pass.
@@ -182,16 +228,17 @@ pub mod tree;
 /// table, the `system = "<bin>"` satisfaction probe and the PATH-shadow probe — both
 /// cross-platform (`PATHEXT` on Windows).
 pub mod vendor;
+/// Vendor-direct agents (design 2026-09-22, Phase 1): the compiled vendor table, the
+/// version ↔ build id map, the update decision and the lane's durable records.
+pub mod vendor_direct;
 pub mod verify;
 
 pub use activate::{Aliases, activate_channel, atomic_symlink, install_shims};
-pub use appgate::{AppIndexGate, app_apply_allowed};
 pub use apply::{Group, TxnOutcome, plan_groups, transact};
-pub use bundled::{SEED_DIR_NAME, bundled_seed_dir};
 pub use cache::IndexCache;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use cost::{disk_ok, human_bytes, needs_consent};
-pub use discovery::{IndexRepo, resolve_account, resolve_account_with};
+pub use discovery::{IndexRepo, resolve_account};
 pub use dispatch::{ApplyStrategy, strategy_for};
 pub use elevate::{Elevation, Runner};
 pub use extract::{
@@ -200,8 +247,8 @@ pub use extract::{
 };
 pub use flow::{
     AppliedMember, ChannelApplyReport, DepOutcome, DepResult, Fetcher, FlowError, InstallReport,
-    InstallRequest, ProtocolOutcome, apply_channel, apply_channel_with, install,
-    resolve_verified_index,
+    InstallRequest, ProtocolOutcome, VendorFetchError, VendorGet, apply_channel,
+    apply_channel_with, install, resolve_verified_index,
 };
 pub use gate::{ApplyDecision, decide, is_yanked};
 pub use gc::{GcReport, reclaimable, run as run_gc};
@@ -217,7 +264,7 @@ pub use lock::{StoreLock, StoreLockError, try_lock_store};
 pub use manifest::{
     Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, TARGETS, parse_pkg,
 };
-pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
+pub use net::{DirFetcher, GithubFetcher};
 pub use noindex::{Migration, Verdict, migrate, scan, verify};
 pub use ops::{active_builds, installed_exposes, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, Selection, select_index};
@@ -269,42 +316,43 @@ pub const PINNED_PKG_ROOTKEY: &str = if PKG_TRUST_ANCHORS.is_empty() {
     PKG_TRUST_ANCHORS[0]
 };
 
-/// Whether the manager is configured to act: a paper master must be pinned AND the user
-/// must not have opted out via `ATPKG_DISABLE`. Fail closed — an empty keyset is never
-/// active. Unlike `aterm-update::enabled` this is **not** macOS-gated: the package
-/// manager is cross-platform.
+/// Whether the manager can act: a paper master must be pinned. Fail closed — an empty
+/// keyset is never active. Unlike `aterm-update::enabled` this is **not** macOS-gated:
+/// the package manager is cross-platform.
+///
+/// It is a property of the BUILD, not of the machine. The machine's own switch is
+/// `[packages] enabled` in aterm.toml — "Automatic updates", which gates the automatic
+/// lanes (the window's loop, a terminal session's pass, the head watch) and never a verb
+/// a person typed. `ATPKG_DISABLE`, the environment kill switch that used to sit here,
+/// is gone (2026-09-23, R2: "NOT ENV VARS those are for development"): it reached only
+/// what one shell launched, never the window's passes, so it was a second, partial
+/// spelling of that switch.
 #[must_use]
 pub fn enabled() -> bool {
-    !PKG_TRUST_ANCHORS.is_empty() && std::env::var_os("ATPKG_DISABLE").is_none()
+    !PKG_TRUST_ANCHORS.is_empty()
 }
 
-/// Effective CLI posture: the compiled root anchor, plus the `ATPKG_DISABLE` kill
-/// switch. This is the shared admission predicate for the CLI and aterm's native
-/// Packages surface.
+/// Effective CLI posture: the compiled root anchor. This is the shared admission
+/// predicate for the CLI and aterm's native Packages surface.
 ///
 /// `ATPKG_ROOTKEY_OVERRIDE` is GONE. It supplied "the same verification anchor the
 /// verbs consume", so an environment variable could ENABLE an otherwise-unpinned
 /// build — i.e. ambient state decided what the package manager trusted. The anchor
 /// now lives in reviewed source ([`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`]) and
 /// nothing outside a commit can change it. An alternate package owner commits their
-/// own paper master, which is the same deliberate act, visible in a diff.
-///
-/// `ATPKG_DISABLE` stays: turning the manager OFF is fail-safe, and a kill switch
-/// that only ever subtracts authority cannot be used to grant any.
+/// own paper master, which is the same deliberate act, visible in a diff. The
+/// `ATPKG_DISABLE` kill switch went the same way (see [`enabled`]).
 #[must_use]
 pub fn manager_enabled() -> bool {
-    manager_enabled_with(
-        PKG_TRUST_ANCHORS,
-        std::env::var_os("ATPKG_DISABLE").is_some(),
-    )
+    manager_enabled_with(PKG_TRUST_ANCHORS)
 }
 
-/// Pure core of [`manager_enabled`]: armed iff the keyset is non-empty, and never while
-/// disabled. The keyset is the input rather than a single key so this cannot be called
-/// with a head that is present while the list behind it is not.
+/// Pure core of [`manager_enabled`]: armed iff the keyset is non-empty. The keyset is
+/// the input rather than a single key so this cannot be called with a head that is
+/// present while the list behind it is not.
 #[must_use]
-pub fn manager_enabled_with(pinned: &[&str], disabled: bool) -> bool {
-    !disabled && !pinned.is_empty()
+pub fn manager_enabled_with(pinned: &[&str]) -> bool {
+    !pinned.is_empty()
 }
 
 /// A short, dependency-free fingerprint of the pinned MASTER keyset, so `atpkg doctor`

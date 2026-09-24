@@ -2,169 +2,25 @@
 // Copyright 2026 Andrew Yates
 
 //! Bounded models for the aterm wrapper's harness core
-//! (`docs/DESIGN-aterm-wrapper-2026-09-17.md` §11 items 5 and 7, plus the
-//! grid spine's turn machine of §4.2/§5.8.1).
+//! (`docs/DESIGN-aterm-wrapper-2026-09-17.md` §11 item 7).
 //!
-//! Three scalar projections of machines that ship in `aterm_agent::harness`:
-//! the bounded, lossy ledger ring (`harness::ring`), the limit-recovery
-//! engine (`harness::limits`) and the observer's turn machine
-//! (`harness::observe`). As everywhere in this crate the model is
-//! hand-written Rust DESCRIBING that code, not extracted from it: Tier 0 here
-//! says the description holds over its whole bounded space, and only the
-//! Tier-1 binds in `aterm-agent/tests/conformance_harness.rs` — which drive
-//! the real `Ring`, the real engine and the real `Observer` and project their
-//! state onto these variables — make any of them a statement about the
-//! program that compiled.
+//! Two scalar projections of machines that ship in `aterm_agent::harness`:
+//! the limit-recovery engine (`harness::limits`) and the bounded child
+//! runner's worker lifecycle (`harness::align::capture_bounded`). As
+//! everywhere in this crate the model is hand-written Rust DESCRIBING that
+//! code, not extracted from it: Tier 0 here says the description holds over
+//! its whole bounded space, and only the Tier-1 binds —
+//! `aterm-agent/tests/conformance_harness.rs` for the engine, `align`'s own
+//! tests for the runner — make either a statement about the program that
+//! compiled.
+//!
+//! The ledger ring (`HarnessLedgerRing`, §11 item 5) and the grid spine's turn
+//! machine (`HarnessTurnObservation`, §4.2/§5.8.1) were modelled here too.
+//! Their subsystems, `harness::ring` and `harness::observe`, were deleted with
+//! the second harness stack on 2026-09-23, and a model of code that no longer
+//! exists proves nothing about anything; they went in the same change.
 
 use super::*;
-
-/// The ledger ring's SLOT accounting (design §11 item 5).
-///
-/// Every line in a segment file occupies one id slot, whether it is a framed
-/// row, sealed junk, or an unterminated fragment. `nextid` is the id the live
-/// writer hands out next, `top` one past the last slot ON DISK, `lo` the first
-/// slot still on disk, `segs` the segment files, `fill` the slots in the newest
-/// one, `torn` that the newest segment ends in a fragment, and `live` that a
-/// writer holds the ring.
-///
-/// `Emit` is an append that fits the active segment and `Rotate` one that
-/// starts a new one (the name is `Emit`, never `Append`, which collides with
-/// ty's Sequences builtin and yields "undefined Next"). `Tear`,
-/// `CrashAfterCreate` and `Crash` are the three ways a writer dies that the
-/// real ring's reopen must survive; `Reopen` is what it then finds.
-///
-/// `Cap` is `SegCap * Segments` written out, because the expression language
-/// has no multiplication, and `MaxId` is the exploration bound rather than a
-/// property of the ring.
-///
-/// `Buggy = 1` arms three historical defect shapes at once, one per design
-/// claim: a reopen that does not count the torn tail's slot and so hands that
-/// id out a SECOND time (`Reopen`), a rotation that forgets the second-oldest
-/// segment as well as the oldest (`RotateForgettingTwo`), and a rotation that
-/// forgets nothing and so leaves the ring over its bound with one file too many
-/// (`RotateForgettingNothing`). The two rotation defects are separate actions
-/// whose healthy branch changes nothing, so the committed machine is exactly
-/// the ring's real behaviour and the mutants sit beside it; `forged` saturates
-/// the witness so the `Buggy = 1` state graph stays finite.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn harness_ledger_ring_model() -> Model {
-    crate::ty_model! {
-        HarnessLedgerRing {
-            const Buggy = 0;
-            const SegCap = 2;
-            const Segments = 3;
-            // SegCap * Segments: the macro has no multiplication.
-            const Cap = 6;
-            // The exploration bound, not a property of the ring.
-            const MaxId = 9;
-
-            var nextid = 1;
-            var top = 1;
-            var lo = 1;
-            var segs = 0;
-            var fill = 0;
-            var torn = 0;
-            var live = 1;
-            var forged = 0;
-
-            action Emit when (
-                live == 1 && nextid <= MaxId && segs > 0 && fill <= SegCap - 1
-            ) {
-                nextid = nextid + 1;
-                top = top + 1;
-                fill = fill + 1;
-                torn = 0;
-            }
-
-            // A record that does not fit starts a segment, and the oldest is
-            // unlinked BEFORE the record is written once the ring is full.
-            action Rotate when (
-                live == 1 && nextid <= MaxId && (segs == 0 || fill == SegCap)
-            ) {
-                nextid = nextid + 1;
-                top = top + 1;
-                fill = 1;
-                torn = 0;
-                segs = if segs <= Segments - 1 { segs + 1 } else { segs };
-                lo = if segs <= Segments - 1 { lo } else { lo + SegCap };
-            }
-
-            // Death mid-write: the record's first bytes reached the segment.
-            action Tear when (
-                live == 1 && nextid <= MaxId && segs > 0 && fill <= SegCap - 1
-            ) {
-                top = top + 1;
-                fill = fill + 1;
-                torn = 1;
-                live = 0;
-            }
-
-            // Death after the new segment was created, before the oldest was
-            // unlinked: one file too many, and the newest is empty.
-            action CrashAfterCreate when (
-                live == 1 && nextid <= MaxId && (segs == 0 || fill == SegCap)
-            ) {
-                segs = segs + 1;
-                fill = 0;
-                torn = 0;
-                live = 0;
-            }
-
-            action Crash when (live == 1) {
-                live = 0;
-            }
-
-            // The reopen writes nothing: it counts the slots it finds. The
-            // torn tail's slot is one of them, so the fragment's id is burned
-            // however many times the ring is reopened.
-            action Reopen when (live == 0) {
-                live = 1;
-                nextid = if Buggy == 1 { top - torn } else { top };
-                segs = if segs <= Segments { segs } else { segs - 1 };
-                lo = if segs <= Segments { lo } else { lo + SegCap };
-            }
-
-            // DEFECT: a rotation that forgets the second-oldest segment too.
-            // The healthy branch changes nothing, which is what the real
-            // `make_room` does at this state.
-            action RotateForgettingTwo when (
-                live == 1 && segs == Segments && fill == SegCap && forged == 0
-            ) {
-                lo = if Buggy == 1 { lo + SegCap + SegCap } else { lo };
-                segs = if Buggy == 1 { segs - 1 } else { segs };
-                forged = if Buggy == 1 { 1 } else { forged };
-            }
-
-            // DEFECT: a rotation that forgets nothing, leaving the ring over
-            // its byte bound with one segment file too many while live.
-            action RotateForgettingNothing when (
-                live == 1 && segs == Segments && fill == SegCap && forged == 0
-            ) {
-                segs = if Buggy == 1 { segs + 1 } else { segs };
-                top = if Buggy == 1 { top + 1 } else { top };
-                nextid = if Buggy == 1 { nextid + 1 } else { nextid };
-                fill = if Buggy == 1 { 1 } else { fill };
-                forged = if Buggy == 1 { 1 } else { forged };
-            }
-
-            // Ids only grow, and a slot that exists on disk is never handed
-            // out again — the torn tail's slot included.
-            invariant NoReuse: live == 0 || top <= nextid;
-            // The ring holds at most one ring's worth of slots.
-            invariant Bounded: top - lo <= Cap;
-            // A rotation drops the OLDEST segment and no more: either nothing
-            // was ever dropped, or all but one segment's slots are still held.
-            invariant OnlyOldestLost: lo == 1 || Cap - SegCap <= top - lo;
-            // One file too many is a crash shape a reopen trims, never a state
-            // a live writer is in.
-            invariant FilesBounded:
-                segs <= Segments + 1 && (live == 0 || segs <= Segments);
-            // The space guard: a segment never holds more slots than it can.
-            invariant FillBounded: fill <= SegCap;
-        }
-    }
-}
 
 /// The limit-recovery engine's per-generation ladder (design §11 item 7).
 ///
@@ -489,135 +345,149 @@ pub fn harness_failure_recovery_model() -> Model {
     }
 }
 
-/// The grid spine's TURN machine (design §4.2, §5.8.1; `harness::observe`).
-///
-/// A writer/reader pair with one law. The WRITER is the evidence that opens a
-/// turn — a parsed grid whose worker phase is busy (or blocked at an approval
-/// box), or, where no grid was read this pass, `status phase=running` alone.
-/// The READER is the evidence that may close it. They are not symmetric, and
-/// the asymmetry is the whole anti-flap rule:
-///
-/// > **A turn opened by the GRID may be closed by an exit or by a later grid
-/// > read, but NEVER by `status` alone** — because a pass that read no grid
-/// > did not look, and "did not look" is not "not busy".
-///
-/// Without it, a pass whose `revision` did not move (so the grid was
-/// deliberately not re-read — the `needs_grid` gate that makes an idle
-/// session cost nothing) would close a live turn from the weaker source and
-/// re-open it on the next grid read, flapping `turn-began`/`turn-ended` at
-/// the ledger and at every actuator gated on a turn boundary.
-///
-/// `turn` is the source that opened the turn in flight, in the coding of
-/// `harness::observe`'s turn source (`harness::source::Source`): `0` none, `1` grid-opened, `2`
-/// status-opened. `exited` is that the session's program has been seen to go.
-/// `statusclosed` is a WITNESS the shipping observer never sets: a
-/// grid-opened turn closed by a pass that read no grid.
-///
-/// The transitions are the shipped `on_sample` arms, one each: the grid opens
-/// (`(None, true)` with grid rows), `status` opens where no grid was read,
-/// a grid reading UPGRADES a status-opened turn to grid-opened (the
-/// `(Some(_), true)` arm — it emits no event, which is why the Tier-1 bind
-/// reads `Observer::turn_source` rather than the event stream), either source
-/// closes a turn it is allowed to close, and the exit closes whatever is open
-/// under it before the `exited` event.
-///
-/// `ExitedSampleRepeats` is a later sample of an already-exited session — the
-/// observer's `!self.exited` guard, which is why `exited` is emitted once.
-/// `NewSession` is the host building a fresh `Observer` for the next session.
-/// It is in the machine so the bounded graph has no wedge at `exited == 1`;
-/// the shipping observer itself never un-exits.
-///
-/// `Buggy = 1` arms exactly two defect shapes, one per law: `status` closing a
-/// grid-opened turn (`StatusWouldCloseAGridTurn` — the healthy branch changes
-/// nothing, which is what the real arm does), and an exit that leaves the open
-/// turn behind instead of closing it under itself.
-///
-/// Deliberately absent: banners, `output-moved`, `quiet`, confidence,
-/// provenance and the program-naming path. Those are per-sample derivations
-/// with no state that survives a pass; this machine states the ONE law about
-/// state that does.
+/// A bounded harness capture may time out and reap its direct child while an
+/// escaped descendant still holds stdout or stdin open. The capture only
+/// returns after the reader and writer workers have both finished or been
+/// cancelled and joined. Tier-1 runs the real `align::capture_bounded` with
+/// escaped descendants and observes both worker completions at return.
+/// `Buggy=1` recovers the historical early-return shape: child exit alone is
+/// treated as enough, leaking a worker past the caller's deadline.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn harness_turn_observation_model() -> Model {
+pub fn harness_capture_worker_lifecycle_model() -> Model {
     crate::ty_model! {
-        HarnessTurnObservation {
+        HarnessCaptureWorkerLifecycle {
             const Buggy = 0;
+            var child_reaped = 0;
+            var reader_done = 0;
+            var writer_done = 0;
+            var deadline = 0;
+            var returned = 0;
 
-            var turn = 0;
-            var exited = 0;
-            var statusclosed = 0;
-
-            // The grid says busy (or an approval box, which has NOT ended the
-            // turn): the strong source opens it.
-            action GridOpensTurn when (exited == 0 && turn == 0) {
-                turn = 1;
+            action ChildExit when (child_reaped == 0 && returned == 0) {
+                child_reaped = 1;
             }
-
-            // No grid this pass — `revision` did not move, or the read failed
-            // — and `status` says running. The weaker source may OPEN.
-            action StatusOpensTurn when (exited == 0 && turn == 0) {
-                turn = 2;
+            // The direct child may have exited while an escaped descendant
+            // still holds a pipe. Its worker deadline remains meaningful.
+            action Deadline when (deadline == 0 && returned == 0) {
+                deadline = 1;
             }
-
-            // A later pass DID read the grid and it is still busy: the open
-            // turn's source is upgraded, so the grid may close it later. No
-            // event is emitted for this.
-            action GridUpgradesTheSource when (exited == 0 && turn == 2) {
-                turn = 1;
+            action TimeoutKill when (child_reaped == 0 && returned == 0) {
+                deadline = 1;
+                child_reaped = 1;
             }
-
-            // The grid was read and the worker is at its composer: whichever
-            // source opened the turn, the strong one closes it.
-            action GridClosesTurn when (exited == 0 && turn > 0) {
-                turn = 0;
+            action ReaderFinish when (reader_done == 0 && returned == 0) {
+                reader_done = 1;
             }
-
-            // `status` closes a turn `status` opened. This is the ONLY
-            // status-sourced close.
-            action StatusClosesItsOwnTurn when (exited == 0 && turn == 2) {
-                turn = 0;
+            action WriterFinish when (writer_done == 0 && returned == 0) {
+                writer_done = 1;
             }
-
-            // DEFECT: the same pass against a GRID-opened turn. The healthy
-            // branch changes nothing — the real arm falls through with a
-            // comment — so the committed machine is the observer's behaviour
-            // and the mutant sits beside it.
-            action StatusWouldCloseAGridTurn when (
-                exited == 0 && turn == 1 && statusclosed == 0
+            action Return when (
+                returned == 0 && child_reaped == 1 &&
+                ((reader_done == 1 && writer_done == 1) || Buggy == 1)
             ) {
-                turn = if Buggy == 1 { 0 } else { turn };
-                statusclosed = if Buggy == 1 { 1 } else { statusclosed };
+                returned = 1;
             }
 
-            // The program is gone. Any open turn is closed UNDER the exit,
-            // whatever opened it — an exit is not "did not look".
-            // DEFECT: the exit is emitted and the turn is left in flight.
-            action SessionExited when (exited == 0) {
-                exited = 1;
-                turn = if Buggy == 1 { turn } else { 0 };
+            invariant NoReturnBeforeWorkersJoin:
+                returned == 0 ||
+                (child_reaped == 1 && reader_done == 1 && writer_done == 1);
+        }
+    }
+}
+
+/// A window checks for a ready Claude upgrade five times at two-second
+/// intervals after launch, even when an early socket/roster read succeeds or
+/// fails. Subsequent checks use the minute cadence. The shipping `HostCadence`
+/// projects its saturated tick and chosen delay onto this model in Tier-1.
+/// `Buggy=1` retires the short cadence after an early successful read, the
+/// defect that lets a Claude tab opened seconds later wait another minute.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_startup_cadence_model() -> Model {
+    crate::ty_model! {
+        HarnessUpgradeStartupCadence {
+            const Buggy = 0;
+            const ShortTicks = 5;
+            const Saturation = 6;
+            var tick = 0;
+            var short = 0;
+            var ready = 0;
+
+            action Ready when (tick == 1 && ready == 0) {
+                ready = 1;
             }
 
-            // A later sample of an already-exited session. The `exited` event
-            // is emitted ONCE, nothing reopens, and the machine holds still.
-            action ExitedSampleRepeats when (exited == 1) {
-                turn = 0;
+            action Step when (tick <= Saturation) {
+                short = if tick <= ShortTicks - 1 &&
+                    (Buggy == 0 || ready == 0 || tick > 1) { 1 } else { 0 };
+                tick = if tick <= Saturation - 1 { tick + 1 } else { tick };
             }
 
-            // The host builds a fresh observer for the next session.
-            action NewSession when (exited == 1) {
-                exited = 0;
-                turn = 0;
+            invariant ShortUntilBudget:
+                tick == 0 || tick > ShortTicks || short == 1;
+        }
+    }
+}
+
+/// A READY answer is usable only by the process and tab that received the
+/// notice, with a unique live owner of that conversation and a complete
+/// session-file scan. The process-start token represents the kernel PID-reuse
+/// guard. `Buggy=1` replays the old conversation-keyed reducer, which accepts
+/// READY in another tab or after a partial scan.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_notice_owner_model() -> Model {
+    crate::ty_model! {
+        HarnessUpgradeNoticeOwner {
+            const Buggy = 0;
+            var phase = 0;
+            var tab = 1;
+            var pid = 1;
+            var start = 1;
+            var owner_tab = 0;
+            var owner_pid = 0;
+            var owner_start = 0;
+            var owners = 1;
+            var scan_complete = 1;
+            var ready = 0;
+            var signaled = 0;
+
+            action Announce when (phase == 0 && owners == 1 && scan_complete == 1) {
+                phase = 1;
+                owner_tab = tab;
+                owner_pid = pid;
+                owner_start = start;
+            }
+            action Ready when (phase == 1 && ready == 0) {
+                ready = 1;
+            }
+            action OtherTab when (phase == 1 && tab == 1) {
+                tab = 2;
+                pid = 2;
+                start = 2;
+            }
+            action DuplicateOwner when (phase == 1 && owners == 1) {
+                owners = 2;
+            }
+            action IncompleteScan when (scan_complete == 1 && phase <= 1) {
+                scan_complete = 0;
+            }
+            action Terminate when (
+                phase == 1 && ready == 1 &&
+                (Buggy == 1 ||
+                    (owners == 1 && scan_complete == 1 && owner_tab == tab &&
+                     owner_pid == pid && owner_start == start))
+            ) {
+                phase = 2;
+                signaled = 1;
             }
 
-            // The space guard.
-            invariant Bounds: turn <= 2 && exited <= 1 && statusclosed <= 1;
-            // THE law. A pass that did not look never ends a turn the grid
-            // opened.
-            invariant AGridTurnIsNeverClosedByStatusAlone: statusclosed == 0;
-            // The exit closes what it finds: no turn outlives the program
-            // that was running it.
-            invariant NoTurnSurvivesTheExit:
-                if exited == 1 { turn == 0 } else { turn <= 2 };
+            invariant OnlyIssuerSignaled:
+                signaled == 0 ||
+                (owner_tab == tab && owner_pid == pid && owner_start == start);
+            invariant NoDuplicateOwnerSignal: signaled == 0 || owners == 1;
+            invariant NoPartialScanSignal: signaled == 0 || scan_complete == 1;
         }
     }
 }

@@ -59,6 +59,7 @@
 use std::fmt;
 
 use crate::prompt::parse_prompt;
+use crate::wall::{Placement, Wall, WallKind, classify_wall};
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,12 +452,12 @@ fn number_then(row: &str, prefix: &str, suffix: &str) -> bool {
 /// Claude Code's composer frame: the top rule (directly above the composer's
 /// caret row) and the bottom rule under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Frame {
-    top: usize,
-    bottom: usize,
+pub(crate) struct Frame {
+    pub(crate) top: usize,
+    pub(crate) bottom: usize,
 }
 
-fn composer_frame(rows: &[String]) -> Option<Frame> {
+pub(crate) fn composer_frame(rows: &[String]) -> Option<Frame> {
     let caret = composer_index(rows)?;
     let top = caret.checked_sub(1).filter(|&t| is_rule(&rows[t]))?;
     let bottom = (caret + 1..rows.len()).find(|&i| is_rule(&rows[i]))?;
@@ -478,7 +479,7 @@ pub(crate) fn composer_top(rows: &[String]) -> Option<usize> {
 
 /// A full-width composer rule: `─` from column 0 to the last column, with at
 /// most a label inside it (`──── sandboxed ─`) and none of a table's joints.
-fn is_rule(row: &str) -> bool {
+pub(crate) fn is_rule(row: &str) -> bool {
     let t = row.trim_end();
     t.starts_with('─')
         && t.ends_with('─')
@@ -490,12 +491,12 @@ fn is_rule(row: &str) -> bool {
 /// row, if one comes before the transcript, and where the rows under it (or
 /// under the transcript row the walk stopped at) begin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StatusBlock {
-    status: Option<usize>,
-    from: usize,
+pub(crate) struct StatusBlock {
+    pub(crate) status: Option<usize>,
+    pub(crate) from: usize,
 }
 
-fn status_block(rows: &[String], top: usize) -> StatusBlock {
+pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
     for i in (0..top).rev() {
         if is_glyph_row(&rows[i]) {
             return StatusBlock {
@@ -843,7 +844,7 @@ fn is_parked_above_composer(row: &str, width: usize) -> bool {
 /// short of the edge is not one, however far in it starts — a transcript row
 /// indented 20 columns (indented code), a right-aligned row quoted in a
 /// tool's output.
-fn is_against_right_edge(row: &str, width: usize) -> bool {
+pub(crate) fn is_against_right_edge(row: &str, width: usize) -> bool {
     is_hint(row, Some(width)) && row.trim_end().chars().count() + 3 >= width
 }
 
@@ -871,7 +872,7 @@ fn is_said(row: &str, width: Option<usize>) -> bool {
 /// text measured 2026-09-17 13:50 on the live worker; a second reading said
 /// `continuing shortly`; where on the screen Claude Code draws it was not
 /// measured, so the banner, the footer and the gutter all read it,
-/// [`banner_limit`]). Anything said after a notice makes it history: a later
+/// [`notice`]). Anything said after a notice makes it history: a later
 /// turn's words (a background command or a monitor event starts one with no
 /// user row), the `/model` output that switched the model (measured), the
 /// worker's reply to a retry — the turn the auto-continue notice resumed,
@@ -880,63 +881,134 @@ fn is_said(row: &str, width: Option<usize>) -> bool {
 /// stays on the screen while the worker resumes under it, and a busy status
 /// row or footer under a notice makes the screen busy, never limited.
 ///
-/// A notice opens with `You've reached your … limit` / `You've hit your …
-/// limit` (Claude Code's second person — `You've reached your Fable limit. Run
-/// /usage-credits to continue or switch models with /model.`, `You've hit your
-/// session limit · resets 7:30pm (America/Los_Angeles)`), with a few words and
-/// `limit reached` (`5-hour limit reached ∙ resets 3am`, `Claude usage limit
-/// reached. Your limit will reset at 3pm (America/New_York).`, `⚠ Usage limit
-/// reached · continuing automatically at 1:50pm`), or with `API Error` and a
-/// rate or usage limit (`API Error: Rate limit reached for requests`). Text
-/// that says `Approaching` a limit is a warning, and never counts. The
+/// What counts as a limit is [`classify_wall`]'s table: a notice whose
+/// [`WallKind::reads_limited`] — a usage window (`You've hit your session
+/// limit · resets 7:30pm (America/Los_Angeles)`, `5-hour limit reached ∙
+/// resets 3am`, `Claude usage limit reached. Your limit will reset at 3pm
+/// (America/New_York).`, `⚠ Usage limit reached · continuing automatically
+/// at 1:50pm`), a model bucket (`You've reached your Fable limit. Run
+/// /usage-credits to continue or switch models with /model.`), spend, or an
+/// API rate limit (`API Error: Rate limit reached for requests`). A warning
+/// (`Approaching …`) never counts, and neither do the notices the worker
+/// goes on under (a subagent quota, a subagent budget, fast mode's
+/// fallback) or a full context — [`crate::wall::wall`] names that one. The
 /// block's continuation rows are part of the message; `reset` is read from
 /// whichever of its rows says `resets …` / `reset at …` — or, the
 /// auto-continue notice, `continuing automatically at <time>` / `continuing
 /// shortly` ([`reset_of`]).
 pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
+    notice(rows, &|text| {
+        classify_wall(text).filter(WallKind::reads_limited)
+    })
+    .map(|w| (w.message, w.reset))
+}
+
+/// The notice the worker's last turn ended on, placed as [`limit_notice`]
+/// places it — the footer, a banner under the last thing said, the `⎿` block
+/// of the last message — and named by `classify`. Shared by
+/// [`limit_notice`] (the usage kinds) and [`crate::wall::wall`] (every
+/// kind), so the two can never disagree about WHERE a wall is.
+///
+/// A `⎿` block counts as the VENDOR's row except in the two forms this
+/// recognises as output: the `⏺` row it hangs from is a tool call written
+/// `⏺ Name(…)` (`⏺ Bash(…)`, `⏺ Update(notes.txt)`, [`is_tool_call`]), or
+/// it opens with the command's own echo (`⎿  $ touch x`, Claude Code 2.1.280
+/// draws a running command so). Any other owner's block — a Monitor event's
+/// payload included — is read as the vendor's ([`crate::wall`], module
+/// header).
+pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -> Option<Wall> {
     if let Some(frame) = composer_frame(rows) {
-        if let Some(found) = footer_limit(&rows[frame.bottom + 1..]) {
+        if let Some(found) = footer_notice(rows, frame.bottom + 1, classify) {
             return Some(found);
         }
         let width = rows[frame.bottom].trim_end().chars().count();
-        if let Some(found) = banner_limit(rows, frame.top, width) {
+        if let Some(found) = banner_notice(rows, frame.top, width, classify) {
             return Some(found);
         }
     }
     let last = last_said_index(rows)?;
     let open = gutter_open(rows, last)?;
     let head = rows[open].trim_start().trim_start_matches('⎿').trim();
-    if !is_limit_notice(head) {
+    if head.starts_with("$ ") || owner_is_tool_call(rows, open) {
         return None;
     }
+    let kind = classify(head)?;
     let parts: Vec<&str> = std::iter::once(head)
         .chain(rows[open + 1..=last].iter().map(|r| r.trim()))
         .filter(|p| !p.is_empty())
         .collect();
     let reset = parts.iter().find_map(|p| reset_of(p));
-    Some((parts.join(" "), reset))
+    Some(Wall {
+        kind,
+        message: parts.join(" "),
+        reset,
+        row: open,
+        placement: Placement::Gutter,
+    })
 }
 
-/// A notice in the footer, under the bottom rule and above the first blank row
-/// (the agents panel and a workflow's line below it are the worker's words):
-/// an item — the row, a part after a wide gap or after ` · ` — that opens with
-/// a limit notice, up to the next wide gap.
-fn footer_limit(footer: &[String]) -> Option<(String, Option<String>)> {
-    footer
-        .iter()
-        .take_while(|r| !r.trim().is_empty())
-        .filter(|r| !r.trim_start().starts_with(['◯', '⏺', '●']))
-        .find_map(|row| {
+/// Whether the `⏺` row the `⎿` block opening at `open` hangs from is a tool
+/// call: walking up over the block's own rows (more `⎿` rows, rows indented
+/// under them) to the first row in column 0, with no blank row between.
+fn owner_is_tool_call(rows: &[String], open: usize) -> bool {
+    for row in rows[..open].iter().rev() {
+        if row.trim().is_empty() {
+            return false;
+        }
+        if leading_spaces(row) == 0 {
+            return is_tool_call(row);
+        }
+    }
+    false
+}
+
+/// A transcript row that is a tool call, `⏺ <Name>(…)`: the marker, then a
+/// name of letters, digits, `_`, `:`, `.` or `-` running straight into `(`
+/// (`⏺ Bash(ls -la)`, `⏺ Update(notes.txt)`, `⏺ mcp__srv__tool(…)`). A
+/// completion notice (`⏺ Dynamic workflow "…" completed`, `⏺ Background
+/// command "…" completed`) and the worker's prose are not.
+pub fn is_tool_call(row: &str) -> bool {
+    let Some(rest) = row.strip_prefix(['⏺', '●']) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let name_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-')))
+        .unwrap_or(rest.len());
+    name_len > 0 && rest[name_len..].starts_with('(')
+}
+
+/// A notice in the footer, under the bottom rule (from row `from`) and above
+/// the first blank row (the agents panel and a workflow's line below it are
+/// the worker's words): an item — the row, a part after a wide gap or after
+/// ` · ` — that opens with a notice `classify` names, up to the next wide gap.
+fn footer_notice(
+    rows: &[String],
+    from: usize,
+    classify: &dyn Fn(&str) -> Option<WallKind>,
+) -> Option<Wall> {
+    rows.iter()
+        .enumerate()
+        .skip(from)
+        .take_while(|(_, r)| !r.trim().is_empty())
+        .filter(|(_, r)| !r.trim_start().starts_with(['◯', '⏺', '●']))
+        .find_map(|(i, row)| {
             let t = row.trim();
             let starts = std::iter::once(0)
                 .chain(t.match_indices("  ").map(|(i, s)| i + s.len()))
                 .chain(t.match_indices(" · ").map(|(i, s)| i + s.len()));
             starts
-                .map(|i| t[i..].trim_start())
-                .find(|item| is_limit_notice(item))
-                .map(|item| {
+                .map(|at| t[at..].trim_start())
+                .find_map(|item| classify(item).map(|kind| (item, kind)))
+                .map(|(item, kind)| {
                     let item = item.split("  ").next().unwrap_or(item).trim();
-                    (item.to_string(), reset_of(item))
+                    Wall {
+                        kind,
+                        message: item.to_string(),
+                        reset: reset_of(item),
+                        row: i,
+                        placement: Placement::Footer,
+                    }
                 })
         })
 }
@@ -947,25 +1019,38 @@ fn footer_limit(footer: &[String]) -> Option<(String, Option<String>)> {
 /// so a notice above a done row with nothing said between counts as one
 /// below it — the lowest row that starts with a status glyph
 /// ([`is_status_row`]: `⚠`, `✔`, …, never a spinner's) and opens with a
-/// limit notice. A banner starts where Claude Code's own rows do — in the
-/// transcript's columns, short of the gutter's text column, or against the
-/// right edge as a hint ([`is_hint`]; the update banner is drawn there) —
-/// and never on a row that hangs from a `⎿` gutter ([`gutter_open`]): a
-/// tool's output is the worker's words at whatever column it puts them, a
-/// peer's screen the worker read included, right-aligned as the peer's
-/// Claude Code drew it (the round-20 review: such a copy twenty columns in
-/// read as the wall). A blank row ends the gutter's block; a banner under
-/// that blank is Claude Code's own. A notice above a said row is history
-/// and is not looked at.
-fn banner_limit(rows: &[String], top: usize, width: usize) -> Option<(String, Option<String>)> {
+/// notice `classify` names. A banner starts where Claude Code's own rows do —
+/// in the transcript's columns, short of the gutter's text column, or
+/// against the right edge as a hint ([`is_hint`]; the update banner is drawn
+/// there) — and never on a row that hangs from a `⎿` gutter
+/// ([`gutter_open`]): a tool's output is the worker's words at whatever
+/// column it puts them, a peer's screen the worker read included,
+/// right-aligned as the peer's Claude Code drew it (the round-20 review:
+/// such a copy twenty columns in read as the wall). A blank row ends the
+/// gutter's block; a banner under that blank is Claude Code's own. A notice
+/// above a said row is history and is not looked at.
+fn banner_notice(
+    rows: &[String],
+    top: usize,
+    width: usize,
+    classify: &dyn Fn(&str) -> Option<WallKind>,
+) -> Option<Wall> {
     let from = last_said_index(rows).map_or(0, |i| i + 1);
     (from..top).rev().find_map(|i| {
         let row = &rows[i];
         let t = row.trim();
         let placed = (leading_spaces(row) < GUTTER_TEXT_COLUMN || is_hint(row, Some(width)))
             && gutter_open(rows, i).is_none();
-        (placed && is_status_row(t) && !is_glyph_row(t) && is_limit_notice(t))
-            .then(|| (t.to_string(), reset_of(t)))
+        if !(placed && is_status_row(t) && !is_glyph_row(t)) {
+            return None;
+        }
+        classify(t).map(|kind| Wall {
+            kind,
+            message: t.to_string(),
+            reset: reset_of(t),
+            row: i,
+            placement: Placement::Banner,
+        })
     })
 }
 
@@ -988,41 +1073,6 @@ fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
         }
         i = i.checked_sub(1)?;
     }
-}
-
-/// Whether `text` OPENS with a limit notice (see [`limit_notice`]).
-fn is_limit_notice(text: &str) -> bool {
-    let lower = text.replace('’', "'").to_lowercase();
-    if lower.contains("approaching") {
-        return false;
-    }
-    let head = lower
-        .split(['.', '·', '∙', '|'])
-        .next()
-        .unwrap_or("")
-        .trim();
-    let reached = head
-        .find("limit reached")
-        .is_some_and(|at| head[..at].split_whitespace().count() <= 3);
-    (lower.starts_with("you") && second_person_limit(head))
-        || reached
-        || (lower.starts_with("api error")
-            && ["rate limit", "rate_limit", "usage limit", "429"]
-                .iter()
-                .any(|k| lower.contains(k)))
-}
-
-/// `reached your <up to three words> limit` / `hit your … limit`, in a
-/// lowercased row.
-fn second_person_limit(lower: &str) -> bool {
-    ["reached your ", "hit your "].iter().any(|lead| {
-        lower.match_indices(lead).any(|(at, _)| {
-            lower[at + lead.len()..]
-                .split_whitespace()
-                .take(4)
-                .any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == "limit")
-        })
-    })
 }
 
 /// When the notice says the limit resets: the text after `resets at ` /
@@ -2462,11 +2512,10 @@ mod tests {
     /// anywhere on it used to be a box, and a manager's transcript carries
     /// its workers' boxes. Under the
     /// `⎿` gutter it is output, whatever is under it — the manager idle (the
-    /// soft monitor), the manager busy. Quoted in prose, it is history once
-    /// the manager's later words or a done row stand between it and the
-    /// composer. With only a spinner under it the parser still errs towards
-    /// `prompt` (the module header of `prompt.rs` says why), and a REAL box
-    /// over the manager's composer is a prompt with this footer as with any.
+    /// soft monitor), the manager busy. Quoted in prose — every row in the
+    /// message's continuation column — it is never a box, whatever is under
+    /// it, and a REAL box over the manager's composer is a prompt with this
+    /// footer as with any.
     #[test]
     fn a_workers_box_in_a_managers_transcript_is_not_a_prompt() {
         let done_row = "✻ Worked for 12s · done 9:01 PM";
@@ -2518,9 +2567,10 @@ mod tests {
             assert_eq!(parse_prompt(&r), None, "{under:?}");
             assert_ne!(worker_phase(&r), Phase::Prompt, "{under:?}");
 
-            // Only a spinner under the prose copy: still read as a box.
+            // Only a spinner under the prose copy: not a box either — every
+            // row of it sits in the message's continuation column.
             let r = with(&[spinner, ""], MANAGER_FOOTER, &BOX_IN_PROSE);
-            assert!(parse_prompt(&r).is_some(), "{under:?}");
+            assert_eq!(parse_prompt(&r), None, "{under:?}");
 
             // A real box over the manager's composer: a prompt.
             let mut live = rows(&["⏺ Pushing the branch.", ""]);

@@ -527,7 +527,7 @@ fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
 fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
     let dir = tempdir("unattributed");
     let inputs = inputs("0.99.0", 990);
-    let staged = publish::stage_manifest(&dir, &inputs, None).expect("stages");
+    let staged = publish::stage_manifest(&dir, &inputs, None, None).expect("stages");
     let bytes = std::fs::read(&staged).expect("staged bytes");
     let expected = manifest_out::emit(&manifest_out::build(&inputs)).expect("emits");
     assert_eq!(
@@ -1100,7 +1100,7 @@ fn attribution_is_inside_the_bytes_the_signature_covers() {
         pubkey_b64: pk(&M3),
         roster_seq: 4,
     };
-    let staged = publish::stage_manifest(&dir, &inputs, Some(&who)).expect("stages");
+    let staged = publish::stage_manifest(&dir, &inputs, Some(&who), None).expect("stages");
     let signed_bytes = std::fs::read(&staged).expect("staged bytes");
     let text = String::from_utf8(signed_bytes.clone()).expect("utf8");
     assert!(text.contains("machine_id = \"m3\""), "{text}");
@@ -1117,10 +1117,11 @@ fn attribution_is_inside_the_bytes_the_signature_covers() {
 
     // THE NEGATIVE CONTROL — the "stamp after signing" ordering, done deliberately, so
     // the ordering above is demonstrated to matter rather than merely asserted.
-    let unattributed = publish::stage_manifest(&dir, &inputs, None).expect("stages");
+    let unattributed = publish::stage_manifest(&dir, &inputs, None, None).expect("stages");
     let early_bytes = std::fs::read(&unattributed).expect("unattributed bytes");
     let early_signature = kp(&M3).sign(&early_bytes).as_ref().to_vec();
-    let late = publish::stage_manifest(&dir, &inputs, Some(&who)).expect("re-stages, stamped");
+    let late =
+        publish::stage_manifest(&dir, &inputs, Some(&who), None).expect("re-stages, stamped");
     let late_bytes = std::fs::read(&late).expect("late bytes");
     assert_ne!(
         early_bytes, late_bytes,
@@ -1166,11 +1167,12 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
         names.contains(&"aterm-machines.toml.sig".to_string()),
         "{names:?}"
     );
-    mirror::validate_mirror_asset_set(&names, "0.5.0", true, true).expect("the exact set");
+    mirror::validate_mirror_asset_set_with_linux(&names, "0.5.0", true, true, &[])
+        .expect("the exact set");
     // ...and a mirror that forgets the roster is refused rather than published: the
     // armed client refuses such a head structurally, before any artifact crypto.
     let forgotten = mirror::required_asset_names("0.5.0", true, false);
-    let err = mirror::validate_mirror_asset_set(&forgotten, "0.5.0", true, true)
+    let err = mirror::validate_mirror_asset_set_with_linux(&forgotten, "0.5.0", true, true, &[])
         .expect_err("a rostered channel head without its roster is unelectable");
     assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
 

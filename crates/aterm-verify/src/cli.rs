@@ -57,6 +57,12 @@ pub struct Args {
     pub root: Option<PathBuf>,
     /// `--in-place`: run in the caller's checkout instead of the snapshot.
     pub in_place: bool,
+    /// `--disk-floor <GiB>`: the disk preflight's floor for this run, in whole
+    /// GiB. `None` keeps [`crate::disk::FLOOR_BYTES`]. The gate's own
+    /// integration tests pass `0`: a fixture with a fake toolchain builds
+    /// nothing, and a fixed floor made the gate's tests refuse whenever the host
+    /// volume held less than it (measured 2026-09-23 at 17.6 GiB free: 23 tests).
+    pub disk_floor_gib: Option<u64>,
     pub help: bool,
 }
 
@@ -82,6 +88,8 @@ pub enum ParseError {
     ScopeAndChanged,
     /// `--base` without `--changed` narrows nothing and means nothing.
     BaseWithoutChanged,
+    /// `--disk-floor` with no value, or one that is not a whole number of GiB.
+    DiskFloorNeedsGib,
     Unknown(String),
 }
 
@@ -98,6 +106,9 @@ impl ParseError {
             }
             ParseError::BaseWithoutChanged => {
                 "verify: --base <ref> only means something with --changed".to_string()
+            }
+            ParseError::DiskFloorNeedsGib => {
+                "verify: --disk-floor needs a whole number of GiB".to_string()
             }
             ParseError::Unknown(a) => format!("verify: unknown argument: {a}"),
         }
@@ -144,6 +155,9 @@ where
                 }
                 out.root = Some(PathBuf::from(v));
             }
+            "--disk-floor" => {
+                out.disk_floor_gib = Some(parse_gib(&it.next().unwrap_or_default())?);
+            }
             _ => {
                 if let Some(v) = a.strip_prefix("--scope=") {
                     // FAIL-CLOSED DIVERGENCE, deliberate. Bash let `--scope=`
@@ -169,6 +183,8 @@ where
                         return Err(ParseError::RootNeedsPath);
                     }
                     out.root = Some(PathBuf::from(v));
+                } else if let Some(v) = a.strip_prefix("--disk-floor=") {
+                    out.disk_floor_gib = Some(parse_gib(v)?);
                 } else {
                     return Err(ParseError::Unknown(a));
                 }
@@ -248,6 +264,14 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             file each run with a TSV row per child and per stage, without
             changing a byte of the ladder.
 
+--disk-floor <GiB>: before anything is built the run reads the free space on
+            the volume holding its root and answers COULD NOT RUN (exit 3), with
+            no receipt, below the floor — 40 GiB unless this moves it. The
+            ladder's `verify: disk …` line always prints the floor in force, so
+            a moved floor is on the record. Lowering it can never make a
+            receipt lie: a run that does run out of space is COULD NOT RUN,
+            never a verdict about the tree. The gate's own tests pass 0.
+
 A skip is an honest \"tool absent\", never a silent pass: skips are counted and
 NAMED, and any run that skipped a stage or narrowed its scope is refused the
 merge-contract verdict.
@@ -262,6 +286,15 @@ exit 1  a gate FAILED — a real finding about the tree
 exit 2  usage error
 exit 3  COULD NOT RUN — the environment is broken; nothing was decided
 ";
+
+/// A `--disk-floor` value: a whole number of GiB, nothing else — an empty or
+/// malformed floor is a usage error, never read as zero.
+fn parse_gib(v: &str) -> Result<u64, ParseError> {
+    v.parse::<u64>()
+        .ok()
+        .filter(|g| g.checked_mul(crate::disk::GIB).is_some())
+        .ok_or(ParseError::DiskFloorNeedsGib)
+}
 
 /// The `--help` text as a reader sees it: [`USAGE_TEMPLATE`] with the child
 /// ceiling read from the constant that enforces it.
@@ -293,6 +326,31 @@ mod tests {
 
     fn ok(args: &[&str]) -> Args {
         parse(args.iter().copied()).expect("parses")
+    }
+
+    /// `--disk-floor` takes a whole number of GiB in both spellings, and a
+    /// missing, empty or malformed value is a usage error — never read as 0,
+    /// which would silently switch the preflight off.
+    #[test]
+    fn the_disk_floor_is_whole_gib_or_a_usage_error() {
+        assert_eq!(ok(&[]).disk_floor_gib, None, "not given keeps the default");
+        assert_eq!(ok(&["--disk-floor", "0"]).disk_floor_gib, Some(0));
+        assert_eq!(ok(&["--disk-floor=25"]).disk_floor_gib, Some(25));
+        for bad in [
+            vec!["--disk-floor"],
+            vec!["--disk-floor", ""],
+            vec!["--disk-floor="],
+            vec!["--disk-floor", "40G"],
+            vec!["--disk-floor", "-1"],
+            vec!["--disk-floor", "1.5"],
+            vec!["--disk-floor", "99999999999999999999"],
+        ] {
+            assert_eq!(
+                parse(bad.iter().copied()),
+                Err(ParseError::DiskFloorNeedsGib),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

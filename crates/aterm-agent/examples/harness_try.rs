@@ -3,17 +3,17 @@
 
 //! `harness_try` — poke the harness core by hand, with your own input.
 //!
-//! The harness core (`aterm_agent::harness`) is four PURE judgments:
+//! The harness core (`aterm_agent::harness`) is three PURE judgments:
 //! `rm_policy` (would this `rm` be approved?), `usage` (what do Claude Code's
-//! own status-line numbers say?), `limits` (what kind of failure is this, and
-//! what happens next?) and `ring` (the bounded ledger). Their tests prove them
+//! own status-line numbers say?) and `limits` (what kind of failure is this,
+//! and what happens next?). Their tests prove them
 //! against fixtures; this example proves nothing at all — it is a window, so a
 //! person can type a real command and read the real verdict rather than take a
 //! test count on trust.
 //!
 //! Nothing here is wired to Claude Code: no hook is answered, no key is typed,
-//! no file of yours is read, and `rm` never runs. The `ring` subcommand is the
-//! one that writes, and only under a temporary directory it names.
+//! no file of yours is read, nothing is written, and `rm` never runs. (The
+//! `ring` subcommand went with the ledger ring on 2026-09-23.)
 //!
 //! ```text
 //! targo --unverified run -p aterm-agent --example harness_try -- rm 'rm -rf target/debug'
@@ -22,15 +22,12 @@
 //! {"rate_limits":{"five_hour":{"used_percentage":62,"resets_at":1789669500}}}
 //! J
 //! targo --unverified run -p aterm-agent --example harness_try -- limit "You've reached your Fable limit"
-//! targo --unverified run -p aterm-agent --example harness_try -- ring
 //! ```
 
-use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use aterm_agent::harness::limits::{Class, Evidence, WindowKind, classify};
-use aterm_agent::harness::ring::{Ring, RingConfig};
 use aterm_agent::harness::rm_policy::{HookEvent, RmPolicy, evaluate};
 use aterm_agent::harness::source::Source;
 use aterm_agent::harness::usage::{
@@ -43,7 +40,6 @@ harness_try — read the harness core's real verdicts, by hand
   rm <command> [cwd]     would this rm be auto-approved? (default cwd: this repo)
   usage [file]           a statusLine JSON (file, or stdin) → the HUD line
   limit <banner text>    a vendor banner → the failure class and what follows
-  ring [dir]             append rows to a bounded ledger and read them back
 
 Nothing is wired to Claude Code. No hook is answered, no key is typed, no rm runs.
 ";
@@ -58,7 +54,6 @@ fn main() {
         "rm" => cmd_rm(&args[1..]),
         "usage" => cmd_usage(&args[1..]),
         "limit" => cmd_limit(&args[1..]),
-        "ring" => cmd_ring(&args[1..]),
         _ => print!("{USAGE}"),
     }
 }
@@ -163,7 +158,12 @@ fn cmd_usage(args: &[String]) {
 fn cmd_limit(args: &[String]) {
     let text = args.join(" ");
     if text.trim().is_empty() {
-        println!("give a banner, e.g.  limit \"You've reached your Fable limit\"");
+        // The example banner is the anchor table's, not a second copy of the
+        // vendor's words (tools/grep_guard.sh V1).
+        println!(
+            "give a banner, e.g.  limit \"{}\"",
+            aterm_phase::anchor("wall.fable")
+        );
         return;
     }
     let now = 1_789_669_000_i64;
@@ -239,68 +239,4 @@ fn report(label: &str, evidence: &[Evidence], now: i64) {
         }
     }
     println!();
-}
-
-fn cmd_ring(args: &[String]) {
-    let dir: PathBuf = args
-        .first()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("aterm-harness-try"));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        println!("could not make {}: {e}", dir.display());
-        return;
-    }
-    let dir = match dir.canonicalize() {
-        Ok(d) => d,
-        Err(e) => {
-            println!("could not resolve {}: {e}", dir.display());
-            return;
-        }
-    };
-    let cfg = RingConfig::default();
-    println!("dir       {}", dir.display());
-    println!(
-        "bound     {} bytes over {} segments",
-        cfg.max_bytes, cfg.segments
-    );
-    println!();
-    let mut ring = match Ring::open(Path::new(&dir), "try", cfg) {
-        Ok(r) => r,
-        Err(e) => {
-            println!("open refused: {e}");
-            println!("(a second writer on one ledger is refused on purpose)");
-            return;
-        }
-    };
-    for n in 1..=3 {
-        match ring.append(&format!("{{\"demo\":true,\"n\":{n}}}")) {
-            Ok(id) => println!("appended  id={id}"),
-            Err(e) => println!("refused   {e}"),
-        }
-    }
-    match ring.append("a line with\na newline in it") {
-        Ok(id) => println!("appended  id={id}  (unexpected)"),
-        Err(e) => println!("refused   a row containing a newline: {e}"),
-    }
-    println!();
-    match ring.read_since(0, 10) {
-        Ok(rows) => {
-            println!("read back {} row(s):", rows.len());
-            for r in rows {
-                println!("  {:>4}  {}", r.id, r.line);
-            }
-        }
-        Err(e) => println!("read failed: {e}"),
-    }
-    println!();
-    println!(
-        "bytes={} next_id={} floor_id={}",
-        ring.bytes(),
-        ring.next_id(),
-        ring.floor_id()
-    );
-    println!(
-        "A cursor below floor_id means rows were dropped — the ledger says so rather than lying."
-    );
-    let _ = BTreeMap::<u8, u8>::new();
 }

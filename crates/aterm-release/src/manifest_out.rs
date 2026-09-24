@@ -121,6 +121,12 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
         )),
         zip: Some(i.zip_name.to_string()),
         zip_sha256: Some(i.zip_sha256.to_string()),
+        linux_x86_64: None,
+        linux_x86_64_sha256: None,
+        linux_x86_64_size: None,
+        linux_aarch64: None,
+        linux_aarch64_sha256: None,
+        linux_aarch64_size: None,
         // RETIRED 2026-08-26: the Intel `aterm-<v>-x86_64.dmg` variant. The two
         // wire keys stay in the shared `Manifest` type so already-published
         // manifests keep parsing on every client, but this cutter never emits

@@ -594,6 +594,17 @@ impl EgressReceipt {
     pub(crate) const fn accepted_order(self) -> Option<AcceptedOrder> {
         self.accepted_order
     }
+
+    /// The whole non-empty event was accepted. A failed multi-frame event may
+    /// still carry an earlier frame's order, which is insufficient to promise
+    /// that a queued key can echo or request a fast present.
+    #[must_use]
+    pub(crate) const fn fully_accepted_nonempty(self) -> bool {
+        matches!(
+            self.egress,
+            Egress::Reported(Delivery::Full | Delivery::FullAt { .. })
+        ) && self.accepted_order.is_some()
+    }
 }
 
 /// Resolve the `(x, y)` numbers a mouse report should carry for `term`'s CURRENT
@@ -1690,6 +1701,7 @@ mod tests {
             EgressMode::Interactive,
         );
         assert!(accepted.accepted_nonempty());
+        assert!(accepted.fully_accepted_nonempty());
         drop(sink);
         assert_eq!(cap.drain(), b"x");
 
@@ -1702,6 +1714,7 @@ mod tests {
         );
         assert_eq!(empty.egress, Egress::Reported(Delivery::Full));
         assert!(!empty.accepted_nonempty());
+        assert!(!empty.fully_accepted_nonempty());
 
         let failed = seam_egress_receipt(
             &term,
@@ -1712,6 +1725,7 @@ mod tests {
         );
         assert_eq!(failed.egress, Egress::Reported(Delivery::Failed));
         assert!(!failed.accepted_nonempty());
+        assert!(!failed.fully_accepted_nonempty());
     }
 
     #[test]
@@ -1741,6 +1755,10 @@ mod tests {
         };
         assert!(receipt.accepted_nonempty());
         assert!(receipt.is_direct());
+        assert!(
+            !receipt.fully_accepted_nonempty(),
+            "an earlier accepted frame cannot authorize a failed queued key"
+        );
         drop(good);
         assert_eq!(cap.drain(), b"first");
     }

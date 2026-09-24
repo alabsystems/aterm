@@ -778,7 +778,7 @@ impl Floor {
         // syncs are `fcntl(F_FULLFSYNC)`, a full drive flush each, so an idle store paid
         // ten drive flushes and five atomic replaces per pass to write down a number it
         // already held — including on the GUI-adjacent seed lane, which resolves the
-        // sealed index before it asks whether there is any work to do.
+        // signed index before it asks whether there is any work to do.
         //
         // The skip is taken ONLY when the file already carries a value at or above the
         // one being recorded, so the durable floor afterwards is exactly what the write
@@ -1177,8 +1177,8 @@ mod tests {
             "so the pinned anchor is live by construction"
         );
         assert!(
-            crate::enabled() || std::env::var_os("ATPKG_DISABLE").is_some(),
-            "and the manager acts at the CLI edge unless explicitly disabled"
+            crate::enabled(),
+            "and the manager acts at the CLI edge — no environment variable can switch it off"
         );
     }
 

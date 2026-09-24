@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Outcome of one bounded, immediate actuator egress attempt.
@@ -262,6 +262,11 @@ pub struct SinkWriter {
     /// a stale read only costs the slower — still correct, still parking-free —
     /// cadence, never a parking write.
     master_nonblocking: AtomicBool,
+    /// Ordered GUI input jobs still waiting for or running on this sink's
+    /// per-session writer. The key path reads this sink-local count without
+    /// visiting the process-wide writer registry, so a paste in another tab
+    /// cannot put its registry lock on this session's typing path.
+    ordered_egress_pending: AtomicUsize,
     /// The write-serialization + wedged-tty spill state, behind its own `Arc` so the
     /// detached spill DRAINER thread can hold it without holding the sink itself
     /// (the drainer pins the PTY via its own `dup(2)`'d fd — see [`Shared`]).
@@ -374,6 +379,7 @@ impl SinkWriter {
             master,
             _owned: None,
             master_nonblocking: AtomicBool::new(false),
+            ordered_egress_pending: AtomicUsize::new(0),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -424,6 +430,7 @@ impl SinkWriter {
             master: master.as_raw_fd(),
             _owned: Some(master),
             master_nonblocking: AtomicBool::new(false),
+            ordered_egress_pending: AtomicUsize::new(0),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -470,6 +477,7 @@ impl SinkWriter {
             master: master.as_raw(),
             _owned: Some(master),
             master_nonblocking: AtomicBool::new(false),
+            ordered_egress_pending: AtomicUsize::new(0),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -517,6 +525,29 @@ impl SinkWriter {
     #[must_use]
     pub fn master(&self) -> i32 {
         self.master
+    }
+
+    /// Jobs submitted to this sink's ordered input writer and not yet
+    /// completed. A key checks only its own sink: another session's paste
+    /// never makes it inspect the process-wide writer registry.
+    #[inline]
+    #[must_use]
+    pub fn ordered_egress_count(&self) -> usize {
+        self.ordered_egress_pending.load(Ordering::Acquire)
+    }
+
+    /// Claim a FIFO slot before its job is sent to the writer. The GUI event
+    /// loop submits paste and key events in one order, so its next key sees
+    /// this count before it can choose an inline write.
+    pub fn claim_ordered_egress(&self) {
+        self.ordered_egress_pending.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Release the slot after the writer has completed its PTY write, or when
+    /// submission failed and the caller is taking back the event.
+    pub fn retire_ordered_egress(&self) {
+        let previous = self.ordered_egress_pending.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "ordered egress retired without a claim");
     }
 
     /// What the line discipline will do with the next byte typed into this

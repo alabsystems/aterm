@@ -15,9 +15,10 @@ rather than maintained.
 
 Installed copies update themselves from that channel, so a running macOS
 install converges on the supported version on its own. An install that has
-turned the updater off (`ATERM_NO_AUTO_UPDATE=1`) or deferred applying
+turned automatic checks off (`[update] enabled = false`) or deferred applying
 (`[update] auto_apply = false`) is supported only once it is brought current —
-`aterm ctl update apply`, or Settings ▸ Software Update.
+Check for Updates and Update Now in Settings ▸ Software Update, or `aterm update
+check` then `aterm ctl update apply`; both work with either switch off.
 
 If a machine has stopped receiving updates, `aterm ctl update status` reports
 the reason and Settings ▸ Software Update shows it in the app; re-running the

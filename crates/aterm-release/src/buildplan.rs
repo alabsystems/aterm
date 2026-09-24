@@ -49,6 +49,11 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+// Native workers share the sealed source/dependency take and scrubbed Trust
+// invocation of the canonical cutter. They never sign or upload anything.
+#[path = "linux_release.rs"]
+pub mod linux;
+
 /// THE shipped binary: `(cargo package, cargo bin name, basename it ships
 /// under)` — all three are `aterm`. One binary is the whole surface: the
 /// window (a no-TTY/Finder launch), the transparent session (a TTY launch),
@@ -1186,6 +1191,12 @@ fn resolve_release_proof_driver(
         )),
     }
 }
+// Isolated mode (`-I`) IGNORES every PYTHON* environment variable, including the
+// PYTHONDONTWRITEBYTECODE this command still sets, so bytecode suppression has to
+// be a command-line invariant (`-B`): an import must not write `__pycache__` into the
+// attributed source tree between its initial fingerprint and the snapshot's
+// comparison.
+const RELEASE_PROOF_PYTHON_FLAGS: [&str; 3] = ["-I", "-S", "-B"];
 
 fn release_proof_python(repo_root: &Path, script: &Path) -> Result<Command, String> {
     let home = std::env::var_os("HOME").ok_or("release proof tooling requires HOME")?;
@@ -1210,9 +1221,8 @@ fn release_proof_python_with(
     let path = release_tool_path(&driver.tool_dir)?;
     let mut command = Command::new("/usr/bin/python3");
     command
+        .args(RELEASE_PROOF_PYTHON_FLAGS)
         .args([
-            "-I",
-            "-S",
             "-c",
             "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')",
         ])
@@ -1453,20 +1463,16 @@ fn publish_verified_symbols(
         }
     }
     // `dist` is ignored and therefore can pre-exist as an attacker-controlled
-    // symlink. Validate and tighten it before any marker write or destructive
-    // replacement below can be redirected outside this checkout.
+    // symlink. Validate and tighten it before any destructive replacement below can
+    // be redirected outside this checkout. (No `.metadata_never_index` marker is
+    // written: it is inert for Spotlight, and its one reader went with the sealed-seed
+    // client lane — `bundle::assemble` says both.)
     drop(open_release_directory(
         out_dir,
         expected_uid,
         true,
         "release output directory",
     )?);
-    // The build-output sentinel atpkg reads (`cli.rs::is_build_output_bundle`), NOT a
-    // Spotlight exclusion: a `.metadata_never_index` file in a subdirectory is INERT,
-    // measured 2026-09-02 (crates/atpkg/src/noindex.rs). The only mechanism measured to
-    // exclude a subtree is a name ending `.noindex`, which `dist/` does not have.
-    std::fs::write(out_dir.join(".metadata_never_index"), "")
-        .map_err(|error| format!("mark {} build output: {error}", out_dir.display()))?;
     if let Some(staged) = output.dsym.take() {
         let published = out_dir.join("aterm.dSYM");
         match std::fs::remove_dir_all(&published) {
@@ -1893,6 +1899,11 @@ fn build_one(
     // stamp, and the manifest all carry the one claimed u64.
     cmd.env("SOURCE_DATE_EPOCH", plan.build_number.to_string());
     cmd.env("CARGO_TARGET_DIR", &take.target_dir);
+    // Native Linux workers use fresh isolated targets and can run beside the
+    // developer's app build. Bound their CPU/memory footprint explicitly after
+    // env_clear; inheriting CARGO_BUILD_JOBS would not survive this boundary.
+    #[cfg(target_os = "linux")]
+    cmd.env("CARGO_BUILD_JOBS", "4");
 
     // Real .dSYM: line-table debug info AND no stripping (the release
     // profile's strip=true would erase the debug map dsymutil follows).
@@ -2726,17 +2737,44 @@ mod tests {
 
     use super::{
         BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
-        RELEASE_SYSTEM_PATH, ReleaseProofDriver, ReleaseProofLane, SECTION_64_LEN,
-        SEGMENT_COMMAND_64_LEN, cargo_build_args, cleanup_release_target_residue_with,
-        create_private_release_directory, current_release_uid, fresh_lease_token, is_lower_hex,
-        make_executable, parse_thin_macho_update_pin, prepare_release_target_parent,
-        publish_verified_binary, publish_verified_symbols, release_build_command,
-        release_proof_driver, release_proof_python_with, release_tool_path,
+        RELEASE_PROOF_PYTHON_FLAGS, RELEASE_SYSTEM_PATH, ReleaseProofDriver, ReleaseProofLane,
+        SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, cargo_build_args,
+        cleanup_release_target_residue_with, create_private_release_directory, current_release_uid,
+        fresh_lease_token, is_lower_hex, make_executable, parse_thin_macho_update_pin,
+        prepare_release_target_parent, publish_verified_binary, publish_verified_symbols,
+        release_build_command, release_proof_driver, release_proof_python_with, release_tool_path,
         resolve_release_proof_driver, resolve_release_rustup_shim_dir,
         validate_app_version_reports, validate_cli_app_version, validate_embedded_update_pin,
         validate_final_slice_records, validate_lipo_architectures, validate_named_cli_app_version,
         validate_slice_update_pin_reports, write_release_target_owner,
     };
+
+    /// The release proof's Python runs isolated (`-I`), and isolated mode ignores
+    /// PYTHONDONTWRITEBYTECODE — so without `-B` an import writes `__pycache__` into
+    /// the source tree the proof fingerprinted, and the snapshot comparison sees a
+    /// tree that changed under it. Drives the real interpreter with the real flags,
+    /// against an environment that asks for the OPPOSITE, and requires the imported
+    /// module's directory to hold nothing but the module afterwards.
+    #[test]
+    fn isolated_proof_imports_never_write_bytecode_into_source() {
+        let output = std::process::Command::new("/usr/bin/python3")
+            .args(RELEASE_PROOF_PYTHON_FLAGS)
+            .args([
+                "-c",
+                "import pathlib,sys,tempfile; assert sys.flags.isolated; assert sys.dont_write_bytecode; scratch=tempfile.TemporaryDirectory(prefix='aterm-proof-bytecode-'); root=pathlib.Path(scratch.name); module=root/'aterm_proof_import_fixture.py'; module.write_text('VALUE = 1\\n'); sys.path.insert(0,str(root)); import aterm_proof_import_fixture; assert aterm_proof_import_fixture.VALUE == 1; assert sorted(p.name for p in root.iterdir()) == [module.name]",
+            ])
+            .env_clear()
+            // Intentionally ineffective under -I: the explicit flag must carry the
+            // invariant even when the environment disagrees.
+            .env("PYTHONDONTWRITEBYTECODE", "0")
+            .output()
+            .expect("run isolated proof Python import regression");
+        assert!(
+            output.status.success(),
+            "isolated import mutated source: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     const EXPECTED: &str = "529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4";
     const WRONG: &str = "b8d47d9179feb56b1cbbe61c000b81f18d1ac152507d8abd320e2a2297890f1f";
@@ -2935,6 +2973,7 @@ mod tests {
         };
         let cmd = release_proof_python_with(&scratch.0, &script, home.as_os_str(), &store).unwrap();
         let args = argv(&cmd);
+        assert_eq!(&args[..3], &["-I", "-S", "-B"]);
         let cargo_at = args
             .iter()
             .position(|a| a == "--cargo")
@@ -2965,6 +3004,7 @@ mod tests {
         let cmd =
             release_proof_python_with(&scratch.0, &script, home.as_os_str(), &rustup).unwrap();
         let args = argv(&cmd);
+        assert_eq!(&args[..3], &["-I", "-S", "-B"]);
         assert!(
             args.windows(2)
                 .any(|w| { w[0] == "--cargo" && w[1] == shims.join("cargo").to_string_lossy() })
@@ -3099,6 +3139,208 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--target", "x86_64-apple-darwin"])
         );
+    }
+
+    /// THE CUTTER NEVER COMPILES A DEVELOPMENT SEAM (2026-09-23). Every
+    /// `aterm_types::dev_seam!` read — `ATPKG_REGISTRY`, `ATERM_UPDATE_ROOT`, the
+    /// handoff deadlines, the `ATERM_DEBUG_*` seams — and every development setting
+    /// (`[update]` owner/repo/require_team_id, `[packages]` prefix/account/repo links)
+    /// compiles only under `cfg(any(debug_assertions, feature = "dev-seams"))`. A
+    /// release build has no `debug_assertions`, so the one way a shipped binary could
+    /// carry a seam is the feature — and this pins the three ways it could arrive: the
+    /// argv (no `--features`/`-F`/`--all-features`, nothing naming the feature), the
+    /// build's environment (cleared, so no inherited `RUSTFLAGS` can add
+    /// `--cfg feature="dev-seams"`), and the manifests (no crate enables it by default
+    /// or through a dependency — only the `dev-seams` feature lists forward it).
+    #[test]
+    fn the_release_build_enables_no_development_seam() {
+        let config = std::path::Path::new("/private/take/.cargo/config.toml");
+        let manifest = std::path::Path::new("/private/take/Cargo.toml");
+        for target in [None, Some("x86_64-apple-darwin")] {
+            let args: Vec<String> = cargo_build_args(config, config, manifest, "aterm", target)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            for arg in &args {
+                assert!(
+                    !arg.starts_with("--features")
+                        && arg != "-F"
+                        && arg != "--all-features"
+                        && !arg.contains("dev-seams")
+                        && !arg.contains("debug-assertions")
+                        && !arg.contains("debug_assertions"),
+                    "{target:?}: the release build names a feature or debug assertions: {args:?}"
+                );
+            }
+            assert!(
+                args.iter().any(|a| a == "--release")
+                    && !args
+                        .iter()
+                        .any(|a| a == "--profile" || a.starts_with("--profile=")),
+                "{target:?}: the cutter builds the `release` profile the pins below read: {args:?}"
+            );
+        }
+        let src = include_str!("buildplan.rs");
+        let body = &src[src.find("\nfn build_one(").expect("build_one")..];
+        let body = &body[..body[1..].find("\nfn ").map_or(body.len(), |i| i + 1)];
+        let clear = body
+            .find("cmd.env_clear();")
+            .expect("the build env is cleared");
+        let args = body.find("cmd.args(cargo_build_args(").expect("the argv");
+        assert!(
+            args < clear,
+            "the environment is cleared after the argv is set"
+        );
+        assert!(
+            !body.contains(".env(\"RUSTFLAGS\"")
+                && !body.contains(".env(\"CARGO_ENCODED_RUSTFLAGS\"")
+                && !body.contains(".env(\"CARGO_BUILD_RUSTFLAGS\""),
+            "no rustflags are handed to the release build"
+        );
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let mut manifests = vec![root.join("Cargo.toml")];
+        for entry in std::fs::read_dir(root.join("crates"))
+            .expect("crates/")
+            .flatten()
+        {
+            let path = entry.path().join("Cargo.toml");
+            if path.is_file() {
+                manifests.push(path);
+            }
+        }
+        assert!(manifests.len() > 20, "found {} manifests", manifests.len());
+        let mut forwarders = 0usize;
+        for path in &manifests {
+            let text = std::fs::read_to_string(path).expect("manifest");
+            let doc: aterm_toml::Table =
+                aterm_toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let shown = path.display();
+            if let Some(features) = doc.get("features").and_then(|f| f.as_table()) {
+                for (name, list) in features.iter() {
+                    let names_seam = list.as_array().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|i| i.as_str().is_some_and(|v| v.contains("dev-seams")))
+                    });
+                    if name == "dev-seams" {
+                        forwarders += 1;
+                    } else {
+                        assert!(
+                            !names_seam,
+                            "{shown}: feature `{name}` enables a development seam"
+                        );
+                    }
+                }
+            }
+            // Every dependency table, however it is spelled: a `features = [..]`
+            // that names the seam compiles it into whatever depends on it.
+            let mut tables: Vec<&aterm_toml::Table> = Vec::new();
+            for key in ["dependencies", "build-dependencies", "workspace"] {
+                if let Some(t) = doc.get(key).and_then(|t| t.as_table()) {
+                    tables.push(t);
+                    if let Some(deps) = t.get("dependencies").and_then(|d| d.as_table()) {
+                        tables.push(deps);
+                    }
+                }
+            }
+            if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
+                for spec in targets.values().filter_map(|v| v.as_table()) {
+                    for key in ["dependencies", "build-dependencies"] {
+                        if let Some(t) = spec.get(key).and_then(|t| t.as_table()) {
+                            tables.push(t);
+                        }
+                    }
+                }
+            }
+            for table in tables {
+                for (dep, spec) in table.iter() {
+                    let enables = spec
+                        .as_table()
+                        .and_then(|t| t.get("features"))
+                        .and_then(|f| f.as_array())
+                        .is_some_and(|items| items.iter().any(|i| i.as_str() == Some("dev-seams")));
+                    assert!(!enables, "{shown}: `{dep}` is depended on with dev-seams");
+                }
+            }
+        }
+        assert!(
+            forwarders >= 6,
+            "the seam feature is declared by every crate that reads a seam; found {forwarders}"
+        );
+
+        // DEBUG ASSERTIONS TURN THE SEAMS ON TOO (2026-09-23 review): `dev_seam!` compiles
+        // under `cfg(any(debug_assertions, feature = "dev-seams"))`, so a
+        // `debug-assertions = true` in the release profile — added for overflow checks,
+        // say — or a `-C debug-assertions` / `--cfg feature="dev-seams"` in the config the
+        // cutter passes (`--config <take>/.cargo/config.toml`) would make every shipped
+        // binary honour ATPKG_REGISTRY, ATERM_UPDATE_ROOT and the `[packages]`/`[update]`
+        // development settings, with every pin above still green.
+        let workspace: aterm_toml::Table =
+            aterm_toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap())
+                .unwrap();
+        let release = workspace
+            .get("profile")
+            .and_then(|p| p.as_table())
+            .and_then(|p| p.get("release"))
+            .and_then(|r| r.as_table())
+            .expect("the workspace declares [profile.release]");
+        assert_no_debug_assertions("Cargo.toml [profile.release]", release);
+        let config_path = root.join(".cargo/config.toml");
+        let config: aterm_toml::Table =
+            aterm_toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_no_debug_assertions(".cargo/config.toml", &config);
+        // Non-vacuity: the walk sees a key set anywhere in a table, and a flag string.
+        let armed: aterm_toml::Table =
+            aterm_toml::from_str("[package.aterm-gui]\ndebug-assertions = true\n").unwrap();
+        assert!(
+            std::panic::catch_unwind(|| assert_no_debug_assertions("fixture", &armed)).is_err()
+        );
+        let flagged: aterm_toml::Table =
+            aterm_toml::from_str("[build]\nrustflags = [\"-C\", \"debug-assertions=on\"]\n")
+                .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| assert_no_debug_assertions("fixture", &flagged)).is_err()
+        );
+    }
+
+    /// No table under `table` turns debug assertions (and so the development seams) on:
+    /// no `debug-assertions = true` at any depth (a profile, a `package.*` override, a
+    /// `build-override`), and no string (a rustflags entry) naming `debug-assertions`,
+    /// `debug_assertions` or `dev-seams`.
+    fn assert_no_debug_assertions(shown: &str, table: &aterm_toml::Table) {
+        fn walk(shown: &str, path: &str, value: &aterm_toml::Value) {
+            match value {
+                aterm_toml::Value::Table(t) => {
+                    for (key, v) in t.iter() {
+                        let here = format!("{path}.{key}");
+                        assert!(
+                            !(key == "debug-assertions" && v.as_bool() != Some(false)),
+                            "{shown}: `{here}` turns debug assertions on — and with them \
+                             every development seam in a shipped binary"
+                        );
+                        walk(shown, &here, v);
+                    }
+                }
+                aterm_toml::Value::Array(items) => {
+                    for item in items {
+                        walk(shown, path, item);
+                    }
+                }
+                aterm_toml::Value::String(text) => {
+                    for needle in ["debug-assertions", "debug_assertions", "dev-seams"] {
+                        assert!(
+                            !text.contains(needle),
+                            "{shown}: `{path}` = {text:?} names {needle}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(shown, "", &aterm_toml::Value::Table(table.clone()));
     }
 
     #[test]
@@ -3559,7 +3801,10 @@ mod tests {
             std::fs::read_to_string(out.join("aterm-0.67.0-dSYM.zip")).unwrap(),
             "archive"
         );
-        assert!(out.join(".metadata_never_index").is_file());
+        assert!(
+            !out.join(".metadata_never_index").exists(),
+            "no build-output marker: inert for Spotlight, and nothing reads it any more"
+        );
         let out_metadata = std::fs::symlink_metadata(out).unwrap();
         assert_eq!(out_metadata.uid(), current_release_uid().unwrap());
         assert_eq!(out_metadata.permissions().mode() & 0o777, 0o700);

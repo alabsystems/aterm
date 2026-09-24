@@ -9,7 +9,7 @@
 //! keyboard, amber while a human should look (a prompt, a question, a typed
 //! escalation), red at a wall (a usage limit) and doubled, with a faint wash,
 //! under a hold. The BAND is one chrome row under the tab bar
-//! (`status_bars::Lane::Presence`) with six fixed slots in a fixed order —
+//! (`message_band::BandTarget::Presence`) with six fixed slots in a fixed order —
 //! role · phase since · hand · mail · ctx · fabric — so a glance reads left to
 //! right and a screen reader gets the same sentence
 //! (`accesskit_tree::ChromeMessage::PresenceStatus`).
@@ -18,7 +18,7 @@
 //!
 //! * The rim is CHANGE-DRIVEN. Nothing in this module reads a clock on the frame
 //!   path: the per-window view is rebuilt only when a fact changes (a lease, a
-//!   hold, mail, a status revision, `meta set`), and the repaint key's
+//!   hold, mail, a published agent verdict, `meta set`), and the repaint key's
 //!   `presence_fp` is exactly `0` on a quiet window — an idle desktop pays
 //!   nothing for this feature ([`WindowView::fp`]).
 //! * The rim never carries a fact the band does not say in words: [`Rim`] is
@@ -36,11 +36,13 @@
 //!   [`crate::motion::MotionEffect::PresenceRipple`]) has amplitude 0 and the
 //!   frame is the same image as the steady rim.
 //!
-//! The agent PHASE (busy / prompt / question / limited / idle / survey) comes
-//! from `aterm_phase::worker_phase` over the last [`CLASSIFY_ROWS`] rows of the
-//! screen — run ONLY when the session's status revision moves
-//! (`session_status.rs`'s own gate), never per frame; the test-only
-//! [`classifier_calls`] counter is the gate's proof.
+//! The agent PHASE (busy / prompt / question / limited / idle / survey) is the
+//! SERVER'S published verdict ([`agent_verdict`], run by the status sweep in
+//! `session_status.rs`): `aterm_phase`'s readers over the last
+//! [`CLASSIFY_ROWS`] rows, applied only to a session identified as an agent,
+//! and re-run only when the content moved AND those rows changed — at most
+//! 4 Hz per session, never per frame; the test-only [`classifier_calls`]
+//! counter is the gate's proof. This module only folds that verdict in.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -50,7 +52,19 @@ use aterm_session::SessionId;
 use winit::event_loop::EventLoopProxy;
 
 use crate::Wake;
-use crate::status_bars::Tone;
+
+/// The colour mood of a chrome row — information, a good end, or something
+/// the user should look at. The presence row's phase slot reads it
+/// ([`Words::tone`]); the message band paints it through
+/// `message_band::paint_presence_row`. Moved here from the retired status
+/// bars (2026-09-22), whose two lanes shared it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Tone {
+    #[default]
+    Info,
+    Success,
+    Warn,
+}
 
 // ---------------------------------------------------------------------------
 // The wakes: how a change on the control thread reaches the main thread.
@@ -107,7 +121,7 @@ thread_local! {
 }
 
 /// How many times the agent-phase classifier has run ON THIS THREAD — the
-/// count the classifier-gate test compares against status-revision moves.
+/// count the classifier-gate test compares against screen changes.
 /// Thread-local because a headless test drives its App on its own thread
 /// and the suite runs tests in parallel.
 #[cfg(test)]
@@ -123,8 +137,9 @@ pub(crate) struct AgentReading {
     pub(crate) context_pct: Option<u8>,
 }
 
-/// The worker's phase as the band spells it. `Limited` keeps only the RESET
-/// time the notice named — never the notice text (the never-shown law).
+/// The worker's phase as the band spells it. `Wall` keeps only the wall's
+/// KIND and the RESET time the notice named — never the notice text (the
+/// never-shown law).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentPhase {
     Busy,
@@ -134,7 +149,12 @@ pub(crate) enum AgentPhase {
         detail: Option<String>,
     },
     Question,
-    Limited {
+    /// The last turn ended on a wall ([`aterm_phase::Wall`]): a usage window,
+    /// a model bucket, spend, a full context, a lost login, an API error, an
+    /// overload. The worker sits at an idle composer and will not move on its
+    /// own (an overload or a retryable API error only after a retry).
+    Wall {
+        kind: aterm_phase::WallKind,
         reset: Option<String>,
         /// When the reset falls, if the notice's time could be placed on this
         /// machine's clock ([`countdown_to_reset`]): the band counts DOWN to
@@ -146,61 +166,299 @@ pub(crate) enum AgentPhase {
     Idle,
     /// Idle with the session survey parked above the composer.
     Survey,
+    /// An identified agent whose reader has no EVIDENCE for a phase
+    /// ([`aterm_phase::Reading::phase_authoritative`] false — a Codex screen
+    /// outside its choice box): its default `idle` is not published as idle,
+    /// since whatever acts on an idle worker would act on a guess.
+    Unknown,
 }
 
 impl AgentPhase {
-    /// The phase word the band prints.
+    /// The `agent=` wire word (`wall:<kind>` for a wall — [`wall_word`]).
     pub(crate) fn word(&self) -> &'static str {
         match self {
             Self::Busy => "busy",
             Self::Prompt { .. } => "prompt",
             Self::Question => "question",
-            Self::Limited { .. } => "limited",
+            Self::Wall { kind, .. } => wall_word(*kind),
             Self::Idle => "idle",
             Self::Survey => "survey",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The word the band prints: [`Self::word`], except that a wall the band
+    /// has always called `limited` (a usage window, a model bucket, spend, an
+    /// API rate limit — [`aterm_phase::WallKind::reads_limited`]) keeps that
+    /// word (design §1: `limited → 19:30 · 1d 22h`), and any other wall is
+    /// its kind (`overloaded`, `context`).
+    pub(crate) fn band_word(&self) -> &'static str {
+        match self {
+            Self::Wall { kind, .. } if kind.reads_limited() => "limited",
+            Self::Wall { kind, .. } => kind.name(),
+            other => other.word(),
         }
     }
 }
 
-/// Classify one screen. The ONLY caller of `aterm_phase` in this crate, so the
-/// test counter is total; `rows` is the tail the App cut at [`CLASSIFY_ROWS`].
-pub(crate) fn classify(rows: &[String], now: Instant) -> AgentReading {
+/// Whether `agent=wall:<kind>`'s `<kind>` is a LIMIT wall: one aterm-phase
+/// always reads as a limit ([`aterm_phase::WallKind::reads_limited`]) — a
+/// usage window, a model bucket, spend. The retired `agent=limited` word
+/// named these, and the supervise engine escalates them itself (a limit
+/// episode). An `api-error` is not one here: the word does not carry the one
+/// status (429) that makes it a limit.
+pub(crate) fn wall_kind_is_limit(kind: &str) -> bool {
+    use aterm_phase::WallKind as K;
+    [
+        K::UsageSession,
+        K::UsageWeekly,
+        K::ModelBucket { consent: false },
+        K::Spend,
+        K::Context,
+        K::Auth,
+        K::ApiError {
+            code: None,
+            retryable: false,
+        },
+        K::Overloaded,
+    ]
+    .iter()
+    .find(|k| k.name() == kind)
+    .is_some_and(K::reads_limited)
+}
+
+/// `wall:<kind>` for a wall kind — `status agent=`'s spelling, `wall:` and
+/// [`aterm_phase::WallKind::name`] (pinned by a test). Static because a
+/// published verdict word is.
+pub(crate) fn wall_word(kind: aterm_phase::WallKind) -> &'static str {
+    use aterm_phase::WallKind as K;
+    match kind {
+        K::UsageSession => "wall:usage-session",
+        K::UsageWeekly => "wall:usage-weekly",
+        K::ModelBucket { .. } => "wall:model-bucket",
+        K::Spend => "wall:spend",
+        K::Context => "wall:context",
+        K::Auth => "wall:auth",
+        K::ApiError { .. } => "wall:api-error",
+        K::Overloaded => "wall:overloaded",
+    }
+}
+
+/// The server's agent verdict on one screen: not an agent, or an agent's
+/// reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgentVerdict {
+    /// The foreground program is not an identified agent: `agent=-`, no band
+    /// phase, no rim. A shell whose last line ends in `?` lands here.
+    NotAgent,
+    /// An identified agent's reading. `by_frame` is true when only Claude
+    /// Code's own screen (its composer frame, or one of its boxes) identified
+    /// it (the caller keeps that identity for the rest of the foreground job,
+    /// since an approval box hides the frame). `subject` is the approval
+    /// box's command or path, folded to one clipped line, for the host's own
+    /// menu row and notification ([`crate::status_item::escalation`]) — never
+    /// for the wire or the band; `None` unless the phase is a prompt.
+    Agent {
+        reading: AgentReading,
+        by_frame: bool,
+        subject: Option<String>,
+        /// Which program's reader read it — by name or by its screen.
+        program: aterm_phase::Program,
+    },
+}
+
+impl AgentVerdict {
+    /// The `agent=` wire word: the phase word, or `-` for [`Self::NotAgent`].
+    pub(crate) fn word(&self) -> &'static str {
+        match self {
+            Self::NotAgent => "-",
+            Self::Agent { reading, .. } => reading.phase.word(),
+        }
+    }
+
+    /// The `agent_detail=` value (raw; the wire pct-encodes it): a prompt's
+    /// `kind[:verdict]`, a wall's reset time, `None` otherwise.
+    pub(crate) fn detail(&self) -> Option<String> {
+        match self {
+            Self::Agent { reading, .. } => match &reading.phase {
+                AgentPhase::Prompt { detail } => detail.clone(),
+                AgentPhase::Wall { reset, .. } => reset.clone(),
+                _ => None,
+            },
+            Self::NotAgent => None,
+        }
+    }
+
+    /// The agent the verdict is of (its reader's program), when it is one.
+    pub(crate) fn program(&self) -> Option<aterm_phase::Program> {
+        match self {
+            Self::Agent { program, .. } => Some(*program),
+            Self::NotAgent => None,
+        }
+    }
+
+    /// The reading, when there is one.
+    pub(crate) fn reading(&self) -> Option<&AgentReading> {
+        match self {
+            Self::Agent { reading, .. } => Some(reading),
+            Self::NotAgent => None,
+        }
+    }
+
+    /// The box's command or path, host-side only (see [`Self::Agent`]).
+    pub(crate) fn subject(&self) -> Option<&str> {
+        match self {
+            Self::Agent { subject, .. } => subject.as_deref(),
+            Self::NotAgent => None,
+        }
+    }
+}
+
+/// THE ONE ADAPTER between a session's screen and its published agent
+/// verdict. Per-vendor screen knowledge stays in `aterm_phase` — its
+/// per-program readers ([`aterm_phase::identify`]); this only decides WHICH
+/// reader to ask, and whether to ask at all: a session whose foreground
+/// program is an identified agent (`claude`, `codex`) gets that program's
+/// reader; one `known_agent` already (identified by Claude Code's screen
+/// earlier in this foreground job) keeps the Claude reader; one whose program
+/// is a runtime an agent runs under ([`aterm_phase::may_host_agent`]) or cannot be
+/// known (no foreground group to name) is identified by its SCREEN
+/// (`identify(None, rows)`: Claude Code's composer frame or one of its boxes,
+/// a Codex choice box). A program still being RESOLVED (`program_pending`: a
+/// group, no name yet) identifies nothing until it is named — a shell's own
+/// group is re-named after every job, and a frame left on screen by `cat`
+/// must not flash an agent verdict in that gap. Anything else, and any screen
+/// the generic reader gets, is [`AgentVerdict::NotAgent`] — a shell never
+/// reads as a question, not even one that has just `cat`-ed a captured
+/// Claude screen.
+pub(crate) fn agent_verdict(
+    program: Option<&str>,
+    program_pending: bool,
+    known_agent: bool,
+    rows: &[String],
+    now: Instant,
+) -> AgentVerdict {
+    use aterm_phase::{Program, ScreenReader};
+    // The one name table is aterm-phase's (`program_of`, `may_host_agent`).
+    let by_program = program.is_some_and(|p| aterm_phase::program_of(p).is_some());
+    // A frame identification made while the program was unresolved does not
+    // survive the program resolving to something that cannot host an agent.
+    let frame_may_identify = program.map_or(!program_pending, aterm_phase::may_host_agent);
+    let known_agent = known_agent && frame_may_identify;
+    let (reader, by_frame): (&dyn ScreenReader, bool) = if by_program {
+        (aterm_phase::identify(program, rows), false)
+    } else if known_agent {
+        (&aterm_phase::ClaudeReader, false)
+    } else if frame_may_identify {
+        let reader = aterm_phase::identify(None, rows);
+        match reader.program() {
+            Program::Generic => return AgentVerdict::NotAgent,
+            // Only Claude Code's identity is carried across its boxes.
+            p => (reader, p == Program::Claude),
+        }
+    } else {
+        return AgentVerdict::NotAgent;
+    };
+    let (reading, subject) = classify(reader, rows, now);
+    AgentVerdict::Agent {
+        reading,
+        by_frame,
+        subject,
+        program: reader.program(),
+    }
+}
+
+/// Classify one screen with one program's reader: the reading, and the
+/// box's command or path for the host's menu row ([`AgentVerdict::Agent`]).
+/// The ONLY caller of `aterm_phase`'s readers in this crate, so the test
+/// counter is total; `rows` is the tail cut at [`CLASSIFY_ROWS`]. Callers go
+/// through [`agent_verdict`].
+///
+/// A reading that is not [`aterm_phase::Reading::phase_authoritative`] is
+/// [`AgentPhase::Unknown`], whatever its default phase. A wall
+/// ([`aterm_phase::Reading::wall`], which the reader leaves `None` under a
+/// box and a hard busy) outranks the phase it ended on — `idle`, `question`,
+/// a background monitor's soft busy: the worker will not move past it.
+pub(crate) fn classify(
+    reader: &dyn aterm_phase::ScreenReader,
+    rows: &[String],
+    now: Instant,
+) -> (AgentReading, Option<String>) {
     #[cfg(test)]
     CLASSIFIER_CALLS.with(|c| c.set(c.get() + 1));
-    let phase = match aterm_phase::worker_phase(rows) {
-        aterm_phase::Phase::Busy => AgentPhase::Busy,
-        aterm_phase::Phase::Prompt => AgentPhase::Prompt {
-            detail: aterm_phase::parse_prompt(rows).map(|p| prompt_detail(&p)),
-        },
-        aterm_phase::Phase::Question => AgentPhase::Question,
-        aterm_phase::Phase::Limited { reset, .. } => {
-            let until = reset
-                .as_deref()
-                .and_then(countdown_to_reset)
-                .map(|d| now + d);
-            AgentPhase::Limited {
-                reset: reset.map(|r| sanitize_token(&r, 32)),
-                until,
-            }
-        }
-        aterm_phase::Phase::Idle => {
-            if aterm_phase::survey_open(rows) {
-                AgentPhase::Survey
-            } else {
-                AgentPhase::Idle
-            }
+    let r = reader.read(rows, None);
+    let wall = |kind: aterm_phase::WallKind, reset: Option<String>| {
+        let until = reset
+            .as_deref()
+            .and_then(countdown_to_reset)
+            .map(|d| now + d);
+        AgentPhase::Wall {
+            kind,
+            reset: reset.map(|r| sanitize_token(&r, 32)),
+            until,
         }
     };
-    AgentReading {
-        phase,
-        context_pct: aterm_phase::context_left(rows),
-    }
+    let mut subject = None;
+    let phase = if !r.phase_authoritative {
+        AgentPhase::Unknown
+    } else if let Some(w) = r.wall {
+        wall(w.kind, w.reset)
+    } else {
+        match r.phase {
+            aterm_phase::Phase::Busy => AgentPhase::Busy,
+            aterm_phase::Phase::Prompt => {
+                subject = r
+                    .prompt
+                    .as_ref()
+                    .map(|p| crate::status_item::fold_clip(&p.command, 96))
+                    .filter(|s| !s.is_empty());
+                AgentPhase::Prompt {
+                    detail: r.prompt.as_ref().map(prompt_detail),
+                }
+            }
+            aterm_phase::Phase::Question => AgentPhase::Question,
+            // `worker_phase` names a limit only where `wall` places one, so
+            // this arm is the belt to that brace: name the kind from the
+            // notice's own words, a usage window when the table has none.
+            aterm_phase::Phase::Limited { message, reset } => wall(
+                aterm_phase::classify_wall(&message).unwrap_or(aterm_phase::WallKind::UsageSession),
+                reset,
+            ),
+            aterm_phase::Phase::Idle if r.survey => AgentPhase::Survey,
+            aterm_phase::Phase::Idle => AgentPhase::Idle,
+        }
+    };
+    (
+        AgentReading {
+            phase,
+            context_pct: r.context_left,
+        },
+        subject,
+    )
 }
 
-/// The prompt's kind word, and — for a tool approval — the classifier's verdict
-/// on it. The command itself is never carried.
-fn prompt_detail(p: &aterm_phase::Prompt) -> String {
-    sanitize_token(p.kind.name(), 24)
+/// The prompt's kind word, and — for a Bash approval — the read-only
+/// classifier's verdict on it (`bash:read-only`, `bash:not-read-only`). The
+/// command itself is never carried. `read-only` only when EVERY reading of
+/// the box's command rows ([`aterm_phase::PromptV2::readings`]) is read-only,
+/// and never for a box with no command rows. Advisory: the supervisor's own
+/// decider decides.
+fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
+    let kind = sanitize_token(p.kind.name(), 24);
+    if p.kind != aterm_phase::PromptKind::Bash || p.command.trim().is_empty() {
+        return kind;
+    }
+    let readings = p.readings();
+    let read_only = !readings.is_empty()
+        && readings
+            .iter()
+            .all(|r| aterm_agent::supervise::classify::classify_command(r).read_only);
+    let verdict = if read_only {
+        "read-only"
+    } else {
+        "not-read-only"
+    };
+    format!("{kind}:{verdict}")
 }
 
 // ---------------------------------------------------------------------------
@@ -394,9 +652,10 @@ fn countdown_at(spec: &ResetSpec, now: i64, offset: i64) -> Option<Duration> {
 }
 
 /// The local clock's offset from UTC in seconds, from `date +%z`, read once;
-/// `None` where it cannot be run — then no figure is ever printed.
+/// `None` where it cannot be run — then no figure is ever printed. (Settings ▸
+/// Packages reads its clock per instant instead, [`local_offset_at`].)
 #[cfg(unix)]
-fn local_offset_s() -> Option<i64> {
+pub(crate) fn local_offset_s() -> Option<i64> {
     static OFFSET: OnceLock<Option<i64>> = OnceLock::new();
     *OFFSET.get_or_init(|| {
         let out = std::process::Command::new("date")
@@ -413,7 +672,36 @@ fn local_offset_s() -> Option<i64> {
 }
 
 #[cfg(not(unix))]
-fn local_offset_s() -> Option<i64> {
+pub(crate) fn local_offset_s() -> Option<i64> {
+    None
+}
+
+/// The local zone's offset from UTC AT the instant `unix`, in seconds — `date -r <unix>
+/// +%z` (BSD) / `date -d @<unix> +%z` (GNU): the offset daylight saving gave that instant,
+/// not today's. Uncached and a subprocess each call, so a WORKER's only (Settings ▸
+/// Packages' clock, `packages_screen::LocalClock::read`); `None` where `date` cannot say.
+#[cfg(unix)]
+pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
+    let mut date = std::process::Command::new("date");
+    if cfg!(target_os = "macos") {
+        date.arg("-r").arg(unix.to_string());
+    } else {
+        date.arg("-d").arg(format!("@{unix}"));
+    }
+    let out = date
+        .arg("+%z")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_utc_offset(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_offset_at(_unix: i64) -> Option<i64> {
     None
 }
 
@@ -535,9 +823,12 @@ pub(crate) struct Facts {
     /// The shell status word (`running`, `idle`, `quiet`, …) and when it was
     /// published — the phase the band shows when no agent reading exists.
     pub(crate) shell: Option<(&'static str, Instant)>,
-    /// The session status REVISION: the agent classifier runs only when this
-    /// moves, and `agent` is `Some` exactly then.
-    pub(crate) revision: u64,
+    /// The sequence number of the server's agent reading
+    /// (`StatusObserver::agent_reading`): `agent` is folded in only when this
+    /// is NEWER than the one the slot last absorbed; `0` = never read.
+    pub(crate) agent_seq: u64,
+    /// The server's agent reading at `agent_seq` — `None` for a session that
+    /// is not an identified agent.
     pub(crate) agent: Option<AgentReading>,
     pub(crate) hand: Hand,
     /// When a cooperative drive lease LAPSES (`Lease::Drive`'s TTL): nothing
@@ -556,7 +847,7 @@ impl Default for Facts {
             role: None,
             attention: None,
             shell: None,
-            revision: 0,
+            agent_seq: 0,
             agent: None,
             hand: Hand::None,
             lease_until: None,
@@ -679,10 +970,11 @@ pub(crate) struct StoryPoint {
 /// A session's presence, as the last refresh left it.
 #[derive(Clone, Debug)]
 pub(crate) struct Slot {
-    /// The status revision the agent reading was classified at; `None` before
-    /// the first classification. THE GATE: the classifier runs again only when
-    /// the revision moves past this — never per refresh, never per frame.
-    pub(crate) revision_seen: Option<u64>,
+    /// The agent-reading sequence last absorbed ([`Facts::agent_seq`]); `None`
+    /// before the first. The classifier itself runs in the status sweep, never
+    /// per refresh or per frame; this only keeps a refresh from re-folding a
+    /// reading it already has.
+    pub(crate) agent_seq_seen: Option<u64>,
     pub(crate) role: Option<String>,
     pub(crate) attention: Option<String>,
     pub(crate) shell: Option<(&'static str, Instant)>,
@@ -720,7 +1012,7 @@ pub(crate) struct Slot {
 impl Slot {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
-            revision_seen: None,
+            agent_seq_seen: None,
             role: None,
             attention: None,
             shell: None,
@@ -797,15 +1089,16 @@ impl Slot {
             changed = true;
         }
         self.shell = facts.shell;
-        if let Some(agent) = facts.agent {
-            self.revision_seen = Some(facts.revision);
-            let word_moved =
-                self.agent.as_ref().map(|a| a.phase.word()) != Some(agent.phase.word());
+        if facts.agent_seq > self.agent_seq_seen.unwrap_or(0) {
+            self.agent_seq_seen = Some(facts.agent_seq);
+            let agent = facts.agent;
+            let word_moved = self.agent.as_ref().map(|a| a.phase.word())
+                != agent.as_ref().map(|a| a.phase.word());
             if word_moved {
                 self.agent_since = now;
-                match agent.phase {
-                    AgentPhase::Question => self.note(StoryVerb::Question, now),
-                    AgentPhase::Limited { .. } => {
+                match agent.as_ref().map(|a| &a.phase) {
+                    Some(AgentPhase::Question) => self.note(StoryVerb::Question, now),
+                    Some(AgentPhase::Wall { .. }) => {
                         self.note(StoryVerb::Limited, now);
                         self.stop_began = Some((StoryVerb::Limited, now));
                     }
@@ -813,16 +1106,18 @@ impl Slot {
                 }
                 if matches!(
                     self.agent.as_ref().map(|a| &a.phase),
-                    Some(AgentPhase::Limited { .. })
-                ) && !matches!(agent.phase, AgentPhase::Limited { .. })
-                {
+                    Some(AgentPhase::Wall { .. })
+                ) && !matches!(
+                    agent.as_ref().map(|a| &a.phase),
+                    Some(AgentPhase::Wall { .. })
+                ) {
                     self.note(StoryVerb::Resumed, now);
                 }
             }
-            if self.agent.as_ref() != Some(&agent) {
+            if self.agent != agent {
                 changed = true;
             }
-            self.agent = Some(agent);
+            self.agent = agent;
         }
         if self.hand != facts.hand {
             self.hand = facts.hand;
@@ -883,7 +1178,7 @@ impl Slot {
         }
         if matches!(
             self.agent.as_ref().map(|a| &a.phase),
-            Some(AgentPhase::Limited { .. })
+            Some(AgentPhase::Wall { .. })
         ) {
             return Level::Limited;
         }
@@ -921,6 +1216,36 @@ impl Slot {
         Level::Quiet
     }
 
+    /// WHY the slot stands at [`Level::Attention`] (`status why=`): the causes
+    /// the level merges, comma-joined in a fixed order — `prompt` (an approval
+    /// box), `question` (the agent asked), `escalation` (a typed `meta
+    /// attention`), `mail` (an unread task/ask with no hand on the session).
+    /// `-` at any other level.
+    pub(crate) fn why(&self, watermark: u64) -> String {
+        if self.level(watermark) != Level::Attention {
+            return "-".to_string();
+        }
+        let phase = self.agent.as_ref().map(|a| &a.phase);
+        let mut causes = Vec::new();
+        if matches!(phase, Some(AgentPhase::Prompt { .. })) {
+            causes.push("prompt");
+        }
+        if matches!(phase, Some(AgentPhase::Question)) {
+            causes.push("question");
+        }
+        if self.attention.is_some() {
+            causes.push("escalation");
+        }
+        if matches!(self.hand, Hand::None) && self.unread_wants_a_human() {
+            causes.push("mail");
+        }
+        if causes.is_empty() {
+            "-".to_string()
+        } else {
+            causes.join(",")
+        }
+    }
+
     /// An unread `task` or `ask` is addressed to someone: a wait state.
     fn unread_wants_a_human(&self) -> bool {
         self.mail.unread > 0
@@ -939,7 +1264,7 @@ impl Slot {
             && self.attention.is_none()
             && !matches!(
                 self.agent.as_ref().map(|a| &a.phase),
-                Some(AgentPhase::Prompt { .. } | AgentPhase::Question | AgentPhase::Limited { .. })
+                Some(AgentPhase::Prompt { .. } | AgentPhase::Question | AgentPhase::Wall { .. })
             )
             && !self.unread_wants_a_human()
     }
@@ -970,7 +1295,7 @@ impl Slot {
             StoryVerb::Hold => self.hold.is_some(),
             _ => matches!(
                 self.agent.as_ref().map(|a| &a.phase),
-                Some(AgentPhase::Limited { .. })
+                Some(AgentPhase::Wall { .. })
             ),
         })
     }
@@ -1582,7 +1907,7 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
             ("\u{25c7} quiet".to_string(), clauses, spoken)
         }
     } else if let Some(agent) = &slot.agent {
-        let word = agent.phase.word();
+        let word = agent.phase.band_word();
         let mut clauses = Vec::new();
         let mut spoken = word.to_string();
         match &agent.phase {
@@ -1590,13 +1915,13 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
                 spoken = format!("prompt, {d}");
                 (format!("prompt\u{00b7}{d}"), clauses, spoken)
             }
-            AgentPhase::Limited { reset, until } => {
+            AgentPhase::Wall { reset, until, .. } => {
                 // `limited → 19:30 · 1d 22h`: the reset the notice named, then
                 // the time TO it (design §1; the mock counts down) — never the
                 // time since the limit began, which is the story's to tell.
                 if let Some(r) = reset {
                     clauses.push(format!("\u{2192} {r}"));
-                    spoken = format!("limited, resets {r}");
+                    spoken = format!("{word}, resets {r}");
                 }
                 if let Some(left) = until
                     .map(|u| u.saturating_duration_since(now))
@@ -1899,7 +2224,7 @@ mod tests {
         s.absorb(
             Facts {
                 role: Some("worker:claude-satcomp".into()),
-                revision: 1,
+                agent_seq: 1,
                 agent: Some(AgentReading {
                     phase: AgentPhase::Busy,
                     context_pct: Some(41),
@@ -2023,9 +2348,10 @@ mod tests {
                     holder: None,
                 },
                 attention: Some("needs a decision".into()),
-                revision: 2,
+                agent_seq: 2,
                 agent: Some(AgentReading {
-                    phase: AgentPhase::Limited {
+                    phase: AgentPhase::Wall {
+                        kind: aterm_phase::WallKind::UsageSession,
                         reset: Some("19:30".into()),
                         until: None,
                     },
@@ -2213,7 +2539,7 @@ mod tests {
                     dur_ms: 1,
                     carried: false,
                 }),
-                revision: 1,
+                agent_seq: 1,
                 agent: Some(AgentReading {
                     phase: AgentPhase::Prompt {
                         detail: Some("bash".into()),
@@ -2242,9 +2568,10 @@ mod tests {
                 hand: Hand::DrivenLease {
                     holder: "h\u{7f}older".into(),
                 },
-                revision: 1,
+                agent_seq: 1,
                 agent: Some(AgentReading {
-                    phase: AgentPhase::Limited {
+                    phase: AgentPhase::Wall {
+                        kind: aterm_phase::WallKind::UsageSession,
                         reset: Some("7:30pm".into()),
                         until: None,
                     },
@@ -2304,10 +2631,10 @@ mod tests {
         assert!(v.ripple_deadline(now).is_some());
     }
 
-    /// The classifier is `aterm-phase`'s verdict, word for word, and its count
-    /// moves once per call (the gate test in `app_presence` compares it with
-    /// revision moves). The screens are judged by `aterm_phase` itself, so the
-    /// mapping — not the composer geometry — is what this pins.
+    /// The classifier is `aterm-phase`'s Claude reader, word for word, and its
+    /// count moves once per call (the gate test in `session_status` compares
+    /// it with screen changes). The screens are judged by `aterm_phase`
+    /// itself, so the mapping — not the composer geometry — is what this pins.
     #[test]
     fn classify_is_aterm_phases_verdict_and_counts_once_per_call() {
         let before = classifier_calls();
@@ -2323,27 +2650,156 @@ mod tests {
             rows(&[]),
         ];
         for screen in &screens {
-            let verdict = aterm_phase::worker_phase(screen);
-            let ours = classify(screen, Instant::now());
-            assert_eq!(ours.phase.word(), verdict.name(), "{screen:?}");
-            assert_eq!(ours.context_pct, aterm_phase::context_left(screen));
+            let verdict = aterm_phase::read(Some("claude"), screen, None);
+            let (ours, _) = classify(&aterm_phase::ClaudeReader, screen, Instant::now());
+            assert_eq!(ours.phase.word(), verdict.phase.name(), "{screen:?}");
+            assert_eq!(ours.context_pct, verdict.context_left);
         }
         assert_eq!(classifier_calls() - before, screens.len() as u64);
         // The never-shown law at the classifier's own edge: a limit notice
-        // keeps only its reset, never its message.
-        let limited = classify(
+        // keeps only its kind and its reset, never its message.
+        let (limited, _) = classify(
+            &aterm_phase::ClaudeReader,
             &rows(&[
                 "\u{23fa} You've hit your weekly limit \u{00b7} resets Sep 19 at 11am (America/Los_Angeles)",
                 "",
             ]),
             Instant::now(),
         );
-        if let AgentPhase::Limited { reset, .. } = &limited.phase {
+        if let AgentPhase::Wall { reset, .. } = &limited.phase {
             assert!(
                 reset.as_deref().is_none_or(|r| !r.contains("weekly")),
                 "{reset:?}"
             );
         }
+    }
+
+    /// `agent=wall:<kind>` is `wall:` and aterm-phase's own kind name, for
+    /// every kind; the band keeps `limited` for exactly the kinds
+    /// `worker_phase` has always read so.
+    #[test]
+    fn a_wall_word_is_wall_and_aterm_phases_kind_name() {
+        use aterm_phase::WallKind as K;
+        let kinds = [
+            K::UsageSession,
+            K::UsageWeekly,
+            K::ModelBucket { consent: false },
+            K::ModelBucket { consent: true },
+            K::Spend,
+            K::Context,
+            K::Auth,
+            K::ApiError {
+                code: Some(500),
+                retryable: true,
+            },
+            K::ApiError {
+                code: Some(429),
+                retryable: true,
+            },
+            K::Overloaded,
+        ];
+        for kind in kinds {
+            assert_eq!(wall_word(kind), format!("wall:{}", kind.name()));
+            let phase = AgentPhase::Wall {
+                kind,
+                reset: None,
+                until: None,
+            };
+            let band = if kind.reads_limited() {
+                "limited"
+            } else {
+                kind.name()
+            };
+            assert_eq!(phase.band_word(), band, "{kind:?}");
+        }
+        assert_eq!(AgentPhase::Unknown.word(), "unknown");
+    }
+
+    /// Lane A's fixtures, through the ONE adapter: each wall reads
+    /// `wall:<kind>` under `program=claude` — a 529 included (it read `idle`
+    /// before, and a supervisor trusting idle waited forever), and the real
+    /// Fable screen. NEGATIVE CONTROLS: a tool's output QUOTING `API Error:
+    /// 529` under a `⏺ Bash(…)` call stays `idle`; every wall screen under a
+    /// shell is not an agent.
+    #[test]
+    fn a_wall_is_published_by_kind() {
+        use aterm_phase::prompt::fixtures::{
+            END_529, END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, screen,
+        };
+        let framed = |body: &[&str]| {
+            let mut r: Vec<String> = body.iter().map(|s| s.to_string()).collect();
+            r.extend(composer("  ? for shortcuts"));
+            r
+        };
+        // The real Fable screen cut before its `/model`, as aterm-phase's own
+        // wall test cuts it.
+        let full: Vec<String> = IDLE_AFTER_LIMIT_AND_MODEL_SWITCH
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let mut fable = full[..56].to_vec();
+        fable.extend_from_slice(&full[58..]);
+        let context = framed(&[
+            "\u{23fa} Reading the remaining modules.",
+            "  \u{23bf}  Context limit reached \u{00b7} /compact or /clear to continue",
+            "",
+        ]);
+        let quoted = framed(&[
+            "\u{23fa} Bash(tail -1 build.log)",
+            "  \u{23bf}  API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
+            "",
+        ]);
+        let cases: [(&str, Vec<String>, &str); 5] = [
+            ("529", screen(END_529), "wall:overloaded"),
+            ("session", screen(END_SESSION_LIMIT), "wall:usage-session"),
+            ("fable", fable, "wall:model-bucket"),
+            ("context", context, "wall:context"),
+            ("quoted 529", quoted, "idle"),
+        ];
+        for (name, rows, want) in &cases {
+            let v = agent_verdict(Some("claude"), false, false, rows, t0());
+            assert_eq!(v.word(), *want, "{name}");
+            let shell = agent_verdict(Some("zsh"), false, false, rows, t0());
+            assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
+        }
+        // The detail is the reset the notice named, nothing of its text.
+        let session = agent_verdict(Some("claude"), false, false, &cases[1].1, t0());
+        assert_eq!(
+            session.detail().as_deref(),
+            Some("3pm (America/Los_Angeles)")
+        );
+    }
+
+    /// A reader with no evidence publishes `unknown`, never its default
+    /// `idle`: a Codex screen outside its choice box. NEGATIVE CONTROL: the
+    /// Codex trust gate itself is read, as a prompt with its subject.
+    #[test]
+    fn a_reading_without_evidence_is_unknown_not_idle() {
+        use aterm_phase::prompt::fixtures::{CODEX_TRUST, screen};
+        let idle = screen("\u{203a} ready\n\n  gpt-5 \u{00b7} 100% context left\n");
+        match agent_verdict(Some("codex"), false, false, &idle, t0()) {
+            AgentVerdict::Agent { reading, .. } => {
+                assert_eq!(reading.phase, AgentPhase::Unknown);
+                assert_eq!(reading.phase.word(), "unknown");
+            }
+            AgentVerdict::NotAgent => panic!("codex is an agent by name"),
+        }
+        let gate = agent_verdict(Some("codex"), false, false, &screen(CODEX_TRUST), t0());
+        assert_eq!(gate.word(), "prompt");
+    }
+
+    /// The box's subject rides the verdict, from the same reading: the
+    /// measured rm box names its command; a non-prompt names nothing.
+    #[test]
+    fn the_prompt_subject_comes_from_the_reading() {
+        use aterm_phase::prompt::fixtures::{BOX_RM, END_529, screen};
+        let rm = agent_verdict(Some("claude"), false, false, &screen(BOX_RM), t0());
+        assert_eq!(rm.word(), "prompt");
+        let subject = rm.subject().expect("the rm box names its command");
+        assert!(subject.contains("rm"), "{subject}");
+        assert!(!subject.contains('\n'));
+        let wall = agent_verdict(Some("claude"), false, false, &screen(END_529), t0());
+        assert_eq!(wall.subject(), None);
     }
 
     /// The reset clock reads the notice's own words: a bare time, a 12-hour
@@ -2605,5 +3061,136 @@ mod tests {
         );
         // The menu row's own pin (`menu::hold_row_reason`, the same words) lives
         // beside that row in `menu.rs`.
+    }
+
+    /// A Bash box in Claude Code's layout: header, the block of command (and
+    /// description) rows, the question and options, the composer under it.
+    fn bash_box(block: &[&str]) -> Vec<String> {
+        let mut rows = vec![" Bash command".to_string(), String::new()];
+        rows.extend(block.iter().map(|r| format!("   {r}")));
+        rows.extend(
+            [
+                "",
+                " Do you want to proceed?",
+                " \u{276f} 1. Yes",
+                "   2. No",
+                "",
+                " Esc to cancel \u{00b7} Tab to amend",
+            ]
+            .iter()
+            .map(|r| (*r).to_string()),
+        );
+        rows.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
+        rows
+    }
+
+    fn detail_of(rows: &[String]) -> Option<String> {
+        match classify(&aterm_phase::ClaudeReader, rows, t0()).0.phase {
+            AgentPhase::Prompt { detail } => detail,
+            other => panic!("not a prompt: {other:?}"),
+        }
+    }
+
+    /// `agent_detail=bash:read-only` holds for EVERY reading of the command
+    /// rows ([`aterm_phase::PromptV2::readings`], the readings the
+    /// supervisor's decider classifies — review major; SUP-1/APR-5).
+    /// NEGATIVE CONTROL for the `│` case: the space-joined string the old
+    /// parser returned classifies read-only on its own — the verdict this used
+    /// to publish.
+    #[test]
+    fn a_bash_verdict_is_read_only_only_when_every_reading_is() {
+        use aterm_agent::supervise::classify::classify_command;
+        let all_read_only = |rows: &[String]| {
+            let p = aterm_phase::parse_prompt_v2(rows).expect("a box");
+            let readings = p.readings();
+            !readings.is_empty() && readings.iter().all(|r| classify_command(r).read_only)
+        };
+        // One command row and its description: read-only, as ever.
+        let one = bash_box(&["git log --oneline -5", "Show the five most recent commits"]);
+        assert_eq!(detail_of(&one).as_deref(), Some("bash:read-only"));
+
+        // `│` rows: two statements (Claude Code draws bars for a command with
+        // a newline in it), joined with a space by the old parser.
+        let bars = bash_box(&["\u{2502} git status", "\u{2502} node scripts/migrate.js"]);
+        let p = aterm_phase::parse_prompt(&bars).expect("a box");
+        assert_eq!(p.command, "git status node scripts/migrate.js");
+        assert!(
+            classify_command(&p.command).read_only,
+            "NEGATIVE CONTROL: the flattened reading is read-only"
+        );
+        assert_eq!(detail_of(&bars).as_deref(), Some("bash:not-read-only"));
+
+        // No `│`: one shell line that may wrap, its rows every command row. A
+        // write anywhere in them — the row shown as the command or the one
+        // the parser guesses is the description — is not read-only.
+        for block in [
+            &["git status &&", "rm -rf build"][..],
+            &["echo hi >", "out.txt"][..],
+            &["rm -rf build", "List the files"][..],
+        ] {
+            let rows = bash_box(block);
+            assert!(!all_read_only(&rows), "{block:?}");
+            assert_eq!(
+                detail_of(&rows).as_deref(),
+                Some("bash:not-read-only"),
+                "{block:?}"
+            );
+        }
+        // …and a wrapped read stays a read: the detail is the decider's
+        // verdict, whatever it is.
+        let wrapped = bash_box(&["git status", "node scripts/migrate.js"]);
+        let want = if all_read_only(&wrapped) {
+            "bash:read-only"
+        } else {
+            "bash:not-read-only"
+        };
+        assert_eq!(detail_of(&wrapped).as_deref(), Some(want));
+    }
+
+    /// FRAME identification is for a program that can be an agent (review
+    /// major): a shell or `cat` showing a captured Claude screen — frame,
+    /// question and all — is not an agent, a frame identity does not survive
+    /// the program resolving to a shell, and a group still being named waits
+    /// for its name. NEGATIVE CONTROL: the same screen under `node`, or with
+    /// no foreground group to name, IS read as the question it shows.
+    #[test]
+    fn a_shell_showing_a_captured_claude_frame_is_not_an_agent() {
+        let mut rows = vec![
+            "\u{23fa} Should I also delete the old logs?".to_string(),
+            String::new(),
+        ];
+        rows.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
+        assert!(
+            aterm_phase::phase::has_composer_frame(&rows),
+            "PRECONDITION"
+        );
+        for program in ["sh", "zsh", "cat", "less"] {
+            for known in [false, true] {
+                assert!(
+                    matches!(
+                        agent_verdict(Some(program), false, known, &rows, t0()),
+                        AgentVerdict::NotAgent
+                    ),
+                    "{program} (known={known}) is not an agent"
+                );
+            }
+        }
+        // A group whose name is still being resolved identifies nothing yet
+        // (the shell's own group is re-named after every job).
+        assert!(matches!(
+            agent_verdict(None, true, false, &rows, t0()),
+            AgentVerdict::NotAgent
+        ));
+        for program in [None, Some("node")] {
+            match agent_verdict(program, false, false, &rows, t0()) {
+                AgentVerdict::Agent {
+                    reading, by_frame, ..
+                } => {
+                    assert!(by_frame, "{program:?}");
+                    assert_eq!(reading.phase, AgentPhase::Question, "{program:?}");
+                }
+                AgentVerdict::NotAgent => panic!("{program:?} is identified by its frame"),
+            }
+        }
     }
 }

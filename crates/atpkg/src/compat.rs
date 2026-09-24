@@ -555,9 +555,10 @@ pub fn ensure_root(layout: &Layout, build_dir: &Path, depth: Depth) -> io::Resul
 /// a tracked process hands the laying to the launchd job the view uses
 /// ([`crate::seam::run_view_job`], a `ViewJob::Root`). When the lane cannot
 /// run: a root that already STANDS is kept as it is (one build behind at worst, refreshed
-/// next pass) rather than lay a tagged one from this process; with no root at all the
-/// in-process build is worth its tag under [`crate::lay::TrackedPolicy::Allow`] (tippy
-/// would refuse the store otherwise) and says so, and is refused under `Refuse`.
+/// next pass) rather than lay a tagged one from this process; with no root at all it is
+/// built in-process under [`crate::lay::TrackedPolicy::Allow`] (tippy would refuse the
+/// store otherwise) and its tag cleared ([`crate::provenance::heal_laid`]), and is
+/// refused under `Refuse`.
 pub fn ensure_root_with(
     layout: &Layout,
     build_dir: &Path,
@@ -594,28 +595,28 @@ pub fn ensure_root_with(
         )),
         Err(why) => match policy {
             crate::lay::TrackedPolicy::Refuse => Err(io::Error::other(
-                crate::lay::tracked_refusal("lay the trust exec root", &why),
+                crate::lay::tracked_refusal("laying the trust exec root", &why),
             )),
             crate::lay::TrackedPolicy::Allow => {
-                let standing = trust_build_of(layout, build_dir)
-                    .is_some_and(|n| crate::seam::is_real_dir(&root_dir(layout, n).join("bin")));
-                if standing {
-                    eprintln!(
-                        "atpkg: note — this process is provenance-tracked and the untracked lane \
-                         could not lay the trust exec root ({why}); the root that stands is kept \
-                         rather than lay a tagged one from this process; the next pass \
-                         refreshes it"
-                    );
+                let build = trust_build_of(layout, build_dir);
+                if build.is_some_and(|n| crate::seam::is_real_dir(&root_dir(layout, n).join("bin")))
+                {
+                    crate::provenance::log_line(&format!(
+                        "could not refresh the trust exec root ({why}); the one that stands \
+                         is kept until the next pass"
+                    ));
                     return Ok(Ensured::Present);
                 }
-                eprintln!(
-                    "atpkg: note — this process is provenance-tracked and the untracked lane \
-                     could not lay the trust exec root ({why}); there is no root yet, so it is \
-                     laid in-process, and every file of the root it clones WILL carry \
-                     com.apple.provenance (the store is not touched) — `aterm pkg repair` \
-                     re-lays it clean once the lane runs"
-                );
-                ensure_root_in_process(layout, build_dir, depth)
+                // No root yet: laid in-process (the store is not touched), then cleared.
+                let ensured = ensure_root_in_process(layout, build_dir, depth)?;
+                if let Some(n) = build {
+                    crate::provenance::heal_laid(
+                        layout,
+                        "the trust exec root",
+                        &[root_dir(layout, n)],
+                    );
+                }
+                Ok(ensured)
             }
         },
     }
@@ -2312,7 +2313,13 @@ mod tests {
                 None,
                 None,
                 "doctor",
-                &crate::doctor::Probes::default(),
+                // The macOS tag is a fact about which process wrote the fixture, and the
+                // routed form lays more files (its root): an attribute nothing sets keeps
+                // the count out of a comparison of shim forms.
+                &crate::doctor::Probes {
+                    provenance_attr: "user.aterm.absent",
+                    ..crate::doctor::Probes::default()
+                },
                 &mut out,
                 &mut err,
             );

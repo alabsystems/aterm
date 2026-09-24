@@ -30,8 +30,11 @@ pub(crate) struct Cli {
 /// site in `main` through the same funnel every other `ATERM_*` knob uses.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HeadlessArming {
-    /// No window is ever created: engine + PTY + control socket only.
-    /// The payload names the source for the stderr announcement.
+    /// No window is ever created: engine + PTY + control socket only — and on
+    /// macOS the process cannot be activated either (no Dock tile, never the
+    /// front app; `launch_posture` in `lib.rs`), so a harness may boot one
+    /// beside a human who is typing. The payload names the source for the
+    /// stderr announcement.
     Armed(HeadlessSource),
     /// Windowed, and nothing asked otherwise — the ordinary interactive launch.
     Windowed,
@@ -605,28 +608,28 @@ const STARTER_CONFIG: &str = "\
 # seed = 0                         # 0 = stable per-window field; nonzero = reproducible
 
 # --- bundled ALab toolchain manager (atpkg): the SAME table the co-located `atpkg`
-# reads, so there is exactly ONE config surface. Env always wins over config
-# (ATPKG_ACCOUNT / ATPKG_REGISTRY / ATPKG_INDEX_REPO / ATPKG_DISABLE). Inert in
-# builds without a pinned root key — Settings ▸ Packages shows the live posture. --
+# reads, so there is exactly ONE config surface — and no environment alternative
+# to any of it. Inert in builds without a pinned root key — Settings ▸ Packages
+# shows the live posture. --
 # [packages]
-# enabled = true                   # master for the background tools loop (Settings ▸ Packages)
-# auto_update = true               # run `atpkg update` on the 6-hour cadence
-#                                  #   (both loop gates are read at LAUNCH)
-# auto_install = false             # ALSO bootstrap-install missing default-set members —
-#                                  #   multi-GB consent; the Settings switch is the click
-# seed_install = true              # install the BUNDLED seed on first launch (batteries
-#                                  #   included — the bytes ship inside the app; false
-#                                  #   turns the first run into an announced offer)
-# account = \"alabsystems\"          # index owner; omit → the compiled default
-# channel = \"stable\"               # the pin set install/update/rollback resolve against
-# include = [\"ay\", \"ty\"]           # narrowing-only filters over the SIGNED index
-# exclude = []                     #   default set (nothing outside the index installs)
-# [packages.links]                 # local mode / private repos, per program:
+# enabled = true                   # Automatic updates — THE switch (Settings ▸ Packages):
+#                                  #   a published index within minutes, a full signed
+#                                  #   check every 6 hours; read LIVE — an edit stands
+#                                  #   the loop down or resumes it within seconds (what
+#                                  #   every lane did is in packages.log, beside aterm.log)
+# auto_install = true              # install the ALab toolset nobody named: the first-run
+#                                  #   fill and new members of the signed set (batteries
+#                                  #   included; may download GBs; `uninstall`, `exclude`
+#                                  #   and `enabled = false` always win)
+# exclude = []                     # per-program opt-out from the SIGNED default set
+# [packages.links]                 # a maintainer's local checkout, per program:
 # ay = \"~/ay\"                      #   path → managed dev-link (registry skipped)
-# orc = \"alabsystems/orc\"        #   owner/repo → private fetch override
-#                                  #   (signature verification unchanged either way)
+# [reroute]
+# announce = true                  # a rerouted cargo/rustc/tlc says so before it runs
+#                                  #   upstream (false silences the line, never the run)
 
-# --- this Mac: every package pass applies these host settings FIRST.
+# --- this Mac: host settings, applied as the window opens, by a terminal
+# session once a day, and by the next package pass after an edit here.
 # `aterm pkg machine apply` applies now; `aterm pkg machine` reads them.
 # Settings ▸ Security shows the measured state and has Apply now. macOS only.
 # [machine]
@@ -1415,8 +1418,9 @@ mod tests {
         assert!(cursor_break.contains("default false"), "{cursor_break}");
 
         // The [machine] host settings are disclosed with their defaults and the
-        // two ways they apply (every package pass first; `aterm pkg machine apply`
-        // now) — and the block sits ABOVE `[key_sequences]`/`[keybindings]`.
+        // ways they apply (as the window opens, a session once a day, a pass after an edit;
+        // `aterm pkg machine apply` now) — and the block sits ABOVE
+        // `[key_sequences]`/`[keybindings]`.
         let universal_control = line_for("universal_control");
         assert!(
             universal_control.contains("= \"off\""),
@@ -1631,8 +1635,8 @@ mod tests {
         keys.dedup();
         assert_eq!(
             keys.len(),
-            160,
-            "the starter config's key count moved — update the `160 keys` line in \
+            155,
+            "the starter config's key count moved — update the `155 keys` line in \
              `aterm help config` (crates/aterm-cli/src/manual.rs, CONFIG_PAGE) and \
              this number together"
         );

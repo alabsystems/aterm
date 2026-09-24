@@ -12,6 +12,11 @@ description = "Shared types for aterm terminal engine (Rgb, CursorStyle, BiDiMod
 [features]
 default = []
 serde = ["dep:serde"]
+# Development seams (`aterm_types::dev_seam!`) in an optimized build. Debug builds
+# compile them anyway; the release cutter never enables this (aterm-release's
+# buildplan pins it). Declared here because `dev_seam!` reads the CALLING crate's
+# `dev-seams` feature, and this crate's own test calls it.
+dev-seams = []
 # NO PLATFORM FEATURE LIVES HERE, and that is load-bearing. The K-2 winit->engine
 # key map used to sit behind an optional `winit-keymap = ["dep:winit"]` feature
 # whose comment promised that "the FFI/bridge consumers of aterm-types never pull

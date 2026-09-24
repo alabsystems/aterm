@@ -205,6 +205,14 @@ control-conformance = ["aterm-control/conformance", "aterm-gpu/acquire-conforman
 # except the bench target below (`required-features`); no shipping crate
 # enables it, so `cargo build -p aterm-gui` stays byte-identical.
 bench-support = []
+# DEVELOPMENT SEAMS in an optimized build: the `aterm_types::dev_seam!` reads this
+# crate makes (the `ATERM_DEBUG_*` screenshot seams, the handoff deadlines) and the
+# development settings (`[update] require_team_id`), forwarded to the updater and atpkg,
+# which read their own (`ATERM_UPDATE_ROOT`, the `[update]` repoint, `ATPKG_REGISTRY`,
+# `[packages]` prefix/account/repo links). A debug build compiles them anyway. The
+# release cutter NEVER enables it — `aterm-release`'s buildplan pins that — so a
+# shipped binary reads none of them.
+dev-seams = ["aterm-update/dev-seams", "atpkg/dev-seams"]
 
 [dependencies]
 # `bidi`: compile in the UAX #9 visual-reordering bridge so RTL (Hebrew/Arabic)
@@ -229,6 +237,13 @@ aterm-effects = { workspace = true }
 # The mosh-style predictive-echo state machine (extracted so the web embedders
 # share it); aliased at the crate root so `crate::predict::*` reads unchanged.
 aterm-predict = { workspace = true }
+# The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md): the
+# message model, the glass policy, the single-row width law, the tagged log
+# ring and its line codec. Lives in its own crate for the same reason
+# `aterm-predict` does — it is host-agnostic (aterm-time only; no fs, threads or
+# cells), so the native GUI paints the layouts it emits and appends the lines
+# it drains, and the engine stays unit-testable without a window or a clock.
+aterm-messages = { workspace = true }
 # The inline-suggestion (ghost text) engine: a bounded LRU corpus of
 # shell-integration command blocks plus a pure, clock-injected ranker. Lives in
 # its own crate for the same reason `aterm-predict` does — the state machine is
@@ -294,7 +309,9 @@ aterm-update-core = { workspace = true }
 # Settings ▸ Packages: read the co-located toolchain manager's OWN durable state
 # (status.toml, dev-link markers, inert/enabled posture) in-process — same source
 # of truth as the `atpkg` verbs, no parallel parser to drift. Network/install
-# verbs still run ONLY via the co-located `atpkg` binary, never in this process.
+# verbs still run ONLY via the co-located `atpkg` binary, never in this process;
+# the one in-process fetch is the vendor head watch's conditional GET (a hint —
+# the `atpkg update <program>` it triggers re-verifies everything).
 atpkg = { workspace = true }
 libc = { workspace = true }
 winit = { workspace = true }

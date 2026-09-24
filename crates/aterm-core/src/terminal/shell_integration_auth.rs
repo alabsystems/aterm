@@ -96,6 +96,16 @@ impl ShellIntegrationAuth {
         self.nonce = None;
     }
 
+    /// The authorized nonce, for the seamless-handoff carry only
+    /// ([`super::Terminal::checkpoint_carry`]): an adopted shell keeps
+    /// emitting the nonce it was spawned with, so the successor engine
+    /// must authorize that same value or drop every mark for the
+    /// session's life.
+    #[must_use]
+    pub(crate) fn nonce(&self) -> Option<[u8; 32]> {
+        self.nonce
+    }
+
     /// Number of OSC 133/633 sequences silently dropped since this
     /// state was last reset or constructed. Exposed for host-side
     /// metrics / tamper audits.

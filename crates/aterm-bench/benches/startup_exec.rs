@@ -241,12 +241,13 @@ fn slot(arm: &Arm, execs: usize) -> f64 {
     for _ in 0..execs {
         let _ = Command::new(&arm.path)
             .args(&arm.args)
-            // A bench must not drive the product's side effects. `aterm
-            // --version` is on the auto-update lane's path, and this loop runs
-            // it a couple of thousand times; the updater's own pre-swap boot
-            // probe sets exactly this variable for exactly this reason
-            // (`crates/aterm-update/src/verify.rs`, `probe_bundle_starts`).
-            .env("ATERM_NO_AUTO_UPDATE", "1")
+            // A bench must not drive the product's side effects, and this loop runs
+            // `aterm --version` a couple of thousand times: it is a mode-free
+            // answer that prints and exits before any update or package lane
+            // starts (`crates/aterm/src/main.rs`, the `mode_free` arm), which is
+            // what the updater's own pre-swap boot probe relies on too
+            // (`crates/aterm-update/src/verify.rs`, `probe_bundle_starts`). No
+            // environment veto is needed — and none exists (2026-09-23).
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

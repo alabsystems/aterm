@@ -453,6 +453,7 @@ pub(crate) fn key_arms_own_license(rest: &str) -> bool {
 /// grammar — the two leading options and the key names — is stated in exactly
 /// one place (the plain, the guarded and both cross-session arms answer it).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
+                                    [if-gen=<epoch>.<seq>] [if-fp=<hex16>] \
                                     <name> — enter tab esc space backspace delete up down \
                                     left right home end pageup pagedown f1..f12 (opt +mods, \
                                     e.g. ctrl+c)\n";
@@ -494,6 +495,12 @@ pub(crate) struct LeadingInputOptions {
     /// The `if=<re>` guard's raw pattern — compiled later by [`compile_guard`],
     /// so a bad regex is answered where the halt gate has already been passed.
     pub guard: Option<String>,
+    /// The `if-gen=<epoch>.<seq>` fence: the screen generation the caller last
+    /// read (`status gen=`, `agent_gen=`). See [`InputFence`].
+    pub if_gen: Option<crate::control::ScreenGen>,
+    /// The `if-fp=<hex16>` fence: the visible screen's FNV-1a-64 the caller last
+    /// read (`status hash=`, `turn hash=`). See [`InputFence`].
+    pub if_fp: Option<u64>,
     /// A leading option that was recognized but malformed (a guard with no
     /// pattern, an option given twice). Carried rather than answered here so the
     /// dispatch answers it AFTER the halt gate: a halted session must say
@@ -515,6 +522,15 @@ pub(crate) struct LeadingInputOptions {
 /// [`GUARDED_VERBS`]; every other verb's tail is returned untouched, so an `id=`
 /// or `if=` token elsewhere stays argument data (a leading `if=` on `paste` is
 /// delivered as literal text, exactly like a leading `id=` on it).
+///
+/// `if-gen=<epoch>.<seq>` and `if-fp=<hex16>` are the other two [`InputFence`]
+/// conditions, taken on the same two verbs and composing with `id=`/`if=` in any
+/// order; a value that does not parse is carried as a refusal like a
+/// pattern-less `if=`. A leading `if-seq=` is RECOGNIZED AND REFUSED: it was
+/// this fence's first spelling, on the per-grid `content_seq`, which repeats
+/// across an alternate-screen re-entry (see [`crate::control::ScreenGen`]); a
+/// caller still spelling it gets `ERR usage` naming `if-gen=`, never a press on
+/// an unsound fence and never the option typed as `send` text.
 ///
 /// The regex is ONE wire token: the control line is split on whitespace and
 /// nothing quotes, so a pattern with a space in it must be written with `.` in
@@ -564,10 +580,66 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
             consumed = true;
             continue;
         }
+        if guarded && let Some(value) = head.strip_prefix("if-gen=") {
+            match crate::control::ScreenGen::parse(value) {
+                Some(generation) if opts.if_gen.replace(generation).is_some() => {
+                    opts.refusal = Some("ERR usage: if-gen= given twice\n".to_string());
+                }
+                Some(_) => {}
+                None => {
+                    opts.refusal = Some(
+                        "ERR usage: if-gen=<epoch>.<seq> needs the screen generation a read \
+                         returned (status gen=)\n"
+                            .to_string(),
+                    );
+                }
+            }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
+        if guarded && head.starts_with("if-seq=") {
+            opts.refusal = Some(
+                "ERR usage: if-seq= is not a fence — seq= is per grid and repeats after an \
+                 alternate-screen re-entry; fence on if-gen=<status gen=>\n"
+                    .to_string(),
+            );
+            cur = tail;
+            consumed = true;
+            continue;
+        }
+        if guarded && let Some(value) = head.strip_prefix("if-fp=") {
+            match parse_fp(value) {
+                Some(fp) if opts.if_fp.replace(fp).is_some() => {
+                    opts.refusal = Some("ERR usage: if-fp= given twice\n".to_string());
+                }
+                Some(_) => {}
+                None => {
+                    opts.refusal = Some(
+                        "ERR usage: if-fp=<hex16> needs the screen hash a read returned \
+                         (status hash=)\n"
+                            .to_string(),
+                    );
+                }
+            }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
         break;
     }
     let tail = if consumed { cur } else { rest };
     (opts, tail.to_string())
+}
+
+/// An `if-fp=` value: 1..=16 hex digits, the spelling `status hash=` prints
+/// (`{:016x}`). Anything else — empty, a sign, a `0x` prefix, a 17th digit — is
+/// refused rather than read as some other number.
+fn parse_fp(value: &str) -> Option<u64> {
+    if value.is_empty() || value.len() > 16 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(value, 16).ok()
 }
 
 /// Compile a leading `if=<re>` guard, OUTSIDE the terminal lock (the same
@@ -584,18 +656,107 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
     }
 }
 
+/// The conditions a fenced write is held to — all checked under the SAME hold of
+/// the terminal lock the write is made under. Every armed condition must hold;
+/// an unarmed one is not consulted.
+///
+/// * `generation` (`if-gen=<epoch>.<seq>`): the screen generation
+///   ([`crate::control::ScreenGen`]) still equals the one the caller read. ANY
+///   output since — a repaint of identical text included — moves its seq, and
+///   any screen switch moves its epoch, so this is the strict fence: "the
+///   screen I decided on is the screen you are about to write to". The bare
+///   `content_seq` is not enough for that: it is per grid, and a re-entered
+///   alternate screen can show a new box at an old value.
+/// * `fp` (`if-fp=<hex16>`): FNV-1a-64 of the untrimmed visible screen (the
+///   `status hash=` / `turn hash=` value, [`crate::control::screen_stamp`])
+///   still equals the caller's. A re-render of the same text keeps it, so a TUI
+///   that repaints without changing (Claude Code's does) does not skip a press
+///   the screen still vouches for.
+/// * `guard` (`if=<re>`): some visible row matches — or, with
+///   `guard_at_cursor`, the row holding the cursor does (`turn …
+///   submit=guarded:<re>`, where the row that matters is the one a submit
+///   lands in).
+///
+/// This is the operator delivery fence's shape (`operator_input_if_epoch`:
+/// compare the screen generation, then write, under one lock) offered to any
+/// driver: a supervisor that decided on box A cannot have its `1` land on a box
+/// B that replaced A between its read and its press.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InputFence<'a> {
+    /// `if=<re>` — some visible row must match.
+    pub guard: Option<&'a dyn RowMatch>,
+    /// `if-gen=<epoch>.<seq>` — the screen generation must still be this.
+    pub generation: Option<crate::control::ScreenGen>,
+    /// `if-fp=<hex16>` — the visible screen's FNV-1a-64 must still be this.
+    pub fp: Option<u64>,
+    /// Match `guard` against the CURSOR's row only, not every visible row.
+    /// The guarded submit's binding: a composer holds the cursor, a select
+    /// box does not, and a transcript row that happens to match (Claude Code
+    /// draws earlier prompts with the composer's own `❯` at column 0) never
+    /// does — so an any-row guard such as `^❯` cannot vouch for an Enter
+    /// that an approval box would take as "Yes".
+    pub guard_at_cursor: bool,
+}
+
+impl InputFence<'_> {
+    /// Whether any condition is armed — the dispatch routes an armed write to
+    /// the fenced arm and leaves an unarmed one on its ordinary path.
+    pub(crate) fn is_armed(&self) -> bool {
+        self.guard.is_some() || self.generation.is_some() || self.fp.is_some()
+    }
+
+    /// Decide the fence against `terminal` (the caller holds its lock).
+    /// `generation` and `fp` are asked before the guard: a moved screen answers
+    /// [`GuardedInput::Changed`] even where the guard would also have missed,
+    /// because "the screen moved" is the more useful thing to tell a driver.
+    fn check(&self, terminal: &Terminal) -> Option<GuardedInput> {
+        if self
+            .generation
+            .is_some_and(|generation| crate::control::screen_gen(terminal) != generation)
+        {
+            return Some(GuardedInput::Changed);
+        }
+        if let Some(fp) = self.fp {
+            let now =
+                crate::turn_ledger::fnv1a_64(crate::control::screen_text(terminal).as_bytes());
+            if now != fp {
+                return Some(GuardedInput::Changed);
+            }
+        }
+        if let Some(guard) = self.guard {
+            let range = if self.guard_at_cursor {
+                let row = usize::from(terminal.cursor().row);
+                RowRange::Span {
+                    start: row,
+                    end: row,
+                }
+            } else {
+                RowRange::All
+            };
+            if first_matching_row(terminal, guard, range).is_none() {
+                return Some(GuardedInput::Skipped);
+            }
+        }
+        None
+    }
+}
+
 /// What a guarded input attempt decided — under ONE hold of the terminal lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GuardedInput {
     /// No visible row matched the guard: NOTHING was written.
     Skipped,
+    /// The screen moved since the caller's read (`if-gen=`/`if-fp=` no longer
+    /// holds): NOTHING was written.
+    Changed,
     /// A row matched, and the bytes were handed to the kernel (or refused with
     /// zero bytes, or accepted in part) while the lock was still held.
     Pressed(Delivery),
 }
 
-/// THE ATOMIC CHECK-AND-PRESS. Test `guard` against the visible rows and, if some
-/// row matches, deliver `ev` — both under the SAME hold of the terminal lock.
+/// THE ATOMIC CHECK-AND-PRESS. Decide `fence` ([`InputFence`]: the screen
+/// generation, the screen hash, the row guard) and, if every armed condition
+/// holds, deliver `ev` — both under the SAME hold of the terminal lock.
 ///
 /// WHY THE SAME LOCK. Measured: a supervisor answering a Claude Code permission
 /// prompt read the screen, saw the box, and sent `key 1`; an auto-mode rule
@@ -625,15 +786,15 @@ pub(crate) enum GuardedInput {
 /// as unseamed, never silently zero) and does not arm a cursor licence of its
 /// own; the dispatch keeps the licence fence for it. A press that must ride the
 /// seam is a plain `key`.
-pub(crate) fn input_if_row_matches(
+pub(crate) fn input_if_fenced(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     ev: InputEvent,
-    guard: &dyn RowMatch,
+    fence: &InputFence<'_>,
 ) -> GuardedInput {
     let terminal = term_lock(term);
-    if first_matching_row(&*terminal, guard, RowRange::All).is_none() {
-        return GuardedInput::Skipped;
+    if let Some(declined) = fence.check(&terminal) {
+        return declined;
     }
     // The encoder is read under the same lock as the guard: the keyboard mode is
     // part of the screen state the check vouched for.
@@ -684,6 +845,7 @@ pub(crate) fn input_if_row_matches(
 pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
     match decision {
         GuardedInput::Skipped => "OK skipped\n".to_string(),
+        GuardedInput::Changed => "OK skipped reason=changed\n".to_string(),
         GuardedInput::Pressed(Delivery::Full | Delivery::FullAt { .. }) => "OK\n".to_string(),
         GuardedInput::Pressed(Delivery::BusyZero | Delivery::ConflictZero) => {
             "ERR busy sink\n".to_string()
@@ -696,31 +858,72 @@ pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
 }
 
 /// `key if=<re> <name>`: [`cmd_key`]'s guarded twin — the same [`parse_key`]
-/// grammar, delivered by [`input_if_row_matches`] instead of the seam. A
-/// malformed name is the usage line BEFORE any lock is taken.
+/// grammar, delivered by [`input_if_fenced`] instead of the seam. A
+/// malformed name is the usage line BEFORE any lock is taken. The guard-only
+/// spelling of [`cmd_key_fenced`], which is what the dispatch calls.
+#[cfg(test)]
 pub(crate) fn cmd_key_guarded(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     guard: &dyn RowMatch,
     rest: &str,
 ) -> String {
+    cmd_key_fenced(
+        term,
+        ctx,
+        &InputFence {
+            guard: Some(guard),
+            ..InputFence::default()
+        },
+        rest,
+    )
+}
+
+/// `key [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] <name>`: the fenced press —
+/// [`cmd_key_guarded`] with every [`InputFence`] condition. A moved screen
+/// answers `OK skipped reason=changed` and writes nothing.
+pub(crate) fn cmd_key_fenced(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    fence: &InputFence<'_>,
+    rest: &str,
+) -> String {
     match parse_key(rest) {
-        Some(ev) => guarded_input_reply(input_if_row_matches(term, ctx, ev, guard)),
+        Some(ev) => guarded_input_reply(input_if_fenced(term, ctx, ev, fence)),
         None => KEY_USAGE.to_string(),
     }
 }
 
 /// `send if=<re> <text>`: the guarded `send` — the same [`send_bytes`] body
 /// (the literal `\n` submit form included), delivered by
-/// [`input_if_row_matches`].
+/// [`input_if_fenced`]. The guard-only spelling of [`cmd_send_fenced`].
+#[cfg(test)]
 pub(crate) fn cmd_send_guarded(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     guard: &dyn RowMatch,
     rest: &str,
 ) -> String {
+    cmd_send_fenced(
+        term,
+        ctx,
+        &InputFence {
+            guard: Some(guard),
+            ..InputFence::default()
+        },
+        rest,
+    )
+}
+
+/// `send [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] <text>`: the fenced raw write.
+pub(crate) fn cmd_send_fenced(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    fence: &InputFence<'_>,
+    rest: &str,
+) -> String {
     let ev = InputEvent::KeySequence(send_bytes(rest));
-    guarded_input_reply(input_if_row_matches(term, ctx, ev, guard))
+    guarded_input_reply(input_if_fenced(term, ctx, ev, fence))
 }
 
 /// `hwkey <char|name> [mods=…] [count=…] [interval=…]` -> inject the key through
@@ -1686,7 +1889,7 @@ mod tests {
         let opts = |idem: Option<&str>, guard: Option<&str>| LeadingInputOptions {
             idem: idem.map(str::to_string),
             guard: guard.map(str::to_string),
-            refusal: None,
+            ..LeadingInputOptions::default()
         };
         assert_eq!(
             take_leading_options("send", "id=a:b:c hello there"),
@@ -1760,6 +1963,50 @@ mod tests {
         assert_eq!(o.refusal.as_deref(), Some("ERR usage: id= given twice\n"));
         // The guarded set is exactly the two keystroke-shaped writes.
         assert_eq!(GUARDED_VERBS, ["send", "key"]);
+    }
+
+    /// `if-gen=<epoch>.<seq>` parses to the screen generation `status gen=`
+    /// prints, composes with the other options, and refuses any other shape. The
+    /// retired `if-seq=` is taken off the tail and REFUSED — on `send` too, where
+    /// an unrecognized option would have been typed into the agent as text.
+    #[test]
+    fn if_gen_is_the_fence_and_if_seq_is_refused_not_typed() {
+        use crate::control::ScreenGen;
+        let (o, tail) = take_leading_options("key", "if-gen=3.15 if-fp=00ff 1");
+        assert_eq!(o.if_gen, Some(ScreenGen { epoch: 3, seq: 15 }));
+        assert_eq!(o.if_fp, Some(0xff));
+        assert_eq!(o.refusal, None);
+        assert_eq!(tail, "1");
+        assert_eq!(ScreenGen { epoch: 3, seq: 15 }.to_string(), "3.15");
+        for bad in ["15", "3.", ".15", "3.15.1", "-3.15", "3.+15", "x.1", ""] {
+            let (o, _) = take_leading_options("key", &format!("if-gen={bad} 1"));
+            assert!(
+                o.refusal
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("ERR usage: if-gen=")),
+                "if-gen={bad:?} must be refused"
+            );
+        }
+        let (o, _) = take_leading_options("key", "if-gen=1.2 if-gen=1.2 1");
+        assert_eq!(
+            o.refusal.as_deref(),
+            Some("ERR usage: if-gen= given twice\n")
+        );
+        for verb in ["key", "send"] {
+            let (o, tail) = take_leading_options(verb, "if-seq=15 1");
+            assert!(
+                o.refusal
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("ERR usage: if-seq= is not a fence")),
+                "{verb}: {o:?}"
+            );
+            assert_eq!(tail, "1", "{verb}: the option is taken, not left as body");
+        }
+        // NEGATIVE CONTROL: a body token spelled like it is still body.
+        assert_eq!(
+            take_leading_options("send", "hello if-seq=15").1,
+            "hello if-seq=15"
+        );
     }
 
     /// A bad guard is `ERR badregex` — the `await match` spelling, from the same

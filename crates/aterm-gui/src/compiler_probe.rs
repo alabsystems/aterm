@@ -273,6 +273,22 @@ mod tests {
         assert_eq!(detect_flavor(stray, "rustc", None), "r");
     }
 
+    #[test]
+    fn sealed_linux_trust_identifies_via_its_explicit_version_field() {
+        let native = "rustc 1.99.0-dev (ec2b5c59f 2026-09-01)\nbinary: rustc\n\
+            commit-hash: ec2b5c59f7ae81dc57dac2a3346cb4c0ef9fad0d\n\
+            host: aarch64-unknown-linux-gnu\nrelease: 1.99.0-dev\ntrust: 0.1.0\nLLVM version: 22.1.2";
+        assert_eq!(detect_flavor(native, "rustc", None), "t");
+        assert_eq!(
+            detect_flavor("rustc 1.99.0-dev\ntrust:", "rustc", None),
+            "r"
+        );
+        assert_eq!(
+            detect_flavor("rustc 1.99.0-dev\nnote: trust: 0.1.0", "rustc", None),
+            "r"
+        );
+    }
+
     /// Provenance is EVIDENCE ONLY — there is no override, in either direction.
     ///
     /// This replaces `flavor_explicit_override_wins_and_junk_falls_through`,

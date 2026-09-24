@@ -59,6 +59,12 @@ fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
     *PRESENCE.get_or_init(aterm_containment::consent::tccutil_presence)
 }
 
+/// Whether `/usr/bin/trash` is a file, read once: it ships with the OS.
+fn trash_tool_once() -> bool {
+    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PRESENT.get_or_init(|| std::path::Path::new(crate::consent_retire::TRASH_TOOL).is_file())
+}
+
 impl App {
     /// Enumerate every live Settings presentation in `wid`, including leaves
     /// that are not currently focused. Generic split/restore operations may
@@ -374,16 +380,21 @@ impl App {
         // headless — so a stale request cannot smuggle a worker past config.
         let mut requested = false;
         let mut opened = false;
+        let mut retire = None;
         for (_, view) in &targets {
             if let Some(crate::native_app::AppViewState::Settings(state)) =
                 self.native_runtime.view_state_mut(*view)
             {
                 requested |= state.take_consent_warmup_request();
                 opened |= state.take_consent_open_request();
+                retire = retire.or(state.take_claimant_retire_request());
             }
         }
         if requested {
             let _ = self.begin_consent_warmup();
+        }
+        if let Some(plan) = retire {
+            let _ = self.begin_claimant_retire(plan);
         }
         // The page's Open Privacy & Security… is the card's Open Settings by
         // another door: the same `opened` marker, and the same watch for the ✓.
@@ -414,8 +425,8 @@ impl App {
         }
     }
 
-    /// Assemble what the Security page renders. Pure over `App` state plus the
-    /// CACHED probe — no syscall of its own, and `SpikeEvidence::UNMEASURED` is
+    /// Assemble what the Security page renders: `App` state, the CACHED probe,
+    /// and one `proc_pidpath` for the image anchor. `SpikeEvidence::UNMEASURED` is
     /// what it publishes, so the panel's coverage claim stays gated on a named
     /// field rather than on prose.
     fn macos_access_projection(&mut self) -> crate::native_settings::MacosAccess {
@@ -427,6 +438,9 @@ impl App {
         let warmup_rows = self.consent_warmup_rows().to_vec();
         let evidence = aterm_containment::SpikeEvidence::UNMEASURED;
         let split = crate::control_privacy::covers_split(facts.fda, evidence);
+        let (claimants, _) = self
+            .consent
+            .claimants(facts.bundle_id.as_deref(), facts.enabled);
         crate::native_settings::MacosAccess {
             enabled: facts.enabled,
             // Read FRESH, never cached: the whole point is that it changes
@@ -452,6 +466,10 @@ impl App {
             // A reset is reported only by the gesture that ran it; the host
             // never invents one, and a successor process inherits none.
             reset: None,
+            claimants: claimants.map(|(census, _age)| census),
+            trash_tool: trash_tool_once(),
+            retire_live: self.claimant_retire.is_live(),
+            retired: self.claimant_retire.report(),
         }
     }
 
@@ -559,10 +577,11 @@ impl App {
         }
     }
 
-    /// Select the process-singleton Settings app, creating its first native tab
-    /// when needed. About and Software Update are routes in this same app rather
-    /// than modal/window variants, so their navigation, history, accessibility,
-    /// and control inspection all share one semantic tree.
+    /// Select the process-singleton Settings app in the FRONTMOST window,
+    /// creating its first native tab when needed. About and Software Update are
+    /// routes in this same app rather than modal/window variants, so their
+    /// navigation, history, accessibility, and control inspection all share one
+    /// semantic tree.
     pub(crate) fn open_settings_tab(
         &mut self,
         route: crate::native_settings::SettingsRoute,
@@ -570,6 +589,19 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return false;
         };
+        self.open_settings_tab_in_window(wid, route)
+    }
+
+    /// [`Self::open_settings_tab`] in a NAMED window (design §3.9): the message
+    /// band, a screen reader's activate on it and the Messages page's own
+    /// actions pass the window the press landed in, so a press in a background
+    /// window opens the page there and raises it — the bars' press switched
+    /// the frontmost window instead.
+    pub(crate) fn open_settings_tab_in_window(
+        &mut self,
+        wid: crate::WindowId,
+        route: crate::native_settings::SettingsRoute,
+    ) -> bool {
         // Singleton means one process controller, not one presentation. Search
         // only the requesting window; another window receives its own view over
         // the same instance and never has focus stolen from it.
@@ -681,6 +713,11 @@ impl App {
         // never a status.toml parse on the event loop.
         self.publish_native_packages_state();
         self.start_native_packages_refresh();
+        // And the Messages projection, unconditionally (design §4.2): a
+        // Settings tab opened at the Messages route — a band row's
+        // `Details ›`, the menu, the control verb — reads the log as it is
+        // now, not as the 2 Hz gate last let it through.
+        self.publish_native_messages_state();
         // The Security page's "This Mac" card confirms the [machine] settings from
         // a fresh `atpkg machine` read every time Settings surfaces — never from a
         // remembered posture.
@@ -1988,7 +2025,7 @@ impl App {
             // The bar band sits between the strip and grid row 0 — the same
             // arithmetic `native_content_origin_y` uses, from the other end.
             bars_y: (strip_y + strip_rows * ch) as f64,
-            bar_h: if self.status_bar_rows == 0 {
+            bar_h: if self.message_band_rows == 0 {
                 0.0
             } else {
                 ch as f64
@@ -2247,28 +2284,35 @@ impl App {
     /// the user unprompted and then leave.
     ///
     /// These are the one class of surface a screen reader cannot find by exploring: by
-    /// the time the user goes looking, a notice has faded and a status band has folded.
-    /// Three of the four paint as terminal cells, so their words did reach the grid
-    /// document as anonymous output; the transient card does not paint cells at all, so
-    /// until it was published here its sentence existed only as pixels.
+    /// the time the user goes looking, a band row has folded. They paint as terminal
+    /// cells, so their words did reach the grid document as anonymous output; what this
+    /// adds is a node per row with its role, its capsules and its place. The retired
+    /// transient card (slot 0) is gone: its producers are band rows, and Robi's tip
+    /// bubble — what survived of it — is a DECORATION, never announced (design D7, R23).
     ///
-    /// EVERY ENTRY IS GATED ON THE SAME PREDICATE THE PIXELS ARE. The notice asks
-    /// [`crate::WindowState::notice_is_on_glass`] — `App::notice` is global and its card
-    /// can be absent in this window — and the status bands ask the committed
-    /// `status_bar_rows`, so a message is announced when and only when it is on the glass
-    /// of THIS window.
+    /// EVERY ENTRY IS GATED ON THE SAME PREDICATE THE PIXELS ARE. The band rows ask the
+    /// committed `message_band_rows`, so a message is announced when and only when it is
+    /// on the glass of THIS window.
     ///
-    /// AND EVERY ENTRY IS CUT WHERE THE PIXELS ARE CUT. What a live region says is spoken
-    /// in full the instant it changes, so a sentence longer than the row it describes
-    /// tells a listener about a screen no one is looking at — the config band's raw lines
-    /// are whole diagnostics, and it takes its words from
-    /// [`crate::config_notice::band_text`] at the frame's own width.
+    /// AND EVERY ENTRY IS THE ROW'S OWN SENTENCE. What a live region says is spoken in
+    /// full the instant it changes, so a band row speaks `title[ · detail[0]]` — its
+    /// first detail line WHOLE, width-independent, and only where the row paints it as
+    /// its excerpt (ruling 77: speech follows paint) — and leaves the rest of its detail
+    /// to the Details press. The band's pictographic joints are said as words
+    /// (`aterm_messages::glass::speakable`: `→` as "did you mean", `×` between numbers
+    /// as "by", `▸` as a pause).
     ///
     /// The split between the announced sentence and the description is deliberate and is
-    /// what keeps a live region from becoming a flood: a band's `title`/`detail` change
-    /// only when the work moves to a new phase, while its `stats` tick with every
-    /// megabyte. Announcing the figures would say the bar aloud a hundred times on the
-    /// way to 100%.
+    /// what keeps a live region from becoming a flood: a band row's spoken sentence
+    /// (design §3.5 — width-independent, so a resize that re-shapes the painted excerpt
+    /// never re-announces a row) changes only when the work moves to a new phase, while
+    /// its `stats` tick with every megabyte and ride the description with the capsules'
+    /// full labels. Announcing the figures would say the row aloud a hundred times on
+    /// the way to 100%.
+    ///
+    /// A row that ASKS — a question, or a consequential capsule — is published as an
+    /// alert (politely), like a failure: "you are being asked something", not status
+    /// news (review 2026-09-24).
     #[cfg(a11y_tree)]
     fn grid_a11y_messages(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridMessage> {
         use crate::accesskit_tree::{ChromeMessage, GridMessage};
@@ -2286,40 +2330,140 @@ impl App {
             out.push(message);
         }
 
-        // The status bands, top to bottom, but only the ones whose rows the geometry has
-        // actually committed — `splice_status_bars` trims its painted cache to that count
-        // too, so the tree can never describe a band the frame does not carry.
-        for (row, (lane, bar)) in self
-            .status_bars
-            .bars()
-            .take(usize::from(self.status_bar_rows))
+        // The band rows, top to bottom, but only the ones whose rows the geometry has
+        // actually committed — `splice_message_band` trims its painted cache to that
+        // count too, so the tree can never describe a row the frame does not carry.
+        // Fixed slots per band ROW (`BandRow0..2`), not per message: AccessKit then
+        // emits "text changed" on a name change instead of node churn.
+        let presentation = self.band_presentation(usize::from(ws.cols));
+        for (row, layout) in presentation
+            .rows
+            .iter()
+            .take(usize::from(self.message_band_rows))
             .enumerate()
         {
-            let row = row + presence_rows;
-            let mut text = bar.text.title.clone();
-            if !bar.text.detail.is_empty() {
-                text.push_str(" \u{00b7} ");
-                text.push_str(&bar.text.detail);
+            let bar_row = row + presence_rows;
+            let capsules: Vec<crate::accesskit_tree::BandCapsule> = layout
+                .capsules
+                .iter()
+                .map(|c| crate::accesskit_tree::BandCapsule {
+                    label: c.full_label,
+                    col: c.col,
+                    width: c.width,
+                    index: crate::accesskit_tree::capsule_index(c.action),
+                })
+                .collect();
+            match layout.kind {
+                aterm_messages::RowKind::Message(id) => {
+                    let Some(live) = self.messages.live(id) else {
+                        continue;
+                    };
+                    let Some(message) = ChromeMessage::band_row(row) else {
+                        continue;
+                    };
+                    // The DESCRIPTION (design §10.10): the time words as a
+                    // reader says them (the ETA, or how long work with no
+                    // fraction has run), the load words, the stats, then the
+                    // capsules' full labels — read on demand, never announced.
+                    let now = std::time::Instant::now();
+                    let busy = live.activity() == 2;
+                    // The work's own clock — the one the band's elapsed words
+                    // read — so the description never disagrees with the paint:
+                    // where a determinate row's ETA slot shows that clock (its
+                    // estimate hidden), the reader hears how long it has run.
+                    let ran = now.saturating_duration_since(live.started_at);
+                    let time_words = if busy {
+                        aterm_messages::progress::elapsed_spoken(ran)
+                    } else {
+                        match live.track.eta(now) {
+                            aterm_messages::Eta::Hidden if layout.eta.is_some() => {
+                                aterm_messages::progress::clock_spoken(ran)
+                            }
+                            eta => aterm_messages::progress::eta_spoken(eta),
+                        }
+                    };
+                    let stats = live
+                        .msg
+                        .meter
+                        .as_ref()
+                        .map(|m| m.stats.clone())
+                        .filter(|s| !s.is_empty());
+                    let labels = layout
+                        .capsules
+                        .iter()
+                        .map(|c| c.full_label)
+                        .collect::<Vec<_>>()
+                        .join(" \u{00b7} ");
+                    let detail = [
+                        time_words,
+                        layout.load.map(|(_, words)| words.to_string()),
+                        stats,
+                        Some(labels).filter(|l| !l.is_empty()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                    // The NAME: the title, and `detail[0]` only where the row
+                    // shows it as its excerpt (E1) — width- and time-free, so
+                    // a countdown never re-announces the row.
+                    let detail0 = if live.msg.excerpt {
+                        live.msg.detail.first().map_or("", String::as_str)
+                    } else {
+                        ""
+                    };
+                    out.push(GridMessage {
+                        message,
+                        text: layout.spoken(detail0),
+                        detail: Some(detail),
+                        busy,
+                        progress: live
+                            .msg
+                            .meter
+                            .as_ref()
+                            .and_then(|m| m.fill_permille)
+                            .map(|f| f32::from(f) / 1000.0),
+                        // A failure, or a question: an alert either way.
+                        alarm: matches!(
+                            live.msg.severity,
+                            aterm_messages::Severity::Warn | aterm_messages::Severity::Error
+                        ) || live.msg.is_ask()
+                            || live
+                                .msg
+                                .actions
+                                .iter()
+                                .any(aterm_messages::Intent::is_consequential),
+                        // A press on the body is the row's `Details ›` — Settings ▸
+                        // Messages at this entry (`App::press_message_body`) — and so
+                        // is a screen reader's activate; each capsule, the `Details ›`
+                        // included, is a button of its own.
+                        activates: true,
+                        bar_row: Some(bar_row),
+                        capsules,
+                    });
+                }
+                // An echo is the band's end of its own indicator: not a row,
+                // not pressable, not announced (design §10.10).
+                aterm_messages::RowKind::Echo(_) => {}
+                aterm_messages::RowKind::Overflow { .. } => {
+                    out.push(GridMessage {
+                        message: ChromeMessage::BandOverflow,
+                        text: layout.full_title.clone(),
+                        detail: None,
+                        busy: false,
+                        progress: None,
+                        alarm: false,
+                        // One link, to Settings ▸ Messages at the top of the log: an
+                        // activate on it opens the page, like a press anywhere on it.
+                        activates: true,
+                        bar_row: Some(bar_row),
+                        // The node IS the link: its painted `Messages ›` capsule is
+                        // not a second control, and the tree publishes capsule
+                        // children only under the three message-row slots.
+                        capsules: Vec::new(),
+                    });
+                }
             }
-            out.push(GridMessage {
-                message: match lane {
-                    crate::status_bars::Lane::Toolchain => ChromeMessage::ToolchainStatus,
-                    crate::status_bars::Lane::Update => ChromeMessage::UpdateStatus,
-                    // Never yielded by `bars()` (the presence row is per window and
-                    // published above); the arm keeps the match total.
-                    crate::status_bars::Lane::Presence => ChromeMessage::PresenceStatus,
-                },
-                text,
-                detail: (!bar.text.stats.is_empty()).then(|| bar.text.stats.clone()),
-                progress: bar.fill,
-                // A press on a band opens its deliberate surface (Settings ▸ Packages /
-                // Software Update) — or, on a STAGED update row, applies the build
-                // (`App::press_update_bar`) — and so does a screen reader's activate.
-                activates: true,
-                // The row this band reserved, which is where the tree says it is —
-                // `bars()` yields them in the painted order the splice consumes.
-                bar_row: Some(row),
-            });
         }
 
         // The multi-line-paste confirmation: a question, and on this platform the only
@@ -2331,73 +2475,16 @@ impl App {
                 message: ChromeMessage::PasteConfirm,
                 text: crate::paste_banner::question(pending.text()),
                 detail: Some(crate::paste_banner::ANSWER_KEYS.to_string()),
+                busy: false,
                 progress: None,
+                alarm: false,
                 // Enter and Escape answer it. A screen reader's Click carries neither
                 // meaning, and guessing one on a security prompt is the wrong default.
                 activates: false,
                 // The band overwrites the frame's top rows rather than reserving a row of
                 // its own, so it has no rectangle of its own to publish.
                 bar_row: None,
-            });
-        }
-
-        // The config-load/reload warnings. GLOBAL (config is window-uniform), like the
-        // band the painter splices into every window.
-        //
-        // BOUNDED THE WAY THE BAND IS BOUNDED, from the same builder and the same
-        // `cols`/`panel_rows` `splice_config_notice` passes it. The raw `lines` behind
-        // this banner are whole diagnostics — a rejected `aterm.toml` reaches here as a
-        // TOML parse error with embedded newlines and a caret diagram — and announcing
-        // that paragraph while painting one ellipsized row tells a screen reader about a
-        // screen no sighted user is looking at.
-        if let Some(notice) = self.config_notice.as_ref() {
-            let panel_rows = notice.wanted_rows().min(ws.input_scratch.cells.len());
-            let band =
-                crate::config_notice::band_text(&notice.lines, usize::from(ws.cols), panel_rows);
-            // The SAME rows the band paints, in the same order — a notice that spans
-            // several lines reaches here already split, so the reader hears the caret
-            // diagram as the rows it is drawn as rather than as one run-on sentence.
-            let mut rows = band
-                .warnings
-                .iter()
-                .map(|warning| warning.text.as_str())
-                .chain(band.more.as_deref());
-            // The title plus the FIRST warning as painted: one sentence, the length of
-            // one row. Everything else the band shows is there to be read on demand.
-            if panel_rows > 0 {
-                let spoken = match rows.next() {
-                    Some(first) => format!("{} \u{00b7} {first}", band.title),
-                    None => band.title.clone(),
-                };
-                let rest: Vec<&str> = rows.collect();
-                out.push(GridMessage {
-                    message: ChromeMessage::ConfigWarning,
-                    text: spoken,
-                    detail: (!rest.is_empty()).then(|| rest.join("; ")),
-                    progress: None,
-                    activates: false,
-                    bar_row: None,
-                });
-            }
-        }
-
-        // The transient card. `notice_is_on_glass` is the predicate every side effect on
-        // this card already has to ask; announcing a card the compositor never showed in
-        // THIS window would be the same lie in a different sense.
-        if let Some(notice) = self.notice.as_ref().filter(|_| ws.notice_is_on_glass()) {
-            out.push(GridMessage {
-                message: ChromeMessage::Notice,
-                text: notice.text(),
-                detail: None,
-                progress: None,
-                // No notice kind is a one-press action any more (the update lane's
-                // click-to-apply is the status bar's row, 2026-09-07), so the tree
-                // never offers an action the pixels do not have. The cards that DO
-                // carry controls announce those controls, not the card.
-                activates: false,
-                // A floating card that slides through its whole life is not a place on
-                // the glass; a rectangle here would name where it was one frame ago.
-                bar_row: None,
+                capsules: Vec::new(),
             });
         }
         out
@@ -2422,58 +2509,72 @@ impl App {
             // The presence band informs and never activates (`activates: false`); a
             // stale activate on it is a no-op, like a click on it.
             ChromeMessage::PresenceStatus => {}
-            ChromeMessage::Notice => {
-                // `App::notice_click`'s gates, minus its hit test: the card must be on
-                // THIS window's glass and still legible. No kind carries a one-press
-                // action now (`activates` is false for the card itself), so an activate
-                // that arrives anyway only dismisses.
-                let Some(notice) = self.notice.as_ref() else {
-                    return;
-                };
-                if !self
-                    .windows
-                    .get(&wid)
-                    .is_some_and(crate::WindowState::notice_is_on_glass)
-                    || notice.alpha(std::time::Instant::now()) < crate::notice::CLICK_MIN_ALPHA
-                {
-                    return;
-                }
-                self.notice = None;
-                self.request_redraw_all_windows();
-            }
-            // The band's own click route (`App::on_mouse_button`): open the lane's
-            // deliberate surface — or, on a staged update row, APPLY the build in
-            // place (`App::press_update_bar`, the one press rule shared with the
-            // mouse). Gated on the band still occupying a committed row, so an
-            // activate on a folded bar does nothing.
-            ChromeMessage::ToolchainStatus | ChromeMessage::UpdateStatus => {
-                let lane = match message {
-                    ChromeMessage::ToolchainStatus => crate::status_bars::Lane::Toolchain,
-                    _ => crate::status_bars::Lane::Update,
-                };
-                let live = self
-                    .status_bars
-                    .bars()
-                    .take(usize::from(self.status_bar_rows))
-                    .any(|(up, _)| up == lane);
-                if !live {
-                    return;
-                }
-                match lane {
-                    crate::status_bars::Lane::Toolchain => {
-                        let _ =
-                            self.open_settings_tab(crate::native_settings::SettingsRoute::Packages);
-                    }
-                    crate::status_bars::Lane::Presence => {}
-                    // The same press rule as the mouse path: a staged row applies.
-                    crate::status_bars::Lane::Update => self.press_update_bar(),
+            // The band's own click route (`App::press_band`): a row's activate is
+            // the body's press — its `Details ›`, Settings ▸ Messages at that entry
+            // in THIS window (`App::press_message_body`, the one press rule shared
+            // with the mouse) — and a capsule's is that capsule. Re-resolved through
+            // the width law at this window's width and gated on the row still
+            // occupying a committed row, so an activate on a folded row does nothing.
+            ChromeMessage::BandRow0 | ChromeMessage::BandRow1 | ChromeMessage::BandRow2 => {
+                if let Some(id) = self.committed_band_message(wid, message.band_row_index()) {
+                    self.press_message_body(wid, id);
                 }
             }
-            // Neither carries a Click in the published tree. The paste question is
-            // answered by Enter/Escape and a generic activate names neither answer, which
-            // on a security prompt must not be guessed; the config band informs and then
-            // leaves on its own.
-            ChromeMessage::PasteConfirm | ChromeMessage::ConfigWarning => {}
+            ChromeMessage::BandCapsule { row, index } => {
+                let Some(id) = self.committed_band_message(wid, Some(usize::from(row))) else {
+                    return;
+                };
+                let action = crate::accesskit_tree::capsule_action(index);
+                if action.is_details() {
+                    self.press_message_body(wid, id);
+                    return;
+                }
+                let intent = self.messages.act(id, action, std::time::Instant::now());
+                self.sync_messages();
+                if let Some(intent) = intent {
+                    let _ = self.perform_intent(wid, id, intent);
+                }
+            }
+            // The overflow row is one link: Settings ▸ Messages, top of the log, in
+            // this window — gated on the band still carrying an overflow row, so a
+            // stale activate opens nothing.
+            ChromeMessage::BandOverflow => {
+                let cols = self.windows.get(&wid).map(|ws| usize::from(ws.cols));
+                let overflow = cols.is_some_and(|cols| {
+                    self.band_presentation(cols)
+                        .rows
+                        .iter()
+                        .take(usize::from(self.message_band_rows))
+                        .any(|row| matches!(row.kind, aterm_messages::RowKind::Overflow { .. }))
+                });
+                if overflow {
+                    let _ = self.open_messages_entry(wid, None);
+                }
+            }
+            // No Click in the published tree. The paste question is answered by
+            // Enter/Escape and a generic activate names neither answer, which on a
+            // security prompt must not be guessed.
+            ChromeMessage::PasteConfirm => {}
+        }
+    }
+
+    /// The message on committed band row `row` of window `wid` right now, or
+    /// `None` when that row is not committed, is the overflow link, or holds
+    /// no message any more — the live re-check every a11y activate makes.
+    #[cfg(a11y_tree)]
+    fn committed_band_message(
+        &self,
+        wid: crate::WindowId,
+        row: Option<usize>,
+    ) -> Option<aterm_messages::MessageId> {
+        let row = row?;
+        if row >= usize::from(self.message_band_rows) {
+            return None;
+        }
+        let cols = usize::from(self.windows.get(&wid)?.cols);
+        match self.band_presentation(cols).rows.get(row)?.kind {
+            aterm_messages::RowKind::Message(id) => self.messages.live(id).map(|l| l.id),
+            aterm_messages::RowKind::Echo(_) | aterm_messages::RowKind::Overflow { .. } => None,
         }
     }
 
@@ -2491,6 +2592,7 @@ impl App {
             // the ONLY edge that says "someone is actually listening": raise the latch first
             // so the publish below (and every later present) is allowed to build a tree.
             AkWindowEvent::InitialTreeRequested => {
+                crate::a11y_backend::note_at_client();
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.a11y_active = true;
                 }
@@ -3961,17 +4063,6 @@ mod a11y_message_wiring_tests {
     use crate::accesskit_tree::{ChromeMessage, GridMessage};
     use crate::{App, WindowId};
 
-    /// The text a window's frame actually carries on row `row`, margins trimmed — what a
-    /// sighted user reads off the glass.
-    fn painted_row(app: &App, wid: WindowId, row: usize) -> String {
-        app.windows[&wid].input_scratch.cells[row]
-            .iter()
-            .map(|cell| cell.ch)
-            .collect::<String>()
-            .trim()
-            .to_string()
-    }
-
     fn message(app: &App, wid: WindowId, kind: ChromeMessage) -> GridMessage {
         app.grid_a11y_messages(wid)
             .into_iter()
@@ -3979,134 +4070,539 @@ mod a11y_message_wiring_tests {
             .unwrap_or_else(|| panic!("{kind:?} is not published"))
     }
 
-    /// A LIVE REGION IS A SENTENCE, AND THE SENTENCE IS THE ONE ON SCREEN. The lines
-    /// behind the config band are raw diagnostics: a rejected `aterm.toml` reaches here as
-    /// a TOML parse error carrying embedded newlines and an ASCII caret diagram. The band
-    /// paints ONE ellipsized row of it, so that is what is announced — reading the whole
-    /// paragraph aloud describes a screen nobody is looking at and takes the listener
-    /// through a caret diagram spoken as punctuation.
-    #[test]
-    fn the_config_bands_announcement_is_cut_exactly_where_the_band_is_cut() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        let raw = "aterm.toml is not a valid aterm config: TOML parse error at line 6, \
-                   column 31\n  |\n6 | this_key_does_not_exist = 42\n  |            ^^\n\
-                   invalid type: integer `42`, expected a string\n";
-        app.config_notice =
-            crate::config_notice::ConfigNotice::new(vec![raw.to_string()], Instant::now());
-        app.splice_config_notice(wid);
-
-        let spoken = message(&app, wid, ChromeMessage::ConfigWarning).text;
-        assert!(
-            !spoken.contains('\n'),
-            "a live region carrying five newlines is spoken as one run-on paragraph: \
-             {spoken:?}"
-        );
-        // The title row and the first warning row, exactly as the frame carries them.
-        let separator = spoken.find(" \u{00b7} ").expect("title \u{00b7} warning");
-        let painted_title = painted_row(&app, wid, 0);
-        let painted_first = painted_row(&app, wid, 1);
-        let bullet = painted_first
-            .trim_start()
-            .strip_prefix('\u{2022}')
-            .expect("the warning row is bulleted")
-            .trim_start();
-        assert!(
-            painted_title.starts_with(&spoken[..separator]),
-            "the announced title is the painted title: {painted_title:?} vs {spoken:?}"
-        );
-        assert!(
-            spoken.ends_with(bullet),
-            "the announced warning is the painted warning, ellipsis and all:\n  \
-             painted:   {bullet:?}\n  announced: {spoken:?}"
-        );
-        assert!(
-            bullet.ends_with('\u{2026}') && bullet.chars().count() < raw.chars().count(),
-            "sanity: the frame really did cut this diagnostic — {bullet:?}"
-        );
-    }
-
-    /// A STATUS BAND IS ANNOUNCED WHERE IT IS PAINTED, AND ONLY WHILE IT IS. The tree
-    /// reads the same committed `status_bar_rows` the splice trims its painted rows to, so
-    /// a band whose row the frame has not committed is not described at all; and the
+    /// A BAND ROW IS ANNOUNCED WHERE IT IS PAINTED, AND ONLY WHILE IT IS. The tree
+    /// reads the same committed `message_band_rows` the splice trims its painted rows
+    /// to, so a row the frame has not committed is not described at all; and the
     /// volatile figures stay out of the spoken half, because the announcement fires on
-    /// that half CHANGING and a byte counter there would say the bar aloud all the way to
-    /// 100%.
+    /// that half CHANGING and a byte counter there would say the row aloud all the way
+    /// to 100%.
     #[test]
-    fn a_status_band_is_announced_at_the_row_it_reserves_and_only_while_it_holds_it() {
+    fn a_band_row_is_announced_at_the_row_it_reserves_and_only_while_it_holds_it() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.prepare_terminal_capture_grid(wid).unwrap();
-        let now = Instant::now();
         let downloading = |done: u64| aterm_update::Progress::Downloading {
             version: "0.64.0".to_string(),
             bytes_done: done * 1024 * 1024,
             bytes_total: 480 * 1024 * 1024,
         };
-        app.status_bars
-            .update_progress(&downloading(120), None, now);
-        app.sync_status_bar_rows();
-        assert_eq!(app.status_bar_rows, 1, "the update lane reserved its row");
+        app.note_update_progress(&downloading(120));
+        assert_eq!(
+            app.message_band_rows, 0,
+            "inside its grace the row is not on the glass (design §10.4.3)"
+        );
+        assert!(app.grid_a11y_messages(wid).is_empty(), "…nor in the tree");
+        app.settle_messages(Instant::now() + aterm_messages::PROGRESS_GRACE * 2);
+        assert_eq!(app.message_band_rows, 1, "the update lane reserved its row");
 
-        let band = message(&app, wid, ChromeMessage::UpdateStatus);
-        assert_eq!(band.bar_row, Some(0), "the only band is the top band");
+        let band = message(&app, wid, ChromeMessage::BandRow0);
+        assert_eq!(band.bar_row, Some(0), "the only row is the top row");
         assert_eq!(band.progress, Some(0.25));
+        assert!(!band.busy, "a download has a fraction");
         assert!(band.activates, "a press opens Software Update");
-        assert!(
-            band.text.contains("downloading"),
-            "the phase is spoken: {:?}",
-            band.text
+        assert_eq!(
+            band.text, "Downloading aterm v0.64.0",
+            "the phase is spoken, and only the title: the row has no excerpt"
         );
         let figures = band.detail.clone().expect("the byte counter is described");
         assert!(
-            !band.text.contains(&figures),
+            figures.starts_with("126 MB / 503 MB; "),
+            "the stats lead the description, then the capsules: {figures:?}"
+        );
+        assert!(
+            !band.text.contains("126 MB"),
             "the volatile figures must not ride the announced sentence: {:?}",
             band.text
         );
+        assert_eq!(
+            band.capsules.len(),
+            1,
+            "a downloading row carries only the implicit Details capsule"
+        );
+        assert_eq!(band.capsules[0].label, "Details \u{203a}");
 
-        // Further bytes move the description and leave the announced sentence alone.
-        app.status_bars
-            .update_progress(&downloading(400), None, now);
-        let later = message(&app, wid, ChromeMessage::UpdateStatus);
+        // Further bytes move the description and leave the announced sentence alone
+        // (through the reporter's seam, which restates the live row: a byte tick is
+        // never a new row).
+        app.note_update_progress(&downloading(400));
+        let later = message(&app, wid, ChromeMessage::BandRow0);
         assert_eq!(later.text, band.text, "no announcement for a byte count");
         assert_ne!(later.detail, band.detail);
 
-        // A band the frame has not committed a row for is not described at all — the same
-        // trim `splice_status_bars` applies to its painted rows.
-        app.status_bar_rows = 0;
+        // A row the frame has not committed is not described at all — the same
+        // trim `splice_message_band` applies to its painted rows.
+        app.message_band_rows = 0;
         assert!(
             app.grid_a11y_messages(wid).is_empty(),
-            "a band with no committed row is not on the glass"
+            "a row with no committed slot is not on the glass"
         );
     }
 
-    /// A SCREEN READER MAY NOT REACH WHAT A CLICK COULD NOT. An action request names a
-    /// node from a tree published some frames ago, and the notice card fades and slides
-    /// the whole time it is up; `activate_a11y_message` therefore re-asks the very
-    /// question `App::notice_click` asks before it consumes the card.
+    /// A ROW THAT ASKS IS AN ALERT, NOT STATUS NEWS (review 2026-09-24): the admin
+    /// step's question reaches assistive technology as something the person is being
+    /// asked — the alert role, at the band's polite politeness — like a failure, while
+    /// work in flight stays a progress indicator.
     #[test]
-    fn activating_a_card_that_is_not_on_this_windows_glass_does_nothing() {
+    fn a_decision_row_is_an_alert() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.prepare_terminal_capture_grid(wid).unwrap();
-        app.notice = Some(crate::notice::TransientNotice::update_status(
-            "\u{2191} Update ready \u{2014} v0.64.0",
-            Instant::now(),
+        app.post_message(crate::message_reporters::admin_step(&[
+            "clt".to_string(),
+            "brew".to_string(),
+        ]));
+        let ask = message(&app, wid, ChromeMessage::BandRow0);
+        assert_eq!(ask.text, "Install Command Line Tools and Homebrew");
+        assert!(ask.alarm, "a question is an alert");
+        assert!(ask.progress.is_none() && !ask.busy);
+        let mut app = App::headless_for_test();
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        app.announce_toolchain_pass("installing 10 ALab program(s)", true);
+        let work = message(&app, wid, ChromeMessage::BandRow0);
+        assert!(!work.alarm, "work in flight is not an alert");
+        assert!(work.busy);
+    }
+
+    /// ROBI'S BUBBLE IS A DECORATION (design D7, R23): what survived of the retired
+    /// transient card is never announced — not while it is armed, not while it is on
+    /// THIS window's glass — so the tree holds no node for it and a stale activate on the
+    /// retired slot 0 decodes to nothing (`ChromeMessage::from_node`).
+    #[test]
+    fn robis_bubble_is_never_announced_even_on_this_windows_glass() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        app.robi_bubble = Some(crate::robi_bubble::RobiBubble::new(
+            aterm_effects::robi::ROBI_TIPS[0].text,
+            None,
+            Instant::now() - std::time::Duration::from_secs(1),
         ));
-        // The card is global; this window has not composited one, which is the state a
-        // second window is in while the first one shows the pill.
-        assert!(!app.windows[&wid].notice_is_on_glass());
+        app.splice_robi_bubble(wid);
+        assert!(
+            app.windows[&wid].bubble_is_on_glass(),
+            "precondition: the bubble is painted in this window"
+        );
+        let tip = aterm_effects::robi::ROBI_TIPS[0].text;
+        let spoken = app.grid_a11y_messages(wid);
+        assert!(
+            spoken.iter().all(|m| !m.text.contains(tip)),
+            "a decoration is not announced: {spoken:?}"
+        );
+        assert!(
+            spoken.is_empty(),
+            "nothing else is on this glass: {spoken:?}"
+        );
+    }
+
+    /// A RESIZE NEVER RE-ANNOUNCES A BAND ROW (design §3.5, §7.2): the spoken
+    /// sentence is the title and the FULL first detail line — width-independent
+    /// — so one row at 60 and at 160 columns is announced once, while the
+    /// excerpt the frame paints is shaped differently at each width. The
+    /// description (stats and the capsules' full labels) is width-independent
+    /// too.
+    #[test]
+    fn a_resize_never_reannounces_a_band_row() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let tools = vec!["ay".to_string(), "trust".to_string()];
+        let pill = crate::toolchain_words::seed_pill_text(
+            &tools,
+            None,
+            1,
+            crate::toolchain_words::HookDialect::Zsh,
+        );
+        // The installed words at a row's hold: a record since the silent lane
+        // (2026-09-22), but the longest detail line a toolchain row has carried,
+        // which is what this pin needs.
+        app.post_message(
+            crate::toolchain_words::installed(&pill).hold(aterm_messages::Hold::Default),
+        );
+        assert_eq!(
+            app.message_band_rows, 1,
+            "the installed row reserved its row"
+        );
+        let at_width = |app: &mut App, cols: u16| {
+            app.windows.get_mut(&wid).expect("headless window").cols = cols;
+            let spoken = message(app, wid, ChromeMessage::BandRow0);
+            let painted = app.band_presentation(usize::from(cols)).rows[0]
+                .detail
+                .clone()
+                .map(|(_, excerpt)| excerpt);
+            (spoken.text, spoken.detail, painted)
+        };
+        let (narrow, narrow_described, narrow_painted) = at_width(&mut app, 60);
+        let (wide, wide_described, wide_painted) = at_width(&mut app, 160);
+        assert_eq!(narrow, wide, "one sentence at every width");
+        assert_eq!(narrow_described, wide_described, "one description too");
+        assert_ne!(
+            narrow_painted, wide_painted,
+            "sanity: the frame really does shape the excerpt differently"
+        );
+        assert!(
+            wide.contains("1 tab from before it picks them up with"),
+            "the FULL detail line is spoken, not the excerpt: {wide}"
+        );
+        app.windows.get_mut(&wid).expect("headless window").cols = 80;
+    }
+
+    /// ACTIVATING A BAND ROW PERFORMS ITS BODY PRESS, AND A CAPSULE CHILD THAT
+    /// CAPSULE'S INTENT (design §7.2, §2.2): a screen reader's activate on the
+    /// row is the mouse's body press — the row's `Details ›`, Settings ▸
+    /// Messages at that entry in THIS window — the `Details ›` child is
+    /// published with its full label and does the same, an authored child
+    /// performs its own intent, and an activate on a row the frame no longer
+    /// carries does nothing.
+    #[test]
+    fn activating_a_band_row_performs_its_body_press_and_a_capsule_child_its_intent() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let id = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::TOOLCHAIN,
+                aterm_messages::Severity::Info,
+                "Installing ALab toolchain",
+            )
+            .line("trust — extracting")
+            .action(aterm_messages::Intent::OpenSettings {
+                route: "/packages".into(),
+            })
+            .hold(aterm_messages::Hold::Live {
+                stale_after: aterm_messages::STALE_TAILED,
+            }),
+        );
+        let row = message(&app, wid, ChromeMessage::BandRow0);
+        assert!(row.activates, "a band row activates");
+        let labels: Vec<&str> = row.capsules.iter().map(|c| c.label).collect();
+        assert_eq!(
+            labels,
+            ["Packages", "Details \u{203a}"],
+            "the authored capsule, then the row's link, each by its full label"
+        );
+        assert_eq!(
+            row.capsules[1].index,
+            crate::accesskit_tree::CAPSULE_DETAILS,
+            "the link takes the Details slot"
+        );
+        let settings = |app: &App| {
+            let (_, view) = app.active_native_view(wid)?;
+            match app.native_runtime.view_state(view)? {
+                crate::native_app::AppViewState::Settings(state) => {
+                    Some((state.route, state.messages_selected))
+                }
+                _ => None,
+            }
+        };
+        assert_eq!(settings(&app), None);
+        // The row itself: the body press — its `Details ›`.
+        app.activate_a11y_message(wid, ChromeMessage::BandRow0);
+        assert_eq!(
+            app.messages.live(id).unwrap().acted.map(|(k, _)| k),
+            None,
+            "the body is no capsule: nothing is recorded as one"
+        );
+        assert!(app.messages.live(id).unwrap().seen, "…but the row is seen");
+        assert_eq!(
+            settings(&app),
+            Some((
+                crate::native_settings::SettingsRoute::Messages,
+                Some(id.raw())
+            )),
+            "Settings \u{25b8} Messages at this entry, in this window"
+        );
+        // The authored child: its own intent.
+        app.activate_a11y_message(wid, ChromeMessage::BandCapsule { row: 0, index: 0 });
+        assert_eq!(
+            app.messages.live(id).unwrap().acted.map(|(k, _)| k),
+            Some(aterm_messages::ActionIndex(0)),
+            "the engine recorded the press"
+        );
+        assert_eq!(
+            settings(&app).map(|(route, _)| route),
+            Some(crate::native_settings::SettingsRoute::Packages),
+            "Settings \u{25b8} Packages, in this window"
+        );
+        // The Details child: the body press again.
+        app.activate_a11y_message(
+            wid,
+            ChromeMessage::BandCapsule {
+                row: 0,
+                index: crate::accesskit_tree::CAPSULE_DETAILS,
+            },
+        );
+        assert_eq!(
+            settings(&app).map(|(route, _)| route),
+            Some(crate::native_settings::SettingsRoute::Messages)
+        );
+        // The row is gone: a stale activate names a slot the frame no longer
+        // carries, and nothing happens.
+        assert!(app.resolve_message(id, aterm_messages::Outcome::Ok));
         assert!(
             app.grid_a11y_messages(wid)
                 .iter()
-                .all(|m| m.message != ChromeMessage::Notice),
-            "a card this window never showed is not announced here"
+                .all(|m| m.message != ChromeMessage::BandRow0),
+            "a resolved row is not published"
         );
-        app.activate_a11y_message(wid, ChromeMessage::Notice);
+        app.activate_a11y_message(wid, ChromeMessage::BandRow0);
+        app.activate_a11y_message(wid, ChromeMessage::BandCapsule { row: 0, index: 0 });
+        assert!(app.messages.live(id).is_none());
+    }
+
+    /// A11Y ACTIVATE ON A ROW OPENS DETAILS (design §4.5, §7.2): a screen
+    /// reader's activate on ANY committed band row — the second as much as
+    /// the first — is that row's `Details ›`: Settings ▸ Messages at that
+    /// entry in this window, the row read (a held one folds off the glass;
+    /// the row count holds through its quiet), the row beside it untouched;
+    /// an activate on a slot the frame no longer carries does nothing; the
+    /// overflow link's activate opens the page unselected and reads no row;
+    /// and with no overflow row on the band that activate is stale and
+    /// opens nothing.
+    #[test]
+    fn a11y_activate_on_a_row_opens_details() {
+        let settings = |app: &App, wid: WindowId| {
+            let (_, view) = app.active_native_view(wid)?;
+            match app.native_runtime.view_state(view)? {
+                crate::native_app::AppViewState::Settings(state) => {
+                    Some((state.route, state.messages_selected))
+                }
+                _ => None,
+            }
+        };
+        let row_of = |app: &App, wid: WindowId, id: aterm_messages::MessageId| {
+            let cols = usize::from(app.windows[&wid].cols);
+            app.band_presentation(cols)
+                .rows
+                .iter()
+                .position(|r| matches!(r.kind, aterm_messages::RowKind::Message(m) if m == id))
+        };
+        let slots = [
+            ChromeMessage::BandRow0,
+            ChromeMessage::BandRow1,
+            ChromeMessage::BandRow2,
+        ];
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let meter = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::TOOLCHAIN,
+                aterm_messages::Severity::Info,
+                "Installing ALab toolchain",
+            )
+            .line("trust — extracting")
+            .action(aterm_messages::Intent::OpenSettings {
+                route: "/packages".into(),
+            })
+            .hold(aterm_messages::Hold::Live {
+                stale_after: aterm_messages::STALE_TAILED,
+            }),
+        );
+        let warning = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                "aterm.toml: unknown key `foo`",
+            )
+            .line("at line 12"),
+        );
+        assert_eq!(app.message_band_rows, 2);
+        let row = row_of(&app, wid, warning).expect("the warning is on the band");
+        let node = message(&app, wid, slots[row]);
+        assert!(node.activates, "a band row activates");
+        assert_eq!(
+            node.capsules.iter().map(|c| c.label).collect::<Vec<_>>(),
+            ["Details \u{203a}"],
+            "a capsule-less row publishes its link alone"
+        );
+        assert_eq!(settings(&app, wid), None);
+        app.activate_a11y_message(wid, slots[row]);
+        assert_eq!(
+            settings(&app, wid),
+            Some((
+                crate::native_settings::SettingsRoute::Messages,
+                Some(warning.raw())
+            )),
+            "Settings \u{25b8} Messages at this entry, in this window"
+        );
         assert!(
-            app.notice.is_some(),
-            "an activate on a card that is not on this glass consumes nothing"
+            app.messages.live(warning).is_none(),
+            "read, so a held row folds"
         );
+        assert!(
+            app.messages
+                .live(meter)
+                .is_some_and(|l| !l.seen && l.acted.is_none()),
+            "the row beside it is untouched"
+        );
+        assert!(
+            row_of(&app, wid, warning).is_none(),
+            "the folded row is off the glass"
+        );
+        assert_eq!(
+            app.message_band_rows, 2,
+            "the count holds through its quiet (D1's hysteresis shrinks late): an \
+             activate never re-grids the terminal under the reader"
+        );
+        assert!(
+            app.grid_a11y_messages(wid)
+                .iter()
+                .all(|m| m.message != ChromeMessage::BandRow1),
+            "the second slot is no longer published"
+        );
+        // A stale activate on the slot the fold emptied: nothing.
+        app.activate_a11y_message(wid, ChromeMessage::BandRow1);
+        assert_eq!(
+            settings(&app, wid),
+            Some((
+                crate::native_settings::SettingsRoute::Messages,
+                Some(warning.raw())
+            ))
+        );
+        assert!(app.messages.live(meter).is_some_and(|l| !l.seen));
+
+        // The overflow link, in a fresh window: the page, nothing selected,
+        // no row read, the band as it was.
+        let mut app = App::headless_for_test();
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let ids: Vec<_> = (0..5)
+            .map(|i| {
+                app.post_message(
+                    aterm_messages::Message::new(
+                        aterm_messages::tags::CONFIG,
+                        aterm_messages::Severity::Warn,
+                        format!("config warning {i}"),
+                    )
+                    .line("why"),
+                )
+            })
+            .collect();
+        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
+        let link = message(&app, wid, ChromeMessage::BandOverflow);
+        assert!(link.activates, "the overflow row is a link");
+        assert!(
+            link.capsules.is_empty(),
+            "the node is the one link: its painted chip is no second control"
+        );
+        app.activate_a11y_message(wid, ChromeMessage::BandOverflow);
+        assert_eq!(
+            settings(&app, wid),
+            Some((crate::native_settings::SettingsRoute::Messages, None)),
+            "the page, top of the log, nothing expanded"
+        );
+        for id in &ids {
+            assert!(
+                app.messages.live(*id).is_some_and(|l| !l.seen),
+                "a link to the log reads no row"
+            );
+        }
+        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
+
+        // No overflow row: the link's activate is stale and opens nothing.
+        let mut app = App::headless_for_test();
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                "one warning",
+            )
+            .line("why"),
+        );
+        assert!(
+            app.grid_a11y_messages(wid)
+                .iter()
+                .all(|m| m.message != ChromeMessage::BandOverflow),
+            "one row: no overflow link is published"
+        );
+        app.activate_a11y_message(wid, ChromeMessage::BandOverflow);
+        assert_eq!(settings(&app, wid), None, "nothing opened");
+    }
+
+    /// A COUNTDOWN NEVER RE-ANNOUNCES A ROW (design §10.10): a download whose
+    /// ETA has latched carries it in the DESCRIPTION, as a reader says it
+    /// ("about … left"); the spoken name is the title alone and does not move
+    /// as the bytes arrive and the countdown runs.
+    #[test]
+    fn a_countdown_never_reannounces_a_row() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let total: u64 = 200_000_000;
+        let words = |done: u64| {
+            crate::update_words::progress(
+                &aterm_update::Progress::Downloading {
+                    version: "0.91.0".to_string(),
+                    bytes_done: done,
+                    bytes_total: total,
+                },
+                None,
+                "",
+            )
+        };
+        // Ten seconds of a steady 5 MB/s, fed at the instants they arrived.
+        let now = Instant::now();
+        let base = now - std::time::Duration::from_secs(10);
+        let id = app
+            .messages
+            .post(words(0), crate::messages_host::wall_stamp_now(), base)
+            .id;
+        for k in 1..=20u64 {
+            let t = base + std::time::Duration::from_millis(k * 500);
+            app.messages.restate(
+                id,
+                crate::messages_host::restatement_of(&words(k * 2_500_000)),
+                t,
+            );
+        }
+        app.settle_messages(now);
+        assert_eq!(app.message_band_rows, 1);
+        let first = message(&app, wid, ChromeMessage::BandRow0);
+        let description = first.detail.clone().unwrap_or_default();
+        assert!(
+            description.starts_with("about ") && description.contains(" left; "),
+            "the latched ETA leads the description: {description:?}"
+        );
+        assert_eq!(first.text, "Downloading aterm v0.91.0");
+        app.messages.restate(
+            id,
+            crate::messages_host::restatement_of(&words(60_000_000)),
+            now,
+        );
+        let later = message(&app, wid, ChromeMessage::BandRow0);
+        assert_eq!(later.text, first.text, "the countdown is never announced");
+    }
+
+    /// SPEECH FOLLOWS THE CLOCK A HIDDEN ESTIMATE PAINTS (review round 3,
+    /// 2026-09-24): until a download's estimate latches, its ETA slot shows the
+    /// work's elapsed clock, and the description says the same thing whole —
+    /// "running for N seconds" — where it said nothing; the name is the title.
+    #[test]
+    fn the_clock_a_hidden_estimate_paints_is_described() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let words = crate::update_words::progress(
+            &aterm_update::Progress::Downloading {
+                version: "0.91.0".to_string(),
+                bytes_done: 10_000_000,
+                bytes_total: 200_000_000,
+            },
+            None,
+            "",
+        );
+        let now = Instant::now();
+        let base = now - std::time::Duration::from_secs(4);
+        app.messages
+            .post(words, crate::messages_host::wall_stamp_now(), base);
+        app.settle_messages(now);
+        assert_eq!(app.message_band_rows, 1);
+        let row = message(&app, wid, ChromeMessage::BandRow0);
+        let description = row.detail.clone().unwrap_or_default();
+        assert!(
+            description.starts_with("running for ") && description.contains(" seconds"),
+            "one read, no estimate: the clock leads the description: {description:?}"
+        );
+        assert_eq!(row.text, "Downloading aterm v0.91.0");
     }
 }

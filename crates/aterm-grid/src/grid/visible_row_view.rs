@@ -418,6 +418,14 @@ impl Grid {
         self.storage.row_at_screen(screen_row)
     }
 
+    /// The ring row at display index `visible_row` with NO viewport bound — the
+    /// row just past the viewport (`visible_row == rows`) that the M1b
+    /// incoming-row apron reads for its DEC line size. `None` past the ring.
+    #[must_use]
+    pub fn row_past_viewport(&self, visible_row: u16) -> Option<&Row> {
+        self.storage.row_past_viewport(visible_row)
+    }
+
     /// LIVE-frame twin of [`is_wide_continuation_at`](Self::is_wide_continuation_at):
     /// same DECSCA-disambiguated continuation rule, keyed on the SCREEN row
     /// (offset-independent) so it pairs with [`row_at_screen`](Self::row_at_screen).

@@ -67,6 +67,9 @@ impl FrontContent {
 pub(crate) struct TerminalMirror {
     pub(crate) session: u64,
     pub(crate) term: Arc<Mutex<Terminal>>,
+    /// Copy-mode state shared by every view of this session, read without the
+    /// terminal mutex on the key path.
+    pub(crate) vi_active: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) master: i32,
     pub(crate) sink: Arc<SinkWriter>,
     /// The session's UI-waiter register (`SessionCtx::ui_waiting`), so the

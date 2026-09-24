@@ -146,20 +146,38 @@ impl LevelFilter {
 }
 
 // ── Host policy helpers ─────────────────────────────────────────────────────
-// Pure decisions for hosts that install a file logger (rotation-lite and
-// record hygiene). Kept engine-side so they are unit-testable without I/O.
+// Pure decisions for hosts that install a file logger (rotation and record
+// hygiene). Kept engine-side so they are unit-testable without I/O.
 
-/// Rotation-lite cap: a host truncates its log file at startup once it has
-/// grown past this size.
-pub const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+/// The size one log file may reach before a host rotates it: the file is
+/// renamed to `<name>.1` (replacing the older copy) and a fresh one started,
+/// so a log and its one older copy stay near twice this, about 8 MiB.
+pub const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Maximum bytes of one sanitized record body (see [`sanitize_record`]).
+/// Maximum bytes of one sanitized INFO, DEBUG or TRACE record body (see
+/// [`sanitize_record`]).
 pub const MAX_RECORD_BYTES: usize = 512;
 
-/// Whether a log file of `len` bytes should be truncated at startup.
+/// Maximum bytes of one sanitized WARN or ERROR record body (see
+/// [`sanitize_record_for`]). These are the lines a failure is diagnosed from
+/// and they arrive a few times a day, so they keep twice the text.
+pub const MAX_ALERT_RECORD_BYTES: usize = 1024;
+
+/// Whether a log file of `len` bytes has outgrown [`MAX_LOG_BYTES`] and should
+/// be rotated.
 #[must_use]
-pub fn should_truncate(len: u64) -> bool {
+pub fn should_rotate(len: u64) -> bool {
     len > MAX_LOG_BYTES
+}
+
+/// The body cap for a record at `level`: [`MAX_ALERT_RECORD_BYTES`] for WARN
+/// and ERROR, [`MAX_RECORD_BYTES`] for everything else.
+#[must_use]
+pub fn record_cap(level: Level) -> usize {
+    match level {
+        Level::Error | Level::Warn => MAX_ALERT_RECORD_BYTES,
+        Level::Info | Level::Debug | Level::Trace => MAX_RECORD_BYTES,
+    }
 }
 
 /// Sanitize one formatted record body for a line-oriented log file.
@@ -172,32 +190,46 @@ pub fn should_truncate(len: u64) -> bool {
 /// record cannot balloon the file. Clean short input is returned borrowed.
 #[must_use]
 pub fn sanitize_record(msg: &str) -> Cow<'_, str> {
+    sanitize_capped(msg, MAX_RECORD_BYTES)
+}
+
+/// [`sanitize_record`] with the cap for a record at `level` ([`record_cap`]).
+#[must_use]
+pub fn sanitize_record_for(level: Level, msg: &str) -> Cow<'_, str> {
+    sanitize_capped(msg, record_cap(level))
+}
+
+/// The one sanitizer behind [`sanitize_record`] and [`sanitize_record_for`];
+/// `cap` is at most [`MAX_ALERT_RECORD_BYTES`].
+fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     let clean = !msg.chars().any(char::is_control);
-    if clean && msg.len() <= MAX_RECORD_BYTES {
+    if clean && msg.len() <= cap {
         return Cow::Borrowed(msg);
     }
     // Capacity is a single compile-time constant so the verifier can bound the
     // reservation below its per-allocation ceiling: the loop below caps output at
-    // `MAX_RECORD_BYTES` and appends at most a 3-byte `…`, so the owned string
-    // never exceeds `MAX_RECORD_BYTES + 3`. Reserving `MAX_RECORD_BYTES + 4` is a
-    // fixed 516-byte hint that only affects the reservation, not the bytes pushed,
-    // so the returned value is byte-identical (a `.min(msg.len())` would only ever
-    // under-reserve for tiny inputs — never change output). The `+ 4` is folded in
-    // a `const` item so the function body carries no runtime add and the operand
-    // reaching `with_capacity` is a plain 516 literal the verifier can bound.
-    const OUT_CAPACITY: usize = MAX_RECORD_BYTES + 4;
+    // `cap` (never above `MAX_ALERT_RECORD_BYTES`) and appends at most a 3-byte
+    // `…`, so the owned string never exceeds `MAX_ALERT_RECORD_BYTES + 3`.
+    // Reserving `MAX_ALERT_RECORD_BYTES + 4` is a fixed hint that only affects the
+    // reservation, not the bytes pushed, so the returned value is byte-identical
+    // (a `.min(msg.len())` would only ever under-reserve for tiny inputs — never
+    // change output). The `+ 4` is folded in a `const` item so the function body
+    // carries no runtime add and the operand reaching `with_capacity` is a plain
+    // literal the verifier can bound.
+    const OUT_CAPACITY: usize = MAX_ALERT_RECORD_BYTES + 4;
+    let cap = cap.min(MAX_ALERT_RECORD_BYTES);
     let mut out = String::with_capacity(OUT_CAPACITY);
     for c in msg.chars() {
         // Guard on the bytes ACTUALLY pushed. A control char becomes U+FFFD (3
         // bytes), not its own `len_utf8()` (1 byte for C0/DEL), so measuring the
         // original width would let a control char at the boundary push `out` past
-        // `MAX_RECORD_BYTES + 3` and silently reallocate past the reservation.
+        // `cap + 3` and silently reallocate past the reservation.
         let (pushed, pushed_len) = if c.is_control() {
             ('\u{FFFD}', '\u{FFFD}'.len_utf8())
         } else {
             (c, c.len_utf8())
         };
-        if out.len().saturating_add(pushed_len) > MAX_RECORD_BYTES {
+        if out.len().saturating_add(pushed_len) > cap {
             out.push('…');
             break;
         }
@@ -747,11 +779,41 @@ mod tests {
     }
 
     #[test]
-    fn test_should_truncate_threshold() {
-        assert!(!should_truncate(0));
-        assert!(!should_truncate(MAX_LOG_BYTES));
-        assert!(should_truncate(MAX_LOG_BYTES + 1));
-        assert!(should_truncate(u64::MAX));
+    fn test_should_rotate_threshold() {
+        assert!(!should_rotate(0));
+        assert!(!should_rotate(MAX_LOG_BYTES));
+        assert!(should_rotate(MAX_LOG_BYTES + 1));
+        assert!(should_rotate(u64::MAX));
+    }
+
+    #[test]
+    fn test_warn_and_error_keep_the_longer_cap() {
+        assert_eq!(record_cap(Level::Error), MAX_ALERT_RECORD_BYTES);
+        assert_eq!(record_cap(Level::Warn), MAX_ALERT_RECORD_BYTES);
+        assert_eq!(record_cap(Level::Info), MAX_RECORD_BYTES);
+        assert_eq!(record_cap(Level::Debug), MAX_RECORD_BYTES);
+        assert_eq!(record_cap(Level::Trace), MAX_RECORD_BYTES);
+
+        let long = "w".repeat(MAX_ALERT_RECORD_BYTES * 2);
+        let warn = sanitize_record_for(Level::Warn, &long);
+        assert!(warn.len() > MAX_RECORD_BYTES + '…'.len_utf8());
+        assert!(warn.len() <= MAX_ALERT_RECORD_BYTES + '…'.len_utf8());
+        assert!(warn.ends_with('…'));
+        let info = sanitize_record_for(Level::Info, &long);
+        assert_eq!(info, sanitize_record(&long));
+        assert!(info.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
+
+        // A WARN body between the two caps is kept whole, and borrowed.
+        let mid = "m".repeat(MAX_RECORD_BYTES + 100);
+        assert!(matches!(sanitize_record_for(Level::Warn, &mid), Cow::Borrowed(m) if m == mid));
+    }
+
+    #[test]
+    fn test_sanitize_record_for_control_char_at_the_alert_boundary_stays_within_reservation() {
+        let msg = "a".repeat(MAX_ALERT_RECORD_BYTES - 1) + "\u{01}" + "a";
+        let out = sanitize_record_for(Level::Error, &msg);
+        assert!(out.len() <= MAX_ALERT_RECORD_BYTES + '…'.len_utf8());
+        assert!(!out.chars().any(char::is_control));
     }
 
     #[test]

@@ -411,7 +411,7 @@ impl App {
     /// whenever [`Self::conn_wire_fingerprint`] is `0` — no drag here, armed
     /// only, native origin, or the cursor has left the source window (beyond
     /// it the pushed highlights + the OS cursor carry the signal). Mirrors
-    /// `splice_notice`'s rasterize/composite shape.
+    /// `splice_robi_bubble`'s rasterize/composite shape.
     pub(crate) fn splice_conn_wire(&mut self, wid: WindowId) {
         let fp = self.conn_wire_fingerprint(wid);
         if fp == 0 {
@@ -494,7 +494,7 @@ impl App {
             },
         ];
         // Crop the raster to the wire's bounds (plus the dot/AA margin), like
-        // the notice card — never a full-frame, mostly-transparent buffer.
+        // Robi's bubble card — never a full-frame, mostly-transparent buffer.
         const PAINT_MARGIN: f32 = 5.0;
         let tray_w = (cols * cw) as f32;
         let tray_h = ((rows + strip) * ch) as f32;

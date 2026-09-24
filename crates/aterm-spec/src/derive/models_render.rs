@@ -8,6 +8,36 @@
 
 use super::*;
 
+/// A composed cursor frame may read ribbon witness rows from its already
+/// captured caret-neighbor snapshot, even if the live PTY advances afterward.
+/// A farther row requires a second terminal read and therefore the captured
+/// generation still matching. Tier-1 drives the real composed sampling and
+/// generation guard in `aterm-gui::app_render`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn composed_witness_generation_model() -> Model {
+    crate::ty_model! {
+        ComposedWitnessGeneration {
+            const Buggy = 0;
+            var changed = 0;
+            var captured = 0;
+            var admitted = 0;
+            action Capture when (captured == 0 && changed == 0) { captured = 1; }
+            action Mutate when (changed == 0 && admitted == 0) { changed = 1; }
+            action ReadFresh when (admitted == 0 && (changed == 0 || Buggy == 1)) {
+                admitted = 1;
+            }
+            action ReadCaptured when (admitted == 0 && (captured == 1 || Buggy == 1)) {
+                admitted = 2;
+            }
+            invariant CoherentFreshRead:
+                admitted == 0 || admitted == 2 || changed == 0;
+            invariant CapturedReadOwnsSnapshot:
+                admitted == 0 || admitted == 1 || captured == 1;
+        }
+    }
+}
+
 /// One demand-driven native drawable acquisition. `active` includes a queued
 /// request that has not entered the OS yet; `ready` includes an unclaimed result.
 /// Retirement must follow that request, never wait on the calling UI thread.

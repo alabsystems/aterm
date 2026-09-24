@@ -17,9 +17,10 @@
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
-//!  "kind":"event|approved|dismissed|reconnect|timeout|exit|mail|extend|escalated|cleared|probe",
-//!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|resumed|
-//!           still-limited|rebriefed|rebrief-failed|-",
+//!  "kind":"event|approved|dismissed|reconnect|timeout|exit|mail|extend|escalated|cleared|
+//!          continued|typed|waiting|skipped|unverified|limited|probe",
+//!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
+//!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
 //!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null}
 //! ```
@@ -31,10 +32,15 @@
 //! (its `rows=` is that body's row count), else `null`; a `MAIL …` line is
 //! `kind` `mail`, its words the summary. A limit episode's lines (round 17):
 //! `EXTEND until=<UTC> reset=<text>` is `extend`; the journal-only `ESCALATED
-//! seq=<n> …`, `CLEARED seq=<n> …` and `PROBE <sent|deferred> seq=<n> …` are
-//! `escalated`, `cleared` and `probe`, their `seq=` read like an EVENT's; the
-//! probe's outcome is an EVENT under `resumed`, `still-limited`, `rebriefed`
-//! or `rebrief-failed`. The file is opened
+//! seq=<n> …` and `CLEARED seq=<n> …` are `escalated` and `cleared`, their
+//! `seq=` read like an EVENT's. The turn-end policy's lines (lane B2 stage 2)
+//! — `CONTINUED` and `TYPED seq=<n> rule=<id> <text>`, the journal-only
+//! `WAITING seq=<n> until=<UTC> <why>`, `SKIPPED` and `UNVERIFIED seq=<n>
+//! rule=<id> <why>`, `LIMITED seq=<n> handled: <message>` — are their word
+//! lowercased, `phase` the rule id where the line names one. A journal an
+//! earlier build wrote still reads: its `PROBE <sent|deferred> seq=<n> …`
+//! is `probe`, the probe's outcome an EVENT under `resumed`,
+//! `still-limited`, `rebriefed` or `rebrief-failed`. The file is opened
 //! append-only, created `0600` when missing; a failure to open or write it is
 //! said ONCE on stderr and never stops the loop — the journal is a record of
 //! the watch, not a condition of it.
@@ -161,6 +167,18 @@ impl JournalRecord {
                 rec.kind = word.to_ascii_lowercase();
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
+                    tail = after;
+                }
+            }
+            "CONTINUED" | "TYPED" | "WAITING" | "SKIPPED" | "UNVERIFIED" | "LIMITED" => {
+                rec.kind = word.to_ascii_lowercase();
+                if let Some((seq, after)) = take_num(rest, "seq") {
+                    rec.seq = Some(seq);
+                    tail = after;
+                }
+                let (first, after) = split_word(tail);
+                if let Some(rule) = first.strip_prefix("rule=") {
+                    rec.phase = rule.to_string();
                     tail = after;
                 }
             }
@@ -311,6 +329,22 @@ impl Journal {
         text.push('\n');
         let res = match self.file.as_mut() {
             Some(f) => f.write_all(text.as_bytes()).and_then(|()| f.flush()),
+            None => return,
+        };
+        if let Err(e) = res {
+            self.warn(&format!("cannot append to it: {e}"), warn);
+        }
+    }
+
+    /// Append one line that is already a JSON object (the approval ledger's
+    /// rows, [`super::approvals`]), under the same open-once, warn-once rule
+    /// as [`Self::record`].
+    pub fn append_raw(&mut self, json: &str, warn: &mut dyn Write) {
+        let res = match self.file.as_mut() {
+            Some(f) => f
+                .write_all(json.as_bytes())
+                .and_then(|()| f.write_all(b"\n"))
+                .and_then(|()| f.flush()),
             None => return,
         };
         if let Err(e) = res {
@@ -507,6 +541,33 @@ mod tests {
             (r.kind.as_str(), r.seq, r.summary.as_str()),
             ("cleared", Some(104), "attention=OK resumed")
         );
+        // The turn-end policy's lines: the rule id is the phase.
+        let r = rec("CONTINUED seq=102 rule=usage-resume@v1 keep going");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            ("continued", "usage-resume@v1", Some(102), "keep going")
+        );
+        let r = rec("TYPED seq=7 rule=model-fallback@v1 /model opus");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            ("typed", "model-fallback@v1", Some(7), "/model opus")
+        );
+        let r = rec("WAITING seq=9 until=2026-09-19T18:10:00Z overloaded retry 1 of 3");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            (
+                "waiting",
+                "-",
+                Some(9),
+                "until=2026-09-19T18:10:00Z overloaded retry 1 of 3"
+            )
+        );
+        let r = rec("SKIPPED seq=9 rule=continue@v1 not submitted: skipped");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.summary.as_str()),
+            ("skipped", "continue@v1", "not submitted: skipped")
+        );
+        // An earlier build's probe lines still read.
         let r = rec("PROBE sent seq=102");
         assert_eq!(
             (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),

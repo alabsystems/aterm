@@ -20,8 +20,7 @@
 //! unit-tested**; the network calls themselves are exercised only against a real release
 //! (no fixture can stand in for GitHub), so they are a thin, faithful wrapper.
 //!
-//! The index lives on `<owner>/aterm` by default ([`crate::discovery::index_repo`],
-//! `ATPKG_INDEX_REPO`-overridable);
+//! The index lives on `<owner>/aterm` ([`crate::discovery::index_repo`]);
 //! each program's `pkg-*.toml` + artifacts live on that program's own repo (`repo`, §4.2),
 //! which the flow threads in. The bytes are handed to the verifier **raw** (no lossy
 //! conversion) — verification happens before any parse (§8).
@@ -30,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::flow::VendorFetchError;
 use crate::select::Candidate;
 
 /// A GitHub Release (subset). Unknown fields ignored.
@@ -568,7 +568,7 @@ pub struct GithubFetcher {
     /// Per-invocation memo of the index candidate set — the expensive one: a miss lists
     /// the index repo AND downloads `index.toml` + `.sig` for every release carrying the
     /// pair (up to 20 × 2 asset downloads). `install_inner` re-resolves it once per
-    /// recursive dependency and `install_default_set` once per ungrouped member.
+    /// recursive dependency and `install_default_set_with_path` once per ungrouped member.
     index: std::sync::Mutex<Option<std::sync::Arc<Vec<Candidate>>>>,
     /// Per-invocation memo of the EVERGREEN POINTER's answer for the index repo — the
     /// web lane's discovery step ([`GithubFetcher::index_pointer`]): `None` = not yet
@@ -578,6 +578,16 @@ pub struct GithubFetcher {
     /// `index_identities` + `index_candidates` are guaranteed to see the same answer,
     /// which is the pairing contract the §14 cache relies on.
     pointer: PointerMemo,
+    /// Where a metered listing dumps its response headers ([`Self::with_header_sink`]) — the
+    /// full pass's alone; `None` spawns the historical argv and touches no file.
+    header_sink: Option<std::path::PathBuf>,
+    /// The latest unix second a rate-limited listing said to come back at (`0`: none) —
+    /// [`crate::flow::Fetcher::metered_hold_until`].
+    metered_hold: std::sync::atomic::AtomicI64,
+    /// Whether the pointer's HEAD failed on the LINK (curl reached no host) — what
+    /// [`crate::flow::Fetcher::index_link_down`] reads for the pointer lane, whose memo keeps
+    /// only the message.
+    pointer_link_down: std::sync::atomic::AtomicBool,
     /// Per-invocation memo of the RAW `(pkg-<program>-<build>.toml, .sig)` bytes, keyed
     /// by `(slug, program, build)` — the triple that fully determines which asset pair is
     /// downloaded. Each miss is two more `download_bytes` round-trips, and the same
@@ -602,8 +612,43 @@ impl GithubFetcher {
             releases: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             index: std::sync::Mutex::new(None),
             pointer: std::sync::Mutex::new(None),
+            pointer_link_down: std::sync::atomic::AtomicBool::new(false),
             manifests: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            header_sink: None,
+            metered_hold: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// Dump the metered listings' response headers into `sink`, so a rate limit's reset is
+    /// read back ([`Self::note_metered_hold`]). The full pass sets it: it holds the store
+    /// lock, so one file under the prefix serves it ([`crate::store::Layout::listing_headers`]).
+    #[must_use]
+    pub fn with_header_sink(mut self, sink: std::path::PathBuf) -> Self {
+        self.header_sink = Some(sink);
+        self
+    }
+
+    /// One metered listing page: the classified GET, dumping its headers where a sink is set.
+    fn metered_get(&self, url: &str) -> Result<Vec<u8>, aterm_update_core::HttpError> {
+        aterm_update_core::api_get_with_headers(url, self.credential(), self.header_sink.as_deref())
+    }
+
+    /// A listing was REFUSED as rate-limited: keep the time the answer said to come back at
+    /// ([`aterm_update_core::RateLimitHeaders::resume_at`]), the latest of this process's.
+    /// Nothing is kept without a sink or a time: the failure ladder stands.
+    fn note_metered_hold(&self) {
+        let Some(until) = self
+            .header_sink
+            .as_deref()
+            .and_then(aterm_update_core::rate_limit_from_header_dump)
+            .and_then(|headers| headers.resume_at())
+        else {
+            return;
+        };
+        self.metered_hold.fetch_max(
+            i64::try_from(until).unwrap_or(i64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Attach the per-program `owner/repo` fetch overrides (from
@@ -672,17 +717,16 @@ impl GithubFetcher {
     /// (left by [`Self::index_releases`], which needs only the newest candidates) is RESUMED
     /// after its last page rather than re-read from page 1 or mistaken for the whole list.
     fn releases_at(&self, slug: &str) -> Result<std::sync::Arc<Vec<Release>>, String> {
-        self.releases_at_with(slug, &mut |url| {
-            aterm_update_core::api_get_classified(url, self.credential())
-        })
+        self.releases_at_with(slug, &mut |url| self.metered_get(url))
     }
 
     /// [`Self::releases_at`] over an INJECTED page GET — the seam the memo is measured
     /// through without a network, the same way [`Self::index_lane`] is measured over an
-    /// injected HEAD. Production passes `api_get_classified`, whose flattened `Display` is
-    /// byte-identical to the `api_get` this lane used to call, so every message, log line
-    /// and status string is the historical one; the classification decides one thing only —
-    /// whether the failure was the LINK's.
+    /// injected HEAD. Production passes [`Self::metered_get`] — `api_get_classified`, plus the
+    /// header dump where a sink is set — whose flattened `Display` is byte-identical to the
+    /// `api_get` this lane used to call, so every message, log line and status string is the
+    /// historical one; the classification decides whether the failure was the LINK's, and
+    /// whether it was a rate limit whose reset is kept ([`Self::note_metered_hold`]).
     fn releases_at_with(
         &self,
         slug: &str,
@@ -748,10 +792,16 @@ impl GithubFetcher {
                 Ok(body) => parse_releases(&body),
                 Err(e) => {
                     offline = offline || listing_is_offline(&e);
+                    if matches!(e, aterm_update_core::HttpError::RateLimited { .. }) {
+                        self.note_metered_hold();
+                    }
                     Err(e.to_string())
                 }
             }
         });
+        if let Some(sink) = &self.header_sink {
+            let _ = std::fs::remove_file(sink);
+        }
         match walked {
             Ok(walk) => {
                 let list = std::sync::Arc::new(seen);
@@ -816,9 +866,7 @@ impl GithubFetcher {
     /// manifest/artifact fallbacks ([`crate::flow::Fetcher::pkg_manifest`], `download`),
     /// which do need the whole catalog, resume it rather than re-read it.
     fn index_releases(&self) -> Result<std::sync::Arc<Vec<Release>>, String> {
-        self.index_releases_with(&mut |url| {
-            aterm_update_core::api_get_classified(url, self.credential())
-        })
+        self.index_releases_with(&mut |url| self.metered_get(url))
     }
 
     /// [`Self::index_releases`] over an INJECTED page GET — the seam the early stop is
@@ -871,7 +919,9 @@ impl GithubFetcher {
     /// precisely so `latest` stays the app release the app's own pointer discovers by,
     /// `tools/atpkg-publish-lib.sh`). Spending a guaranteed-404 HEAD on every
     /// credential-less `atpkg` process would be a round-trip for nothing. The lane
-    /// becomes live when `ATPKG_INDEX_REPO` names a dedicated index repository.
+    /// would become live only for an index on a dedicated repository, which no build
+    /// can name any more (the `ATPKG_INDEX_REPO` override is gone, 2026-09-23); it is
+    /// kept, with its tests, for the day the index moves to one.
     ///
     /// When it IS asked: a 404 (`NoRelease`) — the dedicated repo has no published
     /// non-prerelease index release — falls back to the listing, which then diagnoses
@@ -910,6 +960,10 @@ impl GithubFetcher {
             // lane it stays the verdict the doc above names — never quietly turned
             // into an API listing the web lane promises not to make.
             Err(error) => {
+                if matches!(error, PointerError::Transport(_)) {
+                    self.pointer_link_down
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let mut msg = String::from("index pointer for ");
                 msg.push_str(&slug);
                 msg.push_str(": ");
@@ -1017,6 +1071,24 @@ impl crate::flow::Fetcher for GithubFetcher {
             *memo = Some(std::sync::Arc::clone(&out));
         }
         Ok((*out).clone())
+    }
+
+    fn metered_hold_until(&self) -> Option<i64> {
+        let until = self.metered_hold.load(std::sync::atomic::Ordering::Relaxed);
+        (until > 0).then_some(until)
+    }
+
+    fn index_link_down(&self) -> bool {
+        // The link failed when the pointer's HEAD reached no host, or when the listing
+        // latched its offline verdict — the memo keeps a failed listing ONLY for a transport
+        // failure ([`listing_is_offline`]); a rate limit, an auth answer or a 404 stays
+        // unlatched, and is a host that answered.
+        self.pointer_link_down
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .releases
+                .lock()
+                .is_ok_and(|memo| matches!(memo.get(&self.index_slug()), Some(Err(_))))
     }
 
     fn index_identities(&self) -> Option<Vec<String>> {
@@ -1266,8 +1338,116 @@ impl crate::flow::Fetcher for GithubFetcher {
         aterm_update_core::download_to_resumable_https_only(url, None, dest, cap)
     }
 
+    fn vendor_get(
+        &self,
+        program: &str,
+        url: &str,
+        cap: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<crate::flow::VendorGet, VendorFetchError> {
+        // Only the program's own compiled prefixes, and never a credential (the transport
+        // takes none): the GitHub token is for GitHub's API.
+        refuse_unpinned_vendor_url(program, url)?;
+        aterm_update_core::vendor_get(url, cap, if_none_match)
+            .map(vendor_get_from)
+            .map_err(vendor_error)
+    }
+
+    fn vendor_head(
+        &self,
+        program: &str,
+        url: &str,
+        cap: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<crate::flow::VendorGet, VendorFetchError> {
+        vendor_hint_get(program, url, cap, if_none_match)
+    }
+
+    fn vendor_content_length(&self, program: &str, url: &str) -> Result<u64, VendorFetchError> {
+        refuse_unpinned_vendor_url(program, url)?;
+        aterm_update_core::vendor_content_length(url).map_err(vendor_error)
+    }
+
+    fn vendor_download(
+        &self,
+        program: &str,
+        url: &str,
+        dest: &Path,
+        cap: u64,
+    ) -> Result<(), VendorFetchError> {
+        refuse_unpinned_vendor_url(program, url)?;
+        aterm_update_core::vendor_download_to(url, dest, cap).map_err(vendor_error)
+    }
+
     fn source_id(&self) -> String {
-        format!("github:{}/{}", self.owner, crate::discovery::index_repo())
+        github_source_id(&self.owner)
+    }
+}
+
+/// The §14 cache key of the GitHub source under `owner` — [`GithubFetcher`]'s
+/// `source_id`, and the key `doctor` reads the cache back under
+/// ([`crate::index_probe::held_index_builds`]), so the writer and that reader cannot
+/// disagree on which source a cache entry belongs to.
+pub(crate) fn github_source_id(owner: &str) -> String {
+    format!("github:{owner}/{}", crate::discovery::index_repo())
+}
+
+/// A vendor head read as a hint — the window's head watch, and every pass's and door's
+/// head read ([`crate::flow::Fetcher::vendor_head`]): [`GithubFetcher`]'s `vendor_get`
+/// pins, cap and anonymity, in one short attempt ([`aterm_update_core::vendor_get_hint`]).
+pub(crate) fn vendor_hint_get(
+    program: &str,
+    url: &str,
+    cap: u64,
+    if_none_match: Option<&str>,
+) -> Result<crate::flow::VendorGet, VendorFetchError> {
+    refuse_unpinned_vendor_url(program, url)?;
+    aterm_update_core::vendor_get_hint(url, cap, if_none_match)
+        .map(vendor_get_from)
+        .map_err(vendor_error)
+}
+
+/// Refuse a vendor-direct fetch outside `program`'s compiled prefixes, before any spawn.
+fn refuse_unpinned_vendor_url(program: &str, url: &str) -> Result<(), VendorFetchError> {
+    if crate::vendor::vendor_direct_url_allowed(program, url) {
+        Ok(())
+    } else {
+        Err(VendorFetchError::Refused(format!(
+            "refusing a vendor URL outside {program}'s pinned vendor-direct prefixes: {url}"
+        )))
+    }
+}
+
+/// The transport's error, split the way the vendor-direct lane treats it: only a network
+/// failure, or a status that says the host is busy (408, 429, 5xx), is unreachable; every
+/// other answer is a verdict.
+fn vendor_error(e: aterm_update_core::HttpError) -> VendorFetchError {
+    use aterm_update_core::HttpError;
+    match e {
+        HttpError::Transport(_)
+        | HttpError::VendorStatus {
+            code: 408 | 429 | 500..=599,
+            ..
+        } => VendorFetchError::Unreachable(e.to_string()),
+        _ => VendorFetchError::Refused(e.to_string()),
+    }
+}
+
+/// The transport's answer, in the flow's own type.
+fn vendor_get_from(response: aterm_update_core::VendorResponse) -> crate::flow::VendorGet {
+    match response {
+        aterm_update_core::VendorResponse::Body {
+            bytes,
+            etag,
+            effective_url,
+        } => crate::flow::VendorGet::Body {
+            bytes,
+            etag,
+            effective_url,
+        },
+        aterm_update_core::VendorResponse::NotModified { etag } => {
+            crate::flow::VendorGet::NotModified { etag }
+        }
     }
 }
 
@@ -1278,16 +1458,6 @@ impl crate::flow::Fetcher for GithubFetcher {
 /// freshness gate as `github:` (a dir cache holds bytes, not trust).
 pub struct DirFetcher {
     dir: PathBuf,
-    /// Held for the fetcher's lifetime iff `dir` is THIS bundle's sealed seed:
-    /// the durable "a live process is reading the seal" record that keeps the
-    /// self-updater from swapping the bundle out from under a multi-GB
-    /// extraction. Claimed HERE — the one choke point every seal-reading lane
-    /// flows through (`cmd_seed`, and the empty-store bootstrap chain leg the
-    /// network verbs mount) — so a user-run CLI is guarded exactly like the
-    /// GUI's spawn lanes, with the extractor's OWN pid and no cross-process
-    /// choreography (see `aterm_update_core::seal_guard`). `None` for every
-    /// ordinary `dir:` registry, and always off-macOS.
-    _seal_guard: Option<aterm_update_core::seal_guard::SealReadGuard>,
 }
 
 impl DirFetcher {
@@ -1296,17 +1466,7 @@ impl DirFetcher {
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-        // Compare canonical-to-canonical: `dir` was just canonicalized, and
-        // the bundle path may reach the seal through a symlinked Resources.
-        let seal = crate::bundled_seed_dir()
-            .map(|seed| std::fs::canonicalize(&seed).unwrap_or(seed))
-            .is_some_and(|seed| seed == dir);
-        Self {
-            dir,
-            _seal_guard: seal
-                .then(aterm_update_core::seal_guard::SealReadGuard::claim)
-                .flatten(),
-        }
+        Self { dir }
     }
 }
 
@@ -1379,24 +1539,18 @@ impl crate::flow::Fetcher for DirFetcher {
             return Err(format!("unsafe asset name {asset:?}"));
         }
         let src = self.dir.join(asset);
-        // UNLINK FIRST — this line prevents data destruction inside a signed app
-        // bundle, and it is not optional.
+        // UNLINK FIRST — this line prevents data destruction in the registry, and it is
+        // not optional.
         //
         // Without it: `hard_link` fails EEXIST when a previous run left a staging
-        // link behind (nothing sweeps `staging/`, and an interrupted first run is
-        // exactly what the resumable seed lane expects), so the fallback runs
-        // `fs::copy(src, dest)` where — because they are the SAME hardlinked inode
-        // — dest IS src. Rust's macOS copy opens the destination `O_TRUNC`,
-        // truncating the shared inode, then copies the now-empty source and
-        // returns `Ok(0)`. Measured on macOS 26.5: `src=0 dst=0`, success reported.
-        //
-        // For a `dir:` registry that source lives in
-        // `aterm.app/Contents/Resources/toolchain-seed.lproj/`, so the victim is a
-        // file inside the user's installed, notarized bundle. Zeroing it kills that
-        // seed asset permanently (sha256 can never match again) AND invalidates the
-        // code signature — the `.lproj` optional seal tolerates ABSENCE but not
-        // MODIFICATION. An ordinary power-off during the first-run extraction was
-        // enough to trigger it.
+        // link behind (nothing sweeps `staging/`, and an interrupted run is exactly
+        // what a retry meets), so the fallback runs `fs::copy(src, dest)` where —
+        // because they are the SAME hardlinked inode — dest IS src. Rust's macOS copy
+        // opens the destination `O_TRUNC`, truncating the shared inode, then copies the
+        // now-empty source and returns `Ok(0)`. Measured on macOS 26.5: `src=0 dst=0`,
+        // success reported, and the registry asset zeroed for good (its sha256 can
+        // never match again). It was found when the registry was a seed sealed inside
+        // the signed app bundle, where the zeroed file also broke the code signature.
         let _ = std::fs::remove_file(dest);
         // Hardlink to avoid duplicating a multi-GB toolchain; a later remove_file(dl) drops
         // only the link, never the registry file. Cross-filesystem hardlink fails ⇒ copy.
@@ -1411,170 +1565,6 @@ impl crate::flow::Fetcher for DirFetcher {
     fn source_id(&self) -> String {
         format!("dir:{}", self.dir.display())
     }
-}
-
-/// Two fetchers, one flow (§9.1 bundled seed): candidates from BOTH sources
-/// feed the ONE index selection (highest signature-valid `index_build` ≥ floor
-/// wins, [`crate::select_index`]) with the `primary` (network) leg as the
-/// AUTHORITY — its candidates come first, so on an equal `index_build` tie it
-/// wins, and only it feeds the §14 cache. Per-asset reads run the OTHER way:
-/// `secondary` (the co-located seed — local bytes) first, falling back to
-/// `primary` — the whole point of a batteries-included cut is that a first
-/// run does not re-download the gigabytes the app already carries, and an
-/// asset the seed never sealed (a fresher network pin) simply misses by name
-/// and falls through. This is how a network registry and the app-bundle seed
-/// coexist without a second trust path: a fresher published index outranks
-/// the sealed seed by the ordinary monotonic gate, an offline machine still
-/// resolves the seed's index, and every byte from EITHER source passes the
-/// identical verify-before-parse + floor + freshness + sha256 + `tree_root`
-/// gates. The chain is composition, never authenticity: neither side is
-/// trusted more than its signatures prove.
-pub struct ChainFetcher {
-    primary: Box<dyn crate::flow::Fetcher>,
-    secondary: Box<dyn crate::flow::Fetcher>,
-    /// The primary (network) leg's OWN candidates from the latest
-    /// [`crate::flow::Fetcher::index_candidates`] call — `None` when that leg failed.
-    /// What `cacheable_candidates` serves, so the §14 cache write is keyed off the
-    /// network leg without a second fetch, and a seed-leg success can never refresh or
-    /// overwrite the last-good network cache (the cache-masking tooth, adversarial
-    /// review 2026-07-30).
-    primary_candidates: std::sync::Mutex<Option<Vec<Candidate>>>,
-}
-
-impl ChainFetcher {
-    /// Chain `primary` (the index/cache authority) over `secondary` (the
-    /// local-bytes leg, tried first for every asset).
-    #[must_use]
-    pub fn new(
-        primary: Box<dyn crate::flow::Fetcher>,
-        secondary: Box<dyn crate::flow::Fetcher>,
-    ) -> Self {
-        Self {
-            primary,
-            secondary,
-            primary_candidates: std::sync::Mutex::new(None),
-        }
-    }
-}
-
-impl crate::flow::Fetcher for ChainFetcher {
-    fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
-        // The union of both sides' candidates; a side that errors (offline
-        // GitHub, say) contributes nothing rather than failing the other side.
-        // BOTH failing is a real error — surface both reasons.
-        let p = self.primary.index_candidates();
-        // Record the network leg's own outcome for `cacheable_candidates` BEFORE the
-        // union — the §14 cache must never absorb secondary-leg (seed) bytes. A
-        // poisoned lock skips the record, which downstream reads as "nothing to
-        // cache": conservative, never wrong.
-        if let Ok(mut memo) = self.primary_candidates.lock() {
-            *memo = p.as_ref().ok().cloned();
-        }
-        match (p, self.secondary.index_candidates()) {
-            (Ok(mut a), Ok(b)) => {
-                a.extend(b);
-                Ok(a)
-            }
-            (Ok(a), Err(_)) => Ok(a),
-            (Err(_), Ok(b)) => Ok(b),
-            (Err(a), Err(b)) => Err(format!(
-                "{} failed: {a}; {} failed: {b}",
-                self.primary.source_id(),
-                self.secondary.source_id()
-            )),
-        }
-    }
-
-    fn pkg_manifest(
-        &self,
-        repo: &str,
-        program: &str,
-        build: u64,
-    ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        // Local (seed) bytes first — manifest names are build-qualified, so a
-        // pin the seed never sealed misses by name and falls to the network;
-        // either side's bytes verify identically downstream.
-        self.secondary
-            .pkg_manifest(repo, program, build)
-            .or_else(|e1| {
-                self.primary
-                    .pkg_manifest(repo, program, build)
-                    .map_err(|e2| chain_err(&e2, &e1))
-            })
-    }
-
-    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
-        self.secondary.download(repo, asset, dest).or_else(|e1| {
-            self.primary
-                .download(repo, asset, dest)
-                .map_err(|e2| chain_err(&e2, &e1))
-        })
-    }
-
-    fn download_for(
-        &self,
-        program: &str,
-        repo: &str,
-        asset: &str,
-        dest: &Path,
-        cap: u64,
-    ) -> Result<(), String> {
-        // Route through both sides' OWN `download_for` so the primary's
-        // per-program `[packages.links]` fetch override still applies on the
-        // fallback leg — and so the row's signed `size` bounds whichever leg
-        // actually moves the bytes (the seed leg copies a file already on disk).
-        self.secondary
-            .download_for(program, repo, asset, dest, cap)
-            .or_else(|e1| {
-                self.primary
-                    .download_for(program, repo, asset, dest, cap)
-                    .map_err(|e2| chain_err(&e2, &e1))
-            })
-    }
-
-    fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
-        // The PRIMARY (network) leg only. A vendor URL names bytes the sealed seed never
-        // carries — third-party bytes are never sealed — so the local leg has nothing to
-        // offer and must not be asked (its default refuses anyway; skipping it keeps the
-        // error the user sees the network's, not a spurious "cannot fetch" from the seed).
-        self.primary.download_url(url, dest, cap)
-    }
-
-    fn source_id(&self) -> String {
-        // A chain is not either source alone: a cache written under one leg's
-        // id must not satisfy the other, so the id names both.
-        format!(
-            "chain:{}+{}",
-            self.primary.source_id(),
-            self.secondary.source_id()
-        )
-    }
-
-    fn cache_source_id(&self) -> String {
-        // The §14 cache identity is the NETWORK (primary) leg's, not the chain's:
-        // the cache a bootstrap-time chain writes must serve the post-bootstrap
-        // plain-network path (same key), and the `dir:` seed leg must never gain a
-        // cache identity of its own through the chain.
-        self.primary.cache_source_id()
-    }
-
-    fn cacheable_candidates(&self, _resolved: &[Candidate]) -> Option<Vec<Candidate>> {
-        // The network leg's own candidates from THIS call's `index_candidates`
-        // (recorded there), never the union: a seed-leg success must not mask a
-        // network failure into a cache refresh, nor overwrite the last-good
-        // network candidates with sealed-seed bytes.
-        self.primary_candidates
-            .lock()
-            .ok()
-            .and_then(|memo| memo.clone())
-    }
-}
-
-/// Both legs failed; keep both reasons, the network (primary) story FIRST
-/// regardless of which leg was tried first — the seed dir's "no such file"
-/// alone would mislead when the real story is offline.
-fn chain_err(primary: &str, secondary: &str) -> String {
-    format!("{primary}; fallback: {secondary}")
 }
 
 #[cfg(test)]
@@ -2195,19 +2185,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
-    /// Two registry dirs, one flow: the chain unions index candidates from
-    /// both legs, serves per-asset reads from the first leg that has the
-    /// bytes, and only errors when BOTH legs fail (with both reasons kept).
-    /// THE INODE-TRUNCATION REGRESSION. `DirFetcher`'s source for a bundled seed is a
-    /// file inside the user's signed `aterm.app`, and it hardlinks that file into
-    /// staging. Nothing sweeps staging, so a killed run leaves the link behind; the
-    /// next attempt then found `hard_link` EEXIST and fell back to
-    /// `fs::copy(src, dest)` where dest IS src — which on macOS opens the shared
-    /// inode `O_TRUNC` and reports `Ok(0)`, zeroing a file inside a notarized bundle.
-    /// That kills the asset forever (sha256 can never match) and invalidates the code
-    /// signature, because the `.lproj` seal tolerates absence but not modification.
-    ///
-    /// The fix is one `remove_file(dest)`; this proves the registry survives a retry.
     /// THE ANONYMOUS DELIVERY BUDGET — the FIXED, per-run half of it.
     ///
     /// READ THIS BEFORE TRUSTING IT. This test measures candidate gathering ONLY, and
@@ -2253,6 +2230,13 @@ mod tests {
         };
     }
 
+    /// THE INODE-TRUNCATION REGRESSION. `DirFetcher` hardlinks a registry file into
+    /// staging. Nothing sweeps staging, so a killed run leaves the link behind; the next
+    /// attempt then found `hard_link` EEXIST and fell back to `fs::copy(src, dest)` where
+    /// dest IS src — which on macOS opens the shared inode `O_TRUNC` and reports `Ok(0)`,
+    /// zeroing the registry file. That kills the asset forever (sha256 can never match).
+    ///
+    /// The fix is one `remove_file(dest)`; this proves the registry survives a retry.
     #[test]
     fn a_stale_staging_hardlink_never_truncates_the_registry_file() {
         use crate::flow::Fetcher as _;
@@ -2260,7 +2244,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("reg")).unwrap();
         std::fs::create_dir_all(dir.join("staging")).unwrap();
-        let payload = b"the sealed registry bytes that must survive";
+        let payload = b"the registry bytes that must survive";
         let src = dir.join("reg/ay-18.tar.zst");
         std::fs::write(&src, payload).unwrap();
         let dest = dir.join("staging/ay-18.tar.zst");
@@ -2270,12 +2254,12 @@ mod tests {
         f.download("r", "ay-18.tar.zst", &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
         // The process is killed here — the link survives, nothing sweeps it.
-        // Second fetch (the resumable lane's retry) must NOT destroy the source.
+        // Second fetch (the retry) must NOT destroy the source.
         f.download("r", "ay-18.tar.zst", &dest).unwrap();
         assert_eq!(
             std::fs::read(&src).unwrap(),
             payload,
-            "the registry file inside the app bundle must be byte-intact after a retry"
+            "the registry file must be byte-intact after a retry"
         );
         assert_eq!(
             std::fs::read(&dest).unwrap(),
@@ -2285,119 +2269,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The production fetcher refuses a vendor-direct fetch outside the program's own
+    /// compiled prefixes before any spawn — the allow-listed hosts alone are not enough,
+    /// and neither is the other vendor's prefix — as a verdict, never as unreachable; and
+    /// it carries the transport's answer over field for field.
     #[test]
-    fn chain_unions_candidates_and_falls_back_per_asset() {
+    fn the_github_fetcher_fetches_vendor_documents_only_under_the_pins() {
         use crate::flow::Fetcher as _;
+        let fetcher = GithubFetcher::new("alabsystems".into(), String::new());
+        let dest = std::env::temp_dir().join("atpkg-vendor-unpinned-never-written");
+        for (program, url) in [
+            ("claude", "https://evil.example/claude-code-releases/latest"),
+            (
+                "claude",
+                "https://github.com/alabsystems/aterm/releases/download/v1/x",
+            ),
+            ("claude", "https://downloads.claude.ai/other/latest"),
+            (
+                "claude",
+                "http://downloads.claude.ai/claude-code-releases/latest",
+            ),
+            (
+                "claude",
+                "https://downloads.claude.ai/claude-code-releases/latest?x=1",
+            ),
+            // the other vendor's pinned URLs, and an unpinned program
+            (
+                "claude",
+                "https://releases.openai.com/codex/channels/latest",
+            ),
+            (
+                "codex",
+                "https://downloads.claude.ai/claude-code-releases/latest",
+            ),
+            (
+                "ay",
+                "https://downloads.claude.ai/claude-code-releases/latest",
+            ),
+        ] {
+            let refused = |e: VendorFetchError| match e {
+                VendorFetchError::Refused(m) => {
+                    assert!(m.contains("pinned vendor-direct prefixes"), "{url}: {m}");
+                }
+                other => panic!("{program} {url}: {other:?}"),
+            };
+            refused(fetcher.vendor_get(program, url, 64, None).unwrap_err());
+            refused(fetcher.vendor_content_length(program, url).unwrap_err());
+            refused(
+                fetcher
+                    .vendor_download(program, url, &dest, 64)
+                    .unwrap_err(),
+            );
+        }
+        assert!(!dest.exists(), "a refusal writes nothing");
+        assert_eq!(
+            vendor_get_from(aterm_update_core::VendorResponse::Body {
+                bytes: b"2.1.280\n".to_vec(),
+                etag: Some("\"e\"".into()),
+                effective_url: "https://downloads.claude.ai/claude-code-releases/latest".into(),
+            }),
+            crate::flow::VendorGet::Body {
+                bytes: b"2.1.280\n".to_vec(),
+                etag: Some("\"e\"".into()),
+                effective_url: "https://downloads.claude.ai/claude-code-releases/latest".into(),
+            }
+        );
+        assert_eq!(
+            vendor_get_from(aterm_update_core::VendorResponse::NotModified {
+                etag: "\"e\"".into()
+            }),
+            crate::flow::VendorGet::NotModified {
+                etag: "\"e\"".into()
+            }
+        );
+    }
 
-        let scratch = |label: &str| {
-            let d =
-                std::env::temp_dir().join(format!("atpkg-chain-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            d
+    /// Only the network and a busy host are unreachable; a size, scheme, certificate or
+    /// status verdict, and an unreadable answer, are refusals — so the vendor lane never
+    /// files a bad document as a network blip. The message survives either way.
+    #[test]
+    fn a_vendor_transport_error_is_unreachable_only_for_the_network() {
+        use aterm_update_core::HttpError;
+        const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
+        let status = |code: u16| HttpError::VendorStatus {
+            code,
+            url: URL.into(),
         };
-        // Each leg publishes the COMPLETE authorization unit (index pair + roster
-        // pair) — a `dir:` registry without a roster yields no candidate at all, which
-        // is proved separately; here the union is what is under test, so both legs are
-        // complete. The bytes are opaque: this test is about routing, and the trust
-        // chain runs downstream in `select_index`.
-        let unit = |d: &Path, tag: &[u8], sig: u8| {
-            std::fs::write(d.join("index.toml"), tag).unwrap();
-            std::fs::write(d.join("index.toml.sig"), [sig; 64]).unwrap();
-            std::fs::write(d.join("aterm-machines.toml"), b"roster").unwrap();
-            std::fs::write(d.join("aterm-machines.toml.sig"), [sig; 64]).unwrap();
-        };
-        // Leg A: an index unit + ay's pkg pair. Leg B: an index unit + ny's.
-        let a = scratch("a");
-        unit(&a, b"schema = 2 # a", 1);
-        std::fs::write(a.join("pkg-ay-1.toml"), b"pkg a").unwrap();
-        std::fs::write(a.join("pkg-ay-1.toml.sig"), [2u8; 64]).unwrap();
-        let b = scratch("b");
-        unit(&b, b"schema = 2 # b", 3);
-        std::fs::write(b.join("pkg-ny-2.toml"), b"pkg b").unwrap();
-        std::fs::write(b.join("pkg-ny-2.toml.sig"), [4u8; 64]).unwrap();
-
-        let chain = ChainFetcher::new(
-            Box::new(DirFetcher::new(a.clone())),
-            Box::new(DirFetcher::new(b.clone())),
-        );
-        // Union: BOTH legs' index candidates reach the one selection, PRIMARY
-        // FIRST — load-bearing, because `select_index` replaces only on a
-        // STRICTLY greater index_build, so on a tie the first candidate wins
-        // and the network index must beat an equal-build sealed seed.
-        let candidates = chain.index_candidates().unwrap();
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(
-            candidates[0].index_bytes, b"schema = 2 # a",
-            "primary first"
-        );
-        assert_eq!(candidates[1].index_bytes, b"schema = 2 # b");
-        // Either leg serves what only it holds — a miss falls through by name.
-        assert_eq!(chain.pkg_manifest("r", "ay", 1).unwrap().0, b"pkg a");
-        assert_eq!(chain.pkg_manifest("r", "ny", 2).unwrap().0, b"pkg b");
-        // An asset BOTH legs hold is served from the SECONDARY (local seed)
-        // leg — load-bearing for the batteries-included cut: a networked first
-        // run must not re-download bytes the app bundle already carries. (Real
-        // asset names are build-qualified, so same-name means same signed
-        // bytes; the identical sha256/tree_root gates run either way.)
-        std::fs::write(a.join("pkg-both-3.toml"), b"from net").unwrap();
-        std::fs::write(a.join("pkg-both-3.toml.sig"), [5u8; 64]).unwrap();
-        std::fs::write(b.join("pkg-both-3.toml"), b"from seed").unwrap();
-        std::fs::write(b.join("pkg-both-3.toml.sig"), [6u8; 64]).unwrap();
-        assert_eq!(
-            chain.pkg_manifest("r", "both", 3).unwrap().0,
-            b"from seed",
-            "local seed leg preferred per asset"
-        );
-        // Both legs missing ⇒ an error carrying both stories.
-        let err = chain.pkg_manifest("r", "absent", 9).unwrap_err();
-        assert!(err.contains("fallback:"), "both reasons kept: {err}");
-        // The chain's SOURCE identity names both legs, never one alone…
-        let id = chain.source_id();
-        assert!(id.starts_with("chain:dir:") && id.contains('+'), "{id}");
-        // …but its §14 CACHE identity is the primary (network) leg's alone, and the
-        // cacheable set is the primary's own candidates — the secondary (seed) leg's
-        // bytes never reach the last-good cache through the union.
-        assert_eq!(
-            chain.cache_source_id(),
-            DirFetcher::new(a.clone()).source_id()
-        );
-        let cacheable = chain.cacheable_candidates(&candidates).unwrap();
-        assert_eq!(cacheable.len(), 1);
-        assert_eq!(cacheable[0].index_bytes, b"schema = 2 # a");
-
-        // download_for routes through each leg's OWN download_for (so the
-        // primary's per-program [packages.links] fetch override still
-        // applies), and falls back with BOTH reasons when neither has it.
-        let out = a.join("fetched.bin");
-        chain
-            .download_for("ay", "r", "pkg-ay-1.toml", &out, 1 << 20)
-            .expect("primary serves what it has");
-        assert_eq!(std::fs::read(&out).unwrap(), b"pkg a");
-        std::fs::remove_file(&out).unwrap();
-        chain
-            .download_for("ny", "r", "pkg-ny-2.toml", &out, 1 << 20)
-            .expect("fallback serves what the primary lacks");
-        assert_eq!(std::fs::read(&out).unwrap(), b"pkg b");
-        std::fs::remove_file(&out).unwrap();
-        let err = chain
-            .download_for("x", "r", "absent.bin", &out, 1 << 20)
-            .unwrap_err();
-        assert!(err.contains("fallback:"), "{err}");
-
-        // BOTH legs failing on the index is a real error naming both sources
-        // (an empty dir yields no candidates, so use two unreadable paths).
-        let dead = ChainFetcher::new(
-            Box::new(DirFetcher::new(a.join("nope-1"))),
-            Box::new(DirFetcher::new(a.join("nope-2"))),
-        );
-        // A missing dir yields NO candidates (not an Err) by DirFetcher's
-        // contract, so the chain reports an empty union rather than failing —
-        // pinned here so a future change to that contract is noticed.
-        assert!(dead.index_candidates().unwrap().is_empty());
-
-        let _ = std::fs::remove_dir_all(a);
-        let _ = std::fs::remove_dir_all(b);
+        for e in [
+            HttpError::Transport("curl GET x failed (exit 6): dns".into()),
+            status(408),
+            status(429),
+            status(500),
+            status(503),
+        ] {
+            let text = e.to_string();
+            assert_eq!(vendor_error(e), VendorFetchError::Unreachable(text));
+        }
+        for e in [
+            HttpError::VendorRefused("vendor document x exceeds its 64-byte cap".into()),
+            HttpError::Malformed("no usable Content-Length".into()),
+            status(304),
+            status(403),
+            status(404),
+        ] {
+            let text = e.to_string();
+            assert_eq!(vendor_error(e), VendorFetchError::Refused(text));
+        }
     }
 
     // ------------------------------------------------------------------------------
@@ -2766,6 +2743,41 @@ mod tests {
         );
     }
 
+    /// OFFLINE IS THE LINK, NEVER A REFUSAL: an index listing curl could not reach reads as
+    /// the link down; one a host ANSWERED — a rate limit, a revoked token, a renamed repo, a
+    /// 5xx — does not, so a pass that met it is a failure to surface, never "offline".
+    #[test]
+    fn only_a_link_failure_on_the_index_listing_reads_as_offline() {
+        use crate::flow::Fetcher as _;
+        let dead = GithubFetcher::new("alabsystems".into(), String::new());
+        assert!(!dead.index_link_down(), "nothing asked yet");
+        let mut unreachable = |_: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+            Err(aterm_update_core::HttpError::Transport(
+                "curl: (6) Could not resolve host".into(),
+            ))
+        };
+        assert!(dead.index_releases_with(&mut unreachable).is_err());
+        assert!(dead.index_link_down());
+        for answer in [
+            aterm_update_core::HttpError::RateLimited {
+                code: 403,
+                url: "u".into(),
+                authenticated: false,
+            },
+            aterm_update_core::HttpError::Unauthorized { code: 401 },
+            aterm_update_core::HttpError::NotFound { url: "u".into() },
+            aterm_update_core::HttpError::Status {
+                code: 503,
+                url: "u".into(),
+            },
+        ] {
+            let f = GithubFetcher::new("alabsystems".into(), "t".into());
+            let mut refuse = |_: &str| Err(answer.clone());
+            assert!(f.index_releases_with(&mut refuse).is_err());
+            assert!(!f.index_link_down(), "{answer}: a host answered");
+        }
+    }
+
     /// One release row as the API serves it, carrying the COMPLETE authorization quad.
     fn quad_row(tag: &str) -> String {
         let roster = aterm_update_core::roster::ROSTER_ASSET;
@@ -2973,5 +2985,93 @@ mod tests {
             n, 2,
             "the recovered listing is memoized like any other success"
         );
+    }
+
+    /// A RATE-LIMITED LISTING'S RESET IS KEPT (§3.2 of the 2026-09-22 design): the refused
+    /// listing's dumped headers name when to come back — `x-ratelimit-reset` with the window
+    /// spent, or a secondary limit's `retry-after` — and the fetcher reports it for the pass
+    /// to record, the latest of its listings'; the dump is removed after each listing. No
+    /// sink, a refusal that is no rate limit, or a limit that named no time keeps nothing.
+    #[test]
+    fn a_rate_limited_listing_keeps_the_reset_it_named() {
+        use crate::flow::Fetcher as _;
+        let dir = std::env::temp_dir().join(format!("atpkg-net-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = dir.join("listing-headers.tmp");
+        let now = || {
+            i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap()
+        };
+        let reset = now() + 1800;
+        let refused = |headers: String, code: u16| {
+            let sink = sink.clone();
+            move |url: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+                std::fs::write(&sink, &headers).unwrap();
+                Err(if code == 429 {
+                    aterm_update_core::HttpError::RateLimited {
+                        code,
+                        url: url.into(),
+                        authenticated: false,
+                    }
+                } else {
+                    aterm_update_core::HttpError::Unauthorized { code }
+                })
+            }
+        };
+        let spent = format!("HTTP/2 429\nx-ratelimit-remaining: 0\nx-ratelimit-reset: {reset}\n");
+        let f =
+            GithubFetcher::new("alabsystems".into(), String::new()).with_header_sink(sink.clone());
+        assert!(
+            f.index_releases_with(&mut refused(spent.clone(), 429))
+                .is_err()
+        );
+        assert_eq!(f.metered_hold_until(), Some(reset));
+        assert!(!sink.exists(), "the dump is removed after the listing");
+        // A secondary limit's retry-after, sooner than the kept reset: the later one stands.
+        let before = now();
+        let secondary = "HTTP/2 429\nx-ratelimit-remaining: 30\nretry-after: 120\n".to_string();
+        let g =
+            GithubFetcher::new("alabsystems".into(), String::new()).with_header_sink(sink.clone());
+        assert!(
+            g.index_releases_with(&mut refused(secondary.clone(), 429))
+                .is_err()
+        );
+        let held = g.metered_hold_until().unwrap();
+        assert!((before + 120..=now() + 120).contains(&held), "{held}");
+        assert!(
+            g.index_releases_with(&mut refused(spent.clone(), 429))
+                .is_err()
+        );
+        assert_eq!(g.metered_hold_until(), Some(reset));
+        assert!(
+            g.releases_at_with("x/y", &mut refused(secondary, 429))
+                .is_err()
+        );
+        assert_eq!(g.metered_hold_until(), Some(reset), "the latest is kept");
+        // No hold: no sink, a refusal that is no rate limit, a limit that named no time.
+        let unsunk = GithubFetcher::new("alabsystems".into(), String::new());
+        assert!(
+            unsunk
+                .index_releases_with(&mut refused(spent.clone(), 429))
+                .is_err()
+        );
+        assert_eq!(unsunk.metered_hold_until(), None);
+        let _ = std::fs::remove_file(&sink);
+        for (headers, code) in [
+            (spent, 403),
+            ("HTTP/2 429\nx-ratelimit-remaining: 30\n".to_string(), 429),
+        ] {
+            let h = GithubFetcher::new("alabsystems".into(), String::new())
+                .with_header_sink(sink.clone());
+            assert!(h.index_releases_with(&mut refused(headers, code)).is_err());
+            assert_eq!(h.metered_hold_until(), None, "{code}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

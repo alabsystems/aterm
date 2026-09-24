@@ -137,6 +137,24 @@ fn main() -> ExitCode {
         return atpkg::cli::main_entry(rest.to_vec());
     }
 
+    // THE RETIRED HOOK SHAPE `<aterm> hook run <event> …` — what `aterm link hook
+    // install` wrote on 2026-09-14 before 7bcb0503a spelled it `link hook run`. It
+    // is not a verb and joins no roster: it reaches the fabric bridge's retired
+    // `hook` verb (aterm-link's `retired_hook`, b58cde423: exit 0, nothing on
+    // stdout, its one stderr line, stdin drained), because below the fork it is
+    // the window parser's `unknown option`, exit 2 — a BLOCK to Claude Code — and
+    // a project `.claude/settings*.json` the primer sweep never reads may still
+    // hold it. Only `hook run`: a bare `aterm hook` stays the parser's.
+    #[cfg(unix)]
+    if first == "hook" && rest.get(1).is_some_and(|a| a == "run") {
+        return aterm_link::cli::dispatch(
+            &rest
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<String>>(),
+        );
+    }
+
     // VERBS: the one command's own powers, routed HERE — ABOVE the mode fork, so a
     // verb answers identically at a terminal and through a pipe.
     //
@@ -216,12 +234,13 @@ fn main() -> ExitCode {
             // These read the shared ledger and run the one-shot checker
             // in-process: no socket, no GUI.
             aterm_cli::Verb::Update => update_verb(&forwarded),
-            // The Claude Code harness (docs/DESIGN-aterm-wrapper-2026-09-17.md
-            // §4.5, §5.7). Routed here beside its siblings for the reason the
-            // comment above this match gives: `aterm harness hook …` is run by
-            // the VENDOR through `/bin/sh` with the payload on stdin, where
-            // stdin is a pipe — and `aterm harness status` is typed at a
-            // prompt, where it is a TTY. Both must reach the same code.
+            // The Claude Code harness's read views (docs/DESIGN-aterm-wrapper-
+            // 2026-09-17.md §0.4). Routed here beside its siblings for the reason
+            // the comment above this match gives: `aterm harness usage` is typed
+            // at a prompt, where stdin is a TTY, and the retired `aterm harness hook
+            // …` — still run through `/bin/sh` by a bridge an older build
+            // installed, with the payload on a pipe — must reach the same code
+            // and its silent exit 0 (decision "B").
             aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
             // `agents` is parsed by aterm-cli itself (it prints and exits), so routing
             // it means handing the WHOLE operand list back to that parser.
@@ -283,10 +302,11 @@ fn main() -> ExitCode {
     // Toolchain dispatch (`aterm <tool> …`, docs/ATERM-DISTRIBUTION-WEDGE.md §4):
     // when the managed store resolves the first operand as an installed tool,
     // run it through `pkg run` (which execs the tool — process replacement,
-    // exactly like the binary era). Resolution is the IN-PROCESS `atpkg::which`
-    // (a readlink on the store shim — the library call never touches stdout,
-    // which is why it needs no subprocess); a non-tool falls through to the
-    // normal unknown-operand usage error.
+    // exactly like the binary era). Resolution is IN-PROCESS: `atpkg::which` (a
+    // readlink on the store shim) and, for a word with no shim, the lost-shim
+    // probe (`store_resolves`) — neither touches stdout, which is why they need
+    // no subprocess; a non-tool falls through to the normal unknown-operand
+    // usage error.
     if aterm_cli::is_tool_candidate(Some(first.as_str())) && store_resolves(&first) {
         // KNOWN LIMIT: atpkg's CLI is String-typed, so non-UTF8 tool args
         // are lossy-converted (the binary era exec'd OsStrings verbatim);
@@ -315,15 +335,18 @@ fn main() -> ExitCode {
     // yet resolves to a pending STUB in the managed store — `aterm trust` moments
     // after a lean install must print the live install state (and bump trust to the
     // front of the queue), never fall through to "unknown option". Same in-process
-    // dispatch as the arm above; `atpkg __pending` prints the message and exits 127.
+    // dispatch as the arm above; `atpkg __pending` prints the message and exits 127 —
+    // or, for a person at a terminal while a pass installs the tool, waits and runs it,
+    // so the tool's own arguments ride along exactly as the stub's `"$@"` carries them.
     if aterm_cli::is_tool_candidate(Some(first.as_str())) && pending_stub_resolves(&first) {
-        // `first()` for the reason recorded on the `split_first` arm below:
-        // the index is unreachable with an empty `rest`, but not by a chain
-        // the verifier can follow.
-        let Some(tool) = rest.first() else {
+        // `split_first()` for the reason recorded on the arm above: the index is
+        // unreachable with an empty `rest`, but not by a chain the verifier can follow.
+        let Some((tool, tool_args)) = rest.split_first() else {
             return ExitCode::from(2);
         };
-        return atpkg::cli::main_entry(vec![OsString::from("__pending"), tool.clone()]);
+        let mut pending_args: Vec<OsString> = vec![OsString::from("__pending"), tool.clone()];
+        pending_args.extend(tool_args.iter().cloned());
+        return atpkg::cli::main_entry(pending_args);
     }
 
     // Mode fork. Explicit flags first — `--session` and `--window` force a
@@ -387,11 +410,24 @@ fn main() -> ExitCode {
     // The session: flags → quiet, then the passthrough (never returns).
     let quiet = aterm_cli::parse_args(mode_args);
 
+    // THE SESSION SAYS NOTHING UNASKED ON STDERR (Phase 2, 2026-09-22): its log is the
+    // window's `aterm.log`, and atpkg's unasked notices (a config it cannot read, a
+    // prefix it will not use, a lay that is not provenance-clean) are records in it —
+    // both set up here, before the lane's first atpkg call and its first thread.
+    aterm_gui::install_session_log();
+    atpkg::notice::to_host_log();
+    // ONE read of aterm.toml's `[packages]` and ONE layout for the whole lane — the
+    // agents handoff, the reroute seam, the package pass and the reroute thread's lay
+    // policy all read these. Resolving per consumer re-read the file each time, and a
+    // malformed table was reported once per read (2026-09-22 review: five copies).
+    let packages = atpkg::config::cached();
+    let layout = atpkg::store::resolve_from(packages);
+
     // THE MANAGED `agents/` HANDOFF (2026-09-18, closing R3 of 2026-09-16). The
     // session used to DERIVE `<prefix>/agents` as the sibling of `$ATERM_REROUTE_DIR`
-    // — handed only when the reroute is engaged — so `--no-reroute` /
-    // `ATERM_NO_REROUTE`, the escape hatch for the UPSTREAM RUST NAMES, also dropped
-    // the managed `claude`/`codex` front-insert, and nothing named the directory
+    // — handed only when the reroute is engaged — so `--no-reroute`, the escape hatch
+    // for the UPSTREAM RUST NAMES, also dropped the managed `claude`/`codex`
+    // front-insert, and nothing named the directory
     // unless an enclosing shell that sourced the hook had exported `$ATPKG_AGENTS`.
     // Now the one binary that links atpkg resolves the layout, ENSURES the directory
     // (`Layout::ensure_agents_dir` — the window's mkdir/mode rule: one `mkdir`, mode by
@@ -405,7 +441,7 @@ fn main() -> ExitCode {
     // being unset. Same trusted-launcher discipline as the reroute handoff below:
     // set here, single-threaded, before the reroute lay and the update checker
     // spawn the lane's first threads.
-    hand_agents_dir(atpkg::store::resolve_configured().as_ref());
+    hand_agents_dir(layout.as_ref());
 
     // THE REROUTE SEAM of the session lane (`docs/DESIGN-toolchain-reroute-2026-09-07.md`
     // §"Reaching PATH" 1): resolve the configured store, lay the session-scoped stubs
@@ -417,15 +453,15 @@ fn main() -> ExitCode {
     // reads it at its own edge, puts it FIRST on the child PATH (move-to-front) and
     // re-exports it for the shell integration. Same trusted-launcher discipline as
     // `take_no_reroute`: set HERE, before the update checker below spawns the first
-    // thread. `ATERM_NO_REROUTE` engaged (`--no-reroute` above, or the variable; empty
-    // and `0` do not count) ⇒ nothing laid, nothing handed over, and the session
-    // prepends and exports nothing. On Windows `lay` lays nothing and the directory
+    // thread. `--no-reroute` above (which `take_no_reroute` turns into the internal
+    // `__ATERM_REROUTE_PASSTHROUGH` marker, and clears an inherited one without it) ⇒
+    // nothing laid, nothing handed over, and the session prepends and exports nothing. On Windows `lay` lays nothing and the directory
     // does not exist, so the handoff is skipped there too (TARGET).
     if !atpkg::reroute::engaged(
-        std::env::var(atpkg::reroute::NO_REROUTE_ENV)
+        std::env::var(atpkg::reroute::PASSTHROUGH_ENV)
             .ok()
             .as_deref(),
-    ) && let Some(layout) = atpkg::store::resolve_configured()
+    ) && let Some(layout) = layout.clone()
     {
         // A SESSION SPAWN NEVER WAITS ON A LAUNCHD JOB (2026-09-14, the perf
         // audit) — the window entry's twin, and the same measured cost: when
@@ -436,13 +472,14 @@ fn main() -> ExitCode {
         // What the session needs synchronously is the DIRECTORY, because that is
         // what goes on its PATH; laying the stubs into it is the same work
         // whenever it runs, so it runs beside the shell instead of before it. A
-        // failed lay must still never produce a SILENT un-rerouted session, so
-        // the background lane says it, once, exactly as before. (A recorded
-        // decline lays nothing and says nothing: that is the user's own
-        // instruction, and `lay` still honours it.)
+        // directory not made and a failed lay are LOG lines, never stderr: the same
+        // condition with the same remedy, and nothing prints into a shell the user did
+        // not ask to update (Phase 2, 2026-09-22); `aterm pkg doctor` names an unlaid
+        // reroute. (A recorded decline lays nothing and says nothing: that is the
+        // user's own instruction, and `lay` still honours it.)
         let dir = layout.reroute_dir();
         if let Err(error) = layout.ensure_dir(&dir) {
-            eprintln!(
+            aterm_log::warn!(
                 "aterm: reroute dir not created ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
             );
         }
@@ -453,7 +490,7 @@ fn main() -> ExitCode {
             .name("aterm-reroute-lay".into())
             .spawn(move || {
                 if let Err(error) = atpkg::reroute::lay(&layout) {
-                    eprintln!(
+                    aterm_log::warn!(
                         "aterm: reroute stubs not laid ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
                     );
                 }
@@ -466,32 +503,27 @@ fn main() -> ExitCode {
     // applied anything, while install.sh promised "updates: automatic". Sessions
     // now run the same background check/stage loop; the crate dedupes checkers
     // ACROSS PROCESSES (a shared flock + ledger-freshness gate), so ten tabs
-    // cost the shared GitHub budget one check per interval, not ten. APPLY stays
-    // with the window entry on purpose: applying re-execs the process, and the
+    // cost the shared GitHub budget one check per interval, not ten. On macOS,
+    // APPLY stays with the window entry: applying re-execs the process, and the
     // trial/rollback health confirmation is anchored in the window's steady
-    // state — a session must never gamble a live PTY on it. The one-line nudge
-    // below (before the PTY exists — it never interleaves with a running shell)
-    // is the honest bridge: it names the staged build and how to apply it.
-    // Source: the `[update]` config repoint under the env override + the
-    // compiled default (`aterm_gui::configured_update_source`, 2026-09-14) — the
-    // same resolution the window's loop and the ctl `update check` verb use.
+    // state. Linux replaces only the on-disk binary; this session lane checks
+    // and stages without replacing it or gambling a live PTY. A staged build is
+    // said nowhere here (Phase 2, 2026-09-22: the one-line nudge printed at every
+    // launch went): `aterm update status` answers when asked. Source: the compiled
+    // channel, which only a development build lets
+    // `[update]` owner/repo repoint (`aterm_gui::configured_update_source`, 2026-09-14;
+    // no env override since 2026-09-23) — the same resolution the window's loop and the
+    // ctl `update check` verb use. "Check for updates automatically" off (`[update]
+    // enabled = false`, Settings ▸ Terminal ▸ Updates) makes the call a no-op, exactly as
+    // it does for the window (`aterm_update::automatic`); `aterm update check` still runs.
     // Resolve on the checker thread each cycle so a config reload also changes
     // the channel of an already-running session.
-    #[cfg(target_os = "macos")]
-    {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if session_lane_is_interactive() {
         let build = aterm_gui::running_build_number();
-        if let Some(st) = aterm_update::status(build)
-            && let (Some(staged_build), Some(v)) = (st.staged_build, st.staged_version.as_ref())
-            && staged_build > build
-        {
-            eprintln!(
-                "aterm: update {v} (build {staged_build}) is staged — opening the aterm \
-                 window (aterm --window) applies it"
-            );
-        }
-        aterm_update::spawn_background_check_with_source(
+        aterm_update::spawn_background_check_with_settings(
             build,
-            std::sync::Arc::new(|| Some(aterm_gui::configured_update_source())),
+            std::sync::Arc::new(aterm_gui::configured_update_settings),
             None,
             None,
         );
@@ -499,64 +531,54 @@ fn main() -> ExitCode {
 
     // THE TOOLCHAIN'S OWN CHECK, from the session lane (R3/R4, 2026-09-10). Only
     // the WINDOW ran `atpkg update` — a terminal-only Mac never provisioned or
-    // updated its packages, and nothing anywhere said so. Two things, before the
-    // PTY exists so neither interleaves with a running shell:
+    // updated its packages. SILENT (Phase 2, 2026-09-22): nothing it does prints, and a
+    // spawn that fails is a log line. What it does (Phase 3, 2026-09-23):
     //
-    //  1. If no atpkg pass has EVER succeeded here (status.toml absent, or no
-    //     `last_success_at` — the stamp atpkg writes only on success), the one
-    //     stderr line every console edge prints (`NEVER_CHECKED_STDERR_LINE`),
-    //     unless `--quiet` — and only while `[packages] enabled` is on: a user who
-    //     turned packages off is not told every session to run a pass.
-    //  2. If the last ATTEMPT (`updated_at`, moved by every pass, failed or not) is
-    //     older than the window loop's interval (6 h, or `ATPKG_UPDATE_INTERVAL_SECS`;
-    //     `0` disarms this edge), a DETACHED one-shot `aterm pkg update` — its own
-    //     process group, stdio on /dev/null, never waited for — so a session launch
-    //     is covered by the same pass the window runs at first open. The attempt,
-    //     not the success, on purpose: a pass that keeps failing is retried once per
-    //     interval, not once per tab (atpkg's store lock only dedups CONCURRENT
-    //     passes — a pass refused by it exits 75, atpkg's contention code, and is
-    //     silent here on purpose: this lane never passes `--wait-lock`, because a
-    //     detached, unobserved waiter per tab would pile up; the WINDOW's lanes are
-    //     the ones that queue behind a sibling, 2026-09-10). Note that this pass
-    //     writes no `progress.json`, so a window queued behind it shows its
-    //     waiting row and no meter. Gated on the same `[packages]` bits the window
-    //     reads (`enabled`,
-    //     `auto_update`), on `ATPKG_DISABLE`, and on this being an INTERACTIVE
-    //     launch: stdin a terminal and no `ATERM_SESSION_MODEL` — a harness driving
-    //     the session over pipes (the integration tests, a driver's `--session`
+    //  -  under the MACHINE-WIDE rule the window's loop runs its six-hour walk on
+    //     (`pkg_check::full_pass_owed`: never succeeded, or the last success six hours
+    //     old; no pass installing now or attempted anywhere on the machine in the last
+    //     five minutes, and none that failed in the last six hours, so a pass that keeps
+    //     failing is retried once per interval, not by every tab, and no tab queues a
+    //     waiter behind a pass in flight), a DETACHED one-shot `aterm pkg update` — its own process group,
+    //     stdio on /dev/null, never waited for — claimed first (`pkg_check::claim` on
+    //     `session-pass.stamp`), so tabs opened together start one pass, not one each.
+    //     It runs on the window's argv (`pkg_check::pass_flags`: `--wait-lock`, and
+    //     `--progress-file` under the prefix, so a window follows it), and names no
+    //     spawner (`SPAWNER_DETACHED`): its detaching `sh` exits at once, and a waiter
+    //     that read that as its window going would stand aside with 75 — a contended
+    //     pass WAITS instead. Gated on the switch the window reads — `[packages]
+    //     enabled`, Automatic updates (the retired `auto_update` folded in; there is no
+    //     environment kill switch since 2026-09-23) — and on this being an
+    //     INTERACTIVE launch: stdin a terminal and no `ATERM_SESSION_MODEL` — a harness
+    //     driving the session over pipes (the integration tests, a driver's `--session`
     //     child) must never provision the machine's real prefix as a side effect
     //     (2026-09-10 review: `targo test -p aterm` rewrote the owner's status.toml).
     // THE HOST SETTINGS ARE NOT THE PACKAGE MANAGER'S TO GATE. A session launch — this
     // binary run from another terminal, or over ssh — could only apply them as a side
-    // effect of a package pass that was due, so a Mac with `[packages] enabled = false`,
-    // `auto_update = false`, `ATPKG_DISABLE` set, or simply a pass that ran an hour ago
-    // never got them from this lane at all. They take no store lock, need no index and
-    // no network, and `machine apply` prints nothing when nothing changed, so the lane
-    // that can run them unconditionally should. Interactive launches only, for the same
-    // reason the pass above is gated that way: a harness driving a session over pipes
-    // must not touch the real machine.
-    if cfg!(target_os = "macos") && session_lane_is_interactive() {
+    // effect of a package pass that was due, so a Mac with `[packages] enabled = false`
+    // (then also spelled `auto_update = false`, or an environment kill switch), or simply
+    // a pass that ran an hour ago, never got them from this lane at all. They take no store lock, need no index and
+    // no network, and `machine apply` prints nothing when nothing changed — but they walk
+    // `$HOME`, so the lane runs them ONCE A DAY, on its own stamp beside `status.toml`
+    // (`machine-apply.stamp`), not at every launch. Interactive launches only, for the
+    // same reason the pass above is gated that way: a harness driving a session over
+    // pipes must not touch the real machine.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    if cfg!(target_os = "macos")
+        && session_lane_is_interactive()
+        && let Some(layout) = layout.as_ref()
+        && machine_apply_due(layout, now)
+    {
         spawn_detached_machine_apply();
     }
-    if let Some(layout) = atpkg::store::resolve_configured()
-        && std::env::var_os("ATPKG_DISABLE").is_none()
+    if let Some(layout) = layout.as_ref()
+        && packages.enabled()
+        && session_lane_is_interactive()
+        && session_pass_due(layout, now)
     {
-        use aterm_update_core::pkg_check;
-        let status = layout.status();
-        let cfg = atpkg::config::cached();
-        let enabled = cfg.enabled.unwrap_or(true);
-        if !quiet && enabled && pkg_check::never_checked(&status) {
-            eprintln!("{}", pkg_check::NEVER_CHECKED_STDERR_LINE);
-        }
-        if enabled && cfg.auto_update.unwrap_or(true) && session_lane_is_interactive() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-            let age = pkg_check::last_attempt_age_secs(&status, now);
-            if pkg_check::session_pass_due(age, pkg_check::update_interval_secs()) {
-                spawn_detached_pkg_update();
-            }
-        }
+        spawn_detached_pkg_update(layout);
     }
 
     session_lane(quiet)
@@ -625,22 +647,49 @@ fn hand_agents_dir(layout: Option<&atpkg::store::Layout>) {
 }
 
 /// Whether this `--session` launch is a PERSON's terminal rather than a harness's
-/// child: stdin is a terminal and no `ATERM_SESSION_MODEL` is set (the driver /
-/// integration-test knob that arms the session's VT model). Only such a launch may
-/// spawn the detached toolchain pass — a piped launch is a test or a driver, and a
-/// test must never mutate the machine's real package prefix.
+/// child: stdin is a terminal and no `ATERM_SESSION_MODEL` is set (the development
+/// seam that arms the session's VT model — `aterm_types::dev_seam!`, read by no shipped
+/// binary). Only such a launch may spawn the detached toolchain pass — a piped launch is
+/// a test or a driver, and a test must never mutate the machine's real package prefix.
 fn session_lane_is_interactive() -> bool {
-    stdin_is_terminal() && std::env::var_os("ATERM_SESSION_MODEL").is_none()
+    stdin_is_terminal() && aterm_cli::session_model_seam().is_none()
 }
 
-/// One DETACHED `aterm pkg update` (R4): this very binary, the `pkg` verb, its own
-/// process group so the session's exit (and the SIGHUP that follows it) cannot
-/// take the pass down mid-install, stdio on `/dev/null` (atpkg records its own
-/// `status.toml`; the window's loop is the surface that streams markers), and the
-/// child never waited for. A spawn that fails is said on stderr once — a session
-/// must never be blocked by its package manager.
-/// One DETACHED `aterm pkg machine apply` — the lock-free host settings, on every
-/// interactive session launch.
+/// How often a terminal session runs `aterm pkg machine apply`: once a day, on the lane's
+/// own claim. The window runs it as it opens, a package pass after an edit to `[machine]`
+/// (or an apply that did not finish), and Settings' Apply now at once.
+const MACHINE_APPLY_EVERY_SECS: u64 = 24 * 60 * 60;
+
+/// Whether this launch runs the daily `aterm pkg machine apply`: it claims the lane's
+/// once-a-day slot in `machine-apply.stamp` (Phase 3). The walk of `$HOME` it costs used
+/// to run at EVERY session launch — every tab.
+fn machine_apply_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
+    aterm_update_core::pkg_check::claim(
+        &layout.machine_apply_stamp(),
+        now_unix,
+        MACHINE_APPLY_EVERY_SECS,
+    )
+}
+
+/// Whether this launch spawns the detached pass: the MACHINE-WIDE rule the window's loop
+/// runs its six-hour walk on ([`aterm_update_core::pkg_check::full_pass_owed`]) over the
+/// stamps every lane reads ([`atpkg::status::pass_stamps`]: the outcome the last pass
+/// recorded, never `updated_at`; a pass installing now, not queued behind), then the
+/// session lane's own claim, so tabs opened in the same moment spawn one pass. The derived
+/// model `AtpkgFullPassRule` states the rule — and proves it never spawns inside a
+/// rate-limit hold it does not read; atpkg's `status` conformance binds this reading to it.
+fn session_pass_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
+    use aterm_update_core::pkg_check;
+    pkg_check::full_pass_owed(&atpkg::status::pass_stamps(layout, now_unix), now_unix).is_some()
+        && pkg_check::claim(
+            &layout.session_pass_stamp(),
+            now_unix,
+            pkg_check::PASS_SPACING_SECS,
+        )
+}
+
+/// One DETACHED `aterm pkg machine apply` — the lock-free host settings, once a day
+/// ([`machine_apply_due`]).
 ///
 /// Separate from [`spawn_detached_pkg_update`] because the two are gated differently on
 /// purpose: a package pass is due or it is not, and a user may switch it off entirely;
@@ -651,18 +700,39 @@ fn spawn_detached_machine_apply() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    if let Err(error) = spawn_detached(exe.as_os_str(), &["pkg", "machine", "apply"]) {
-        eprintln!("aterm: could not start the background `aterm pkg machine apply`: {error}");
+    let args = ["pkg", "machine", "apply"].map(std::ffi::OsString::from);
+    if let Err(error) = spawn_detached(exe.as_os_str(), &args, None) {
+        aterm_log::warn!(
+            "aterm: could not start the background `aterm pkg machine apply`: {error}"
+        );
     }
 }
 
-fn spawn_detached_pkg_update() {
+/// One DETACHED `aterm pkg update` (R4): this very binary, the `pkg` verb on the window's
+/// own argv ([`session_pass_args`]), its own process group so the session's exit (and
+/// the SIGHUP that follows it) cannot take the pass down mid-install, stdio on
+/// `/dev/null` (atpkg records its own `status.toml`, and its progress file is the one a
+/// window tails), and the child never waited for. A spawn that fails is a log line, never
+/// stderr — a session must never be blocked, or spoken over, by its package manager.
+fn spawn_detached_pkg_update(layout: &atpkg::store::Layout) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    if let Err(error) = spawn_detached(exe.as_os_str(), &["pkg", "update"]) {
-        eprintln!("aterm: could not start the background `aterm pkg update` pass: {error}");
+    let detached = (atpkg::cli::SPAWNER_PID_ENV, atpkg::cli::SPAWNER_DETACHED);
+    if let Err(error) = spawn_detached(exe.as_os_str(), &session_pass_args(layout), Some(detached))
+    {
+        aterm_log::warn!("aterm: could not start the background `aterm pkg update` pass: {error}");
     }
+}
+
+/// The detached pass's argv: `pkg update` and the flags every scheduled pass carries
+/// ([`aterm_update_core::pkg_check::pass_flags`]) — the window's own. Pure for the test.
+fn session_pass_args(layout: &atpkg::store::Layout) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec!["pkg".into(), "update".into()];
+    args.extend(aterm_update_core::pkg_check::pass_flags(Some(
+        &layout.progress_file(),
+    )));
+    args
 }
 
 /// Start `program args` DETACHED: stdio on `/dev/null`, its own process group, and
@@ -673,11 +743,19 @@ fn spawn_detached_pkg_update() {
 /// shell's (2026-09-12 audit K9; reliably on Linux, ~6% of exits on macOS). So on
 /// unix a `/bin/sh` middle process — the group leader — backgrounds the program and
 /// exits at once, and reaping it here re-parents the pass to launchd/init.
-fn spawn_detached(program: &std::ffi::OsStr, args: &[&str]) -> std::io::Result<()> {
+fn spawn_detached(
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+    env: Option<(&str, &str)>,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        let status = std::process::Command::new("/bin/sh")
+        let mut command = std::process::Command::new("/bin/sh");
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        }
+        let status = command
             .args(["-c", "\"$@\" &", "sh"])
             .arg(program)
             .args(args)
@@ -696,7 +774,11 @@ fn spawn_detached(program: &std::ffi::OsStr, args: &[&str]) -> std::io::Result<(
     }
     #[cfg(not(unix))]
     {
-        std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        }
+        command
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -856,22 +938,27 @@ fn strip_mode_flags(rest: &[OsString]) -> Vec<OsString> {
 }
 
 /// `--no-reroute`: restore the upstream Rust names in this session (`aterm help
-/// reroute`; `docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH" 3).
-/// Consumed by [`take_no_reroute`] exactly like a mode flag: stripped before the
-/// payload boundary (neither mode library knows it) and, when present, turned into
-/// `ATERM_NO_REROUTE=1` in THIS process's environment — so both lanes read it
-/// through the same env gate a bare variable takes, and every child inherits it.
+/// reroute`; `docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH" 3) — THE
+/// spelling of that escape (the `ATERM_NO_REROUTE` variable that was its twin is gone,
+/// 2026-09-23: "NOT ENV VARS those are for development"). Consumed by
+/// [`take_no_reroute`] exactly like a mode flag: stripped before the payload boundary
+/// (neither mode library knows it) and, when present, turned into the INTERNAL marker
+/// [`atpkg::reroute::PASSTHROUGH_ENV`] in THIS process's environment — so both lanes
+/// read one answer, and every child inherits it.
 const NO_REROUTE_FLAG: &str = "--no-reroute";
 
-/// `rest` with [`NO_REROUTE_FLAG`] stripped, the flag ESTABLISHED as
-/// `ATERM_NO_REROUTE=1` when it was present. Trusted-launcher idiom (the
-/// `--containment` precedent in aterm-cli's parser): single-threaded startup,
-/// before the update checker's thread and before any PTY byte flows, through the
-/// workspace's one lock-scoped env helper. Inside a `-e`/`--` payload the token
-/// belongs to the child command line and is neither read nor stripped. A launch
-/// carrying the flag is deliberately NOT a "plain" launch for the single-instance
-/// routing policy (which reads the unstripped `rest`): a tab forwarded to another
-/// instance would not carry the environment the flag asked for, so it opens here.
+/// `rest` with [`NO_REROUTE_FLAG`] stripped, and the marker ESTABLISHED to match:
+/// [`atpkg::reroute::PASSTHROUGH_ENV`]`=1` when the flag was present, and REMOVED when
+/// it was not — an inherited marker (this launch typed inside a `--no-reroute`
+/// session) is protocol from another launch, never an instruction to this one, so a
+/// launch without the flag always gets the reroute. Trusted-launcher idiom (the
+/// `--containment` precedent in aterm-cli's parser): single-threaded startup, before
+/// the update checker's thread and before any PTY byte flows, through the workspace's
+/// one lock-scoped env helper. Inside a `-e`/`--` payload the token belongs to the
+/// child command line and is neither read nor stripped. A launch carrying the flag is
+/// deliberately NOT a "plain" launch for the single-instance routing policy (which
+/// reads the unstripped `rest`): a tab forwarded to another instance would not carry
+/// the environment the flag asked for, so it opens here.
 fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
     // Same form, same reason as the `scan` slice above.
     if rest
@@ -880,7 +967,9 @@ fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
         .iter()
         .any(|a| a.to_string_lossy() == NO_REROUTE_FLAG)
     {
-        aterm_log::env::set(atpkg::reroute::NO_REROUTE_ENV, "1");
+        aterm_log::env::set(atpkg::reroute::PASSTHROUGH_ENV, "1");
+    } else {
+        aterm_log::env::unset(atpkg::reroute::PASSTHROUGH_ENV);
     }
     strip_flags(rest, &[NO_REROUTE_FLAG])
 }
@@ -907,16 +996,6 @@ fn plain_launch_request(
         return None;
     }
     if !aterm_cli::plain_launch_is_policy_eligible(argv, env) {
-        return None;
-    }
-    // `ATERM_NO_REROUTE=1 aterm` is the documented twin of `--no-reroute`, and
-    // a tab forwarded to a running instance would not carry that environment:
-    // it fails closed to a local spawn, exactly as the flag does.
-    if atpkg::reroute::engaged(
-        std::env::var(atpkg::reroute::NO_REROUTE_ENV)
-            .ok()
-            .as_deref(),
-    ) {
         return None;
     }
     let dir = plain_launch_dir(argv).ok()?;
@@ -1137,75 +1216,372 @@ fn plain_launch_dir(scan: &[OsString]) -> Result<Option<String>, ()> {
     }
 }
 
-/// `aterm update [status|check]` — the headless update lane, served in-process
-/// from the shared ledger (`status`) and the one-shot checker (`check`): no
-/// control socket, no window. `aterm ctl update status` remains the machine
-/// surface a controller drives against a RUNNING window; this verb is what a
-/// terminal-only machine (round-11: previously unable to even report its own
-/// staleness) and scripts get. Apply is deliberately absent: applying re-execs
-/// a process and rides the window entry's trial/rollback confirmation — the
-/// nudges name `aterm --window` as the apply path instead.
+/// `aterm update [status|check] [-v]` — the headless update lane, served in-process
+/// from the shared ledger (`status`) and the one-shot checker (`check`): no control
+/// socket, no window. `aterm ctl update status` remains the machine surface a controller
+/// drives against a RUNNING window; this verb is what a terminal-only machine (round-11:
+/// previously unable to even report its own staleness) and scripts get. On macOS apply
+/// is deliberately absent: applying re-execs a process and rides the window entry's
+/// trial/rollback confirmation. Linux replaces only the on-disk executable, so there
+/// `enable`, `apply`, `rollback` and the installers' `install` are verbs here; and
+/// `identity` prints the running binary's compiled identity on every platform.
+///
+/// It says ONE plain line ([`update_summary`]) — `aterm 0.91.0 is up to date · checked
+/// 12 min ago` — and, when something is wrong, one more on stderr saying where the rest
+/// is (a `check` at a terminal first says it is checking, on stderr). `-v` adds the
+/// ledger's own detail ([`print_update_detail`]). `check` exits nonzero when the copy
+/// cannot update or its checks are failing; `status` when there is no ledger to read.
 fn update_verb(rest: &[OsString]) -> ExitCode {
-    // `aterm-update` logs through `aterm_log`, a no-op until a host installs a
-    // logger — the window installs a file logger, but THIS lane runs with a
-    // terminal attached, where stderr is the honest surface. Without it a failed
-    // manual check printed nothing at all and looked identical to success.
-    static STDERR_LOGGER: StderrLogger = StderrLogger;
-    let _ = aterm_log::set_logger(&STDERR_LOGGER);
-    aterm_log::set_max_level(aterm_log::LevelFilter::Info);
-    let sub = rest
-        .first()
-        .map(|a| a.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "status".to_string());
+    // The updater logs through `aterm_log`. Its records go to aterm.log with the
+    // window's and the session's, never to this terminal: a check used to print every
+    // INFO record raw ("INFO: aterm-update: authoritative v0.91.0 was signed by machine
+    // m3 …", 2026-09-23 audit). What went wrong reaches the terminal as the plain line
+    // below, and the whole record is in Settings ▸ Messages and the file.
+    aterm_gui::install_session_log();
     let build = aterm_gui::running_build_number();
-    match sub.as_str() {
-        "status" => {
-            let Some(st) = aterm_update::status(build) else {
-                // `None` on macOS too, when `HOME` is unset or the updater's private
-                // staging directory cannot be made — so the platform is not the
-                // only reason there is nothing to report, and the line says both.
-                println!(
-                    "aterm update: nothing to report — auto-update runs on macOS only, and \
-                     only where the updater's staging directory under HOME resolves"
+    let first = rest.first().map(|a| a.to_string_lossy().into_owned());
+    if first.as_deref() == Some("identity") && rest.len() == 1 {
+        return match aterm_update::binary_identity_json(&aterm_gui::running_binary_identity()) {
+            Ok(identity) => {
+                println!("{identity}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("aterm update: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if matches!(first.as_deref(), Some("--help" | "-h" | "help")) && rest.len() == 1 {
+        println!(
+            "usage: aterm update [status|check] [-v] | identity\nLinux: aterm update enable [--proof-dir DIR] | apply | rollback\nBootstrap: aterm update install --target ABS/aterm --proof-dir DIR --candidate FILE\nLinux updates replace only the on-disk executable; running sessions are never restarted."
+        );
+        return ExitCode::SUCCESS;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(sub) = first
+        .as_deref()
+        .filter(|sub| matches!(*sub, "enable" | "apply" | "rollback" | "install"))
+    {
+        let result = match sub {
+            "enable" if rest.len() <= 1 => aterm_update::linux::enable(build, None),
+            "enable" if rest.len() == 3 && rest[1] == "--proof-dir" => {
+                aterm_update::linux::enable(build, Some(std::path::Path::new(&rest[2])))
+            }
+            "apply" if rest.len() == 1 => aterm_update::linux::apply(),
+            "rollback" if rest.len() == 1 => aterm_update::linux::rollback(),
+            "install"
+                if rest.len() == 7
+                    && rest[1] == "--target"
+                    && rest[3] == "--proof-dir"
+                    && rest[5] == "--candidate" =>
+            {
+                aterm_update::linux::install_release(
+                    std::path::Path::new(&rest[2]),
+                    std::path::Path::new(&rest[6]),
+                    std::path::Path::new(&rest[4]),
+                )
+            }
+            _ => Err("usage: aterm update enable [--proof-dir DIR] | apply | rollback".into()),
+        };
+        return match result {
+            Ok(message) => {
+                println!("aterm update: {message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("aterm update: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let mut verbose = false;
+    let mut sub = None;
+    for arg in rest.iter().map(|a| a.to_string_lossy().into_owned()) {
+        match arg.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            _ if sub.is_none() && !arg.starts_with('-') => sub = Some(arg),
+            _ => {
+                eprintln!(
+                    "aterm: unknown update argument {arg:?} (usage: aterm update [status|check] \
+                     [-v])"
                 );
-                return ExitCode::SUCCESS;
-            };
-            print_update_status(build, &st);
-            ExitCode::SUCCESS
+                return ExitCode::from(2);
+            }
         }
+    }
+    let checking = sub.as_deref() == Some("check");
+    let st = match sub.as_deref().unwrap_or("status") {
+        "status" => aterm_update::status(build),
         "check" => {
-            let st = aterm_update::check_now(build, &aterm_gui::configured_update_source());
-            print_update_status(build, &st);
-            ExitCode::SUCCESS
+            // A check can download a whole release: say it is working, to a person only.
+            if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                eprintln!("Checking for updates\u{2026}");
+            }
+            let provider: aterm_update::CheckSettingsProvider =
+                std::sync::Arc::new(aterm_gui::configured_update_settings);
+            Some(aterm_update::check_now_with_settings(build, &provider))
         }
         other => {
             eprintln!(
-                "aterm: unknown update sub-command {other:?} (usage: aterm update [status|check])"
+                "aterm: unknown update sub-command {other:?} (usage: aterm update \
+                 [status|check] [-v])"
             );
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
+    };
+    // `None` when this platform has no updater, or `HOME` is unset, or the updater's
+    // private staging directory cannot be made — so the platform is not the only reason.
+    let Some(st) = st else {
+        println!(
+            "Nothing to report: this copy of aterm can\u{2019}t update itself here (no updater \
+             on this platform, or HOME is not set)."
+        );
+        return ExitCode::FAILURE;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let (line, trouble) = update_summary(
+        aterm_gui::running_version(),
+        build,
+        &st,
+        now,
+        aterm_update_core::settings::update_auto_apply(),
+        aterm_update::automatic(),
+    );
+    aterm_log::info!("aterm update: {line}");
+    println!("{line}");
+    if let Some(trouble) = trouble {
+        eprintln!("{trouble}");
+    }
+    if verbose {
+        print_update_detail(build, &st);
+    }
+    // A check that could not do its job says so in its exit status too (a script's
+    // only reading): the copy cannot update, its channel is unreadable, or checks fail.
+    if checking
+        && (!st.enabled || !st.installable || st.channel_unreadable || st.failing_checks > 0)
+    {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
-/// The human rendering shared by `aterm update status` and `… check`: the
-/// ledger's own summary sentence, when the record was written, and the failure
-/// counters only when they carry news. The stranded/failing `outcome` already
-/// contains the full explanation with the copy-pasteable remedy, so it is
-/// printed verbatim rather than paraphrased.
-fn print_update_status(build: u64, st: &aterm_update::UpdateStatus) {
-    println!("aterm update: {}", st.summary());
-    if !st.installable {
-        // A dev build / DMG-mounted / translocated copy: the checker deliberately
-        // no-ops (nothing to swap), which otherwise looks exactly like idleness.
-        println!(
-            "  note: this copy is not an installed aterm.app, so checks and staging are inert here"
+/// Where a trouble line sends the reader for the rest.
+#[cfg(target_os = "macos")]
+const UPDATE_LOG_HINT: &str =
+    "Details are in Settings \u{25b8} Messages, and in ~/Library/Logs/aterm/aterm.log.";
+/// Where a trouble line sends the reader for the rest.
+#[cfg(not(target_os = "macos"))]
+const UPDATE_LOG_HINT: &str =
+    "Details are in Settings \u{25b8} Messages, and in ~/.local/state/aterm/logs/aterm.log.";
+
+/// What `aterm update status|check` says: ONE plain line for stdout, and — when
+/// something is wrong — one for stderr. The version a person knows (the build number
+/// is `--version`'s and About's); what is on offer and when it installs; when the last
+/// check completed, relative. The updater's own decision sentence, the lane and the
+/// counters stay in `aterm ctl update status`, `-v` and the log (2026-09-23 audit).
+/// `installs_by_itself` is `[update] auto_apply`, `automatic_checks` `[update] enabled`.
+/// Pure for the test.
+fn update_summary(
+    version: &str,
+    build: u64,
+    st: &aterm_update::UpdateStatus,
+    now: i64,
+    installs_by_itself: bool,
+    automatic_checks: bool,
+) -> (String, Option<String>) {
+    if !st.enabled {
+        // Only a Linux copy reaches here (macOS always has an updater; elsewhere there
+        // is no ledger at all): not enrolled, or automatic updates are off. The
+        // ledger's sentence names the remedy (`aterm update enable`).
+        let remedy = st.outcome.trim();
+        return (
+            format!("aterm {version} doesn\u{2019}t update itself on this machine"),
+            (!remedy.is_empty()).then(|| remedy.to_string()),
         );
+    }
+    // A Linux copy stages on disk and replaces only its executable: a staged build is
+    // applied with `aterm update apply` (upstream's Linux delivery, d0a4c2930).
+    if let Some(staged) = st
+        .linux
+        .as_ref()
+        .and_then(|native| {
+            native
+                .staged_build
+                .map(|b| (b, native.staged_version.clone()))
+        })
+        .filter(|(b, _)| *b > build)
+    {
+        let next = staged.1.unwrap_or_else(|| format!("build {}", staged.0));
+        return (
+            format!("aterm {next} is downloaded \u{2014} `aterm update apply` installs it"),
+            None,
+        );
+    }
+    if !st.installable {
+        // A dev build, or a copy run from the disk image or a quarantined download: the
+        // checker deliberately does nothing here, which otherwise reads as idleness.
+        return (
+            format!(
+                "This copy of aterm {version} can\u{2019}t update itself \u{2014} only aterm.app \
+                 installed in Applications does"
+            ),
+            None,
+        );
+    }
+    if let Some(staged) = st.staged_build.filter(|staged| *staged > build) {
+        let next = st
+            .staged_version
+            .clone()
+            .unwrap_or_else(|| format!("build {staged}"));
+        return if st.failing_applies > 0 {
+            let tries = if st.failing_applies == 1 {
+                "1 try".to_string()
+            } else {
+                format!("{} tries", st.failing_applies)
+            };
+            (
+                format!("aterm {next} is downloaded but didn\u{2019}t install ({tries})"),
+                Some(UPDATE_LOG_HINT.to_string()),
+            )
+        } else if installs_by_itself {
+            // The window installs it (a terminal session never replaces itself).
+            (
+                format!(
+                    "aterm {next} is downloaded and installs within a minute while an aterm \
+                     window is open"
+                ),
+                None,
+            )
+        } else {
+            (
+                format!(
+                    "aterm {next} is downloaded \u{2014} install it from Settings \u{25b8} \
+                     Software Update"
+                ),
+                None,
+            )
+        };
+    }
+    if st.channel_unreadable {
+        // The ledger's sentence here is the remedy only an operator can apply.
+        let remedy = st.outcome.trim();
+        return (
+            format!("aterm {version} can\u{2019}t check for updates on this machine"),
+            Some(if remedy.is_empty() {
+                UPDATE_LOG_HINT.to_string()
+            } else {
+                remedy.to_string()
+            }),
+        );
+    }
+    let class = if st.failing_checks_kind.is_empty() {
+        st.failing_kind.as_str()
+    } else {
+        st.failing_checks_kind.as_str()
+    };
+    if st.failing_persistent {
+        // The one failure a person has to act on: a build that predates the channel's
+        // keys, whose ledger sentence prescribes the reinstall.
+        if class == "manifest" && st.outcome.contains("reinstall") {
+            return (
+                format!("aterm {version} is too old to check for updates"),
+                Some(
+                    "Reinstall aterm from the current release (drag it from the release DMG)."
+                        .to_string(),
+                ),
+            );
+        }
+        let trouble = if class == "apply" {
+            // An install streak whose build is gone: not a check failure.
+            "the last updates didn\u{2019}t install".to_string()
+        } else {
+            format!("update checks keep failing: {}", check_trouble_words(class))
+        };
+        return (
+            format!("aterm {version} \u{b7} {trouble}; aterm keeps trying"),
+            Some(UPDATE_LOG_HINT.to_string()),
+        );
+    }
+    if st.failing_checks > 0 {
+        return (
+            format!(
+                "aterm {version} \u{b7} the last check didn\u{2019}t finish: {}; aterm will try \
+                 again",
+                check_trouble_words(class)
+            ),
+            Some(UPDATE_LOG_HINT.to_string()),
+        );
+    }
+    let checked = aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at).map_or_else(
+        || "not checked yet".to_string(),
+        |at| format!("checked {}", ago_words(at, now)),
+    );
+    let mut line = format!("aterm {version} is up to date \u{b7} {checked}");
+    if !automatic_checks {
+        line.push_str(
+            " \u{b7} automatic checks are off (Settings \u{25b8} Terminal \u{25b8} Updates)",
+        );
+    }
+    (line, None)
+}
+
+/// A failing check CLASS (the updater's health-ledger names) in a person's words.
+fn check_trouble_words(kind: &str) -> &'static str {
+    match kind {
+        "network" => "the update server can\u{2019}t be reached",
+        "manifest" => "the newest release couldn\u{2019}t be verified",
+        "pipeline" => "downloads aren\u{2019}t finishing",
+        "stage" => "a download couldn\u{2019}t be prepared",
+        _ => "the check failed",
+    }
+}
+
+/// How long before `now` the instant `at` was: `just now`, `12 min ago`, `3 h ago`,
+/// `2 days ago` (Unix seconds both; a time ahead of `now` is `just now`).
+fn ago_words(at: i64, now: i64) -> String {
+    let age = now.saturating_sub(at);
+    if age < 60 {
+        "just now".to_string()
+    } else if age < 3600 {
+        format!("{} min ago", age / 60)
+    } else if age < 86_400 {
+        format!("{} h ago", age / 3600)
+    } else if age < 2 * 86_400 {
+        "1 day ago".to_string()
+    } else {
+        format!("{} days ago", age / 86_400)
+    }
+}
+
+/// `aterm update … -v`: the ledger's own detail under the plain line — the updater's
+/// last decision, when the last check completed, the failure counters when they carry
+/// news, and the apply lane's own words (2026-09-14, audit OBS-7: the reason, not just
+/// the count).
+fn print_update_detail(build: u64, st: &aterm_update::UpdateStatus) {
+    println!("  last decision: {}", st.summary());
+    if let Some(native) = &st.linux {
+        println!(
+            "  Linux: running build {build}, installed build {}",
+            native.installed_build
+        );
+        if let Some(staged) = native.staged_build {
+            println!(
+                "  verified Linux build {staged} staged; apply explicitly with: aterm update apply"
+            );
+        }
+        if let Some(phase) = &native.trial_phase {
+            println!(
+                "  trial: {phase}, starts={}, healthy={}",
+                native.trial_starts, native.trial_healthy
+            );
+        }
     }
     if !st.updated_at.is_empty() {
         println!("  last completed check: {}", st.updated_at);
-    }
-    if st.channel_unreadable {
-        println!("  this machine CANNOT read its release channel — see above for the remedy");
     }
     if st.failing_checks > 0 {
         let kind = if st.failing_checks_kind.is_empty() {
@@ -1224,10 +1600,6 @@ fn print_update_status(build: u64, st: &aterm_update::UpdateStatus) {
             st.failing_applies
         );
     }
-    // THE REASON, not just the count (2026-09-14, audit OBS-7): the apply lane's
-    // own words — the last failure and any standing refusal or schedule — used to
-    // reach only the control socket's `apply_failure=` (percent-encoded) while
-    // this, the local answer to "why is it not running?", printed a number.
     if let Some(report) = aterm_update::apply_lane_report(build) {
         if !report.last_failure.is_empty() {
             let target = if report.last_failure_target_build > 0 {
@@ -1246,9 +1618,6 @@ fn print_update_status(build: u64, st: &aterm_update::UpdateStatus) {
             println!("  apply lane{when}: {}", report.last_refusal);
         }
     }
-    if st.staged_build.is_some_and(|b| b > build) {
-        println!("  apply it by opening the aterm window: aterm --window");
-    }
 }
 
 /// Whether the managed store resolves `tool` — the IN-PROCESS `atpkg::which`
@@ -1266,8 +1635,18 @@ fn print_update_status(build: u64, st: &aterm_update::UpdateStatus) {
 // installed bundle, `aterm pkg which <not-a-tool>` runs 5-19 ms depending on
 // machine load, against a ~1.4 ms `/bin/echo` spawn baseline (and ~0.5 s cold,
 // with the page cache empty).
+//
+// A live build whose own-name shim is LOST resolves too (`atpkg::cli::live_without_shim`):
+// `pkg run` execs it from the store and names the repair. Before, `aterm ty` over a lost
+// `bin/ty` fell through to "aterm-gui: unknown option 'ty'" (measured on m3, 2026-09-23).
+// Its cost for a word that is no tool at all — the common case here — is one more
+// `stat` (no `store/<word>` directory ends it); only a program the store holds reads
+// further.
 fn store_resolves(tool: &str) -> bool {
-    atpkg::store::resolve_configured().is_some_and(|layout| atpkg::which(&layout, tool).is_some())
+    atpkg::store::resolve_configured().is_some_and(|layout| {
+        atpkg::which(&layout, tool).is_some()
+            || atpkg::cli::live_without_shim(&layout, tool).is_some()
+    })
 }
 
 /// Whether the managed store holds a PENDING stub for `tool` — the front door's
@@ -1285,21 +1664,6 @@ fn pending_stub_resolves(tool: &str) -> bool {
 fn stdin_is_terminal() -> bool {
     use std::io::IsTerminal as _;
     std::io::stdin().is_terminal()
-}
-
-/// The minimal stderr logger the headless update lane installs (see
-/// [`update_verb`]): level + message, no file/line noise — these lines are for
-/// a person at a terminal, not a log file.
-struct StderrLogger;
-
-impl aterm_log::Log for StderrLogger {
-    fn enabled(&self, _metadata: &aterm_log::Metadata<'_>) -> bool {
-        true
-    }
-    fn log(&self, record: &aterm_log::Record<'_>) {
-        eprintln!("{}: {}", record.level(), record.args());
-    }
-    fn flush(&self) {}
 }
 
 /// The first-position verbs `--completions` offers — built FROM the tables the
@@ -1353,16 +1717,171 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
 mod tests {
     use super::*;
 
-    /// THE HOST SETTINGS RUN ON EVERY INTERACTIVE SESSION LAUNCH, not only when a
-    /// package pass happens to be due.
+    fn update_status() -> aterm_update::UpdateStatus {
+        aterm_update::UpdateStatus {
+            linux: None,
+            enabled: true,
+            installable: true,
+            current_build: 100,
+            staged_build: None,
+            staged_version: None,
+            staged_commit: None,
+            staged_dmg_sha256: None,
+            changelog: None,
+            outcome: "up to date (latest release build 100) \u{b7} checks every 30 min".into(),
+            updated_at: "2026-09-23T12:00:00Z".into(),
+            failing_checks: 0,
+            failing_kind: String::new(),
+            failing_applies: 0,
+            failing_since: String::new(),
+            failing_persistent: false,
+            rescues: 0,
+            failing_checks_kind: String::new(),
+            channel_unreadable: false,
+        }
+    }
+
+    /// `aterm update status|check` SAYS ONE PLAIN LINE (2026-09-23 audit): the version a
+    /// person knows and what is true, relative — never the updater's decision sentence,
+    /// whose lane and token jargon ("checking over the unmetered web lane … every
+    /// update-token rung") the verb used to print verbatim, and never a build number.
+    /// Trouble adds one stderr line saying where the rest is.
+    #[test]
+    fn the_update_verb_says_one_plain_line() {
+        let checked =
+            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
+        let now = checked + 12 * 60;
+        let say = |st: &aterm_update::UpdateStatus, auto_apply: bool, automatic: bool| {
+            update_summary("0.91.0", 100, st, now, auto_apply, automatic)
+        };
+        let healthy = update_status();
+        assert_eq!(
+            say(&healthy, true, true),
+            (
+                "aterm 0.91.0 is up to date \u{b7} checked 12 min ago".to_string(),
+                None
+            )
+        );
+        let (line, _) = say(&healthy, true, false);
+        assert!(
+            line.ends_with(
+                "automatic checks are off (Settings \u{25b8} Terminal \u{25b8} Updates)"
+            ),
+            "{line}"
+        );
+
+        let mut staged = update_status();
+        staged.staged_build = Some(101);
+        staged.staged_version = Some("0.92.0".into());
+        assert_eq!(
+            say(&staged, true, true).0,
+            "aterm 0.92.0 is downloaded and installs within a minute while an aterm window \
+             is open"
+        );
+        assert!(
+            say(&staged, false, true)
+                .0
+                .contains("Settings \u{25b8} Software Update")
+        );
+        staged.failing_applies = 2;
+        let (line, trouble) = say(&staged, true, true);
+        assert_eq!(
+            line,
+            "aterm 0.92.0 is downloaded but didn\u{2019}t install (2 tries)"
+        );
+        assert!(trouble.is_some_and(|t| t.contains("Settings \u{25b8} Messages")));
+
+        let mut failing = update_status();
+        failing.failing_checks = 1;
+        failing.failing_checks_kind = "network".into();
+        failing.outcome = "update check deferred: curl exit 6 (attempt 1)".into();
+        let (line, trouble) = say(&failing, true, true);
+        assert_eq!(
+            line,
+            "aterm 0.91.0 \u{b7} the last check didn\u{2019}t finish: the update server \
+             can\u{2019}t be reached; aterm will try again"
+        );
+        assert!(trouble.is_some_and(|t| t.contains("aterm.log")));
+
+        // A persistent streak: in words, and the one a person must act on says so.
+        failing.failing_persistent = true;
+        failing.failing_checks = 3;
+        let (line, trouble) = say(&failing, true, true);
+        assert_eq!(
+            line,
+            "aterm 0.91.0 \u{b7} update checks keep failing: the update server can\u{2019}t \
+             be reached; aterm keeps trying"
+        );
+        assert!(trouble.is_some_and(|t| t.contains("Settings \u{25b8} Messages")));
+        let mut stale = failing.clone();
+        stale.failing_checks_kind = "manifest".into();
+        stale.outcome = "FAILING (3 consecutive checks since 2026-09-23T10:00:00Z): this \
+                         build's trust anchor cannot verify the channel's releases \u{2014} \
+                         reinstall aterm from the current release"
+            .into();
+        let (line, trouble) = say(&stale, true, true);
+        assert_eq!(line, "aterm 0.91.0 is too old to check for updates");
+        assert!(trouble.is_some_and(|t| t.starts_with("Reinstall aterm")));
+        failing.failing_persistent = false;
+        failing.failing_checks = 1;
+
+        for (line, _) in [say(&healthy, true, true), say(&failing, true, true)] {
+            for jargon in ["lane", "rung", "token", "build 100", "curl"] {
+                assert!(!line.contains(jargon), "{jargon}: {line}");
+            }
+        }
+        let mut never = update_status();
+        never.updated_at = String::new();
+        assert_eq!(
+            say(&never, true, true).0,
+            "aterm 0.91.0 is up to date \u{b7} not checked yet"
+        );
+
+        // LINUX (main's native delivery, merged 2026-09-23): a copy that is not
+        // enrolled says so plainly and hands on the ledger's remedy, and a staged
+        // Linux build names the verb that installs it — never "only on macOS".
+        let mut unenrolled = update_status();
+        unenrolled.enabled = false;
+        unenrolled.outcome = "Linux self-update is not enrolled; run aterm update enable \
+                              explicitly for this installed copy"
+            .into();
+        let (line, trouble) = say(&unenrolled, true, true);
+        assert_eq!(
+            line,
+            "aterm 0.91.0 doesn\u{2019}t update itself on this machine"
+        );
+        assert!(trouble.is_some_and(|t| t.contains("aterm update enable")));
+        let mut native = update_status();
+        native.linux = Some(aterm_update::LinuxUpdateStatus {
+            installed_build: 100,
+            staged_build: Some(101),
+            staged_version: Some("0.92.0".into()),
+            staged_commit: None,
+            trial_phase: None,
+            trial_starts: 0,
+            trial_healthy: false,
+        });
+        assert_eq!(
+            say(&native, true, true),
+            (
+                "aterm 0.92.0 is downloaded \u{2014} `aterm update apply` installs it".to_string(),
+                None
+            )
+        );
+    }
+
+    /// THE HOST SETTINGS RUN FROM AN INTERACTIVE SESSION LAUNCH — once a day, on their own
+    /// stamp — not only when a package pass happens to be due.
     ///
     /// This lane exists because only the WINDOW entry ran the updater; the same gap
     /// applied to the `[machine]` settings, which are not the package manager's to gate:
     /// they take no store lock, need no index and no network, and a Mac with
-    /// `[packages] enabled = false` (or `auto_update = false`, or `ATPKG_DISABLE` set,
-    /// or simply a pass that ran an hour ago) got them from this lane never. A scrape,
-    /// in the idiom of atpkg's own placement test, because the alternative is spawning a
-    /// real detached child in a unit test.
+    /// `[packages] enabled = false` (then also `auto_update = false`, or an environment
+    /// kill switch, both gone since 2026-09-23, or simply a pass that ran an hour ago)
+    /// got them from this lane never. Since Phase 3
+    /// (2026-09-22) the gate is their own daily claim ([`machine_apply_due`]), not every
+    /// launch. A scrape, in the idiom of atpkg's own placement test, because the
+    /// alternative is spawning a real detached child in a unit test.
     #[test]
     fn the_session_lane_applies_the_machine_settings_outside_every_package_gate() {
         let src = include_str!("main.rs");
@@ -1374,21 +1893,237 @@ mod tests {
             .find("spawn_detached_machine_apply();")
             .expect("the session lane applies the [machine] settings");
         let gate = src
-            .find("if let Some(layout) = atpkg::store::resolve_configured()")
+            .find("if let Some(layout) = layout.as_ref()\n        && packages.enabled()")
             .expect("the package-pass gate");
         assert!(
             call < gate,
             "the host settings must not sit inside the package manager's gate"
         );
         assert!(start <= call);
+        let daily = src[..call]
+            .rfind("&& machine_apply_due(layout, now)")
+            .expect("the one-shot is gated on its daily claim");
+        assert!(
+            !src[daily..call].contains("packages.enabled()"),
+            "the daily claim is the only gate between it and the call"
+        );
         // And the argv is the lock-free verb, not a pass.
         let spawner = src
             .find("fn spawn_detached_machine_apply()")
             .expect("the spawner");
         let body = &src[spawner..spawner + 600];
         assert!(
-            body.contains(r#"&["pkg", "machine", "apply"]"#),
+            body.contains(r#"["pkg", "machine", "apply"]"#),
             "the lane runs `aterm pkg machine apply`: {body}"
+        );
+    }
+
+    /// A scratch store for the lane's due rules.
+    fn scratch_layout(label: &str) -> atpkg::store::Layout {
+        let prefix = std::env::temp_dir().join(format!(
+            "aterm-session-lane-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).expect("scratch prefix");
+        atpkg::store::Layout { prefix }
+    }
+
+    /// THE SESSION LANE'S DUE RULE (Phase 3): the machine-wide rule — never checked or six
+    /// hours since the last success, and no pass attempted anywhere in the last five
+    /// minutes — then the lane's own claim, so the second of two tabs opened together
+    /// spawns nothing. A fresh success, or a sibling's attempt a minute ago, is no pass.
+    /// (A record that shows only FAILED attempts is the next test's.)
+    #[test]
+    fn the_session_pass_is_due_on_the_machine_rule_and_claimed_once() {
+        let layout = scratch_layout("pass");
+        let now = 1_790_000_000_i64;
+        assert!(
+            session_pass_due(&layout, now),
+            "never checked: the first tab"
+        );
+        assert!(
+            !session_pass_due(&layout, now + 1),
+            "the second tab, a second later: claimed"
+        );
+        assert!(
+            session_pass_due(&layout, now + 5 * 60),
+            "still never checked, five minutes on: the next tab tries again"
+        );
+        // A success an hour ago: nothing owed, and nothing claimed.
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2026-09-21T13:00:00Z\"\n\
+             last_success_at = \"2026-09-21T13:00:00Z\"\n",
+        )
+        .unwrap();
+        let success =
+            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-21T13:00:00Z").expect("stamp");
+        assert!(!session_pass_due(&layout, success + 3600));
+        let walk = i64::try_from(aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS).unwrap();
+        assert!(!session_pass_due(&layout, success + walk - 1));
+        assert!(session_pass_due(&layout, success + walk), "six hours on");
+        // A sibling's pass ended a minute ago and recorded a failure: the walk waits for what
+        // it left, and then the interval after it, not five minutes (the next test).
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2026-09-22T13:30:00Z\"\n\
+             last_success_at = \"2026-09-21T13:00:00Z\"\nlast_pass = \"failed\"\n\
+             last_pass_at = \"2026-09-22T13:30:00Z\"\n",
+        )
+        .unwrap();
+        let attempt =
+            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-22T13:30:00Z").expect("stamp");
+        assert!(!session_pass_due(&layout, attempt + 60));
+        assert!(!session_pass_due(&layout, attempt + 5 * 60));
+        assert!(
+            session_pass_due(&layout, attempt + walk),
+            "the negative control: six hours after it, it is owed again"
+        );
+        // THE MISREAD, FIXED (2026-09-23): the same `updated_at` from a vendor head-watch
+        // write, the last pass the success itself — no failed pass, and no pass a minute
+        // ago: the walk is owed at once. The lane read "written after the last success" as
+        // a failed pass and held the tab's pass six hours from the write.
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2026-09-22T13:30:00Z\"\n\
+             last_success_at = \"2026-09-21T13:00:00Z\"\nlast_pass = \"ok\"\n\
+             last_pass_at = \"2026-09-21T13:00:00Z\"\n",
+        )
+        .unwrap();
+        assert!(session_pass_due(&layout, attempt + 5 * 60));
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A PASS THAT KEEPS FAILING IS NOT RESPAWNED BY EVERY TAB (the 2026-09-10 rule, kept
+    /// through Phase 3): a record whose passes never succeed — an unserved triple exits 2
+    /// and stamps no success — owes nothing for the interval after its last attempt, as the
+    /// lane's old attempt-age rule answered; the spacing alone would have let a tab opened
+    /// five minutes on spawn another detached pass. And a pass INSTALLING now is not queued
+    /// behind: no unobserved waiter per tab.
+    #[test]
+    fn a_failing_or_running_pass_is_not_respawned_by_every_tab() {
+        let layout = scratch_layout("failing");
+        let attempt =
+            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-22T13:00:00Z").expect("stamp");
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2026-09-22T13:00:00Z\"\n\
+             outcome = \"update failed: index unreachable\"\nlast_pass = \"failed\"\n\
+             last_pass_at = \"2026-09-22T13:00:00Z\"\n",
+        )
+        .unwrap();
+        for minutes in [5, 10, 60, 120, 359] {
+            assert!(
+                !session_pass_due(&layout, attempt + minutes * 60),
+                "a tab {minutes} min after the failed pass"
+            );
+        }
+        assert!(
+            session_pass_due(&layout, attempt + 6 * 3600),
+            "the negative control: six hours on, one tab tries again"
+        );
+        // A live writer in the progress file: a pass is installing, so no tab spawns.
+        let fresh = scratch_layout("running");
+        let now = attempt + 7 * 3600;
+        std::fs::write(
+            fresh.progress_file(),
+            format!(
+                "{{\"v\":{},\"pid\":{},\"heartbeat_unix\":{now}}}",
+                atpkg::progress::PROGRESS_VERSION,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        assert!(
+            !session_pass_due(&fresh, now),
+            "never checked, but installing"
+        );
+        std::fs::remove_file(fresh.progress_file()).unwrap();
+        assert!(
+            session_pass_due(&fresh, now),
+            "the negative control: nothing running"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&fresh.prefix);
+    }
+
+    /// NO TAB SPAWNS INSIDE A RATE-LIMIT HOLD (§3.2 of the 2026-09-22 design), and reads
+    /// none to get there: a hold is recorded only with a pass's end — as atpkg's own writer
+    /// lays it here, a success a day old, then a rate-limited pass that failed, or one the
+    /// cache stood in for — and that end holds the tab's rule an interval, past any reset.
+    #[test]
+    fn a_rate_limit_hold_is_outlasted_by_the_pass_that_recorded_it() {
+        use aterm_update_core::pkg_check::{FULL_PASS_INTERVAL_SECS, PassOutcome, rfc3339_to_unix};
+        let walk = i64::try_from(FULL_PASS_INTERVAL_SECS).unwrap();
+        for (label, outcome) in [
+            ("held-failed", PassOutcome::Failed),
+            ("held-ok", PassOutcome::Ok),
+        ] {
+            let layout = scratch_layout(label);
+            let ended = "2026-09-22T13:00:00Z";
+            let end = rfc3339_to_unix(ended).expect("stamp");
+            let success = if outcome == PassOutcome::Ok {
+                ended
+            } else {
+                "2026-09-21T13:00:00Z"
+            };
+            atpkg::status::stamp_success(&layout, success).unwrap();
+            atpkg::status::stamp_pass_end(
+                &layout,
+                ended,
+                outcome,
+                atpkg::status::MeteredHold::Until(end + 20 * 60),
+            )
+            .unwrap();
+            for at in [end + 60, end + 20 * 60, end + walk - 1] {
+                assert!(!session_pass_due(&layout, at), "{label} at +{}", at - end);
+            }
+            assert!(
+                session_pass_due(&layout, end + walk),
+                "{label}: an interval on"
+            );
+            let _ = std::fs::remove_dir_all(&layout.prefix);
+        }
+    }
+
+    /// The `[machine]` one-shot runs once a day from the session lane, not at every
+    /// launch: the first launch claims the day, the rest of it spawns nothing.
+    #[test]
+    fn the_machine_one_shot_is_claimed_once_a_day() {
+        let layout = scratch_layout("machine");
+        let now = 1_790_000_000_i64;
+        let day = i64::try_from(MACHINE_APPLY_EVERY_SECS).unwrap();
+        assert!(machine_apply_due(&layout, now));
+        assert!(!machine_apply_due(&layout, now + 60));
+        assert!(!machine_apply_due(&layout, now + day - 1));
+        assert!(machine_apply_due(&layout, now + day));
+        assert!(layout.machine_apply_stamp().is_file());
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The detached pass runs on the window's argv — the lock wait and the progress file
+    /// under the prefix — so a contended pass queues, and a window follows its progress.
+    #[test]
+    fn the_detached_pass_runs_on_the_windows_argv() {
+        let layout = atpkg::store::Layout {
+            prefix: std::path::PathBuf::from("/p"),
+        };
+        let words: Vec<String> = session_pass_args(&layout)
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            words,
+            [
+                "pkg",
+                "update",
+                "--wait-lock",
+                "1800",
+                "--progress-file",
+                "/p/progress.json"
+            ]
         );
     }
 
@@ -1398,7 +2133,9 @@ mod tests {
     /// our zombie could be reaped in the shell's place, and `aterm` then exited
     /// with the pkg pass's status instead of the shell's. So the pass must be
     /// re-parented away from us — and still sit in its own process group, so the
-    /// session's SIGHUP cannot take it down mid-install.
+    /// session's SIGHUP cannot take it down mid-install. And it is told it was detached
+    /// on purpose (Phase 3), so its lock wait does not read the `sh` exiting as its
+    /// window going.
     #[test]
     #[cfg(unix)]
     fn a_detached_pass_is_neither_our_child_nor_in_our_process_group() {
@@ -1410,11 +2147,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let pid_file = dir.join("pid");
+        let env_file = dir.join("env");
         let script = format!(
-            "echo $$ > '{0}.tmp' && mv '{0}.tmp' '{0}' && exec sleep 30",
-            pid_file.display()
+            "echo \"$ATPKG_SPAWNER_PID\" > '{1}' && echo $$ > '{0}.tmp' && mv '{0}.tmp' '{0}' \
+             && exec sleep 30",
+            pid_file.display(),
+            env_file.display()
         );
-        spawn_detached(std::ffi::OsStr::new("/bin/sh"), &["-c", &script]).expect("spawn");
+        let args = [std::ffi::OsString::from("-c"), script.into()];
+        spawn_detached(
+            std::ffi::OsStr::new("/bin/sh"),
+            &args,
+            Some(("ATPKG_SPAWNER_PID", atpkg::cli::SPAWNER_DETACHED)),
+        )
+        .expect("spawn");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let pid: libc::pid_t = loop {
             if let Ok(text) = std::fs::read_to_string(&pid_file) {
@@ -1435,7 +2181,13 @@ mod tests {
         if reaped == 0 {
             unsafe { libc::waitpid(pid, &mut status, 0) };
         }
+        let env = std::fs::read_to_string(&env_file).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            env.trim(),
+            atpkg::cli::SPAWNER_DETACHED,
+            "the pass is told it was detached on purpose"
+        );
         assert_eq!(
             (reaped, errno),
             (-1, Some(libc::ECHILD)),
@@ -1447,9 +2199,10 @@ mod tests {
         );
     }
 
-    /// `ATERM_NO_REROUTE` is process-global and two tests here read or set it
-    /// (`plain_launch_request` fails closed on it since the 2026-09-07 review);
-    /// they take this lock so a parallel test never sees the other's value.
+    /// The reroute markers (`__ATERM_REROUTE_PASSTHROUGH`, which `take_no_reroute` sets
+    /// and clears, and `ATERM_AGENTS_DIR`) are process-global and several tests here
+    /// read or set them; they take this lock so a parallel test never sees the other's
+    /// value.
     static NO_REROUTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `-d` must reach the running instance as an ABSOLUTE native path: the
@@ -1527,7 +2280,7 @@ mod tests {
         let _env_lock = NO_REROUTE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        aterm_log::env::unset(atpkg::reroute::NO_REROUTE_ENV);
+        aterm_log::env::unset(atpkg::reroute::PASSTHROUGH_ENV);
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
         let env = aterm_cli::LaunchEnv::default();
         for argv in [
@@ -1681,31 +2434,37 @@ mod tests {
     }
 
     /// `--no-reroute` is consumed like a mode flag — stripped for both lanes (neither
-    /// mode library knows it), never inside a payload — and ESTABLISHES
-    /// `ATERM_NO_REROUTE=1` in the process environment: the one reading both lanes
-    /// and every child share. The flag also completes.
+    /// mode library knows it), never inside a payload — and ESTABLISHES the internal
+    /// `__ATERM_REROUTE_PASSTHROUGH=1` marker in the process environment: the one reading
+    /// both lanes and every child share. A launch WITHOUT the flag clears an inherited
+    /// marker: the flag is the one spelling of the escape (the `ATERM_NO_REROUTE`
+    /// variable is gone, 2026-09-23), so no environment left over from another launch
+    /// can make this one skip the reroute. The flag also completes.
     #[test]
-    fn no_reroute_is_stripped_before_dispatch_and_sets_the_env() {
+    fn no_reroute_is_stripped_before_dispatch_and_sets_the_marker() {
         let _env_lock = NO_REROUTE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        let env = atpkg::reroute::NO_REROUTE_ENV;
+        let env = atpkg::reroute::PASSTHROUGH_ENV;
         let engaged = || atpkg::reroute::engaged(std::env::var(env).ok().as_deref());
         // This test OWNS the variable for its duration (the lock above serializes
         // it with the routing tests that read it) and clears it on the way out
         // (and first, in case the developer is running the suite under
         // `aterm --no-reroute`).
         aterm_log::env::unset(env);
-        // The bare-variable spelling of the escape is never forwarded to a running
-        // instance either: a forwarded tab would not carry this environment.
+        // An INHERITED marker is not an instruction: a launch without the flag clears it.
         aterm_log::env::set(env, "1");
-        assert_eq!(
-            plain_launch_request(&osv(&["--window"]), aterm_cli::LaunchEnv::default()),
-            None,
-            "an engaged {env} must fail closed to a local spawn, exactly like the flag"
+        assert_eq!(take_no_reroute(&osv(&["--window"])), osv(&["--window"]));
+        assert!(
+            !engaged(),
+            "no flag, no escape — whatever the environment carried"
         );
-        aterm_log::env::unset(env);
+        // The retired variable is inert: nothing reads it.
+        aterm_log::env::set("ATERM_NO_REROUTE", "1");
+        assert_eq!(take_no_reroute(&osv(&[])), osv(&[]));
+        assert!(!engaged(), "ATERM_NO_REROUTE is not the escape any more");
+        aterm_log::env::unset("ATERM_NO_REROUTE");
         // A payload token is the child's: neither stripped nor read.
         assert_eq!(
             take_no_reroute(&osv(&["-e", "sh", "--no-reroute"])),
@@ -1718,6 +2477,16 @@ mod tests {
             osv(&["--window", "-d", "/tmp"])
         );
         assert!(engaged(), "the flag must establish {env}=1");
+        // …and a flagged launch is never forwarded to a running instance: a forwarded
+        // tab would not carry the marker.
+        assert_eq!(
+            plain_launch_request(
+                &osv(&["--window", "--no-reroute"]),
+                aterm_cli::LaunchEnv::default()
+            ),
+            None,
+            "a --no-reroute launch fails closed to a local spawn"
+        );
         aterm_log::env::unset(env);
         assert!(
             COMPLETION_FLAGS
@@ -1860,8 +2629,8 @@ mod tests {
             Some(handed.as_str()),
             "a second call is a no-op with the same answer"
         );
-        // The reroute escape, engaged both ways it can be: still handed.
-        let env = atpkg::reroute::NO_REROUTE_ENV;
+        // The reroute escape engaged (the marker `--no-reroute` establishes): still handed.
+        let env = atpkg::reroute::PASSTHROUGH_ENV;
         let before = std::env::var_os(env);
         for value in ["1", "yes"] {
             aterm_log::env::set(env, value);
@@ -2001,13 +2770,13 @@ mod tests {
 
     /// The handoff is established in the session lane OUTSIDE the reroute gate — before
     /// it, and before the lane's first background thread — so an engaged
-    /// `ATERM_NO_REROUTE` cannot skip it and no thread races the `setenv`. A scrape, in
+    /// `--no-reroute` cannot skip it and no thread races the `setenv`. A scrape, in
     /// the idiom of `the_session_lane_applies_the_machine_settings_outside_every_package_gate`.
     #[test]
     fn the_agents_dir_handoff_sits_outside_the_reroute_gate() {
         let src = include_str!("main.rs");
         let handoff = src
-            .find("hand_agents_dir(atpkg::store::resolve_configured().as_ref());")
+            .find("hand_agents_dir(layout.as_ref());")
             .expect("the session lane hands the agents dir");
         let quiet = src
             .find("let quiet = aterm_cli::parse_args(mode_args);")

@@ -140,6 +140,14 @@ pub(crate) fn synchronize_captured_title_cache(
 }
 
 #[cfg(test)]
+thread_local! {
+    /// The herald's notifications on this thread (test-only): what
+    /// `App::post_herald_notice` would have queued for the notifier.
+    pub(crate) static HERALD_POSTS: std::cell::RefCell<Vec<crate::status_item::HeraldNotice>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
 mod background_title_tests {
     use super::{
         background_title_refresh_needed, resolved_terminal_title_rung,
@@ -1136,8 +1144,8 @@ impl App {
     }
 
     /// THE CHROME ROWS above the terminal grid: the in-grid tab strip's rows plus
-    /// the live status bars' (`status_bar_rows`, committed by
-    /// `sync_status_bar_rows`). This — never `tab_strip_rows` alone — is what
+    /// the message band's (`message_band_rows`, committed by
+    /// `sync_message_band_rows`). This — never `tab_strip_rows` alone — is what
     /// every geometry law reads: the grid fit (`grid_dims_for`), the frame size
     /// (`window_frame_px_for`), the pointer's cell mapping, the effects origin, the
     /// accessibility snapshot. The strip painter alone still reads
@@ -1147,12 +1155,12 @@ impl App {
             .saturating_add(self.windows.get(&wid).map_or(0, |ws| ws.presence.rows))
     }
 
-    /// The chrome rows every window shares — the strip and the status bars —
+    /// The chrome rows every window shares — the strip and the message band —
     /// WITHOUT the per-window presence row. Only for geometry computed before
     /// a window exists (`window_frame_px_for` at creation); every sited law reads
     /// [`Self::chrome_rows`].
     pub(crate) fn chrome_rows_shared(&self) -> u16 {
-        self.tab_strip_rows.saturating_add(self.status_bar_rows)
+        self.tab_strip_rows.saturating_add(self.message_band_rows)
     }
 
     /// One title per TAB (top-level) of window `wid`, for the strip labels: each
@@ -1901,6 +1909,7 @@ impl App {
                     Some(crate::front_content::TerminalMirror {
                         session: terminal.session,
                         term: session.term.clone(),
+                        vi_active: session.vi_active.clone(),
                         master: session.master,
                         sink: session.ctx.sink.clone(),
                         ui_waiting: session.ctx.ui_waiting.clone(),
@@ -2186,6 +2195,7 @@ impl App {
         let metrics = self.unattached_window_metrics();
         let ws_b = WindowState::new_terminal(
             term,
+            sess.vi_active.clone(),
             master,
             sink,
             sess.ctx.ui_waiting.clone(),
@@ -2611,9 +2621,10 @@ impl App {
         if surface == "ui"
             && crate::connections::first_use_notice_should_show(crate::app_config::config_path())
         {
-            self.notice = Some(crate::notice::TransientNotice::session_connection(
-                crate::connections::first_use_notice_text(kind),
-                std::time::Instant::now(),
+            // A disclosure the tab's own mark and menu already show: a RECORD
+            // (R22, the owner's attention rule), never a row.
+            self.record_message(crate::message_reporters::session_connection_created(
+                &crate::connections::first_use_notice_text(kind),
             ));
         }
         // The tables changed ON the main thread — no wake round-trip needed:
@@ -2646,8 +2657,116 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// REGISTRY snapshot → [`crate::status_item::SessionRow`]s (effective
-    /// title + typed `role`/`attention`, one leaf-lock take per row) →
+    /// One registry handle as the status item sees it: the effective title,
+    /// the typed `role`/`attention`, whether a supervisor's claim is live (one
+    /// meta leaf-lock take), and the server's published agent verdict (one
+    /// timeline leaf-lock take, never nested in the first). No `Terminal`
+    /// lock: the verdict is the status sweep's publication, not a re-read.
+    pub(crate) fn status_session_row(
+        h: &crate::session_store::SessionHandle,
+    ) -> crate::status_item::SessionRow {
+        let (user_title, role, attention, supervised) = {
+            let m = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                m.user_title.clone(),
+                m.role.clone(),
+                m.attention.clone(),
+                m.live_supervisor(crate::metrics::now_us()).is_some(),
+            )
+        };
+        let agent = {
+            let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let a = tl.agent();
+            (a.word != "-").then(|| crate::status_item::AgentFact {
+                word: a.word,
+                detail: a.detail.clone(),
+                rev: a.rev,
+                subject: a.subject.clone(),
+            })
+        };
+        crate::status_item::SessionRow {
+            id: h.local_id,
+            title: user_title.unwrap_or_else(|| h.title.clone()),
+            role,
+            attention,
+            agent,
+            supervised,
+        }
+    }
+
+    /// Fold one session's escalation into the herald
+    /// ([`crate::status_item::Herald`]): re-render the menu-bar item when its
+    /// row moved, and post the one native notification a transition earns.
+    /// Called from [`Self::refresh_presence_session`], i.e. at change rate
+    /// (a verdict move from the status sweep, a `meta set`, a lease wake).
+    /// Leaf locks only, each released before the next; the notification is
+    /// a `try_send` onto `notify.rs`'s bounded queue, so nothing here blocks
+    /// the event loop. A headless instance has no menu bar and posts nothing:
+    /// it never reaches the notifier subprocesses (AGENTS.md rule 5).
+    pub(crate) fn herald_session(&mut self, session: u64) {
+        if self.headless {
+            return;
+        }
+        let row = {
+            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+            store
+                .by_local(session)
+                .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
+                .map(Self::status_session_row)
+        };
+        let current = row.as_ref().and_then(crate::status_item::escalation);
+        let looking = self
+            .notify_suppress
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&session);
+        let outcome = self.presence.herald.note(
+            session,
+            current.as_ref(),
+            looking,
+            std::time::Instant::now(),
+        );
+        if let Some(notice) = outcome.notice {
+            self.post_herald_notice(notice);
+        } else if self.presence.herald.last_quiet()
+            == Some(crate::status_item::HeraldQuiet::Limited)
+        {
+            aterm_log::debug!(
+                "escalation notification for session {session} held by the rate limit"
+            );
+        }
+        if outcome.row_moved {
+            self.refresh_operator_status_item();
+        }
+    }
+
+    /// Post one herald notification through `notify.rs`'s bounded queue — the
+    /// consent notice's path: `try_send`, dropped (and logged) when full. Not
+    /// behind `allow_notifications`: that opt-in guards PROGRAM-originated
+    /// escapes, and this text is aterm's own. Under `cfg(test)` the notice
+    /// is recorded instead, so no test ever runs a notifier subprocess.
+    fn post_herald_notice(&self, notice: crate::status_item::HeraldNotice) {
+        #[cfg(test)]
+        HERALD_POSTS.with(|posts| posts.borrow_mut().push(notice.clone()));
+        #[cfg(not(test))]
+        {
+            let message = crate::notify::NotifyMsg {
+                session: notice.session,
+                title: Some(notice.title.to_owned()),
+                body: notice.body,
+            };
+            if let Err(
+                std::sync::mpsc::TrySendError::Full(dropped)
+                | std::sync::mpsc::TrySendError::Disconnected(dropped),
+            ) = self.session_factory.notify_tx.try_send(message)
+            {
+                aterm_log::debug!("escalation notification not delivered: {}", dropped.body);
+            }
+        }
+    }
+
+    /// REGISTRY snapshot → [`crate::status_item::SessionRow`]s
+    /// ([`Self::status_session_row`], leaf locks only) →
     /// `classify`, then join the window rows (id order, composed chrome
     /// title, tab count, frontmost mark) and the last background fleet scan's
     /// sibling rows. Title rung: user meta title else the registry's live OSC
@@ -2661,19 +2780,7 @@ impl App {
                 .snapshot()
                 .into_iter()
                 .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-                .map(|h| {
-                    // One leaf-lock take per row: title + the typed keys.
-                    let (user_title, role, attention) = {
-                        let m = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-                        (m.user_title.clone(), m.role.clone(), m.attention.clone())
-                    };
-                    crate::status_item::SessionRow {
-                        id: h.local_id,
-                        title: user_title.unwrap_or_else(|| h.title.clone()),
-                        role,
-                        attention,
-                    }
-                })
+                .map(|h| Self::status_session_row(&h))
                 .collect()
         };
         let mut glance = crate::status_item::classify(&rows);
@@ -3162,7 +3269,7 @@ impl App {
             }
             Err(e) => {
                 crate::logging::stderr_line!("aterm-gui: could not open a new tab: {e}");
-                self.surface_gesture_failure(&format!("✕ New tab failed: {e}"));
+                self.post_message(crate::message_reporters::new_tab_failed(&e.to_string()));
             }
         }
     }

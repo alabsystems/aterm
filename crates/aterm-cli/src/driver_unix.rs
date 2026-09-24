@@ -300,38 +300,37 @@ mod tests {
         std::mem::forget(decoy);
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let mut master: libc::c_int = -1;
-        // SAFETY: the child calls only close/usleep/_exit (async-signal-safe).
-        let pid = unsafe {
-            libc::forkpty(
-                &mut master,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert!(pid >= 0, "forkpty: {}", std::io::Error::last_os_error());
-        if pid == 0 {
-            // The stand-in shell: close the slave so the master sees EOF, and be
-            // still ALIVE when the driver reaps, then exit 3. It ignores SIGHUP
-            // first: the driver closes the master before it waits, and on Linux
-            // that hangs up the slave's session leader — this child — while it
-            // is still alive, so it died by signal and the session reported 1,
-            // which the assertion read as "took another child's status". macOS
-            // sends no such hangup once every slave fd is closed, which is why
-            // the fixture passed there (2026-09-14, m17). A real shell has
-            // exited by the time the master sees EOF; the signal reaches
-            // nothing. `signal` is async-signal-safe.
-            unsafe {
-                libc::signal(libc::SIGHUP, libc::SIG_IGN);
-                libc::close(0);
-                libc::close(1);
-                libc::close(2);
-                libc::usleep(300_000);
-                libc::_exit(3);
-            }
-        }
-        let code = run(aterm_pty::SpawnedShell { master, pid }, None, false);
+        // Use the same protected spawn seam as the session. The shell closes
+        // the slave so the master sees EOF while it is still alive, then exits
+        // 3. Ignore the hangup from the driver closing the master on EOF so the
+        // fixture's planned exit status survives on Linux. The older zombie
+        // still distinguishes waitpid(-1) from waiting for
+        // this particular shell, without introducing a second raw PTY spawn.
+        // SAFETY: this is the isolated test child's trusted launch point.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let command = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "trap '' HUP; exec 0<&- 1>&- 2>&-; sleep 0.3; exit 3".to_string(),
+        ];
+        let shell = aterm_pty::spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+        )
+        .expect("protected shell spawn");
+        let code = run(shell, None, false);
         let mut status = 0;
         unsafe { libc::waitpid(decoy_pid, &mut status, libc::WNOHANG) };
         assert_eq!(code, 3, "the session took another child's exit status");

@@ -25,6 +25,8 @@
 //! exists. So this module owns the other obligation — an accessibility surface that
 //! has failed must SAY it has failed, in the window, where a person can act on it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Crate names of the AccessKit backend that owns the AT-SPI route. A panic located
 /// inside one of these is a failure OF the accessibility publisher, not a crash of
 /// aterm, and it is matched by CRATE rather than by file so a version bump — or a
@@ -81,7 +83,7 @@ pub(crate) fn reason_from_payload(payload: &str) -> &str {
 /// someone who does not know what AT-SPI is: this window is invisible to a screen
 /// reader. The RETRY comes ahead of the reason because restarting really is the only
 /// one — the publisher's `OnceLock`s mean a process gets one backend — and because
-/// the notice band ellipsizes to the window width from the right, so whatever must
+/// the band row shows its title whole and the detail beside it, so whatever must
 /// survive a narrow window has to be written early.
 pub(crate) fn notice_lines(reason: &str) -> [String; 2] {
     [
@@ -91,21 +93,44 @@ pub(crate) fn notice_lines(reason: &str) -> [String; 2] {
 }
 
 /// Report a dead accessibility publisher on every surface aterm has for it: the
-/// window notice band a person can read, the log a support request can carry, and
-/// the stderr a console launch keeps. Called FROM THE PANIC HOOK, so it must not
+/// message band a person can read (one Standing `a11y.publisher` row, both
+/// sentences on it — design R8), the log a support request can carry, and the
+/// stderr a console launch keeps. Called FROM THE PANIC HOOK, so it must not
 /// unwind and must not take a lock the panicking thread could already hold — the
-/// notice lane and the file logger are both reached only from threads that have
+/// pre-App inbox and the file logger are both reached only from threads that have
 /// nothing to do with AccessKit, and both degrade to a no-op when poisoned.
 ///
 /// Deliberately NOT a substitute for the default hook: the caller still chains to it,
 /// so the panic's own message and backtrace reach stderr exactly as before. This adds
 /// the surface a windowed launch has; it takes none away.
 pub(crate) fn report_failure(reason: &str, location: &str) {
-    for line in notice_lines(reason) {
+    let lines = notice_lines(reason);
+    for line in &lines {
         crate::logging::stderr_line!("aterm-gui: {line}");
-        crate::config_notice::queue_deferred(line);
     }
+    crate::message_inbox::queue_message(crate::message_reporters::a11y_publisher_dead(
+        reason,
+        at_client_seen(),
+    ));
     aterm_log::error!("accessibility publisher failed at {location}: {reason}");
+}
+
+/// Raised the first time an assistive-technology client asks any window of
+/// this process for its tree (`InitialTreeRequested`, the ONE edge that says
+/// someone is listening — `App::on_accessibility_event`), and never lowered.
+/// An atomic, so the panic hook reads it without a lock.
+static AT_CLIENT_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// An AT client attached to this process's tree.
+pub(crate) fn note_at_client() {
+    AT_CLIENT_SEEN.store(true, Ordering::Release);
+}
+
+/// Whether an AT client has attached in this process's life: the dead
+/// publisher's row stands on the glass only then, and is a record otherwise
+/// (`message_reporters::a11y_publisher_dead`).
+pub(crate) fn at_client_seen() -> bool {
+    AT_CLIENT_SEEN.load(Ordering::Acquire)
 }
 
 #[cfg(test)]

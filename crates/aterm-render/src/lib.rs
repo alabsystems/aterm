@@ -37,6 +37,7 @@ pub use aterm_core::render::DefaultBgSpan;
 // (which builds terminals + calls `Terminal::cell_frame` to feed the renderer).
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
 
+pub mod apron;
 pub mod chrome_metrics;
 mod colr;
 pub mod deco;
@@ -73,6 +74,7 @@ mod subpixel;
 pub mod variation;
 pub mod vibrancy;
 
+pub use apron::ApronScratch;
 pub use spill::SpillBand;
 
 pub use deco::{
@@ -1444,6 +1446,49 @@ pub struct ChromeBleed {
     /// here, since a chrome band indistinguishable from the terminal background is
     /// already not a band.
     pub top_extends_cells: bool,
+    /// Chrome rows whose two side gutters wear their OWN tones instead of
+    /// [`Self::color`] — the message band's full-width meter, whose fill
+    /// reaches the window's left edge from the first lit cell and its right
+    /// edge only at 100 % (`aterm-gui` `message_band::MeterSpan`). `None`
+    /// entries, and rows no entry names, keep [`Self::color`]; the strip above
+    /// row 0 keeps it too, and the seam is drawn over either.
+    ///
+    /// THE HOST'S HALF OF [`Renderer::set_chrome_bleed`]'s NO-EPOCH CONTRACT:
+    /// each tone is the background of its row's own edge cell (the first cell
+    /// for `left`, the last for `right`), so a tone can only change together
+    /// with that cell — and a changed cell is a dirty row, whose gutters the
+    /// damaged path repaints from scratch.
+    pub row_edges: [Option<ChromeRowEdges>; CHROME_ROW_EDGES],
+}
+
+/// How many chrome rows can carry their own gutter tones
+/// ([`ChromeBleed::row_edges`]): the message band's three rows.
+pub const CHROME_ROW_EDGES: usize = 3;
+
+/// One chrome row whose side gutters continue its own edge cells' tones
+/// ([`ChromeBleed::row_edges`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromeRowEdges {
+    /// The chrome row, counted from the top like [`ChromeBleed::rows`].
+    pub row: usize,
+    /// The left gutter's tone, `0x00RRGGBB` — the row's first cell's background.
+    pub left: u32,
+    /// The right gutter's tone, `0x00RRGGBB` — the row's last cell's background.
+    pub right: u32,
+}
+
+impl ChromeBleed {
+    /// The `(left, right)` gutter tones of chrome row `r`: its
+    /// [`Self::row_edges`] entry, else [`Self::color`] on both sides. Read by
+    /// both backends, so the two place the same tones by construction.
+    #[must_use]
+    pub fn gutter_tones(&self, r: usize) -> (u32, u32) {
+        self.row_edges
+            .iter()
+            .flatten()
+            .find(|e| e.row == r)
+            .map_or((self.color, self.color), |e| (e.left, e.right))
+    }
 }
 
 /// Monospace CPU rasterizer.
@@ -2034,6 +2079,12 @@ pub struct Renderer {
     /// drew with and [`Self::render_input_cached`] full-repaints on mismatch —
     /// the content-only dirty diff cannot see a face change.
     font_epoch: u64,
+    /// TEST HOOK (`debug_land_lazy_parses_on_poll`): when set, every
+    /// non-blocking poll of a lazy parse ([`Self::poll_fallback_parses`])
+    /// WAITS for the parse instead — so the landing is consumed by the very
+    /// next chain probe, deterministically MID-frame, the race the snapshot
+    /// path must survive (`render_input`). Never set outside a test.
+    land_parses_on_poll: bool,
     /// Blink phase consulted ONLY for the `Blinking*` cursor styles: `true`
     /// (the default) draws the cursor, `false` skips it for the frame. Steady
     /// styles ignore it. A windowed frontend toggles this ~every 530ms.
@@ -2219,6 +2270,12 @@ pub struct WindowCpu {
     /// touched) on the common whole-row path — then the present borrows the cache
     /// directly, zero-copy, byte-identical to the pre-M1b path.
     pub(crate) present_scratch: Vec<u32>,
+    /// M1b INCOMING-ROW APRON scratch: the one-row raster of the row an
+    /// up-glide slides in at the bottom, laid over the strip the translate
+    /// exposes in [`present_scratch`](Self::present_scratch) (see
+    /// [`apron`]). Rastered only on a sub-row frame that owes a strip; empty
+    /// otherwise.
+    pub(crate) apron: ApronScratch,
     /// How the most recent [`render_input_cached`](Renderer::render_input_cached)
     /// frame changed the cached pixels (see [`DamageOutcome`]). `Full` until the
     /// first frame and after every invalidation, so a presenter that consults it
@@ -2230,6 +2287,14 @@ pub struct WindowCpu {
     /// only — not in this cache — so the first present after it ends must erase
     /// it with a full copy; a damage-bounded copy would leave it ghosted.
     pub(crate) presented_chrome: bool,
+    /// PRESENTER scratch (the renderer never reads it): the chrome extent
+    /// ([`Renderer::chrome_extent_px`]) the retained surface's remainder bands
+    /// were last placed with. [`place_frame_bands`] continues chrome rows' edge
+    /// pixels into those bands, and a damage-bounded copy never touches them,
+    /// so a presenter must take the full copy when the extent moves (a band
+    /// row retiring leaves its edge pixels beside what is terminal content
+    /// now). `0` until the first present — no bands continued.
+    pub(crate) presented_edge_rows: usize,
     /// PRESENTER scratch (the renderer never reads it): whether a background
     /// fallback-face parse was pending at this window's previous redraw — the
     /// frontend's edge detector for the in-flight → landed transition, which
@@ -2320,6 +2385,19 @@ impl WindowCpu {
     /// (which still describes the surface contents) in place.
     pub fn set_presented_chrome(&mut self, chrome: bool) {
         self.presented_chrome = chrome;
+    }
+
+    /// PRESENTER scratch: the chrome extent the surface's remainder bands were
+    /// last placed with (see the field doc).
+    pub fn presented_edge_rows(&self) -> usize {
+        self.presented_edge_rows
+    }
+
+    /// PRESENTER scratch: record the chrome extent the present just placed the
+    /// surface's remainder bands with. Call only after the surface accepted the
+    /// present, like [`Self::set_presented_chrome`].
+    pub fn set_presented_edge_rows(&mut self, rows: usize) {
+        self.presented_edge_rows = rows;
     }
 
     /// PRESENTER scratch: store this redraw's fallback-parse-pending signal and
@@ -6787,13 +6865,21 @@ pub fn band_offset_y(dst_px: usize, src_px: usize) -> i64 {
 /// band-aware `fs_blit`. `invert` XORs the CONTENT pixels (the visual-bell flash); the
 /// bands are chrome and never flash, matching the GPU shader's early-out.
 ///
+/// CHROME REACHES THE WINDOW EDGE. The source rows `[0, edge_rows)` are host
+/// chrome ([`Renderer::chrome_extent_px`]): beside them the left and right
+/// remainder bands CONTINUE the row's own first and last frame pixel instead of
+/// `band_rgb`, so a chrome band — its gutters, and a full-width meter's fill —
+/// runs to the true window edge on a window that is not a whole number of cells
+/// wide (maximized, tiled, full screen). `0` is the historical layout. The
+/// continued pixels are band pixels: never inverted, exactly like the GPU twin.
+///
 /// Byte-exactness: every in-bounds content pixel is copied 1:1 (never scaled);
 /// with `dst == src` dims this is exactly the historical whole-buffer copy
 /// (offset 0, no bands). A dst smaller than src crops the frame, centred.
 /// Trailing `dst` pixels beyond `dst_w*dst_h` are left untouched.
 #[allow(
     clippy::too_many_arguments,
-    reason = "a destination surface + a source frame + the two present flags is irreducibly 8 scalars; a struct would only relocate the list"
+    reason = "a destination surface + a source frame + the present flags is irreducibly 9 scalars; a struct would only relocate the list"
 )]
 pub fn place_frame_bands(
     dst: &mut [u32],
@@ -6804,6 +6890,7 @@ pub fn place_frame_bands(
     src_h: usize,
     invert: bool,
     band_rgb: u32,
+    edge_rows: usize,
 ) {
     let band = band_rgb & 0x00ff_ffff;
     let xor = if invert { 0x00ff_ffff } else { 0 };
@@ -6824,8 +6911,16 @@ pub fn place_frame_bands(
             row.fill(band);
             continue;
         }
-        row[..x0].fill(band);
-        row[x1..].fill(band);
+        // Beside a chrome row the bands continue its own edge pixels (the
+        // source row exists: `0 <= sy < src_h`, and `src_w > 0` is checked).
+        let (lo, hi) = if (sy as usize) < edge_rows && src_w > 0 {
+            let base = sy as usize * src_w;
+            (src[base] & 0x00ff_ffff, src[base + src_w - 1] & 0x00ff_ffff)
+        } else {
+            (band, band)
+        };
+        row[..x0].fill(lo);
+        row[x1..].fill(hi);
         let sx0 = (x0 as i64 - off_x) as usize;
         let srow = &src[sy as usize * src_w + sx0..sy as usize * src_w + sx0 + (x1 - x0)];
         if invert {
@@ -7537,6 +7632,7 @@ impl Renderer {
             cluster_gids: TwoGenTextCache::default(),
             styled_keys: FxHashMap::default(),
             font_epoch: 0,
+            land_parses_on_poll: false,
             cursor_blink_phase: true,
             cursor_style_override: None,
             procedural: std::env::var_os(NO_PROCEDURAL_ENV).is_none(),
@@ -8293,9 +8389,27 @@ impl Renderer {
     /// through the remaining symbol/colour/runtime faces). A face injected
     /// while the parse ran (`set/add_fallback_bytes`, which also empty the
     /// candidate paths) owns its slot; the lazy result is then discarded.
+    ///
+    /// Every chain probe polls (`ensure_fallback`, `ensure_symbol_fallback`,
+    /// `fallback_mono_raster`), so a parse can land — and the epoch move —
+    /// in the MIDDLE of a frame, between two cells; the cells resolved
+    /// before the landing keep their provisional `.notdef` until the next
+    /// frame. That is why a snapshot (`render_input`) redraws on the EPOCH
+    /// and not on a receiver still being held at frame end.
     fn poll_fallback_parses(&mut self) {
+        // The test hook waits for the landing (`land_parses_on_poll`); the
+        // shipping path never blocks here.
+        let recv = |rx: &std::sync::mpsc::Receiver<Vec<FallbackFace>>, wait: bool| {
+            if wait {
+                rx.recv()
+                    .map_err(|_| std::sync::mpsc::TryRecvError::Disconnected)
+            } else {
+                rx.try_recv()
+            }
+        };
+        let wait = self.land_parses_on_poll;
         if let Some(rx) = self.fallback_parse_rx.take() {
-            match rx.try_recv() {
+            match recv(&rx, wait) {
                 Ok(chain) => self.install_fallback_chain(chain),
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.fallback_parse_rx = Some(rx),
                 // Parse thread died without sending: give up on the slot (the
@@ -8304,12 +8418,35 @@ impl Renderer {
             }
         }
         if let Some(rx) = self.symbol_parse_rx.take() {
-            match rx.try_recv() {
+            match recv(&rx, wait) {
                 Ok(chain) => self.install_symbol_result(chain),
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.symbol_parse_rx = Some(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.font_epoch += 1,
             }
         }
+    }
+
+    /// TEST/DEBUG: make every lazy-parse poll WAIT for the parse
+    /// ([`Self::poll_fallback_parses`]), so a parse kicked by one cell's probe
+    /// lands at the NEXT cell's probe — the mid-frame landing, on demand and
+    /// without a race. The snapshot test that pins `render_input`'s epoch
+    /// loop needs the landing to fall inside the frame every run; timing
+    /// alone put it there in 18 of the band's 69 glyph cells on the machine
+    /// that measured it, and a faster parse or a slower frame moves it.
+    #[doc(hidden)]
+    pub fn debug_land_lazy_parses_on_poll(&mut self, on: bool) {
+        self.land_parses_on_poll = on;
+    }
+
+    /// The glyph-ROUTING epoch: bumped whenever unchanged cell content can
+    /// rasterize differently — a lazy fallback parse landing or giving up, a
+    /// styled face retired, the runtime tier widened. A snapshot compares it
+    /// across a draw to know whether the frame it just drew holds cells that
+    /// resolved against an older routing ([`Self::render_input`]); the GPU
+    /// backend's owned-frame snapshot reads it here for the same comparison.
+    #[must_use]
+    pub fn font_epoch(&self) -> u64 {
+        self.font_epoch
     }
 
     /// Whether a background fallback-face parse is still in flight, installing
@@ -8375,20 +8512,51 @@ impl Renderer {
     }
 
     fn block_on_lazy_fallbacks(&mut self) {
+        // The serial order it always had: spawn the broad chain and wait for
+        // it, then the symbol chain (each spawn is a no-op once its path list
+        // is consumed). The waiting is the snapshot path's settle.
         self.ensure_fallback();
+        let _ = self.settle_in_flight_fallback_parses();
+        self.ensure_symbol_fallback();
+        let _ = self.settle_in_flight_fallback_parses();
+    }
+
+    /// A SNAPSHOT'S ANSWER TO THE PARSES IT STARTED (2026-09-22): wait for any
+    /// broad-chain / symbol-chain parse in flight and install what it produced
+    /// (a chain, or the give-up), returning whether there was one. Unlike
+    /// [`Self::block_on_lazy_fallbacks`] this SPAWNS nothing: a renderer that
+    /// probed no lazy tier has nothing to wait for, so a Latin-only snapshot
+    /// still never reads the chain. Every landing bumps [`Self::font_epoch`],
+    /// exactly as [`Self::poll_fallback_parses`]'s does, and that bump is what
+    /// makes the redraw repaint the provisional cells (their content is
+    /// unchanged, so the row diff alone would not).
+    ///
+    /// The return value is NOT the redraw signal — the epoch is. A parse that
+    /// lands DURING the frame is consumed by a later cell's probe (every probe
+    /// polls), leaves no receiver to settle, and still leaves the cells drawn
+    /// before it provisional; [`Self::render_input`] compares the epoch across
+    /// the draw, which sees both that landing and this one.
+    ///
+    /// `pub` for the GPU backend, whose owned-frame snapshot
+    /// (`GpuRenderer::render_input`) resolves through this renderer and keeps
+    /// the same promise on the atlas path.
+    pub fn settle_in_flight_fallback_parses(&mut self) -> bool {
+        let mut settled = false;
         if let Some(rx) = self.fallback_parse_rx.take() {
             match rx.recv() {
                 Ok(chain) => self.install_fallback_chain(chain),
                 Err(_) => self.font_epoch += 1,
             }
+            settled = true;
         }
-        self.ensure_symbol_fallback();
         if let Some(rx) = self.symbol_parse_rx.take() {
             match rx.recv() {
                 Ok(chain) => self.install_symbol_result(chain),
                 Err(_) => self.font_epoch += 1,
             }
+            settled = true;
         }
+        settled
     }
 
     /// Resolve and pre-rasterize a bounded semantic text specimen through the
@@ -11254,6 +11422,19 @@ impl Renderer {
         self.chrome_bleed
     }
 
+    /// How many frame pixel rows from the top belong to host chrome: the strip
+    /// above the grid (`grid_top`) plus [`ChromeBleed::rows`] cell rows, clamped
+    /// to `frame_h`; `0` with no chrome declared. The presenters continue these
+    /// rows' edge pixels through the window's remainder bands
+    /// ([`place_frame_bands`]' `edge_rows`, the GPU blit's `chrome_y1`), so a
+    /// chrome band — and a full-width meter on it — reaches the true window
+    /// edge when the window is not a whole number of cells wide.
+    #[must_use]
+    pub fn chrome_extent_px(&self, frame_h: usize) -> usize {
+        self.chrome_bleed
+            .map_or(0, |b| (self.grid_top() + b.rows * self.cell_h).min(frame_h))
+    }
+
     /// Declare (or clear, with `None`) the top rows that are host chrome and the tone
     /// their surface extends into the window's padding — see [`ChromeBleed`].
     ///
@@ -11266,7 +11447,9 @@ impl Renderer {
     /// dirty band across its FULL width from the theme background
     /// ([`Self::fill_band_bg`]) before the bleed repaints it, so a stale gutter cannot
     /// survive either. A value that could change independently of its rows' content
-    /// would need a cache epoch; this one cannot.
+    /// would need a cache epoch; this one cannot — and [`ChromeBleed::row_edges`]
+    /// keeps it that way by contract: each per-row gutter tone IS its row's edge
+    /// cell's background.
     pub fn set_chrome_bleed(&mut self, bleed: Option<ChromeBleed>) {
         self.chrome_bleed = bleed.filter(|b| b.rows > 0);
     }
@@ -13311,6 +13494,18 @@ impl Renderer {
         self.begin_frame_boundary();
     }
 
+    /// How many draw-and-settle passes an owned-frame snapshot
+    /// ([`Self::render_input`]; the GPU backend's twin) may take before it
+    /// returns what it has. A pass redraws only when the routing epoch moved
+    /// across the one before it, and a bounded set of events moves it: the
+    /// broad chain's parse (landed or given up); the symbol chain's, probed
+    /// only once the broad chain has answered, so a pass later; a styled
+    /// retire landed at the frame boundary. Two lazy tiers make two moving
+    /// passes and a third that sees the epoch hold; the fourth absorbs a
+    /// boundary retire. A snapshot that reaches the bound returns its last
+    /// draw — the live paths' contract anyway (a later frame repaints).
+    pub const SNAPSHOT_SETTLE_PASSES: usize = 4;
+
     pub fn render_input(&mut self, input: &RenderInput) -> Frame {
         // ONE rendering code path: do the damage render into the cache, then
         // clone the borrowed result into an owned Frame. The clone is the price
@@ -13324,7 +13519,44 @@ impl Renderer {
         // forgone. The per-frame presentation hot path holds a persistent
         // `WindowCpu` and calls `render_input_cached(wc, ..)` directly.
         let mut wc = WindowCpu::new();
-        let view = self.render_input_cached(&mut wc, input);
+        // A SNAPSHOT IS FINAL (2026-09-22). A cell whose face is still parsing
+        // resolves to a PROVISIONAL `.notdef` (`font_chain::resolve_chain`) on
+        // the promise that a LATER frame repaints it once the parse lands. The
+        // live paths keep that promise (`fallback_parse_pending`, the epoch);
+        // this path has no later frame, so it keeps the promise HERE: draw,
+        // wait for the parses the draw started, and draw again while the
+        // ROUTING EPOCH moved across the pass. Measured on the message band's
+        // headless captures (55 frames, 54 with a band row, one fresh renderer
+        // each; 69 band glyph cells): 30 cells were EMPTY before this — every
+        // frame's first fallback-face probe — while a later `↻` in the same
+        // frame painted, the parse having landed between the two rows.
+        //
+        // THE CONDITION IS THE EPOCH, NOT A RECEIVER STILL HELD. The first cut
+        // redrew only while `settle_in_flight_fallback_parses` found a parse to
+        // wait for, and left 18 of the 69 cells empty: every chain probe polls
+        // (`ensure_fallback`, `ensure_symbol_fallback`, `fallback_mono_raster`),
+        // so a parse that lands DURING the frame is consumed by a later cell's
+        // probe, which installs the chain and bumps the epoch — no receiver
+        // remains, and the cells resolved before the landing keep their
+        // provisional `.notdef`. Each lazy tier (the broad chain for `↻ ⇣ ✕`,
+        // the symbol chain for `⚠ ℹ`) opens that window once. The epoch sees
+        // both landings: a settle always bumps it, and so does the mid-frame
+        // install. 0 of the 69 cells are empty with this loop.
+        //
+        // A frame that started no parse pays nothing (the settle spawns none,
+        // the epoch holds), so a Latin-only snapshot still never reads the
+        // chain. BOUNDED by `SNAPSHOT_SETTLE_PASSES`: see the constant.
+        let mut view;
+        let mut pass = 1;
+        loop {
+            let epoch = self.font_epoch;
+            view = self.render_input_cached(&mut wc, input);
+            let _ = self.settle_in_flight_fallback_parses();
+            if self.font_epoch == epoch || pass == Self::SNAPSHOT_SETTLE_PASSES {
+                break;
+            }
+            pass += 1;
+        }
         Frame {
             width: view.width(),
             height: view.height(),
@@ -13367,7 +13599,16 @@ impl Renderer {
         // SIGNED: a positive frac shifts the grid band up (glide), a negative frac
         // shifts it down (the elastic-overscroll bounce at a history end).
         let frac = i64::from(input.scroll_frac_px);
-        Self::present_view(wc, w, h, y0, y1, frac)
+        // M1b INCOMING-ROW APRON: an up-glide owes the exposed bottom strip the
+        // row sliding in from below. Raster it NOW — one row, only on a sub-row
+        // frame that owes a strip (`incoming_row_applies` + `incoming_strip`, the
+        // predicates the GPU consults too) — into the resident scratch, so the
+        // present step lays its top `frac` px over the strip the translate
+        // exposes. `&&` short-circuits: a whole-row frame rasters nothing.
+        let apron_ready = scroll_translate::incoming_row_applies(input)
+            && scroll_translate::incoming_strip(y0, y1, frac).is_some()
+            && self.rasterize_apron_row(input, &mut wc.apron);
+        Self::present_view(wc, w, h, y0, y1, frac, apron_ready)
     }
 
     /// The damage-tracking render CORE: paint this frame into `wc.cache`
@@ -13763,7 +14004,12 @@ impl Renderer {
     /// residual, down for an overscroll bounce;
     /// [`scroll_translate::translate_grid_band_in_place`]) — chrome pixels are
     /// left untouched (the chrome-invariance theorem), and the damage cache stays
-    /// untranslated for next frame's diff.
+    /// untranslated for next frame's diff. With `apron_ready` (an up-glide whose
+    /// incoming row [`Renderer::rasterize_apron_row`] just rastered into
+    /// [`WindowCpu::apron`]) the strip the translate exposed at the band's bottom
+    /// then takes that row's top `frac` px
+    /// ([`scroll_translate::paint_incoming_strip`]) — inside the band, so the
+    /// chrome theorem is untouched.
     fn present_view(
         wc: &mut WindowCpu,
         w: usize,
@@ -13771,14 +14017,17 @@ impl Renderer {
         y0: usize,
         y1: usize,
         frac: i64,
+        apron_ready: bool,
     ) -> RenderView<'_> {
         if frac == 0 || y0 >= y1 {
             return Self::cached_view(wc, w, h);
         }
-        // Split-borrow `wc`: read the pristine cache, write the present scratch.
+        // Split-borrow `wc`: read the pristine cache (and the apron raster), write
+        // the present scratch.
         let WindowCpu {
             cache,
             present_scratch,
+            apron,
             ..
         } = wc;
         {
@@ -13790,6 +14039,11 @@ impl Renderer {
             present_scratch.extend_from_slice(src);
         }
         scroll_translate::translate_grid_band_in_place(present_scratch, w, y0, y1, frac);
+        // The incoming row over the exposed strip — AFTER the translate (the strip
+        // is what it exposed), only ever inside `[y1 - frac, y1)`.
+        if apron_ready && apron.width() == w {
+            scroll_translate::paint_incoming_strip(present_scratch, w, y0, y1, frac, apron.band());
+        }
         RenderView::Borrowed {
             width: w,
             height: h,
@@ -14050,14 +14304,35 @@ impl Renderer {
         // background-opacity transmittance), and a see-through gutter next to a solid
         // band is the same broken edge this whole helper exists to close.
         let color = bleed.color & 0x00ff_ffff;
+        // A metered band row continues its own edge cells into the gutters
+        // (`ChromeBleed::row_edges`); every other row wears the band tone.
+        let (left_tone, right_tone) = bleed.gutter_tones(r);
         // The grid occupies `[pad, w - pad)` horizontally by construction
         // (`frame_size` = `cols·cell_w + 2·pad`); derive the right gutter from the
         // FRAME rather than from `cols·cell_w` so a clamped/oversized frame still
         // yields a gutter inside the buffer rather than an off-screen one.
         let right = w.saturating_sub(self.pad);
         let band_h = y1 - y0;
-        self.fill_rect(pixels, w, h, 0, y0, self.pad, band_h, color);
-        self.fill_rect(pixels, w, h, right, y0, self.pad, band_h, color);
+        self.fill_rect(
+            pixels,
+            w,
+            h,
+            0,
+            y0,
+            self.pad,
+            band_h,
+            left_tone & 0x00ff_ffff,
+        );
+        self.fill_rect(
+            pixels,
+            w,
+            h,
+            right,
+            y0,
+            self.pad,
+            band_h,
+            right_tone & 0x00ff_ffff,
+        );
         // The strip above the grid belongs to no row, so the FIRST chrome row adopts
         // it — otherwise the band ships with a dark lip along the window's top edge,
         // which is the same defect as the side margins turned ninety degrees.
@@ -30586,7 +30861,7 @@ mod tests {
         // A permanent Unicode noncharacter: DejaVu Sans Mono lacks it AND the
         // runtime resolver deterministically gives up on it (LastResort is
         // filtered), so the post-landing re-resolve settles as a real `.notdef`.
-        const UNCOVERED: char = '\u{FDD2}';
+        const UNCOVERED: char = '\u{FFFF}';
         let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
             .expect("embedded font builds a renderer");
         assert_eq!(
@@ -30676,6 +30951,155 @@ mod tests {
             Some(0),
             "the landed face owns the glyph via fallback_pick"
         );
+    }
+
+    /// A SNAPSHOT IS FINAL (2026-09-22). On a FRESH renderer the first raster
+    /// of a glyph the primary mono face lacks — the message band's `↻` U+21BB,
+    /// `⚠` U+26A0, `⇣` U+21E3 — painted an EMPTY cell while a second
+    /// occurrence of the same glyph lower in the same frame painted (the
+    /// band's visual reviewer found it; measured 2026-09-22 as 30 blank of
+    /// the 69 band glyph cells across 55 headless captures, 54 of them with
+    /// a band row). Not the memo: `fallback_pick` is written by
+    /// `fallback_has` before the key exists, and `fallback_mono_raster` fails
+    /// safe to the first chain face regardless. The first probe KICKS the
+    /// background chain parse and resolves a PROVISIONAL `.notdef`
+    /// (`font_chain::resolve_chain`) that a LIVE frontend repaints once the
+    /// parse lands (`fallback_parse_pending`, the epoch); the second cell
+    /// re-probed (a provisional answer is never memoized) after the parse
+    /// had landed. The owned-`Frame` snapshot path has no later frame, so
+    /// the tofu was what every capture kept.
+    ///
+    /// `render_input` now draws again while the ROUTING EPOCH moved across
+    /// the pass. Its first cut redrew only while a parse RECEIVER was still
+    /// held at frame end, and left 18 of the 69 cells empty: a parse that
+    /// lands DURING the frame is consumed by a later cell's probe (every
+    /// probe polls), which installs the chain and bumps the epoch with no
+    /// receiver left to settle — the cells resolved before the landing stay
+    /// provisional. Each lazy tier opens that window once. This test FORCES
+    /// the landing on every run (`debug_land_lazy_parses_on_poll`: a poll
+    /// waits for the parse, so the parse row 0's glyph kicked lands at row
+    /// 1's probe, for both tiers in turn) and runs the timed race beside it.
+    /// Against the receiver-only loop the forced run fails on rows 0 and 2.
+    ///
+    /// The band's shape: 21 rows × 60 cols, four band rows — the SAME
+    /// broad-chain glyph on rows 0 and 1, the same symbol-chain glyph on rows
+    /// 2 and 3 (bold, text presentation, prose after the glyph), the seam
+    /// underline on the last band row, terminal rows below — ONE
+    /// `render_input` on a renderer that has probed nothing. Every glyph
+    /// cell carries ink, measured over the whole cell (a seam scanline set
+    /// aside, nothing else masked); the blank band cell beside the glyph is
+    /// the control that the measure sees only ink. A settled ORACLE renderer
+    /// picks the glyph per tier on this host (a glyph the primary covers
+    /// never touches the chain; a glyph nothing covers is honest tofu either
+    /// way).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_fresh_renderers_first_snapshot_paints_every_fallback_glyph() {
+        let theme = Theme::default();
+        let Some(mut oracle) = Renderer::from_system(20.0, theme) else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        oracle.debug_block_on_lazy_fallbacks();
+        let mut routed = |candidates: &[char], tier: FaceId| {
+            candidates
+                .iter()
+                .copied()
+                .find(|&ch| oracle.glyph_key_text(ch).source == tier)
+        };
+        // The band's own glyphs: `↻ ⇣ ✕` ride the broad chain, `⚠ ℹ` the
+        // symbol chain (probed only once the broad chain has answered).
+        let broad = routed(&['\u{21BB}', '\u{21E3}', '\u{2715}'], FaceId::Fallback);
+        let symbol = routed(&['\u{26A0}', '\u{2139}'], FaceId::SymbolFallback);
+        let (Some(broad), Some(symbol)) = (broad, symbol) else {
+            eprintln!(
+                "SKIP: no band glyph reaches both lazy tiers here; the chain is not exercised"
+            );
+            return;
+        };
+        let (rows, cols) = (21usize, 60usize);
+        let band = [broad, broad, symbol, symbol];
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let mut bytes = String::from("\x1b[?25l");
+        for (row, ch) in band.iter().enumerate() {
+            let seam = row + 1 == band.len();
+            bytes.push_str(&format!("\x1b[{};1H", row + 1));
+            if seam {
+                bytes.push_str("\x1b[4m");
+            }
+            bytes.push_str(&format!(" \x1b[1m{ch}\x1b[22m Universal Control disabled"));
+            if seam {
+                bytes.push_str("\x1b[24m");
+            }
+        }
+        for row in band.len()..rows {
+            bytes.push_str(&format!("\x1b[{};1H$ claude --version", row + 1));
+        }
+        term.process(bytes.as_bytes());
+        let mut input = term.cell_frame(rows, cols);
+        for (row, &ch) in band.iter().enumerate() {
+            let cell = &mut input.cells[row][1];
+            assert_eq!(cell.ch, ch, "row {row}: the glyph sits at its column");
+            cell.text_presentation = true; // the band's presentation
+        }
+        assert!(
+            input.cells[band.len() - 1][1].underline != input.cells[0][1].underline
+                && input.cells[0][1].underline == Default::default(),
+            "the seam is on the last band row only"
+        );
+        for forced in [true, false] {
+            let Some(mut r) = Renderer::from_system(20.0, theme) else {
+                return;
+            };
+            r.debug_land_lazy_parses_on_poll(forced);
+            assert!(
+                r.fallback_chain.is_empty() && !r.fallback_parse_pending(),
+                "precondition: a fresh renderer has probed nothing — the chain is lazy"
+            );
+            let frame = r.render_input(&input);
+            let (cw, ch_px) = r.cell_size();
+            let (x_pad, y_top) = (r.pad(), r.grid_top());
+            assert!(
+                frame.width >= x_pad + cols * cw && frame.height >= y_top + rows * ch_px,
+                "the frame holds the grid"
+            );
+            // Each written cell's ground is ITS OWN `bg` (the terminal's
+            // default background), so the count is ink and nothing else; a
+            // scanline the seam fills — one non-ground colour across the
+            // cell's width — is set aside.
+            let ink = |col: usize, row: usize| -> usize {
+                let c = &input.cells[row][col];
+                let ground =
+                    (u32::from(c.bg[0]) << 16) | (u32::from(c.bg[1]) << 8) | u32::from(c.bg[2]);
+                let (x0, y0) = (x_pad + col * cw, y_top + row * ch_px);
+                (y0..y0 + ch_px)
+                    .map(|y| {
+                        let line: Vec<u32> = (x0..x0 + cw)
+                            .map(|x| frame.pixels[y * frame.width + x])
+                            .collect();
+                        let non = line.iter().filter(|&&p| p != ground).count();
+                        let seam = non == cw && line.iter().all(|&p| p == line[0]);
+                        if seam { 0 } else { non }
+                    })
+                    .sum()
+            };
+            assert_eq!(
+                ink(0, 0),
+                0,
+                "forced={forced}: control — the blank band cell beside the glyph has no ink"
+            );
+            for (row, &ch) in band.iter().enumerate() {
+                assert!(
+                    ink(1, row) > 0,
+                    "forced={forced}: {ch:?} painted a blank cell on row {row} of a fresh \
+                     renderer's first snapshot"
+                );
+            }
+            assert!(
+                !r.fallback_parse_pending(),
+                "forced={forced}: the snapshot settled the parses it started"
+            );
+        }
     }
 
     /// A font-epoch bump (what a completed background parse applies) must force
@@ -32139,6 +32563,137 @@ mod tests {
         );
     }
 
+    /// A METERED chrome row continues its own edge cells into the gutters
+    /// ([`ChromeBleed::row_edges`], the message band's full-width meter —
+    /// ruling 55): its left gutter wears `left`, its right gutter `right`,
+    /// every row no entry names keeps the band tone, the strip above row 0
+    /// keeps it too, and the seam still closes the last chrome row over
+    /// either tone. The damaged path reproduces a fresh render with the
+    /// tones in force (the no-epoch contract), and [`Renderer::chrome_extent_px`]
+    /// names exactly the strip plus the chrome rows.
+    #[test]
+    fn a_metered_chrome_row_continues_its_edge_cells_into_the_gutters() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const BAND: u32 = 0x0030_3135;
+        const SEAM: u32 = 0x0060_6164;
+        const FILL: u32 = 0x0050_FA7B;
+        const TRACK: u32 = 0x0044_4750;
+        let (_, ch) = r.cell_size();
+        let (rows, cols) = (4usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"metered row");
+        let input = term.cell_frame(rows, cols);
+        r.set_pad(P);
+        let base = r.render_input(&input);
+        let (w, hgt) = (base.width, base.height);
+        assert_eq!(r.chrome_extent_px(hgt), 0, "no chrome, no extent");
+        let bleed = ChromeBleed {
+            rows: 2,
+            color: BAND,
+            seam: Some(SEAM),
+            top_extends_cells: false,
+            row_edges: [
+                Some(ChromeRowEdges {
+                    row: 1,
+                    left: FILL,
+                    right: TRACK,
+                }),
+                None,
+                None,
+            ],
+        };
+        assert_eq!(bleed.gutter_tones(0), (BAND, BAND));
+        assert_eq!(bleed.gutter_tones(1), (FILL, TRACK));
+        assert_eq!(
+            bleed.gutter_tones(2),
+            (BAND, BAND),
+            "past the chrome: the band tone"
+        );
+        r.set_chrome_bleed(Some(bleed));
+        let top = r.grid_top();
+        assert_eq!(r.chrome_extent_px(hgt), top + 2 * ch);
+        assert_eq!(r.chrome_extent_px(top + 1), top + 1, "clamped to the frame");
+        let bled = r.render_input(&input);
+        let at = |px: &[u32], x: usize, y: usize| px[y * w + x];
+        let deco = r.deco_metrics();
+        let t = deco.underline_t.max(1).min(ch);
+        let seam = top + ch + deco.underline_y.min(ch - t);
+        for x in 0..w {
+            for y in 0..top {
+                assert_eq!(
+                    at(&bled.pixels, x, y),
+                    BAND,
+                    "the strip above keeps the band ({x},{y})"
+                );
+            }
+        }
+        for y in top..top + ch {
+            for x in (0..P).chain(w - P..w) {
+                assert_eq!(
+                    at(&bled.pixels, x, y),
+                    BAND,
+                    "row 0 names no entry ({x},{y})"
+                );
+            }
+        }
+        for y in top + ch..top + 2 * ch {
+            for x in 0..P {
+                let want = if (seam..seam + t).contains(&y) {
+                    SEAM
+                } else {
+                    FILL
+                };
+                assert_eq!(at(&bled.pixels, x, y), want, "row 1 left gutter ({x},{y})");
+            }
+            for x in w - P..w {
+                let want = if (seam..seam + t).contains(&y) {
+                    SEAM
+                } else {
+                    TRACK
+                };
+                assert_eq!(at(&bled.pixels, x, y), want, "row 1 right gutter ({x},{y})");
+            }
+        }
+        for y in top..hgt {
+            for x in P..w - P {
+                assert_eq!(
+                    at(&bled.pixels, x, y),
+                    at(&base.pixels, x, y),
+                    "grid pixel ({x},{y}) must not move"
+                );
+            }
+        }
+        // The damaged path reproduces a fresh render with the tones in force,
+        // and after they change together with a changed chrome row.
+        let mut wc = WindowCpu::default();
+        assert_eq!(r.render_input_cached(&mut wc, &input).pixels(), bled.pixels);
+        let mut term2 = Terminal::new(rows as u16, cols as u16);
+        term2.process(b"metered row\r\nnow lit");
+        let moved = term2.cell_frame(rows, cols);
+        r.set_chrome_bleed(Some(ChromeBleed {
+            row_edges: [
+                Some(ChromeRowEdges {
+                    row: 1,
+                    left: FILL,
+                    right: FILL,
+                }),
+                None,
+                None,
+            ],
+            ..bleed
+        }));
+        let fresh = r.render_input(&moved);
+        assert_eq!(
+            r.render_input_cached(&mut wc, &moved).pixels(),
+            fresh.pixels,
+            "incremental frame must match a fresh one when a row and its tones change together"
+        );
+    }
+
     /// A declared [`ChromeBleed`] makes the top rows' SURFACE reach the window edges:
     /// the left/right pad gutters and the whole `[0, grid_top)` strip above the grid
     /// carry the chrome tone instead of the theme background, and the seam hairline
@@ -32177,6 +32732,7 @@ mod tests {
             color: BAND,
             seam: Some(SEAM),
             top_extends_cells: false,
+            row_edges: [None; CHROME_ROW_EDGES],
         }));
         let bled = r.render_input(&input);
         assert_eq!(
@@ -32249,6 +32805,7 @@ mod tests {
             color: BAND,
             seam: None,
             top_extends_cells: false,
+            row_edges: [None; CHROME_ROW_EDGES],
         }));
         assert_eq!(r.chrome_bleed(), None, "a zero-row bleed is no bleed");
         assert_eq!(r.render_input(&input).pixels, base.pixels);
@@ -32301,6 +32858,7 @@ mod tests {
                 color: BAND,
                 seam: None,
                 top_extends_cells: false,
+                row_edges: [None; CHROME_ROW_EDGES],
             }));
             r.render_input(&input)
         };
@@ -32310,6 +32868,7 @@ mod tests {
                 color: BAND,
                 seam: None,
                 top_extends_cells: true,
+                row_edges: [None; CHROME_ROW_EDGES],
             }));
             r.render_input(&input)
         };
@@ -33081,7 +33640,7 @@ mod tests {
     /// A code point that no real font claims must resolve to `None` from the
     /// runtime resolver (graceful give-up), and dispatch to the primary face for
     /// `.notdef` — never panic, never a bogus face. We use a permanent Unicode
-    /// NONCHARACTER (U+FDD0): no real font has a glyph for it, and the universal
+    /// NONCHARACTER (U+FFFF): no real font has a glyph for it, and the universal
     /// LastResort tofu font (which "covers" everything) is explicitly filtered out
     /// by the resolver, so the give-up is deterministic on every host. (An arbitrary
     /// PUA code point is unreliable here — e.g. macOS's U+F8FF is the Apple logo.)
@@ -33091,7 +33650,7 @@ mod tests {
             eprintln!("SKIP: no system mono font found");
             return;
         };
-        let uncovered = '\u{FDD0}'; // a permanent Unicode noncharacter.
+        let uncovered = '\u{FFFF}'; // a permanent Unicode noncharacter.
         assert!(
             !r.runtime_fallback_resolves(uncovered),
             "a noncharacter must not resolve to any runtime fallback font"
@@ -33114,7 +33673,7 @@ mod tests {
             eprintln!("SKIP: no system mono font found");
             return;
         };
-        let ch = '\u{FDD1}'; // a noncharacter — stable `None` decision everywhere.
+        let ch = '\u{FFFE}'; // a noncharacter — stable `None` decision everywhere.
         let first = r.runtime_fallback_resolves(ch);
         let before = r.runtime_fallback.decisions.len();
         let second = r.runtime_fallback_resolves(ch);
@@ -33177,13 +33736,13 @@ mod tests {
             primary_weight: 400,
             primary_italic: false,
         };
-        let _ = rf.resolve('\u{FDD2}', ctx);
+        let _ = rf.resolve('\u{FFFF}', ctx);
         assert!(
             rf.decisions.len() <= RuntimeFallback::MAX_DECISIONS,
             "decision cache must stay within MAX_DECISIONS"
         );
         assert!(
-            rf.decisions.contains_key(&'\u{FDD2}'),
+            rf.decisions.contains_key(&'\u{FFFF}'),
             "the triggering lookup must remain cached after the bound resets the map"
         );
     }

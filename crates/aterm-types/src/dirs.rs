@@ -269,6 +269,60 @@ pub fn resolve_state_dir(
     }
 }
 
+/// aterm's per-user LOG directory — ONE rule for every process that writes a log there
+/// (the window's and the session's `aterm.log`, and atpkg's `packages.log`, which every
+/// package lane appends to), so the files a person is told to look at sit side by side:
+///
+/// - **macOS**: `$HOME/Library/Logs/aterm` (Console.app's convention);
+/// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm/logs` (absolute) or
+///   `$HOME/.local/state/aterm/logs` — a Linux home has no business growing a `~/Library`;
+/// - **Windows**: `%LOCALAPPDATA%\aterm\logs`, falling back through the home dir's
+///   `AppData\Local`.
+///
+/// Resolution only: the caller creates the directory with the posture it needs (the
+/// window's logger makes it `0700`). `None` only when nothing resolves.
+#[must_use]
+pub fn logs_dir() -> Option<PathBuf> {
+    resolve_logs_dir(StatePlatform {
+        home: home_dir(),
+        xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+    })
+}
+
+/// The pure half of [`logs_dir`].
+#[must_use]
+pub fn resolve_logs_dir(platform: StatePlatform) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (&platform.xdg_state_home, &platform.local_app_data);
+        platform.home.map(|home| home.join("Library/Logs/aterm"))
+    }
+    #[cfg(windows)]
+    {
+        let _ = &platform.xdg_state_home;
+        platform
+            .local_app_data
+            .filter(|root| root.is_absolute())
+            .or_else(|| platform.home.map(|h| h.join("AppData").join("Local")))
+            .map(|root| root.join("aterm").join("logs"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = &platform.local_app_data;
+        platform
+            .xdg_state_home
+            .filter(|root| root.is_absolute())
+            .or_else(|| platform.home.map(|home| home.join(".local/state")))
+            .map(|root| root.join("aterm/logs"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = platform;
+        None
+    }
+}
+
 /// Where session identities live: `<state_dir>/identities/<name>/` — one
 /// directory per name, each holding the agents' relocated config dirs
 /// (`.claude/`, `.codex/`, …; see `aterm_primer::agent_homes`).
@@ -369,6 +423,40 @@ mod tests {
             None,
             "nothing to resolve from is None, not a panic"
         );
+    }
+
+    /// THE LOG DIRECTORY RULE (packages.log beside aterm.log, 2026-09-23), pure: macOS
+    /// keeps Console.app's `~/Library/Logs/aterm`, other Unix the XDG state dir's
+    /// `aterm/logs` (a relative XDG value falls through to the home default), and nothing
+    /// to resolve from is `None`.
+    #[test]
+    fn logs_dir_follows_each_platforms_convention() {
+        let platform = StatePlatform {
+            home: Some(PathBuf::from("/Users//who")),
+            xdg_state_home: Some(PathBuf::from("/xdg/state")),
+            local_app_data: Some(PathBuf::from("C:\\Users\\who\\AppData\\Local")),
+        };
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolve_logs_dir(platform.clone()),
+            Some(PathBuf::from("/Users//who/Library/Logs/aterm"))
+        );
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert_eq!(
+                resolve_logs_dir(platform.clone()),
+                Some(PathBuf::from("/xdg/state/aterm/logs"))
+            );
+            assert_eq!(
+                resolve_logs_dir(StatePlatform {
+                    xdg_state_home: Some(PathBuf::from("relative")),
+                    ..platform.clone()
+                }),
+                Some(PathBuf::from("/Users//who/.local/state/aterm/logs"))
+            );
+        }
+        let _ = &platform;
+        assert_eq!(resolve_logs_dir(StatePlatform::default()), None);
     }
 
     #[test]

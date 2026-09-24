@@ -149,7 +149,7 @@ mod macos {
     };
     use winit::application::ApplicationHandler;
     use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
-    use winit::event_loop::{ActiveEventLoop, EventLoop};
+    use winit::event_loop::ActiveEventLoop;
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
@@ -1723,7 +1723,9 @@ mod macos {
         trap::install();
         trap::set_row("(before any row)");
         arm_hang_watchdog();
-        let mut el = match EventLoop::new() {
+        // The quiet builder (Accessory, no launch activation): the gate runs this
+        // drive beside a developer who is typing somewhere else.
+        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
                 eprintln!("objc-event-drive: NOT RUN — no event loop: {e}");

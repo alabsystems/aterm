@@ -70,9 +70,8 @@ pub fn is_verdict(v: &str) -> bool {
 /// field over — three implicit limits for one value and no place where they met.
 ///
 /// THIS IS THAT PLACE. It lives beside the parser rather than beside any one
-/// consumer, so the inbound side ([`crate::bridge`]'s `deliver` line) and the
-/// outbound side ([`crate::mirror`]'s `post` line) are bounding the same field by
-/// the same number. The byte cap is COMPUTED from the hop cap and
+/// consumer, so every consumer — today the inbound side, [`crate::bridge`]'s
+/// `deliver` line — bounds the same field by the same number. The byte cap is COMPUTED from the hop cap and
 /// [`crate::subject::PRINCIPAL_MAX`], so those two cannot drift either.
 ///
 /// Sixteen is past any relay §6.7 describes, and the whole is three orders of

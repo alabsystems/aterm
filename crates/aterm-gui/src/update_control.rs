@@ -5,12 +5,13 @@
 
 use crate::native_update_auto_intent::ApplyPhase;
 use crate::native_updater_service::{StagedUpdate, UpdaterPhase};
-use crate::status_bars::ApplyPosture;
+use crate::update_words::ApplyPosture;
 use crate::{App, Wake};
 
 pub(crate) struct Snapshot {
     pub(crate) owner: Option<String>,
     pub(crate) repo: Option<String>,
+    pub(crate) auto_apply: bool,
     staged: Option<StagedUpdate>,
     posture: Option<ApplyPosture>,
     /// Where the automatic lane stands on its ladder, for the staged build.
@@ -26,6 +27,12 @@ impl Snapshot {
         Self {
             owner: app.config.update.as_ref().and_then(|u| u.owner.clone()),
             repo: app.config.update.as_ref().and_then(|u| u.repo.clone()),
+            auto_apply: app
+                .config
+                .update
+                .as_ref()
+                .and_then(|u| u.auto_apply)
+                .unwrap_or(true),
             staged: updater.staged.clone(),
             posture: updater
                 .staged
@@ -129,6 +136,47 @@ impl Snapshot {
     }
 }
 
+/// The worker observes source AND policy together; this also services the final
+/// pre-replacement recheck after a potentially long download/probe.
+pub(crate) fn check_settings_provider(
+    proxy: winit::event_loop::EventLoopProxy<Wake>,
+) -> aterm_update::CheckSettingsProvider {
+    let proxy = std::sync::Mutex::new(proxy);
+    std::sync::Arc::new(move || {
+        let proxy = proxy.lock().ok()?;
+        let live = crate::control::control_media::call_main_within(
+            &proxy,
+            std::time::Duration::from_secs(2),
+            |reply| Wake::ReadUpdateControl { reply },
+        )
+        .ok()?;
+        let settings = aterm_update::CheckSettings {
+            source: aterm_update::Source::resolve(live.owner.as_deref(), live.repo.as_deref()),
+            auto_apply: live.auto_apply,
+        };
+        #[cfg(target_os = "linux")]
+        return admit_check_settings(settings, crate::app_config::update_check_settings_setting());
+        #[cfg(not(target_os = "linux"))]
+        Some(settings)
+    })
+}
+
+/// Disk admission is worker-only. Startup/reload may retain a usable GUI with
+/// fallback defaults after a parse failure; those defaults are not permission
+/// to replace its executable. Both live and persisted policy must admit apply.
+#[cfg(any(target_os = "linux", test))]
+fn admit_check_settings(
+    mut live: aterm_update::CheckSettings,
+    persisted: Option<aterm_update::CheckSettings>,
+) -> Option<aterm_update::CheckSettings> {
+    let persisted = persisted?;
+    if live.source != persisted.source {
+        return None;
+    }
+    live.auto_apply &= persisted.auto_apply;
+    Some(live)
+}
+
 /// Every completion refreshes the GUI, including errors, retirement and an
 /// installed-only activation. A newer downloaded stage uses the background
 /// check's existing hint. The reducer re-reads and validates durable facts before
@@ -175,7 +223,33 @@ mod tests {
             rescues: 0,
             failing_checks_kind: String::new(),
             channel_unreadable: false,
+            linux: None,
         }
+    }
+
+    #[test]
+    fn automatic_check_requires_both_live_and_readable_persisted_policy() {
+        let settings = |auto_apply| aterm_update::CheckSettings {
+            source: aterm_update::Source {
+                owner: "owner".into(),
+                repo: "repo".into(),
+            },
+            auto_apply,
+        };
+        assert!(admit_check_settings(settings(true), None).is_none());
+        for live in [false, true] {
+            for disk in [false, true] {
+                assert_eq!(
+                    admit_check_settings(settings(live), Some(settings(disk)))
+                        .unwrap()
+                        .auto_apply,
+                    live && disk
+                );
+            }
+        }
+        let mut repointed = settings(true);
+        repointed.source.repo = "changed".into();
+        assert!(admit_check_settings(settings(true), Some(repointed)).is_none());
     }
 
     #[test]
@@ -208,6 +282,7 @@ mod tests {
         let mut snapshot = Snapshot {
             owner: None,
             repo: None,
+            auto_apply: true,
             staged: Some(StagedUpdate {
                 build: 11,
                 version: "test".into(),

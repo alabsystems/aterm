@@ -128,9 +128,10 @@ pub enum OperatorState {
 }
 
 /// One session as the classifier sees it: the effective title joined with the
-/// TYPED user-meta fields. Built by `App::operator_fleet_glance` from the
-/// registry snapshot; pure data so [`classify`] stays lock-free and testable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// TYPED user-meta fields and the server's published agent verdict. Built by
+/// `App::status_session_row` from the registry snapshot; pure data so
+/// [`classify`] stays lock-free and testable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionRow {
     /// Process-local session id (the `@<n>` selector and Show/close target).
     pub id: u64,
@@ -140,6 +141,242 @@ pub struct SessionRow {
     pub role: Option<String>,
     /// Typed `meta set attention` value — non-empty means needs-human.
     pub attention: Option<String>,
+    /// The server's agent verdict for this session (`status agent=`), or
+    /// `None` when it is not an identified agent (`agent=-`) or the row came
+    /// from a sibling instance, whose verdict this instance does not read.
+    pub agent: Option<AgentFact>,
+    /// Whether a supervisor's claim on the session is live (`status
+    /// supervisor=`). A supervised session's prompts, questions and limits
+    /// raise no row of their own: its supervisor answers the rote boxes and
+    /// escalates the rest through keyed `attention`, which still shows. A
+    /// wall the supervisor does not escalate (an overload, an API error, the
+    /// login, a full context) still raises its row.
+    pub supervised: bool,
+}
+
+/// The published agent verdict one [`SessionRow`] carries — the
+/// `SessionTimeline` publication, copied under its leaf lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentFact {
+    /// `agent=`: `busy|prompt|question|wall:<kind>|idle|survey|unknown`.
+    pub word: &'static str,
+    /// `agent_detail=` (raw): a prompt's `kind[:verdict]`, a limit's reset.
+    pub detail: Option<String>,
+    /// `agent_rev=`: bumps whenever `word` or `detail` moves — the identity
+    /// of one transition, which is what a notification is keyed by.
+    pub rev: u64,
+    /// The approval box's command or path, host-side only (never on the
+    /// wire), already folded to one clipped line.
+    pub subject: Option<String>,
+}
+
+/// What an escalation row is about, MOST SEVERE FIRST: the derived order is
+/// the menu's row order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EscalationKind {
+    /// Typed `meta set attention` — someone (a supervisor, a script) asked
+    /// for the human explicitly.
+    Attention,
+    /// An agent's approval box is waiting.
+    Prompt,
+    /// An agent asked a question and is waiting for the answer.
+    Question,
+    /// An agent's turn ended on a wall (`agent=wall:<kind>`): a usage limit,
+    /// a model bucket, a full context, a lost login, an API error, overload.
+    Wall,
+    /// The legacy `⚠`-title convention. Its text is program output (an OSC
+    /// title), so it badges and lists but never notifies.
+    Title,
+}
+
+impl EscalationKind {
+    /// Whether a transition into this kind posts a native notification.
+    pub fn notifies(self) -> bool {
+        !matches!(self, Self::Title)
+    }
+
+    /// The notification's title for this kind — aterm's own words.
+    pub fn headline(self) -> &'static str {
+        match self {
+            Self::Attention => "aterm · needs you",
+            Self::Prompt => "aterm · approval waiting",
+            Self::Question => "aterm · question waiting",
+            Self::Wall => "aterm · agent stopped at a wall",
+            Self::Title => "aterm",
+        }
+    }
+}
+
+/// One session's escalation: at most one per session, the most severe of
+/// what it carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Escalation {
+    /// Process-local session id — the [`OperatorAction::FocusSession`] payload.
+    pub session: u64,
+    /// What it is about.
+    pub kind: EscalationKind,
+    /// The transition's identity within `(session, kind)`: the agent's
+    /// `agent_rev` for the agent kinds, a hash of the text otherwise. The
+    /// same box re-read is the same key; a new box is a new one.
+    pub key: u64,
+    /// The menu row, host-written: `⚠ <tab title>: <kind> <command>` for an
+    /// agent verdict; `⚠ <message>` for typed attention; the title itself
+    /// for the legacy convention.
+    pub label: String,
+    /// The notification body: `<tab title>: <what>`.
+    pub body: String,
+}
+
+/// Byte budget for the tab title inside a row or a notification.
+const ROW_TITLE_MAX: usize = 32;
+/// Byte budget for the `<kind> <command>` part of a row.
+const ROW_WHAT_MAX: usize = 72;
+
+/// `s` folded to one line (control characters and runs of whitespace become
+/// one space) and clipped to `max` bytes on a char boundary, with `…` when
+/// cut. Row text comes from titles, commands and meta values — none of it may
+/// carry a newline into a menu item or a notification. The characters the
+/// crate forbids in native chrome
+/// ([`crate::session_timeline::is_forbidden_metadata_char`]: bidi overrides
+/// and isolates, zero-width and other invisible format characters) are
+/// dropped too: a box's command is program-written text the human approves
+/// from, and `rm -rf \u{202e}…` must not render reordered in a menu row.
+pub fn fold_clip(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut space = false;
+    for c in s.chars() {
+        if c.is_control() || c.is_whitespace() {
+            space = !out.is_empty();
+            continue;
+        }
+        if crate::session_timeline::is_forbidden_metadata_char(c) {
+            continue;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        out.push(c);
+    }
+    if out.len() <= max {
+        return out;
+    }
+    let mut cut = max.saturating_sub('…'.len_utf8());
+    while cut > 0 && !out.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    out.truncate(cut);
+    let trimmed = out.trim_end().len();
+    out.truncate(trimmed);
+    out.push('…');
+    out
+}
+
+/// FNV-1a 64 of `s` — the key of a text escalation.
+fn text_key(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The agent-verdict half of [`escalation`]: `(kind, what)` for a verdict
+/// that needs a human, `None` for `busy|idle|survey`.
+fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
+    match fact.word {
+        "prompt" => {
+            // `bash:not-read-only` names the box's kind before the colon.
+            let kind = fact
+                .detail
+                .as_deref()
+                .and_then(|d| d.split(':').next())
+                .filter(|k| !k.is_empty())
+                .unwrap_or("approval");
+            let what = match fact.subject.as_deref().filter(|s| !s.is_empty()) {
+                Some(subject) => format!("{kind} {subject}"),
+                None if kind == "approval" => kind.to_string(),
+                None => format!("{kind} approval"),
+            };
+            Some((EscalationKind::Prompt, what))
+        }
+        "question" => Some((EscalationKind::Question, "question".to_string())),
+        word => {
+            // `wall:usage-session` → `usage-session`, the kind aterm-phase
+            // names; a reset time rides it.
+            let kind = word.strip_prefix("wall:").filter(|k| !k.is_empty())?;
+            Some((
+                EscalationKind::Wall,
+                match fact.detail.as_deref().filter(|d| !d.is_empty()) {
+                    Some(reset) => format!("{kind} until {reset}"),
+                    None => kind.to_string(),
+                },
+            ))
+        }
+    }
+}
+
+/// The ONE escalation a session row carries, or `None`. Typed attention wins
+/// (someone asked for the human in words); then the agent verdict — unless a
+/// live supervisor holds the session: it answers the rote boxes and escalates
+/// every other prompt, question and wall aterm-phase names through its own
+/// keyed attention (the turn-end decider acts on or escalates every wall
+/// kind), so the verdict's row would be a second row for one point; a
+/// supervisor that stops or faults releases its claim and the rows are
+/// back — then the legacy `⚠` title.
+pub fn escalation(row: &SessionRow) -> Option<Escalation> {
+    let title = fold_clip(stripped_title(&row.title), ROW_TITLE_MAX);
+    let body_for = |what: &str| {
+        if title.is_empty() {
+            what.to_string()
+        } else {
+            format!("{title}: {what}")
+        }
+    };
+    if let Some(message) = row
+        .attention
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        let label = if message.starts_with('⚠') {
+            message.to_string()
+        } else {
+            format!("⚠ {message}")
+        };
+        let what = fold_clip(message.trim_start_matches('⚠').trim_start(), ROW_WHAT_MAX);
+        return Some(Escalation {
+            session: row.id,
+            kind: EscalationKind::Attention,
+            key: text_key(message),
+            label,
+            body: body_for(&what),
+        });
+    }
+    if let Some(fact) = &row.agent
+        && !row.supervised
+        && let Some((kind, what)) = agent_escalation(fact)
+    {
+        let what = fold_clip(&what, ROW_WHAT_MAX);
+        let body = body_for(&what);
+        return Some(Escalation {
+            session: row.id,
+            kind,
+            key: fact.rev,
+            label: format!("⚠ {body}"),
+            body,
+        });
+    }
+    let stripped = stripped_title(&row.title);
+    if stripped.starts_with('⚠') || row.title.trim_start().starts_with('⚠') {
+        let text = row.title.trim().to_string();
+        return Some(Escalation {
+            session: row.id,
+            kind: EscalationKind::Title,
+            key: text_key(&text),
+            body: fold_clip(&text, ROW_WHAT_MAX),
+            label: text,
+        });
+    }
+    None
 }
 
 /// One window of this instance as the menu shows it (row order = id order,
@@ -169,6 +406,233 @@ pub struct InstanceRow {
     pub warnings: usize,
     /// Whether it reports a running operator.
     pub operator: bool,
+}
+
+/// The shortest spacing between two notifications for ONE session. A verdict
+/// that flaps (a misread box re-read a moment later as a new one) costs one
+/// notification per window, never one per flap; the menu row stays current.
+pub const NOTIFY_SESSION_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
+/// At most [`NOTIFY_BURST`] notifications per [`NOTIFY_BURST_WINDOW`] across
+/// the instance — ten agents hitting one usage limit together page once or a
+/// few times, not ten times. The menu lists every one of them regardless.
+pub const NOTIFY_BURST: usize = 3;
+/// The window [`NOTIFY_BURST`] is counted over.
+pub const NOTIFY_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One native notification the herald decided to post.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeraldNotice {
+    /// The session it is about (the delivery thread's focus suppression).
+    pub session: u64,
+    /// aterm's own headline for the kind ([`EscalationKind::headline`]).
+    pub title: &'static str,
+    /// `<tab title>: <what>`.
+    pub body: String,
+}
+
+/// What one [`Herald::note`] decided.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeraldOutcome {
+    /// The session's menu row appeared, changed or went away — re-render.
+    pub row_moved: bool,
+    /// Post exactly this notification.
+    pub notice: Option<HeraldNotice>,
+}
+
+/// Why a transition into an escalation posted nothing (test-visible).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeraldQuiet {
+    /// The same `(kind, key)` as the last note — the same box re-read.
+    Same,
+    /// The kind never notifies ([`EscalationKind::notifies`]).
+    Silent,
+    /// The human is looking at the tab in the active app.
+    Looking,
+    /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back: it is OWED,
+    /// and posted (coalesced) when the limit allows ([`Herald::due`]).
+    Limited,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HeraldSlot {
+    /// The `(kind, key)` last noted, `None` while nothing escalates.
+    shown: Option<(EscalationKind, u64)>,
+    /// The row label last noted (a subject arriving late changes it).
+    label: Option<String>,
+    /// When this session last posted.
+    notified_at: Option<std::time::Instant>,
+    /// Transitions the rate limit held back since the last post. Nonzero
+    /// means a notice is OWED for the escalation shown now; it is paid by one
+    /// coalesced notice once the limit allows, and dropped when the
+    /// escalation clears or the human looks.
+    owed: u32,
+}
+
+/// THE ESCALATION HERALD: per session, folds the current [`escalation`] into
+/// "did the menu row move" and "post one notification". Pure — the caller
+/// reads the facts under leaf locks, acts on the outcome, and never holds a
+/// lock across it — so the whole policy is a table test.
+///
+/// One notification per TRANSITION INTO an escalation, keyed by `(session,
+/// kind, key)` (for an agent verdict the key is `agent_rev`): re-reading the
+/// same box is not a transition. A transition while the human is looking at
+/// that tab in the active app is spent silently — they already see it — and
+/// is not re-announced when they look away. Rate-limited per session by
+/// [`NOTIFY_SESSION_FLOOR`] and per instance by [`NOTIFY_BURST`]; a held-back
+/// transition is OWED, not spent: when the limit allows ([`Self::due`], the
+/// App's timer), and only while that session still escalates, ONE notice
+/// pays every transition it held back (`… (+2 more)`). Several boxes in a
+/// few seconds therefore page twice, not once and then never — and never
+/// for a box already gone.
+#[derive(Debug, Default)]
+pub struct Herald {
+    slots: std::collections::HashMap<u64, HeraldSlot>,
+    /// Post times inside the last [`NOTIFY_BURST_WINDOW`], oldest first.
+    recent: std::collections::VecDeque<std::time::Instant>,
+    /// Why the last note posted nothing (test-visible).
+    last_quiet: Option<HeraldQuiet>,
+}
+
+impl Herald {
+    /// Fold `session`'s current escalation. `looking` is true when the
+    /// session is the focused pane of a focused window (the notification
+    /// suppression set).
+    pub fn note(
+        &mut self,
+        session: u64,
+        current: Option<&Escalation>,
+        looking: bool,
+        now: std::time::Instant,
+    ) -> HeraldOutcome {
+        self.last_quiet = None;
+        if current.is_none() && !self.slots.contains_key(&session) {
+            // Nothing escalates and nothing ever did: keep no slot (a retired
+            // session's late refresh must not re-grow the map).
+            return HeraldOutcome::default();
+        }
+        let slot = self.slots.entry(session).or_default();
+        let ident = current.map(|e| (e.kind, e.key));
+        let label = current.map(|e| e.label.clone());
+        let row_moved = slot.label != label;
+        slot.label = label;
+        let quiet = |herald: &mut Self, why| {
+            herald.last_quiet = Some(why);
+            HeraldOutcome {
+                row_moved,
+                notice: None,
+            }
+        };
+        let Some(esc) = current else {
+            slot.shown = None;
+            slot.owed = 0;
+            return HeraldOutcome {
+                row_moved,
+                notice: None,
+            };
+        };
+        if slot.shown == ident {
+            if slot.owed == 0 {
+                return quiet(self, HeraldQuiet::Same);
+            }
+        } else {
+            slot.shown = ident;
+            slot.owed += 1;
+        }
+        // A notice is wanted for what is shown now (a transition, or one the
+        // limit held back earlier).
+        if !esc.kind.notifies() {
+            slot.owed = 0;
+            return quiet(self, HeraldQuiet::Silent);
+        }
+        if looking {
+            slot.owed = 0;
+            return quiet(self, HeraldQuiet::Looking);
+        }
+        let notified_at = slot.notified_at;
+        while self
+            .recent
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= NOTIFY_BURST_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        if Self::free_at(&self.recent, notified_at, now) > now {
+            return quiet(self, HeraldQuiet::Limited);
+        }
+        let Some(slot) = self.slots.get_mut(&session) else {
+            return HeraldOutcome::default();
+        };
+        let more = slot.owed.saturating_sub(1);
+        slot.owed = 0;
+        slot.notified_at = Some(now);
+        self.recent.push_back(now);
+        let body = if more == 0 {
+            esc.body.clone()
+        } else {
+            format!("{} (+{more} more)", esc.body)
+        };
+        HeraldOutcome {
+            row_moved,
+            notice: Some(HeraldNotice {
+                session,
+                title: esc.kind.headline(),
+                body,
+            }),
+        }
+    }
+
+    /// When a session last notified at `notified_at` may notify again: the
+    /// later of its [`NOTIFY_SESSION_FLOOR`] and the instance's
+    /// [`NOTIFY_BURST`] window freeing a place (posts older than the window
+    /// do not count). `now` means now.
+    fn free_at(
+        recent: &std::collections::VecDeque<std::time::Instant>,
+        notified_at: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> std::time::Instant {
+        let live: Vec<std::time::Instant> = recent
+            .iter()
+            .copied()
+            .filter(|t| now.saturating_duration_since(*t) < NOTIFY_BURST_WINDOW)
+            .collect();
+        let floor = notified_at.map_or(now, |t| t + NOTIFY_SESSION_FLOOR);
+        let burst = if live.len() >= NOTIFY_BURST {
+            live[live.len() - NOTIFY_BURST] + NOTIFY_BURST_WINDOW
+        } else {
+            now
+        };
+        floor.max(burst).max(now)
+    }
+
+    /// The sessions whose owed notice the limit now allows — the App's timer
+    /// re-heralds each ([`Self::note`] with its current escalation), and the
+    /// earliest instant any other owed notice becomes allowed (its next wake).
+    pub fn due(&self, now: std::time::Instant) -> (Vec<u64>, Option<std::time::Instant>) {
+        let mut ready = Vec::new();
+        let mut next: Option<std::time::Instant> = None;
+        for (session, slot) in self.slots.iter().filter(|(_, slot)| slot.owed > 0) {
+            let (session, notified_at) = (*session, slot.notified_at);
+            let at = Self::free_at(&self.recent, notified_at, now);
+            if at <= now {
+                ready.push(session);
+            } else if next.is_none_or(|n| at < n) {
+                next = Some(at);
+            }
+        }
+        ready.sort_unstable();
+        (ready, next)
+    }
+
+    /// Why the last [`Self::note`] posted nothing, when it had a transition
+    /// or a re-read to judge; `None` after a post or a cleared escalation.
+    pub fn last_quiet(&self) -> Option<HeraldQuiet> {
+        self.last_quiet
+    }
+
+    /// Forget a retired session.
+    pub fn retire(&mut self, session: u64) {
+        self.slots.remove(&session);
+    }
 }
 
 /// A point-in-time glance at operator + fleet, produced by [`classify`] and
@@ -201,9 +665,8 @@ pub struct FleetGlance {
     /// authority only — NO live-activity term (design DECIDED: lease/watcher
     /// liveness has no wake funnel and belongs to the map's paint time).
     pub connections: usize,
-    /// Escalating sessions in roster order: `(local_id, display text)`. Typed
-    /// `attention` meta escalates (rendered `⚠ <message>`); a `⚠`-prefixed
-    /// title still escalates as fallback. Non-empty ⇒ the bar icon badges.
+    /// Escalating sessions, most severe first: `(local_id, display text)`,
+    /// one per session ([`escalation`]). Non-empty ⇒ the bar icon badges.
     pub warnings: Vec<(u64, String)>,
     /// This instance's windows, in id order.
     pub windows: Vec<WindowRow>,
@@ -318,33 +781,24 @@ fn title_operator_detail(title: &str) -> Option<String> {
 ///   case-insensitive) wins outright; only when NO row carries the typed role
 ///   does the legacy `operator`-title scan run. The running detail comes from
 ///   the title either way (the title stays the human-readable status line).
-/// * Warnings — a row with non-empty typed `attention` escalates and renders
-///   `⚠ <message>`; a row without it whose title starts with `⚠` escalates
-///   with the title as the message (never both — one row per session).
+/// * Warnings — one row per session, from [`escalation`]: typed `attention`
+///   renders `⚠ <message>`; an unsupervised agent's prompt, question or wall
+///   — or a supervised agent's wall its supervisor does not escalate —
+///   renders `⚠ <tab title>: <kind> <command>`; a `⚠`-prefixed title renders
+///   as itself. Rows are ordered most severe first ([`EscalationKind`]), in
+///   roster order within a kind.
 ///
 /// An operator whose own row escalates still counts as running (its warning
 /// row carries the detail). `windows`/`instances` start empty — the caller
 /// owns those facts.
 pub fn classify(rows: &[SessionRow]) -> FleetGlance {
-    let mut warnings = Vec::new();
-    for row in rows {
-        match row.attention.as_deref().map(str::trim) {
-            Some(message) if !message.is_empty() => {
-                let display = if message.starts_with('⚠') {
-                    message.to_string()
-                } else {
-                    format!("⚠ {message}")
-                };
-                warnings.push((row.id, display));
-            }
-            _ => {
-                let title = stripped_title(&row.title);
-                if title.starts_with('⚠') || row.title.trim_start().starts_with('⚠') {
-                    warnings.push((row.id, row.title.trim().to_string()));
-                }
-            }
-        }
-    }
+    let mut escalations: Vec<Escalation> = rows.iter().filter_map(escalation).collect();
+    // Most severe first; roster order within a kind (the sort is stable).
+    escalations.sort_by_key(|e| e.kind);
+    let warnings = escalations
+        .into_iter()
+        .map(|e| (e.session, e.label))
+        .collect();
 
     let typed = rows.iter().find(|row| {
         row.role
@@ -1107,8 +1561,284 @@ mod tests {
                 title: s.to_string(),
                 role: None,
                 attention: None,
+                ..SessionRow::default()
             })
             .collect()
+    }
+
+    fn agent_row(id: u64, title: &str, word: &'static str, rev: u64) -> SessionRow {
+        SessionRow {
+            id,
+            title: title.to_string(),
+            agent: Some(AgentFact {
+                word,
+                detail: (word == "prompt").then(|| "bash:not-read-only".to_string()),
+                rev,
+                subject: (word == "prompt").then(|| "rm -rf build".to_string()),
+            }),
+            ..SessionRow::default()
+        }
+    }
+
+    /// The agent verdict becomes one host-written row per session, most
+    /// severe first; busy/idle/survey raise nothing; a live supervisor
+    /// takes the agent's rows over (its typed attention still shows).
+    #[test]
+    fn agent_verdicts_list_most_severe_first_and_a_supervisor_takes_them_over() {
+        let g = classify(&[
+            agent_row(1, "\u{2733} limits", "wall:usage-session", 3),
+            agent_row(2, "tests", "busy", 1),
+            agent_row(3, "asker", "question", 2),
+            agent_row(4, "builder", "prompt", 5),
+            row(5, "zsh", None, Some("deploy needs a human")),
+            agent_row(6, "idle one", "idle", 1),
+        ]);
+        assert_eq!(
+            g.warnings,
+            vec![
+                (5, "\u{26a0} deploy needs a human".to_string()),
+                (4, "\u{26a0} builder: bash rm -rf build".to_string()),
+                (3, "\u{26a0} asker: question".to_string()),
+                (1, "\u{26a0} limits: usage-session".to_string()),
+            ]
+        );
+        assert_eq!(g.button_title(), "\u{276f}\u{26a0}");
+        // A reset time rides the wall row.
+        let mut limited = agent_row(1, "limits", "wall:usage-session", 3);
+        limited.agent.as_mut().unwrap().detail = Some("7:30pm".into());
+        assert_eq!(
+            escalation(&limited).unwrap().label,
+            "\u{26a0} limits: usage-session until 7:30pm"
+        );
+        // Every wall kind raises a row; `unknown` (no evidence) and a bare
+        // `wall:` raise none.
+        for word in ["wall:overloaded", "wall:auth", "wall:context"] {
+            let esc = escalation(&agent_row(7, "w", word, 1)).expect(word);
+            assert_eq!(esc.kind, EscalationKind::Wall, "{word}");
+        }
+        for word in ["unknown", "wall:", "limited"] {
+            assert_eq!(escalation(&agent_row(7, "w", word, 1)), None, "{word}");
+        }
+        // Supervised: the prompt raises nothing of its own…
+        let mut supervised = agent_row(4, "builder", "prompt", 5);
+        supervised.supervised = true;
+        assert_eq!(escalation(&supervised), None);
+        // …while the supervisor's own escalation still shows.
+        supervised.attention = Some("rm outside scratch".into());
+        let e = escalation(&supervised).unwrap();
+        assert_eq!(e.kind, EscalationKind::Attention);
+        assert_eq!(e.body, "builder: rm outside scratch");
+        // NEGATIVE CONTROL: the same row unsupervised does escalate.
+        supervised.supervised = false;
+        supervised.attention = None;
+        assert_eq!(
+            escalation(&supervised).unwrap().kind,
+            EscalationKind::Prompt
+        );
+    }
+
+    /// A supervised session's wall is the SUPERVISOR's to answer — every
+    /// kind: the turn-end decider retries or escalates a 529, an API error, a
+    /// lost login and a full context as it resumes, switches or escalates the
+    /// limits — so the verdict raises no second row (and no second
+    /// notification) while the claim is live; what the supervisor cannot
+    /// resolve arrives as its own attention, which wins. NEGATIVE CONTROLS:
+    /// the same walls with no supervisor each raise their row, and a
+    /// supervised prompt raises nothing.
+    #[test]
+    fn a_supervised_wall_is_the_supervisors_and_an_unsupervised_one_raises_its_row() {
+        let supervised = |word: &'static str| SessionRow {
+            supervised: true,
+            ..agent_row(8, "w", word, 1)
+        };
+        let walls = [
+            "wall:overloaded",
+            "wall:api-error",
+            "wall:auth",
+            "wall:context",
+            "wall:usage-session",
+            "wall:usage-weekly",
+            "wall:model-bucket",
+            "wall:spend",
+        ];
+        for word in walls.iter().copied().chain(["prompt", "question"]) {
+            assert_eq!(escalation(&supervised(word)), None, "{word}");
+        }
+        for word in walls {
+            let esc = escalation(&agent_row(8, "w", word, 1)).expect(word);
+            assert_eq!(esc.kind, EscalationKind::Wall, "{word}");
+        }
+        let mut badged = supervised("wall:overloaded");
+        badged.attention = Some("claude wall: 529".into());
+        assert_eq!(escalation(&badged).unwrap().kind, EscalationKind::Attention);
+    }
+
+    #[test]
+    fn row_text_is_one_clipped_line() {
+        assert_eq!(fold_clip("rm -rf\n  build\t/x", 64), "rm -rf build /x");
+        assert_eq!(fold_clip("  lead", 64), "lead");
+        let long = "x".repeat(100);
+        let clipped = fold_clip(&long, 20);
+        assert!(
+            clipped.len() <= 20 && clipped.ends_with('\u{2026}'),
+            "{clipped}"
+        );
+        // Never splits a char.
+        let wide = "\u{00e9}".repeat(30);
+        assert!(fold_clip(&wide, 11).ends_with('\u{2026}'));
+        // Bidi overrides/isolates and invisible format characters never reach
+        // native chrome (review minor): the command reads in its real order.
+        assert_eq!(
+            fold_clip("rm -rf /tmp/\u{202e}gol.txt\u{2066}x\u{2069}\u{200b}y", 64),
+            "rm -rf /tmp/gol.txtxy"
+        );
+        let mut spoof = agent_row(1, "t", "prompt", 1);
+        spoof.agent.as_mut().unwrap().subject = Some("ls \u{202e}fr- mr".to_string());
+        let esc = escalation(&spoof).unwrap();
+        assert!(!esc.label.contains('\u{202e}') && !esc.body.contains('\u{202e}'));
+        // NEGATIVE CONTROL: ordinary non-ASCII text and emoji joiners survive.
+        assert_eq!(
+            fold_clip("caf\u{00e9} \u{1f469}\u{200d}\u{1f4bb}", 64),
+            "caf\u{00e9} \u{1f469}\u{200d}\u{1f4bb}"
+        );
+        // A prompt with no subject still names its kind.
+        let mut bare = agent_row(1, "t", "prompt", 1);
+        bare.agent.as_mut().unwrap().subject = None;
+        assert_eq!(
+            escalation(&bare).unwrap().label,
+            "\u{26a0} t: bash approval"
+        );
+    }
+
+    fn herald_note(
+        h: &mut Herald,
+        row: &SessionRow,
+        looking: bool,
+        now: std::time::Instant,
+    ) -> HeraldOutcome {
+        h.note(row.id, escalation(row).as_ref(), looking, now)
+    }
+
+    /// One notification per transition: the first box posts, the same box
+    /// re-read does not, a cleared-then-new box does; a box first seen while
+    /// the human looks is spent and never announced when they look away; the
+    /// legacy title lists but never posts.
+    #[test]
+    fn the_herald_posts_once_per_transition() {
+        let t0 = std::time::Instant::now();
+        let mut h = Herald::default();
+        let boxed = agent_row(4, "builder", "prompt", 5);
+        let first = herald_note(&mut h, &boxed, false, t0);
+        assert!(first.row_moved);
+        let notice = first.notice.expect("the first box posts");
+        assert_eq!(notice.session, 4);
+        assert_eq!(notice.title, "aterm \u{b7} approval waiting");
+        assert_eq!(notice.body, "builder: bash rm -rf build");
+        let again = herald_note(&mut h, &boxed, false, t0);
+        assert_eq!(again, HeraldOutcome::default(), "same box, nothing");
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Same));
+        // Answered (busy, rev 6), then a new box (rev 7) past the floor.
+        let busy = agent_row(4, "builder", "busy", 6);
+        assert!(herald_note(&mut h, &busy, false, t0).row_moved);
+        let later = t0 + NOTIFY_SESSION_FLOOR;
+        let next = herald_note(&mut h, &agent_row(4, "builder", "prompt", 7), false, later);
+        assert!(next.notice.is_some(), "a new box is a new transition");
+
+        // Looking: spent, and not re-announced once the human looks away.
+        let mut h = Herald::default();
+        let seen = herald_note(&mut h, &boxed, true, t0);
+        assert!(seen.row_moved && seen.notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
+        assert!(herald_note(&mut h, &boxed, false, t0).notice.is_none());
+
+        // The legacy `⚠` title is program output: listed, never posted.
+        let mut h = Herald::default();
+        let titled = rows(&[(9, "\u{26a0} approve me")]).remove(0);
+        let out = herald_note(&mut h, &titled, false, t0);
+        assert!(out.row_moved && out.notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Silent));
+        // A late subject changes the row without a second post.
+        let mut h = Herald::default();
+        let mut early = boxed.clone();
+        early.agent.as_mut().unwrap().subject = None;
+        assert!(herald_note(&mut h, &early, false, t0).notice.is_some());
+        let late = herald_note(&mut h, &boxed, false, t0);
+        assert!(late.row_moved && late.notice.is_none());
+    }
+
+    /// The limiter: a session posts at most once per floor, the instance at
+    /// most [`NOTIFY_BURST`] per window; a held transition is spent, not
+    /// deferred; retiring a session forgets it.
+    #[test]
+    fn the_herald_is_rate_limited_per_session_and_per_instance() {
+        let t0 = std::time::Instant::now();
+        let mut h = Herald::default();
+        assert!(
+            herald_note(&mut h, &agent_row(1, "a", "prompt", 1), false, t0)
+                .notice
+                .is_some()
+        );
+        let _ = herald_note(&mut h, &agent_row(1, "a", "busy", 2), false, t0);
+        let flap = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, t0);
+        assert!(flap.notice.is_none(), "inside the session floor");
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
+        // A second box inside the floor is owed too.
+        let second = herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, t0);
+        assert!(second.notice.is_none());
+        // OWED, not spent (review minor): the timer is armed at the floor…
+        assert_eq!(h.due(t0), (vec![], Some(t0 + NOTIFY_SESSION_FLOOR)));
+        // …and past it the same, still-shown box posts ONE coalesced notice.
+        let after = t0 + NOTIFY_SESSION_FLOOR;
+        assert_eq!(h.due(after), (vec![1], None));
+        let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, after);
+        assert_eq!(
+            paid.notice.map(|n| n.body),
+            Some("a: bash rm -rf build (+1 more)".to_string())
+        );
+        // Paid once: nothing more is owed, and a re-read stays quiet.
+        assert_eq!(h.due(after), (vec![], None));
+        assert!(
+            herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, after)
+                .notice
+                .is_none()
+        );
+        // NEGATIVE CONTROL: an owed notice whose escalation CLEARED is dropped
+        // — a box already answered is never announced late.
+        let _ = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, after);
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
+        let _ = herald_note(&mut h, &agent_row(1, "a", "busy", 6), false, after);
+        assert_eq!(h.due(after + NOTIFY_SESSION_FLOOR), (vec![], None));
+
+        // Ten sessions hit a limit together: NOTIFY_BURST post now, not ten…
+        let mut h = Herald::default();
+        let posted = (10..20)
+            .filter(|id| {
+                herald_note(
+                    &mut h,
+                    &agent_row(*id, "w", "wall:usage-session", 1),
+                    false,
+                    t0,
+                )
+                .notice
+                .is_some()
+            })
+            .count();
+        assert_eq!(posted, NOTIFY_BURST);
+        // Every one of them still has its row (the menu is not rate-limited).
+        let rows: Vec<SessionRow> = (10..20)
+            .map(|id| agent_row(id, "w", "wall:usage-session", 1))
+            .collect();
+        assert_eq!(classify(&rows).warnings.len(), 10);
+        // …and the rest are owed until the window slides.
+        let later = t0 + NOTIFY_BURST_WINDOW;
+        assert_eq!(h.due(t0).1, Some(later));
+        let (ready, _) = h.due(later);
+        assert_eq!(ready.len(), 10 - NOTIFY_BURST);
+
+        // Retire forgets; a cleared session that never escalated keeps no slot.
+        h.retire(30);
+        assert_eq!(h.note(99, None, false, t0), HeraldOutcome::default());
+        assert!(!h.slots.contains_key(&99));
     }
 
     #[test]
@@ -1206,6 +1936,7 @@ mod tests {
             title: title.to_string(),
             role: role.map(str::to_string),
             attention: attention.map(str::to_string),
+            ..SessionRow::default()
         }
     }
 
@@ -1360,6 +2091,7 @@ mod tests {
                 title: title.into(),
                 role: role.map(str::to_string),
                 attention: None,
+                ..SessionRow::default()
             }]);
             g.start_available = true;
             compose_status_menu(&g)
@@ -1395,12 +2127,14 @@ mod tests {
             title: "operator: x".into(),
             role: Some("operator".into()),
             attention: None,
+            ..SessionRow::default()
         }]);
         let heuristic = classify(&[SessionRow {
             id: 1,
             title: "operator: x".into(),
             role: None,
             attention: None,
+            ..SessionRow::default()
         }]);
         assert!(typed.operator_typed);
         assert!(!heuristic.operator_typed);

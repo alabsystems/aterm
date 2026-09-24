@@ -359,10 +359,20 @@ static MAX_DEADLINE_LATE_AT_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_PRESENT_LATENCY_AT_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_PRESENT_LATENCY_GAP_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_INPUT_PRESENT_AT_NS: AtomicU64 = AtomicU64::new(0);
-/// When the last slow-present breadcrumb was written (`now_ns`), so a stall
-/// episode costs ONE line per [`SLOW_PRESENT_LOG_MIN_GAP_NS`] instead of one
-/// per frame. 0 = none since process start or the last [`reset`].
-static LAST_SLOW_PRESENT_LOG_NS: AtomicU64 = AtomicU64::new(0);
+/// The open slow-present episode ([`SlowEpisode`], one field per atomic), so a
+/// run of slow presents costs two `aterm.log` lines instead of one per frame.
+/// `SLOW_EPISODE_SAMPLES == 0` = none open since process start or the last
+/// [`reset`]. Single writer: the UI thread, which is why [`reset`] (a control
+/// thread) only raises [`SLOW_EPISODE_RESET`] — five separate stores racing the
+/// UI thread's five could stitch two episodes into one line.
+static SLOW_EPISODE_START_NS: AtomicU64 = AtomicU64::new(0);
+static SLOW_EPISODE_LAST_NS: AtomicU64 = AtomicU64::new(0);
+static SLOW_EPISODE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static SLOW_EPISODE_WORST_NS: AtomicU64 = AtomicU64::new(0);
+static SLOW_EPISODE_WORST_AT_NS: AtomicU64 = AtomicU64::new(0);
+/// A `metrics reset` the UI thread has not yet acted on: its next present closes
+/// the open episode, with its line, before it looks at anything else.
+static SLOW_EPISODE_RESET: AtomicBool = AtomicBool::new(false);
 
 // PER-OWNER ARM ATTRIBUTION (responsiveness audit, item 6). WHY: the two facts
 // above are structurally unable to name a spin's producer. `past_deadline_arms`
@@ -376,7 +386,7 @@ static LAST_SLOW_PRESENT_LOG_NS: AtomicU64 = AtomicU64::new(0);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 39;
+const DEADLINE_OWNER_SLOTS: usize = 40;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -587,8 +597,18 @@ pub(crate) enum DeadlineOwner {
     Overscroll = 19,
     ScrollPill = 20,
     WordDecorations = 21,
-    ConfigNotice = 22,
-    UpdateNotice = 23,
+    /// Retired config-warning banner slot (its warnings are message-band rows
+    /// since 2026-09-22, folded under `MessageBand`). The numeric tombstone is
+    /// retained because deadline-owner discriminants are an append-only
+    /// diagnostics wire contract.
+    Retired22 = 22,
+    /// Robi's tip bubble (`crate::robi_bubble::RobiBubble::deadline`): a
+    /// frame cadence through its entrance and exit ramps, one wake at the exit
+    /// boundary through the hold. Slot 23 was the retired transient notice's
+    /// (`update_notice`, the floating card whose producers are message-band
+    /// rows since 2026-09-23); the bubble is what survived of it, and the name
+    /// moved with the surface — the precedent `MessageBand` records.
+    RobiBubble = 23,
     LevelUp = 24,
     AutoApply = 25,
     ReaderResume = 26,
@@ -605,12 +625,14 @@ pub(crate) enum DeadlineOwner {
     /// the probe cadence while the owner may be in System Settings, the
     /// decide timeout while a verdict is awaited.
     ConsentCard = 36,
-    /// The status bars (`crate::status_bars`): ONE wake per bar, at the fold of
-    /// a bar holding a terminal outcome. A live bar folds nothing (its paints
-    /// ride `Wake::PkgProgress` / `Wake::UpdateProgress`), and no bar folds
-    /// nothing — an idle window never wakes for them (FL-1). Slot 34 was the
-    /// retired floating progress card's; the name moved with the surface.
-    StatusBars = 34,
+    /// The message band (`crate::messages_host::App::messages_deadline`): ONE
+    /// wake at the nearest fold, staleness cap, overflow patience or D1 shrink
+    /// instant the center has armed. A live row folds nothing (its paints ride
+    /// its reporter's wakes), and an idle band arms nothing — an idle window
+    /// never wakes for it (FL-1). Slot 34 was the retired floating progress
+    /// card's, then the status bars' (`status_bars`, 2026-09-07 → 2026-09-22);
+    /// the name moved with the surface each time, and this is the third.
+    MessageBand = 34,
     /// The per-session STATUS observer (`SessionStatus::next_wake`): a candidate
     /// serving its dwell, or a Running session aging into Quiet. Split out of
     /// `TitleSummary` (item 8) because the two fold at the same seam in
@@ -631,6 +653,18 @@ pub(crate) enum DeadlineOwner {
     /// CONTRACT (`every_deadline_owner_has_its_own_label_and_its_own_slot`), so
     /// the one that reached main first keeps its number and this one moves.
     HandoffPark = 38,
+    /// The MESSAGE BAND's MOTION (design §10.8): the frames of a live row's
+    /// indicator — a sweeping comet, a gliding fill, a travelling glint, an
+    /// echo — at most one per 33 ms frame (the 30 fps cap), plus the text ticks
+    /// of an elapsed time or an ETA. Armed ONLY while a live row or an echo is
+    /// on an on-screen window's glass; a resting comet or glint arms its next
+    /// start, not a frame. The band's STATE wakes (a fold, a reveal, an echo's
+    /// end) stay on `MessageBand`. Since the merge with main's full-width
+    /// meter (ruling 140) this is the band's ONLY motion clock: main's 125 ms
+    /// busy frame, which folded under `MessageBand`, retired into it — the
+    /// busy spinner steps on this grid every `aterm_messages::SPIN_FRAMES`
+    /// frames — and nothing is armed while a handoff freezes the band.
+    MessageBandMotion = 39,
 }
 
 impl DeadlineOwner {
@@ -657,8 +691,8 @@ impl DeadlineOwner {
             19 => Self::Overscroll,
             20 => Self::ScrollPill,
             21 => Self::WordDecorations,
-            22 => Self::ConfigNotice,
-            23 => Self::UpdateNotice,
+            22 => Self::Retired22,
+            23 => Self::RobiBubble,
             24 => Self::LevelUp,
             25 => Self::AutoApply,
             26 => Self::ReaderResume,
@@ -670,10 +704,11 @@ impl DeadlineOwner {
             32 => Self::TitleDrift,
             33 => Self::KittyTenure,
             36 => Self::ConsentCard,
-            34 => Self::StatusBars,
+            34 => Self::MessageBand,
             35 => Self::SessionStatus,
             37 => Self::Presence,
             38 => Self::HandoffPark,
+            39 => Self::MessageBandMotion,
             _ => Self::None,
         }
     }
@@ -703,8 +738,8 @@ impl DeadlineOwner {
             Self::Overscroll => "overscroll",
             Self::ScrollPill => "scroll_pill",
             Self::WordDecorations => "word_decorations",
-            Self::ConfigNotice => "config_notice",
-            Self::UpdateNotice => "update_notice",
+            Self::Retired22 => "retired-22",
+            Self::RobiBubble => "robi_bubble",
             Self::LevelUp => "level_up",
             Self::AutoApply => "auto_apply",
             Self::ReaderResume => "reader_resume",
@@ -716,10 +751,11 @@ impl DeadlineOwner {
             Self::TitleDrift => "title_drift",
             Self::KittyTenure => "kitty_tenure",
             Self::ConsentCard => "consent_card",
-            Self::StatusBars => "status_bars",
+            Self::MessageBand => "message_band",
             Self::SessionStatus => "session_status",
             Self::Presence => "presence",
             Self::HandoffPark => "handoff_park",
+            Self::MessageBandMotion => "message_band_motion",
         }
     }
 }
@@ -2126,6 +2162,7 @@ pub(crate) fn record_present(
     if prev_stamp != 0 {
         MAX_FRAME_GAP_NS.fetch_max(now.saturating_sub(prev_stamp), Ordering::Relaxed);
     }
+    note_slow_episode_quiet(now);
 }
 
 /// An `output→application-present-return` reading big enough to be what a user
@@ -2134,21 +2171,151 @@ pub(crate) fn record_present(
 /// writes a line.
 const SLOW_PRESENT_LOG_THRESHOLD_NS: u64 = SLOW_FRAME_THRESHOLD_NS * 3;
 
-/// At most one breadcrumb per this interval. A stall episode is a RUN of slow
-/// presents: a line per frame would bury `aterm.log` and spend main-thread time
-/// inside the very stall it describes.
-const SLOW_PRESENT_LOG_MIN_GAP_NS: u64 = 10_000_000_000;
+/// Quiet time that separates two slow-present EPISODES. A stall is a RUN of
+/// slow presents: a line per frame would bury `aterm.log` and spend main-thread
+/// time inside the very stall it describes, and a line every few seconds still
+/// wrote 9,908 of the file's 11,587 lines during one 27-hour run (2026-09-18).
+/// So a slow present after at least this long without one opens an episode
+/// (one line), and one that has had none for this long is closed (one line).
+const SLOW_PRESENT_EPISODE_QUIET_NS: u64 = 60_000_000_000;
 
-/// Whether this sample earns a line. Pure, so the threshold and the rate limit
-/// are testable without the process globals or a real stall — the same rule
-/// [`wake_owner`] is kept pure for.
-const fn should_log_slow_present(latency_ns: u64, last_log_ns: u64, at_ns: u64) -> bool {
-    latency_ns > SLOW_PRESENT_LOG_THRESHOLD_NS
-        && (last_log_ns == 0 || at_ns.saturating_sub(last_log_ns) >= SLOW_PRESENT_LOG_MIN_GAP_NS)
+/// One run of slow presents, as `aterm.log` reports it. `samples == 0` means
+/// none is open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SlowEpisode {
+    start_ns: u64,
+    last_ns: u64,
+    samples: u64,
+    worst_ns: u64,
+    worst_at_ns: u64,
 }
 
-/// ONE UNGATED BREADCRUMB PER SLOW-PRESENT EPISODE, with the scheduler facts
-/// that name it.
+/// What one present-latency sample did to the episode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlowEpisodeStep {
+    /// Not a slow present, or one whose delay belongs to the session-status
+    /// observer: no line.
+    Ignored,
+    /// It opened an episode — first closing `closed`, when one was still open
+    /// but had gone quiet: its lines are written.
+    Opened { closed: Option<SlowEpisode> },
+    /// It joined the open episode: no line.
+    Joined,
+}
+
+/// Fold one sample into `episode`. Pure, so the threshold, the quiet gap and
+/// the session-status rule are testable without the process globals or a real
+/// stall — the same rule [`wake_owner`] is kept pure for.
+///
+/// A sample whose last deadline owner is the session-status observer is
+/// skipped: it owned 9,842 of the 9,908 breadcrumbs of the 2026-09-18 run, and
+/// those readings timed that observer's wait on output nobody was watching, not
+/// lag in front of a user. Output that was not on screen never gets here at
+/// all: a sample taken while the window was occluded or parked goes to the
+/// tainted ledger in [`record_present`], and `present_latency_ns_with_plan`
+/// only times panes on this window's glass.
+fn slow_episode_step(
+    episode: &mut SlowEpisode,
+    latency_ns: u64,
+    deadline_owner: DeadlineOwner,
+    at_ns: u64,
+) -> SlowEpisodeStep {
+    if latency_ns <= SLOW_PRESENT_LOG_THRESHOLD_NS || deadline_owner == DeadlineOwner::SessionStatus
+    {
+        return SlowEpisodeStep::Ignored;
+    }
+    let mut closed = None;
+    if episode.samples != 0 {
+        if at_ns.saturating_sub(episode.last_ns) < SLOW_PRESENT_EPISODE_QUIET_NS {
+            episode.samples += 1;
+            episode.last_ns = at_ns;
+            if latency_ns > episode.worst_ns {
+                episode.worst_ns = latency_ns;
+                episode.worst_at_ns = at_ns;
+            }
+            return SlowEpisodeStep::Joined;
+        }
+        closed = Some(*episode);
+    }
+    *episode = SlowEpisode {
+        start_ns: at_ns,
+        last_ns: at_ns,
+        samples: 1,
+        worst_ns: latency_ns,
+        worst_at_ns: at_ns,
+    };
+    SlowEpisodeStep::Opened { closed }
+}
+
+/// Close `episode` when it has had no slow present for
+/// [`SLOW_PRESENT_EPISODE_QUIET_NS`] by `now_ns` (or unconditionally when
+/// `force`), answering the episode to report.
+fn slow_episode_close(episode: &mut SlowEpisode, now_ns: u64, force: bool) -> Option<SlowEpisode> {
+    if episode.samples == 0
+        || !(force || now_ns.saturating_sub(episode.last_ns) >= SLOW_PRESENT_EPISODE_QUIET_NS)
+    {
+        return None;
+    }
+    Some(std::mem::take(episode))
+}
+
+/// The open episode, read on the UI thread. A [`reset`] since the last read
+/// closes it here first, writing its closing line.
+fn load_slow_episode() -> SlowEpisode {
+    let mut episode = SlowEpisode {
+        start_ns: SLOW_EPISODE_START_NS.load(Ordering::Relaxed),
+        last_ns: SLOW_EPISODE_LAST_NS.load(Ordering::Relaxed),
+        samples: SLOW_EPISODE_SAMPLES.load(Ordering::Relaxed),
+        worst_ns: SLOW_EPISODE_WORST_NS.load(Ordering::Relaxed),
+        worst_at_ns: SLOW_EPISODE_WORST_AT_NS.load(Ordering::Relaxed),
+    };
+    if SLOW_EPISODE_RESET.swap(false, Ordering::Relaxed)
+        && let Some(closed) = slow_episode_close(&mut episode, 0, true)
+    {
+        store_slow_episode(episode);
+        log_slow_episode_end(closed);
+    }
+    episode
+}
+
+fn store_slow_episode(episode: SlowEpisode) {
+    SLOW_EPISODE_START_NS.store(episode.start_ns, Ordering::Relaxed);
+    SLOW_EPISODE_LAST_NS.store(episode.last_ns, Ordering::Relaxed);
+    SLOW_EPISODE_SAMPLES.store(episode.samples, Ordering::Relaxed);
+    SLOW_EPISODE_WORST_NS.store(episode.worst_ns, Ordering::Relaxed);
+    SLOW_EPISODE_WORST_AT_NS.store(episode.worst_at_ns, Ordering::Relaxed);
+}
+
+/// A duration for a log line: seconds under two minutes, then minutes, then
+/// hours.
+fn log_span(ns: u64) -> String {
+    let secs = ns as f64 / 1e9;
+    if secs < 120.0 {
+        format!("{secs:.1} s")
+    } else if secs < 7200.0 {
+        format!("{:.0} min", secs / 60.0)
+    } else {
+        format!("{:.1} h", secs / 3600.0)
+    }
+}
+
+/// The closing line of an episode. A one-sample episode has none: its opening
+/// line already said everything.
+fn log_slow_episode_end(episode: SlowEpisode) {
+    if episode.samples < 2 {
+        return;
+    }
+    aterm_log::info!(
+        "slow presents ended: {} over {}, worst {:.1} ms at t+{:.1} s",
+        episode.samples,
+        log_span(episode.last_ns.saturating_sub(episode.start_ns)),
+        episode.worst_ns as f64 / 1e6,
+        episode.worst_at_ns as f64 / 1e9,
+    );
+}
+
+/// ONE UNGATED LINE WHEN A SLOW-PRESENT EPISODE OPENS, AND ONE WHEN IT ENDS,
+/// with the scheduler facts that name it.
 ///
 /// WHY IT EXISTS. The only per-spike line aterm had ran behind
 /// `$ATERM_TRACE_LATENCY`, so a shipped binary wrote nothing; the main-thread
@@ -2157,33 +2324,61 @@ const fn should_log_slow_present(latency_ns: u64, last_log_ns: u64, at_ns: u64) 
 /// opened this block therefore contained not one frame, present or latency
 /// line — the counters knew the worst number and the log could not say when it
 /// happened or what the loop was doing. The maxima above make the summary
-/// answer "how bad and when"; this line is what lets `aterm.log` answer "what
+/// answer "how bad and when"; these lines are what let `aterm.log` answer "what
 /// happened at 08:31" after the fact, without a driver having been attached.
 ///
-/// Every field is a `last_` reading at the moment the slow frame closed, and is
-/// labelled that way: this is a breadcrumb, not an attribution proof.
+/// READING THE OPENING LINE. `slow present: 676.7 ms at t+52355.3 s (prev
+/// present 728.1 ms ago); wake=timer late 1.0 ms; deadline=cursor_effect late
+/// 0.0 ms; acquire 0.4 ms`. The latency is an OPEN INTERVAL (output leading
+/// edge to the present that showed it): a previous present about that long ago
+/// means nothing presented for that long, a much shorter one means frames kept
+/// coming while this output waited. Every other field is a `last_` reading at
+/// the moment the slow frame closed, so this is a breadcrumb, not an
+/// attribution proof; `max_wake_late_ms` and `max_present_latency_at_ms` on
+/// `aterm ctl metrics` carry the worst cases. The closing line gives the count,
+/// the span and the worst reading of the whole episode.
 fn note_slow_present(latency_ns: u64, since_previous_present_ns: u64, at_ns: u64) {
-    if !should_log_slow_present(
-        latency_ns,
-        LAST_SLOW_PRESENT_LOG_NS.load(Ordering::Relaxed),
-        at_ns,
-    ) {
+    let owner = DeadlineOwner::from_raw(LAST_DEADLINE_OWNER.load(Ordering::Relaxed));
+    let mut episode = load_slow_episode();
+    let step = slow_episode_step(&mut episode, latency_ns, owner, at_ns);
+    if step == SlowEpisodeStep::Ignored {
         return;
     }
-    LAST_SLOW_PRESENT_LOG_NS.store(at_ns, Ordering::Relaxed);
+    store_slow_episode(episode);
+    let SlowEpisodeStep::Opened { closed } = step else {
+        return;
+    };
+    if let Some(closed) = closed {
+        log_slow_episode_end(closed);
+    }
     let ms = |ns: u64| ns as f64 / 1e6;
     aterm_log::info!(
-        "slow output->present: {:.1} ms at t+{:.1} s, {:.1} ms since the previous present.          IT IS AN OPEN INTERVAL: a gap that size means nothing presented for that long, a          much smaller one means frames kept coming while this output waited. At the close:          last wake={} late {:.1} ms, last deadline owner={} late {:.1} ms, last acquire          {:.1} ms. (one line per {} s; see max_wake_late_ms/max_present_latency_at_ms on          `aterm ctl metrics`)",
+        "slow present: {:.1} ms at t+{:.1} s (prev present {:.1} ms ago); wake={} late {:.1} ms; \
+         deadline={} late {:.1} ms; acquire {:.1} ms",
         ms(latency_ns),
         at_ns as f64 / 1e9,
         ms(since_previous_present_ns),
         EventWakeKind::from_raw(LAST_WAKE_KIND.load(Ordering::Relaxed)).as_str(),
         ms(LAST_WAKE_LATE_NS.load(Ordering::Relaxed)),
-        DeadlineOwner::from_raw(LAST_DEADLINE_OWNER.load(Ordering::Relaxed)).as_str(),
+        owner.as_str(),
         ms(LAST_DEADLINE_LATE_NS.load(Ordering::Relaxed)),
         ms(LAST_ACQUIRE_WAIT_NS.load(Ordering::Relaxed)),
-        SLOW_PRESENT_LOG_MIN_GAP_NS / 1_000_000_000,
     );
+}
+
+/// Close the open episode once it has gone quiet (or a [`reset`] asked),
+/// writing its closing line. Called on every present, so it is two relaxed loads
+/// when nothing is open.
+fn note_slow_episode_quiet(now_ns: u64) {
+    if SLOW_EPISODE_SAMPLES.load(Ordering::Relaxed) == 0 {
+        SLOW_EPISODE_RESET.store(false, Ordering::Relaxed);
+        return;
+    }
+    let mut episode = load_slow_episode();
+    if let Some(closed) = slow_episode_close(&mut episode, now_ns, false) {
+        store_slow_episode(episode);
+        log_slow_episode_end(closed);
+    }
 }
 
 /// An OFFSCREEN rasterization (`image` / `window` / `snapshot` introspection) —
@@ -3232,12 +3427,14 @@ pub fn backend_gpu() -> bool {
 pub fn reset() {
     FRAMES_PRESENTED.store(0, Ordering::Relaxed);
     MAX_PRESENT_LATENCY_NS.store(0, Ordering::Relaxed);
-    // A max's instant, the frame gap that qualifies it, and the breadcrumb's
-    // rate limiter are all observations OF THE WINDOW: they clear with it, so a
-    // fresh window's first spike is logged and never carries a stale stamp.
+    // A max's instant, the frame gap that qualifies it, and the open slow-present
+    // episode are all observations OF THE WINDOW: they clear with it, so a fresh
+    // window's first spike is logged and never carries a stale stamp. The
+    // episode is the UI thread's to close, with its line, at its next present,
+    // so the log never shows a run that simply stops.
     MAX_PRESENT_LATENCY_AT_NS.store(0, Ordering::Relaxed);
     MAX_PRESENT_LATENCY_GAP_NS.store(0, Ordering::Relaxed);
-    LAST_SLOW_PRESENT_LOG_NS.store(0, Ordering::Relaxed);
+    SLOW_EPISODE_RESET.store(true, Ordering::Relaxed);
     MAX_FRAME_RENDER_NS.store(0, Ordering::Relaxed);
     SLOW_FRAMES.store(0, Ordering::Relaxed);
     SYNC_HOLDS_ARMED.store(0, Ordering::Relaxed);
@@ -4696,6 +4893,30 @@ mod histogram_tests {
             DeadlineOwner::SessionStatus
         );
         assert_eq!(DeadlineOwner::SessionStatus.as_str(), "session_status");
+        // Slot 34 moved with its surface (2026-09-22): the message band
+        // inherits the status bars' number, under the band's own label.
+        assert_eq!(
+            DeadlineOwner::from_raw(34),
+            DeadlineOwner::MessageBand,
+            "slot 34 is the message band's"
+        );
+        assert_eq!(DeadlineOwner::MessageBand.as_str(), "message_band");
+        // Slot 39 is the band's MOTION (design §10.8): its own label, so a
+        // spin in the frames is never attributed to the band's state wakes.
+        assert_eq!(
+            DeadlineOwner::from_raw(39),
+            DeadlineOwner::MessageBandMotion
+        );
+        assert_eq!(
+            DeadlineOwner::MessageBandMotion.as_str(),
+            "message_band_motion"
+        );
+        // Slot 22 is a tombstone (2026-09-22): the config banner's owner
+        // retired with `config_notice.rs`, and the number stays taken under a
+        // label no live owner wears, so an older wire reader never attributes
+        // a later owner's arms to the banner.
+        assert_eq!(DeadlineOwner::from_raw(22), DeadlineOwner::Retired22);
+        assert_eq!(DeadlineOwner::Retired22.as_str(), "retired-22");
         assert_ne!(
             DeadlineOwner::SessionStatus.as_str(),
             DeadlineOwner::TitleSummary.as_str(),
@@ -5019,14 +5240,16 @@ mod window_input_attribution_tests {
 #[cfg(test)]
 mod lateness_attribution_tests {
     use super::{
-        DeadlineOwner, EventWakeKind, LAST_PRESENT_STAMP_NS, LAST_WAKE_LATE_NS,
-        MAX_DEADLINE_LATE_AT_NS, MAX_DEADLINE_LATE_NS, MAX_DEADLINE_LATE_OWNER,
+        DeadlineOwner, EventWakeKind, LAST_DEADLINE_OWNER, LAST_PRESENT_STAMP_NS,
+        LAST_WAKE_LATE_NS, MAX_DEADLINE_LATE_AT_NS, MAX_DEADLINE_LATE_NS, MAX_DEADLINE_LATE_OWNER,
         MAX_PRESENT_LATENCY_AT_NS, MAX_PRESENT_LATENCY_GAP_NS, MAX_PRESENT_LATENCY_NS,
         MAX_WAKE_LATE_AT_NS, MAX_WAKE_LATE_NS, MAX_WAKE_LATE_OWNER, PRESENT_TAINT_UNTIL_NS,
-        SCHEDULER_STATE, SLOW_PRESENT_LOG_MIN_GAP_NS, SLOW_PRESENT_LOG_THRESHOLD_NS,
+        SCHEDULER_STATE, SLOW_EPISODE_RESET, SLOW_EPISODE_SAMPLES, SLOW_EPISODE_START_NS,
+        SLOW_PRESENT_EPISODE_QUIET_NS, SLOW_PRESENT_LOG_THRESHOLD_NS, SlowEpisode, SlowEpisodeStep,
         StartupPresentTiming, clear_key_arrival, key_queue_distribution, key_queue_last_max_ns,
-        lateness_fields_json, lateness_fields_text, note_event_wake, note_key_arrival_queued,
-        now_ns, record_deadline, record_present, reset, should_log_slow_present,
+        lateness_fields_json, lateness_fields_text, log_span, note_event_wake,
+        note_key_arrival_queued, note_slow_episode_quiet, note_slow_present, now_ns,
+        record_deadline, record_present, reset, slow_episode_close, slow_episode_step,
     };
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -5192,40 +5415,126 @@ mod lateness_attribution_tests {
     }
 
     /// The breadcrumb is the half of this that reaches `aterm.log` in a SHIPPED
-    /// binary, so both of its bounds matter: an ordinary slow frame must not
-    /// write a line, and a stall episode must not write one per frame inside
-    /// the stall it is describing.
+    /// binary, so its bounds matter: an ordinary slow frame must not write a
+    /// line, a stall must cost one line when it starts and one when it ends —
+    /// never one per frame or one every few seconds — and a loop waiting only
+    /// on the session-status observer writes nothing.
     #[test]
-    fn the_slow_present_breadcrumb_is_thresholded_and_rate_limited() {
-        let at = 60_000_000_000;
-        assert!(
-            !should_log_slow_present(SLOW_PRESENT_LOG_THRESHOLD_NS, 0, at),
+    fn the_slow_present_breadcrumb_is_one_line_per_episode() {
+        let slow = SLOW_PRESENT_LOG_THRESHOLD_NS + 1;
+        let quiet = SLOW_PRESENT_EPISODE_QUIET_NS;
+        let mut ep = SlowEpisode::default();
+        let owner = DeadlineOwner::Blink;
+        assert_eq!(
+            slow_episode_step(&mut ep, SLOW_PRESENT_LOG_THRESHOLD_NS, owner, 1),
+            SlowEpisodeStep::Ignored,
             "a frame at the threshold is a slow frame, not an episode"
         );
-        assert!(
-            should_log_slow_present(SLOW_PRESENT_LOG_THRESHOLD_NS + 1, 0, at),
-            "the first spike of a process must always be recorded"
+        assert_eq!(
+            slow_episode_step(&mut ep, slow, DeadlineOwner::SessionStatus, 1),
+            SlowEpisodeStep::Ignored,
+            "a delay owned by the session-status observer is not logged"
         );
-        assert!(
-            should_log_slow_present(SLOW_PRESENT_LOG_THRESHOLD_NS + 1, 0, 1),
-            "…including one in the first seconds, where `now - 0` is under the gap"
+        assert_eq!(
+            slow_episode_step(&mut ep, slow, owner, 1),
+            SlowEpisodeStep::Opened { closed: None },
+            "the first spike of a process opens an episode, even in its first second"
         );
-        assert!(
-            !should_log_slow_present(
-                SLOW_PRESENT_LOG_THRESHOLD_NS * 5,
-                at,
-                at + SLOW_PRESENT_LOG_MIN_GAP_NS - 1
-            ),
-            "a run of slow presents is ONE episode, not one line per frame"
+
+        // The 2026-09-18 condition: a slow present every 10 s for 27 hours. The
+        // opening line above and the closing line below are the only two.
+        let mut at = 1;
+        while at < 27 * 3600 * 1_000_000_000 {
+            at += 10_000_000_000;
+            assert_eq!(
+                slow_episode_step(&mut ep, slow + at % 7, owner, at),
+                SlowEpisodeStep::Joined,
+                "a continuous stall wrote another line at {at}"
+            );
+            assert_eq!(slow_episode_close(&mut ep, at + 1, false), None);
+        }
+        assert_eq!(ep.samples, 27 * 360 + 1);
+        assert_eq!(ep.worst_ns, slow + 6);
+        let closed = slow_episode_close(&mut ep, at + quiet, false)
+            .expect("a minute without a slow present closes the episode");
+        assert_eq!(closed.samples, 27 * 360 + 1);
+        assert_eq!(ep, SlowEpisode::default());
+
+        // A slow present after a quiet gap, with the old episode still open
+        // (no present in between closed it), closes it and opens another.
+        assert_eq!(
+            slow_episode_step(&mut ep, slow, owner, at),
+            SlowEpisodeStep::Opened { closed: None }
         );
-        assert!(
-            should_log_slow_present(
-                SLOW_PRESENT_LOG_THRESHOLD_NS * 5,
-                at,
-                at + SLOW_PRESENT_LOG_MIN_GAP_NS
-            ),
-            "a still-live stall must keep saying so"
+        let again = at + quiet;
+        match slow_episode_step(&mut ep, slow * 2, owner, again) {
+            SlowEpisodeStep::Opened { closed: Some(old) } => {
+                assert_eq!((old.start_ns, old.samples), (at, 1));
+            }
+            other => panic!("expected a new episode, got {other:?}"),
+        }
+        assert_eq!((ep.start_ns, ep.worst_ns), (again, slow * 2));
+        assert_eq!(
+            slow_episode_step(&mut ep, slow, owner, again + quiet - 1),
+            SlowEpisodeStep::Joined,
+            "under a minute apart is the same episode"
         );
+        assert_eq!(
+            slow_episode_close(&mut ep, again + 1, true).map(|e| e.samples),
+            Some(2),
+            "`metrics reset` closes an open episode"
+        );
+    }
+
+    /// `metrics reset` runs on a control thread, and the open episode is five
+    /// atomics the UI thread writes. So reset only ASKS: the UI thread's next
+    /// present closes the episode (with its line), and a slow present after the
+    /// reset opens a fresh one rather than joining the old.
+    #[test]
+    fn metrics_reset_leaves_the_episode_for_the_ui_thread_to_close() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let samples = || SLOW_EPISODE_SAMPLES.load(Ordering::Relaxed);
+        reset();
+        note_slow_episode_quiet(0);
+        assert_eq!(samples(), 0);
+        assert!(!SLOW_EPISODE_RESET.load(Ordering::Relaxed));
+        let owner = LAST_DEADLINE_OWNER.swap(DeadlineOwner::Blink as u64, Ordering::Relaxed);
+        let slow = SLOW_PRESENT_LOG_THRESHOLD_NS + 1;
+        let at = 1_000_000_000;
+        note_slow_present(slow, 0, at);
+        note_slow_present(slow, 0, at + 1);
+        assert_eq!(samples(), 2);
+
+        reset();
+        assert_eq!(
+            samples(),
+            2,
+            "the control thread does not touch the episode"
+        );
+        note_slow_episode_quiet(at + 2);
+        assert_eq!(samples(), 0, "the next present closes it");
+
+        note_slow_present(slow, 0, at + 3);
+        reset();
+        note_slow_present(slow, 0, at + 4);
+        assert_eq!(
+            samples(),
+            1,
+            "a slow present after a reset opens a new episode"
+        );
+        assert_eq!(SLOW_EPISODE_START_NS.load(Ordering::Relaxed), at + 4);
+        reset();
+        note_slow_episode_quiet(0);
+        LAST_DEADLINE_OWNER.store(owner, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn log_spans_read_as_seconds_minutes_or_hours() {
+        assert_eq!(log_span(1_500_000_000), "1.5 s");
+        assert_eq!(log_span(27 * 60 * 1_000_000_000), "27 min");
+        assert_eq!(log_span(27 * 3600 * 1_000_000_000), "27.0 h");
     }
 
     /// THE CONFLATION THIS FIXES. `note_key_arrival_queued` backdates the arrival

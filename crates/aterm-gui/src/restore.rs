@@ -1109,6 +1109,20 @@ pub(crate) fn write_to(path: &Path, manifest: &RestoreManifest) -> Result<(), St
     with_restore_lock(path, || write_restore_locked(path, toml.as_bytes()))
 }
 
+/// [`write_to`] for a ONE-SHOT name no other process will ever lock — an update
+/// handoff's attempt-bound layout (`seamless-<pid>-<nonce>.layout.toml`), which its
+/// successor reads without the lock — and then remove the lock file the write took.
+/// Only such a name may drop its lock: for a shared one (`session.toml`) a lock
+/// unlinked while another process waits on it lets a third lock a new file beside
+/// it. Kept, these locks piled up in the control directory, one per update.
+pub(crate) fn write_once_to(path: &Path, manifest: &RestoreManifest) -> Result<(), String> {
+    let written = write_to(path, manifest);
+    if let Some(lock) = restore_lock_path(path) {
+        let _ = fs::remove_file(lock);
+    }
+    written
+}
+
 /// Claim the manifest atomically, durably remove its public name, then parse the
 /// claimed bytes. The rename is the single-use commit point: a crash during
 /// parsing/apply cannot expose the same manifest to the next launch.
@@ -1210,17 +1224,22 @@ fn take_from_result(path: &Path) -> Result<Option<RestoreManifest>, String> {
     })
 }
 
+/// The lock file that serializes every write and claim of `path`: the hidden
+/// `.<name>.aterm-restore.lock` beside it. `None` for a path with no parent.
+fn restore_lock_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("session.toml"));
+    Some(parent.join(format!(".{}.aterm-restore.lock", name.to_string_lossy())))
+}
+
 fn with_restore_lock<T>(
     path: &Path,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let parent = path
-        .parent()
+    let lock_path = restore_lock_path(path)
         .ok_or_else(|| format!("restore manifest {} has no parent", path.display()))?;
-    let name = path
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("session.toml"));
-    let lock_path = parent.join(format!(".{}.aterm-restore.lock", name.to_string_lossy()));
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -2051,6 +2070,47 @@ metadata = "opaque=copy-me"
         assert_eq!(m, back);
         assert!(!path.exists(), "single-use: manifest deleted on read");
         assert!(take_from(&path).is_none(), "a second take finds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-shot name — the handoff's attempt-bound layout — keeps nothing but the
+    /// manifest: its lock goes with the write (they used to pile up in the control
+    /// directory, one per update), while a shared name keeps the lock every writer
+    /// and claimer of it serializes on. The bytes are exactly `to_toml()`, which is
+    /// what the handoff's layout digest commits to.
+    #[test]
+    fn a_one_shot_write_leaves_only_its_manifest() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-restore-once-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let once = dir.join("seamless-4242-abcd.layout.toml");
+        let manifest = sample();
+        write_once_to(&once, &manifest).unwrap();
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&dir), ["seamless-4242-abcd.layout.toml"]);
+        assert_eq!(
+            std::fs::read_to_string(&once).unwrap(),
+            manifest.to_toml().unwrap()
+        );
+        let shared = dir.join("session.toml");
+        write_to(&shared, &manifest).unwrap();
+        assert_eq!(
+            names(&dir),
+            [
+                ".session.toml.aterm-restore.lock",
+                "seamless-4242-abcd.layout.toml",
+                "session.toml"
+            ],
+            "a shared name keeps its lock"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1579,6 +1579,29 @@ pub struct RenderInput {
     pub grid_top_row: usize,
     /// One past the last terminal-content row — see [`grid_top_row`](Self::grid_top_row).
     pub grid_bot_row: usize,
+    /// M1b INCOMING-ROW APRON: the ONE row just below the viewport at
+    /// extraction — the row a positive [`scroll_frac_px`](Self::scroll_frac_px)
+    /// up-glide is sliding IN at the bottom — so the present translate can fill
+    /// the strip it exposes with that row's real pixels instead of the band's own
+    /// stale ones (the retired placeholder). The engine stamps it on EVERY fill
+    /// ([`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into),
+    /// the damage-scoped arm included: the row lives at viewport index `rows`,
+    /// outside any mask the tracker can mark); it is EMPTY (`present == false`)
+    /// at `display_offset == 0`, where no row lies below the live bottom. THE LAW:
+    /// the apron at offset `d` IS the bottom viewport row at offset `d - 1`.
+    /// Consumed at PRESENT time only, so — like `scroll_frac_px` — it is EXCLUDED
+    /// from `PartialEq`/`Eq` and never enters the content damage diff (an
+    /// apron-only change must not dirty a viewport row; the strip is re-rastered
+    /// from this field on every sub-row frame that shows one).
+    pub apron_row: ApronRow,
+    /// The facts `apron_row` was last extracted under — `(display_offset,
+    /// content_gen, history_renumber_epoch, rows, cols)` — so a fill that
+    /// finds them unchanged keeps the row instead of re-reading history
+    /// (`Terminal::apron_row_into`). The cursor scalar is deliberately absent:
+    /// it is refreshed even when this content memo hits. Present-time bookkeeping
+    /// like the row itself: excluded from `PartialEq`, copied with the row by
+    /// `copy_from`.
+    pub apron_stamp: Option<(usize, u64, u64, usize, usize)>,
     /// FOCUSED-PANE effect-clip box `(x0, y0, x1, y1)` in WINDOW-ABSOLUTE
     /// device pixels — the same space as the `cursor_glow_add` stream (split
     /// composition sets it to the focused pane's box; `None` = single-pane /
@@ -2022,9 +2045,19 @@ pub enum FullRefillCause {
     /// window and its terminal are momentarily out of step (a resize in
     /// flight).
     EngineDims,
-    /// The engine's viewport is scrolled back (`display_offset != 0`). Tracker
+    /// The engine's viewport is scrolled back (`display_offset != 0`) and the
+    /// SCROLLED continuity proof (SCR-2, `Terminal::scrolled_scoped_refill_delta`)
+    /// did not hold: the scratch entered history from the live bottom, content
+    /// or row identity moved under the parked viewport, the tracker holds
+    /// whole-grid damage, or the net move exposes the whole viewport. Tracker
     /// rows are live-grid rows and coincide with viewport rows only at offset
-    /// 0.
+    /// 0, so this is the one cause under which the scoped arm may still be
+    /// reached — by rotating a parked scratch, never by reading those bits.
+    /// An output batch under a viewport parked deeper than one screen also
+    /// lands here: the SCR-1 pin (`display_offset -> 0`) marks `Damage::Full`
+    /// for a move of `>= rows`, and a palette/DECSCNM change in the same batch
+    /// is indistinguishable from it, so the anchor-preserving re-pin cannot be
+    /// treated as a no-op without a render-policy generation of its own.
     EngineScrolled,
     /// The engine is at offset 0 but the SCRATCH was filled while scrolled
     /// back, so its retained rows are viewport rows from a different mapping.
@@ -2170,6 +2203,8 @@ impl Clone for RenderInput {
             scroll_frac_px: self.scroll_frac_px,
             grid_top_row: self.grid_top_row,
             grid_bot_row: self.grid_bot_row,
+            apron_row: self.apron_row.clone(),
+            apron_stamp: self.apron_stamp,
             fx_clip: self.fx_clip,
             selection: self.selection.clone(),
             selection_clip: self.selection_clip,
@@ -2350,6 +2385,9 @@ impl PartialEq for RenderInput {
         // content damage diff. Comparing them would force a full repaint on a
         // frac-only change (a drag frame) that dirties no cell — the translate needs
         // only a re-present, not a re-raster. See `RenderInput::scroll_frac_px`.
+        // `apron_row` is excluded on the SAME law: it is the present translate's
+        // strip source, rastered outside the damage cache, and the row it carries
+        // is not a viewport row the per-row diff may mark.
         // `input_hot` is likewise NOT compared: it is a present-time bloom-defer hint
         // (see its doc), so a hot→settle transition must not by itself force a repaint
         // — the animating comet already differs frame-to-frame while a halo is pending.
@@ -2374,6 +2412,58 @@ impl PartialEq for RenderInput {
 }
 
 impl Eq for RenderInput {}
+
+/// M1b INCOMING-ROW APRON — the one row just below the viewport, carried on
+/// [`RenderInput::apron_row`]. A plain struct rather than an `Option` so the
+/// per-frame refill keeps its Vec capacity (`present` is the presence bit).
+///
+/// Not to be confused with the E7 scroll-blit OVERSHOOT apron (the rows
+/// adjacent to a re-rastered row): this apron is CONTENT — the row the
+/// sub-row translate reveals — not a raster-protection band.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApronRow {
+    /// `true` when a row lies below the viewport (`display_offset > 0`); the
+    /// remaining fields are meaningful only then.
+    pub present: bool,
+    /// The row's resolved cells, exactly as a viewport row's
+    /// [`RenderInput::cells`] entry.
+    pub cells: Vec<RenderCell>,
+    /// Its sparse emoji clusters — one [`RenderInput::clusters`] row.
+    pub clusters: Vec<(usize, Box<str>)>,
+    /// Its sparse combining marks — one [`RenderInput::combining`] row.
+    pub combining: Vec<(usize, Box<[char]>)>,
+    /// Its DEC line size (`SingleWidth` for a history row).
+    pub line_size: LineSize,
+    /// The cursor column when the DEC cursor's PROJECTED row is exactly this
+    /// row (the row the glide is bringing back on screen), else `None` — so the
+    /// caret rides in with its row instead of popping in once the row lands.
+    pub cursor_col: Option<usize>,
+}
+
+impl Default for ApronRow {
+    fn default() -> Self {
+        Self {
+            present: false,
+            cells: Vec::new(),
+            clusters: Vec::new(),
+            combining: Vec::new(),
+            line_size: LineSize::SingleWidth,
+            cursor_col: None,
+        }
+    }
+}
+
+impl ApronRow {
+    /// Mark the apron absent, keeping every Vec's capacity for the next fill.
+    pub fn clear(&mut self) {
+        self.present = false;
+        self.cells.clear();
+        self.clusters.clear();
+        self.combining.clear();
+        self.line_size = LineSize::SingleWidth;
+        self.cursor_col = None;
+    }
+}
 
 impl Default for RenderInput {
     fn default() -> Self {
@@ -2440,6 +2530,8 @@ impl RenderInput {
         self.scroll_frac_px = source.scroll_frac_px;
         self.grid_top_row = source.grid_top_row;
         self.grid_bot_row = source.grid_bot_row;
+        self.apron_row.clone_from(&source.apron_row);
+        self.apron_stamp = source.apron_stamp;
         self.fx_clip = source.fx_clip;
         self.selection.clone_from(&source.selection);
         self.selection_clip = source.selection_clip;
@@ -2540,6 +2632,8 @@ impl RenderInput {
             scroll_frac_px: 0,
             grid_top_row: 0,
             grid_bot_row: 0,
+            apron_row: ApronRow::default(),
+            apron_stamp: None,
             fx_clip: None,
             selection: TextSelection::new(),
             selection_clip: None,

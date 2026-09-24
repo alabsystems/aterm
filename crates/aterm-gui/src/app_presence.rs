@@ -8,8 +8,8 @@
 //! resize a band row costs when it appears or folds.
 //!
 //! Every entry point here runs at CHANGE rate: a `Wake::LeaseChanged` /
-//! `Wake::FabricChanged` / `Wake::MetaChanged`, a status-revision move from the
-//! sweep, a tab switch, the human's own keystroke (the fold law), and the
+//! `Wake::FabricChanged` / `Wake::MetaChanged`, a status-revision or
+//! agent-verdict move from the sweep, a tab switch, the human's own keystroke (the fold law), and the
 //! band's once-a-second / once-a-minute `since` tick while a row is up. The
 //! frame path reads plain fields on the view and allocates nothing
 //! (`presence_overlay`, `presence_fp`).
@@ -38,6 +38,13 @@ const RIPPLE_WASH_PEAK: u32 = 24;
 #[derive(Default, Debug)]
 pub(crate) struct PresenceTable {
     slots: std::collections::HashMap<u64, Slot>,
+    /// The menu-bar rows' and notifications' transition memory
+    /// (`App::herald_session`), per session like the slots.
+    pub(crate) herald: crate::status_item::Herald,
+    /// When each session's `ttl=` supervisor claim lapses — the timer
+    /// ([`App::presence_deadline`]) wakes there, because a supervisor that
+    /// dies writes nothing and its box must still reach the human.
+    supervisor_until: std::collections::HashMap<u64, Instant>,
 }
 
 impl PresenceTable {
@@ -47,6 +54,8 @@ impl PresenceTable {
 
     pub(crate) fn retire(&mut self, session: u64) {
         self.slots.remove(&session);
+        self.herald.retire(session);
+        self.supervisor_until.remove(&session);
     }
 }
 
@@ -74,9 +83,8 @@ impl App {
     }
 
     /// Gather one session's facts. Leaf locks only, each held for a copy; the
-    /// terminal is TRY-locked and only when the status revision moved (the
-    /// classifier gate) — contention skips the reading and the next refresh
-    /// retries, the sweep's own discipline.
+    /// agent reading is the status sweep's published one (no terminal lock
+    /// here at all).
     fn presence_facts(&self, session: u64) -> Option<Facts> {
         let s = self.pool.get(session)?;
         let ctx = &s.ctx;
@@ -153,32 +161,17 @@ impl App {
             .session_status
             .status(session)
             .map(|st| (st.phase.as_str(), st.since));
-        let revision = self.session_status.revision(session);
-        let seen = self
-            .presence
-            .slots
-            .get(&session)
-            .and_then(|s| s.revision_seen);
-        // THE CLASSIFIER GATE: only when the status revision moved past the one
-        // the slot was classified at (or never was), and only under a try-lock
-        // the reader is not holding.
-        let agent = if seen != Some(revision) {
-            crate::term_try_lock(&s.term).map(|t| {
-                let rows = usize::from(t.rows());
-                let from = rows.saturating_sub(presence::CLASSIFY_ROWS);
-                let screen: Vec<String> = (from..rows)
-                    .map(|r| crate::control::visible_row(&t, r))
-                    .collect();
-                presence::classify(&screen, now)
-            })
-        } else {
-            None
-        };
+        // THE SERVER'S PUBLISHED VERDICT: the status sweep classified the
+        // screen (only for an identified agent, only when its live zone
+        // changed); presence folds that reading in and never re-reads the
+        // screen itself, so the band, the rim, `status agent=` and `EVENT
+        // agent` all say the same thing.
+        let (agent_seq, agent) = self.session_status.agent_reading(session);
         Some(Facts {
             role,
             attention,
             shell,
-            revision,
+            agent_seq,
             agent,
             hand,
             lease_until,
@@ -241,6 +234,12 @@ impl App {
     /// submit keypress — the ripple's edge.
     pub(crate) fn refresh_presence_session(&mut self, session: u64, submitted: bool) {
         let now = Instant::now();
+        self.note_supervisor_expiry(session, now);
+        // The human channel rides every presence refresh — the same change
+        // rate (a verdict move from the sweep, a `meta set`, a lease wake) —
+        // and dedups by transition itself, so a refresh that moved nothing
+        // costs two leaf-lock reads and no AppKit call.
+        self.herald_session(session);
         let Some(facts) = self.presence_facts(session) else {
             return;
         };
@@ -250,7 +249,7 @@ impl App {
                 .slots
                 .entry(session)
                 .or_insert_with(|| Slot::new(now));
-            let first = slot.revision_seen.is_none() && slot.shell.is_none();
+            let first = slot.agent_seq_seen.is_none() && slot.shell.is_none();
             slot.absorb(facts, now) || first
         };
         if !changed && !submitted {
@@ -365,7 +364,7 @@ impl App {
 
     /// Commit the band row's existence to the window geometry: `true` when the
     /// count moved (and the window was re-gridded — ONE PTY resize). Frozen
-    /// mid-handoff for the same reason `sync_status_bar_rows` is, and yielding
+    /// mid-handoff for the same reason `sync_message_band_rows` is, and yielding
     /// to the last terminal row the same way.
     pub(crate) fn sync_presence_rows(&mut self, wid: WindowId) -> bool {
         if self.pending_update_handoff.is_some() || self.incoming_handoff_pending {
@@ -423,6 +422,71 @@ impl App {
         self.refresh_presence_window(wid);
     }
 
+    /// Remember when `session`'s `ttl=` supervisor claim lapses (or forget a
+    /// session with none), so [`Self::presence_deadline`] wakes there. Read at
+    /// every presence refresh — a `meta set supervisor` posts
+    /// `Wake::MetaChanged`, which refreshes — so a renewal moves the deadline.
+    fn note_supervisor_expiry(&mut self, session: u64, now: Instant) {
+        let expiry = self.pool.get(session).and_then(|s| {
+            s.ctx
+                .meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .supervisor_expiry()
+        });
+        match expiry {
+            Some(at_us) => {
+                let now_us = crate::metrics::now_us();
+                // One millisecond past the expiry, so the lapse check at the
+                // wake sees it lapsed on the microsecond clock too.
+                let at = now
+                    + Duration::from_micros(at_us.saturating_sub(now_us))
+                    + Duration::from_millis(1);
+                self.presence.supervisor_until.insert(session, at);
+            }
+            None => {
+                self.presence.supervisor_until.remove(&session);
+            }
+        }
+    }
+
+    /// The timer's human-channel half: a `ttl=` supervisor claim that has
+    /// lapsed is removed and recorded (`meta-change field=supervisor
+    /// value=-`, pushed as `EVENT meta`), and the session is re-heralded — so
+    /// a box the dead supervisor was holding reaches the menu row and the
+    /// notification; and every owed notification the rate limit now allows
+    /// is posted ([`crate::status_item::Herald::due`]).
+    fn presence_herald_tick(&mut self, now: Instant) {
+        let lapsed: Vec<u64> = self
+            .presence
+            .supervisor_until
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(session, _)| *session)
+            .collect();
+        for session in lapsed {
+            let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
+                self.presence.retire(session);
+                continue;
+            };
+            if crate::session_timeline::lapse_supervisor(&ctx, crate::metrics::now_us())
+                && self.subscribers.any()
+            {
+                self.subscribers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notify(session);
+            }
+            // Re-reads the claim: a lapsed one is gone (the deadline with it),
+            // a renewed one re-arms at its new expiry.
+            self.refresh_presence_session(session, false);
+        }
+        let (ready, _) = self.presence.herald.due(now);
+        for session in ready {
+            self.herald_session(session);
+        }
+    }
+
     /// The band's `since` text ticks — once a second while it shows seconds,
     /// once a minute after — and the ripple steps. `None` on a quiet desktop.
     pub(crate) fn presence_deadline(&self, now: Instant) -> Option<Instant> {
@@ -469,6 +533,16 @@ impl App {
                 fold(d.max(now));
             }
         }
+        // A `ttl=` supervisor claim's lapse, and an owed notification the
+        // rate limit will allow: neither posts a wake of its own.
+        for d in self.presence.supervisor_until.values() {
+            fold((*d).max(now));
+        }
+        match self.presence.herald.due(now) {
+            (ready, _) if !ready.is_empty() => fold(now),
+            (_, Some(d)) => fold(d),
+            _ => {}
+        }
         deadline
     }
 
@@ -477,6 +551,7 @@ impl App {
     /// that need a repaint.
     pub(crate) fn presence_tick(&mut self, now: Instant) -> Vec<WindowId> {
         let mut out = Vec::new();
+        self.presence_herald_tick(now);
         // The facts a timer can move without a wake: a cooperative lease that
         // LAPSED (its driver crashed; nothing posts for a lapse) is re-read the
         // moment its deadline passes, on every session that holds one.
@@ -517,8 +592,8 @@ impl App {
             if row_up {
                 let before = self.windows.get(&wid).map(|ws| ws.presence.seed);
                 // The belt under the wakes' braces: while a row is up, its
-                // session's facts are re-read at the tick (leaf locks, the
-                // classifier still gated on the revision), so a fact whose
+                // session's facts are re-read at the tick (leaf locks; the
+                // agent reading is the sweep's, never re-classified), so a fact whose
                 // change posted nothing — the link coming back, a lease that
                 // lapsed — reaches the row at the tick, never later.
                 if let Some(session) = self.focused_session_id(wid) {
@@ -603,8 +678,8 @@ impl App {
         let key = (ws.presence.seed, cols, palette_key);
         if ws.presence.cached_key != Some(key) {
             let row = match &ws.presence.words {
-                Some(words) => crate::status_bars::paint_presence_row(words, cols, theme),
-                None => crate::status_bars::blank_band_row(cols, theme),
+                Some(words) => crate::message_band::paint_presence_row(words, cols, theme),
+                None => crate::message_band::blank_band_row(cols, theme),
             };
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.presence.cached_row = row;
@@ -665,10 +740,17 @@ impl App {
         Some(crate::accesskit_tree::GridMessage {
             message: crate::accesskit_tree::ChromeMessage::PresenceStatus,
             text: words.sentence.clone(),
-            detail: Some(words.fit(crate::status_bars::presence_text_cols(usize::from(ws.cols)))),
+            detail: Some(
+                words.fit(crate::message_band::presence_text_cols(usize::from(
+                    ws.cols,
+                ))),
+            ),
             progress: None,
+            busy: false,
+            alarm: false,
             activates: false,
             bar_row: Some(0),
+            capsules: Vec::new(),
         })
     }
 
@@ -683,7 +765,11 @@ impl App {
             .presence
             .words
             .as_ref()
-            .map(|w| w.fit(crate::status_bars::presence_text_cols(usize::from(ws.cols))))
+            .map(|w| {
+                w.fit(crate::message_band::presence_text_cols(usize::from(
+                    ws.cols,
+                )))
+            })
             .unwrap_or_default();
         Some((line, rim))
     }
@@ -793,19 +879,29 @@ impl App {
         slot.level(watermark)
     }
 
-    /// The three additive `status` fields of round 19: `hand=<token>
-    /// level=<level> story=<n>` (design §5). Read from the slot the wakes keep
-    /// current — no lock, no classification — and `hand=- level=quiet story=0`
-    /// for a session no wake has touched yet.
+    /// The additive presence `status` fields: round 19's `hand=<token>
+    /// level=<level> story=<n>` (design §5), then `why=` — what put the
+    /// session at `level=attention` ([`Slot::why`]). Read from the slot the
+    /// wakes keep current — no lock, no classification — and `hand=-
+    /// level=quiet story=0 why=-` for a session no wake has touched yet.
     pub(crate) fn presence_status_tail(&self, session: u64) -> String {
         let level = self.presence_session_level(session).wire();
         match self.presence.slot(session) {
-            Some(slot) => format!(
-                "hand={} level={level} story={}",
-                slot.hand.wire(),
-                slot.story_seq
-            ),
-            None => format!("hand=- level={level} story=0"),
+            Some(slot) => {
+                let watermark = self
+                    .windows
+                    .values()
+                    .map(|ws| ws.presence.watermark(session))
+                    .max()
+                    .unwrap_or(0);
+                format!(
+                    "hand={} level={level} story={} why={}",
+                    slot.hand.wire(),
+                    slot.story_seq,
+                    slot.why(watermark)
+                )
+            }
+            None => format!("hand=- level={level} story=0 why=-"),
         }
     }
 
@@ -1090,93 +1186,101 @@ mod tests {
     /// approval). A session the pool does not hold is an error, not a row.
     #[test]
     fn a_told_story_reaches_the_band_and_the_verbs_within_one_revision() {
-        use crate::presence::{StoryVerb, TOLD_FLASH};
-        let (mut app, wid, sid, _ctx) = app_with_stub();
-        let revision = app.session_status.revision(sid);
-        let record = app.session_status_record(sid).expect("live");
-        // The round-19 tail, with round 22's screen stamp appended after it.
-        assert!(
-            record.contains(" hand=- level=quiet story=0 seq="),
-            "{record}"
-        );
-        assert_eq!(
-            app.presence_chrome_line(),
-            "presence rim=none level=quiet band=\"\" sentence=\"\"",
-            "a quiet window prints empty quotes"
-        );
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            use crate::presence::{StoryVerb, TOLD_FLASH};
+            let (mut app, wid, sid, _ctx) = app_with_stub();
+            let revision = app.session_status.revision(sid);
+            let record = app.session_status_record(sid).expect("live");
+            // The round-19 tail, with round 22's screen stamp appended after it.
+            assert!(
+                record.contains(" hand=- level=quiet story=0 why=- path=live program="),
+                "{record}"
+            );
+            assert_eq!(
+                app.presence_chrome_line(),
+                "presence rim=none level=quiet band=\"\" sentence=\"\"",
+                "a quiet window prints empty quotes"
+            );
 
-        assert_eq!(app.tell_story(sid, StoryVerb::Approval, ""), Ok(1));
-        let (text, rim) = line(&app, wid);
-        assert!(text.contains("\u{2713} approved"), "{text}");
-        assert_eq!(rim, "none", "a story has no rim");
-        assert_eq!(app.presence_level(wid), Level::Story);
-        let record = app.session_status_record(sid).expect("live");
-        assert!(
-            record.contains(" hand=- level=story story=1 seq="),
-            "{record}"
-        );
-        assert_eq!(
-            app.session_status.revision(sid),
-            revision,
-            "before the next status revision"
-        );
-        let chrome = app.presence_chrome_line();
-        assert!(
-            chrome.starts_with("presence rim=none level=story band=\""),
-            "{chrome}"
-        );
-        assert!(chrome.contains("\u{2713} approved"), "{chrome}");
-        assert!(
-            chrome.ends_with(" sentence=\"approved by watcher\""),
-            "{chrome}"
-        );
-        let now = Instant::now();
-        let deadline = app
-            .presence_deadline(now)
-            .expect("the flash arms the timer");
-        assert!(deadline <= now + TOLD_FLASH, "the slot returns within 3 s");
+            assert_eq!(app.tell_story(sid, StoryVerb::Approval, ""), Ok(1));
+            let (text, rim) = line(&app, wid);
+            assert!(text.contains("\u{2713} approved"), "{text}");
+            assert_eq!(rim, "none", "a story has no rim");
+            assert_eq!(app.presence_level(wid), Level::Story);
+            let record = app.session_status_record(sid).expect("live");
+            assert!(
+                record.contains(" hand=- level=story story=1 why=- path=live program="),
+                "{record}"
+            );
+            assert_eq!(
+                app.session_status.revision(sid),
+                revision,
+                "before the next status revision"
+            );
+            let chrome = app.presence_chrome_line();
+            assert!(
+                chrome.starts_with("presence rim=none level=story band=\""),
+                "{chrome}"
+            );
+            assert!(chrome.contains("\u{2713} approved"), "{chrome}");
+            assert!(
+                chrome.ends_with(" sentence=\"approved by watcher\""),
+                "{chrome}"
+            );
+            let now = Instant::now();
+            let deadline = app
+                .presence_deadline(now)
+                .expect("the flash arms the timer");
+            assert!(deadline <= now + TOLD_FLASH, "the slot returns within 3 s");
 
-        // Three seconds on: the phase slot is the story summary, counting it.
-        let slot = app.presence.slot(sid).expect("a slot");
-        let later = presence::words(slot, now + TOLD_FLASH, 0);
-        assert_eq!(later.phase, "\u{25c7} quiet", "{later:?}");
-        assert!(later.since.iter().any(|c| c == "1 approval"), "{later:?}");
+            // Three seconds on: the phase slot is the story summary, counting it.
+            let slot = app.presence.slot(sid).expect("a slot");
+            let later = presence::words(slot, now + TOLD_FLASH, 0);
+            assert_eq!(later.phase, "\u{25c7} quiet", "{later:?}");
+            assert!(later.since.iter().any(|c| c == "1 approval"), "{later:?}");
 
-        // A verb with text: the text is the detail, sanitized, and the seq moves.
-        assert_eq!(
-            app.tell_story(sid, StoryVerb::Exit, "session\u{202e} gone"),
-            Ok(2)
-        );
-        let (text, _) = line(&app, wid);
-        assert!(text.contains("\u{2715} exit"), "{text}");
-        assert!(text.contains("session gone"), "{text}");
-        assert!(
-            !text.contains('\u{202e}'),
-            "a bidi override never reaches the chrome"
-        );
-        let record = app.session_status_record(sid).expect("live");
-        assert!(record.contains(" level=story story=2 seq="), "{record}");
-        assert_eq!(
-            app.tell_story(9999, StoryVerb::Timeout, ""),
-            Err("no such session")
-        );
+            // A verb with text: the text is the detail, sanitized, and the seq moves.
+            assert_eq!(
+                app.tell_story(sid, StoryVerb::Exit, "session\u{202e} gone"),
+                Ok(2)
+            );
+            let (text, _) = line(&app, wid);
+            assert!(text.contains("\u{2715} exit"), "{text}");
+            assert!(text.contains("session gone"), "{text}");
+            assert!(
+                !text.contains('\u{202e}'),
+                "a bidi override never reaches the chrome"
+            );
+            let record = app.session_status_record(sid).expect("live");
+            assert!(
+                record.contains(" level=story story=2 why=- path=live program="),
+                "{record}"
+            );
+            assert_eq!(
+                app.tell_story(9999, StoryVerb::Timeout, ""),
+                Err("no such session")
+            );
 
-        // The hand rides `status` too: a peer's open turn.
-        *_ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
-            id: 41,
-            driver: None,
+            // The hand rides `status` too: a peer's open turn.
+            *_ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+                id: 41,
+                driver: None,
+            });
+            app.on_presence_wake(&_ctx.self_id, false);
+            let record = app.session_status_record(sid).expect("live");
+            assert!(
+                record.contains(" hand=turn:41 level=driven story=2 why=- path=live program="),
+                "{record}"
+            );
+            let chrome = app.presence_chrome_line();
+            assert!(
+                chrome.starts_with("presence rim=drive level=driven band=\""),
+                "{chrome}"
+            );
         });
-        app.on_presence_wake(&_ctx.self_id, false);
-        let record = app.session_status_record(sid).expect("live");
-        assert!(
-            record.contains(" hand=turn:41 level=driven story=2 seq="),
-            "{record}"
-        );
-        let chrome = app.presence_chrome_line();
-        assert!(
-            chrome.starts_with("presence rim=drive level=driven band=\""),
-            "{chrome}"
-        );
     }
 
     #[test]
@@ -1200,26 +1304,23 @@ mod tests {
         assert!(v.ripple_at.is_none());
     }
 
-    /// THE CLASSIFIER GATE (§7): `aterm_phase` runs exactly once per status
-    /// revision the slot sees — a thousand refreshes at one revision cost one
-    /// call; each revision move costs one more.
+    /// THE CLASSIFIER GATE (§7), presence's half: a refresh folds the
+    /// sweep's PUBLISHED reading and never classifies — a thousand refreshes
+    /// cost zero `aterm_phase` calls, and a status revision move costs none
+    /// either (the audit measured `level=quiet` with a box up because the old
+    /// gate hung the classifier on that revision). The sweep's half — one
+    /// classification per changed live zone, at most 4 Hz — is pinned in
+    /// `session_status`.
     #[test]
-    fn the_classifier_runs_once_per_status_revision_never_per_frame() {
+    fn a_presence_refresh_never_classifies() {
         use crate::session_status::{ActivitySample, Evidence};
         let (mut app, _wid, sid, _ctx) = app_with_stub();
         let calls = presence::classifier_calls();
         for _ in 0..1000 {
             app.refresh_presence_session(sid, false);
         }
-        assert_eq!(
-            presence::classifier_calls() - calls,
-            1,
-            "one revision, one call"
-        );
-        let mut revisions = std::collections::BTreeSet::new();
-        revisions.insert(app.session_status.revision(sid));
         let t0 = Instant::now();
-        let mut ev = Evidence {
+        let ev = Evidence {
             pin: None,
             shell: None,
             lifecycle: None,
@@ -1231,27 +1332,22 @@ mod tests {
                 last_output: Some(t0),
             },
         };
-        // Two observations past the dwell: the slot is minted (revision 1),
-        // then Running publishes (revision 2).
+        let before = app.session_status.revision(sid);
         app.session_status.observe(sid, &ev, t0);
-        revisions.insert(app.session_status.revision(sid));
-        for _ in 0..100 {
-            app.refresh_presence_session(sid, false);
-        }
-        let t1 = t0 + Duration::from_millis(800);
-        ev.activity.last_output = Some(t1);
-        assert!(
-            app.session_status.observe(sid, &ev, t1),
-            "Running publishes"
+        app.session_status
+            .observe(sid, &ev, t0 + Duration::from_millis(800));
+        assert_ne!(
+            app.session_status.revision(sid),
+            before,
+            "the revision moved"
         );
-        revisions.insert(app.session_status.revision(sid));
         for _ in 0..100 {
             app.refresh_presence_session(sid, false);
         }
         assert_eq!(
             presence::classifier_calls() - calls,
-            revisions.len() as u64,
-            "calls == distinct revisions seen ({revisions:?}), not frames"
+            0,
+            "presence folds the published verdict; it never reads the screen"
         );
     }
 
@@ -1311,7 +1407,7 @@ mod tests {
                 slot(
                     Facts {
                         role: role(),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(AgentPhase::Busy, Some(41)),
                         hand: Hand::DrivenTurn {
                             id: 41,
@@ -1330,7 +1426,7 @@ mod tests {
                 slot(
                     Facts {
                         role: Some("agent:claude-manager".into()),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(AgentPhase::Busy, Some(77)),
                         hand: Hand::Driving {
                             sid: "s-1e91".into(),
@@ -1348,7 +1444,7 @@ mod tests {
                 slot(
                     Facts {
                         role: role(),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(
                             AgentPhase::Prompt {
                                 detail: Some("bash".into()),
@@ -1370,7 +1466,7 @@ mod tests {
                 slot(
                     Facts {
                         role: role(),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(AgentPhase::Question, Some(12)),
                         link: Link::Connected { rtt_ms: Some(6) },
                         ..Facts::default()
@@ -1384,9 +1480,10 @@ mod tests {
                 slot(
                     Facts {
                         role: role(),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(
-                            AgentPhase::Limited {
+                            AgentPhase::Wall {
+                                kind: aterm_phase::WallKind::UsageSession,
                                 reset: Some("19:30".into()),
                                 until: Some(now + Duration::from_secs(165_600)),
                             },
@@ -1405,7 +1502,7 @@ mod tests {
                 slot(
                     Facts {
                         role: role(),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(AgentPhase::Idle, Some(41)),
                         hold: Some(HoldFact {
                             reason: "fabric-lost".into(),
@@ -1430,7 +1527,7 @@ mod tests {
                     Facts {
                         role: role(),
                         attention: Some("needs a decision".into()),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(AgentPhase::Busy, Some(50)),
                         link: Link::Connected { rtt_ms: Some(3) },
                         ..Facts::default()
@@ -1444,7 +1541,7 @@ mod tests {
                 slot(
                     Facts {
                         role: role(),
-                        revision: 1,
+                        agent_seq: 1,
                         agent: agent(AgentPhase::Busy, Some(91)),
                         link: Link::Stalled {
                             age_ms: Some(7_400),
@@ -1463,7 +1560,7 @@ mod tests {
             s.absorb(
                 Facts {
                     role: role(),
-                    revision: 1,
+                    agent_seq: 1,
                     agent: agent(AgentPhase::Idle, Some(41)),
                     turn: Some(TurnFact {
                         id,
@@ -1480,7 +1577,7 @@ mod tests {
         }
         let held = |hold: Option<HoldFact>| Facts {
             role: role(),
-            revision: 1,
+            agent_seq: 1,
             agent: agent(AgentPhase::Idle, Some(41)),
             turn: Some(TurnFact {
                 id: 3,
@@ -1558,7 +1655,7 @@ mod tests {
                     "{name} at {cols}: hand survives: {fitted}"
                 );
                 for (palette, hc, theme) in &palettes {
-                    let paint = || crate::status_bars::paint_presence_row(&w, cols, *theme);
+                    let paint = || crate::message_band::paint_presence_row(&w, cols, *theme);
                     let (row, colors) = match hc {
                         Some(hc) => crate::chrome_band::hc_fixtures::with_forced(*hc, || {
                             (paint(), crate::chrome_band::band_colors(*theme))
@@ -1605,38 +1702,43 @@ mod tests {
     /// a story the dot, and a quiet session leaves the bit alone.
     #[test]
     fn the_chip_level_folds_the_session_level_over_the_indicator_bit() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        let metadata = |app: &App| -> Vec<crate::tab_bar::TabStripMetadata> {
-            let mut m: Vec<_> = app.windows[&wid]
-                .tab_set
-                .tabs()
-                .iter()
-                .map(|t| crate::tab_bar::TabStripMetadata::from_presentation(&t.presentation))
-                .collect();
-            app.stamp_presence_chips(wid, &mut m);
-            m
-        };
-        let front = app.windows[&wid].tab_set.tabs().len() - 1;
-        assert_eq!(metadata(&app)[front].attention, ChipLevel::Off);
-        assert!(crate::fabric::apply_hold_for_test(
-            &ctx,
-            Some(crate::fabric::Hold {
-                reason: "pause".into(),
-                origin: "local".into(),
-            })
-        ));
-        app.refresh_presence_session(sid, false);
-        assert_eq!(metadata(&app)[front].attention, ChipLevel::Stop);
-        assert_eq!(ChipLevel::Stop.chrome_states(), &["attention", "stop"]);
-        assert!(crate::fabric::apply_hold_for_test(&ctx, None));
-        app.refresh_presence_session(sid, false);
-        assert_eq!(app.presence_level(wid), Level::Story);
-        assert_eq!(metadata(&app)[front].attention, ChipLevel::Story);
-        app.note_human_acted(wid);
-        assert_eq!(metadata(&app)[front].attention, ChipLevel::Off);
-        assert_eq!(chip_of_attention(true), ChipLevel::Wait);
-        assert!(ChipLevel::Off < ChipLevel::Story && ChipLevel::Story < ChipLevel::Wait);
-        assert!(ChipLevel::Wait < ChipLevel::Stop);
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, sid, ctx) = app_with_stub();
+            let metadata = |app: &App| -> Vec<crate::tab_bar::TabStripMetadata> {
+                let mut m: Vec<_> = app.windows[&wid]
+                    .tab_set
+                    .tabs()
+                    .iter()
+                    .map(|t| crate::tab_bar::TabStripMetadata::from_presentation(&t.presentation))
+                    .collect();
+                app.stamp_presence_chips(wid, &mut m);
+                m
+            };
+            let front = app.windows[&wid].tab_set.tabs().len() - 1;
+            assert_eq!(metadata(&app)[front].attention, ChipLevel::Off);
+            assert!(crate::fabric::apply_hold_for_test(
+                &ctx,
+                Some(crate::fabric::Hold {
+                    reason: "pause".into(),
+                    origin: "local".into(),
+                })
+            ));
+            app.refresh_presence_session(sid, false);
+            assert_eq!(metadata(&app)[front].attention, ChipLevel::Stop);
+            assert_eq!(ChipLevel::Stop.chrome_states(), &["attention", "stop"]);
+            assert!(crate::fabric::apply_hold_for_test(&ctx, None));
+            app.refresh_presence_session(sid, false);
+            assert_eq!(app.presence_level(wid), Level::Story);
+            assert_eq!(metadata(&app)[front].attention, ChipLevel::Story);
+            app.note_human_acted(wid);
+            assert_eq!(metadata(&app)[front].attention, ChipLevel::Off);
+            assert_eq!(chip_of_attention(true), ChipLevel::Wait);
+            assert!(ChipLevel::Off < ChipLevel::Story && ChipLevel::Story < ChipLevel::Wait);
+            assert!(ChipLevel::Wait < ChipLevel::Stop);
+        });
     }
 
     /// THE A11Y ROUND TRIP (§7), the App side: the band's message is the sixth
@@ -1675,7 +1777,7 @@ mod tests {
         s.absorb(
             Facts {
                 role: Some("worker:claude-satcomp".into()),
-                revision: 1,
+                agent_seq: 1,
                 agent: agent(AgentPhase::Busy, Some(41)),
                 hand: Hand::DrivenTurn {
                     id: 41,
@@ -1797,49 +1899,76 @@ mod tests {
     /// R2: a cooperative lease that LAPSES (its driver crashed) posts no wake;
     /// the model arms its expiry as a deadline and the tick re-reads the hand,
     /// so the teal rim and `◂ holder` lift when `lease status` says `none`.
+    /// A LINK READER WAITS OUT A SIBLING'S LIVE LINK SECTION (2026-09-24). The
+    /// v-fast gate of 83b38be87 failed `review_r2` once with `level=note` and a
+    /// `✉0  ~` band — a sibling test's un-acked bridge read through the
+    /// process-global link, because the test did not take the section every
+    /// reader takes. Deterministically: a thread holds a section with an
+    /// un-acked bridge for 300 ms while `review_r2` runs; taking the reset, it
+    /// waits the section out and reads `quiet` (without it, it read `note`).
+    #[test]
+    fn review_r2_waits_out_a_siblings_live_link_section() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sibling = std::thread::spawn(move || {
+            crate::fabric::with_link_reset(|| {
+                crate::fabric::bridge_attached(crate::fabric::next_bridge_generation());
+                tx.send(()).expect("the reader waits for this");
+                std::thread::sleep(Duration::from_millis(300));
+            });
+        });
+        rx.recv().expect("the sibling's section is live");
+        review_r2_a_lapsed_drive_lease_lifts_the_rim();
+        sibling.join().expect("the sibling section ends");
+    }
+
     #[test]
     fn review_r2_a_lapsed_drive_lease_lifts_the_rim() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        let now_us = crate::metrics::now_us();
-        *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Drive {
-            holder: "manager".into(),
-            expires_us: now_us + 20_000,
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, sid, ctx) = app_with_stub();
+            let now_us = crate::metrics::now_us();
+            *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Drive {
+                holder: "manager".into(),
+                expires_us: now_us + 20_000,
+            });
+            app.on_presence_wake(&ctx.self_id, false);
+            assert_eq!(app.presence_level(wid), Level::Driven);
+            assert_eq!(line(&app, wid).1, "drive");
+            let armed = app
+                .presence_deadline(Instant::now())
+                .expect("the lease's lapse is a deadline");
+            assert!(
+                armed <= Instant::now() + Duration::from_millis(20),
+                "armed at the lapse, not a second later"
+            );
+            std::thread::sleep(Duration::from_millis(60));
+            assert!(
+                !ctx.turn_lease
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_live(crate::metrics::now_us()),
+                "the lease has lapsed"
+            );
+            // Every timer the model armed has fired.
+            let now = Instant::now();
+            let deadline = app.presence_deadline(now);
+            let _ = app.presence_tick(deadline.map_or(now, |d| d.max(now)));
+            let (text, rim) = line(&app, wid);
+            assert_eq!(
+                (rim, app.presence_status_tail(sid)),
+                ("none", "hand=- level=quiet story=0 why=-".to_string()),
+                "`lease status` says none but the window says rim={rim} band=`{text}`"
+            );
+            assert_eq!(app.presence_view(wid).unwrap().rows, 0, "the row folded");
+            assert!(
+                app.presence_deadline(Instant::now()).is_none(),
+                "nothing re-arms on a quiet window"
+            );
         });
-        app.on_presence_wake(&ctx.self_id, false);
-        assert_eq!(app.presence_level(wid), Level::Driven);
-        assert_eq!(line(&app, wid).1, "drive");
-        let armed = app
-            .presence_deadline(Instant::now())
-            .expect("the lease's lapse is a deadline");
-        assert!(
-            armed <= Instant::now() + Duration::from_millis(20),
-            "armed at the lapse, not a second later"
-        );
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(
-            !ctx.turn_lease
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .is_live(crate::metrics::now_us()),
-            "the lease has lapsed"
-        );
-        // Every timer the model armed has fired.
-        let now = Instant::now();
-        let deadline = app.presence_deadline(now);
-        let _ = app.presence_tick(deadline.map_or(now, |d| d.max(now)));
-        let (text, rim) = line(&app, wid);
-        assert_eq!(
-            (rim, app.presence_status_tail(sid)),
-            ("none", "hand=- level=quiet story=0".to_string()),
-            "`lease status` says none but the window says rim={rim} band=`{text}`"
-        );
-        assert_eq!(app.presence_view(wid).unwrap().rows, 0, "the row folded");
-        assert!(
-            app.presence_deadline(Instant::now()).is_none(),
-            "nothing re-arms on a quiet window"
-        );
     }
 
     /// R3: a turn that TIMES OUT drops the lease while the worker is still
@@ -1852,7 +1981,7 @@ mod tests {
         s.absorb(
             Facts {
                 role: Some("worker:claude-satcomp".into()),
-                revision: 1,
+                agent_seq: 1,
                 shell: Some(("running", now)),
                 agent: agent(AgentPhase::Busy, Some(40)),
                 hand: Hand::DrivenTurn {
@@ -1868,7 +1997,7 @@ mod tests {
         s.absorb(
             Facts {
                 role: Some("worker:claude-satcomp".into()),
-                revision: 1,
+                agent_seq: 1,
                 shell: Some(("running", now)),
                 agent: None,
                 hand: Hand::None,
@@ -1905,7 +2034,7 @@ mod tests {
         s.absorb(
             Facts {
                 role: Some("worker:claude-satcomp".into()),
-                revision: 2,
+                agent_seq: 2,
                 shell: Some(("idle", later)),
                 agent: agent(AgentPhase::Idle, Some(40)),
                 turn: Some(TurnFact {
@@ -1930,33 +2059,38 @@ mod tests {
     /// rim stays, and the mail slot names the task, not the note.
     #[test]
     fn review_r4_an_unread_task_still_waits_after_a_later_note() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        let fabric_sid = ctx.self_id.as_str();
-        let reply = crate::fabric::cmd_deliver(
-            &app.store,
-            &format!("{fabric_sid} off=1 from=h-x kind=task trust=human text=please"),
-        );
-        assert!(reply.starts_with("OK"), "{reply}");
-        app.on_presence_wake(&ctx.self_id, false);
-        assert_eq!(app.presence_level(wid), Level::Attention);
-        assert_eq!(line(&app, wid).1, "wait");
-        let reply = crate::fabric::cmd_deliver(
-            &app.store,
-            &format!("{fabric_sid} off=2 from=s-y kind=note trust=agent text=fyi"),
-        );
-        assert!(reply.starts_with("OK"), "{reply}");
-        app.on_presence_wake(&ctx.self_id, false);
-        let (text, rim) = line(&app, wid);
-        assert_eq!(
-            (app.presence_level(wid), rim),
-            (Level::Attention, "wait"),
-            "the task from h-x is still unread; band `{text}`, status `{}`",
-            app.presence_status_tail(sid)
-        );
-        assert!(
-            text.contains("\u{2709}2 task\u{2190}\u{2713}h-x"),
-            "the slot names the waiting task: {text}"
-        );
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, sid, ctx) = app_with_stub();
+            let fabric_sid = ctx.self_id.as_str();
+            let reply = crate::fabric::cmd_deliver(
+                &app.store,
+                &format!("{fabric_sid} off=1 from=h-x kind=task trust=human text=please"),
+            );
+            assert!(reply.starts_with("OK"), "{reply}");
+            app.on_presence_wake(&ctx.self_id, false);
+            assert_eq!(app.presence_level(wid), Level::Attention);
+            assert_eq!(line(&app, wid).1, "wait");
+            let reply = crate::fabric::cmd_deliver(
+                &app.store,
+                &format!("{fabric_sid} off=2 from=s-y kind=note trust=agent text=fyi"),
+            );
+            assert!(reply.starts_with("OK"), "{reply}");
+            app.on_presence_wake(&ctx.self_id, false);
+            let (text, rim) = line(&app, wid);
+            assert_eq!(
+                (app.presence_level(wid), rim),
+                (Level::Attention, "wait"),
+                "the task from h-x is still unread; band `{text}`, status `{}`",
+                app.presence_status_tail(sid)
+            );
+            assert!(
+                text.contains("\u{2709}2 task\u{2190}\u{2713}h-x"),
+                "the slot names the waiting task: {text}"
+            );
+        });
     }
 
     /// R5: a `since` that prints seconds — `3m12s` included — ticks every
@@ -1997,9 +2131,10 @@ mod tests {
         s.absorb(
             Facts {
                 role: Some("worker:claude-satcomp".into()),
-                revision: 1,
+                agent_seq: 1,
                 agent: agent(
-                    AgentPhase::Limited {
+                    AgentPhase::Wall {
+                        kind: aterm_phase::WallKind::UsageSession,
                         reset: Some("19:30".into()),
                         until: Some(now + Duration::from_secs(2 * 3600)),
                     },
@@ -2029,9 +2164,10 @@ mod tests {
         let mut u = Slot::new(now);
         u.absorb(
             Facts {
-                revision: 1,
+                agent_seq: 1,
                 agent: agent(
-                    AgentPhase::Limited {
+                    AgentPhase::Wall {
+                        kind: aterm_phase::WallKind::UsageSession,
                         reset: Some("19:30".into()),
                         until: None,
                     },
@@ -2056,9 +2192,10 @@ mod tests {
         let mut s = Slot::new(now);
         s.absorb(
             Facts {
-                revision: 1,
+                agent_seq: 1,
                 agent: agent(
-                    AgentPhase::Limited {
+                    AgentPhase::Wall {
+                        kind: aterm_phase::WallKind::UsageSession,
                         reset: Some("19:30".into()),
                         until: Some(now + Duration::from_secs(165_600)),
                     },
@@ -2081,32 +2218,37 @@ mod tests {
     /// width (one margin cell each side), never a slot past the margin.
     #[test]
     fn review_r7_chrome_band_is_the_row_the_human_sees() {
-        let (mut app, wid, _sid, _ctx) = app_with_stub();
-        let now = Instant::now();
-        let w = driven_words(now);
-        let whole = w.fit(160);
-        let cols = whole.chars().count() as u16;
-        {
-            let ws = app.windows.get_mut(&wid).unwrap();
-            ws.presence.words = Some(w.clone());
-            ws.presence.rows = 1;
-            ws.cols = cols;
-        }
-        let painted = crate::status_bars::paint_presence_row(
-            &w,
-            usize::from(cols),
-            aterm_render::Theme::default(),
-        );
-        let (band, _) = app.presence_report(wid).unwrap();
-        assert_eq!(
-            band,
-            text_of(&painted),
-            "at {cols} columns the wire and the row disagree"
-        );
-        assert!(
-            !band.contains("\u{27df}"),
-            "the rtt fell off the row: {band}"
-        );
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, _sid, _ctx) = app_with_stub();
+            let now = Instant::now();
+            let w = driven_words(now);
+            let whole = w.fit(160);
+            let cols = whole.chars().count() as u16;
+            {
+                let ws = app.windows.get_mut(&wid).unwrap();
+                ws.presence.words = Some(w.clone());
+                ws.presence.rows = 1;
+                ws.cols = cols;
+            }
+            let painted = crate::message_band::paint_presence_row(
+                &w,
+                usize::from(cols),
+                aterm_render::Theme::default(),
+            );
+            let (band, _) = app.presence_report(wid).unwrap();
+            assert_eq!(
+                band,
+                text_of(&painted),
+                "at {cols} columns the wire and the row disagree"
+            );
+            assert!(
+                !band.contains("\u{27df}"),
+                "the rtt fell off the row: {band}"
+            );
+        });
     }
 
     /// R8: a turn is attributed only to the session the dispatch resolved as
@@ -2116,70 +2258,75 @@ mod tests {
     /// `adv3_…` for the seam itself).
     #[test]
     fn review_r8_a_turn_is_not_attributed_to_a_read_only_observer() {
-        let (mut app, wid, sid_a, ctx_a) = app_with_stub();
-        let ia = app.windows[&wid].tab_set.tabs().len() - 1;
-        let sid_b = app.next_session_id;
-        app.push_stub_tab(wid, crate::stub_session(sid_b));
-        let ctx_b = app.pool.get(sid_b).unwrap().ctx.clone();
-        ctx_b.meta.lock().unwrap().role = Some("watcher".into());
-        {
-            let mut edges = ctx_a.edges.lock().unwrap();
-            let _ = edges.grant(
-                ctx_b.self_id.clone(),
-                ctx_a.self_id.clone(),
-                aterm_session::Op::ReadScreen,
-                ctx_a.nonce,
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, sid_a, ctx_a) = app_with_stub();
+            let ia = app.windows[&wid].tab_set.tabs().len() - 1;
+            let sid_b = app.next_session_id;
+            app.push_stub_tab(wid, crate::stub_session(sid_b));
+            let ctx_b = app.pool.get(sid_b).unwrap().ctx.clone();
+            ctx_b.meta.lock().unwrap().role = Some("watcher".into());
+            {
+                let mut edges = ctx_a.edges.lock().unwrap();
+                let _ = edges.grant(
+                    ctx_b.self_id.clone(),
+                    ctx_a.self_id.clone(),
+                    aterm_session::Op::ReadScreen,
+                    ctx_a.nonce,
+                );
+            }
+            app.switch_tab_in(wid, ia);
+            assert_eq!(app.focused_session_id(wid), Some(sid_a));
+            // A turn over the Owner token (the CLI): no write edge is involved.
+            *ctx_a.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+                id: 41,
+                driver: None,
+            });
+            app.on_presence_wake(&ctx_a.self_id, false);
+            let (text, _) = line(&app, wid);
+            assert!(
+                !text.contains("watcher"),
+                "a read-screen edge cannot type a turn, yet the band names it: `{text}` (status `{}`)",
+                app.presence_status_tail(sid_a)
             );
-        }
-        app.switch_tab_in(wid, ia);
-        assert_eq!(app.focused_session_id(wid), Some(sid_a));
-        // A turn over the Owner token (the CLI): no write edge is involved.
-        *ctx_a.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
-            id: 41,
-            driver: None,
-        });
-        app.on_presence_wake(&ctx_a.self_id, false);
-        let (text, _) = line(&app, wid);
-        assert!(
-            !text.contains("watcher"),
-            "a read-screen edge cannot type a turn, yet the band names it: `{text}` (status `{}`)",
-            app.presence_status_tail(sid_a)
-        );
-        assert!(text.contains("\u{25c2} turn 41"), "{text}");
-        assert!(
-            app.presence_status_tail(sid_a).starts_with("hand=turn:41 "),
-            "{}",
-            app.presence_status_tail(sid_a)
-        );
-        // A WRITE edge from the same session changes nothing by itself: the
-        // lease still names nobody.
-        {
-            let mut edges = ctx_a.edges.lock().unwrap();
-            let _ = edges.grant(
-                ctx_b.self_id.clone(),
-                ctx_a.self_id.clone(),
-                aterm_session::Op::WriteInput,
-                ctx_a.nonce,
+            assert!(text.contains("\u{25c2} turn 41"), "{text}");
+            assert!(
+                app.presence_status_tail(sid_a).starts_with("hand=turn:41 "),
+                "{}",
+                app.presence_status_tail(sid_a)
             );
-        }
-        app.refresh_presence_session(sid_a, false);
-        let (text, _) = line(&app, wid);
-        assert!(text.contains("\u{25c2} turn 41"), "{text}");
-        assert!(!text.contains("watcher"), "{text}");
-        // A turn whose lease names that session as its driver: now it is.
-        *ctx_a.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
-            id: 42,
-            driver: Some(ctx_b.self_id.clone()),
+            // A WRITE edge from the same session changes nothing by itself: the
+            // lease still names nobody.
+            {
+                let mut edges = ctx_a.edges.lock().unwrap();
+                let _ = edges.grant(
+                    ctx_b.self_id.clone(),
+                    ctx_a.self_id.clone(),
+                    aterm_session::Op::WriteInput,
+                    ctx_a.nonce,
+                );
+            }
+            app.refresh_presence_session(sid_a, false);
+            let (text, _) = line(&app, wid);
+            assert!(text.contains("\u{25c2} turn 41"), "{text}");
+            assert!(!text.contains("watcher"), "{text}");
+            // A turn whose lease names that session as its driver: now it is.
+            *ctx_a.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+                id: 42,
+                driver: Some(ctx_b.self_id.clone()),
+            });
+            app.refresh_presence_session(sid_a, false);
+            let (text, _) = line(&app, wid);
+            assert!(text.contains("\u{25c2} watcher \u{00b7} turn 42"), "{text}");
+            assert!(
+                app.presence_status_tail(sid_a)
+                    .starts_with("hand=turn:42:watcher "),
+                "{}",
+                app.presence_status_tail(sid_a)
+            );
         });
-        app.refresh_presence_session(sid_a, false);
-        let (text, _) = line(&app, wid);
-        assert!(text.contains("\u{25c2} watcher \u{00b7} turn 42"), "{text}");
-        assert!(
-            app.presence_status_tail(sid_a)
-                .starts_with("hand=turn:42:watcher "),
-            "{}",
-            app.presence_status_tail(sid_a)
-        );
     }
 
     /// R9: a cache hit on the frame path returns the cached row itself — no
@@ -2216,7 +2363,7 @@ mod tests {
         let mut s = Slot::new(now);
         s.absorb(
             Facts {
-                revision: 1,
+                agent_seq: 1,
                 agent: agent(AgentPhase::Idle, None),
                 hold: Some(HoldFact {
                     reason: "fabric-lost".into(),
@@ -2227,7 +2374,7 @@ mod tests {
             now,
         );
         let w = presence::words(&s, now, 0);
-        let row = crate::status_bars::paint_presence_row(&w, 120, aterm_render::Theme::default());
+        let row = crate::message_band::paint_presence_row(&w, 120, aterm_render::Theme::default());
         let at = row
             .iter()
             .position(|c| c.ch == '\u{1f512}')
@@ -2327,7 +2474,7 @@ mod tests {
                     "\u{2298} hold pause \u{00b7}fleet\u{1f512}  \u{25c2} manager \u{00b7} turn 9"
                         .into(),
                 ),
-                revision: 1,
+                agent_seq: 1,
                 agent: agent(AgentPhase::Idle, None),
                 ..Facts::default()
             },
@@ -2354,25 +2501,30 @@ mod tests {
     /// review` — the stop's duration behind the told word, as an age.
     #[test]
     fn a_told_word_under_a_hold_carries_no_stop_duration() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        // The slot's baseline first, so the hold that follows is news (a hold
-        // already standing at the mint is state — `adv7`).
-        app.refresh_presence_session(sid, false);
-        assert!(crate::fabric::apply_hold_for_test(
-            &ctx,
-            Some(crate::fabric::Hold {
-                reason: "review".into(),
-                origin: "local".into(),
-            })
-        ));
-        app.on_presence_wake(&ctx.self_id, false);
-        assert_eq!(app.tell_story(sid, StoryVerb::Approval, ""), Ok(2));
-        let (text, _) = line(&app, wid);
-        assert!(
-            text.contains("\u{2713} approved  \u{2298} hold review"),
-            "{text}"
-        );
-        assert!(!text.contains("approved 0s"), "{text}");
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, sid, ctx) = app_with_stub();
+            // The slot's baseline first, so the hold that follows is news (a hold
+            // already standing at the mint is state — `adv7`).
+            app.refresh_presence_session(sid, false);
+            assert!(crate::fabric::apply_hold_for_test(
+                &ctx,
+                Some(crate::fabric::Hold {
+                    reason: "review".into(),
+                    origin: "local".into(),
+                })
+            ));
+            app.on_presence_wake(&ctx.self_id, false);
+            assert_eq!(app.tell_story(sid, StoryVerb::Approval, ""), Ok(2));
+            let (text, _) = line(&app, wid);
+            assert!(
+                text.contains("\u{2713} approved  \u{2298} hold review"),
+                "{text}"
+            );
+            assert!(!text.contains("approved 0s"), "{text}");
+        });
     }
 
     // ───────── the second adversarial review (honesty-cost), 2026-09-19 ─────────
@@ -2597,128 +2749,134 @@ mod tests {
     /// says `▸ @<sid>` for exactly the length of that turn.
     #[test]
     fn adv3_an_owner_turn_is_not_credited_to_a_standing_write_edge() {
-        let (mut app, wid, sid_a, ctx_a) = app_with_stub();
-        let ia = app.windows[&wid].tab_set.tabs().len() - 1;
-        let sid_b = app.next_session_id;
-        app.push_stub_tab(wid, crate::stub_session(sid_b));
-        let ib = app.windows[&wid].tab_set.tabs().len() - 1;
-        let ctx_b = app.pool.get(sid_b).unwrap().ctx.clone();
-        ctx_b.meta.lock().unwrap().role = Some("manager".into());
-        {
-            let mut edges = ctx_a.edges.lock().unwrap();
-            let _ = edges.grant(
-                ctx_b.self_id.clone(),
-                ctx_a.self_id.clone(),
-                aterm_session::Op::WriteInput,
-                ctx_a.nonce,
-            );
-        }
-        app.switch_tab_in(wid, ia);
-        assert_eq!(app.focused_session_id(wid), Some(sid_a));
-        // A real `turn` on A through the lease seam, with the driver the
-        // dispatch resolved: `None` is the Owner CLI's `aterm ctl @A turn …`
-        // (its scope check passes, and it is nobody on the fabric).
-        let term_a = app.pool.get(sid_a).unwrap().term.clone();
-        let store = app.store.clone();
-        let run_turn = |driver: Option<SessionId>| {
-            let term = term_a.clone();
-            let store = store.clone();
-            let ctx = ctx_a.clone();
-            std::thread::spawn(move || {
-                let subscribers = crate::subscribe::new_registry();
-                let paste = |_: &str| true;
-                let press = |_: &str| true;
-                crate::control::cmd_turn(
-                    &term,
-                    &store,
-                    sid_a,
-                    "idle=300 timeout=4000 submit=none -- hello",
-                    &subscribers,
-                    &ctx,
-                    &crate::control::TurnIo {
-                        paste: &paste,
-                        press: &press,
-                        driver,
-                        ..crate::control::TurnIo::paste_only()
-                    },
-                )
-            })
-        };
-        let wait_for_lease = |ctx: &crate::SessionCtx| -> u64 {
-            for _ in 0..200 {
-                if let Some(crate::Lease::Turn { id, .. }) = ctx.turn_lease.lock().unwrap().as_ref()
-                {
-                    return *id;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+        // Reads the process-global link (a sibling test's un-acked bridge
+        // reads as `level=note` and a `~` band), so it takes the reset like
+        // every other reader.
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, sid_a, ctx_a) = app_with_stub();
+            let ia = app.windows[&wid].tab_set.tabs().len() - 1;
+            let sid_b = app.next_session_id;
+            app.push_stub_tab(wid, crate::stub_session(sid_b));
+            let ib = app.windows[&wid].tab_set.tabs().len() - 1;
+            let ctx_b = app.pool.get(sid_b).unwrap().ctx.clone();
+            ctx_b.meta.lock().unwrap().role = Some("manager".into());
+            {
+                let mut edges = ctx_a.edges.lock().unwrap();
+                let _ = edges.grant(
+                    ctx_b.self_id.clone(),
+                    ctx_a.self_id.clone(),
+                    aterm_session::Op::WriteInput,
+                    ctx_a.nonce,
+                );
             }
-            panic!("the turn never held the lease");
-        };
+            app.switch_tab_in(wid, ia);
+            assert_eq!(app.focused_session_id(wid), Some(sid_a));
+            // A real `turn` on A through the lease seam, with the driver the
+            // dispatch resolved: `None` is the Owner CLI's `aterm ctl @A turn …`
+            // (its scope check passes, and it is nobody on the fabric).
+            let term_a = app.pool.get(sid_a).unwrap().term.clone();
+            let store = app.store.clone();
+            let run_turn = |driver: Option<SessionId>| {
+                let term = term_a.clone();
+                let store = store.clone();
+                let ctx = ctx_a.clone();
+                std::thread::spawn(move || {
+                    let subscribers = crate::subscribe::new_registry();
+                    let paste = |_: &str| true;
+                    let press = |_: &str| true;
+                    crate::control::cmd_turn(
+                        &term,
+                        &store,
+                        sid_a,
+                        "idle=300 timeout=4000 submit=none -- hello",
+                        &subscribers,
+                        &ctx,
+                        &crate::control::TurnIo {
+                            paste: &paste,
+                            press: &press,
+                            driver,
+                            ..crate::control::TurnIo::paste_only()
+                        },
+                    )
+                })
+            };
+            let wait_for_lease = |ctx: &crate::SessionCtx| -> u64 {
+                for _ in 0..200 {
+                    if let Some(crate::Lease::Turn { id, .. }) =
+                        ctx.turn_lease.lock().unwrap().as_ref()
+                    {
+                        return *id;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!("the turn never held the lease");
+            };
 
-        // 1. The Owner's turn: no driver, whatever edges stand.
-        let runner = run_turn(None);
-        let id = wait_for_lease(&ctx_a);
-        app.refresh_presence_session(sid_a, false);
-        let (text, _) = line(&app, wid);
-        let tail = app.presence_status_tail(sid_a);
-        let sentence = app
-            .presence_view(wid)
-            .unwrap()
-            .words
-            .as_ref()
-            .map(|w| w.sentence.clone())
-            .unwrap_or_default();
-        assert!(runner.join().unwrap().starts_with("OK"));
-        assert!(
-            !text.contains("manager"),
-            "an Owner-token turn {id} is credited to the standing write edge: band=`{text}` status=`{tail}` sentence=`{sentence}`"
-        );
-        assert!(text.contains(&format!("\u{25c2} turn {id}")), "{text}");
-        assert!(tail.starts_with(&format!("hand=turn:{id} ")), "{tail}");
-        assert!(
-            sentence.starts_with(&format!("driven, turn {id}")),
-            "{sentence}"
-        );
-        // Settled: the lease is gone and the hand with it.
-        app.refresh_presence_session(sid_a, false);
-        assert!(app.presence_status_tail(sid_a).starts_with("hand=- "));
+            // 1. The Owner's turn: no driver, whatever edges stand.
+            let runner = run_turn(None);
+            let id = wait_for_lease(&ctx_a);
+            app.refresh_presence_session(sid_a, false);
+            let (text, _) = line(&app, wid);
+            let tail = app.presence_status_tail(sid_a);
+            let sentence = app
+                .presence_view(wid)
+                .unwrap()
+                .words
+                .as_ref()
+                .map(|w| w.sentence.clone())
+                .unwrap_or_default();
+            assert!(runner.join().unwrap().starts_with("OK"));
+            assert!(
+                !text.contains("manager"),
+                "an Owner-token turn {id} is credited to the standing write edge: band=`{text}` status=`{tail}` sentence=`{sentence}`"
+            );
+            assert!(text.contains(&format!("\u{25c2} turn {id}")), "{text}");
+            assert!(tail.starts_with(&format!("hand=turn:{id} ")), "{tail}");
+            assert!(
+                sentence.starts_with(&format!("driven, turn {id}")),
+                "{sentence}"
+            );
+            // Settled: the lease is gone and the hand with it.
+            app.refresh_presence_session(sid_a, false);
+            assert!(app.presence_status_tail(sid_a).starts_with("hand=- "));
 
-        // 2. The manager's turn over its edge: the edge's source is the
-        // driver, named by its role — and the manager's own band says `▸ @A`.
-        let runner = run_turn(Some(ctx_b.self_id.clone()));
-        let id = wait_for_lease(&ctx_a);
-        app.refresh_presence_session(sid_a, false);
-        app.refresh_presence_session(sid_b, false);
-        let (text, _) = line(&app, wid);
-        assert!(
-            text.contains(&format!("\u{25c2} manager \u{00b7} turn {id}")),
-            "{text}"
-        );
-        assert!(
-            app.presence_status_tail(sid_a)
-                .starts_with(&format!("hand=turn:{id}:manager "))
-        );
-        app.switch_tab_in(wid, ib);
-        app.refresh_presence_window(wid);
-        let (text_b, _) = line(&app, wid);
-        let short = presence::short_sid(ctx_a.self_id.as_str());
-        assert!(
-            text_b.contains(&format!("\u{25b8} @{short}")),
-            "the driver's band: `{text_b}`"
-        );
-        assert!(
-            app.presence_status_tail(sid_b).starts_with("hand=driving:"),
-            "{}",
-            app.presence_status_tail(sid_b)
-        );
-        assert!(runner.join().unwrap().starts_with("OK"));
-        // The turn settled: the manager drives nobody now, edge or no edge.
-        app.refresh_presence_session(sid_b, false);
-        assert!(
-            app.presence_status_tail(sid_b).starts_with("hand=- "),
-            "{}",
-            app.presence_status_tail(sid_b)
-        );
+            // 2. The manager's turn over its edge: the edge's source is the
+            // driver, named by its role — and the manager's own band says `▸ @A`.
+            let runner = run_turn(Some(ctx_b.self_id.clone()));
+            let id = wait_for_lease(&ctx_a);
+            app.refresh_presence_session(sid_a, false);
+            app.refresh_presence_session(sid_b, false);
+            let (text, _) = line(&app, wid);
+            assert!(
+                text.contains(&format!("\u{25c2} manager \u{00b7} turn {id}")),
+                "{text}"
+            );
+            assert!(
+                app.presence_status_tail(sid_a)
+                    .starts_with(&format!("hand=turn:{id}:manager "))
+            );
+            app.switch_tab_in(wid, ib);
+            app.refresh_presence_window(wid);
+            let (text_b, _) = line(&app, wid);
+            let short = presence::short_sid(ctx_a.self_id.as_str());
+            assert!(
+                text_b.contains(&format!("\u{25b8} @{short}")),
+                "the driver's band: `{text_b}`"
+            );
+            assert!(
+                app.presence_status_tail(sid_b).starts_with("hand=driving:"),
+                "{}",
+                app.presence_status_tail(sid_b)
+            );
+            assert!(runner.join().unwrap().starts_with("OK"));
+            // The turn settled: the manager drives nobody now, edge or no edge.
+            app.refresh_presence_session(sid_b, false);
+            assert!(
+                app.presence_status_tail(sid_b).starts_with("hand=- "),
+                "{}",
+                app.presence_status_tail(sid_b)
+            );
+        });
     }
 
     /// ADV-4: the hand slot is TEXT (`◂ manager · turn 41`, `⊘ hold review
@@ -2767,7 +2925,7 @@ mod tests {
         for (name, s, _) in rows(now) {
             let w = presence::words(&s, now, 0);
             for theme in [aterm_render::Theme::default(), light()] {
-                let row = crate::status_bars::paint_presence_row(&w, 120, theme);
+                let row = crate::message_band::paint_presence_row(&w, 120, theme);
                 for cell in row.iter().filter(|c| c.ch != ' ') {
                     assert!(
                         contrast(cell.fg, cell.bg) >= 4.5,
@@ -2950,7 +3108,7 @@ mod tests {
         assert_eq!(chip, ChipLevel::Off, "the read story shows no dot");
         assert_eq!(
             app.presence_status_tail(sid_a),
-            "hand=- level=quiet story=1",
+            "hand=- level=quiet story=1 why=-",
             "the chip is off but `status` says: {}",
             app.presence_status_tail(sid_a)
         );

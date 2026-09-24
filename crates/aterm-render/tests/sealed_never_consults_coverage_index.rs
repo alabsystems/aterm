@@ -34,7 +34,7 @@ const PROBES: &[char] = &[
     '\u{23F8}',  // ⏸ — symbol slot
     '\u{2AFF}',  // ⫿ — math operator (Arial Unicode / STIX territory)
     '\u{0E01}',  // ก — Thai
-    '\u{FDD2}',  // noncharacter: the honest `.notdef`
+    '\u{FFFF}',  // noncharacter: the honest `.notdef`
 ];
 
 #[test]
@@ -83,7 +83,7 @@ fn a_sealed_system_generation_never_builds_or_queries_the_coverage_index() {
     // here, last.
     let mut unsealed = Renderer::from_system(18.0, Theme::default()).expect("resolved once");
     unsealed.debug_block_on_lazy_fallbacks();
-    let key = unsealed.glyph_key('\u{FDD2}');
+    let key = unsealed.glyph_key('\u{FFFF}');
     let _ = unsealed.glyph_image(key);
     assert!(
         aterm_render::font_coverage_scan_queries() > 0,

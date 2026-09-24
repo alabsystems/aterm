@@ -207,8 +207,15 @@ impl App {
             // Windows has a real `IFileOpenDialog` now, and both document
             // runtimes already worked here — so the rows come alive from the
             // same predicate Settings ▸ Wallpaper's button asks, and stay grey
-            // wherever the dialog genuinely cannot open.
-            local_file_picker_available: crate::menu::local_file_picker_available(),
+            // wherever the dialog genuinely cannot open. HEADLESS is one such
+            // place, folded here rather than in the platform predicate: a
+            // headless instance has no glass to hang the panel on, and since
+            // its launch posture is `Prohibited` (see `launch_posture`) AppKit
+            // could not present the modal at all — `invoke OpenMarkdown` must
+            // answer "disabled", never park the main thread in a modal nothing
+            // can dismiss.
+            local_file_picker_available: !self.headless
+                && crate::menu::local_file_picker_available(),
             front_hold,
             presence_band: self.presence_band_on(),
             presence_rim: self.presence_rim_on(),
@@ -708,7 +715,7 @@ mod tests {
                 .expect("open palette")
                 .controls_lines()
                 .iter()
-                .any(|line| line.contains("Updated to v"))
+                .any(|line| line.contains("Updated to aterm v"))
         };
         assert!(
             has_realized_row(&app),
@@ -953,6 +960,28 @@ mod tests {
                 "{action} remains discoverable"
             );
         }
+    }
+
+    /// A headless instance has no glass to hang a file picker on — and since
+    /// its launch posture is `Prohibited` it could not even present the
+    /// `NSOpenPanel` — so the two local-file rows read disabled there, and
+    /// `invoke OpenMarkdown` answers "disabled" instead of parking the main
+    /// thread in a modal nothing can dismiss. Windowed, the platform predicate
+    /// decides as before.
+    #[test]
+    fn local_file_open_rows_are_disabled_headless() {
+        let mut app = App::headless_for_test();
+        assert!(app.headless, "the fixture is headless");
+        assert!(
+            !app.palette_live().local_file_picker_available,
+            "no picker on a headless instance"
+        );
+        app.headless = false;
+        assert_eq!(
+            app.palette_live().local_file_picker_available,
+            crate::menu::local_file_picker_available(),
+            "windowed: the platform predicate decides"
+        );
     }
 
     #[test]

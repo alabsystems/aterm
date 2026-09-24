@@ -32,6 +32,8 @@ use crate::native_updater_service::{
 
 fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus {
     DurableUpdateStatus {
+        linux_host: false,
+        linux: None,
         enabled: true,
         current_build: 10,
         staged_build,
@@ -55,6 +57,7 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
         apply_failures_for_target: 0,
         installable: true,
         channel_unreadable: false,
+        checked_at: None,
     }
 }
 
@@ -876,6 +879,7 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
         hands_off_keys: true,
         output_quiet: true,
         focused: true,
+        consent_warmup: false,
     };
     for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
         for quiet in [false, true] {
@@ -952,7 +956,8 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
 /// phases, and the shipping `automatic_park_refusal` — the ONE predicate the
 /// entry gate and the park gate both read — must admit exactly the states in
 /// which the model's `Park` is enabled, over every phase and every combination
-/// of the four terminal facts. The mutant's stand-down is the 2026-09-20
+/// of the five facts (the four about the terminal, and the user's consent
+/// warm-up, which no phase relaxes). The mutant's stand-down is the 2026-09-20
 /// incident, caught here as a wedge: the busy terminal that never updates.
 #[test]
 fn real_apply_ladder_admits_exactly_the_model_s_park() {
@@ -979,12 +984,13 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
             apply_phase(since_armed + std::time::Duration::from_secs(1)),
             phase
         );
-        for bits in 0..16u32 {
+        for bits in 0..32u32 {
             let facts = ActivityFacts {
                 quiet: bits & 1 != 0,
                 hands_off_keys: bits & 2 != 0,
                 output_quiet: bits & 4 != 0,
                 focused: bits & 8 != 0,
+                consent_warmup: bits & 16 != 0,
             };
             let mut state = model.init_state();
             state.insert("phase", modeled);
@@ -992,6 +998,7 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
             state.insert("keys", i64::from(facts.hands_off_keys));
             state.insert("output", i64::from(facts.output_quiet));
             state.insert("focused", i64::from(facts.focused));
+            state.insert("warmup", i64::from(facts.consent_warmup));
             let model_parks = !model.successors("Park", &state).is_empty();
             let real_parks = automatic_park_refusal(phase, facts).is_none();
             assert_eq!(
@@ -1004,6 +1011,43 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
             }
         }
     }
+
+    // THE WARM-UP AT THE BOUND. Past `LANDS_WITHIN` the shipping predicate and
+    // the model both still refuse a park over the user's warm-up, and the
+    // model's warm-up ending is what lets the landing through.
+    let mut at_bound = model.init_state();
+    for _ in 0..3 {
+        at_bound = model.successors("Advance", &at_bound)[0].clone();
+    }
+    assert_eq!(at_bound["phase"], 3);
+    let warming = model.successors("WarmupStarts", &at_bound)[0].clone();
+    assert_exact_model_action(&model, "WarmupStarts", &at_bound, &warming);
+    assert!(model.successors("Park", &warming).is_empty());
+    let busy_warmup = ActivityFacts {
+        quiet: false,
+        hands_off_keys: false,
+        output_quiet: false,
+        focused: true,
+        consent_warmup: true,
+    };
+    assert!(automatic_park_refusal(apply_phase(LANDS_WITHIN), busy_warmup).is_some());
+    let ended = model.successors("WarmupEnds", &warming)[0].clone();
+    assert_eq!(model.successors("Park", &ended)[0]["landed"], 1);
+    assert_eq!(
+        automatic_park_refusal(
+            apply_phase(LANDS_WITHIN),
+            ActivityFacts {
+                consent_warmup: false,
+                ..busy_warmup
+            }
+        ),
+        None
+    );
+    // NEGATIVE CONTROL: the mutant's ruleless park lands over the warm-up and
+    // the invariant catches it.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let over_dialog = buggy.successors("ParkWithoutTheRule", &warming)[0].clone();
+    assert!(!buggy.check_invariant("ParkedOnlyWhenTheLadderAdmits", &over_dialog));
 
     // The healthy ladder always lands; the mutant wedges a busy terminal.
     let landed = |state: &State| state["landed"] == 1;
@@ -1052,8 +1096,8 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
     assert_exact_model_action(&model, "Lapse", &aged, &lapsed);
     assert_eq!(lapsed["phase"], 3);
 
-    // The shipping App on the same arc: anchored 930 s ago, latched with a
-    // deadline that has passed.
+    // The shipping App on the same arc: anchored past the bound, latched with
+    // a deadline that has passed.
     let mut app = crate::App::headless_for_test();
     let build = app.native_updater_service.snapshot().current_build + 1;
     let now = std::time::Instant::now();

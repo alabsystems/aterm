@@ -7,7 +7,7 @@
 //! `aterm.app` has the same three sources every provisioned program has: a DMG
 //! drag-install, the Homebrew cask (`auto_updates true`: brew never upgrades it), or
 //! `tools/install.sh`. The updater updates the RUNNING bundle's location only; a
-//! second copy elsewhere (`~/Applications`, a dev `dist/aterm.app`, a Caskroom
+//! second copy elsewhere (`~/Applications`, a Caskroom
 //! leftover) is not its owner and is left alone (`install::trial_owned_by`). So
 //! `aterm --version` and Settings ▸ About name the path of the running copy and, when
 //! another `aterm.app` sits in one of the usual places, say so in ONE sentence — the
@@ -35,15 +35,15 @@ use std::path::{Path, PathBuf};
 /// it. A person's is not. Two of the three are a mistake they can undo in one
 /// drag, and the third is not a fault at all.
 ///
-/// Re-exported here rather than reimplemented: the classification is the pure
-/// path logic that sits beside [`crate::bundle::resolve_from`], so the reason
-/// shown to a human and the refusal acted on by the updater are the same
-/// judgement and cannot drift apart.
-/// macOS-only, like the module it comes from: `bundle` is `#[cfg(target_os =
-/// "macos")]` because the whole notion of an `.app` that can be translocated is,
-/// and every other `crate::bundle` use in this file is gated the same way.
+/// The presentation value is portable so all-host message builders can render
+/// these facts. Only the macOS probe classifies a real bundle; exposing the
+/// enum does not infer an install posture for another platform.
+pub use crate::install_posture::InstallPosture;
+
+/// The real macOS path classification remains platform-specific, shared with
+/// the updater's bundle admission rather than independently reimplemented.
 #[cfg(target_os = "macos")]
-pub use crate::bundle::{InstallPosture, posture_from};
+pub use crate::bundle::posture_from;
 
 /// What the running copy IS — decides whether the updater's promise ("the updater
 /// updates only this one") may be made at all.

@@ -215,8 +215,9 @@
 //! one name is an error at the *use site*, in a file that only builds on
 //! Windows and Linux. So this crate exports no `Result`, no `Error`, no
 //! `AllocationError`, and none of `aterm_log`'s extras (`env`,
-//! `sanitize_record`, `should_truncate`, `MAX_LOG_BYTES`, `MAX_RECORD_BYTES`,
-//! `__log`). Every name it does export is a name upstream `log` exports.
+//! `sanitize_record`, `sanitize_record_for`, `record_cap`, `should_rotate`,
+//! `MAX_LOG_BYTES`, `MAX_RECORD_BYTES`, `MAX_ALERT_RECORD_BYTES`, `__log`).
+//! Every name it does export is a name upstream `log` exports.
 //!
 //! # `unused_variables` in the consumers, and why it is safe *here*
 //!

@@ -1806,6 +1806,9 @@ fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::S
         "windows" | "window and tabs" | "window & tabs" => Some(SettingsRoute::WindowTabs),
         "input" | "keyboard" | "keyboard and input" => Some(SettingsRoute::KeyboardInput),
         "update" | "software updates" => Some(SettingsRoute::SoftwareUpdate),
+        // The owner's word is "log"; the log's page is Settings ▸ Messages.
+        "log" | "logs" | "history" | "history log" | "activity log" | "message log"
+        | "messages log" => Some(SettingsRoute::Messages),
         _ => None,
     }
 }
@@ -3627,6 +3630,11 @@ mod video_parse_tests {
             ("input", SettingsRoute::KeyboardInput),
             ("update", SettingsRoute::SoftwareUpdate),
             ("prefs", SettingsRoute::Home),
+            ("log", SettingsRoute::Messages),
+            ("logs", SettingsRoute::Messages),
+            ("history", SettingsRoute::Messages),
+            ("activity log", SettingsRoute::Messages),
+            ("messages", SettingsRoute::Messages),
         ] {
             assert_eq!(parse_settings_section_route(alias), Some(route), "{alias}");
         }

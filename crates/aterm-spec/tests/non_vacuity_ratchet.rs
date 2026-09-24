@@ -505,6 +505,9 @@ const UNCAUGHT: &[(&str, &[&str])] = &[
         &["DeliveryIsClassifiedAndAtMostOnce", "StateBounded"],
     ),
     ("CursorHintLicense", &["StateBounded"]),
+    ("RainbowTypedContinuity", &["Bounded"]),
+    ("SameCaretTypedEcho", &["Bounded"]),
+    ("UnknownInsertOrphanKey", &["Bounded"]),
     ("EchoLedgerBridge", &["StateBounded"]),
     (
         "CursorViewportLifecycle",
@@ -686,6 +689,10 @@ const UNCAUGHT: &[(&str, &[&str])] = &[
     ),
     ("PredictiveEchoVisibility", &["Bounds"]),
     ("OutputEchoReceiptPublication", &["StateBounded"]),
+    // The 0..2 queue counts define this bounded model's state space; the
+    // cross-session design claim is DecisionReadsOnlySelectedSink, which the
+    // process-wide ACTIVE mutant falsifies.
+    ("PasteOrderSinkIsolation", &["PendingIsBounded"]),
     (
         "StreamingSearch",
         &[

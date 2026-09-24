@@ -101,6 +101,7 @@ fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> 
 fn missing_against_index(
     layout: &Layout,
     installed: &std::collections::BTreeMap<String, u64>,
+    dev_linked: &std::collections::BTreeSet<String>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let Some(index) = crate::cli::cached_index(layout) else {
         return (Vec::new(), Vec::new(), Vec::new());
@@ -109,10 +110,15 @@ fn missing_against_index(
         &crate::cli::wanted_programs(layout, &index, crate::config::cached()),
         installed,
         &layout.removed_programs(),
-        &crate::linkmode::linked_programs(layout)
-            .into_iter()
-            .collect(),
+        dev_linked,
     )
+}
+
+/// Development links are explicit provisioning too, without a signed build number.
+/// Inspect the actual shim destinations: a marker alone must not hide an empty,
+/// deleted, non-executable, or redirected checkout from the health report.
+fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<String>, Vec<String>) {
+    crate::linkmode::live_dev_links(layout)
 }
 
 /// The decision [`missing_against_index`] makes, without the I/O: which wanted programs
@@ -151,6 +157,17 @@ fn split_missing(
     (unexplained, on_purpose, dev_linked)
 }
 
+/// Whether one `status.toml` row is a fault [`recorded_problems`] lists: a real program
+/// (a `-`-prefixed key is a stray row, never a program) in a problem state
+/// ([`is_problem_state`]). Public so the window's Settings ▸ Packages badge counts the
+/// doctor's own list; the badge then drops what the doctor also drops on a DECLINED store
+/// (everything), and the one fault nobody can act on
+/// ([`crate::state::is_unserved_toolset`]).
+#[must_use]
+pub fn is_recorded_problem(name: &str, state: &str) -> bool {
+    !name.starts_with('-') && is_problem_state(state)
+}
+
 /// EVERY recorded fault, formatted `"<program>: <state>"`, in program order — `BTreeMap`
 /// order, i.e. alphabetical by program name.
 ///
@@ -167,90 +184,25 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
         .map(|s| {
             s.programs
                 .iter()
-                .filter(|(name, _)| !name.starts_with('-'))
-                .filter(|(_, p)| is_problem_state(&p.state))
+                .filter(|(name, p)| is_recorded_problem(name, &p.state))
                 .map(|(name, p)| format!("{name}: {}", p.state))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// The doctor line for a bundle whose executables carry `com.apple.provenance` — the
-/// count, one example, the CAUSE when the store recorded one (`recorded`: the
-/// `<build>.tracked-install` record a tracked installer left when its untracked lane
-/// could not run, [`crate::store::tracked_install_record`]), what it breaks, and the
-/// cure. Pure, so the words are pinned by a test that mints a synthetic attribute rather
-/// than the one it cannot.
-pub(crate) fn provenance_bundle_line(
-    program: &str,
-    build: u64,
-    bin: &Path,
-    scan: &crate::provenance::Scan,
-    recorded: Option<&str>,
-) -> String {
-    let example = scan
-        .carriers
-        .first()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let cause = match recorded {
-        // The RECORD's own reason, verbatim — never a mechanism this line picks. Two
-        // outcomes write the record (`install::decide_tracked_stage`): an in-process
-        // stage, and a KEPT lane tree that came back tagged. Naming the first as the
-        // cause made the second read "staged in-process … because the untracked lane
-        // ran", a sentence contradicting its own evidence.
-        Some(why) => format!(" — recorded cause: {why}"),
-        None => String::new(),
-    };
+/// The ONE doctor line for installed files that still carry `com.apple.provenance` — the
+/// files every package pass and `aterm pkg repair` clear ([`crate::provenance::heal_store`])
+/// and could not: how many, what that breaks, and the verb that tries again. At most 160
+/// characters with the speaker's prefix. Pure, so the words are pinned by a test that
+/// mints a synthetic attribute rather than the one it cannot.
+pub(crate) fn provenance_line(scan: &crate::provenance::Scan) -> String {
+    let n = scan.carriers.len();
     format!(
-        "warn — {program} build {build} carries com.apple.provenance on {} of {} file(s) in {} \
-         (e.g. {example}){cause} — {}. fix: {}",
-        scan.carriers.len(),
-        scan.total,
-        bin.display(),
-        crate::provenance::WHAT_IT_BREAKS,
-        crate::provenance::REMEDY.replace("<program>", program),
-    )
-}
-
-/// The doctor line for a build that carries a tracked-install record but whose `bin/`
-/// scan finds no tagged file: the record is stale (a re-stage cleared the tag but not,
-/// somehow, the record) and says so rather than accusing a clean bundle.
-pub(crate) fn provenance_stale_record_line(
-    program: &str,
-    build: u64,
-    bin: &Path,
-    recorded: &str,
-) -> String {
-    format!(
-        "warn — {program} build {build} carries a tracked-install record ({recorded}) but no \
-         file in {} carries com.apple.provenance — a stale record; `aterm pkg uninstall \
-         {program} && aterm pkg install {program}` re-stages and clears it",
-        bin.display()
-    )
-}
-
-/// The doctor line for tagged shims in the managed `bin/`: a shim is exec'd as a script,
-/// so the tag on it tracks the tool it forwards to whatever the bundle carries.
-pub(crate) fn provenance_shim_line(bin_dir: &Path, scan: &crate::provenance::Scan) -> String {
-    let example = scan
-        .carriers
-        .first()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    format!(
-        "warn — {} of {} shim(s) in {} carry com.apple.provenance (e.g. {example}) — a shim is \
-         a `#!/bin/sh` script the kernel execs, so a tagged shim makes the tool it forwards to \
-         provenance-tracked even when the bundle behind it is clean (its output is tagged, and \
-         a release cut built through it is refused after the claim). fix: `aterm pkg repair` \
-         re-lays them — this atpkg lays shims through an untracked launchd job when it \
-         measures itself as tracked, so any shell will do; the cutter itself resolves the \
-         bundle's bin/ directly and never goes through a shim",
-        scan.carriers.len(),
-        scan.total,
-        bin_dir.display(),
+        "warn — {} still {} a macOS tag (com.apple.provenance) that release builds refuse. \
+         fix: aterm pkg repair",
+        crate::provenance::count_of(n, "installed file"),
+        if n == 1 { "carries" } else { "carry" },
     )
 }
 
@@ -306,6 +258,35 @@ pub struct Probes {
     /// cannot be minted by a test (`xattr -w com.apple.provenance` is refused), so the
     /// scan is exercised with a `user.*` attribute through the very `listxattr` path.
     pub provenance_attr: &'static str,
+    /// Whether packages update here on their own: the manager armed, and `[packages]
+    /// enabled` on — Automatic updates, default on, with the retired `auto_update` folded
+    /// in ([`crate::config::PackagesConfig::enabled`]). With [`Self::excluded`], what the
+    /// never-checked line may claim of the vendor programs.
+    pub automatic: bool,
+    /// The programs `[packages] exclude` names: never updated here, by any lane.
+    pub excluded: Vec<String>,
+    /// What the `[packages]` table's own spelling asks of its owner — a retired key to
+    /// rename or remove ([`crate::config::PackagesConfig::config_notes`]), one `note` line
+    /// each.
+    pub config_notes: Vec<String>,
+    /// A `[packages] prefix` this shipped build does not use, naming another store
+    /// ([`crate::config::PackagesConfig::ignored_prefix`]): a `warn`, because nothing is
+    /// installed unattended until the line goes.
+    pub ignored_prefix: Option<PathBuf>,
+    /// Retired environment opt-outs still EXPORTED to this process — `(name, the setting
+    /// that replaced it)` ([`retired_opt_outs_exported`]): a `warn` each, because the
+    /// person who set one believes something is off that is not.
+    pub retired_env: Vec<(&'static str, &'static str)>,
+    /// What an agent program's reroute stub reads besides PATH, as the shell that ran this
+    /// report sees it ([`crate::reroute::StubEnv::of_process`]): (10d) says what `claude`
+    /// typed there does, and the stub decides at exec time on exactly these. The default
+    /// is a shell outside aterm.
+    pub stub_env: crate::reroute::StubEnv,
+    /// Whether this store's index source is the one the channel-head probe watches
+    /// ([`crate::index_probe::probes_this_source`]): then (8) reads the probe's cached
+    /// answer back and says whether a newer index is published. Default `false` — a
+    /// private or repointed registry has no probe, so there is nothing to report.
+    pub index_head: bool,
 }
 
 impl Default for Probes {
@@ -314,8 +295,57 @@ impl Default for Probes {
             workspace: None,
             local_seal: None,
             provenance_attr: crate::provenance::PROVENANCE_XATTR,
+            automatic: true,
+            excluded: Vec::new(),
+            config_notes: Vec::new(),
+            ignored_prefix: None,
+            retired_env: Vec::new(),
+            stub_env: crate::reroute::StubEnv::default(),
+            index_head: false,
         }
     }
+}
+
+/// The environment opt-outs Phase 4 deleted (2026-09-23) that a person may still export
+/// from a shell rc — each with the setting that replaced it. The README and SECURITY
+/// taught `ATERM_NO_AUTO_UPDATE=1`, and `ATPKG_DISABLE` switched the whole manager off;
+/// once they became inert, a machine they were meant to hold still started checking,
+/// staging and installing again, and nothing said why.
+///
+/// THE ONE PLACE A RETIRED NAME IS READ, and it reads PRESENCE only — never the value, and
+/// nothing acts on it: this is the doctor telling a person their switch no longer does
+/// anything and naming the one that does. `crates/aterm-update-core/tests/env_reads.rs`
+/// admits this table by name (`RETIRED_DETECTOR`) and no other read of these names.
+pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
+    (
+        "ATERM_NO_AUTO_UPDATE",
+        "[update] enabled = false (Settings ▸ Terminal ▸ Updates)",
+    ),
+    (
+        "ATERM_NO_AUTO_APPLY",
+        "[update] auto_apply = false (Settings ▸ Software Update)",
+    ),
+    (
+        "ATPKG_DISABLE",
+        "[packages] enabled = false (Settings ▸ Packages)",
+    ),
+    (
+        "ATERM_REROUTE_QUIET",
+        "[reroute] announce = false (Settings ▸ Packages)",
+    ),
+    ("ATERM_NO_REROUTE", "aterm --no-reroute"),
+    ("ATERM_NO_HARNESS", "[harness] enabled = false"),
+];
+
+/// Which [`RETIRED_OPT_OUTS`] are exported to this process (set at all, whatever the
+/// value — an exported `=0` is still a line in an rc a person should delete).
+#[must_use]
+pub fn retired_opt_outs_exported() -> Vec<(&'static str, &'static str)> {
+    RETIRED_OPT_OUTS
+        .iter()
+        .copied()
+        .filter(|(name, _)| std::env::var_os(name).is_some())
+        .collect()
 }
 
 /// The publisher-side act that cures an `UnknownField` verdict: publish the newer
@@ -428,25 +458,47 @@ fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealPro
     })
 }
 
-/// Run the health surface, printing the report. Returns `true` iff there were NO structural
-/// problems (`main` maps `false` → exit 1). Reads the real environment (home + PATH + clock
-/// + the `[packages]` config account + the token chain's SOURCE label — never the token).
+/// How much of the report a person asked for: the problems (the default), or everything
+/// the doctor checked (`--verbose`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// The verdict, then only what needs attention — each in one short line with its next
+    /// step — and the one next act.
+    Problems,
+    /// The verdict, then every row and its whole explanation.
+    Everything,
+}
+
+/// Run the health surface, printing the report ([`present`]). Returns `true` iff there
+/// were NO structural problems (`main` maps `false` → exit 1). Reads the real environment:
+/// home, PATH, the clock, the `[packages]` config's account, automatic-update switches and
+/// exclusions, and the token chain's SOURCE label — never the token.
 #[must_use]
-pub fn run(layout: &Layout, prefix: &str) -> bool {
+pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
-    // Which source supplies a GitHub token (§5.1 private-repo aid): `$ATPKG_TOKEN`,
-    // else aterm-update-core's chain. Only the LABEL is surfaced.
+    // Which source supplies a GitHub token (§5.1 private-repo aid): aterm-update-core's
+    // chain, consulted only for a repointed destination. Only the LABEL is surfaced.
     let (_token, token_source) = crate::cli::resolve_pkg_token(layout);
+    let cfg = crate::config::cached();
     let probes = Probes {
         workspace: std::env::current_dir()
             .ok()
             .and_then(|cwd| probe_workspace_policy(layout, &cwd)),
         local_seal: probe_local_seal(layout, home.as_deref()),
         provenance_attr: crate::provenance::PROVENANCE_XATTR,
+        automatic: crate::manager_enabled() && cfg.enabled(),
+        excluded: cfg.exclude().to_vec(),
+        config_notes: cfg.config_notes(),
+        ignored_prefix: cfg.ignored_prefix.clone(),
+        retired_env: retired_opt_outs_exported(),
+        stub_env: crate::reroute::StubEnv::of_process(),
+        index_head: crate::index_probe::probes_this_source(),
     };
-    run_with(
+    let mut report = Vec::new();
+    let mut faults = Vec::new();
+    let healthy = run_with(
         layout,
         home.as_deref(),
         path.as_deref(),
@@ -455,9 +507,270 @@ pub fn run(layout: &Layout, prefix: &str) -> bool {
         token_source.as_deref(),
         prefix,
         &probes,
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
-    )
+        &mut report,
+        &mut faults,
+    );
+    let shown = present(
+        &String::from_utf8_lossy(&report),
+        &String::from_utf8_lossy(&faults),
+        prefix,
+        detail,
+    );
+    // The verdict first, then the structural faults — still on stderr, where they always
+    // were — then the rest. Written the way the checks' own lines always were, errors
+    // ignored: a reader that closed the pipe (`doctor | head`) costs an `EPIPE` nobody
+    // sees, never a panic.
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(shown.verdict.as_bytes());
+    let _ = stdout.flush();
+    let _ = std::io::stderr().write_all(shown.faults.as_bytes());
+    let _ = stdout.write_all(shown.rest.as_bytes());
+    let _ = stdout.flush();
+    healthy
+}
+
+/// The longest line the default report prints — a row, its next step included.
+pub const SHORT_ROW: usize = 160;
+
+/// The head of the line a declined store's report carries — said by default too
+/// ([`present`]): it is why nothing is installed.
+const DECLINED_LINE: &str = "the ALab toolset was removed on this machine";
+
+/// The report as [`present`] lays it out, in the order it is printed: the verdict, the
+/// structural faults ([`run_with`]'s stderr lines, which stay on stderr), then the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Presented {
+    pub verdict: String,
+    pub faults: String,
+    pub rest: String,
+}
+
+impl Presented {
+    /// The three parts in the order they are printed — what a terminal shows.
+    #[must_use]
+    pub fn joined(&self) -> String {
+        format!("{}{}{}", self.verdict, self.faults, self.rest)
+    }
+}
+
+/// THE REPORT AS A PERSON READS IT (2026-09-23). [`run_with`]'s full report was 44 lines
+/// and 16 KB on the owner's Mac: fourteen warnings up to 1,100 characters, nine `ok` lines
+/// burying the one warning a person could act on — and then `healthy`. So the report
+/// leads with its VERDICT, and by default ([`Detail::Problems`]) says only what needs
+/// attention: each `warn`/`FAIL`/`PROBLEM` row in one line of at most [`SHORT_ROW`]
+/// characters — the fact, and its next step when the row names one — then the one next
+/// act, and where the rest is. `healthy` is said only when nothing at all was flagged;
+/// a report with warnings and no fault is "working", with the count of what to look at.
+/// [`Detail::Everything`] prints the verdict and then every line the checks wrote. Pure
+/// over the full report's text — `report` its stdout, `faults` its stderr — so the exit
+/// code and every check stay [`run_with`]'s.
+#[must_use]
+pub fn present(report: &str, faults: &str, p: &str, detail: Detail) -> Presented {
+    let head = format!("{p}: ");
+    let mut problems: Vec<String> = Vec::new();
+    let mut body: Vec<&str> = Vec::new();
+    let mut verdict: Option<&str> = None;
+    let mut next: Option<&str> = None;
+    let mut active: Option<&str> = None;
+    let mut elided = false;
+    // A row as the default report prints it, and whether that dropped anything: a
+    // `warn`/`FAIL`/`PROBLEM` row in its short form, any other line cut to fit.
+    let shorten = |line: &str| -> (String, bool) {
+        let rest = line.strip_prefix(&head).unwrap_or(line);
+        let level = ["warn", "FAIL", "PROBLEM"]
+            .into_iter()
+            .find(|l| rest.starts_with(&format!("{l} \u{2014} ")));
+        let row = match level {
+            Some(level) => short_row(p, level, &rest[level.len() + " \u{2014} ".len()..]),
+            None if line.chars().count() > SHORT_ROW => {
+                let mut row: String = line.chars().take(SHORT_ROW - 1).collect();
+                row.push('\u{2026}');
+                row
+            }
+            None => line.to_string(),
+        };
+        let cut = row != line;
+        (row, cut)
+    };
+    for line in report.lines() {
+        let rest = line.strip_prefix(&head).unwrap_or(line);
+        if rest == "healthy"
+            || rest.starts_with("not healthy \u{2014} ")
+            || (rest.starts_with("found ") && rest.ends_with(" problem(s)"))
+        {
+            verdict = Some(rest);
+            continue;
+        }
+        if rest.starts_with("next \u{2014} ") {
+            next = Some(line);
+            continue;
+        }
+        body.push(line);
+        if let Some(count) = rest.strip_suffix(" program(s) active")
+            && count.chars().all(|c| c.is_ascii_digit())
+        {
+            active = Some(count);
+        }
+        let flagged_row = ["warn", "FAIL", "PROBLEM"]
+            .iter()
+            .any(|l| rest.starts_with(&format!("{l} \u{2014} ")));
+        // The recorded problems a PROBLEM verdict lists, indented under it — and the
+        // one plain fact that explains an empty store: it was removed on purpose.
+        if flagged_row || rest.starts_with("  ") || rest.starts_with(DECLINED_LINE) {
+            let (row, cut) = shorten(line);
+            elided |= cut;
+            problems.push(row);
+        } else {
+            elided = true;
+        }
+    }
+    // The structural faults, one row each, whole under `--verbose`.
+    let mut fault_rows: Vec<String> = Vec::new();
+    for line in faults.lines() {
+        match detail {
+            Detail::Everything => fault_rows.push(line.to_string()),
+            Detail::Problems => {
+                let (row, cut) = shorten(line);
+                elided |= cut;
+                fault_rows.push(row);
+            }
+        }
+    }
+    let flagged = fault_rows.len()
+        + problems
+            .iter()
+            .filter(|r| {
+                let rest = r.strip_prefix(&head).unwrap_or(r);
+                !rest.starts_with("  ") && !rest.starts_with(DECLINED_LINE)
+            })
+            .count();
+    // Not "ALab program(s)": the count includes the vendor-direct agents ([`run_with`]).
+    let programs = active.map_or_else(String::new, |n| format!("{n} program(s) installed"));
+    let verdict_line = match verdict {
+        Some("healthy") if flagged == 0 => match programs.as_str() {
+            "" => format!("{p}: healthy"),
+            programs => format!("{p}: healthy \u{2014} {programs} and working"),
+        },
+        Some("healthy") => match programs.as_str() {
+            "" => format!("{p}: working \u{2014} {flagged} thing(s) to look at"),
+            programs => {
+                format!("{p}: working \u{2014} {programs}; {flagged} thing(s) to look at")
+            }
+        },
+        Some(said) => format!("{p}: {said}"),
+        None => format!("{p}: {flagged} thing(s) to look at"),
+    };
+    let mut rest = String::new();
+    let rows: Vec<&str> = match detail {
+        Detail::Everything => body,
+        Detail::Problems => problems.iter().map(String::as_str).collect(),
+    };
+    for row in rows {
+        rest.push_str(row);
+        rest.push('\n');
+    }
+    if let Some(next) = next {
+        rest.push_str(next);
+        rest.push('\n');
+    }
+    if detail == Detail::Problems && elided {
+        rest.push_str(&format!("{p}: the full report: aterm pkg {p} --verbose\n"));
+    }
+    let mut faults = String::new();
+    for row in fault_rows {
+        faults.push_str(&row);
+        faults.push('\n');
+    }
+    Presented {
+        verdict: format!("{verdict_line}\n"),
+        faults,
+        rest,
+    }
+}
+
+/// One problem row in at most [`SHORT_ROW`] characters: the row as written when it fits,
+/// else its first clause — the fact, up to the first ` — `, `; ` or sentence end — and
+/// the next step the row names ([`next_step`]), the fact cut short with a visible `…` if
+/// the two still do not fit.
+fn short_row(p: &str, level: &str, text: &str) -> String {
+    let whole = format!("{p}: {level} \u{2014} {text}");
+    if whole.chars().count() <= SHORT_ROW {
+        return whole;
+    }
+    let fact = text[..first_clause_end(text)]
+        .trim_end()
+        .trim_end_matches('.');
+    let lead = format!("{p}: {level} \u{2014} ");
+    // The step is what a person acts on, so the fact yields room to it, never the reverse.
+    let tail = next_step(text).map_or_else(String::new, |step| format!(" \u{2014} {step}"));
+    let room = SHORT_ROW
+        .saturating_sub(lead.chars().count() + tail.chars().count())
+        .max(20);
+    let fact: String = if fact.chars().count() > room {
+        let mut cut: String = fact.chars().take(room - 1).collect();
+        cut.push('…');
+        cut
+    } else {
+        fact.to_string()
+    };
+    format!("{lead}{fact}{tail}")
+}
+
+/// Where a row's first clause ends: at its first ` — `, `; ` or `. ` outside parentheses
+/// and backticks (a parenthetical's `;` is not the end of the fact), else the whole row.
+fn first_clause_end(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (at, c) in text.char_indices() {
+        match c {
+            '`' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0
+            && !quoted
+            && [" \u{2014} ", "; ", ". "]
+                .iter()
+                .any(|sep| text[at..].starts_with(sep))
+        {
+            return at;
+        }
+    }
+    text.len()
+}
+
+/// The ONE next step a row names: its `fix:`, `now:` or `or add:` clause (a PATH line to
+/// paste), else the first `aterm …` command it quotes in backticks. `None` when the row
+/// names none, or only one too long to leave room for the fact beside it.
+fn next_step(text: &str) -> Option<String> {
+    let clause = |word: &str| {
+        text.find(word).map(|at| {
+            let rest = &text[at + word.len()..];
+            rest.split(" \u{2014} ")
+                .next()
+                .unwrap_or(rest)
+                .split(" (")
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .trim_end_matches(['.', ';'])
+                .to_string()
+        })
+    };
+    let step = clause("fix: ")
+        .or_else(|| clause("Fix: "))
+        .map(|fix| format!("fix: {fix}"))
+        .or_else(|| clause("now: ").map(|now| format!("run {now}")))
+        .or_else(|| clause("or add: ").map(|line| format!("add: {line}")))
+        .or_else(|| {
+            let at = text.find("`aterm ")?;
+            let cmd = &text[at + 1..];
+            let end = cmd.find('`')?;
+            Some(format!("run `{}`", &cmd[..end]))
+        })?;
+    (step.chars().count() <= 110 && !step.is_empty()).then_some(step)
 }
 
 /// The testable core: `home`, the `PATH` value, `now`, the `[packages].account`
@@ -526,14 +839,13 @@ pub fn run_with(
     } else {
         let _ = writeln!(
             out,
-            "{p}: warn — disabled/inert (no paper master compiled in \
-             (pins::PAPER_MASTER_PUBKEYS is empty), or ATPKG_DISABLE set) — this build \
-             installs nothing"
+            "{p}: warn — disabled/inert (no paper master compiled in: \
+             pins::PAPER_MASTER_PUBKEYS is empty) — this build installs nothing"
         );
     }
-    // Loud token provenance (never the token itself): which source of the
-    // `$ATPKG_TOKEN` → aterm-update-core chain (env → keychain → 0600 file →
-    // `$GITHUB_TOKEN`/`$GH_TOKEN` → `gh auth token`) supplied a credential.
+    // Loud token provenance (never the token itself): which rung of aterm-update-core's
+    // chain (keychain → 0600 file → `gh auth token`; no environment rung) supplied a
+    // credential.
     match token_source {
         Some(src) => {
             let _ = writeln!(
@@ -544,13 +856,31 @@ pub fn run_with(
         None => {
             let _ = writeln!(
                 out,
-                "{p}: ok — no GitHub token in use (anonymous API: fine for public repos, \
-             rate-limited; `$ATPKG_TOKEN` is always honoured, and a repointed account or a \
-             private `[packages.links]` override also consults the app updater's chain — \
-             `$ATERM_UPDATE_TOKEN`, keychain, 0600 file, `$GITHUB_TOKEN`/`$GH_TOKEN`, \
-             `gh auth token`)"
+                "{p}: ok — no GitHub token in use (anonymous API: fine for the public index, \
+             rate-limited; only a development build's repointed account or private \
+             `[packages.links]` override consults the app updater's chain — keychain, \
+             0600 file, `gh auth token`)"
             );
         }
+    }
+    // The table's own spelling: a retired key to rename or remove. Notes, never failures —
+    // every one of them is still honoured or harmlessly ignored.
+    for note in &probes.config_notes {
+        let _ = writeln!(out, "{p}: note — {note}");
+    }
+    if let Some(ignored) = probes.ignored_prefix.as_deref() {
+        let _ = writeln!(
+            out,
+            "{p}: warn — {}",
+            crate::config::ignored_prefix_note(ignored)
+        );
+    }
+    for (name, setting) in &probes.retired_env {
+        let _ = writeln!(
+            out,
+            "{p}: warn — ${name} is exported but no longer does anything (2026-09-23: no \
+             environment variable changes a shipped aterm) — delete it and use {setting}"
+        );
     }
 
     // (2) PREFIX / STORE.
@@ -593,7 +923,12 @@ pub fn run_with(
     // BY DESIGN (the prepend is session-scoped, never machine-wide), and a missing stub
     // is re-laid at the next spawn. Doctor names; it never lays.
     let reroute_dir = layout.reroute_dir();
-    for (name, state) in crate::reroute::states(layout) {
+    // …and every agent program whose `agents/` twin stands (2026-09-23): its stub is what
+    // routes `claude` to the managed copy at exec time in a shell whose PATH predates it.
+    let agent_rows = crate::reroute::agents_routes(layout)
+        .into_iter()
+        .map(|name| (name, crate::reroute::stub_state(layout, name)));
+    for (name, state) in crate::reroute::states(layout).into_iter().chain(agent_rows) {
         match state {
             crate::reroute::StubState::Laid => {
                 let _ = writeln!(out, "{p}: ok — reroute stub {name} laid");
@@ -706,7 +1041,8 @@ pub fn run_with(
             fails += 1;
             let _ = writeln!(
                 err,
-                "{p}: FAIL — active {program} build {build} store missing/incomplete"
+                "{p}: FAIL — active {} store missing/incomplete",
+                crate::vendor_direct::display_build(program, *build)
             );
             if next_install_program.is_none() {
                 next_install_program = Some(program.clone());
@@ -716,11 +1052,11 @@ pub fn run_with(
     let _ = writeln!(out, "{p}: ok — {} program(s) active", active.len());
 
     // (5a) THE INSTALLER ITSELF, when it is a browser download. A quarantined app is
-    // provenance-tracked in EVERY invocation — a job launchd spawns from it included,
-    // which is the escape the untracked lane leans on — so its installs go through the
-    // lane's copy plan and its own executable is the carrier. Named here because every
-    // surface said "a probe file it wrote came back tagged" and none said why
-    // (2026-09-14). A note, not a warning: the lane handles it.
+    // provenance-tracked in EVERY invocation, so every file it lays would carry the tag
+    // were the installs not staged and cleared the way they are. A note, not a warning:
+    // nothing is wrong, and the line says why installs from it still come out clean
+    // (2026-09-14: every surface said "a probe file it wrote came back tagged" and none
+    // said why).
     if let Some(carrier) = std::env::current_exe()
         .ok()
         .and_then(|exe| std::fs::canonicalize(exe).ok())
@@ -728,78 +1064,30 @@ pub fn run_with(
     {
         let _ = writeln!(
             out,
-            "{p}: note — {} carries com.apple.quarantine (a browser download): every \
-             process this app starts is provenance-tracked, so its installs and shims go \
-             through the untracked launchd lane; an app laid down by aterm's own updater \
-             carries no such tag",
+            "{p}: note — {} is a browser download (com.apple.quarantine); what it installs \
+             is still cleared of the macOS tag",
             carrier.display()
         );
     }
 
-    // (5b) PROVENANCE-TAGGED EXECUTABLES AND SHIMS (macOS).
+    // (5b) INSTALLED FILES THAT STILL CARRY `com.apple.provenance` (macOS).
     //
-    // macOS stamps `com.apple.provenance` on every file a provenance-tracked process
-    // writes, and a process is tracked when its executable carries the tag or its parent
-    // does (measured 2026-09-12 — `crate::provenance`). So a bundle seeded from a tracked
-    // shell — an agent started from a tagged `claude`, a shell inside a tracked aterm.app —
-    // carries the tag on `bin/trustc`, every object file and proof snapshot a release cut
-    // builds with it inherits the tag, and tools/proof_snapshot.py refuses them AFTER the
-    // ledger claim: v0.83.0 burned a build number on `trust/8590`. The shims in the managed
-    // `bin/` are checked too: a shim is a `#!/bin/sh` script the kernel execs, and a tagged
-    // one tracks the tool it forwards to even when the bundle behind it is clean.
+    // A file a provenance-tracked process writes carries the tag, and a tagged executable,
+    // shim or dylib tags what it writes in turn — every object file and proof snapshot a
+    // release cut builds with it, which tools/proof_snapshot.py refuses AFTER the ledger
+    // claim (v0.83.0 burned a build number on `trust/8590`). Every package pass and
+    // `aterm pkg repair` clear it ([`crate::provenance::heal_store`]); this reads what the
+    // clearing left, over the same roots, and says it in ONE line — nothing when clean.
     //
-    // A WARNING, never a PROBLEM: every tool still runs — only a release cut cannot use it
-    // — and doctor does not measure whether THIS process is tracked (that takes a probe
-    // write, and doctor never mutates); it reports what is on disk and names the cure.
+    // A WARNING, never a PROBLEM: every tool still runs — only a release cut cannot use
+    // it — and doctor clears nothing itself: it reports what is on disk.
     if cfg!(target_os = "macos") {
-        for (program, build) in &active {
-            let build_dir = layout.build_dir(program, *build);
-            let bin = build_dir.join("bin");
-            // `bin/` and `lib/` both: a tagged dylib tracks the process that loads it
-            // (measured 2026-09-15 — `trustc` loads the bundle's `libstd`/`librustc_driver`),
-            // so a clean `bin/` over a tagged `lib/` is a tracked compiler all the same.
-            let mut scan = crate::provenance::tagged_files_in(&bin, probes.provenance_attr);
-            let lib = crate::provenance::tagged_files_under(
-                &build_dir.join("lib"),
-                probes.provenance_attr,
-            );
-            scan.total += lib.total;
-            scan.carriers.extend(lib.carriers);
-            // The CAUSE, when the store recorded one: a tracked installer that staged
-            // this build in-process because its untracked lane could not run wrote
-            // `<build>.tracked-install` beside it, and the line names it rather than
-            // leaving the operator to guess which shell seeded what.
-            let recorded = crate::store::tracked_install_record(&build_dir);
-            if scan.carriers.is_empty() {
-                if let Some(why) = &recorded {
-                    let _ = writeln!(
-                        out,
-                        "{p}: {}",
-                        provenance_stale_record_line(program, *build, &bin, why)
-                    );
-                }
-                continue;
-            }
-            let _ = writeln!(
-                out,
-                "{p}: {}",
-                provenance_bundle_line(program, *build, &bin, &scan, recorded.as_deref())
-            );
-        }
-        // Every directory of executables atpkg lays, not `bin/` alone: the `agents/`
-        // twin is what actually runs `claude`/`codex` (first on every PATH) and is laid
-        // by its own lane job, and the reroute stubs run every upstream `cargo`/`rustc`
-        // typed in a session — a tagged file in either tracks the tool exactly as a
-        // tagged `bin/` shim does, and until 2026-09-14 neither was looked at.
-        for dir in [
-            layout.bin_dir(),
-            layout.agents_dir(),
-            crate::reroute::dir(layout),
-        ] {
-            let shims = crate::provenance::tagged_files_in(&dir, probes.provenance_attr);
-            if !shims.carriers.is_empty() {
-                let _ = writeln!(out, "{p}: {}", provenance_shim_line(&dir, &shims));
-            }
+        let scan = crate::provenance::scan_roots(
+            &crate::provenance::store_roots(layout),
+            probes.provenance_attr,
+        );
+        if !scan.carriers.is_empty() {
+            let _ = writeln!(out, "{p}: {}", provenance_line(&scan));
         }
     }
 
@@ -1076,10 +1364,13 @@ pub fn run_with(
                 next_update_divergence = true;
                 let _ = writeln!(
                     err,
-                    "{p}: FAIL — {}: the channel selects build {channel_says} but its bin/ \
-                     shims run build {shims_say} (re-run `aterm pkg update {}`: it installs \
-                     the pinned build, or re-points the links when the shims already run it)",
-                    d.program, d.program
+                    "{p}: FAIL — {}: the channel selects {} but its bin/ shims run {} (re-run \
+                     `aterm pkg update {}`: it installs the build it keeps, or re-points the \
+                     links when the shims already run it)",
+                    d.program,
+                    crate::vendor_direct::build_words(*channel_says),
+                    crate::vendor_direct::build_words(*shims_say),
+                    d.program
                 );
             }
             crate::gc::Diverged::ShimsDisagree { builds } => {
@@ -1113,10 +1404,13 @@ pub fn run_with(
             crate::gc::Diverged::NoLiveWitness { shims_say } => {
                 let _ = writeln!(
                     out,
-                    "{p}: warn — {}: build {shims_say} is on PATH but no `current` link \
-                     selects it, so gc keeps every superseded {} build. Run \
-                     `aterm pkg update {}` to write the link and clear this.",
-                    d.program, d.program, d.program
+                    "{p}: warn — {}: {} is on PATH but no `current` link selects it, so gc \
+                     keeps every superseded {} build. Run `aterm pkg update {}` to write the \
+                     link and clear this.",
+                    d.program,
+                    crate::vendor_direct::build_words(*shims_say),
+                    d.program,
+                    d.program
                 );
             }
         }
@@ -1237,6 +1531,21 @@ pub fn run_with(
                     manual_path_hint(&bin_dir)
                 );
             }
+        }
+        // (6c) A file at a command path: a copy never updates, and either way it runs
+        // instead of the app wherever `~/.local/bin` leads PATH. Only the macOS release
+        // bundle lays these links, so only there does `repair` replace one — and it has to
+        // be the app's own `atpkg`, because `aterm` may be the very copy named here.
+        #[cfg(all(unix, target_os = "macos"))]
+        for path in crate::hooks::copied_command_links(home) {
+            let _ = writeln!(
+                out,
+                "{p}: warn — {} is a file, not a link to aterm.app (a copy that never \
+                 updates, or a build of your own), and it runs instead of the app; {} moves \
+                 it aside",
+                path.display(),
+                crate::hooks::repair_from_app_hint()
+            );
         }
         // Privacy of the login-sourced dirs (READ-ONLY — doctor never chmods).
         for dir in [&aterm, &shell_d] {
@@ -1397,18 +1706,22 @@ pub fn run_with(
     // not "successful update": on an Intel Mac whose every pass ended in a member
     // failure it read "0 day(s) since the last successful update" (2026-09-15), which
     // is not what the stamp measures; the member rows below say what failed.
+    // "NEVER CHECKED" IS SAID HERE AND NOWHERE ELSE (Phase 2, 2026-09-22), and only what
+    // is true: an index pass moves the index-pinned programs; the vendor programs this
+    // machine keeps at their vendors' heads update without one (design §1).
+    let vendors = vendor_update_clause(layout, probes);
     if let Some(status) = crate::status::read(layout) {
         if status.last_success_at.trim().is_empty() {
             let _ = writeln!(
                 out,
-                "{p}: warn — no successful update pass recorded yet (status last written {}) — \
-                 packages cannot be updated until the first pass completes (run: aterm pkg \
-                 update)",
+                "{p}: warn — no index update pass has completed yet (status last written {}) — \
+                 the programs the ALab index pins update once one does (run: aterm pkg \
+                 update){vendors}",
                 if status.updated_at.is_empty() {
                     "never"
                 } else {
                     status.updated_at.as_str()
-                }
+                },
             );
         } else {
             match index_age_days(&status.last_success_at, now) {
@@ -1439,6 +1752,28 @@ pub fn run_with(
             let reached_days = (!status.last_index_reached_at.is_empty())
                 .then(|| index_age_days(&status.last_index_reached_at, now))
                 .flatten();
+            // A RECORD WITH NO FRESHNESS STAMP AT ALL is not "from before the fields
+            // existed" once a pass has completed since they did: it is one of two
+            // things the record alone cannot tell apart, and both mute the two checks
+            // below while every other row reads green. Measured 2026-09-22: a second,
+            // OLDER aterm build ran its own 6 h pass on the same store and rewrote
+            // status.toml through a Status without the fields, so "publishing looks
+            // frozen" could never fire while the index sat at one build for three
+            // days. Said once, as a warn — the remedy is a pass by THIS build.
+            if status.last_index_reached_at.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — no completed pass has recorded reaching the signed index \
+                     listing (last completed pass {}) — either every pass ran on the cached \
+                     index, or the record was last written by an OLDER atpkg that does not \
+                     stamp index freshness (a second aterm build running its own update pass \
+                     on this store: `aterm pkg status` prints which atpkg answers, the app log \
+                     names each pass's); until a pass by this build reaches the listing, the \
+                     'listing not reached' and 'frozen publishing' checks cannot run — \
+                     run: aterm pkg update",
+                    status.last_success_at
+                );
+            }
             match reached_days {
                 Some(days) if days > INDEX_UNREACHED_WARN_DAYS => {
                     let _ = writeln!(
@@ -1471,8 +1806,8 @@ pub fn run_with(
     } else {
         let _ = writeln!(
             out,
-            "{p}: warn — no status.toml yet (no update has run) — packages cannot be updated \
-             until the first pass completes (run: aterm pkg update)"
+            "{p}: warn — no status.toml yet (no update pass has run) — the programs the ALab \
+             index pins update once one completes (run: aterm pkg update){vendors}"
         );
     }
     // The build floor is printed WITH the generation that recorded it, because that pair
@@ -1488,6 +1823,25 @@ pub fn run_with(
         "{p}: last-trusted index_build {} (recorded under roster_seq {})",
         build_floor.index_build, build_floor.roster_seq
     );
+    // ...AND WHETHER IT IS STILL THE NEWEST (2026-09-22). The owner read "healthy", "0
+    // day(s) since the last completed update pass" and "last-trusted index_build 42" — every
+    // line true — while index 43 had been published for an hour, and nothing on this report
+    // compared the two. The channel-head probe already knows: it writes its last answer
+    // beside the floor. This reads that answer back, offline, and says it.
+    if probes.index_head {
+        let last_pass = LastPass {
+            read_listing_at: crate::status::read(layout)
+                .and_then(|s| crate::flow::rfc3339_to_unix(&s.last_index_reached_at)),
+            held: crate::index_probe::held_index_builds(layout),
+        };
+        index_head_line(
+            &crate::index_probe::cached_answer(layout),
+            &last_pass,
+            now,
+            p,
+            out,
+        );
+    }
     // The SECOND durable ratchet, shown beside the first because they answer different
     // questions and move independently: `index_build` is how far the toolchain index has
     // advanced, `roster_seq` is which generation of the machine roster this store has
@@ -1702,13 +2056,38 @@ pub fn run_with(
         if crate::linkmode::is_linked(layout, program) {
             continue;
         }
+        // AN AGENT PROGRAM'S REROUTE STUB DECIDES AT EXEC TIME (2026-09-23): with
+        // `reroute/<name>` first on this PATH, what runs is the stub's choice — the managed
+        // twin inside aterm, which is no shadow however stale this shell's PATH is (said
+        // below as an `ok` naming the copy it out-ranks), or a pass-through, whose walk is
+        // the one probed (`cli::shadow_in_shell`).
         let shadow = crate::ops::active_tools(layout, program, *build)
             .into_iter()
             .find_map(|tool| {
-                crate::vendor::shadowing_binary_on_path(&layout.prefix, tool.as_str(), path_var)
+                crate::cli::shadow_in_shell(layout, tool.as_str(), path_var, probes.stub_env)
                     .map(|path| (tool, path))
             });
+        if shadow.is_none()
+            && let Some(row) =
+                crate::cli::agent_routed_row(layout, program, *build, path_var, probes.stub_env)
+        {
+            let _ = writeln!(out, "{p}: ok — {program}: {row}");
+            continue;
+        }
         if let Some((tool, path)) = shadow {
+            // …and outside aterm, a stub that passes through to the user's own copy is
+            // the design (owner law, 03513b5d7), said as a note, never SHADOWED.
+            if let Some(row) = crate::cli::agent_passed_row(
+                layout,
+                program,
+                *build,
+                &path,
+                path_var,
+                probes.stub_env,
+            ) {
+                let _ = writeln!(out, "{p}: note — {program}: {row}");
+                continue;
+            }
             // An AGENT PROGRAM whose `agents/` twin is laid and current (2026-09-16):
             // aterm's copy is what every tab runs (owner decision 2026-09-10), so this
             // is THIS shell's state — a shell that has not run the hook — and the
@@ -1730,48 +2109,82 @@ pub fn run_with(
             let fix = crate::cli::alias_fix(layout, &tool, program, path_var)
                 .map(|f| format!(" — {f}"))
                 .unwrap_or_default();
+            let managed = crate::vendor_direct::spec(program).map_or_else(
+                || String::from("the pinned build"),
+                |s| format!("the copy aterm updates from {}", s.vendor),
+            );
             let _ = writeln!(
                 out,
-                "{p}: warn — {program}: {} (not the pinned build; atpkg never edits PATH — \
-                 remove or reorder that copy if you want the managed one){fix}",
+                "{p}: warn — {program}: {} (not {managed}; atpkg never edits PATH — remove or \
+                 reorder that copy if you want the managed one){fix}",
                 crate::state::shadowed(*build, &path)
             );
         }
     }
     // (10f) MANAGED MEMBERS WHOSE SHIM EXPORTS AN ENVIRONMENT (design S7): a vendor tool
-    // whose signed manifest declared `shim_env` runs, through the managed shim, with its
-    // own updater off — `self-update off (DISABLE_AUTOUPDATER=1)`. Read off the shim as
-    // laid (the thing that runs), printed as ONE trailing sentence after the canonical
-    // row, never inside it; withheld when a foreign copy shadows the shim (the env never
-    // reaches a system copy — that member's line is (10d)'s warn). An `ok`, never a fault.
+    // whose policy declares `shim_env` runs, through the managed shim, with its own
+    // updater off — `Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)`. Read
+    // off the shim as laid (the thing that runs), printed as ONE trailing sentence after
+    // the canonical row, never inside it; withheld
+    // when a foreign copy shadows the shim (the env never reaches a system copy — that
+    // member's line is (10d)'s warn). An `ok`, never a fault.
+    //
+    // A shim that exports other than its BUILD declares (the sidecar, written from the
+    // signed policy — `activate::shim_env_drift`, the predicate the pass heals by) is
+    // NAMED instead, as a `warn` with the one remedy: every `repair` before 2026-09-23
+    // laid `claude` plain, and this check read the plain shim, found no sentence to say
+    // and said nothing — the "own updater is off here" line simply went missing while the
+    // vendor's updater ran (audit 2026-09-23). Said even when a foreign copy shadows the
+    // shim in this shell, because the shim still reaches something whatever this PATH
+    // finds first: for an agent program, the `agents/` twin every aterm tab runs, which
+    // copies this shim's exports; for an ALab tool, its `alab-` alias, which copies them
+    // too; for any program, every other shell whose PATH finds the shim. (Review
+    // 2026-09-23: the twin alone justifies it only for claude and codex.)
     for (program, build) in &installed {
         if crate::linkmode::is_linked(layout, program) {
             continue;
         }
         let tools = crate::ops::active_tools(layout, program, *build);
+        if let Some(drift) =
+            crate::activate::shim_env_drift(layout, &layout.build_dir(program, *build), &tools)
+            && let Some((shim, _)) = drift.shims.first()
+        {
+            let have = crate::platform::shim_env_of(shim);
+            let line = env_drift_line(program, *build, shim, &have, &drift.declared);
+            let _ = writeln!(out, "{p}: warn — {program}: {line}");
+            continue;
+        }
         let Some(fix) = tools
             .iter()
-            .find_map(|t| crate::cli::shim_env_fix(&layout.shim(t)))
+            .find_map(|t| crate::cli::shim_env_fix(&layout.shim(t), program))
         else {
             continue;
         };
+        // The same probe (10d) takes, an agent program's reroute stub included.
         if tools.iter().any(|t| {
-            crate::vendor::shadowing_binary_on_path(&layout.prefix, t.as_str(), path_var).is_some()
+            crate::cli::shadow_in_shell(layout, t.as_str(), path_var, probes.stub_env).is_some()
         }) {
             continue;
         }
-        let state = status
-            .as_ref()
-            .and_then(|s| s.programs.get(program))
-            .filter(|r| crate::state::managed_pin(&r.state).is_some())
-            .map_or_else(
-                || crate::state::managed(*build, build_floor.index_build),
-                |r| r.state.clone(),
-            );
-        let _ = writeln!(
-            out,
-            "{p}: ok — {program}: {state} — {fix} (updates arrive with the ALab index)"
-        );
+        let row = status.as_ref().and_then(|s| s.programs.get(program));
+        // A vendor-direct program moves with its vendor — its row and the fix-line say so;
+        // an index program's with the ALab index.
+        let line = match crate::vendor_direct::spec(program) {
+            Some(spec) => format!(
+                "{} — {fix}",
+                crate::cli::vendor_state_of(layout, spec, *build, row)
+            ),
+            None => {
+                let state = row
+                    .filter(|r| crate::state::managed_pin(&r.state).is_some())
+                    .map_or_else(
+                        || crate::state::managed(*build, build_floor.index_build),
+                        |r| r.state.clone(),
+                    );
+                format!("{state} — {fix} (updates arrive with the ALab index)")
+            }
+        };
+        let _ = writeln!(out, "{p}: ok — {program}: {line}");
     }
     // EVERY problem, not the first one. This scan used to `.find()`, so a second failing
     // program was invisible until the first was fixed — a diagnostic that reveals its
@@ -1795,17 +2208,26 @@ pub fn run_with(
     // The index is the only thing that knows what SHOULD be here, so ask it. Offline and
     // best-effort by construction (`cached_index`): an unreachable index must never
     // invent a missing program.
-    let (missing_unexplained, missing_on_purpose, dev_linked) =
-        missing_against_index(layout, &installed);
+    let (dev_linked, link_problems) = live_dev_links(layout);
+    for why in &link_problems {
+        let _ = writeln!(out, "{p}: PROBLEM — {why}");
+    }
+    fails += link_problems.len();
+    let active_count = installed
+        .keys()
+        .chain(dev_linked.iter())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let (missing_unexplained, missing_on_purpose, _indexed_dev_linked) =
+        missing_against_index(layout, &installed, &dev_linked);
     let mut toolset_problem = false;
     if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
         let _ = writeln!(
             out,
-            "{p}: the ALab toolset was removed on this machine (`aterm pkg install \
-             --default-set` reinstalls it)"
+            "{p}: {DECLINED_LINE} (`aterm pkg install --default-set` reinstalls it)"
         );
-    } else if installed.is_empty() {
+    } else if active_count == 0 {
         toolset_problem = true;
         match recorded_problems.first() {
             Some(why) => {
@@ -1849,7 +2271,7 @@ pub fn run_with(
         let _ = writeln!(
             out,
             "{p}: PROBLEM — the toolset is incomplete; {} program(s) active",
-            installed.len()
+            active_count
         );
     } else if !missing_unexplained.is_empty() {
         // The machine wants these, does not have them, and NOTHING recorded a reason.
@@ -1861,14 +2283,12 @@ pub fn run_with(
             "{p}: PROBLEM — the toolset is incomplete: {} of {} program(s) the signed \
              index serves are not installed ({})",
             missing_unexplained.len(),
-            installed.len()
-                + missing_unexplained.len()
-                + missing_on_purpose.len()
-                + dev_linked.len(),
+            active_count + missing_unexplained.len() + missing_on_purpose.len(),
             missing_unexplained.join(", ")
         );
     } else {
-        let _ = writeln!(out, "{p}: {} ALab program(s) active", installed.len());
+        // Not "ALab program(s)": the count includes the vendor-direct agents.
+        let _ = writeln!(out, "{p}: {active_count} program(s) active");
     }
     // A DELIBERATE removal is not a fault — but it must be VISIBLE. The ledger that
     // records it is a file no user reads, and its effect (no stub, no unattended
@@ -1891,8 +2311,7 @@ pub fn run_with(
              (aterm pkg install {program} brings it back)"
         );
     }
-    if let Some(start) =
-        problem_listing_start(declined, installed.is_empty(), recorded_problems.len())
+    if let Some(start) = problem_listing_start(declined, active_count == 0, recorded_problems.len())
     {
         for why in recorded_problems.iter().skip(start) {
             let _ = writeln!(out, "{p}:   {why}");
@@ -1923,7 +2342,7 @@ pub fn run_with(
         // re-flips diverged shims), then the structural repair of one named program.
         // Failures with their remedy already inline (a stray .sh — "remove it") add no
         // line here rather than a second, vaguer act.
-        let next = if toolset_problem && installed.is_empty() {
+        let next = if toolset_problem && active_count == 0 {
             Some(String::from("aterm pkg install --default-set"))
         } else if next_publish {
             Some(format!(
@@ -2009,6 +2428,44 @@ fn withheld_summary(cannot: usize, unproven: usize) -> String {
              {UNPROVEN}"
         ),
     }
+}
+
+/// (10f)'s drift warn, after `<program>: `: what `shim` exports (`have`) against what
+/// its build declares; the consequence only when the build declares a self-update switch
+/// ([`crate::shim_env::SELF_UPDATE_SWITCHES`]) and the shim exports NONE — the one shape
+/// where "on here" is certain, and the mirror of [`crate::shim_env::ShimEnv::fix_line`],
+/// whose "off here" sentence this warn replaces; and the one remedy: `repair` re-lays each
+/// shim with its build's sidecar. Pure, so every wording is pinned without a store.
+fn env_drift_line(
+    program: &str,
+    build: u64,
+    shim: &Path,
+    have: &crate::shim_env::ShimEnv,
+    declared: &crate::shim_env::ShimEnv,
+) -> String {
+    let exports = if have.is_empty() {
+        String::from("nothing")
+    } else {
+        have.spelled()
+    };
+    let switches = |env: &crate::shim_env::ShimEnv| {
+        env.entries()
+            .iter()
+            .any(|(name, _)| crate::shim_env::SELF_UPDATE_SWITCHES.contains(&name.as_str()))
+    };
+    let switch_lost = switches(declared) && !switches(have);
+    let consequence = match (switch_lost, crate::vendor_direct::spec(program)) {
+        (false, _) => String::new(),
+        (true, Some(spec)) => format!(", so {}'s own updater is on here", spec.product),
+        (true, None) => String::from(", so its own updater is on here"),
+    };
+    format!(
+        "{} exports {exports}, but {} declares {}{consequence} — fix: `aterm pkg repair` \
+         re-lays it",
+        shim.display(),
+        crate::vendor_direct::display_build(program, build),
+        declared.spelled()
+    )
 }
 
 /// The (5f)(c) line for an active trust build that [`crate::compat::needs_root`], and
@@ -2145,16 +2602,184 @@ fn presents(store: &Path, at: &Path) -> bool {
     crate::clone::is_clone_of(store, at) && matches!(crate::clone::same_bytes(store, at), Ok(true))
 }
 
-/// Render a divergence's contested build numbers for the report line.
+/// Render a divergence's contested builds for the report line — a vendor-direct build by
+/// its version, never its store id.
 fn build_list(builds: &[u64]) -> String {
     builds
         .iter()
-        .map(u64::to_string)
+        .map(|b| crate::vendor_direct::build_label(*b))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// Whole days since `updated_at` (RFC3339), or `None` if it cannot be parsed.
+/// How recent a "nothing newer" answer must be for (8) to say `ok`: the window re-asks
+/// the next two tags every minute and the two after them every five, so an answer older
+/// than this means nothing is asking any more (no window running), and its age is the
+/// honest thing to print.
+const INDEX_HEAD_FRESH_SECS: i64 = 15 * 60;
+
+/// What the last signed update pass left on disk that bears on the channel head: when it
+/// last read the index listing (`status.toml`'s `last_index_reached_at`), and the index
+/// builds of the signed candidates it downloaded ([`crate::index_probe::held_index_builds`]).
+/// `None` in either field when that record is absent or unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LastPass {
+    read_listing_at: Option<i64>,
+    held: Option<Vec<u64>>,
+}
+
+/// (8)'s channel-head line: the probe's cached answer for the CURRENT floor
+/// ([`crate::index_probe::cached_answer`]) set beside what the last signed update pass left
+/// ([`LastPass`]), said as one line. None withholds "healthy" — like the other freshness
+/// lines, it is a fact about the channel, not a fault in the store. Pure over its inputs
+/// and `now`, so tests drive it through the probe's and the cache's real writers.
+///
+/// # The remedy is only printed where it can work (review of 9fd97c253)
+///
+/// "run: aterm pkg update" is right when no signed pass has looked since the newer index
+/// appeared. It is wrong — and loops, update saying "already current" and doctor saying
+/// "not the newest" — when a pass already downloaded the newer index and refused it, or
+/// read the listing and found no complete newer release there. The last pass's downloaded
+/// candidates (the §14 cache, written before select) tell those apart offline, so each gets
+/// its own sentence. And the notes never promise that `aterm pkg update` refreshes the
+/// probe's answer — it does not write the probe's stamps; what it does move, the time the
+/// listing was last read, is printed beside them.
+fn index_head_line(
+    cached: &crate::index_probe::CachedProbe,
+    last: &LastPass,
+    now: i64,
+    p: &str,
+    out: &mut dyn std::io::Write,
+) {
+    use crate::index_probe::RangeAnswer;
+    let floor = cached.floor;
+    let age = |written: std::time::SystemTime| -> i64 {
+        let at = written
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        now.saturating_sub(at).max(0)
+    };
+    let pass = match last.read_listing_at {
+        Some(at) => format!(
+            "the last signed update pass read the index listing {} ago",
+            ago(now.saturating_sub(at).max(0))
+        ),
+        None => "no update pass has recorded reading the signed index listing".to_string(),
+    };
+    // A NEWER INDEX ALREADY DOWNLOADED AND NOT LANDED. The cache is written from the
+    // listing before verify-then-select, so this is independent of the probe: the pass
+    // held it, and the floor did not move.
+    if let Some(held) = last
+        .held
+        .as_ref()
+        .and_then(|builds| builds.iter().copied().filter(|b| *b > floor).max())
+    {
+        let _ = writeln!(
+            out,
+            "{p}: warn — index {floor} is not the newest: this machine already downloaded \
+             the signed index {held} and did not land it — its signatures did not verify \
+             here (the roster that authorizes it, the machine that signed it, or their \
+             validity window), or the pass that fetched it stopped early; if `aterm pkg \
+             update` still ends on index {floor}, it is the release that needs fixing, not \
+             this machine"
+        );
+        return;
+    }
+    let ranges = [cached.near, cached.lookahead, cached.listing];
+    let newest = |want: RangeAnswer| {
+        ranges
+            .iter()
+            .flatten()
+            .filter(|(answer, _)| *answer == want)
+            .map(|(_, written)| age(*written))
+            .min()
+    };
+    if let Some(seen) = newest(RangeAnswer::Published) {
+        if last.read_listing_at.is_some() && last.held.is_some() {
+            // The last pass reached the listing and held nothing above the floor: at that
+            // moment the listing had no COMPLETE signed release newer than it.
+            let _ = writeln!(
+                out,
+                "{p}: warn — index {floor} is not the newest: the index probe found a \
+                 newer ALab index (seen {} ago; an unverified hint), but {pass} and found no \
+                 complete signed release newer than {floor} there — if the new one was up by \
+                 then, its signed files are not all uploaded and no update can land it yet; \
+                 otherwise run: aterm pkg update",
+                ago(seen)
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{p}: warn — index {floor} is not the newest: the index probe found a \
+                 newer ALab index (seen {} ago; an unverified hint — no signed pass has \
+                 landed it on this machine) — run: aterm pkg update",
+                ago(seen)
+            );
+        }
+        return;
+    }
+    if let (
+        Some((RangeAnswer::Missing, near)),
+        Some((RangeAnswer::Missing, deep)),
+        Some((RangeAnswer::Missing, listing)),
+    ) = (cached.near, cached.lookahead, cached.listing)
+    {
+        // The claim rests on all three ranges, so it is as old as the oldest. It is
+        // said as what was CHECKED — four tags and one listing page — because the probe's
+        // own rule is that absence is never authority.
+        let checked = age(near).max(age(deep)).max(age(listing));
+        if checked <= INDEX_HEAD_FRESH_SECS {
+            let _ = writeln!(
+                out,
+                "{p}: ok — the release host shows no index newer than {floor} at the next \
+                 four tags or on its first releases page (checked {} ago)",
+                ago(checked)
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{p}: note — the release host showed no index newer than {floor} when last \
+                 asked, {} ago (the aterm window asks every minute while it runs); {pass}",
+                ago(checked)
+            );
+        }
+        return;
+    }
+    let failed = [
+        (RangeAnswer::RateLimited, "was rate-limited"),
+        (RangeAnswer::Failed, "got no usable answer"),
+    ]
+    .into_iter()
+    .find_map(|(want, said)| newest(want).map(|a| (said, a)));
+    if let Some((said, when)) = failed {
+        let _ = writeln!(
+            out,
+            "{p}: note — the last check for an index newer than {floor} {said} ({} ago), so \
+             whether one is published is unknown here; {pass}",
+            ago(when)
+        );
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "{p}: note — no check for an index newer than {floor} is recorded on this machine (the \
+         aterm window asks every minute while it runs); {pass}"
+    );
+}
+
+/// A non-negative age in seconds, said in the unit a person reads it in.
+fn ago(secs: i64) -> String {
+    if secs < 90 {
+        format!("{secs} s")
+    } else if secs < 90 * 60 {
+        format!("{} min", secs / 60)
+    } else if secs < 48 * 3600 {
+        format!("{} h", secs / 3600)
+    } else {
+        format!("{} day(s)", secs / 86_400)
+    }
+}
+
 /// How long the signed index listing may go unreached before `doctor` says so: past
 /// this, every pass has been a cached one — the vendor lane publishes daily-ish, so
 /// three days of cache is three days a newer claude pin could have been missed.
@@ -2164,6 +2789,32 @@ const INDEX_UNREACHED_WARN_DAYS: i64 = 3;
 /// on every Claude Code and Codex release, and thirty days without either is neither.
 const INDEX_FROZEN_WARN_DAYS: i64 = 30;
 
+/// The tail of the never-checked lines — `; claude and codex update from their vendors
+/// without it` — naming only the vendor programs that do: kept at their vendor's head
+/// ([`crate::vendor_direct::watch::follows_vendor`]: installed, not removed, held or
+/// dev-linked), not in `[packages] exclude`, on a machine whose packages update on their
+/// own ([`Probes::automatic`]). Empty when none does, and the line claims nothing of them.
+fn vendor_update_clause(layout: &Layout, probes: &Probes) -> String {
+    if !probes.automatic {
+        return String::new();
+    }
+    let names: Vec<&str> = crate::vendor_direct::VENDORS
+        .iter()
+        .filter(|spec| !probes.excluded.iter().any(|p| p == spec.program))
+        .filter(|spec| crate::vendor_direct::watch::follows_vendor(layout, spec))
+        .map(|spec| spec.program)
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => format!("; {one} updates from its vendor without it"),
+        many => format!(
+            "; {} update from their vendors without it",
+            many.join(" and ")
+        ),
+    }
+}
+
+/// Whole days since `updated_at` (RFC3339), or `None` if it cannot be parsed.
 fn index_age_days(updated_at: &str, now: i64) -> Option<i64> {
     let then = crate::flow::rfc3339_to_unix(updated_at)?;
     Some((now - then) / 86_400)
@@ -2444,6 +3095,9 @@ fn native_hook_ext() -> &'static str {
 /// opinion about them. What it must NEVER do is tell the user to reopen the app for an
 /// update: the app applies a staged build to itself in-session, so there is nothing to
 /// reopen — a note that said otherwise stood over the live mechanism until 2026-08-30.
+/// And it names WHICH process applies: the window. A terminal session checks and stages
+/// but never applies (a live PTY is not gambled on the trial), so on a Mac with no window
+/// open the note names `aterm --window` — since 2026-09-22 no session launch says so.
 ///
 /// Silent when there is no updater state: a bare CLI install is a legitimate posture, not a
 /// fault.
@@ -2491,26 +3145,29 @@ fn report_aterm_posture_at(
     };
     match (current, field("status.toml", "staged_build")) {
         (Some(current), Some(staged)) if current != staged => {
-            // The staged build is applied IN-SESSION by the app's own overlap handoff
+            // The staged build is applied IN-SESSION by the WINDOW's overlap handoff
             // (automatic at the first quiet moment — forced within ~2 min — by default, one
-            // click otherwise); the shells keep running. atpkg names that lane and the
-            // `aterm ctl update` verbs, and never asks the user to reopen anything.
+            // click otherwise); the shells keep running. A terminal session never applies,
+            // so the note names the window for a Mac that has none open, and never asks the
+            // user to reopen anything.
             let _ = writeln!(
                 out,
                 "{p}: note — aterm is running build {current} (installed {installed}); build \
-                 {staged} is staged and aterm applies it at its next quiet moment, in-session \
-                 and in place — your shells keep running (`aterm ctl update status` shows it; \
-                 `aterm ctl update apply` presses it now)"
+                 {staged} is staged and an aterm window applies it at its next quiet moment, \
+                 in-session and in place — your shells keep running (`aterm ctl update apply` \
+                 presses it now); a terminal session never applies it, so with no window open \
+                 `aterm --window` does (`aterm update status` shows it)"
             );
         }
         (Some(current), _) if newer_on_disk => {
-            // A newer bundle is already on disk: the GUI activates it in place, the same
-            // in-session lane.
+            // A newer bundle is already on disk: the window activates it in place, the same
+            // in-session lane — and, as above, only the window.
             let _ = writeln!(
                 out,
                 "{p}: note — aterm is running build {current} but build {installed} is \
-                 installed on disk; aterm activates it in-session, in place — your shells \
-                 keep running (`aterm ctl update status` shows it)"
+                 installed on disk; an aterm window activates it in-session, in place — your \
+                 shells keep running; a terminal session never does, so with no window open \
+                 `aterm --window` does (`aterm update status` shows it)"
             );
         }
         _ => {
@@ -2583,11 +3240,12 @@ fn upstream_index_on_path(
     })
 }
 
-/// The clause of the Spotlight warning that says how far the unattended pass reaches:
-/// the exposed target dirs beside a Cargo.toml are the pass's to migrate; the
-/// FREE-STANDING ones (`free`, no Cargo.toml beside them) are pointed at by an env var
-/// or a build system the pass cannot re-point, so it never renames them and the
-/// operator has to — by name, after re-pointing. Up to three are named; a count that
+/// The clause of the Spotlight warning that says how far the unattended apply reaches
+/// (`aterm pkg machine apply`, which the window runs as it opens and a terminal session once
+/// a day — no longer every package pass, Phase 3): the exposed target dirs beside a
+/// Cargo.toml are its to migrate; the FREE-STANDING ones (`free`, no Cargo.toml beside
+/// them) are pointed at by an env var or a build system it cannot re-point, so it never
+/// renames them and the operator has to — by name, after re-pointing. Up to three are named; a count that
 /// names nothing sends the reader to `aterm pkg noindex` to find out which.
 fn spotlight_reach(in_repo: usize, free: &[&crate::noindex::Target]) -> String {
     const SHOWN: usize = 3;
@@ -2603,19 +3261,20 @@ fn spotlight_reach(in_repo: usize, free: &[&crate::noindex::Target]) -> String {
         names.join(", ")
     };
     match (in_repo, free.len()) {
-        (_, 0) => {
-            "the next update pass migrates them (every one is beside a Cargo.toml)".to_string()
-        }
+        (_, 0) => "the next aterm window (or the day's first terminal session) migrates them \
+             (every one is beside a Cargo.toml)"
+            .to_string(),
         (0, _) => format!(
-            "NONE is beside a Cargo.toml, so the update pass never renames any of them: each \
+            "NONE is beside a Cargo.toml, so aterm never renames any of them: each \
              is a free-standing target dir an env var or a build system points at ({}) — \
              re-point that, then `aterm pkg noindex apply <dir>` by name",
             named()
         ),
         (r, f) => format!(
-            "the next update pass migrates the {r} beside a Cargo.toml; the other {f} \
-             {} free-standing — an env var or a build system points at {} ({}), which the \
-             pass cannot re-point, so it never renames {} — re-point that, then `aterm pkg \
+            "the next aterm window (or the day's first terminal session) migrates the {r} \
+             beside a Cargo.toml; the other {f} \
+             {} free-standing — an env var or a build system points at {} ({}), which \
+             aterm cannot re-point, so it never renames {} — re-point that, then `aterm pkg \
              noindex apply <dir>` by name",
             if f == 1 { "is" } else { "are" },
             if f == 1 { "it" } else { "each" },
@@ -2805,7 +3464,8 @@ mod tests {
     #[test]
     fn no_cached_index_invents_no_missing_programs() {
         let l = layout("no-index");
-        let (unexplained, on_purpose, dev_linked) = missing_against_index(&l, &builds(&["ay"]));
+        let (unexplained, on_purpose, dev_linked) =
+            missing_against_index(&l, &builds(&["ay"]), &names(&[]));
         assert!(unexplained.is_empty() && on_purpose.is_empty() && dev_linked.is_empty());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -2947,6 +3607,91 @@ mod tests {
             ),
             "a clean install is healthy"
         );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_link_only_toolset_is_healthy_but_deleted_tool_is_not() {
+        let l = layout("dev-only");
+        let home = synthetic_home("dev-only");
+        let checkout = home.join("local-build");
+        std::fs::create_dir_all(checkout.join("bin")).unwrap();
+        let binary = checkout.join("bin/ay");
+        std::fs::write(&binary, b"#!/bin/true\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::linkmode::link(&l, "ay", &checkout, &[PathBuf::from("bin/ay")]).unwrap();
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let mut out = Vec::new();
+        assert!(run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut out,
+            &mut std::io::sink(),
+        ));
+        let report = String::from_utf8_lossy(&out);
+        assert!(report.contains("ay: dev-linked from"), "{report}");
+        assert!(report.contains("1 program(s) active"), "{report}");
+        assert!(
+            !report.contains("no ALab programs are installed"),
+            "{report}"
+        );
+        assert!(
+            crate::ops::active_builds(&l).is_empty(),
+            "no fabricated signed build"
+        );
+
+        std::fs::remove_file(binary).unwrap();
+        assert!(live_dev_links(&l).0.is_empty());
+        assert!(!run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut Vec::new(),
+            &mut std::io::sink(),
+        ));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_link_health_rejects_non_executable_and_foreign_destinations() {
+        let l = layout("dev-link-targets");
+        let home = synthetic_home("dev-link-targets");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(checkout.join("bin")).unwrap();
+        let binary = checkout.join("bin/ay");
+        std::fs::write(&binary, b"#!/bin/true\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644)).unwrap();
+        crate::linkmode::link(&l, "ay", &checkout, &[PathBuf::from("bin/ay")]).unwrap();
+        assert!(
+            live_dev_links(&l).0.is_empty(),
+            "a non-executable file cannot run"
+        );
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(live_dev_links(&l).0, names(&["ay"]));
+        let foreign = home.join("foreign-ay");
+        std::fs::copy(&binary, &foreign).unwrap();
+        crate::platform::install_shim_to(&l.shim(&tool("ay")), &foreign).unwrap();
+        let (live, problems) = live_dev_links(&l);
+        assert!(
+            live.is_empty(),
+            "a marker cannot bless a foreign shim destination"
+        );
+        assert_eq!(problems.len(), 1);
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -3899,7 +4644,13 @@ mod tests {
                 last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
+                last_pass: String::new(),
+                last_pass_at: String::new(),
+                last_pass_attempted_index_build: 0,
+                last_pass_attempted_at: String::new(),
+                metered_hold_until: String::new(),
                 programs,
+                extra: Default::default(),
             },
         )
         .unwrap();
@@ -3989,7 +4740,13 @@ mod tests {
                 last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
+                last_pass: String::new(),
+                last_pass_at: String::new(),
+                last_pass_attempted_index_build: 0,
+                last_pass_attempted_at: String::new(),
+                metered_hold_until: String::new(),
                 programs,
+                extra: Default::default(),
             },
         )
         .unwrap();
@@ -4083,7 +4840,13 @@ mod tests {
             last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
+            last_pass: String::new(),
+            last_pass_at: String::new(),
+            last_pass_attempted_index_build: 0,
+            last_pass_attempted_at: String::new(),
+            metered_hold_until: String::new(),
             programs,
+            extra: Default::default(),
         };
         crate::status::write(&layout, &status).unwrap();
         assert!(
@@ -4198,6 +4961,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A file at a command-link path is a warning naming `repair`, never a fault, and doctor
+    /// leaves it byte-identical; a link there says nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_at_a_command_link_path_is_a_warning_that_names_repair() {
+        let l = layout("copied-cmd");
+        install(&l, "ay", 18);
+        let home = synthetic_home("copied-cmd");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("aterm"), b"old copy").unwrap();
+        std::os::unix::fs::symlink(
+            "/Applications/aterm.app/Contents/MacOS/atpkg",
+            bin.join("atpkg"),
+        )
+        .unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let ok = run_with(
+            &l,
+            Some(&home),
+            None,
+            0,
+            None,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut out,
+            &mut std::io::sink(),
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(ok, "a copied command is a warning, not a fault:\n{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — {} is a file, not a link to aterm.app",
+                bin.join("aterm").display()
+            )) && out.contains("`atpkg repair` from the installed aterm.app moves it aside"),
+            "{out}"
+        );
+        assert!(
+            !out.contains(&format!("{} is a file", bin.join("atpkg").display())),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read(bin.join("aterm")).unwrap(),
+            b"old copy",
+            "doctor never fixes"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_shadowed_managed_member_is_a_warning_never_a_fault() {
@@ -4272,7 +5086,10 @@ mod tests {
         let l = layout("agent-shadow");
         // An ALab member too, so the report has a toolset to be healthy about.
         install(&l, "ay", 19);
-        install(&l, "claude", 2_026_091_601);
+        let v280 = crate::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v280);
         let twin = l.agent_shim(&tool("claude"));
         assert!(twin.exists(), "install lays the agents/ twin");
         let foreign = l
@@ -4312,7 +5129,7 @@ mod tests {
             out.contains(&format!(
                 "doctor: warn — claude: {}",
                 crate::state::agent_shadowed_in_shell(
-                    2_026_091_601,
+                    v280,
                     &exe,
                     &l.agents_dir(),
                     false,
@@ -4334,7 +5151,7 @@ mod tests {
         assert!(ok, "{out}");
         assert!(
             out.contains(&crate::state::agent_shadowed_in_shell(
-                2_026_091_601,
+                v280,
                 &exe,
                 &l.agents_dir(),
                 true,
@@ -4354,8 +5171,8 @@ mod tests {
         assert!(ok, "{out}");
         assert!(
             out.contains(&format!(
-                "doctor: warn — claude: {} (not the pinned build",
-                crate::state::shadowed(2_026_091_601, &exe)
+                "doctor: warn — claude: {} (not the copy aterm updates from Anthropic;",
+                crate::state::shadowed(v280, &exe)
             )),
             "{out}"
         );
@@ -4364,17 +5181,225 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// THE REROUTE STUB DECIDES AT EXEC TIME (2026-09-23). The owner restarted `claude` in
+    /// a session shell from 2026-09-10 whose PATH was `reroute, ~/.local/bin, …, pkg/bin`
+    /// with no `agents/`, got the vendor's own copy, and this report said SHADOWED. With
+    /// `reroute/claude` laid, that shell runs the managed copy — so the report says it is
+    /// ROUTED (an `ok`, naming the stub and the copy it out-ranks), not SHADOWED. Outside
+    /// aterm the stub passes through to the user's own copy by design, a note. It still
+    /// warns where the stub is absent.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_program_routed_by_its_reroute_stub_is_ok_and_warns_only_where_it_is_not() {
+        let l = layout("agent-routed");
+        install(&l, "ay", 19);
+        let v280 = crate::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v280);
+        crate::reroute::lay(&l).unwrap();
+        let stub = crate::reroute::stub_path(&l, "claude");
+        assert!(
+            crate::reroute::is_reroute_stub(&stub),
+            "the twin earns a stub"
+        );
+        let foreign = l.prefix.parent().unwrap().join(format!(
+            "atpkg-doctor-agent-routed-foreign-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&foreign);
+        std::fs::create_dir_all(&foreign).unwrap();
+        let exe = foreign.join("claude");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = synthetic_home("agent-routed");
+        let now = crate::flow::rfc3339_to_unix("2026-09-23T00:00:00Z").unwrap();
+        let run = |path: &std::ffi::OsStr, stub_env: crate::reroute::StubEnv| {
+            let mut out: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(path),
+                now,
+                None,
+                None,
+                "doctor",
+                &Probes {
+                    stub_env,
+                    ..Probes::default()
+                },
+                &mut out,
+                &mut std::io::sink(),
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        let inside = crate::reroute::StubEnv { in_aterm: true };
+        let shadow_warn = format!(
+            "doctor: warn — claude: {}",
+            crate::state::agent_shadowed_in_shell(
+                v280,
+                &exe,
+                &l.agents_dir(),
+                false,
+                &crate::cli::shell_remedy_command(&l),
+            )
+        );
+        // The owner's shell: reroute first, the foreign copy next, no agents/.
+        let stale =
+            std::env::join_paths([crate::reroute::dir(&l), foreign.clone(), l.bin_dir()]).unwrap();
+        let (ok, out) = run(&stale, inside);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: ok — claude: {}",
+                crate::state::agent_routed_in_shell(v280, &stub, &exe)
+            )),
+            "{out}"
+        );
+        assert!(
+            !out.contains("SHADOWED"),
+            "the managed copy runs here: {out}"
+        );
+        assert!(
+            out.contains("doctor: ok — reroute stub claude laid"),
+            "{out}"
+        );
+        // Outside aterm the stub passes through to the user's own copy — the design, said
+        // as a note naming no remedy (sourcing the hook there demotes agents/, and the
+        // stub skips it anyway), never SHADOWED.
+        let (ok, out) = run(&stale, crate::reroute::StubEnv::default());
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: note — claude: {}",
+                crate::state::agent_passed_through(v280, &stub, &exe)
+            )),
+            "{out}"
+        );
+        assert!(
+            !out.contains("SHADOWED") && !out.contains("routed at exec time"),
+            "{out}"
+        );
+        // agents/ first (every new session shell): nothing to route around, nothing said.
+        let first = std::env::join_paths([
+            crate::reroute::dir(&l),
+            l.agents_dir(),
+            foreign.clone(),
+            l.bin_dir(),
+        ])
+        .unwrap();
+        let (_, out) = run(&first, inside);
+        assert!(
+            !out.contains("SHADOWED") && !out.contains("routed at exec time"),
+            "{out}"
+        );
+        // The stub absent: still the warning, inside aterm too.
+        std::fs::remove_file(&stub).unwrap();
+        let (ok, out) = run(&stale, inside);
+        assert!(ok, "{out}");
+        assert!(out.contains(&shadow_warn), "{out}");
+        assert!(
+            out.contains("doctor: warn — reroute stub claude missing"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&foreign);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Inspect the intended member's status sentence, not arbitrary path text in
+    /// the report (the executable itself may live in a `self-update` checkout).
+    fn member_has_self_update_notice(report: &str, program: &str) -> bool {
+        let ok = format!("doctor: ok — {program}:");
+        let warn = format!("doctor: warn — {program}:");
+        report.lines().any(|line| {
+            (line.starts_with(&ok) || line.starts_with(&warn))
+                && line.contains(" own updater is off here (")
+                && line.ends_with(')')
+        })
+    }
+
+    #[test]
+    fn self_update_notice_assertion_ignores_paths_but_detects_the_members_trailing_sentence() {
+        let paths = "doctor: this atpkg is 0.86.0 at /tmp/self-update/atpkg\n\
+            doctor: warn — claude: managed 1 — SHADOWED by /tmp/self-update/claude\n";
+        assert!(!member_has_self_update_notice(paths, "claude"));
+        for level in ["ok", "warn"] {
+            let notice = format!(
+                "{paths}doctor: {level} — claude: managed 2.1.280 — Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)\n"
+            );
+            assert!(member_has_self_update_notice(&notice, "claude"));
+            assert!(!member_has_self_update_notice(&notice, "codex"));
+        }
+    }
+
+    /// (10f)'s drift warn, every wording: what the shim exports (`nothing`, or its own
+    /// entries), what the build declares, the consequence only when the build declares a
+    /// self-update switch and the shim exports none (the vendor's product for a
+    /// vendor-direct program, `its` for any other), and always the one remedy.
+    #[test]
+    fn the_drift_warn_says_what_the_shim_exports_and_what_the_build_declares() {
+        let admit = |e: &[&str]| {
+            crate::shim_env::ShimEnv::admit(&e.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+                .unwrap()
+        };
+        let shim = Path::new("/p/bin/x");
+        let none = crate::shim_env::ShimEnv::NONE;
+        let off = admit(&["DISABLE_AUTOUPDATER=1"]);
+        let claude = crate::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        assert_eq!(
+            env_drift_line("claude", claude, shim, &none, &off),
+            "/p/bin/x exports nothing, but claude 2.1.280 declares DISABLE_AUTOUPDATER=1, so \
+             Claude Code's own updater is on here — fix: `aterm pkg repair` re-lays it"
+        );
+        assert_eq!(
+            env_drift_line("ay", 17, shim, &none, &off),
+            "/p/bin/x exports nothing, but ay build 17 declares DISABLE_AUTOUPDATER=1, so its \
+             own updater is on here — fix: `aterm pkg repair` re-lays it"
+        );
+        // A switch is exported, just not the declared one: no claim about the updater.
+        assert_eq!(
+            env_drift_line("ay", 17, shim, &admit(&["DISABLE_AUTOUPDATER=0"]), &off),
+            "/p/bin/x exports DISABLE_AUTOUPDATER=0, but ay build 17 declares \
+             DISABLE_AUTOUPDATER=1 — fix: `aterm pkg repair` re-lays it"
+        );
+        // The switch is there; the drift is an EXTRA entry — no updater claim.
+        assert_eq!(
+            env_drift_line(
+                "ay",
+                17,
+                shim,
+                &admit(&["DISABLE_AUTOUPDATER=1", "AY_MODE=x"]),
+                &off
+            ),
+            "/p/bin/x exports DISABLE_AUTOUPDATER=1, AY_MODE=x, but ay build 17 declares \
+             DISABLE_AUTOUPDATER=1 — fix: `aterm pkg repair` re-lays it"
+        );
+        assert_eq!(
+            env_drift_line("ay", 17, shim, &none, &admit(&["AY_MODE=x"])),
+            "/p/bin/x exports nothing, but ay build 17 declares AY_MODE=x — fix: `aterm pkg \
+             repair` re-lays it"
+        );
+    }
+
     /// DESIGN S7 on the `doctor` surface: a managed member whose shim exports its
-    /// manifest's `shim_env` gets ONE `ok` line — the canonical row (the recorded one when
-    /// it is managed, else derived) and the trailing `self-update off (…)` sentence —
+    /// policy's `shim_env` gets ONE `ok` line — the canonical row (the recorded one when
+    /// it is managed, else derived) and the trailing "own updater is off here" sentence —
     /// never a fault, never inside the state; a plain shim gets no such line, and a
-    /// shadowed one keeps (10d)'s warn alone (the env never reaches the system copy).
+    /// shadowed one keeps (10d)'s warn alone (the env never reaches the system copy). A
+    /// vendor program (design §1.7) reads by version and source — never an index pin, never
+    /// "updates arrive with the ALab index".
     #[cfg(unix)]
     #[test]
     fn a_managed_member_with_a_shim_env_says_self_update_off_as_a_trailing_line() {
         use std::os::unix::fs::PermissionsExt as _;
         let l = layout("shim-env");
-        let dir = install_build_tree(&l, "claude", 2026082701);
+        let claude = crate::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        let dir = install_build_tree(&l, "claude", claude);
         let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
         crate::activate::install_tools_env(
             &l,
@@ -4390,8 +5415,8 @@ mod tests {
         programs.insert(
             "claude".to_string(),
             crate::ProgramStatus {
-                installed_build: Some(2026082701),
-                state: crate::state::managed(2026082701, 41),
+                installed_build: Some(claude),
+                state: crate::state::vendor_managed("2.1.280", "Anthropic"),
                 tree_root: String::new(),
             },
         );
@@ -4408,7 +5433,13 @@ mod tests {
                 last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
+                last_pass: String::new(),
+                last_pass_at: String::new(),
+                last_pass_attempted_index_build: 0,
+                last_pass_attempted_at: String::new(),
+                metered_hold_until: String::new(),
                 programs,
+                extra: Default::default(),
             },
         )
         .unwrap();
@@ -4440,9 +5471,27 @@ mod tests {
             .unwrap_or_else(|| panic!("an ok line for claude:\n{out}"));
         assert_eq!(
             line,
-            "doctor: ok — claude: managed 2026082701 — pinned by index 41 — self-update off \
-             (DISABLE_AUTOUPDATER=1) (updates arrive with the ALab index)"
+            "doctor: ok — claude: managed 2.1.280 — Anthropic latest — Claude Code's own \
+             updater is off here (DISABLE_AUTOUPDATER=1)"
         );
+        // Held, then rolled back: the row says why, and the sentence after it claims
+        // nothing about the version.
+        for why in ["held by local pin", "rolled back from 2.1.281"] {
+            let mut st = crate::status::read(&l).unwrap();
+            st.programs.get_mut("claude").unwrap().state =
+                crate::state::vendor_kept("2.1.280", why);
+            crate::status::write(&l, &st).unwrap();
+            let (ok, out) = run(&managed_only);
+            assert!(ok, "{out}");
+            let line = out.lines().find(|l| l.contains("ok — claude:")).unwrap();
+            assert_eq!(
+                line,
+                format!(
+                    "doctor: ok — claude: managed 2.1.280 — {why} — Claude Code's own updater \
+                     is off here (DISABLE_AUTOUPDATER=1)"
+                )
+            );
+        }
         // Shadowed: the warn alone — the foreign copy runs, and runs without the env.
         let foreign = l
             .prefix
@@ -4458,13 +5507,51 @@ mod tests {
         let (ok, out) = run(&ahead);
         assert!(ok, "{out}");
         assert!(out.contains("warn — claude:"), "{out}");
-        assert!(!out.contains("self-update"), "{out}");
+        assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
+        for line in out.lines().filter(|l| l.contains("claude")) {
+            assert_eq!(crate::vendor_direct::retired_wording(line), None, "{line}");
+        }
         // A plain shim: no line about it at all.
         crate::activate::install_tools(&l, &dir, &[tool("claude")], crate::activate::Aliases::Off)
             .unwrap();
         let (ok, out) = run(&managed_only);
         assert!(ok, "{out}");
-        assert!(!out.contains("self-update"), "{out}");
+        assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
+        assert!(!out.contains("exports nothing"), "{out}");
+        // A plain shim over a build whose sidecar DECLARES the env — what every `repair`
+        // before 2026-09-23 left: NAMED, with the one remedy, never passed over (audit
+        // 2026-09-23). A warn, not a fault; and said with a foreign copy ahead too, since
+        // the `agents/` twin every aterm tab runs copies this shim.
+        crate::shim_env::write_sidecar(&dir, &env).unwrap();
+        let drift = format!(
+            "doctor: warn — claude: {} exports nothing, but claude 2.1.280 declares \
+             DISABLE_AUTOUPDATER=1, so Claude Code's own updater is on here — fix: `aterm pkg \
+             repair` re-lays it",
+            l.shim(&tool("claude")).display()
+        );
+        for path in [&managed_only, &ahead] {
+            let (ok, out) = run(path);
+            assert!(ok, "a warn, not a fault: {out}");
+            assert!(out.lines().any(|line| line == drift), "{drift}\n---\n{out}");
+            assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
+            for line in out.lines().filter(|l| l.contains("claude")) {
+                assert_eq!(crate::vendor_direct::retired_wording(line), None, "{line}");
+            }
+        }
+        // Exporting what the build declares: the ok line again, and no warn.
+        crate::activate::install_tools_env(
+            &l,
+            &dir,
+            &[tool("claude")],
+            crate::activate::Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        let (ok, out) = run(&managed_only);
+        assert!(ok, "{out}");
+        assert!(member_has_self_update_notice(&out, "claude"), "{out}");
+        assert!(!out.contains("exports nothing"), "{out}");
+        crate::shim_env::write_sidecar(&dir, &crate::shim_env::ShimEnv::NONE).unwrap();
         let _ = std::fs::remove_dir_all(&foreign);
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
@@ -4631,7 +5718,9 @@ mod tests {
     /// otherwise) and the shells keep running, so the posture note names that lane and the
     /// `aterm ctl update` verbs — never a reopen. Both note arms are pinned (a newer build
     /// staged; a newer bundle already on disk), plus the quiet case, against the words that
-    /// stood here until 2026-08-30.
+    /// stood here until 2026-08-30. And both say it is the WINDOW that applies (changed
+    /// 2026-09-22, deliberately): a terminal session never does, so "aterm applies it" was
+    /// false on a Mac with no window open, and no session launch says so any more.
     #[test]
     fn aterm_posture_never_prompts_a_restart() {
         let base = layout("posture");
@@ -4667,9 +5756,11 @@ mod tests {
             "in-session",
             "staged",
             "1788077184",
+            "an aterm window applies it",
             "in place — your shells keep running",
-            "aterm ctl update status",
             "aterm ctl update apply",
+            "a terminal session never applies it, so with no window open `aterm --window` does",
+            "`aterm update status` shows it",
         ] {
             assert!(text.contains(want), "{want:?} missing from: {text}");
         }
@@ -4687,9 +5778,18 @@ mod tests {
         .unwrap();
         std::fs::write(updates.join("status.toml"), "current_build = 1788035619\n").unwrap();
         let text = report(&lay);
-        assert!(text.contains("activates it in-session"), "{text}");
+        assert!(
+            text.contains("an aterm window activates it in-session"),
+            "{text}"
+        );
         assert!(
             text.contains("in place — your shells keep running"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "a terminal session never does, so with no window open `aterm --window` does"
+            ),
             "{text}"
         );
         let lower = text.to_lowercase();
@@ -4853,8 +5953,8 @@ mod tests {
         );
         assert!(
             out.contains(
-                "the next update pass migrates the 1 beside a Cargo.toml; the other 1 is \
-                 free-standing"
+                "the next aterm window (or the day's first terminal session) migrates the 1 \
+                 beside a Cargo.toml; the other 1 is free-standing"
             ),
             "{out}"
         );
@@ -4877,9 +5977,7 @@ mod tests {
         let (ok, out) = run();
         assert!(ok, "{out}");
         assert!(
-            out.contains(
-                "NONE is beside a Cargo.toml, so the update pass never renames any of them"
-            ),
+            out.contains("NONE is beside a Cargo.toml, so aterm never renames any of them"),
             "{out}"
         );
         assert!(
@@ -4905,7 +6003,10 @@ mod tests {
         let (ok, out) = run();
         assert!(ok, "{out}");
         assert!(
-            out.contains("the next update pass migrates them (every one is beside a Cargo.toml)"),
+            out.contains(
+                "the next aterm window (or the day's first terminal session) migrates them \
+                 (every one is beside a Cargo.toml)"
+            ),
             "{out}"
         );
         assert!(!out.contains("free-standing"), "{out}");
@@ -5082,6 +6183,7 @@ mod tests {
                 },
             }),
             local_seal: None,
+            ..Probes::default()
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
@@ -5130,6 +6232,7 @@ mod tests {
                 link_target: PathBuf::from("/Users//me/toolchains/trust-d3866677"),
                 trustc: "d3866677".into(),
             }),
+            ..Probes::default()
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
@@ -5392,7 +6495,9 @@ mod tests {
         std::fs::create_dir_all(checkout.join("bin")).unwrap();
         std::fs::create_dir_all(checkout.join("lib")).unwrap();
         for tool in ["trustc", "targo", "tippy"] {
-            std::fs::write(checkout.join("bin").join(tool), format!("dev {tool}")).unwrap();
+            let executable = checkout.join("bin").join(tool);
+            std::fs::write(&executable, format!("dev {tool}")).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         crate::linkmode::link(
             &l,
@@ -5462,7 +6567,9 @@ mod tests {
         std::fs::create_dir_all(checkout.join("bin")).unwrap();
         std::fs::create_dir_all(checkout.join("lib")).unwrap();
         for tool in ["trustc", "targo"] {
-            std::fs::write(checkout.join("bin").join(tool), format!("dev {tool}")).unwrap();
+            let executable = checkout.join("bin").join(tool);
+            std::fs::write(&executable, format!("dev {tool}")).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         crate::linkmode::link(
             &l,
@@ -6086,25 +7193,35 @@ mod tests {
         assert_eq!(workspace_with_trust_table(&plain), None);
     }
 
-    /// A bundle whose `bin/` executables carry the tag, and a tagged shim, are each ONE
-    /// warning line — exit stays 0 — naming the count, an example, what breaks (a release
-    /// cut, after the claim) and the cure. Minted with a synthetic `user.*` attribute:
+    /// Installed files that still carry the tag — anywhere the heal reaches: a bundle's
+    /// `bin/`, a nested directory of it, a shim, the rustup view — are ONE warning line,
+    /// exit 0, at most 160 characters, naming the count, what it breaks and `aterm pkg
+    /// repair`. A clean store says nothing about the tag at all, and a record beside a
+    /// build is not what doctor reads. Minted with a synthetic `user.*` attribute:
     /// `com.apple.provenance` cannot be set by hand, and a test process may itself be
     /// tracked, so the negative half uses an attribute nothing set rather than the real one.
     #[cfg(target_os = "macos")]
     #[test]
-    fn provenance_tagged_executables_and_shims_warn_but_exit_zero() {
+    fn tagged_installed_files_are_one_short_warning_and_exit_zero() {
         let l = layout("provenance");
         install(&l, "trust", 8590);
         install(&l, "ay", 8256);
         let trust_exe = l.build_dir("trust", 8590).join("bin/trust");
         let shim = l.bin_dir().join("trust");
+        let nested = l.build_dir("trust", 8590).join("libexec").join("helper");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"#!/bin/sh\n").unwrap();
+        let view = crate::seam::view_dir(&l, "trust")
+            .join("bin")
+            .join("trustc");
+        std::fs::create_dir_all(view.parent().unwrap()).unwrap();
+        std::fs::write(&view, b"trustc").unwrap();
         assert!(
             trust_exe.is_file() && shim.is_file(),
             "fixture laid the tool and its shim"
         );
-        crate::provenance::set_xattr_for_test(&trust_exe, "user.aterm.probe", b"1").unwrap();
-        crate::provenance::set_xattr_for_test(&shim, "user.aterm.probe", b"1").unwrap();
+        // A record beside a CLEAN build: not doctor's to read.
+        crate::store::record_tracked_install(&l.build_dir("ay", 8256), "an old record").unwrap();
         let home = synthetic_home("provenance");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         let now = crate::flow::rfc3339_to_unix("2026-09-12T00:00:00Z").unwrap();
@@ -6134,58 +7251,235 @@ mod tests {
             )
         };
 
+        // Clean: not a word about the tag.
+        let (ok, out, _) = run("user.aterm.probe");
+        assert!(ok);
+        assert!(
+            !out.contains("com.apple.provenance") && !out.contains("macOS tag"),
+            "{out}"
+        );
+        assert!(!out.contains("tracked-install"), "{out}");
+
+        for tagged in [&trust_exe, &shim, &nested, &view] {
+            crate::provenance::set_xattr_for_test(tagged, "user.aterm.probe", b"1").unwrap();
+        }
         let (ok, out, err) = run("user.aterm.probe");
         assert!(
             ok,
-            "a tagged bundle is advisory, never structural:\n{out}\n{err}"
+            "a tagged file is advisory, never structural:\n{out}\n{err}"
         );
-        let bundle_line = out
-            .lines()
-            .find(|l| l.contains("trust build 8590 carries com.apple.provenance"))
-            .unwrap_or_else(|| panic!("the bundle line is missing:\n{out}"));
-        assert!(bundle_line.starts_with("doctor: warn — "), "{bundle_line}");
-        assert!(bundle_line.contains("1 of 1 file(s)"), "{bundle_line}");
-        assert!(bundle_line.contains("(e.g. trust)"), "{bundle_line}");
-        assert!(
-            bundle_line.contains("proof_snapshot.py"),
-            "what it breaks: {bundle_line}"
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("macOS tag")).collect();
+        assert_eq!(lines.len(), 1, "ONE line, however many roots:\n{out}");
+        let line = lines[0];
+        assert_eq!(
+            line,
+            "doctor: warn — 4 installed files still carry a macOS tag (com.apple.provenance) \
+             that release builds refuse. fix: aterm pkg repair"
         );
-        assert!(
-            bundle_line.contains("aterm pkg uninstall trust && aterm pkg install trust"),
-            "the cure names the program: {bundle_line}"
-        );
-        assert!(bundle_line.contains("TRUST_STAGE2_BIN"), "{bundle_line}");
-        // `ay` carries nothing and is not mentioned.
-        assert!(!out.contains("ay build 8256 carries"), "{out}");
-        let shim_line = out
-            .lines()
-            .find(|l| l.contains("shim(s) in"))
-            .unwrap_or_else(|| panic!("the shim line is missing:\n{out}"));
-        assert!(
-            shim_line.starts_with("doctor: warn — 1 of 2 shim(s) in"),
-            "{shim_line}"
-        );
-        assert!(shim_line.contains("(e.g. trust)"), "{shim_line}");
-        assert!(shim_line.contains("aterm pkg repair"), "{shim_line}");
+        assert!(line.chars().count() <= 160, "{line}");
         assert!(err.is_empty(), "warnings go to out, never err:\n{err}");
 
-        // An attribute nothing set: neither line.
+        // One file: the singular.
+        let scan = crate::provenance::Scan {
+            carriers: vec![trust_exe.clone()],
+            total: 9,
+        };
+        assert!(
+            provenance_line(&scan).starts_with("warn — 1 installed file still carries a macOS tag")
+        );
+
+        // An attribute nothing set: no line.
         let (ok, out, _) = run("user.aterm.absent");
         assert!(ok);
-        assert!(!out.contains("com.apple.provenance"), "{out}");
+        assert!(!out.contains("macOS tag"), "{out}");
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The RECORD a tracked installer left when its lane could not run is reported as
-    /// the cause on the tagged bundle's line; a record with no tagged file behind it is
-    /// named as stale rather than presented as a tagged bundle.
+    /// WHAT THIS BUILD IGNORES, WARNED (2026-09-23 review): a `[packages] prefix` naming
+    /// another store stops unattended installs until the line goes, and a retired opt-out
+    /// still exported switches nothing off — each is a `warn` naming the fix, and neither
+    /// line appears when there is nothing to say.
+    #[test]
+    fn doctor_warns_an_ignored_prefix_and_an_exported_retired_opt_out() {
+        let l = layout("ignored-settings");
+        let home = synthetic_home("ignored-settings");
+        let run = |probes: &Probes| -> String {
+            let path = std::env::join_paths([l.bin_dir()]).unwrap();
+            let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                crate::flow::now_unix(),
+                None,
+                None,
+                "doctor",
+                probes,
+                &mut out,
+                &mut err,
+            );
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let quiet = run(&Probes::default());
+        assert!(!quiet.contains("is not used by this build"), "{quiet}");
+        assert!(!quiet.contains("no longer does anything"), "{quiet}");
+        let out = run(&Probes {
+            ignored_prefix: Some(PathBuf::from("/opt/aterm/pkg")),
+            retired_env: vec![RETIRED_OPT_OUTS[0], RETIRED_OPT_OUTS[2]],
+            ..Probes::default()
+        });
+        let warns: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("doctor: warn — "))
+            .collect();
+        assert!(
+            warns.iter().any(|w| w.contains(
+                "[packages] prefix = /opt/aterm/pkg is not used \
+                                          by this build"
+            ) && w.contains("until you remove the line")),
+            "{out}"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("$ATERM_NO_AUTO_UPDATE is exported")
+                    && w.contains("[update] enabled = false")),
+            "{out}"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("$ATPKG_DISABLE is exported")
+                    && w.contains("[packages] enabled = false")),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// "NEVER CHECKED", SAID TRUTHFULLY (Phase 2, 2026-09-22): the doctor is the one
+    /// surface that reports that no index pass has completed — with no `status.toml`, and
+    /// over a record a failed pass wrote — and each line says what is true: the programs
+    /// the ALab index pins wait for a pass, and the vendor programs this machine keeps at
+    /// their vendors' heads update without one. Never the claim every read-only verb printed
+    /// on stderr until then, that no package could update before a first pass; and nothing
+    /// on stderr. The vendor clause names ONLY the programs that do (review, 2026-09-22 —
+    /// it used to name claude and codex always): installed and not held, not in `[packages]
+    /// exclude`, on a machine whose packages update on their own — and is absent when none.
+    #[test]
+    fn doctor_says_never_checked_truthfully_and_only_in_its_report() {
+        let l = layout("never-checked");
+        let home = synthetic_home("never-checked");
+        let now = crate::flow::rfc3339_to_unix("2026-10-20T00:00:00Z").unwrap();
+        let run = |probes: &Probes| -> (String, String) {
+            let path = std::env::join_paths([l.bin_dir()]).unwrap();
+            let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                probes,
+                &mut out,
+                &mut err,
+            );
+            (
+                String::from_utf8_lossy(&out).into_owned(),
+                String::from_utf8_lossy(&err).into_owned(),
+            )
+        };
+        let line = |text: &str| -> String {
+            text.lines()
+                .find(|l| l.starts_with("doctor: warn — no "))
+                .unwrap_or_else(|| panic!("the never-checked line: {text}"))
+                .to_owned()
+        };
+        let untrue = ["cannot be updated", " until"].concat();
+        let defaults = Probes::default();
+
+        // Nothing installed: no vendor program updates, so the line claims none.
+        let (out, err) = run(&defaults);
+        assert_eq!(
+            line(&out),
+            "doctor: warn — no status.toml yet (no update pass has run) — the programs the \
+             ALab index pins update once one completes (run: aterm pkg update)"
+        );
+        // Both installed: both named.
+        for program in ["claude", "codex"] {
+            let dir = l.build_dir(program, 2_026_092_201);
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            crate::activate::atomic_symlink(&dir, &l.program_current(program)).unwrap();
+        }
+        let (out1, err1) = run(&defaults);
+        assert_eq!(
+            line(&out1),
+            "doctor: warn — no status.toml yet (no update pass has run) — the programs the \
+             ALab index pins update once one completes (run: aterm pkg update); claude and \
+             codex update from their vendors without it"
+        );
+        // A failed pass's record: written, and still no completed index pass.
+        crate::status::write(
+            &l,
+            &crate::Status {
+                schema: 1,
+                updated_at: "2026-10-19T00:00:00Z".into(),
+                outcome: "update failed: index unreachable".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (out2, err2) = run(&defaults);
+        assert_eq!(
+            line(&out2),
+            "doctor: warn — no index update pass has completed yet (status last written \
+             2026-10-19T00:00:00Z) — the programs the ALab index pins update once one does \
+             (run: aterm pkg update); claude and codex update from their vendors without it"
+        );
+        // `exclude = ["claude"]`, and codex held by a local pin: neither is named.
+        let excluded = Probes {
+            excluded: vec!["claude".into()],
+            ..Probes::default()
+        };
+        let (out3, _) = run(&excluded);
+        assert!(
+            line(&out3).ends_with("; codex updates from its vendor without it"),
+            "{out3}"
+        );
+        crate::pin::set_pinned(&l, "codex", true).unwrap();
+        let (out4, _) = run(&excluded);
+        assert!(line(&out4).ends_with("(run: aterm pkg update)"), "{out4}");
+        crate::pin::set_pinned(&l, "codex", false).unwrap();
+        // Packages that do not update on their own (`enabled` off — or the retired
+        // `auto_update` off — or the manager disarmed): no vendor program updates by itself either.
+        let (out5, _) = run(&Probes {
+            automatic: false,
+            ..Probes::default()
+        });
+        assert!(line(&out5).ends_with("(run: aterm pkg update)"), "{out5}");
+
+        for text in [&out, &err, &out1, &err1, &out2, &err2, &out3, &out4, &out5] {
+            assert!(!text.contains(&untrue), "{text}");
+        }
+        for text in [&err, &err1, &err2] {
+            assert!(
+                !text.contains("update pass"),
+                "the report, not stderr: {text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[cfg(target_os = "macos")]
-    /// The two freshness warnings (2026-09-15), separately: a listing unreached for
+    /// The freshness warnings (2026-09-15 and 2026-09-22), separately: a listing unreached for
     /// days is named as such — every pass since ran on the cache — and an index build
     /// unchanged for a month WHILE the listing was reachable reads as a frozen
-    /// publisher. A record from before the fields existed says nothing new, and an
-    /// unreachable listing is never called a frozen publisher.
+    /// publisher. A completed pass with no freshness stamp names that blind spot;
+    /// an unreachable listing is never called a frozen publisher.
     #[test]
     fn doctor_names_an_unreached_listing_and_a_frozen_index_separately() {
         let l = layout("freshness");
@@ -6221,17 +7515,45 @@ mod tests {
             last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
+            last_pass: String::new(),
+            last_pass_at: String::new(),
+            last_pass_attempted_index_build: 0,
+            last_pass_attempted_at: String::new(),
+            metered_hold_until: String::new(),
             programs: Default::default(),
+            extra: Default::default(),
         };
         let out = run(base.clone());
         assert!(!out.contains("has not been reached"), "{out}");
         assert!(!out.contains("publishing looks frozen"), "{out}");
+        // A completed pass with NO freshness stamp is named, never silent
+        // (2026-09-22): the two checks above cannot run over such a record, and a
+        // reader must be told why rather than shown a green report.
+        assert!(
+            out.contains(
+                "warn — no completed pass has recorded reaching the signed index listing \
+                 (last completed pass 2026-10-19T00:00:00Z)"
+            ),
+            "a record without a freshness stamp is named:\n{out}"
+        );
+        assert!(
+            out.contains("OLDER atpkg that does not stamp index freshness")
+                && out.contains("run: aterm pkg update"),
+            "the warn names the second cause and the remedy:\n{out}"
+        );
         let out = run(crate::Status {
             last_index_reached_at: "2026-10-10T00:00:00Z".into(),
             last_index_build: 32,
             index_build_changed_at: "2026-10-01T00:00:00Z".into(),
+            last_pass: String::new(),
+            last_pass_at: String::new(),
+            metered_hold_until: String::new(),
             ..base.clone()
         });
+        assert!(
+            !out.contains("no completed pass has recorded reaching"),
+            "a stamped record is not accused of lacking a stamp:\n{out}"
+        );
         assert!(
             out.contains("has not been reached for 10 day(s)"),
             "an unreached listing is named:\n{out}"
@@ -6244,6 +7566,9 @@ mod tests {
             last_index_reached_at: "2026-10-19T00:00:00Z".into(),
             last_index_build: 32,
             index_build_changed_at: "2026-09-10T00:00:00Z".into(),
+            last_pass: String::new(),
+            last_pass_at: String::new(),
+            metered_hold_until: String::new(),
             ..base
         });
         assert!(
@@ -6256,77 +7581,517 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// macOS-gated like its sibling above: it mints the synthetic `user.*` attribute through
-    /// [`crate::provenance::set_xattr_for_test`], which is
-    /// `#[cfg(all(test, target_os = "macos"))]` because it calls the six-argument Darwin
-    /// `setxattr`. Without the gate the whole unit-test binary fails to build off macOS
-    /// (E0425); `crates/atpkg/tests/platform_cfg_parity.rs` is the standing guard.
-    #[cfg(target_os = "macos")]
+    /// THE VERDICT FIRST, THEN ONLY WHAT NEEDS ATTENTION: a report with warnings and no
+    /// fault is "working", never "healthy"; every row it prints fits [`SHORT_ROW`] with the
+    /// row's own next step; ok rows and notes wait for `--verbose`, which prints them all
+    /// under the same verdict.
     #[test]
-    fn a_tracked_install_record_is_reported_as_the_cause() {
-        let l = layout("tracked-record");
-        install(&l, "trust", 8590);
-        install(&l, "ay", 8256);
-        let trust_exe = l.build_dir("trust", 8590).join("bin/trust");
-        crate::provenance::set_xattr_for_test(&trust_exe, "user.aterm.probe", b"1").unwrap();
-        crate::store::record_tracked_install(
-            &l.build_dir("trust", 8590),
-            "the untracked lane could not run (launchctl submit failed)",
-        )
-        .unwrap();
-        // `ay` carries a record but nothing tagged: stale.
-        crate::store::record_tracked_install(&l.build_dir("ay", 8256), "an old record").unwrap();
-        let home = synthetic_home("tracked-record");
-        let path = std::env::join_paths([l.bin_dir()]).unwrap();
-        let now = crate::flow::rfc3339_to_unix("2026-09-12T00:00:00Z").unwrap();
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        let probes = Probes {
-            provenance_attr: "user.aterm.probe",
-            ..Probes::default()
-        };
-        let ok = run_with(
-            &l,
-            Some(&home),
-            Some(&path),
-            now,
-            None,
-            None,
-            "doctor",
-            &probes,
-            &mut out,
-            &mut err,
-        );
-        let out = String::from_utf8_lossy(&out).into_owned();
-        assert!(ok, "advisory, never structural:\n{out}");
-        let bundle_line = out
-            .lines()
-            .find(|l| l.contains("trust build 8590 carries com.apple.provenance"))
-            .unwrap_or_else(|| panic!("the bundle line is missing:\n{out}"));
-        assert!(
-            bundle_line.contains(
-                "recorded cause: the untracked lane could not run (launchctl submit failed)"
+    fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
+        let spotlight = "doctor: warn — 18 of 49 cargo target dir(s) under /Users//x are \
+             indexed by Spotlight (at least 37.0 GiB) — `mds` grinding build output was one of \
+             the two amplifiers behind a watchdog kill; the other 13 are free-standing, which \
+             aterm cannot re-point — re-point that, then `aterm pkg noindex apply <dir>` by \
+             name — now: `aterm pkg machine apply` (or `aterm pkg noindex apply --all`)";
+        let path_row = "doctor: warn — managed bin/ is not on PATH here; an aterm shell — and \
+             any rc file carrying atpkg's block (the rc lines below) — sources \
+             ~/.aterm/shell.d (which APPENDS it), or add: export \
+             PATH=\"$PATH:/Users//x/Library/Application Support/aterm/pkg/bin\"";
+        assert_eq!(
+            present(path_row, "", "doctor", Detail::Problems)
+                .joined()
+                .lines()
+                .nth(1),
+            Some(
+                "doctor: warn — managed bin/ is not on PATH here — add: export \
+                 PATH=\"$PATH:/Users//x/Library/Application Support/aterm/pkg/bin\""
             ),
-            "{bundle_line}"
+            "the line to paste survives the cut"
         );
-        assert!(
-            bundle_line.contains("fix: re-seed the bundle untagged"),
-            "the cure still follows the cause: {bundle_line}"
+        let report = format!(
+            "doctor: this atpkg is 0.91.0 at /x\n\
+             doctor: ok — prefix /p\n\
+             doctor: warn — 1252 installed files still carry a macOS tag. fix: aterm pkg repair\n\
+             doctor: note — Trust builds use the ay pinned inside the trust bundle\n\
+             {spotlight}\n\
+             doctor: 12 program(s) active\n\
+             doctor: healthy\n"
         );
-        let stale = out
-            .lines()
-            .find(|l| l.contains("ay build 8256 carries a tracked-install record"))
-            .unwrap_or_else(|| panic!("the stale-record line is missing:\n{out}"));
-        assert!(stale.contains("(an old record)"), "{stale}");
-        assert!(stale.contains("stale record"), "{stale}");
-        assert!(
-            stale.contains("aterm pkg uninstall ay && aterm pkg install ay"),
-            "{stale}"
+        let out = present(&report, "", "doctor", Detail::Problems).joined();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            "doctor: working — 12 program(s) installed; 2 thing(s) to look at"
         );
+        assert_eq!(
+            lines[1],
+            "doctor: warn — 1252 installed files still carry a macOS tag. fix: aterm pkg repair"
+        );
+        assert_eq!(
+            lines[2],
+            "doctor: warn — 18 of 49 cargo target dir(s) under /Users//x are indexed by \
+             Spotlight (at least 37.0 GiB) — run `aterm pkg machine apply`"
+        );
+        assert_eq!(
+            lines[3],
+            "doctor: the full report: aterm pkg doctor --verbose"
+        );
+        assert_eq!(lines.len(), 4, "{out}");
         assert!(
-            !out.contains("ay build 8256 carries com.apple.provenance"),
+            lines.iter().all(|l| l.chars().count() <= SHORT_ROW),
             "{out}"
         );
+        assert!(
+            !out.contains("healthy"),
+            "never healthy beside a warning: {out}"
+        );
+
+        let all = present(&report, "", "doctor", Detail::Everything).joined();
+        assert!(all.starts_with("doctor: working — 12 program(s)"), "{all}");
+        assert!(
+            all.contains("doctor: ok — prefix /p") && all.contains(spotlight),
+            "{all}"
+        );
+        assert!(!all.contains("doctor: healthy"), "{all}");
+    }
+
+    /// Nothing flagged is `healthy`, with nothing below it; a fault keeps its own verdict
+    /// and the one next act; a FAIL row's indented detail follows it.
+    #[test]
+    fn a_clean_report_is_healthy_and_a_faulty_one_keeps_its_verdict_and_next_act() {
+        let clean = "status: ok — prefix /p\nstatus: 3 program(s) active\nstatus: healthy\n";
+        assert_eq!(
+            present(clean, "", "status", Detail::Problems).joined(),
+            "status: healthy — 3 program(s) installed and working\n\
+             status: the full report: aterm pkg status --verbose\n"
+        );
+        let faulty = format!(
+            "doctor: FAIL — trust: shim missing\n\
+             doctor:   trust: {}\n\
+             doctor: ok — prefix /p\n\
+             doctor: found 1 problem(s)\n\
+             doctor: next — aterm pkg update\n",
+            "x".repeat(300)
+        );
+        let out = present(&faulty, "", "doctor", Detail::Problems).joined();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "doctor: found 1 problem(s)");
+        assert_eq!(lines[1], "doctor: FAIL — trust: shim missing");
+        assert!(lines[2].starts_with("doctor:   trust: xxx") && lines[2].ends_with('…'));
+        assert_eq!(lines[2].chars().count(), SHORT_ROW);
+        assert_eq!(lines[3], "doctor: next — aterm pkg update");
+
+        // A recorded problem listed after other rows still follows its verdict, and a
+        // declined store says why it is empty.
+        let declined = format!(
+            "doctor: PROBLEM — the toolset is incomplete; 3 program(s) active\n\
+             doctor: ok — ty: removed on purpose\n\
+             doctor:   trust: error: disk full\n\
+             doctor: {DECLINED_LINE} (`aterm pkg install --default-set` reinstalls it)\n\
+             doctor: found 1 problem(s)\n"
+        );
+        let out = present(&declined, "", "doctor", Detail::Problems).joined();
+        assert!(out.contains("doctor:   trust: error: disk full"), "{out}");
+        assert!(out.contains(DECLINED_LINE), "{out}");
+        assert!(
+            !out.contains("removed on purpose"),
+            "an ok row waits for --verbose: {out}"
+        );
+    }
+
+    /// A STRUCTURAL FAULT — the rows [`run_with`] writes to stderr — follows the verdict
+    /// and is cut to one short row like every other problem, still on stderr; a row whose
+    /// fact ends at a `;` or a sentence keeps the fact whole and its `Fix:`, and a `;` inside
+    /// a parenthetical is not the end of the fact.
+    #[test]
+    fn a_structural_fault_follows_the_verdict_in_one_short_row() {
+        let long_path = format!("/Users//x/{}/pkg/bin/foo", "d".repeat(150));
+        let faults = format!(
+            "doctor: FAIL \u{2014} broken bin shim {long_path}\n\
+             doctor: FAIL \u{2014} trust: its bin/ shims are split across builds 1, 2 \u{2014} \
+             one program's tools must all point into one build (run `aterm pkg repair` to \
+             re-lay every shim from one build, then `aterm pkg update trust` to re-point the \
+             links)\n"
+        );
+        let report = "doctor: ok \u{2014} prefix /p\n\
+             doctor: PROBLEM \u{2014} no ALab programs are installed. Fix: aterm pkg install \
+             --default-set (installs the whole ALab toolset; if no build is published for this \
+             machine it names the reason and exits 2)\n\
+             doctor: found 3 problem(s)\n\
+             doctor: next \u{2014} aterm pkg install --default-set\n";
+        let shown = present(report, &faults, "doctor", Detail::Problems);
+        assert_eq!(shown.verdict, "doctor: found 3 problem(s)\n");
+        let fault_rows: Vec<&str> = shown.faults.lines().collect();
+        assert_eq!(fault_rows.len(), 2, "{}", shown.faults);
+        assert!(
+            fault_rows[0].starts_with("doctor: FAIL \u{2014} broken bin shim /Users//x/")
+                && fault_rows[0].ends_with('\u{2026}'),
+            "{}",
+            fault_rows[0]
+        );
+        assert_eq!(
+            fault_rows[1],
+            "doctor: FAIL \u{2014} trust: its bin/ shims are split across builds 1, 2 \u{2014} run \
+             `aterm pkg repair`"
+        );
+        assert!(
+            fault_rows.iter().all(|r| r.chars().count() <= SHORT_ROW),
+            "{fault_rows:?}"
+        );
+        assert_eq!(
+            shown.rest.lines().next(),
+            Some(
+                "doctor: PROBLEM \u{2014} no ALab programs are installed \u{2014} fix: aterm pkg \
+                 install --default-set"
+            )
+        );
+        assert!(
+            shown
+                .rest
+                .ends_with("doctor: the full report: aterm pkg doctor --verbose\n"),
+            "{}",
+            shown.rest
+        );
+        // Under --verbose every fault is whole.
+        let all = present(report, &faults, "doctor", Detail::Everything);
+        assert_eq!(all.faults, faults);
+
+        // A `;` inside a parenthetical does not end the fact.
+        let row = format!(
+            "reroute stub {} missing (an aterm session lays it at spawn; `aterm pkg repair` \
+             re-lays it; a recorded decline lays none)",
+            "c".repeat(60)
+        );
+        let short = short_row("doctor", "warn", &row);
+        assert!(short.chars().count() <= SHORT_ROW, "{short}");
+        assert!(
+            !short.contains("at spawn \u{2014}") && short.ends_with("run `aterm pkg repair`"),
+            "{short}"
+        );
+    }
+
+    /// THE OWNER'S 2026-09-22 REPORT, REPLAYED. A pass completed minutes ago, the listing
+    /// was reached, the floor is index 42 — and the release host already answers for index
+    /// 43. The report used to say "ok — 0 day(s) since the last completed update pass",
+    /// "last-trusted index_build 42" and "healthy", every line true and none the answer.
+    /// The stamps here are written by the probe's REAL writer
+    /// ([`crate::index_probe::successor_with`]) over a fake HEAD, and read back by the real
+    /// reader; nothing on this path touches the network.
+    #[test]
+    fn doctor_says_when_the_channel_head_is_past_the_local_index() {
+        use crate::index_probe::{LISTING_LOCK, LOOKAHEAD_LOCK, NEAR_LOCK};
+        use aterm_update_core::{HeadAnswer, HttpError};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let l = layout("channel-head");
+        install(&l, "ay", 8256);
+        let home = synthetic_home("channel-head");
+        let now = crate::flow::rfc3339_to_unix("2026-09-22T18:00:00Z").unwrap();
+        let at = |secs_ago: u64| {
+            UNIX_EPOCH + Duration::from_secs(u64::try_from(now).unwrap() - secs_ago)
+        };
+        crate::status::write(
+            &l,
+            &crate::Status {
+                schema: 1,
+                updated_at: "2026-09-22T17:58:00Z".into(),
+                enabled: true,
+                index_source: "alabsystems/aterm".into(),
+                outcome: "up to date".into(),
+                seams: Vec::new(),
+                last_success_at: "2026-09-22T17:58:00Z".into(),
+                last_index_reached_at: "2026-09-22T17:58:00Z".into(),
+                last_index_build: 42,
+                index_build_changed_at: "2026-09-21T09:00:00Z".into(),
+                last_pass: String::new(),
+                last_pass_at: String::new(),
+                last_pass_attempted_index_build: 0,
+                last_pass_attempted_at: String::new(),
+                metered_hold_until: String::new(),
+                programs: Default::default(),
+                extra: Default::default(),
+            },
+        )
+        .unwrap();
+        std::fs::write(l.floor(), "42").unwrap();
+        // The probe's real writer, over a fake release host.
+        let probe = |published: Option<u64>, fail: bool| {
+            let mut head = |url: &str| -> Result<HeadAnswer, HttpError> {
+                if fail {
+                    return Err(HttpError::Transport("offline".into()));
+                }
+                let hit = published
+                    .is_some_and(|b| url.ends_with(&format!("/atpkg-index-{b}/index.toml")));
+                Ok(HeadAnswer {
+                    code: if hit { 302 } else { 404 },
+                    location: hit
+                        .then(|| "https://release-assets.githubusercontent.com/object".into()),
+                })
+            };
+            let mut list = |_: &str| -> Result<Vec<u8>, HttpError> { Ok(b"[]".to_vec()) };
+            crate::index_probe::successor_with(
+                &l,
+                "alabsystems",
+                "aterm",
+                SystemTime::now(),
+                &mut head,
+                &mut list,
+            )
+        };
+        let age_stamps = |secs_ago: u64| {
+            for lock in [NEAR_LOCK, LOOKAHEAD_LOCK, LISTING_LOCK] {
+                if let Ok(file) = std::fs::File::options()
+                    .write(true)
+                    .open(l.prefix.join(lock))
+                {
+                    file.set_modified(at(secs_ago)).unwrap();
+                }
+            }
+        };
+        let clear = || {
+            for lock in [NEAR_LOCK, LOOKAHEAD_LOCK, LISTING_LOCK] {
+                let _ = std::fs::remove_file(l.prefix.join(lock));
+            }
+        };
+        let run = |index_head: bool| -> (bool, String) {
+            let path = std::env::join_paths([l.bin_dir()]).unwrap();
+            let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                &Probes {
+                    index_head,
+                    ..Probes::default()
+                },
+                &mut out,
+                &mut err,
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        let head_lines = |out: &str| -> Vec<String> {
+            out.lines()
+                .filter(|l| l.contains("newer than 42") || l.contains("index 42 "))
+                .map(str::to_string)
+                .collect()
+        };
+
+        // The §14 cache the pass writes from the listing before it selects — by its REAL
+        // writer, under the source key the real fetcher uses.
+        let cache_holds = |builds: &[u64]| {
+            let candidates: Vec<crate::select::Candidate> = builds
+                .iter()
+                .map(|b| crate::select::Candidate {
+                    label: format!("atpkg-index-{b}"),
+                    index_bytes: b"i".to_vec(),
+                    sig: b"s".to_vec(),
+                    roster_bytes: b"r".to_vec(),
+                    roster_sig: b"rs".to_vec(),
+                })
+                .collect();
+            crate::cache::IndexCache::for_layout(&l).store(
+                &crate::net::github_source_id("alabsystems"),
+                &candidates,
+                &[],
+            );
+        };
+        let drop_cache = || {
+            let _ = std::fs::remove_file(l.prefix.join("index-cache.toml"));
+        };
+
+        // (a) Index 43 is published: the owner's state, with no downloaded candidates on
+        // record. Said, as a warn with the remedy.
+        assert_eq!(
+            probe(Some(43), false),
+            crate::index_probe::Probe::Published(43)
+        );
+        age_stamps(120);
+        let (ok, out) = run(true);
+        assert!(ok, "advisory, never structural:\n{out}");
+        assert!(
+            out.contains("ok — 0 day(s) since the last completed update pass")
+                && out.contains("last-trusted index_build 42"),
+            "the lines the owner read are still there:\n{out}"
+        );
+        let published_line = "doctor: warn — index 42 is not the newest: the index probe found a \
+                              newer ALab index (seen 2 min ago; an unverified hint — no signed \
+                              pass has landed it on this machine) — run: aterm pkg update";
+        assert_eq!(head_lines(&out), [published_line], "{out}");
+
+        // A complete first-page Releases listing is an actionable hint even if all four
+        // release-asset HEADs miss. The doctor reads that third stamp and names the
+        // probe, without claiming a successful asset HEAD it did not observe.
+        clear();
+        let mut head = |_: &str| -> Result<HeadAnswer, HttpError> {
+            Ok(HeadAnswer {
+                code: 404,
+                location: None,
+            })
+        };
+        let mut list = |_: &str| -> Result<Vec<u8>, HttpError> {
+            Ok(br#"[{"tag_name":"atpkg-index-43","assets":[{"name":"index.toml","url":"i"},{"name":"index.toml.sig","url":"is"},{"name":"aterm-machines.toml","url":"m"},{"name":"aterm-machines.toml.sig","url":"ms"}]}]"#.to_vec())
+        };
+        assert_eq!(
+            crate::index_probe::successor_with(
+                &l,
+                "alabsystems",
+                "aterm",
+                SystemTime::now(),
+                &mut head,
+                &mut list,
+            ),
+            crate::index_probe::Probe::Published(43)
+        );
+        age_stamps(120);
+        let cached = crate::index_probe::cached_answer(&l);
+        assert_eq!(
+            cached.near.unwrap().0,
+            crate::index_probe::RangeAnswer::Missing
+        );
+        assert_eq!(
+            cached.lookahead.unwrap().0,
+            crate::index_probe::RangeAnswer::Missing
+        );
+        assert_eq!(
+            cached.listing.unwrap().0,
+            crate::index_probe::RangeAnswer::Published
+        );
+        let (_, out) = run(true);
+        assert_eq!(head_lines(&out), [published_line], "{out}");
+
+        clear();
+        assert_eq!(
+            probe(Some(43), false),
+            crate::index_probe::Probe::Published(43)
+        );
+        age_stamps(120);
+
+        // (a2) The same hint, but the last pass that read the listing held only 42 and
+        // older: the listing had no COMPLETE newer release then. "run: aterm pkg update"
+        // alone would loop ("already current" / "not the newest"); the line says why.
+        cache_holds(&[42, 41, 40, 39]);
+        let (_, out) = run(true);
+        assert_eq!(
+            head_lines(&out),
+            [
+                "doctor: warn — index 42 is not the newest: the index probe found a \
+              newer ALab index (seen 2 min ago; an unverified hint), but the last signed \
+              update pass read the index listing 2 min ago and found no complete signed \
+              release newer than 42 there — if the new one was up by then, its signed files \
+              are not all uploaded and no update can land it yet; otherwise run: aterm pkg \
+              update"
+            ],
+            "{out}"
+        );
+
+        // (a3) The last pass DOWNLOADED 43 and the floor is still 42: it was refused.
+        // Another update is not the remedy; the line says so — whatever the probe says.
+        cache_holds(&[43, 42, 41, 40]);
+        let refused = "doctor: warn — index 42 is not the newest: this machine already \
+                       downloaded the signed index 43 and did not land it — its signatures \
+                       did not verify here (the roster that authorizes it, the machine that \
+                       signed it, or their validity window), or the pass that fetched it \
+                       stopped early; if `aterm pkg update` still ends on index 42, it is the \
+                       release that needs fixing, not this machine";
+        let (ok, out) = run(true);
+        assert!(ok, "{out}");
+        assert_eq!(head_lines(&out), [refused], "{out}");
+
+        // (b) Nothing newer, asked just now by both ranges: ok, said as what was checked.
+        clear();
+        drop_cache();
+        assert_eq!(probe(None, false), crate::index_probe::Probe::Missing);
+        age_stamps(30);
+        let (_, out) = run(true);
+        assert_eq!(
+            head_lines(&out),
+            [
+                "doctor: ok — the release host shows no index newer than 42 at the next four \
+              tags or on its first releases page (checked 30 s ago)"
+            ],
+            "{out}"
+        );
+        assert!(!out.contains("not the newest"), "{out}");
+        // ...and a refused download outranks the probe's "nothing newer".
+        cache_holds(&[43, 42]);
+        let (_, out) = run(true);
+        assert_eq!(head_lines(&out), [refused], "{out}");
+        drop_cache();
+
+        // (d) The same answer three hours old — no window asking: its age, not an ok, and
+        // the time the listing was last read (what `aterm pkg update` does move).
+        age_stamps(3 * 3600);
+        let (_, out) = run(true);
+        assert_eq!(
+            head_lines(&out),
+            [
+                "doctor: note — the release host showed no index newer than 42 when last \
+              asked, 3 h ago (the aterm window asks every minute while it runs); the last \
+              signed update pass read the index listing 2 min ago"
+            ],
+            "{out}"
+        );
+
+        // A failed check is unknown, never "newest".
+        clear();
+        assert_eq!(probe(None, true), crate::index_probe::Probe::Deferred);
+        age_stamps(60);
+        let (_, out) = run(true);
+        assert_eq!(
+            head_lines(&out),
+            [
+                "doctor: note — the last check for an index newer than 42 got no usable \
+              answer (60 s ago), so whether one is published is unknown here; the last \
+              signed update pass read the index listing 2 min ago"
+            ],
+            "{out}"
+        );
+
+        // (c) No false alarm once the index LANDED: a "published" stamp written under 42
+        // says nothing about floor 43, and a cache holding 43 is not "newer than 43".
+        clear();
+        assert_eq!(
+            probe(Some(43), false),
+            crate::index_probe::Probe::Published(43)
+        );
+        cache_holds(&[43, 42]);
+        std::fs::write(l.floor(), "43").unwrap();
+        let (_, out) = run(true);
+        assert!(!out.contains("not the newest"), "{out}");
+        assert!(
+            out.contains(
+                "doctor: note — no check for an index newer than 43 is recorded on this \
+                 machine (the aterm window asks every minute while it runs); the last signed \
+                 update pass read the index listing 2 min ago"
+            ),
+            "{out}"
+        );
+        drop_cache();
+
+        // (e) A source the probe does not watch reports nothing at all.
+        std::fs::write(l.floor(), "42").unwrap();
+        let (_, out) = run(false);
+        assert!(head_lines(&out).is_empty(), "{out}");
+        assert!(!out.contains("release host"), "{out}");
+
+        // No pass has recorded reading the listing: the note says that, not a time.
+        clear();
+        let mut status = crate::status::read(&l).unwrap();
+        status.last_index_reached_at.clear();
+        crate::status::write(&l, &status).unwrap();
+        let (_, out) = run(true);
+        assert_eq!(
+            head_lines(&out),
+            [
+                "doctor: note — no check for an index newer than 42 is recorded on this \
+              machine (the aterm window asks every minute while it runs); no update pass has \
+              recorded reading the signed index listing"
+            ],
+            "{out}"
+        );
+
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -305,6 +305,22 @@ impl IndexCache {
         decode(self.read_doc(source_id)?)
     }
 
+    /// The release LABELS of the candidates cached for `source_id`, newest first, under the
+    /// same guards as [`Self::load`] and without decoding a byte of them. A label is
+    /// diagnostics, never trust: `doctor` reads it to say which index the last pass that
+    /// reached the listing downloaded, never to decide anything. Read-only — no lock, no
+    /// write, no repair; `None` on anything [`Self::load`] would refuse.
+    #[must_use]
+    pub fn labels(&self, source_id: &str) -> Option<Vec<String>> {
+        Some(
+            self.read_doc(source_id)?
+                .candidate
+                .into_iter()
+                .map(|c| c.label)
+                .collect(),
+        )
+    }
+
     /// The HIT PATH: the cached candidates IFF the same-source guard passes AND every
     /// entry's stored `identity` equals `live` — the identity of the candidate set the
     /// source is publishing RIGHT NOW, in the same order.

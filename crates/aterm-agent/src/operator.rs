@@ -1373,13 +1373,14 @@ impl Drop for ProcessLock {
         // fork window left standing. Closing that gap means unlocking BEFORE the
         // exit, which no `Drop` can do for it.
         //
-        // The workspace's other advisory-lock guards do NOT yet release this way:
-        // `atpkg::lock::StoreLock` (crates/atpkg/src/lock.rs),
-        // `aterm_update_core::FileLock` (crates/aterm-update-core/src/sys.rs) and
-        // `atpkg-keys`' roster claim (crates/atpkg-keys/src/provision.rs) each
+        // Two of the workspace's other advisory-lock guards do NOT yet release this
+        // way: `aterm_update_core::FileLock` (crates/aterm-update-core/src/sys.rs)
+        // and `atpkg-keys`' roster claim (crates/atpkg-keys/src/provision.rs) each
         // still rely on the close, and each carries the same fork window. They
         // are named here so the difference is deliberate and findable rather than
-        // an accident of which one was measured first.
+        // an accident of which one was measured first. (`atpkg::lock::StoreLock`
+        // and its `Flock` took this spelling on 2026-09-23, and the vendor lane's
+        // stamp and digest-log lock moved off `FileLock` onto `Flock` with it.)
         let _ = self.file.unlock();
     }
 }

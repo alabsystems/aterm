@@ -1515,6 +1515,16 @@ pub(crate) mod test_fixtures {
         "crates/aterm-lexicon/src",
         "crates/aterm-log/src",
         "crates/aterm-lz4/src",
+        // Entered the closure 2026-09-22 with the unified message system
+        // (docs/DESIGN-unified-messages-2026-09-21.md Phase 1): aterm-gui
+        // hosts the message band, the durable message log and the pre-App
+        // inbox over this engine. A normal [dependencies] edge, so it is GUI
+        // process code. Reviewed: aterm-time only — no locks, no threads, no
+        // fs, no sockets; every method that reads time takes `now` — so it can
+        // participate in no lock order; the census walks it because the event
+        // loop, the log writer thread and the inbox's producers all run its
+        // pure code.
+        "crates/aterm-messages/src",
         "crates/aterm-net/src",
         // Entered the closure 2026-09-01 with b90beb2d2 ("aterm-objc — the
         // first-party ObjC runtime layer, and the first declare_class! site off

@@ -1295,8 +1295,7 @@ mod tests {
 
     /// **THE STATE-DIR RULE IS DUPLICATED FROM `cli.rs`, SO IT IS PINNED TO
     /// IT.** `cli.rs` carried this rule as a binary main until 2026-09-10, so it
-    /// exists three times — there, in `hook.rs` and in `notify.rs` (`tui.rs` held a
-    /// fourth until round 21 deleted the module) —
+    /// exists twice — there and in `notify.rs` —
     /// and it belongs in `state.rs` where all three could call one copy. Until it
     /// moves, every copy is pinned to the original: change `cli.rs`'s rule and
     /// this fails, rather than leaving `notify` reading its state under a

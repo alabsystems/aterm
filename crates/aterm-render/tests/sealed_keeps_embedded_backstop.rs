@@ -51,7 +51,7 @@ const NERD_PUA: char = '\u{E0A0}';
 
 /// A noncharacter: no font anywhere covers it, so it is the honest `.notdef`
 /// control. The fix must not make the resolver invent coverage.
-const NONCHARACTER: char = '\u{FDD2}';
+const NONCHARACTER: char = '\u{FFFF}';
 
 fn renderer() -> Renderer {
     Renderer::from_bytes(&dejavu(), 18.0, Theme::default()).expect("fixture parses")

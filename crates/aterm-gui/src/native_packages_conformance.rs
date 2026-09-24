@@ -20,6 +20,24 @@ use crate::packages_screen::{
 };
 
 fn report(outcome: &str) -> PackagesStatusReport {
+    report_with_rows(outcome, &[])
+}
+
+/// A report whose record carries `rows` (program, state) as a pass wrote them.
+fn report_with_rows(outcome: &str, rows: &[(&str, &str)]) -> PackagesStatusReport {
+    let programs = rows
+        .iter()
+        .map(|(name, state)| {
+            (
+                (*name).to_string(),
+                atpkg::ProgramStatus {
+                    installed_build: Some(1),
+                    state: (*state).to_string(),
+                    tree_root: String::new(),
+                },
+            )
+        })
+        .collect();
     let status = atpkg::Status {
         schema: 1,
         updated_at: "2026-07-21T00:00:00Z".to_string(),
@@ -31,7 +49,13 @@ fn report(outcome: &str) -> PackagesStatusReport {
         last_index_reached_at: String::new(),
         last_index_build: 0,
         index_build_changed_at: String::new(),
-        programs: std::collections::BTreeMap::new(),
+        last_pass: String::new(),
+        last_pass_at: String::new(),
+        last_pass_attempted_index_build: 0,
+        last_pass_attempted_at: String::new(),
+        metered_hold_until: String::new(),
+        programs,
+        extra: Default::default(),
     };
     PackagesStatusReport::from_parts(true, true, "fp".to_string(), Some(&status), &[])
 }
@@ -185,4 +209,65 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
     let mut false_success = project(&model, failed);
     false_success.insert("presented_result", 1);
     assert!(!model.check_invariant("FinalResultIsPresented", &false_success));
+}
+
+/// A FAILING ROW DOES NOT SPEAK FOR A VERB (2026-09-22). The Packages badge's
+/// attention headline (`Needs attention: codex refused` — a refusal named as one since
+/// Phase 4, 2026-09-23) is what a page with no verb
+/// result shows; a verb that completed over the same failing record keeps its own
+/// headline, so the model's `FinalResultIsPresented` binds the shipping page with
+/// failing rows in it — not only the row-less reports above. Negative control: the
+/// rendering this slice first shipped, the attention line in place of a completed
+/// check's headline, is the state the invariant refuses.
+#[test]
+fn a_failing_row_is_presented_as_attention_never_as_a_verb_result() {
+    use crate::packages_screen::{ATTENTION_PREFIX, presented_result_of};
+    let model = native_packages_worker_model();
+    let failing = || report_with_rows("1 failed", &[("codex", "error: codex refused: x")]);
+    let mut service = PackagesService::new();
+    let headline =
+        |service: &PackagesService| service.state(true, true, false).projection().headline;
+
+    let before = service.model_state();
+    let sequence = service.begin(None).expect("start refresh");
+    assert_transition(&model, before, service.model_state(), "BeginRefresh");
+    let before = service.model_state();
+    assert!(service.finish(sequence, PackagesWorkerCompletion::refresh(failing())));
+    assert_transition(&model, before, service.model_state(), "FinishRefresh");
+    assert_eq!(
+        headline(&service),
+        format!("{ATTENTION_PREFIX}codex refused"),
+        "not vacuous: the attention headline IS on the page, presenting no result"
+    );
+
+    let before = service.model_state();
+    let sequence = service
+        .begin(Some(PackagesBusy::Check))
+        .expect("start package check");
+    assert_transition(&model, before, service.model_state(), "BeginCheck");
+    let before = service.model_state();
+    assert!(service.finish(
+        sequence,
+        PackagesWorkerCompletion::command(
+            failing(),
+            PackagesCommandOutcome::Succeeded {
+                operation: PackagesBusy::Check,
+            },
+        ),
+    ));
+    let completed = service.model_state();
+    assert_transition(&model, before, completed, "FinishCheckSuccess");
+    assert_eq!(headline(&service), "Package check completed");
+
+    let mut attention_over_success = project(&model, completed);
+    attention_over_success.insert(
+        "presented_result",
+        i64::from(presented_result_of(&format!(
+            "{ATTENTION_PREFIX}codex refused"
+        ))),
+    );
+    assert!(
+        !model.check_invariant("FinalResultIsPresented", &attention_over_success),
+        "the attention line in place of a completed check's headline is refused"
+    );
 }

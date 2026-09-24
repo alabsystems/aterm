@@ -231,7 +231,7 @@ fn note_delivery(staging: &Staging, lane: Lane, token_source: Option<&str>) {
 
 /// Whether `source` is the compiled-in public channel — the one source on which a
 /// token is ignored outright (see the module doc). GitHub slugs are case-insensitive,
-/// so `ATERM_UPDATE_OWNER=Alabsystems` is the public channel too — not a "repointed"
+/// so a development build's `[update] owner = "Alabsystems"` is the public channel too — not a "repointed"
 /// source that walks the token chain every check and puts an ambient `gh auth token`
 /// on the API lane (2026-09-04 review).
 fn is_default_channel(source: &Source) -> bool {
@@ -262,8 +262,11 @@ fn note_readable(lane: Lane, source: &Source) {
         TOKEN_REJECTED.store(false, Ordering::Relaxed);
     }
     crate::no_token::clear();
+    // Once per process, and at DEBUG: every aterm process (the window and each
+    // terminal session) runs this loop, so at INFO it was one line per launch saying
+    // what every launch before it had said.
     if lane == Lane::Web && !ANNOUNCED_LANE.swap(true, Ordering::Relaxed) {
-        crate::log(&format!(
+        crate::debug(&format!(
             "updating from github.com/{}/{} over its unmetered download host with no \
              credential — {}; nothing on this lane touches the GitHub API, and it checks \
              on a {}-minute interval",
@@ -279,45 +282,35 @@ fn note_readable(lane: Lane, source: &Source) {
     }
 }
 
-/// The lane annotation appended to a HEALTHY status outcome, so `status.toml` /
-/// `aterm-ctl update status` answers "why is this machine slow to update?" on its own.
+/// The note a HEALTHY status outcome ends with — how often this machine looks: ` · checks
+/// every 30 min` on the web lane, and nothing on the token lane (the 75-second cadence the
+/// crate docs describe), so a provisioned repointed machine's wording does not change.
 ///
-/// Empty on the token lane (the 75-second cadence the crate docs describe), so no
-/// existing status wording changes for a provisioned repointed machine.
-///
-/// The web-lane wording is per-channel: on the compiled-in PUBLIC channel a token is
-/// ignored outright, so a status that said "no update token provisioned" NEXT TO a
-/// file the installer wrote read as a contradiction, and the file-writing "fix" it
-/// suggested is a no-op there. A REPOINTED channel walks the whole chain, so for it the
-/// missing token stays the named, remediable cause. The note reports the interval
-/// ACTUALLY in effect (an operator's `ATERM_UPDATE_INTERVAL_SECS` wins over the lane
-/// default and must not be misreported as it), and a REJECTED provisioned token names
-/// rotation — the opposite remedy from provisioning — via the `TOKEN_REJECTED` latch.
+/// How the channel is read — the lane, the credential — is `aterm ctl update status`'s
+/// `lane=` / `delivery=` fields and the log's, never this sentence, which Settings may
+/// paint (2026-09-23 audit, GT-16). Only a clause a person can act on is added: on a
+/// REPOINTED channel, the missing token that makes it slow, or a provisioned token GitHub
+/// REJECTED (the opposite remedy, via the `TOKEN_REJECTED` latch). The compiled-in PUBLIC
+/// channel ignores a token outright, so it says neither. The interval has no override
+/// (`ATERM_UPDATE_INTERVAL_SECS` went with the other update env knobs, 2026-09-23).
 fn lane_note(source: &Source) -> String {
     if lane() != Lane::Web {
         return String::new();
     }
-    let secs = std::env::var("ATERM_UPDATE_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(crate::cadence::WEB_INTERVAL_SECS);
+    let secs = crate::cadence::WEB_INTERVAL_SECS;
     let every = if secs >= 120 && secs.is_multiple_of(60) {
-        format!("{}-minute", secs / 60)
+        format!("{} min", secs / 60)
     } else {
-        format!("{secs}-second")
+        format!("{secs} s")
     };
     let why = if TOKEN_REJECTED.load(Ordering::Relaxed) {
-        "a provisioned update token was rejected by GitHub — rotate it"
+        " \u{b7} the update token was rejected by GitHub \u{2014} replace it"
     } else if is_default_channel(source) {
-        "the public channel is read with no credential and ignores every update-token \
-         rung, so a provisioned update-token file serves only a repointed updater"
+        ""
     } else {
-        "no update token provisioned"
+        " \u{b7} no update token is set up"
     };
-    format!(
-        " — checking over the unmetered web lane on a {every} interval ({why}; no GitHub \
-         API request is made)"
-    )
+    format!(" \u{b7} checks every {every}{why}")
 }
 
 /// What a failed token-lane releases-LIST response says the check should do. Split out
@@ -395,9 +388,8 @@ fn moved_explanation(source: &Source) -> String {
     format!(
         "aterm's release channel github.com/{}/{} answers HTTP 301 (moved permanently): \
          the repository was renamed or transferred, and this machine will keep asking the \
-         OLD name — and never receive an update — until an operator repoints it: set \
-         `[update] owner`/`repo` in aterm's config, or $ATERM_UPDATE_OWNER / \
-         $ATERM_UPDATE_REPO, to the repository's new location.",
+         OLD name — and never receive an update — until the channel answers at that name \
+         again or aterm is reinstalled from the repository's new location.",
         source.owner, source.repo
     )
 }
@@ -420,11 +412,10 @@ fn unreadable_explanation(
         return format!(
             "aterm cannot read its release channel github.com/{}/{} (HTTP {code}): the \
              channel has no published release, or the repository was made private, renamed \
-             or removed. The public channel is read with no credential — every update-token \
-             rung is ignored for it — so this machine will NEVER receive an update until \
-             the channel is repaired at github.com/{}/{}, or the updater is repointed via \
-             `[update] owner`/`repo` in aterm's config, or $ATERM_UPDATE_OWNER / \
-             $ATERM_UPDATE_REPO.",
+             or removed. An update token is ignored for the public channel, so nothing on \
+             this Mac can fix it: this machine will NEVER receive an update until the \
+             channel is repaired at github.com/{}/{}, or aterm is reinstalled from the \
+             channel's new location.",
             source.owner, source.repo, source.owner, source.repo
         );
     }
@@ -463,8 +454,8 @@ fn unreadable_explanation(
          same way for every cause and cannot tell them apart, so check all four: (1) the \
          channel is PRIVATE — {private}; (2) the channel has no published release yet; (3) \
          the repository does not exist; (4) the configured channel is wrong — check \
-         `[update] owner`/`repo` in aterm's config, or $ATERM_UPDATE_OWNER / \
-         $ATERM_UPDATE_REPO.",
+         `[update] owner`/`repo` in aterm's config (honoured by a development build \
+         only).",
         source.owner, source.repo,
     )
 }
@@ -1159,11 +1150,19 @@ fn fetch_authoritative_release(
     let bytes = match download(&manifest_url, 5_000_000) {
         Ok(bytes) => bytes,
         Err(error) => {
-            crate::warn(&format!("fetch appcast: {error}"));
+            fetched.appcast_missing = aterm_update_core::download_error_is_not_found(&error);
+            // A 404 is the source-only release's ordinary shape: the web lane elects the
+            // release below it and says so once ([`web_head_fallback`]), and where
+            // nothing is elected the check's own failure line reports it. Anything else
+            // here is a fetch that failed.
+            if fetched.appcast_missing {
+                crate::debug(&format!("fetch appcast: {error}"));
+            } else {
+                crate::warn(&format!("fetch appcast: {error}"));
+            }
             fetched.appcast_fetch_error = true;
             fetched.asset_fetch_rate_limited =
                 aterm_update_core::download_error_is_rate_limit(&error);
-            fetched.appcast_missing = aterm_update_core::download_error_is_not_found(&error);
             return fetched;
         }
     };
@@ -1351,17 +1350,25 @@ fn fetch_authoritative_release(
                 // reserved for actual verification degradation: the roster refuses the
                 // signer, a signature fails, or the roster itself cannot be verified
                 // (all handled above).
-                if !pinned_update_pubkeys.is_empty()
-                    && !pinned_update_pubkeys.contains(&who.pubkey_b64.as_str())
-                {
-                    crate::log(&format!(
+                //
+                // Once per release per process, at DEBUG (2026-09-23): the same fact was
+                // logged on every check that read the release and again at every launch —
+                // a hundred lines for one release in the owner's log.
+                let first = crate::first_in_process(&format!(
+                    "signer {} {who}",
+                    candidate.release.tag_name
+                ));
+                let outside_keyset = !pinned_update_pubkeys.is_empty()
+                    && !pinned_update_pubkeys.contains(&who.pubkey_b64.as_str());
+                if first && outside_keyset {
+                    crate::debug(&format!(
                         "authoritative {} was signed by machine {who}, whose key is not in \
                          this build's channel keyset — the master-signed roster authorizes \
                          it, but clients older than the roster cannot verify this release",
                         candidate.release.tag_name
                     ));
-                } else {
-                    crate::log(&format!(
+                } else if first {
+                    crate::debug(&format!(
                         "authoritative {} was signed by machine {who}",
                         candidate.release.tag_name
                     ));
@@ -1485,23 +1492,26 @@ fn covered_stage_line(
     staged_build: u64,
     release_build: u64,
 ) -> String {
-    let mut msg = format!(
-        "staged {version} (build {staged_build}) — verified and ready to apply; release \
-         build {release_build} needs no download"
-    );
+    let mut msg = format!("staged {version} (build {staged_build}) — verified and ready to apply");
+    // The release build is news only when it is not the staged one.
+    if release_build != staged_build {
+        msg.push_str(&format!(
+            "; release build {release_build} needs no download"
+        ));
+    }
     let ledger = crate::health::Health::read(&staging.health());
     if ledger.last_apply_failure_target_build == staged_build
         && ledger.apply_failures_for_target > 0
     {
         msg.push_str(&format!(
-            "; the apply lane has failed it {} time(s) — did not apply: {}",
+            "; it failed to install {} time(s): {}",
             ledger.apply_failures_for_target, ledger.last_apply_error
         ));
     } else if ledger.apply_refusal_applies_to(current_build)
         && !ledger.last_apply_refusal.is_empty()
     {
         msg.push_str(&format!(
-            "; last apply refused: {}",
+            "; the last install was refused: {}",
             ledger.last_apply_refusal
         ));
     }
@@ -1966,12 +1976,16 @@ fn resolve_web_head(
         // normal release. It used to be filed as a `network` failure (the one
         // class that never escalates) with no listing consulted, so every
         // web-lane client silently stopped updating until the next app cut
-        // outranked it. It takes the source-only head's road instead.
+        // outranked it. It takes the source-only head's road instead. Warned once per
+        // head per process: the head stands until an app cut outranks it, and every
+        // check re-reads it.
         Err(PointerError::OtherTag { tag }) => {
-            crate::warn(&format!(
-                "channel head {tag} is not an app release; electing the newest published \
-                 release that carries an app manifest"
-            ));
+            if crate::first_in_process(&format!("non-app head {tag}")) {
+                crate::warn(&format!(
+                    "channel head {tag} is not an app release; electing the newest published \
+                     release that carries an app manifest"
+                ));
+            }
             return Ok(WebHead::NonAppHead { tag });
         }
         // A refused redirect, an unexpected status, an unsafe source, a transport
@@ -2029,7 +2043,7 @@ enum HeadFallback {
 /// release that carries the manifest, skipping releases with zero manifests. It costs
 /// ONE anonymous LIST of the releases API — the only request the web lane ever makes
 /// there, and only after the head's appcast has answered 404 — because the web host
-/// serves no listing. At the web lane's cadence that is at most two metered requests
+/// serves no listing. At the web lane's cadence that is at most six metered requests
 /// an hour against the ~60/hour anonymous budget, for as long as the head stays
 /// source-only; a rate-limited LIST is a deferral, never a failure.
 ///
@@ -2042,7 +2056,9 @@ enum HeadFallback {
 ///
 /// Recorded outcome wording: the distinct sentence `channel head <tag> has no app
 /// manifest` rides the check note onto every later record of this check, so
-/// `aterm ctl update status` and the update screen say what is actually going on.
+/// `aterm ctl update status` and the update screen say what is actually going on. The
+/// log gets DEBUG lines on the way and, when a release is elected, one INFO line
+/// ([`note_source_only_head`]).
 fn web_head_fallback(
     staging: &Staging,
     current_build: u64,
@@ -2055,18 +2071,33 @@ fn web_head_fallback(
     if !fetched.appcast_missing {
         return Ok(HeadFallback::NotNeeded);
     }
-    crate::warn(&format!(
+    crate::debug(&format!(
         "channel head {head_tag} has no app manifest (a source-only release); electing the \
          newest published release that carries one"
     ));
-    elect_from_listing(
+    let elected = elect_from_listing(
         staging,
         current_build,
         source,
         head_tag,
         list,
         pinned_update_pubkeys,
-    )
+    )?;
+    if let HeadFallback::Candidate(candidate) = &elected {
+        note_source_only_head(head_tag, &candidate.release.tag_name);
+    }
+    Ok(elected)
+}
+
+/// The one line a successful source-only fallback leaves, at INFO — the head, and the
+/// release this check uses instead. Once per pair per process: a source-only head can
+/// stand for a night, and every check re-reads it. The 404 and the election that led
+/// here are DEBUG; a source-only release is part of how releases are published, not a
+/// fault.
+fn note_source_only_head(head: &str, elected: &str) {
+    if crate::first_in_process(&format!("source-only {head} {elected}")) {
+        crate::log(&format!("{head} is a source-only release; using {elected}"));
+    }
 }
 
 /// The listing election both fallbacks share: the source-only head (above) and
@@ -2317,7 +2348,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
 /// (`last_check_at`'s own doc: never "a check that has not run on this channel").
 /// Stamping it from the failing exits broke both, because a failed check also
 /// reveals no lane (`note_readable` is never reached): `dedup_window_base` then
-/// keeps the process on the slow WEB base (30 min → a 21-minute window) while its
+/// keeps the process on the slow WEB base (then 30 min → a 21-minute window) while its
 /// own cadence still ticks on the 75 s token base, so the process re-read its OWN
 /// failure stamp and logged "another aterm process completed this interval's
 /// update check" — measured 2026-09-13, with no second aterm process on the
@@ -3383,7 +3414,7 @@ mod tests {
         token::Diagnosis {
             resolved: None,
             probes: vec![SourceProbe {
-                source: "$ATERM_UPDATE_TOKEN",
+                source: "keychain item aterm-update-token",
                 outcome: ProbeOutcome::Absent,
             }],
         }
@@ -3412,9 +3443,10 @@ mod tests {
             "cause 1 missing: {text}"
         );
         assert!(text.contains("private"), "cause 2 missing: {text}");
+        assert!(text.contains("reinstalled"), "cause 3 missing: {text}");
         assert!(
-            text.contains("ATERM_UPDATE_OWNER"),
-            "cause 3 missing: {text}"
+            !text.contains("ATERM_UPDATE_OWNER"),
+            "no environment knob is taught: {text}"
         );
         // On the compiled-in public channel a token is IGNORED, so no token remedy is
         // offered there: a user who followed it would watch nothing change.
@@ -3468,7 +3500,7 @@ mod tests {
             "the diagnosis must survive so the channel-unreadable explanation can name \
              WHY there is no token, instead of the misleading 'not configured'"
         );
-        let (tok, carried) = plan_credential(Ok(("ghp_x".to_string(), "$ATERM_UPDATE_TOKEN")));
+        let (tok, carried) = plan_credential(Ok(("ghp_x".to_string(), "0600 update-token file")));
         assert_eq!(tok.as_deref(), Some("ghp_x"));
         assert!(carried.is_none());
     }
@@ -3514,7 +3546,8 @@ mod tests {
                 panic!("a moved repository is a standing state, not weather");
             };
             assert!(text.contains("renamed or transferred"), "{text}");
-            assert!(text.contains("ATERM_UPDATE_OWNER"), "{text}");
+            assert!(text.contains("new location"), "{text}");
+            assert!(!text.contains("ATERM_UPDATE_OWNER"), "{text}");
         }
         let ListDecision::Failed(text) = classify_list_error(&not_found(), &source) else {
             panic!("404 with a token is a failure, not a strand");
@@ -3541,7 +3574,7 @@ mod tests {
     /// The lane latch is what the background loop reads to choose a cadence, and what
     /// clears the stranded state. Reading the channel on the web lane — with no
     /// credential at all — clears it exactly as a token-lane read does, and the healthy
-    /// status names the lane, the interval and (per channel) WHY a token is absent.
+    /// status says how often it checks and (on a repointed channel) why a token is absent.
     #[test]
     fn a_readable_channel_establishes_the_lane_and_clears_the_strand() {
         let _serialized = crate::STRANDED_TEST_LOCK
@@ -3559,37 +3592,37 @@ mod tests {
         );
         assert_eq!(rate_limit_reset(), None, "…and any hold");
         assert!(!crate::no_token::is_stranded());
+        // How often, in words; never the lane's mechanics (2026-09-23 audit, GT-16) —
+        // `lane=` and the log carry those.
         let note = lane_note(&source);
-        assert!(
-            note.contains("unmetered web lane")
-                && note.contains("30-minute")
-                && note.contains("no GitHub API request is made"),
-            "{note}"
+        assert_eq!(
+            note,
+            format!(
+                " \u{b7} checks every {} min",
+                crate::cadence::WEB_INTERVAL_SECS / 60
+            )
         );
-        // On the PUBLIC channel the status must NOT claim "no update token
-        // provisioned" — the installer may have written the update-token file, and
-        // this channel ignores every rung. Name the channel and the file's irrelevance.
-        assert!(
-            note.contains("ignores every update-token rung") && note.contains("repointed"),
-            "{note}"
-        );
-        assert!(!note.contains("no update token provisioned"), "{note}");
+        for jargon in ["lane", "rung", "token", "API", "unmetered"] {
+            assert!(!note.contains(jargon), "{jargon}: {note}");
+        }
         // A REPOINTED channel walks the whole chain, so for it the missing token stays
         // the named, remediable cause.
         let repointed = Source {
             owner: "example".into(),
             repo: "mirror".into(),
         };
-        assert!(
-            lane_note(&repointed).contains("no update token provisioned"),
-            "{}",
-            lane_note(&repointed)
+        assert_eq!(
+            lane_note(&repointed),
+            format!(
+                " \u{b7} checks every {} min \u{b7} no update token is set up",
+                crate::cadence::WEB_INTERVAL_SECS / 60
+            )
         );
-        // A rejected PROVISIONED token asks for the opposite remedy: rotation.
+        // A rejected PROVISIONED token asks for the opposite remedy: replacing it.
         TOKEN_REJECTED.store(true, Ordering::Relaxed);
         let rejected_note = lane_note(&source);
         assert!(
-            rejected_note.contains("rejected by GitHub") && rejected_note.contains("rotate"),
+            rejected_note.contains("rejected by GitHub") && rejected_note.contains("replace it"),
             "{rejected_note}"
         );
         // A token-lane read ends the rejected story and keeps the historical wording.
@@ -4518,7 +4551,7 @@ mod tests {
     /// clients read the public channel (`[workspace.metadata.aterm]
     /// update_channel`), whose namespace carries only the current series. This
     /// test pins the asset rule so the archive stays inert even for a machine
-    /// pointed back at the staging repo by `ATERM_UPDATE_OWNER`/`_REPO`.
+    /// pointed back at the staging repo by a development build's `[update]` owner/repo.
     #[test]
     fn archive_releases_are_not_candidates_even_when_their_tags_outrank_us() {
         // Real tags from this repo's history, in their real spellings, carrying
@@ -5919,14 +5952,16 @@ mod tests {
     /// THE ROTATION NOTE'S LOG CONTRACT, pinned by LEVEL. A signer outside the
     /// compiled-in keyset that the master-signed roster authorizes is the ordinary state
     /// of every pristine install made after a key rotation — the very first check such
-    /// an install runs lands exactly here. It must be told so ONCE, at INFO, on the
-    /// attribution line. It used to be told twice — first as a WARN, then the same fact
-    /// as INFO — which presented routine rotation as a security problem on a release the
-    /// user had just installed and verified, and trained people to ignore the signature
-    /// warnings that DO matter. WARN stays reserved for actual verification degradation
-    /// (see the revoked-machine test above, which pins that a refusal still warns).
+    /// an install runs lands exactly here. It must be told so ONCE, at DEBUG, on the
+    /// attribution line, and not again for the same release in the same process. It used
+    /// to be told twice — first as a WARN, then the same fact as INFO — which presented
+    /// routine rotation as a security problem on a release the user had just installed
+    /// and verified, and trained people to ignore the signature warnings that DO matter;
+    /// then once per check at INFO, a hundred times for one release (2026-09-23). WARN
+    /// stays reserved for actual verification degradation (see the revoked-machine test
+    /// above, which pins that a refusal still warns).
     #[test]
-    fn a_roster_authorized_rotation_is_one_info_note_and_never_a_warn() {
+    fn a_roster_authorized_rotation_is_one_debug_note_and_never_a_warn() {
         let c = chain(
             &[("m3", M3_SEED_FIXTURE), ("m11", M11_SEED_FIXTURE)],
             &[],
@@ -5964,10 +5999,21 @@ mod tests {
             "the fact is stated exactly once, not WARN-then-INFO: {lines:?}"
         );
         let (level, note) = noted[0];
-        assert_eq!(*level, aterm_log::Level::Info, "the note is INFO: {note}");
+        assert_eq!(*level, aterm_log::Level::Debug, "the note is DEBUG: {note}");
         assert!(
             note.contains("m11 (roster seq 4)") && note.contains("channel keyset"),
             "one line carries both the attribution and the compatibility note: {note}"
+        );
+
+        // The next check that reads the same release says nothing more about it.
+        let (again, _) = run_chain(&c, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(again.selected.is_some(), "the release is still accepted");
+        let lines = crate::log_capture::take();
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, msg)| msg.contains("was signed by machine")),
+            "once per release per process: {lines:?}"
         );
     }
 
@@ -7599,6 +7645,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let staging = Staging::scratch("source-only-e2e");
+        let _ = crate::log_capture::take();
         let source = test_source();
         let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
         let masters = [channel.master_pub.as_str()];
@@ -7610,29 +7657,30 @@ mod tests {
         };
         // The head as the web lane synthesizes it, and its fetch: the appcast 404s.
         let candidate = web_release(&source, head, crate::PINNED_UPDATE_PUBKEYS).unwrap();
-        let fetched = fetch_authoritative_release(
+        let head_fetched = fetch_authoritative_release(
             Some(candidate),
             crate::PINNED_UPDATE_PUBKEYS,
             &mut download,
             &channel.policy(&masters),
         );
-        assert!(fetched.selected.is_none() && fetched.appcast_missing);
+        assert!(head_fetched.selected.is_none() && head_fetched.appcast_missing);
+        let listing = format!(
+            r#"[{{"tag_name":"{head}","draft":false,"assets":[{{"name":"SHA256SUMS","url":"u","size":1}}]}},
+                {{"tag_name":"{WEB_TAG}","draft":false,"assets":[
+                  {{"name":"aterm-appcast.toml","url":"https://api.github.com/x/1","size":1}},
+                  {{"name":"aterm-appcast.toml.sig","url":"https://api.github.com/x/2","size":1}}]}}]"#
+        )
+        .into_bytes();
         let mut lists = 0;
         let mut list = |_url: &str, _token: &str| {
             lists += 1;
-            Ok(format!(
-                r#"[{{"tag_name":"{head}","draft":false,"assets":[{{"name":"SHA256SUMS","url":"u","size":1}}]}},
-                    {{"tag_name":"{WEB_TAG}","draft":false,"assets":[
-                      {{"name":"aterm-appcast.toml","url":"https://api.github.com/x/1","size":1}},
-                      {{"name":"aterm-appcast.toml.sig","url":"https://api.github.com/x/2","size":1}}]}}]"#
-            )
-            .into_bytes())
+            Ok(listing.clone())
         };
         let Ok(HeadFallback::Candidate(below)) = web_head_fallback(
             &staging,
             WEB_BUILD,
             &source,
-            &fetched,
+            &head_fetched,
             head,
             &mut list,
             crate::PINNED_UPDATE_PUBKEYS,
@@ -7658,6 +7706,39 @@ mod tests {
             gets.iter()
                 .all(|u| !aterm_update_core::cdn::is_api_host(u) && !u.contains("/latest/")),
             "{gets:?}"
+        );
+        // THE LOG: a source-only head is how releases are published, not a fault. The
+        // 404 and the election are DEBUG, nothing on the way WARNs, and the one INFO
+        // line names both — once per head and release: the next check meets the same
+        // head, elects the same release, and says nothing more at INFO.
+        let Ok(HeadFallback::Candidate(again)) = web_head_fallback(
+            &staging,
+            WEB_BUILD,
+            &source,
+            &head_fetched,
+            head,
+            &mut |_url: &str, _token: &str| Ok(listing.clone()),
+            crate::PINNED_UPDATE_PUBKEYS,
+        ) else {
+            panic!("the next check elects the same release");
+        };
+        assert_eq!(again.release.tag_name, WEB_TAG);
+        let lines = crate::log_capture::take();
+        assert!(
+            lines
+                .iter()
+                .all(|(level, _)| *level != aterm_log::Level::Warn),
+            "a successful source-only fallback warns about nothing: {lines:?}"
+        );
+        let info: Vec<_> = lines
+            .iter()
+            .filter(|(level, _)| *level == aterm_log::Level::Info)
+            .map(|(_, msg)| msg.as_str())
+            .collect();
+        assert_eq!(
+            info,
+            [format!("{head} is a source-only release; using {WEB_TAG}")],
+            "{lines:?}"
         );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
@@ -7689,7 +7770,7 @@ mod tests {
             current_build: 5,
             source: &source,
             tok: "ghp_test",
-            token_source: Some("$ATERM_UPDATE_TOKEN"),
+            token_source: Some("0600 update-token file"),
             fetch: &mut fetch,
         };
         let Ok(Listing::Releases(releases)) = list_releases(&mut ctx) else {
@@ -7721,7 +7802,7 @@ mod tests {
             current_build: 5,
             source: &source,
             tok: "ghp_stale",
-            token_source: Some("$ATERM_UPDATE_TOKEN"),
+            token_source: Some("0600 update-token file"),
             fetch: &mut rejecting,
         };
         assert!(matches!(
@@ -7753,7 +7834,7 @@ mod tests {
             current_build: 5,
             source: &source,
             tok: "ghp_test",
-            token_source: Some("$ATERM_UPDATE_TOKEN"),
+            token_source: Some("0600 update-token file"),
             fetch: &mut limited,
         };
         assert!(
@@ -7772,7 +7853,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("lane = \"token:env\""),
+            text.contains("lane = \"token:file\""),
             "the rung's ID, not its label: {text}"
         );
         assert!(!staging.health().exists(), "weather is not a fault");
@@ -7844,10 +7925,13 @@ mod tests {
         };
         assert_eq!(acquired.lane, Lane::Web);
         assert!(acquired.tok.is_none());
-        assert!(
-            lane_note(&variant).contains("ignores every update-token rung"),
-            "{}",
-            lane_note(&variant)
+        assert_eq!(
+            lane_note(&variant),
+            format!(
+                " \u{b7} checks every {} min",
+                crate::cadence::WEB_INTERVAL_SECS / 60
+            ),
+            "a case variant of the public channel is the public channel: no token clause"
         );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
@@ -8466,6 +8550,7 @@ mod tests {
         let staging = Staging::scratch("non-app-head");
         crate::status::clear_check_note();
         let _ = std::fs::remove_file(&staging.status);
+        let _ = crate::log_capture::take();
         let source = test_source();
         let mut heads = Vec::new();
         let mut head = |url: &str| {
@@ -8524,6 +8609,43 @@ mod tests {
             lists[0].1.is_empty(),
             "no credential rides the web lane's LIST"
         );
+        // Warned once per head per process: the next check re-reads the same head,
+        // elects the same release, and says nothing more.
+        let warned = |lines: Vec<(aterm_log::Level, String)>| {
+            lines
+                .iter()
+                .filter(|(level, msg)| {
+                    *level == aterm_log::Level::Warn && msg.contains("is not an app release")
+                })
+                .count()
+        };
+        assert_eq!(
+            warned(crate::log_capture::take()),
+            1,
+            "the first check warns"
+        );
+        let again = acquire(
+            &staging,
+            WEB_BUILD,
+            &source,
+            &support_dir(&staging),
+            &mut |_url: &str, _token: &str| Ok(non_app_head_listing()),
+            &mut |_url: &str| {
+                Ok(HeadAnswer {
+                    code: 302,
+                    location: Some(tag_url("atpkg-index-31", APPCAST_ASSET)),
+                })
+            },
+        );
+        assert!(
+            matches!(again, Ok(Acquisition::Proceed(_))),
+            "the same election: {again:?}"
+        );
+        assert_eq!(
+            warned(crate::log_capture::take()),
+            0,
+            "the same head is not warned twice in one process"
+        );
         note_readable(Lane::Web, &source);
         let _ = std::fs::remove_dir_all(&staging.root);
     }
@@ -8566,7 +8688,7 @@ mod tests {
             running,
             &format!("staged build did not apply: {reason}"),
         );
-        // The next check, 30 minutes later, finds the stage covering the candidate.
+        // The next check, an interval later, finds the stage covering the candidate.
         record_covered_stage_status(&staging, running, &manifest);
         let text = std::fs::read_to_string(&staging.status).expect("status written");
         let outcome = text

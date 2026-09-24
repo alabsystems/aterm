@@ -105,6 +105,9 @@ impl Runner for RealRunner {
                 })
             }
             Io::Inherit => {
+                // The child owns the terminal (`sudo` asks for a password there): the
+                // meter stays off it until the child is done.
+                let _terminal = crate::meter::hold();
                 let status = cmd.status().map_err(|e| spawn_failed(exe, &e))?;
                 Ok(Ran {
                     code: status.code(),
@@ -135,7 +138,9 @@ impl Runner for RealRunner {
                         while let Ok(n) = pipe.read(&mut buf)
                             && n > 0
                         {
-                            let _ = std::io::stdout().write_all(&buf[..n]);
+                            crate::meter::around(buf[..n].ends_with(b"\n"), || {
+                                let _ = std::io::stdout().write_all(&buf[..n]);
+                            });
                         }
                     }
                 });
@@ -145,7 +150,9 @@ impl Runner for RealRunner {
                         while let Ok(n) = pipe.read(&mut buf)
                             && n > 0
                         {
-                            let _ = std::io::stderr().write_all(&buf[..n]);
+                            crate::meter::around(buf[..n].ends_with(b"\n"), || {
+                                let _ = std::io::stderr().write_all(&buf[..n]);
+                            });
                         }
                     }
                 });

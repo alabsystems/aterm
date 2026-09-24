@@ -393,6 +393,7 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         commit: "0123456789abcdef0123456789abcdef01234567".into(),
         min_build: Some(2),
         arm64_only: false,
+        linux: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

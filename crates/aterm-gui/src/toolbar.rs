@@ -851,7 +851,7 @@ mod non_macos_tests {
             icon: None,
             dirty,
             busy,
-            attention,
+            attention: crate::app_presence::chip_of_attention(attention),
             conn: None,
             closable: true,
             drop_target: false,

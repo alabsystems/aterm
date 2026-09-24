@@ -498,8 +498,10 @@ impl Auditor {
 /// variable whose name begins with `ATERM_` is removed, whatever it is called
 /// and whenever it was invented. The exceptions are NAMED rather than assumed —
 /// the caller re-sets `ATERM_LINES`, `ATERM_COLUMNS` and `ATERM_FABRIC_COMMAND`
-/// after this runs. The baseline also disables reroute installation and automatic
-/// update checks; explicit per-test overrides are applied afterwards. A variable
+/// after this runs. Automatic update checks and the package lane are switched off by
+/// the fixture CONFIG ([`FIXTURE_GUI_CONFIG`]), the way a person switches them off —
+/// the environment vetoes that used to be set here are gone (2026-09-23) — and the
+/// reroute's stubs land under the scratch HOME. A variable
 /// the test wants is one the test states; a variable it inherits is one nobody
 /// chose.
 ///
@@ -519,15 +521,14 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
             cmd.env_remove(&name);
         }
     }
-    cmd.env("ATERM_NO_REROUTE", "1")
-        .env("ATERM_NO_AUTO_UPDATE", "1");
 }
 
-/// These Fabric fixtures do not exercise package or machine configuration.
-/// Automatic primer installation is off too. Package opt-out alone still runs
-/// machine settings, and a scratch HOME does not isolate macOS preferences, so
-/// both machine policies are explicit.
-pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[packages]\nenabled = false\n\n[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
+/// These Fabric fixtures do not exercise update, package or machine configuration.
+/// The app updater and automatic package updates are off (settings, 2026-09-23: no
+/// environment veto exists), and so is automatic primer installation. Package opt-out
+/// alone still runs machine settings, and a scratch HOME does not isolate macOS
+/// preferences, so both machine policies are explicit.
+pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[update]\nenabled = false\nauto_apply = false\n\n[packages]\nenabled = false\n\n[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
 
 /// Seed a private config once; an intentional fixture edit survives relaunch.
 pub fn prepare_fixture_config(tmp: &Path) {
@@ -589,10 +590,9 @@ impl Drop for World {
         // reason [`Fleet::drop`] honours it and with the same default: a failing
         // end-to-end test whose gui log, cap file and bridge state dir delete
         // themselves is a test nobody can diagnose. `Fleet` has had the hatch
-        // since it was written; `World` deleted unconditionally — and seven of
-        // this crate's eleven end-to-end suites are `World` suites (bridge_e2e,
-        // hooks, mirror and the four r1_*, 43 of its 60 e2e tests), so for most
-        // of them the evidence was unreachable.
+        // since it was written; `World` deleted unconditionally — and most of
+        // this crate's end-to-end suites are `World` suites, so for most of them
+        // the evidence was unreachable.
         if std::env::var_os("ATERM_LINK_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.tmp);
         }
@@ -1211,6 +1211,43 @@ impl World {
         (first, second)
     }
 
+    /// A SECOND headless instance in this world's socket dir, with no fabric
+    /// command and so no bridge of its own — what a node with two aterm windows
+    /// looks like to the first one's bridge. The world is first re-pointed at
+    /// its own instance's per-pid socket, because the newcomer takes the
+    /// `aterm.sock` latest alias.
+    pub fn sibling_instance(&mut self) -> Sibling {
+        let own = self.gui.as_ref().expect("this world's gui").id();
+        self.ctl_sock = self
+            .tmp
+            .join(format!("run/aterm/aterm-{own}.sock"))
+            .to_string_lossy()
+            .into_owned();
+        self.token = World::wait_for_token_at(&self.ctl_sock);
+        let log = std::fs::File::create(self.tmp.join("sibling.log")).expect("sibling log");
+        let err = log.try_clone().expect("sibling log clone");
+        let mut cmd = Command::new(gui_binary());
+        prepare_gui_environment(&mut cmd);
+        cmd.arg("--headless")
+            .env("HOME", scratch_home(&self.tmp))
+            .env("XDG_RUNTIME_DIR", self.tmp.join("run"))
+            .env("XDG_CONFIG_HOME", self.tmp.join("cfg"))
+            .env("SHELL", "/bin/sh")
+            .env("ATERM_LINES", "40")
+            .env("ATERM_COLUMNS", "120")
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(err);
+        let child = cmd.spawn().expect("launch a sibling aterm-gui --headless");
+        let sock = self
+            .tmp
+            .join(format!("run/aterm/aterm-{}.sock", child.id()))
+            .to_string_lossy()
+            .into_owned();
+        let token = World::wait_for_token_at(&sock);
+        Sibling { child, sock, token }
+    }
+
     /// This session's `inbox` rows (`--peek`, so the watermarks do not move).
     pub fn inbox(&self, sid: &str) -> Vec<String> {
         self.verb(&format!("@{sid} inbox --peek"))
@@ -1393,6 +1430,23 @@ impl World {
             });
         refuse_a_gui_that_cannot_launch_a_bridge(&version, &status);
         token
+    }
+}
+
+/// A second instance a [`World`] hosts beside its own ([`World::sibling_instance`]),
+/// reaped with the test.
+pub struct Sibling {
+    child: Child,
+    /// Its per-pid control socket.
+    pub sock: String,
+    /// Its Owner token.
+    pub token: String,
+}
+
+impl Drop for Sibling {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -1934,26 +1988,25 @@ fn gui_fixture_defaults_disable_machine_writes_and_preserve_explicit_edits() {
     prepare_fixture_config(&dir);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
 
+    // The updater is off through the config, not the environment (2026-09-23).
+    let update = aterm_toml::from_str::<aterm_toml::Table>(FIXTURE_GUI_CONFIG)
+        .expect("fixture config")
+        .get("update")
+        .and_then(|v| v.as_table())
+        .cloned()
+        .expect("[update]");
+    assert_eq!(update.get("enabled").and_then(|v| v.as_bool()), Some(false));
+
+    // It must run first on a fresh Command (its own doc says why), so it can only
+    // REMOVE: every inherited ATERM_* is removed, and nothing is set in its place.
     let mut command = Command::new("unused-fixture-program");
     prepare_gui_environment(&mut command);
-    for name in ["ATERM_NO_REROUTE", "ATERM_NO_AUTO_UPDATE"] {
-        assert_eq!(
-            command
-                .get_envs()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| value),
-            Some(Some(std::ffi::OsStr::new("1"))),
-            "{name} must be explicit after inherited environment removal"
-        );
-    }
-    command.env("ATERM_NO_REROUTE", "0");
-    assert_eq!(
+    assert!(
         command
             .get_envs()
-            .find(|(key, _)| *key == "ATERM_NO_REROUTE")
-            .map(|(_, value)| value),
-        Some(Some(std::ffi::OsStr::new("0"))),
-        "an explicit behavior test may override the baseline"
+            .filter(|(key, _)| key.to_string_lossy().starts_with("ATERM_"))
+            .all(|(_, value)| value.is_none()),
+        "the baseline sets no ATERM_* variable: isolation is the fixture config"
     );
     std::fs::remove_dir_all(dir).expect("remove owned fixture");
 }

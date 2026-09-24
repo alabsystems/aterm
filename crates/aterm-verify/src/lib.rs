@@ -298,8 +298,9 @@ pub struct Ctx {
     /// whatever the root holds by the time the ladder starts.
     pub source_baseline: Option<identity::TreeState>,
     /// The free-space floor the disk preflight refuses under ([`disk`]):
-    /// [`disk::FLOOR_BYTES`] for every real run. A test moves it — to force the
-    /// refusal, or to never refuse — on whatever volume it happens to run on.
+    /// [`disk::FLOOR_BYTES`] unless `--disk-floor` moved it. The gate's own
+    /// fixture tests set it to `0`, and the preflight laws to `u64::MAX` or `0`,
+    /// so none of them depends on how full the host volume happens to be.
     pub disk_floor: u64,
 }
 
@@ -445,12 +446,13 @@ impl Ctx {
                 .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         };
         let commit = git(&["rev-parse", "--short=12", "HEAD"]).filter(|c| !c.is_empty());
+        let full_commit = git(&["rev-parse", "HEAD"]).filter(|c| !c.is_empty());
         let dev_commits = git(&["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
             .and_then(|tag| git(&["rev-list", &format!("{tag}..HEAD"), "--count"]))
             .filter(|c| !c.is_empty());
-        // BOTH OR NEITHER. The build script pins only when it has both, so half
+        // ALL OR NONE. The build script pins only when it has every fact, so half
         // a pin would leave the watch armed while looking pinned.
-        if let (Some(commit), Some(dev)) = (commit, dev_commits) {
+        if let (Some(commit), Some(full_commit), Some(dev)) = (commit, full_commit, dev_commits) {
             let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
             let stamp = if dirty {
                 format!("{commit}-dirty")
@@ -462,6 +464,8 @@ impl Ctx {
             ));
             self.child_env_add
                 .push(("ATERM_BUILD_GIT_COMMIT".into(), stamp.into()));
+            self.child_env_add
+                .push(("ATERM_BUILD_GIT_COMMIT_FULL".into(), full_commit.into()));
             self.child_env_add
                 .push(("ATERM_BUILD_DEV_COMMITS".into(), dev.into()));
         } else {
@@ -507,8 +511,10 @@ impl Ctx {
         self
     }
 
-    /// Move the disk preflight's floor ([`Ctx::disk_floor`]). For tests: the
-    /// gate itself always runs at [`disk::FLOOR_BYTES`].
+    /// Move the disk preflight's floor ([`Ctx::disk_floor`]). A run takes
+    /// [`disk::FLOOR_BYTES`] unless `--disk-floor <GiB>` moved it
+    /// ([`cli::Args::disk_floor_gib`]), and its `verify: disk …` line prints
+    /// whichever floor is in force. The gate's own fixture tests use `0`.
     #[must_use]
     pub fn with_disk_floor(mut self, bytes: u64) -> Self {
         self.disk_floor = bytes;
@@ -1268,6 +1274,71 @@ mod tests {
             "a real run keeps the real floor"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn pinned_display_and_native_update_identities_describe_the_same_tree() {
+        let tmp = mktemp_dir("atv-git-stamp").expect("mktemp");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&tmp)
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout)
+                .expect("git UTF-8")
+                .trim()
+                .to_string()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ]);
+        git(&["tag", "v0.1.0"]);
+        let full = git(&["rev-parse", "HEAD"]);
+        let short = git(&["rev-parse", "--short=12", "HEAD"]);
+        for dirty in [false, true] {
+            if dirty {
+                std::fs::write(tmp.join("untracked"), "changed").expect("dirty fixture");
+            }
+            let ctx = Ctx::new(
+                tmp.clone(),
+                Mode::Fast,
+                Scope::Workspace,
+                false,
+                EnvSnapshot::default(),
+                tmp.clone(),
+            )
+            .with_pinned_child_facts();
+            let fact = |key: &str| {
+                ctx.child_env_add
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, value)| value.to_string_lossy().into_owned())
+                    .expect("pinned fact")
+            };
+            assert_eq!(fact("ATERM_BUILD_GIT_COMMIT_FULL"), full);
+            assert_eq!(
+                fact("ATERM_BUILD_GIT_COMMIT"),
+                if dirty {
+                    format!("{short}-dirty")
+                } else {
+                    short.clone()
+                }
+            );
+            assert_eq!(fact("ATERM_BUILD_DEV_COMMITS"), "0");
+        }
+        std::fs::remove_dir_all(tmp).expect("fixture cleanup");
     }
 
     /// THE PIN for the question that killed an 80-minute gate on 2026-09-10.

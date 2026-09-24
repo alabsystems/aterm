@@ -63,8 +63,8 @@ pub const SUPPORTED_SCHEMA: u32 = 2;
 /// The default repository the signed index lives on, under the configurable account:
 /// `github.com/<account>/aterm` (§5). The index is a small signed release asset on the
 /// **aterm repo itself** — no dedicated repo to administer, 1-to-1 with the existing
-/// repos, and coherent with §16 (aterm is itself an index member). Overridable at runtime
-/// via `ATPKG_INDEX_REPO` (see [`crate::discovery::index_repo`]).
+/// repos, and coherent with §16 (aterm is itself an index member). Not overridable: the
+/// `ATPKG_INDEX_REPO` override is gone (2026-09-23; [`crate::discovery::index_repo`]).
 pub const INDEX_REPO: &str = "aterm";
 
 /// The root-signed `index.toml` (§4.1): allow-list + key delegation + freshness +
@@ -232,9 +232,8 @@ impl Channel {
     /// [`Self::min_build`] and that program's [`Self::min_build_by_program`] entry.
     ///
     /// EVERY floor comparison in the client goes through here — [`crate::gate::decide`],
-    /// [`crate::gate::current_build_ok`], the rollback target predicate
-    /// ([`crate::flow::rollback`]) and the app-apply gate ([`crate::appgate`]) — because a
-    /// build number is only comparable to another build number OF THE SAME PROGRAM. The
+    /// [`crate::gate::current_build_ok`] and the rollback target predicate
+    /// ([`crate::flow::rollback`]) — because a build number is only comparable to another build number OF THE SAME PROGRAM. The
     /// counters in one channel are independent (`nn = 108` and `trust-mc = 20065` are both
     /// current), so comparing one program's pin against a floor meant for another is a
     /// category error: it would tombstone every working tool whose numbering happens to be
@@ -1347,8 +1346,8 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
         assert_eq!(m.shim_env, vec!["DISABLE_AUTOUPDATER=1".to_string()]);
         assert_eq!(m.shim_env().spelled(), "DISABLE_AUTOUPDATER=1");
         assert_eq!(
-            m.shim_env().fix_line().as_deref(),
-            Some("self-update off (DISABLE_AUTOUPDATER=1)")
+            m.shim_env().fix_line("ay").as_deref(),
+            Some("its own updater is off here (DISABLE_AUTOUPDATER=1)")
         );
         // Absent: no environment, exactly as every manifest published before the key.
         let without = parse_pkg(&verified(&format!("{head}{row}"))).unwrap();

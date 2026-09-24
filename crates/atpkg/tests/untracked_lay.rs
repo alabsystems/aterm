@@ -10,7 +10,8 @@
 //! answer is detected inside the exit grace and lays nothing. The lane is also what lets
 //! the pending-stub reconcile's identical-skip rule (`atpkg::stub`) be measured against a
 //! genuinely CLEAN stub: on a provenance-tracked machine no test can write one itself, and
-//! the tag cannot be removed by hand.
+//! the test's own `xattr -d` removes nothing (only a launchd job's does —
+//! `atpkg::provenance::heal`).
 //!
 //! macOS only: the tag and launchd exist nowhere else.
 
@@ -215,8 +216,8 @@ fn m21_a_clean_shim_exec_d_from_an_untracked_parent_writes_clean_output() {
 
 /// The pending-stub reconcile's "leave an identical one alone" rule, measured against a
 /// stub that is REALLY CLEAN — which on a provenance-tracked machine (an agent's shell, a
-/// shell inside aterm.app) only this lane can produce: the tag follows every file the test
-/// process writes, and `xattr -d` exits 0 without removing it. The unit test beside the
+/// shell inside aterm.app) only a launchd job can produce: the tag follows every file the
+/// test process writes, and its own `xattr -d` exits 0 without removing it. The unit test beside the
 /// rule (`atpkg::stub`'s `an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten`)
 /// hands the measurement in so both halves are asserted everywhere; here the file's tag is
 /// the real one, so the skip is exercised end to end wherever this runs — under an

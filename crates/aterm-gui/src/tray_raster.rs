@@ -452,6 +452,146 @@ impl ChromeFace {
     }
 }
 
+/// The chrome's OWN ink for the admitted message glyphs no face it holds cold
+/// carries — `ℹ` (U+2139) and `⏸` (U+23F8). DejaVu Sans Mono (the embedded
+/// fallback), Menlo and SF Pro all lack both, so Settings ▸ Messages drew every
+/// Info row's severity cell blank while the band, on the terminal renderer's
+/// broad chain, drew it fine (Phase 2 review, 2026-09-22): the chain face that
+/// covers them is parsed lazily by the live terminal, so whether the page's
+/// coverage rung held it was luck. These two are drawn analytically at the
+/// pen's size — a ring with a dotted stem; two bars — placed on the cap box
+/// like any glyph, UNDER [`ChromeFonts::face_for`]'s last rung and only once
+/// every loaded face has missed, so no char a face covers changes face and the
+/// same ink lands on every host. Measured by the arithmetic the pen advances
+/// by ([`synthesized::advance`]), so a run that carries one is fitted to what
+/// is drawn.
+mod synthesized {
+    use super::ChromeMetrics;
+
+    /// Whether the pen draws `ch` itself when no loaded face covers it.
+    pub(super) const fn covers(ch: char) -> bool {
+        matches!(ch, '\u{2139}' | '\u{23f8}')
+    }
+
+    /// One glyph's design, in em: its extent (`left..right` from the pen,
+    /// `bottom..top` from the baseline, up positive), its advance and its
+    /// shape as a point test `(x, y, px)` — `px` so a stroke can floor at
+    /// one device pixel.
+    struct Design {
+        left: f32,
+        right: f32,
+        bottom: f32,
+        top: f32,
+        advance: f32,
+        inside: fn(f32, f32, f32) -> bool,
+    }
+
+    /// `ℹ`: a ring 0.66 em across, its centre 0.36 em up (the cap box's
+    /// middle, where [`super::row_baseline`] centres a run), a dotted stem
+    /// inside it. Its strokes floor at one device pixel and the stem snaps
+    /// to the pixel grid — what hinting does for an outline at small sizes —
+    /// so an 11 px glyph keeps a legible ring and a solid spine instead of
+    /// two hairlines no pixel of which is ever fully lit.
+    const INFO: Design = Design {
+        left: 0.05,
+        right: 0.71,
+        bottom: 0.03,
+        top: 0.69,
+        advance: 0.76,
+        inside: info_inside,
+    };
+
+    /// `⏸`: two bars 0.16 em wide and 0.56 em tall, 0.14 em apart, on the
+    /// mono stack's 0.6 em advance.
+    const PAUSE: Design = Design {
+        left: 0.07,
+        right: 0.53,
+        bottom: 0.08,
+        top: 0.64,
+        advance: 0.6,
+        inside: pause_inside,
+    };
+
+    fn info_inside(x: f32, y: f32, px: f32) -> bool {
+        const CX: f32 = 0.38;
+        const CY: f32 = 0.36;
+        const OUTER: f32 = 0.33;
+        let dx = x - CX;
+        let stroke = 0.08_f32.max(1.0 / px);
+        let ring = (OUTER - stroke..=OUTER).contains(&(dx * dx + (y - CY) * (y - CY)).sqrt());
+        let stem_w = (0.10 * px).round().max(1.0);
+        let stem_left = (CX * px - stem_w / 2.0).round();
+        let stem =
+            (stem_left..stem_left + stem_w).contains(&(x * px)) && (0.15..=0.39).contains(&y);
+        let dot = (dx * dx + (y - 0.505) * (y - 0.505)).sqrt() <= 0.06_f32.max(0.6 / px);
+        ring || stem || dot
+    }
+
+    fn pause_inside(x: f32, y: f32, _px: f32) -> bool {
+        (0.08..=0.64).contains(&y) && ((0.07..=0.23).contains(&x) || (0.37..=0.53).contains(&x))
+    }
+
+    fn design(ch: char) -> Option<&'static Design> {
+        match ch {
+            '\u{2139}' => Some(&INFO),
+            '\u{23f8}' => Some(&PAUSE),
+            _ => None,
+        }
+    }
+
+    /// The advance of `ch` at `px`, or `None` when the pen does not draw it.
+    pub(super) fn advance(ch: char, px: f32) -> Option<f32> {
+        design(ch).map(|d| d.advance * px)
+    }
+
+    /// Sub-samples per pixel edge: 16 per pixel, so an edge's coverage lands
+    /// in sixteenths, anti-aliased like a rasterized outline's.
+    const SUB: usize = 4;
+
+    /// `ch` at `px`: its coverage bitmap and placement, in the convention
+    /// every glyph the pen blits uses (`xmin`/`ymin` from the pen and the
+    /// baseline, rows top-down), or `None` for a char the pen does not draw.
+    pub(super) fn rasterize(ch: char, px: f32) -> Option<(ChromeMetrics, Vec<u8>)> {
+        let d = design(ch)?;
+        let xmin = (d.left * px).floor() as i32;
+        let ymin = (d.bottom * px).floor() as i32;
+        let top = (d.top * px).ceil() as i32;
+        let width = ((d.right * px).ceil() as i32 - xmin).max(0) as usize;
+        let height = (top - ymin).max(0) as usize;
+        let metrics = ChromeMetrics {
+            xmin,
+            ymin,
+            width,
+            height,
+            advance_width: d.advance * px,
+        };
+        if width == 0 || height == 0 {
+            return Some((metrics, Vec::new()));
+        }
+        let step = 1.0 / SUB as f32;
+        let mut bitmap = vec![0u8; width * height];
+        for (row, line) in bitmap.chunks_mut(width).enumerate() {
+            // Row 0 is the bitmap's top: `top` px above the baseline.
+            let y_px = (top - row as i32) as f32;
+            for (col, alpha) in line.iter_mut().enumerate() {
+                let x_px = (xmin + col as i32) as f32;
+                let mut hits = 0;
+                for sy in 0..SUB {
+                    for sx in 0..SUB {
+                        let x = (x_px + (sx as f32 + 0.5) * step) / px;
+                        let y = (y_px - (sy as f32 + 0.5) * step) / px;
+                        if (d.inside)(x, y, px) {
+                            hits += 1;
+                        }
+                    }
+                }
+                *alpha = ((hits * 255 + SUB * SUB / 2) / (SUB * SUB)) as u8;
+            }
+        }
+        Some((metrics, bitmap))
+    }
+}
+
 /// The chrome font stack: the user's terminal face + its real bold sibling
 /// (both injected by [`set_chrome_fonts`]) over the embedded DejaVu coverage
 /// fallback, over the renderer's already-parsed chain faces
@@ -1026,8 +1166,9 @@ impl ChromeFonts {
     /// gate is untouched: the rung sits strictly UNDER its `Fallback` pick and
     /// is consulted only once every face the gate knows has missed, so no char
     /// a chrome face covers changes face. `None` when nothing loaded covers
-    /// `ch` (the pen then advances without ink; the strip band hands the whole
-    /// title to the cell lane).
+    /// `ch` (the pen then draws one of its own two glyphs — [`synthesized`] —
+    /// or advances without ink; the strip band hands the whole title to the
+    /// cell lane).
     fn face_for(&mut self, weight: TextWeight, ch: char) -> Option<&mut ChromeFace> {
         let bold_run = weight == TextWeight::Bold;
         let bold_has = self.bold.as_ref().is_some_and(|f| f.has(ch));
@@ -1418,6 +1559,8 @@ pub(crate) fn measure_text(s: &str, px: f32, weight: TextWeight) -> f32 {
     for ch in s.chars() {
         if let Some(face) = fonts.face_for(weight, ch) {
             pen_q += px_to_q(face.advance_em(ch) * px);
+        } else if let Some(advance) = synthesized::advance(ch, px) {
+            pen_q += px_to_q(advance);
         }
     }
     q_to_px(pen_q)
@@ -1609,51 +1752,97 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
     ]
 }
 
+/// The Linux UI face ladder as `(regular, semibold)` paths, first choice first — the
+/// list [`ui_font_candidates`] resolves on Linux, and the one a test measures a layout
+/// with on ANY host ([`install_linux_ui_fonts_for_test`]), so a page's fit is not
+/// judged only in the face of the machine that runs the gate.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_UI_FONT_PAIRS: [(&str, &str); 5] = [
+    // `resolve_ui_font_assets` accepts a candidate only when BOTH faces
+    // parse, so each Noto pairing must name a file the distro actually
+    // ships. fonts-noto-core on Debian/Ubuntu installs exactly the four
+    // Regular/Bold (+Italics) cuts — there is NO NotoSans-SemiBold.ttf
+    // there (that cut arrives only with the separate -extra package). The
+    // SemiBold pair stays first for the distros that do carry it; the
+    // Regular+Bold pair right behind it is what keeps stock Debian on
+    // Noto at all. Without it every chrome surface silently fell through
+    // to DejaVu Sans, ~8% wider, and each width the pages authored
+    // against Noto turned into systemic truncation (2026-08 settings
+    // audit: theme card, wallpaper, font credits, badges, search
+    // placeholder).
+    (
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    ),
+    // Arch/Fedora keep Noto under /usr/share/fonts/noto.
+    (
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ),
+];
+
 #[cfg(target_os = "linux")]
 fn ui_font_candidates() -> Vec<UiFontCandidate> {
-    [
-        // `resolve_ui_font_assets` accepts a candidate only when BOTH faces
-        // parse, so each Noto pairing must name a file the distro actually
-        // ships. fonts-noto-core on Debian/Ubuntu installs exactly the four
-        // Regular/Bold (+Italics) cuts — there is NO NotoSans-SemiBold.ttf
-        // there (that cut arrives only with the separate -extra package). The
-        // SemiBold pair stays first for the distros that do carry it; the
-        // Regular+Bold pair right behind it is what keeps stock Debian on
-        // Noto at all. Without it every chrome surface silently fell through
-        // to DejaVu Sans, ~8% wider, and each width the pages authored
-        // against Noto turned into systemic truncation (2026-08 settings
-        // audit: theme card, wallpaper, font credits, badges, search
-        // placeholder).
-        (
-            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
-        ),
-        (
-            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-        ),
-        // Arch/Fedora keep Noto under /usr/share/fonts/noto.
-        (
-            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-        ),
-        (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ),
-        (
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        ),
-    ]
-    .into_iter()
-    .map(|(regular, semibold)| UiFontCandidate {
-        regular_path: regular.into(),
-        regular_index: 0,
-        semibold_path: semibold.into(),
-        semibold_index: 0,
-    })
-    .collect()
+    LINUX_UI_FONT_PAIRS
+        .into_iter()
+        .map(|(regular, semibold)| UiFontCandidate {
+            regular_path: regular.into(),
+            regular_index: 0,
+            semibold_path: semibold.into(),
+            semibold_index: 0,
+        })
+        .collect()
+}
+
+/// Install, as THIS test thread's UI faces, the first pair of the Linux ladder
+/// ([`LINUX_UI_FONT_PAIRS`]) whose two files parse — the faces a Linux window measures
+/// and paints its chrome with — so a test can judge a layout's fit with Linux metrics
+/// on any host. With `root`, each file is looked up by its FILE NAME in that directory
+/// instead (a folder holding `NotoSans-Regular.ttf` and `NotoSans-Bold.ttf`, say), so a
+/// host without Linux's font tree can still measure with the ladder's faces. Answers
+/// the regular face's path, or `None` when no pair is readable — the faces installed
+/// before are then left alone.
+///
+/// Call it AFTER building the test's `ViewCx`: that fixture installs the host's own
+/// faces ([`prepare_ui_fonts_for_direct_view_test`]).
+#[cfg(test)]
+pub(crate) fn install_linux_ui_fonts_for_test(
+    root: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let locate = |path: &str| -> std::path::PathBuf {
+        let path = std::path::Path::new(path);
+        match (root, path.file_name()) {
+            (Some(root), Some(name)) => root.join(name),
+            _ => path.to_path_buf(),
+        }
+    };
+    let mut files = UiFontFiles::default();
+    for (regular, semibold) in LINUX_UI_FONT_PAIRS {
+        let regular = locate(regular);
+        let (Some((regular_face, _)), Some((semibold_face, _))) = (
+            parse_ui_font(&mut files, &regular, 0),
+            parse_ui_font(&mut files, &locate(semibold), 0),
+        ) else {
+            continue;
+        };
+        let mut fonts = lock_fonts();
+        fonts.ui_regular = Some(regular_face);
+        fonts.ui_semibold = Some(semibold_face);
+        return Some(regular);
+    }
+    None
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -1864,7 +2053,8 @@ pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
 /// Can the chrome stack draw EVERY char of `s` as real ink — the UI face first,
 /// then the terminal cascade ([`select_chrome_face`]: real bold sibling / user
 /// primary / embedded DejaVu), then the renderer's already-parsed chain faces
-/// ([`ChromeFonts::coverage`])? This is exactly the per-char routing
+/// ([`ChromeFonts::coverage`]), then the pen's own two glyphs
+/// ([`synthesized`])? This is exactly the per-char routing
 /// [`Canvas::text`]'s proportional arm performs, asked ahead of time: a char that
 /// fails ALL of them is one the pen would silently skip (advance-only), which for
 /// a tab TITLE means a hole where a glyph should be. The strip band asks this
@@ -1887,6 +2077,7 @@ pub(crate) fn strip_band_run_coverable(s: &str) -> bool {
                 .as_deref()
                 .is_some_and(|font| font.lookup_glyph_index(ch) != 0)
             || fonts.face_for(TextWeight::Regular, ch).is_some()
+            || synthesized::covers(ch)
     })
 }
 
@@ -1954,11 +2145,10 @@ fn ui_text_wrap_ranges_impl(
                 true,
             ),
             Some(_) => (
-                fonts
-                    .face_for(TextWeight::Regular, character)
-                    .map_or(px * 0.6, |cface| {
-                        cface.font.metrics(character, px).advance_width
-                    }),
+                fonts.face_for(TextWeight::Regular, character).map_or_else(
+                    || synthesized::advance(character, px).unwrap_or(px * 0.6),
+                    |cface| cface.font.metrics(character, px).advance_width,
+                ),
                 false,
             ),
         };
@@ -2061,7 +2251,7 @@ pub(crate) fn ui_text_wrap_ranges(
 /// an ideograph), so a CJK label fitted to its span by this measure overran it
 /// under the pen, and the band's centring, which subtracts this width, was off
 /// by half the difference. A char no loaded face covers measures the pen's own
-/// 0.6 em placeholder.
+/// glyph where it has one ([`synthesized`]), else its 0.6 em placeholder.
 pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
     let mut fonts = lock_fonts();
     let Some(f) = fonts.ui_font(face).cloned() else {
@@ -2079,9 +2269,10 @@ pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
             continue;
         }
         prev = None;
-        w += fonts
-            .face_for(TextWeight::Regular, ch)
-            .map_or(px * 0.6, |cface| cface.font.metrics(ch, px).advance_width);
+        w += fonts.face_for(TextWeight::Regular, ch).map_or_else(
+            || synthesized::advance(ch, px).unwrap_or(px * 0.6),
+            |cface| cface.font.metrics(ch, px).advance_width,
+        );
     }
     w
 }
@@ -2267,6 +2458,25 @@ impl Canvas {
         self.glyphs
             .insert(key, (metrics, std::sync::Arc::clone(&bitmap)));
         (metrics, bitmap)
+    }
+
+    /// [`Self::raster_glyph`] for a glyph the pen draws itself
+    /// ([`synthesized`]), cached under the null face pointer — an address no
+    /// parsed face can occupy. `None` for a char the pen does not draw.
+    fn raster_synthesized(
+        &mut self,
+        character: char,
+        px: f32,
+    ) -> Option<(ChromeMetrics, std::sync::Arc<[u8]>)> {
+        let key = (0, px.to_bits(), character);
+        if let Some((metrics, bitmap)) = self.glyphs.get(&key) {
+            return Some((*metrics, std::sync::Arc::clone(bitmap)));
+        }
+        let (metrics, bitmap) = synthesized::rasterize(character, px)?;
+        let bitmap: std::sync::Arc<[u8]> = bitmap.into();
+        self.glyphs
+            .insert(key, (metrics, std::sync::Arc::clone(&bitmap)));
+        Some((metrics, bitmap))
     }
 
     /// Intersect device-px rect `(x, y, w, h)` with the current clip and push it.
@@ -2853,7 +3063,8 @@ impl Canvas {
     /// render font. `Mono` draws in the chrome terminal stack: per-char face pick
     /// (bold sibling / user primary / DejaVu coverage fallback —
     /// [`select_chrome_face`], then the renderer's already-parsed chain faces —
-    /// [`ChromeFonts::coverage`]), a 26.6 fixed-point pen with per-glyph rounding
+    /// [`ChromeFonts::coverage`], then the pen's own two glyphs —
+    /// [`synthesized`]), a 26.6 fixed-point pen with per-glyph rounding
     /// (placement error ≤ 0.5 px, drift-free — `chrome_metrics` proofs). `Ui`/
     /// `UiBold` draw in real regular/semibold native system faces (SF Pro, Segoe UI,
     /// Noto Sans, or DejaVu Sans; the terminal stack is the final fallback) with
@@ -2884,10 +3095,14 @@ impl Canvas {
             let mut pen_q = px_to_q(x);
             let baseline_px = q_round_to_px(px_to_q(baseline)) as i32;
             for ch in s.chars() {
-                let Some(cface) = fonts.face_for(weight, ch) else {
-                    continue;
+                let glyph = match fonts.face_for(weight, ch) {
+                    Some(cface) => self.raster_glyph(&cface.font, ch, px),
+                    None => match self.raster_synthesized(ch, px) {
+                        Some(own) => own,
+                        None => continue,
+                    },
                 };
-                let (m, bitmap) = self.raster_glyph(&cface.font, ch, px);
+                let (m, bitmap) = glyph;
                 if m.width > 0 && m.height > 0 {
                     let gx = q_round_to_px(pen_q) as i32 + m.xmin;
                     let gy = baseline_px - (m.height as i32 + m.ymin);
@@ -2930,8 +3145,11 @@ impl Canvas {
             }
             prev_ui = None;
 
-            if let Some(cface) = fonts.face_for(weight, ch) {
-                let (m, bitmap) = self.raster_glyph(&cface.font, ch, px);
+            let glyph = match fonts.face_for(weight, ch) {
+                Some(cface) => Some(self.raster_glyph(&cface.font, ch, px)),
+                None => self.raster_synthesized(ch, px),
+            };
+            if let Some((m, bitmap)) = glyph {
                 self.blit_fontdue_glyph(pen, baseline_i, &m, &bitmap, c);
                 pen += m.advance_width;
                 continue;
@@ -5257,6 +5475,119 @@ mod tests {
             patched, fresh,
             "patching the declared local change is pixel-identical to rerasterizing the scene"
         );
+    }
+
+    /// REVIEW PIN (Phase 2, 2026-09-22): EVERY ADMITTED MESSAGE GLYPH INKS in
+    /// the cold chrome store — the embedded DejaVu alone, which is what unit
+    /// tests hold and what a host whose faces lack a symbol holds. `ℹ` and
+    /// `⏸` are DejaVu Sans Mono's two misses (Menlo's and SF Pro's too) and
+    /// the pen's own; the rest are the face's. So Settings ▸ Messages can
+    /// never draw a severity cell blank, whatever the host's chain has
+    /// parsed — and the next glyph the vocabulary admits cannot go blank
+    /// silently.
+    #[test]
+    fn every_admitted_message_glyph_inks_in_the_cold_store() {
+        let mut fonts = default_chrome_fonts();
+        assert!(
+            fonts.face_for(TextWeight::Regular, '\u{2139}').is_none(),
+            "the pin's premise: no cold face carries \u{2139}"
+        );
+        for &ch in aterm_messages::Glyph::ALLOWED {
+            let faced = fonts.face_for(TextWeight::Regular, ch).is_some();
+            let own = synthesized::covers(ch);
+            assert!(faced || own, "{ch:?} (U+{:04X}) has no ink", u32::from(ch));
+            assert!(
+                !(faced && own),
+                "{ch:?} is the pen's own only where every face misses"
+            );
+            if !own {
+                continue;
+            }
+            for px in [11.0, 14.0, 28.0, 44.0] {
+                let (m, bitmap) = synthesized::rasterize(ch, px).expect("drawn");
+                assert_eq!(bitmap.len(), m.width * m.height, "{ch:?} at {px}px");
+                assert!(
+                    bitmap.contains(&255),
+                    "{ch:?} at {px}px has solid ink, not only edges"
+                );
+                assert_eq!(
+                    m.advance_width,
+                    synthesized::advance(ch, px).unwrap(),
+                    "the pen advances by what the measure charges"
+                );
+                assert_eq!(
+                    measure_text(&ch.to_string(), px, TextWeight::Regular),
+                    q_to_px(px_to_q(m.advance_width)),
+                    "{ch:?} at {px}px measures as it is drawn"
+                );
+                // On the cap box: from the baseline (an O's overshoot at
+                // most) to under 0.72 em, inside its own advance.
+                assert!(m.ymin >= -1, "{ch:?} at {px}px sinks under the baseline");
+                assert!(
+                    (m.ymin + m.height as i32) as f32 <= 0.72 * px + 1.0,
+                    "{ch:?} at {px}px rises past the cap height"
+                );
+                assert!(
+                    (m.xmin + m.width as i32) as f32 <= m.advance_width + 1.0,
+                    "{ch:?} at {px}px overhangs its advance"
+                );
+            }
+        }
+    }
+
+    /// The pen INKS `ℹ` on both its arms — the mono stack and the
+    /// proportional UI arm — in the cold store, inside the glyph's own box
+    /// on the baseline it was given, and nothing else on the canvas.
+    #[test]
+    fn the_pen_inks_the_info_glyph_no_face_carries() {
+        let px = 28.0_f32;
+        let (x, baseline) = (4.0_f32, 40.0_f32);
+        for face in [TextFace::Ui, TextFace::Mono] {
+            let prims = vec![DrawPrim::Text {
+                x,
+                baseline,
+                s: "\u{2139}".to_string(),
+                px,
+                color: [255, 255, 255, 255],
+                weight: TextWeight::Regular,
+                face,
+            }];
+            let (pixels, w, _) = rasterize_tray(&prims, 48, 48, 1.0, [0, 0, 0, 255]);
+            let lit: Vec<(usize, usize)> = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c[0] >= 128)
+                .map(|(i, _)| (i % w as usize, i / w as usize))
+                .collect();
+            assert!(!lit.is_empty(), "{face:?}: the pen inked nothing");
+            let (left, right) = (x as usize, (x + 0.76 * px).ceil() as usize);
+            let (top, bottom) = (
+                (baseline - 0.69 * px).floor() as usize,
+                baseline as usize + 1,
+            );
+            for &(lx, ly) in &lit {
+                assert!(
+                    (left..=right).contains(&lx) && (top..=bottom).contains(&ly),
+                    "{face:?}: ink at ({lx}, {ly}) is outside the glyph's box"
+                );
+            }
+            // A ring, not a blob: the centre of the ring is dark (the stem
+            // and the dot sit off it), and both the top and the bottom of
+            // the ring are lit.
+            let (cx, cy) = ((x + 0.38 * px) as usize, (baseline - 0.36 * px) as usize);
+            let lit_at = |px_x: usize, px_y: usize| lit.contains(&(px_x, px_y));
+            assert!(
+                lit_at(cx, (baseline - 0.66 * px) as usize)
+                    && lit_at(cx, (baseline - 0.06 * px) as usize),
+                "{face:?}: the ring's top and bottom are lit"
+            );
+            assert!(
+                !lit_at(cx + (0.15 * px) as usize, cy),
+                "{face:?}: the ring is hollow beside the stem"
+            );
+        }
     }
 
     #[test]

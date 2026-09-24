@@ -335,7 +335,7 @@ end
 # leading $PATH is what the very next `claude` runs.
 #
 # $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
-# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $ATERM_NO_REROUTE is
+# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $__ATERM_REROUTE_PASSTHROUGH is
 # not engaged (non-empty and not "0": atpkg::reroute::engaged) — so the final order
 # is reroute, agents, everything else, bin/ last (the hook appends it). The parent
 # is cut with `string` (a builtin — its substitution forks nothing) and captured
@@ -382,7 +382,7 @@ function __aterm_managed_derive_reroute
     if test -n "$ATERM_REROUTE_DIR"; or test -z "$ATPKG_AGENTS"
         return 1
     end
-    if test -n "$ATERM_NO_REROUTE"; and test "$ATERM_NO_REROUTE" != 0
+    if test -n "$__ATERM_REROUTE_PASSTHROUGH"; and test "$__ATERM_REROUTE_PASSTHROUGH" != 0
         return 1
     end
     set -l parent (string replace -r '/[^/]*$' '' -- "$ATPKG_AGENTS")

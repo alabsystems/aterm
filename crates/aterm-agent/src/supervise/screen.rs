@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `text --json` reply as the supervisor reads it: the rows, the cursor and
-//! the content sequence. A small std-only JSON reader — the reply is one object
-//! of known shape (`{"rows":[…],"cursor":{"row":r,"col":c,…},"dims":{…},"seq":n}`)
-//! and this crate's closure stays free of a serde stack for it.
+//! The `text --json` reply as the supervisor reads it: the rows, the cursor, the
+//! content sequence and the screen generation. A small std-only JSON reader — the
+//! reply is one object of known shape (`{"rows":[…],"cursor":{"row":r,"col":c,…},
+//! "dims":{…},"seq":n,"gen":"e.s"}`) and this crate's closure stays free of a serde
+//! stack for it.
 
 /// One screen read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -20,6 +21,13 @@ pub struct Screen {
     /// The grid row the first of `rows` is: a shaped read's `first` (`tail=`
     /// sends it when it does not start at row 0), 0 for a full read.
     pub first: usize,
+    /// The screen GENERATION the read was taken at, `<epoch>.<seq>` (the
+    /// server's `"gen"`, read under the same lock as the rows): what a fenced
+    /// press names (`key if-gen=`). Unlike `seq` it never repeats — an
+    /// alternate-screen re-entry moves the epoch — so a press fenced on it
+    /// cannot land on a box that replaced the one read. `None` from a host
+    /// that does not send it (the press then carries no fence).
+    pub generation: Option<String>,
 }
 
 impl Screen {
@@ -60,6 +68,22 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         cursor_col: usize::try_from(num(cursor, "col").unwrap_or(0)).unwrap_or(usize::MAX),
         seq: num(Some(&v), "seq").unwrap_or(0),
         first: usize::try_from(num(Some(&v), "first").unwrap_or(0)).unwrap_or(usize::MAX),
+        generation: v
+            .get("gen")
+            .and_then(Json::as_str)
+            .filter(|g| is_generation(g))
+            .map(str::to_string),
+    })
+}
+
+/// The wire shape of a screen generation, `<epoch>.<seq>`: two unsigned
+/// decimals. Anything else is not sent as a fence (the server would answer
+/// `ERR usage`).
+fn is_generation(g: &str) -> bool {
+    g.split_once('.').is_some_and(|(e, s)| {
+        [e, s]
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
     })
 }
 
@@ -287,6 +311,24 @@ mod tests {
         let s = parse_text_json(trimmed).expect("parses");
         assert!(s.rows.is_empty());
         assert_eq!(s.seq, 5);
+        assert_eq!(s.generation, None, "an older host sends no gen");
+    }
+
+    /// The screen generation (`"gen":"<epoch>.<seq>"`) is read as the fence a
+    /// press names; a malformed one is not a fence at all.
+    #[test]
+    fn the_screen_generation_is_read_and_a_malformed_one_is_none() {
+        let with = |g: &str| {
+            parse_text_json(&format!(
+                r#"{{"rows":[],"cursor":{{"row":0,"col":0}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"{g}"}}"#
+            ))
+            .expect("parses")
+            .generation
+        };
+        assert_eq!(with("2.15").as_deref(), Some("2.15"));
+        for bad in ["15", "2.", ".15", "2.15.1", "-2.15", "a.b", ""] {
+            assert_eq!(with(bad), None, "{bad:?}");
+        }
     }
 
     /// A `tail=` read that does not start at row 0 says where it starts

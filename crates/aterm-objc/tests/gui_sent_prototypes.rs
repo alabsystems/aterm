@@ -719,6 +719,13 @@ fn the_scope_is_a_named_fraction_of_the_crate() {
     // other four it sends (`sharedApplication`, `respondsToSelector:`,
     // `runningApplicationWithProcessIdentifier:`, `activateWithOptions:`) were
     // already crate-wide, which is why this moved by one and not by five.
+    // 2026-09-24: the toolbar click drive briefly removed its only sends of
+    // `activateIgnoringOtherApps:` and `makeKeyAndOrderFront:` (283 -> 281).
+    // The quality-round-two merge restored both in `toolbar_drive.rs` so
+    // AppKit routes synthesized chip clicks on Darwin 27 (281 -> 283). They
+    // use that driver's typed `s_v_bool` / `s_v_id` casts; both selector
+    // encodings also have runtime rows in `winit_sent_prototypes.rs`. The
+    // drive remains outside this census's three-file W13 scope.
     assert_eq!(
         uncovered, 283,
         "the UNCENSUSED remainder of `crates/aterm-gui/src` moved to {uncovered}. \

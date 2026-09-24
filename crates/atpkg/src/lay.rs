@@ -18,7 +18,8 @@
 //! bundle clean; this lane makes the way IN clean. Nothing a tracked process writes
 //! itself escapes (`fork`, `posix_spawn`, `exec` into a clean image were all measured
 //! tagged), so the shims are handed, like the bundle, to a job launchd spawns from this
-//! binary — run in place when it is untagged, from a clean byte copy when it is tagged
+//! binary — run in place when neither it nor an `.app` above it is tagged, from a clean
+//! byte copy (of the binary, or of its whole bundle) when either is
 //! ([`crate::stage_helper::plan_helper`]) — the one mechanism that measured clean.
 //!
 //! # The mechanism
@@ -33,36 +34,27 @@
 //! reroute stubs at once), never one per file — a round trip is a fraction of a second,
 //! a `repair` lays dozens.
 //!
-//! # The policy when the lane cannot run
+//! # When the lane cannot run
 //!
 //! A tracked process whose lane fails — no launchd, a job that never starts, a helper
-//! that does not answer, a file that came back tagged anyway — writes the files itself,
-//! says so once on stderr, and (for a staged bundle) RECORDS the choice beside the
-//! bundle (`<build>.tracked-install`) for `aterm pkg doctor` and `aterm pkg repair` to
-//! name ([`TrackedPolicy::Allow`], the default since 2026-09-14); tagged shims need no
-//! record, the doctor's `bin/` scan sees them directly. That is not the v0.83.0 shape:
-//! v0.83.0 was a tagged toolchain NOBODY HAD MEASURED, cut into a release. Now the tag is
-//! measured at every seam that matters — the record here, the doctor's scan, and the
-//! release cutter's pre-claim gate (`gates::provenance_gate`), which refuses a tagged
-//! `trustc`/`targo` BEFORE a build number is burned. Between 2026-09-12 and 2026-09-14
-//! the default was to REFUSE the install instead, and on the owner's own machine that
-//! refused every stage — claude and codex never installed, `trust` and `clean` "aborted:
-//! stage", "⚠ ALab toolchain install failed" on screen — because the lane's one refusal
-//! (a tagged bundle executable) fired on every self-updated app. The lane now handles
-//! that shape ([`crate::stage_helper::HelperPlan::CopyBundleThenExec`]), and a lane that
-//! still cannot run must not leave a user with no toolchain to protect a release cut
-//! that guards itself. `[packages] tracked_install = "refuse"` in aterm.toml
-//! ([`crate::config::PackagesConfig::tracked_install`]) restores the refusal for a MACHINE
-//! whose operator would rather have no toolchain than a tagged one, and
-//! `ATPKG_REFUSE_TRACKED_INSTALL=1` ([`REFUSE_TRACKED_ENV`]) for one run: the env var, set
-//! non-empty, wins over the key ([`tracked_policy_of`]). The key exists because the env
-//! var alone could not reach the passes that matter (2026-09-15): the window's own
-//! update/seed passes are spawned from launchd's environment, where no shell export
-//! arrives, so a release cutter's machine could refuse a pass typed by hand and never the
-//! unattended ones that lay most of its toolchain. `ATPKG_ALLOW_TRACKED_INSTALL`
-//! ([`ALLOW_TRACKED_ENV`]), the old escape hatch, names the default and is accepted so
-//! nothing that set it breaks; it relaxes nothing, not even for one run — a machine that
-//! spelled `refuse` records again by editing the key.
+//! that does not answer — writes the files itself, and a lane that answered but whose
+//! files came back tagged keeps them as they are (they are complete). Either way the tag
+//! is then cleared in place ([`crate::provenance::heal`]: one launchd job of platform
+//! binaries, which no state of aterm's own bundle can make tracked), silently. Only a
+//! heal that fails is said — one plain line for the log ([`crate::provenance`]'s
+//! `log_line`), and `aterm pkg doctor` counts what is still tagged. The release cutter's
+//! pre-claim gate (`gates::provenance_gate`) refuses a tagged `trustc`/`targo` BEFORE a
+//! build number is burned whatever happened here.
+//!
+//! `[packages] tracked_install = "refuse"` in aterm.toml
+//! ([`crate::config::PackagesConfig::tracked_install`]) — the ONE spelling
+//! ([`tracked_policy_of`]) — refuses instead when the tag could not be cleared, for a
+//! machine whose operator would rather have no toolchain than a tagged one (the rustup
+//! view and the exec roots, [`crate::seam`] and [`crate::compat`], refuse as soon as their
+//! lane cannot run). The key exists because an environment variable could not reach the
+//! window's own passes, which are spawned from launchd's environment.
+//! `ATPKG_REFUSE_TRACKED_INSTALL` (the one-run refusal) and `ATPKG_ALLOW_TRACKED_INSTALL`
+//! (a no-op name for the default) are gone (2026-09-23, R2: no env alternatives).
 //!
 //! A binary that is not `atpkg`/`aterm` — a test harness, some other embedding of this
 //! crate — has NO lane by construction ([`Lane::Unavailable`]: it would not serve the
@@ -84,32 +76,6 @@ pub const HIDDEN_VERB: &str = "__lay-files";
 /// First line of a spec file — a version stamp, so a stale copy of this binary never
 /// misreads a newer spec.
 const SPEC_HEADER: &str = "atpkg-lay-spec v1";
-
-/// The pre-2026-09-14 escape hatch, now the name of the DEFAULT: a provenance-tracked
-/// installer whose untracked lane cannot run writes tagged files itself without being
-/// asked — the staged bundle recorded beside it as `<build>.tracked-install`, the shims
-/// visible to `aterm pkg doctor`'s `bin/` scan. Accepted (and a no-op) so a script that
-/// set it keeps working; the knobs that change the behaviour are [`REFUSE_TRACKED_ENV`]
-/// and `[packages] tracked_install`. It does NOT relax a machine whose config spells
-/// `"refuse"` — not even for one run (2026-09-15): the policy has two inputs
-/// ([`tracked_policy_of`]) and this is neither of them.
-pub const ALLOW_TRACKED_ENV: &str = "ATPKG_ALLOW_TRACKED_INSTALL";
-
-/// Set (non-empty) to REFUSE instead: a provenance-tracked installer whose untracked
-/// lane cannot run fails the install, naming why the lane failed — the 2026-09-12 to
-/// 2026-09-14 default, kept for an operator who would rather have no toolchain than one
-/// that cannot cut a release (the cutter's own machine). Off by default: `aterm pkg
-/// doctor` and the cutter's pre-claim gate name a tagged toolchain either way, and a
-/// refused install left the owner's machine with no `claude`, no `codex` and a stale
-/// `trust` (2026-09-14). Wins over [`ALLOW_TRACKED_ENV`] when both are set — fail-closed.
-///
-/// This is the ONE-RUN spelling: an operator typing it in a shell means it for that run,
-/// so it wins over `[packages] tracked_install` in aterm.toml
-/// ([`crate::config::PackagesConfig::tracked_install`]), which is the spelling for a
-/// MACHINE — the one that reaches the window's own passes, spawned from launchd's
-/// environment where no shell export arrives (2026-09-15). Empty is unset: `""` defers
-/// to the key. The precedence table is [`tracked_policy_of`]'s and is unit-tested there.
-pub const REFUSE_TRACKED_ENV: &str = "ATPKG_REFUSE_TRACKED_INSTALL";
 
 /// One executable to lay: where, and what bytes. Always mode `0755`, always temp+rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,81 +100,43 @@ impl Executable {
 // Policy.
 // ---------------------------------------------------------------------------------------
 
-/// What a tracked process does when its untracked lane cannot run.
+/// What a tracked process does with files whose tag could not be cleared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackedPolicy {
-    /// Refuse, naming why the lane failed and the way out. `ATPKG_REFUSE_TRACKED_INSTALL=1`
-    /// for one run; `[packages] tracked_install = "refuse"` for a machine.
+    /// Refuse them: `[packages] tracked_install = "refuse"` — the cutter's own machine,
+    /// which would rather have no toolchain than one that cannot cut a release.
     Refuse,
-    /// Write the files in-process (tagged), say so once, and — for a staged bundle —
-    /// record it beside the build. The default; `[packages] tracked_install = "record"`
-    /// names it.
+    /// Keep them, log one line, and — for a staged bundle — record it beside the build.
+    /// The default; `[packages] tracked_install = "record"` names it.
     Allow,
 }
 
-/// The policy this process runs under — the two inputs of [`tracked_policy_of`], read:
-/// [`REFUSE_TRACKED_ENV`] from the environment and `[packages] tracked_install` from the
-/// once-loaded config ([`crate::config::cached`]). [`ALLOW_TRACKED_ENV`] in any state
-/// changes nothing.
+/// The policy this process runs under: `[packages] tracked_install` from the
+/// once-loaded config ([`crate::config::cached`]), through [`tracked_policy_of`].
 #[must_use]
 pub fn tracked_policy() -> TrackedPolicy {
-    tracked_policy_of(
-        std::env::var_os(REFUSE_TRACKED_ENV).as_deref(),
-        crate::config::cached().tracked_install(),
-    )
+    tracked_policy_of(crate::config::cached().tracked_install())
 }
 
-/// The policy the two inputs select — pure, so the precedence table is a unit test:
-/// `env`, the value of [`REFUSE_TRACKED_ENV`], WINS when it is set non-empty (an operator
-/// typing it in a shell means it for that run); an unset or EMPTY env var is not set,
-/// and `config` — what `[packages] tracked_install` spelled, `None` when it spelled
-/// nothing admissible — decides; neither ⇒ `Allow`, the default since 2026-09-14.
-/// The env var can only ever say `Refuse`, so a config `Refuse` has no one-run override:
-/// that is deliberate (fail-closed on the machine that asked for it), and
-/// [`ALLOW_TRACKED_ENV`] is not a third input.
+/// The policy `config` selects — what `[packages] tracked_install` spelled, `None` when
+/// it spelled nothing admissible — and `Allow`, the default since 2026-09-14, when it
+/// selects none. Pure, so the table is a unit test.
 #[must_use]
-pub fn tracked_policy_of(env: Option<&OsStr>, config: Option<TrackedPolicy>) -> TrackedPolicy {
-    if env.is_some_and(|v| !v.is_empty()) {
-        return TrackedPolicy::Refuse;
-    }
+pub fn tracked_policy_of(config: Option<TrackedPolicy>) -> TrackedPolicy {
     config.unwrap_or(TrackedPolicy::Allow)
 }
 
-/// The refusal both lanes print under [`TrackedPolicy::Refuse`]: what could not be done
-/// (`what`, e.g. "stage the bundle" or "lay 12 executable(s)"), why the lane failed,
-/// what the tag breaks, and the way out. It no longer recommends "run this from an
-/// untracked process — Terminal.app, or `launchctl submit … <path to atpkg>`": the tag
-/// follows the EXECUTABLE, so on the one machine shape that reaches here in practice — a
-/// self-updated app, whose bundle carries the tag — a Terminal.app shell or a launchd job
-/// running that atpkg is tracked all the same (measured 2026-09-14), and the advice was
-/// a loop. It names BOTH spellings of the refusal (2026-09-15) rather than which one
-/// fired: the policy arrives here already decided, and an operator who set neither has
-/// nothing to unset, so the pair is the whole search space.
+/// The refusal under [`TrackedPolicy::Refuse`], when the tag could not be cleared: what
+/// was not done (`what`, e.g. "installing this build" or "laying 12 executable(s)"), why,
+/// and the switch that refused — the machine's key, its one spelling. Plain, and short:
+/// the operator who set the switch is the one reading it.
 #[must_use]
 pub fn tracked_refusal(what: &str, why: &str) -> String {
     format!(
-        "this process is provenance-tracked (a probe file it wrote came back carrying \
-         com.apple.provenance) and the untracked launchd lane could not {what} ({why}) — \
-         refusing rather than write files that would all carry the tag, because the \
-         refuse policy is in force ({REFUSE_TRACKED_ENV} set in this environment, or \
-         `[packages] tracked_install = \"refuse\"` in aterm.toml): {}. fix: unset \
-         {REFUSE_TRACKED_ENV} and set tracked_install = \"record\" (or drop the key) and \
-         the files are written in-process and recorded beside the build as \
-         <build>.tracked-install (`aterm pkg doctor` names it and every tagged shim), or \
-         clear what stopped launchd from running the helper — named above — and retry",
-        crate::provenance::WHAT_IT_BREAKS
+        "not done: {what} would leave files with a macOS tag (com.apple.provenance) that \
+         release builds refuse, and it could not be cleared ({why}); remove \
+         `tracked_install = \"refuse\"` from aterm.toml to allow it"
     )
-}
-
-/// The one stderr line printed when [`TrackedPolicy::Allow`] takes the in-process path.
-fn allowed_note(what: &str, why: &str) {
-    eprintln!(
-        "atpkg: note — this process is provenance-tracked and the untracked lane could not \
-         {what} ({why}); the files are written in-process and WILL carry \
-         com.apple.provenance — `aterm pkg doctor` names what that breaks; \
-         {REFUSE_TRACKED_ENV}=1 refuses instead for one run, `[packages] tracked_install \
-         = \"refuse\"` in aterm.toml for this machine"
-    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -436,7 +364,7 @@ pub fn run_helper(args: &[std::ffi::OsString]) -> ExitCode {
 /// that ran without achieving its purpose — `Err`, like a lane that did not run.
 /// `scratch` holds the job's spec, logs and any copy. `Err(reason)` is "the lane
 /// could not do it"; the files it did write (all of them, on the measured-tagged path)
-/// are complete files, and the caller's policy decides what happens next.
+/// are complete files, which the caller keeps and clears ([`lay_executables_with`]).
 #[cfg(target_os = "macos")]
 pub fn lay_untracked(
     helper_exe: &Path,
@@ -493,27 +421,33 @@ pub fn lay_untracked(
 /// Lay `files` (mode `0755`, temp+rename each): in this process when it is not
 /// provenance-tracked — measured, [`crate::provenance::process_is_tracked`] — or when
 /// this binary has no lane ([`Lane::Unavailable`]); through the untracked launchd job
-/// when it is tracked; and, when that lane fails, under [`tracked_policy`]: write
-/// in-process and say so by default, refuse under `ATPKG_REFUSE_TRACKED_INSTALL=1` or
-/// `[packages] tracked_install = "refuse"`. Empty `files` is a no-op that measures
-/// nothing.
+/// when it is tracked; and, when that lane fails, in this process with the tag cleared
+/// afterwards ([`crate::provenance::heal`]) — refused under `[packages] tracked_install =
+/// "refuse"` only if the tag stays. Empty `files` is a no-op that measures nothing.
 pub fn lay_executables(files: &[Executable]) -> io::Result<()> {
     if files.is_empty() {
         return Ok(());
     }
     let tracked =
         cfg!(target_os = "macos") && crate::provenance::process_is_tracked(&std::env::temp_dir());
-    lay_executables_with(files, tracked, &lane_for_this_binary(), tracked_policy())
+    lay_executables_with(
+        files,
+        tracked,
+        &lane_for_this_binary(),
+        tracked_policy(),
+        crate::provenance::heal,
+    )
 }
 
-/// [`lay_executables`] with its three inputs explicit — the tracking measurement, the
-/// lane and the policy — so every branch is exercisable from a test that is not itself
-/// in a position to be tracked.
+/// [`lay_executables`] with its inputs explicit — the tracking measurement, the lane, the
+/// policy and the heal — so every branch is exercisable from a test that is not itself in
+/// a position to be tracked.
 pub fn lay_executables_with(
     files: &[Executable],
     tracked: bool,
     lane: &Lane,
     policy: TrackedPolicy,
+    heal: crate::provenance::Healer,
 ) -> io::Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -521,6 +455,7 @@ pub fn lay_executables_with(
     if !tracked {
         return write_all_in_process(files);
     }
+    let what = format!("laying {} executable(s)", files.len());
     let helper = match lane {
         Lane::Helper(exe) => exe,
         // A fact about the binary, not a failure of the lane (module doc) — but a
@@ -530,28 +465,72 @@ pub fn lay_executables_with(
         Lane::Unavailable(why) => {
             return match policy {
                 TrackedPolicy::Refuse => Err(io::Error::other(tracked_refusal(
-                    &format!("lay {} executable(s)", files.len()),
-                    &format!("this binary has no untracked lane: {why}"),
+                    &what,
+                    &format!("this binary cannot lay them clean: {why}"),
                 ))),
                 TrackedPolicy::Allow => write_all_in_process(files),
             };
         }
     };
-    let what = format!("lay {} executable(s)", files.len());
     // The lanes' scratch is `<prefix>/staging/.lanes/` (2026-09-15), never the shared
     // per-user `$TMPDIR`: the dead-job sweep `Job::prepare` runs there walks only
     // directories atpkg created, and takes only the stems this crate submits
     // (`stage_helper::JOB_STEMS`) even so. No store (no `HOME`): the temp dir, as before.
     let scratch = crate::stage_helper::lanes_scratch().unwrap_or_else(std::env::temp_dir);
-    match lay_untracked(helper, files, &scratch) {
-        Ok(()) => Ok(()),
-        Err(why) => match policy {
-            TrackedPolicy::Refuse => Err(io::Error::other(tracked_refusal(&what, &why))),
-            TrackedPolicy::Allow => {
-                allowed_note(&what, &why);
-                write_all_in_process(files)
+    let Err(lane_why) = lay_untracked(helper, files, &scratch) else {
+        return Ok(());
+    };
+    // THE LANE DID NOT LAY THEM CLEAN. Whatever it did lay is complete — it writes each
+    // file temp+rename — so only what is missing or different is written here, never a
+    // second copy of what it laid tagged (the old in-process rewrite came back tagged
+    // too), and then everything is cleared in place.
+    //
+    // Under `Refuse` a file that STANDS is not replaced on the hope of a heal: a refusal
+    // cannot put it back, so a heal that then failed would leave the shim gone. The heal
+    // proves itself first, on a probe this process tags: one that cannot clear it is
+    // refused with nothing touched, as every refusal was before the heal existed.
+    if policy == TrackedPolicy::Refuse
+        && files
+            .iter()
+            .any(|f| f.path.symlink_metadata().is_ok() && !laid_as_asked(f))
+        && let Err(heal_why) = heal_works_in(&scratch, heal)
+    {
+        return Err(io::Error::other(tracked_refusal(
+            &what,
+            &format!("{lane_why}; {heal_why}"),
+        )));
+    }
+    let created: Vec<PathBuf> = files
+        .iter()
+        .filter(|f| f.path.symlink_metadata().is_err())
+        .map(|f| f.path.clone())
+        .collect();
+    write_differing_in_process(files)?;
+    let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+    let healed = heal(&paths, &scratch);
+    if healed.is_clean() {
+        return Ok(());
+    }
+    let why = format!(
+        "{lane_why}; {}",
+        healed.why().unwrap_or("the tag could not be cleared")
+    );
+    match policy {
+        TrackedPolicy::Refuse => {
+            // Refused means not laid by this step: what it created goes again.
+            for path in &created {
+                let _ = std::fs::remove_file(path);
             }
-        },
+            Err(io::Error::other(tracked_refusal(&what, &why)))
+        }
+        TrackedPolicy::Allow => {
+            crate::provenance::log_line(&format!(
+                "could not clear a macOS tag from {} it laid ({why}); `aterm pkg repair` \
+                 tries again",
+                crate::provenance::count_of(healed.left().len(), "file")
+            ));
+            Ok(())
+        }
     }
 }
 
@@ -560,6 +539,56 @@ fn write_all_in_process(files: &[Executable]) -> io::Result<()> {
         write_in_process(f)?;
     }
     Ok(())
+}
+
+/// Write, in this process, each of `files` not already on disk as asked — the exact bytes
+/// at mode `0755`.
+fn write_differing_in_process(files: &[Executable]) -> io::Result<()> {
+    for f in files {
+        if !laid_as_asked(f) {
+            write_in_process(f)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `heal` clears the tag here: a probe file this process writes into `scratch` —
+/// tagged, as everything a tracked process writes is — handed to it, then removed. `Err`
+/// says why not.
+fn heal_works_in(scratch: &Path, heal: crate::provenance::Healer) -> Result<(), String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = scratch.join(format!(".heal-probe-{}-{seq}", std::process::id()));
+    std::fs::write(&probe, b"probe")
+        .map_err(|e| format!("the heal could not be tried ({}): {e}", probe.display()))?;
+    let healed = heal(std::slice::from_ref(&probe), scratch);
+    let _ = std::fs::remove_file(&probe);
+    if healed.is_clean() {
+        Ok(())
+    } else {
+        Err(healed
+            .why()
+            .unwrap_or("the tag could not be cleared")
+            .to_string())
+    }
+}
+
+/// Whether `file` is on disk as a regular file with its bytes, at mode `0755`.
+fn laid_as_asked(file: &Executable) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(&file.path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o777 != 0o755 {
+            return false;
+        }
+    }
+    std::fs::read(&file.path).is_ok_and(|bytes| bytes == file.body)
 }
 
 /// [`lay_executables`] for one file — the shape the per-file writers keep.
@@ -584,6 +613,113 @@ pub fn lay_clears_provenance() -> bool {
     let tracked =
         cfg!(target_os = "macos") && crate::provenance::process_is_tracked(&std::env::temp_dir());
     lay_clears_provenance_with(tracked, &lane_for_this_binary())
+}
+
+/// Whether a file of ours at `path` that is CURRENT in content but carries the tag is worth
+/// re-laying now: a lay from this process can come back clean ([`lay_clears_provenance`]),
+/// and this very file — path and inode — was not already re-laid once and came back tagged
+/// ([`note_relayed`]). One attempt per file instance: a lane whose file returns tagged
+/// re-laid identical bytes through a launchd job every pass, for ever (the reroute marker,
+/// 2026-09-19..22), while a file that is laid anew — a self-update's, a fallback's — gets
+/// its one try. The memo is read only for a tagged file.
+#[must_use]
+pub fn relay_worth_trying(layout: &crate::store::Layout, path: &Path) -> bool {
+    lay_clears_provenance() && !relay_tried(&read_relay_memo(layout), path)
+}
+
+/// After laying `paths`: remember each that came back TAGGED, by path and inode, so no pass
+/// re-lays those bytes again ([`relay_worth_trying`]); forget each that came back clean or
+/// is gone. The memo (`<prefix>/tag-relay.tried`, `<inode>\t<path>` per line) is written
+/// only when it changes. Best-effort.
+pub fn note_relayed(layout: &crate::store::Layout, paths: &[PathBuf]) {
+    note_relayed_with(layout, paths, crate::provenance::carries_provenance);
+}
+
+/// [`note_relayed`] with the tag probe explicit — no test can put the kernel's tag on a file.
+fn note_relayed_with(
+    layout: &crate::store::Layout,
+    paths: &[PathBuf],
+    tagged: impl Fn(&Path) -> bool,
+) {
+    let had = read_relay_memo(layout);
+    let mut memo: Vec<(String, String)> = had
+        .iter()
+        .filter(|(_, p)| !paths.iter().any(|q| q.to_string_lossy() == p.as_str()))
+        .cloned()
+        .collect();
+    for path in paths {
+        if let Some(id) = file_instance(path)
+            && tagged(path)
+        {
+            memo.push((id, path.to_string_lossy().into_owned()));
+        }
+    }
+    memo.sort();
+    let mut sorted_had = had;
+    sorted_had.sort();
+    if memo == sorted_had {
+        return;
+    }
+    let target = relay_memo_path(layout);
+    if memo.is_empty() {
+        let _ = std::fs::remove_file(&target);
+        return;
+    }
+    let mut body = String::new();
+    for (id, path) in &memo {
+        body.push_str(id);
+        body.push('\t');
+        body.push_str(path);
+        body.push('\n');
+    }
+    let tmp = target.with_file_name(format!("tag-relay.tried.tmp-{}", std::process::id()));
+    if crate::call2(std::fs::write, &tmp, body).is_err() || std::fs::rename(&tmp, &target).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// `<prefix>/tag-relay.tried` ([`note_relayed`]).
+fn relay_memo_path(layout: &crate::store::Layout) -> PathBuf {
+    layout.prefix.join("tag-relay.tried")
+}
+
+/// The memo's `(instance, path)` rows; empty when absent or unreadable.
+fn read_relay_memo(layout: &crate::store::Layout) -> Vec<(String, String)> {
+    crate::metadata_io::read_bounded_regular_utf8(&relay_memo_path(layout), 256 * 1024)
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| l.split_once('\t'))
+                .map(|(id, p)| (id.to_string(), p.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `memo` holds the file now at `path` — the same path at the same inode.
+fn relay_tried(memo: &[(String, String)], path: &Path) -> bool {
+    let Some(id) = file_instance(path) else {
+        return false;
+    };
+    let path = path.to_string_lossy();
+    memo.iter().any(|(i, p)| *i == id && *p == path)
+}
+
+/// The identity of the file instance at `path`: its inode (a re-lay renames a new one over
+/// it), or its modification time where there are no inodes.
+fn file_instance(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(meta.ino().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = meta.modified().ok()?;
+        let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(since.as_nanos().to_string())
+    }
 }
 
 /// [`lay_clears_provenance`] with its two inputs explicit — the tracking measurement and
@@ -614,6 +750,45 @@ mod tests {
             ),
             Executable::new(d.join("with space"), b"\x00\xff binary body\n".to_vec()),
         ]
+    }
+
+    /// ONE TAG-DRIVEN RE-LAY PER FILE: a re-lay that came back tagged is remembered by path
+    /// and inode, and that very file is never re-laid for its tag again — the loop the
+    /// reroute marker ran every pass (2026-09-19..22). A file laid anew (a new inode) gets
+    /// its one try; one that came back clean is forgotten; an unchanged memo is not written.
+    #[cfg(unix)]
+    #[test]
+    fn a_relay_that_came_back_tagged_is_not_tried_again_for_the_same_file() {
+        let d = tmp("relay-memo");
+        let layout = crate::store::Layout { prefix: d.clone() };
+        let twin = d.join("claude");
+        std::fs::write(&twin, "#!/bin/sh\n").unwrap();
+        assert!(
+            !relay_tried(&read_relay_memo(&layout), &twin),
+            "never tried"
+        );
+        note_relayed_with(&layout, std::slice::from_ref(&twin), |_| true);
+        assert!(
+            relay_tried(&read_relay_memo(&layout), &twin),
+            "came back tagged"
+        );
+        let memo = relay_memo_path(&layout);
+        let written = std::fs::metadata(&memo).unwrap().modified().unwrap();
+        note_relayed_with(&layout, std::slice::from_ref(&twin), |_| true);
+        assert_eq!(
+            std::fs::metadata(&memo).unwrap().modified().unwrap(),
+            written,
+            "unchanged: not rewritten"
+        );
+        // Laid anew — a rename puts a new inode at the path — it gets its one try.
+        let next = d.join(".claude.new");
+        std::fs::write(&next, "#!/bin/sh\n# v2\n").unwrap();
+        std::fs::rename(&next, &twin).unwrap();
+        assert!(!relay_tried(&read_relay_memo(&layout), &twin), "a new file");
+        // A re-lay that came back clean is forgotten, and an empty memo goes.
+        note_relayed_with(&layout, std::slice::from_ref(&twin), |_| false);
+        assert!(!memo.exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Who can lay a file free of the tag: anyone untracked, and a tracked process only
@@ -660,36 +835,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The precedence table (2026-09-15), every row: the env var set non-empty WINS
-    /// (an operator typing it means it for that run), an unset or EMPTY env var defers
-    /// to `[packages] tracked_install`, and neither is ALLOW — the default since
-    /// 2026-09-14, when a refused install left the owner's machine without a toolchain.
+    /// The table (2026-09-23), every row: the key decides, and none is ALLOW — the
+    /// default since 2026-09-14, when a refused install left the owner's machine without
+    /// a toolchain. No environment variable is an input any more.
     #[test]
-    fn the_policy_precedence_is_env_then_config_then_allow() {
+    fn the_policy_is_the_key_then_allow() {
         use TrackedPolicy::{Allow, Refuse};
-        let unset: Option<&OsStr> = None;
-        let empty = Some(OsStr::new(""));
-        let set = Some(OsStr::new("1"));
-        // (unset, none) → Allow: the default.
-        assert_eq!(tracked_policy_of(unset, None), Allow);
-        // (unset, record) → Allow: the key naming the default.
-        assert_eq!(tracked_policy_of(unset, Some(Allow)), Allow);
-        // (unset, refuse) → Refuse: the machine's durable spelling, reached from
-        // launchd's environment where no shell export is.
-        assert_eq!(tracked_policy_of(unset, Some(Refuse)), Refuse);
-        // ("1", record) → Refuse: the shell wins for this run.
-        assert_eq!(tracked_policy_of(set, Some(Allow)), Refuse);
-        // ("", refuse) → Refuse: an empty env var is unset, so the key decides.
-        assert_eq!(tracked_policy_of(empty, Some(Refuse)), Refuse);
-        // (set, none) → Refuse: the pre-2026-09-15 behaviour, unchanged.
-        assert_eq!(tracked_policy_of(set, None), Refuse);
-        // The two rows the table above implies and a regression would silently flip.
-        assert_eq!(tracked_policy_of(empty, None), Allow, "empty env is unset");
-        assert_eq!(tracked_policy_of(set, Some(Refuse)), Refuse);
-        // Any non-empty value is "set" — the env var is a presence switch, not a bool.
-        assert_eq!(tracked_policy_of(Some(OsStr::new("0")), None), Refuse);
-        assert_eq!(REFUSE_TRACKED_ENV, "ATPKG_REFUSE_TRACKED_INSTALL");
-        assert_eq!(ALLOW_TRACKED_ENV, "ATPKG_ALLOW_TRACKED_INSTALL");
+        assert_eq!(tracked_policy_of(None), Allow);
+        assert_eq!(tracked_policy_of(Some(Allow)), Allow);
+        assert_eq!(tracked_policy_of(Some(Refuse)), Refuse);
     }
 
     /// The config side feeds the table through `PackagesConfig::tracked_install`, so
@@ -697,9 +851,8 @@ mod tests {
     /// policy lives, so a rename on either side fails a test in both.
     #[test]
     fn the_config_key_spells_the_two_policies() {
-        let of = |toml: &str| {
-            tracked_policy_of(None, crate::config::parse_packages(toml).tracked_install())
-        };
+        let of =
+            |toml: &str| tracked_policy_of(crate::config::parse_packages(toml).tracked_install());
         assert_eq!(of(""), TrackedPolicy::Allow);
         assert_eq!(
             of("[packages]\ntracked_install = \"record\"\n"),
@@ -777,61 +930,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The decision table, with the lane's outcome forced: an untracked process writes
-    /// in-process whatever the lane; a tracked one with no lane for its binary writes
-    /// in-process; a tracked one whose lane FAILS refuses under `Refuse` — nothing laid,
-    /// the refusal naming the cause and the way out — and writes under `Allow`, the
-    /// default.
+    /// A heal that clears what it was handed.
+    #[cfg(target_os = "macos")]
+    fn heal_clears(_roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
+        crate::provenance::HealOutcome::Healed { cleared: 3 }
+    }
+
+    /// A heal that could not clear what it was handed.
+    #[cfg(target_os = "macos")]
+    fn heal_fails(roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
+        crate::provenance::HealOutcome::Left {
+            carriers: roots.to_vec(),
+            why: String::from("xattr exited 1"),
+        }
+    }
+
+    /// A lay that needs no clearing never asks.
+    #[cfg(target_os = "macos")]
+    fn heal_not_asked(_roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
+        panic!("a lay with nothing to clear must not run the heal")
+    }
+
+    /// The decision table, with the lane's outcome and the heal's forced: an untracked
+    /// process writes in-process whatever the lane; a tracked one with no lane for its
+    /// binary writes in-process, or is refused under `Refuse`; a tracked one whose lane
+    /// FAILS writes the files and clears the tag — laid, under either policy, when the tag
+    /// clears; when it does not, refused under `Refuse` (nothing it created is left, and a
+    /// file that stood is never replaced) and kept under `Allow`, the default.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_tracked_process_whose_lane_fails_refuses_under_refuse_and_writes_under_allow() {
+    fn a_tracked_process_whose_lane_fails_heals_and_refuses_only_what_stays_tagged() {
         let d = tmp("policy");
         let dest = d.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         let wanted = files(&dest);
-        // A helper that is spelled right but cannot answer: `/usr/bin/true` under the
-        // name `atpkg` exits 0 without a result — a real lane failure, detected inside
-        // the exit grace.
+        // A helper that is spelled right but cannot answer: `/usr/bin/true` under the name
+        // `atpkg` exits 0 without a result — a real lane failure, detected inside the
+        // exit grace.
         let fake_dir = d.join("fake");
         std::fs::create_dir_all(&fake_dir).unwrap();
         let fake = fake_dir.join("atpkg");
         std::fs::copy("/usr/bin/true", &fake).unwrap();
         let broken = Lane::Helper(fake);
         let none = Lane::Unavailable(String::from("a test harness"));
+        let remove_all = || {
+            for f in &wanted {
+                let _ = std::fs::remove_file(&f.path);
+            }
+        };
 
-        // Untracked: in-process, no lane consulted.
-        lay_executables_with(&wanted, false, &broken, TrackedPolicy::Refuse).unwrap();
-        for f in &wanted {
-            std::fs::remove_file(&f.path).unwrap();
-        }
+        // Untracked: in-process, no lane consulted, nothing to clear.
+        lay_executables_with(
+            &wanted,
+            false,
+            &broken,
+            TrackedPolicy::Refuse,
+            heal_not_asked,
+        )
+        .unwrap();
+        remove_all();
         // Tracked, no lane for this binary: in-process under the default, REFUSED under
         // `Refuse` — an operator who asked for no tagged files gets none from a binary
         // that cannot lay clean ones (2026-09-15).
-        lay_executables_with(&wanted, true, &none, TrackedPolicy::Allow).unwrap();
-        for f in &wanted {
-            std::fs::remove_file(&f.path).unwrap();
-        }
-        let err = lay_executables_with(&wanted, true, &none, TrackedPolicy::Refuse)
+        lay_executables_with(&wanted, true, &none, TrackedPolicy::Allow, heal_not_asked).unwrap();
+        remove_all();
+        let err = lay_executables_with(&wanted, true, &none, TrackedPolicy::Refuse, heal_not_asked)
             .expect_err("tracked, no lane, refuse policy: refused");
-        assert!(err.to_string().contains("no untracked lane"), "{err}");
+        assert!(err.to_string().contains("cannot lay them clean"), "{err}");
         for f in &wanted {
             assert!(!f.path.exists(), "refused means not laid");
         }
-        // Tracked, lane fails, `Refuse` opted into: REFUSED, nothing laid.
-        let err = lay_executables_with(&wanted, true, &broken, TrackedPolicy::Refuse)
-            .expect_err("a tracked process with a broken lane must refuse under Refuse");
+        // Tracked, lane fails, the tag clears: laid, under either policy.
+        for policy in [TrackedPolicy::Refuse, TrackedPolicy::Allow] {
+            lay_executables_with(&wanted, true, &broken, policy, heal_clears).unwrap();
+            for f in &wanted {
+                assert_eq!(std::fs::read(&f.path).unwrap(), f.body);
+            }
+            remove_all();
+        }
+        // Tracked, lane fails, the tag stays, `Refuse` opted into: REFUSED, nothing left.
+        let err = lay_executables_with(&wanted, true, &broken, TrackedPolicy::Refuse, heal_fails)
+            .expect_err("a tag that stays is refused under Refuse");
         let msg = err.to_string();
-        assert!(msg.contains("provenance-tracked"), "{msg}");
+        assert!(msg.starts_with("not done: laying 3 executable(s)"), "{msg}");
         assert!(msg.contains("exited without a result"), "the cause: {msg}");
-        assert!(msg.contains("lay 3 executable(s)"), "{msg}");
+        assert!(msg.contains("xattr exited 1"), "why it stayed: {msg}");
         assert!(
-            msg.contains(REFUSE_TRACKED_ENV),
-            "the knob that refused: {msg}"
-        );
-        assert!(msg.contains("proof_snapshot.py"), "what it breaks: {msg}");
-        assert!(
-            !msg.contains("Terminal.app") && !msg.contains("launchctl submit"),
-            "the looping remedy is gone: {msg}"
+            msg.contains("tracked_install = \"refuse\"") && !msg.contains("ATPKG_"),
+            "the one key that refused, and no environment knob: {msg}"
         );
         for f in &wanted {
             assert!(
@@ -840,12 +1026,49 @@ mod tests {
                 f.path.display()
             );
         }
-        // Tracked, lane fails, the default: written in-process.
-        assert_eq!(tracked_policy_of(None, None), TrackedPolicy::Allow);
-        lay_executables_with(&wanted, true, &broken, TrackedPolicy::Allow).unwrap();
+        // …and a file that STANDS is not replaced on the hope of a heal: refused under
+        // `Refuse` by a heal that cannot clear a probe, it is exactly as it was — and a heal
+        // that can clear it lets the new bytes in.
+        let ino = |p: &Path| {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(p).unwrap().ino()
+        };
+        std::fs::write(&wanted[0].path, b"standing").unwrap();
+        let standing = ino(&wanted[0].path);
+        let err = lay_executables_with(&wanted, true, &broken, TrackedPolicy::Refuse, heal_fails)
+            .expect_err("a heal that cannot clear is refused before anything is replaced");
+        assert!(err.to_string().contains("xattr exited 1"), "{err}");
+        assert_eq!(std::fs::read(&wanted[0].path).unwrap(), b"standing");
+        assert_eq!(
+            ino(&wanted[0].path),
+            standing,
+            "the standing file was never replaced"
+        );
+        assert!(!wanted[1].path.exists() && !wanted[2].path.exists());
+        lay_executables_with(&wanted, true, &broken, TrackedPolicy::Refuse, heal_clears).unwrap();
         for f in &wanted {
             assert_eq!(std::fs::read(&f.path).unwrap(), f.body);
         }
+        remove_all();
+        // Tracked, lane fails, the tag stays, the default: kept.
+        assert_eq!(tracked_policy_of(None), TrackedPolicy::Allow);
+        lay_executables_with(&wanted, true, &broken, TrackedPolicy::Allow, heal_fails).unwrap();
+        for f in &wanted {
+            assert_eq!(std::fs::read(&f.path).unwrap(), f.body);
+        }
+        // What is already laid as asked is never rewritten: only a file that differs is.
+        let before: Vec<u64> = wanted.iter().map(|f| ino(&f.path)).collect();
+        std::fs::write(&wanted[2].path, b"stale").unwrap();
+        let stale = ino(&wanted[2].path);
+        lay_executables_with(&wanted, true, &broken, TrackedPolicy::Allow, heal_clears).unwrap();
+        assert_eq!(ino(&wanted[0].path), before[0], "laid as asked: left alone");
+        assert_eq!(ino(&wanted[1].path), before[1], "laid as asked: left alone");
+        assert_ne!(
+            ino(&wanted[2].path),
+            stale,
+            "a file that differs is written"
+        );
+        assert_eq!(std::fs::read(&wanted[2].path).unwrap(), wanted[2].body);
         // The lane's job scratch and label are gone either way.
         let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
@@ -860,25 +1083,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The refusal text names every piece an operator needs — and not the remedy that
-    /// looped on a self-updated app (a Terminal.app shell or a launchd job running a
-    /// tagged bundle binary is tracked all the same).
+    /// The refusal is short and plain: what was not done, why, and the switch that
+    /// refused — the machine's key, its one spelling; no environment knob.
     #[test]
-    fn the_refusal_names_the_cause_the_breakage_and_the_way_out() {
-        let msg = tracked_refusal("stage the bundle", "launchctl submit failed (exit 1)");
-        assert!(
-            msg.starts_with("this process is provenance-tracked"),
-            "{msg}"
-        );
-        assert!(msg.contains("could not stage the bundle (launchctl submit failed (exit 1))"));
-        assert!(msg.contains("xattr -d"), "{msg}");
-        assert!(msg.contains(REFUSE_TRACKED_ENV), "{msg}");
-        assert!(
-            msg.contains("tracked_install = \"refuse\"")
-                && msg.contains("tracked_install = \"record\""),
-            "both spellings of the refusal, and the way back: {msg}"
-        );
-        assert!(msg.contains("<build>.tracked-install"), "{msg}");
-        assert!(!msg.contains("Terminal.app"), "{msg}");
+    fn the_refusal_names_what_was_not_done_why_and_the_switch() {
+        let msg = tracked_refusal("installing this build", "xattr exited 1");
+        assert!(msg.starts_with("not done: installing this build"), "{msg}");
+        assert!(msg.contains("(xattr exited 1)"), "{msg}");
+        assert!(msg.contains("com.apple.provenance"), "{msg}");
+        assert!(msg.contains("tracked_install = \"refuse\""), "{msg}");
+        assert!(!msg.contains("ATPKG_"), "no environment knob: {msg}");
+        assert!(msg.chars().count() < 300, "{msg}");
+        assert!(!msg.contains("untracked") && !msg.contains("lane"), "{msg}");
     }
 }

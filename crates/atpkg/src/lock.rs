@@ -16,9 +16,11 @@
 //! So every verb that MUTATES the store TRY-acquires this advisory lock — a
 //! `store.lock` file (`0600`) directly under the hardened pkg prefix — at the CLI edge
 //! ([`crate::cli::main_entry`]) and holds it for the whole verb. Contention is
-//! **fail-closed and LOUD** for a HUMAN-typed verb: the refusal names the lock path
-//! and exits [`CONTENDED_EXIT`] (75, `EX_TEMPFAIL` — distinct from the exit-1 `Io`
-//! refusal, so a caller classifies by CODE and never by the sentence). MACHINE lanes
+//! **fail-closed and LOUD** for a verb typed where no person watches (a script, a
+//! pipe): the refusal names the lock path and exits [`CONTENDED_EXIT`] (75,
+//! `EX_TEMPFAIL` — distinct from the exit-1 `Io` refusal, so a caller classifies by
+//! CODE and never by the sentence). A verb a person typed on a terminal waits for the
+//! holder instead, behind a spinner, up to ten minutes (2026-09-23). MACHINE lanes
 //! — the window's launch-time `seed` and `update` children — opt into a BOUNDED WAIT
 //! instead with `--wait-lock <secs>` ([`lock_store_waiting`]): the same try, then a
 //! 500 ms poll until the holder exits or the deadline passes, announced once on
@@ -52,11 +54,195 @@ use std::time::{Duration, Instant};
 
 use crate::store::Layout;
 
+/// A held advisory lock on an open file, released by `LOCK_UN` when dropped rather than by
+/// the close: a child another thread is spawning holds a copy of every descriptor until it
+/// execs, and a lock released only by the close stays held for that long (measured
+/// 2026-09-17; `aterm-verify/tests/release_then_probe.rs`).
+pub(crate) struct Flock(File);
+
+impl Flock {
+    /// Take `file`'s exclusive lock without blocking.
+    pub(crate) fn try_lock(file: File) -> Result<Self, std::fs::TryLockError> {
+        // The ascription is the lock-order census's File evidence (`is_file_binding_rhs`):
+        // it keeps this flock out of the in-process mutex graph.
+        let file: std::fs::File = file;
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+
+    /// Take `file`'s exclusive lock, re-trying every [`LOCK_POLL`] for up to `limit`:
+    /// `TimedOut` naming `what` once it was not granted in time. Never a blocking `flock`.
+    pub(crate) fn lock_within(file: File, limit: Duration, what: &Path) -> io::Result<Self> {
+        // The census's File evidence, as in `try_lock`.
+        let file: std::fs::File = file;
+        let deadline = Instant::now() + limit;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "{} was held for more than {}s",
+                            what.display(),
+                            limit.as_secs()
+                        ),
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
+    }
+}
+
+/// How often [`Flock::lock_within`] re-tries a held lock: a holder's millisecond critical
+/// section costs one tick.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
+impl std::ops::Deref for Flock {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Flock {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// The store-wide writer lock, held for the lifetime of the value. Dropping it (or
 /// the process exiting) releases it — `flock` is associated with the open file
-/// description, so the kernel always cleans up after a crashed holder.
+/// description, so the kernel always cleans up after a crashed holder — and a drop
+/// releases it at once, whatever another thread is spawning ([`Flock`]).
 pub struct StoreLock {
-    _file: File,
+    _file: Flock,
+    /// The holder record this lock announced ([`StoreLock::announce_holder`]), removed on
+    /// release.
+    holder: Option<PathBuf>,
+    /// The store this lock serializes — what [`held_by_this_process`] answers for.
+    prefix: PathBuf,
+}
+
+/// The prefixes whose store lock a live [`StoreLock`] in THIS process holds, one entry per
+/// lock. What lets a writer ask "am I the store's one writer right now?" without being
+/// handed the guard — the package log rotates only then (`crate::packages_log`).
+static HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether a [`StoreLock`] on `layout`'s store is alive in this process.
+#[must_use]
+pub fn held_by_this_process(layout: &Layout) -> bool {
+    HELD.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&layout.prefix)
+}
+
+/// `<prefix>/store.lock.holder` — who holds the store: `pid=<n>` and `person=<0|1>`.
+#[must_use]
+pub fn holder_path(layout: &Layout) -> PathBuf {
+    layout.prefix.join("store.lock.holder")
+}
+
+impl StoreLock {
+    /// Say who holds the store ([`holder_path`]): this pid, and whether it is a PERSON's
+    /// typed verb — its stdin a terminal, which no machine lane's is. Read by a Settings
+    /// Check deciding whether to queue behind the holder or answer at once
+    /// ([`person_holder`]). Best-effort; removed on release, and a holder that dies leaves
+    /// a record naming a dead pid, which reads as nobody.
+    pub fn announce_holder(&mut self, layout: &Layout, person: bool) {
+        let path = holder_path(layout);
+        let body = format!("pid={}\nperson={}\n", std::process::id(), u8::from(person));
+        let tmp = layout
+            .prefix
+            .join(format!("store.lock.holder.tmp-{}", std::process::id()));
+        if crate::call2(std::fs::write, &tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_ok()
+        {
+            self.holder = Some(path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        {
+            let mut held = HELD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(at) = held.iter().position(|p| *p == self.prefix) {
+                held.swap_remove(at);
+            }
+        }
+        // Only a record that still names this process: a later holder's is not ours.
+        if let Some(path) = &self.holder
+            && read_holder(path).is_some_and(|(pid, _)| pid == std::process::id())
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// `(pid, person)` from a holder record, `None` when absent or malformed.
+fn read_holder(path: &Path) -> Option<(u32, bool)> {
+    let text = crate::metadata_io::read_bounded_regular_utf8(path, 256).ok()?;
+    let mut pid = None;
+    let mut person = None;
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("pid", v)) => pid = v.trim().parse::<u32>().ok(),
+            Some(("person", v)) => person = Some(v.trim() == "1"),
+            _ => {}
+        }
+    }
+    Some((pid?, person?))
+}
+
+/// Whether the holder record names a PERSON's typed verb in a live process — the words a
+/// waiting person is shown, never a decision: the record can be stale, and nothing
+/// here tries the lock ([`person_holder`] is the checked form).
+#[must_use]
+pub fn holder_is_person(layout: &Layout) -> bool {
+    read_holder(&holder_path(layout))
+        .is_some_and(|(pid, person)| person && crate::progress::pid_alive(pid))
+}
+
+/// The pid of a PERSON's typed verb holding `layout`'s store right now, else `None`: the
+/// holder record says so, names a live process that is not this one, AND the store lock is
+/// actually held. The Settings Check's one fail-fast case — every other holder (a window's
+/// pass, the session's, a `claude update`'s child) it queues behind, as the window's own
+/// passes do.
+///
+/// The lock is asked last because the record alone can lie: a holder killed by Ctrl-C or
+/// SIGKILL never removes it, and once its pid is reused the record names a live process
+/// holding nothing. A try-lock that SUCCEEDS proves the record stale; it is released at
+/// once (the Check's own pass takes the lock a moment later anyway) and the record removed.
+#[must_use]
+pub fn person_holder(layout: &Layout) -> Option<u32> {
+    let (pid, person) = read_holder(&holder_path(layout))?;
+    if !(person && pid != std::process::id() && crate::progress::pid_alive(pid)) {
+        return None;
+    }
+    match try_lock_store(layout) {
+        Ok(free) => {
+            drop(free);
+            if read_holder(&holder_path(layout)).is_some_and(|(p, _)| p == pid) {
+                let _ = std::fs::remove_file(holder_path(layout));
+            }
+            None
+        }
+        Err(_) => Some(pid),
+    }
 }
 
 /// Why the store lock could not be taken. Both variants are refusals at the CLI
@@ -282,8 +468,18 @@ fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
         Ok(f) => f,
         Err(e) => return Err(StoreLockError::Io(path.to_path_buf(), e)),
     };
-    match file.try_lock() {
-        Ok(()) => Ok(StoreLock { _file: file }),
+    match Flock::try_lock(file) {
+        Ok(file) => {
+            let prefix = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            HELD.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(prefix.clone());
+            Ok(StoreLock {
+                _file: file,
+                holder: None,
+                prefix,
+            })
+        }
         Err(std::fs::TryLockError::WouldBlock) => {
             Err(StoreLockError::Contended(path.to_path_buf()))
         }
@@ -301,6 +497,62 @@ mod tests {
         let p = std::env::temp_dir().join(format!("atpkg-lock-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         Layout { prefix: p }
+    }
+
+    /// THE HOLDER RECORD (Phase 3): a lock announces who holds it, a person's typed verb
+    /// reads as one while its process lives AND the lock is held, a lane never does, a dead
+    /// holder's record — or one whose pid was reused while the lock is free — reads as
+    /// nobody, and the record goes with the lock.
+    #[cfg(unix)]
+    #[test]
+    fn the_holder_record_names_a_person_only_while_one_holds_the_store() {
+        let layout = temp_layout("holder");
+        {
+            let mut guard = try_lock_store(&layout).unwrap();
+            guard.announce_holder(&layout, false);
+            assert_eq!(person_holder(&layout), None, "a lane is no person");
+            assert!(holder_path(&layout).is_file());
+        }
+        assert!(!holder_path(&layout).exists(), "released with the lock");
+        // A person's verb in ANOTHER live process (this test's parent stands in: alive, and
+        // not this pid) — believed only while the store lock is held.
+        let parent = std::os::unix::process::parent_id();
+        std::fs::write(holder_path(&layout), format!("pid={parent}\nperson=1\n")).unwrap();
+        {
+            // An unrelated test's fork can briefly inherit the just-dropped lock
+            // descriptor until its child execs. Observe release with the same
+            // bounded retry as the contention test below.
+            let _held = lock_store_waiting(&layout, Duration::from_secs(10), |_| {}, || true)
+                .expect("the released store lock becomes takeable");
+            assert_eq!(person_holder(&layout), Some(parent));
+        }
+        // The same record with the lock FREE: a holder killed before its Drop, its pid
+        // reused. Stale — nobody holds the store, and the record goes.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while person_holder(&layout).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "a released lock never made the parent record stale"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !holder_path(&layout).exists(),
+            "the stale record is removed"
+        );
+        // Its own record never makes a process wait on itself.
+        std::fs::write(
+            holder_path(&layout),
+            format!("pid={}\nperson=1\n", std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(person_holder(&layout), None);
+        // A holder that died left its record: nobody holds the store.
+        std::fs::write(holder_path(&layout), "pid=999999999\nperson=1\n").unwrap();
+        assert_eq!(person_holder(&layout), None);
+        std::fs::write(holder_path(&layout), "garbage").unwrap();
+        assert_eq!(person_holder(&layout), None);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
     /// The single-writer contract, in-process: with the lock held (one `Layout`),
@@ -333,40 +585,47 @@ mod tests {
             "the refusal names the lock path: {msg}"
         );
         drop(guard);
-        // THE RELEASE IS POLLED, NOT SAMPLED ONCE (2026-09-17). `drop` closes
-        // THIS process's last descriptor for the lock file — but `flock` is
-        // released only when every descriptor on that open file description is
-        // closed, and a `fork`/`posix_spawn` anywhere else in this test binary
-        // copies every open descriptor into the child, which holds them until
-        // it `exec`s (`FD_CLOEXEC` closes at exec, never at fork). So a lock
-        // this thread released a microsecond ago can still read as HELD for the
-        // length of someone else's spawn.
-        //
-        // MEASURED, not inferred: a 30-line probe that locks, drops and
-        // immediately re-locks one file, with one sibling thread doing nothing
-        // but `Command::new("/usr/bin/true").status()`, hits `WouldBlock` on
-        // the FIRST re-lock. This test failed exactly that way in the workspace
-        // `--tests` run of 2026-09-17 ("released lock is takeable again:
-        // Contended(…)") and passed 5/5 alone.
-        //
-        // The CLAIM IS UNCHANGED — a released lock must become takeable, and a
-        // release that never took effect still fails this test, loudly, naming
-        // the last refusal. Only the instant it must be visible is relaxed, by
-        // exactly the thing that delays it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let reacquired = loop {
-            match try_lock_store(&b) {
-                Ok(g) => break g,
-                Err(e) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "a released store lock never became takeable again: {e:?}"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        };
+        // Sampled ONCE, deliberately: the drop is `LOCK_UN` ([`Flock`]), so a spawn in a
+        // sibling test holding a copy of the descriptor cannot keep it held (it did until
+        // 2026-09-23, and this site polled a 10 s window for it).
+        let reacquired = try_lock_store(&b).expect("a released store lock is takeable at once");
         drop(reacquired);
+        let _ = std::fs::remove_dir_all(&a.prefix);
+    }
+
+    /// A DROPPED STORE LOCK IS FREE AT ONCE, whatever else holds its descriptor. A child
+    /// another thread is spawning holds a copy of every open descriptor until it execs, and
+    /// a lock released only by the close stayed held for that long: under a loaded suite the
+    /// holder test above read a released store as a person's, and the index probe and the
+    /// head watch deferred to a sibling that was gone. A second descriptor on the same open
+    /// file description (`try_clone`, which is `dup`) is exactly what that child holds.
+    #[test]
+    fn a_dropped_store_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let a = temp_layout("dup");
+        let b = Layout {
+            prefix: a.prefix.clone(),
+        };
+        let guard = try_lock_store(&a).expect("first acquisition succeeds");
+        let childs_copy = guard._file.try_clone().expect("dup the lock's descriptor");
+        drop(guard);
+        let again = try_lock_store(&b).expect("free while a copy of its descriptor lives");
+        drop(again);
+        // The same for every [`Flock`], the index probe's and the head watch's included.
+        let path = a.prefix.join("other.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let held = Flock::try_lock(open()).expect("free");
+        let copy = held.try_clone().unwrap();
+        drop(held);
+        assert!(Flock::try_lock(open()).is_ok(), "free while its copy lives");
+        drop((childs_copy, copy));
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
@@ -658,9 +917,15 @@ mod tests {
     /// poll is the full acquisition — the prefix comes back hardened and the lock
     /// is taken on the real, new file rather than an orphan inode.
     ///
-    /// Unix only: the remover deletes a directory whose `store.lock` the holder
+    /// The prefix vanishes in ONE step — renamed aside, deleted after the wait. A
+    /// `remove_dir_all` in place unlinked `store.lock` before the directory, and a
+    /// poll landing between the two re-created the lock file in it, so the removal
+    /// failed "directory not empty" (2 runs in 20 of four concurrent suites, found in
+    /// review 2026-09-23).
+    ///
+    /// Unix only: the remover moves a directory whose `store.lock` the holder
     /// keeps open and flock'd, which Unix allows; on Windows the open
-    /// `LockFileEx`'d handle leaves the file delete-pending and the removal fails.
+    /// `LockFileEx`'d handle refuses it.
     #[cfg(unix)]
     #[test]
     fn lock_store_waiting_re_vets_a_prefix_that_vanished_under_it() {
@@ -670,9 +935,12 @@ mod tests {
         };
         let guard = try_lock_store(&a).expect("first acquisition succeeds");
         let prefix = a.prefix.clone();
+        let aside = PathBuf::from(format!("{}-gone", a.prefix.display()));
+        let _ = std::fs::remove_dir_all(&aside);
+        let gone = aside.clone();
         let remover = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
-            std::fs::remove_dir_all(&prefix).expect("the prefix is removable under a holder");
+            std::fs::rename(&prefix, &gone).expect("the prefix is movable under a holder");
         });
         let got = lock_store_waiting(&b, Duration::from_secs(10), |_| {}, || true);
         assert!(
@@ -690,6 +958,7 @@ mod tests {
         drop(guard);
         drop(got);
         let _ = std::fs::remove_dir_all(&a.prefix);
+        let _ = std::fs::remove_dir_all(&aside);
     }
 
     /// A WAITING POLL RE-VETS THE PREFIX'S SHAPE, NOT ONLY ITS PRESENCE (F16, the
@@ -703,10 +972,40 @@ mod tests {
     /// the link with the F16 error at that poll rather than at the bound.
     ///
     /// RED before the fix: `Ok` — the lock taken on `<elsewhere>/store.lock`.
-    /// Unix only: the swap renames a directory whose held lock file stays open.
-    #[cfg(unix)]
+    /// macOS and Linux: the swap is one atomic exchange of the real prefix (its held
+    /// lock file goes with it) and a link — never a moment with nothing at the path.
+    /// It was a rename then a `symlink`, and a poll landing between the two re-created
+    /// the prefix into the link's way and met the post-create arm of the same guard
+    /// ("not a real directory") instead — 1 run in 20 of the suite under load.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn lock_store_waiting_refuses_a_prefix_swapped_for_a_symlink_under_it() {
+        /// Exchange the two names in one step (`renamex_np(RENAME_SWAP)` /
+        /// `renameat2(RENAME_EXCHANGE)`).
+        fn exchange(a: &Path, b: &Path) -> io::Result<()> {
+            use std::os::unix::ffi::OsStrExt as _;
+            let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+            let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+            // SAFETY: both C strings are NUL-terminated and outlive the call.
+            #[cfg(target_os = "macos")]
+            let rc = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+            // SAFETY: as above; `AT_FDCWD` resolves both paths from the cwd.
+            #[cfg(target_os = "linux")]
+            let rc = unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    a.as_ptr(),
+                    libc::AT_FDCWD,
+                    b.as_ptr(),
+                    libc::RENAME_EXCHANGE,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
         let a = temp_layout("wait-symlink");
         let b = Layout {
             prefix: a.prefix.clone(),
@@ -716,15 +1015,14 @@ mod tests {
         std::fs::create_dir_all(&elsewhere.prefix).unwrap();
         let prefix = a.prefix.clone();
         let moved = PathBuf::from(format!("{}-moved", a.prefix.display()));
-        let target = elsewhere.prefix.clone();
+        let _ = std::fs::remove_dir_all(&moved);
+        std::os::unix::fs::symlink(&elsewhere.prefix, &moved).expect("the link, beside the prefix");
         let aside = moved.clone();
         let swapper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
-            // Two atomic renames inside the waiter's first poll sleep: the real
-            // prefix aside (its held lock file goes with it), then a link over
-            // its name — never a moment with nothing at the path.
-            std::fs::rename(&prefix, &aside).expect("the prefix moves aside under a holder");
-            std::os::unix::fs::symlink(&target, &prefix).expect("a link takes the prefix's name");
+            // Inside the waiter's first poll sleep: the link takes the prefix's name
+            // and the real prefix takes the link's, in one step.
+            exchange(&aside, &prefix).expect("the prefix and the link exchange names");
         });
         let started = Instant::now();
         let err = match lock_store_waiting(&b, Duration::from_secs(10), |_| {}, || true) {
@@ -868,7 +1166,9 @@ mod tests {
     /// `reroute::REFUSAL_EXIT`, plus the literal returns of every `fn <verb>_code()
     /// -> u8` body that a verb RELAYS through `ExitCode::from(code)` (0.82.0's
     /// announcement ledger split `cmd_update_all` and `cmd_install_default_set` that
-    /// way, so the pass's real verdict answers its own announcement); the one other
+    /// way, so the pass's real verdict answers its own announcement) — where the offline
+    /// code is returned by its name, `pkg_check::PASS_OFFLINE_EXIT` (a pass that stood down
+    /// behind an offline one, 2026-09-24), read as the constant it names; the one other
     /// non-literal argument is the lock edge's own match, which names this constant.
     /// The self-update verb (`cli::cmd_selfupdate`, 2026-09-19) relays its CHILD's
     /// status the same way — literal arms for 0, 2 and everything else, and the named
@@ -930,12 +1230,14 @@ mod tests {
                         .filter(|l| !l.starts_with("//"))
                     {
                         let code = if let Some(after) = line.strip_prefix("return ") {
-                            after
-                                .trim_end_matches(';')
-                                .parse::<u8>()
-                                .unwrap_or_else(|_| {
+                            match after.trim_end_matches(';') {
+                                "aterm_update_core::pkg_check::PASS_OFFLINE_EXIT" => {
+                                    aterm_update_core::pkg_check::PASS_OFFLINE_EXIT
+                                }
+                                literal => literal.parse::<u8>().unwrap_or_else(|_| {
                                     panic!("{callee}: `{line}` is not a literal exit code")
-                                })
+                                }),
+                            }
                         } else if let Ok(bare) = line.parse::<u8>() {
                             bare
                         } else {

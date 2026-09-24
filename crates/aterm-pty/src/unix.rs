@@ -3745,14 +3745,32 @@ mod tests {
         }
         // Scheduling noise under a parallel suite can stretch or cut either arm,
         // so each is judged from the direction that falsifies it: the hot arm by
-        // its SHORTEST of three holds (the old code's hot arm cannot beat ~3 ms
+        // its SHORTEST of five holds (the old code's hot arm cannot beat ~3 ms
         // however many times it is run), the cold control by its LONGEST (a
         // writer descheduled past the bridge poll cuts one run short; it cannot
         // make a run hold past the budget).
+        //
+        // THE CONTROL RUNS UNTIL IT CLEARS ITS FLOOR, up to fifteen times. It
+        // took the longest of three, and on 2026-09-23 two full gates sharing
+        // one machine descheduled the writer in all three (held 1.47 ms, then
+        // 1.18 ms in isolation — one run in five). A cold arm that ENDED at the
+        // hot budget — the regression this control exists for — never clears
+        // the floor however often it runs, so stopping at the first run that
+        // does keeps the falsifier and drops the flake.
+        const COLD_FLOOR: std::time::Duration = std::time::Duration::from_micros(1500);
         let shortest = |f: fn() -> bool| (0..5).map(|_| hold(f)).min().expect("five runs");
-        let longest = |f: fn() -> bool| (0..3).map(|_| hold(f)).max().expect("three runs");
+        let longest_until_floor = |f: fn() -> bool| {
+            let mut longest = std::time::Duration::ZERO;
+            for _ in 0..15 {
+                longest = longest.max(hold(f));
+                if longest >= COLD_FLOOR {
+                    break;
+                }
+            }
+            longest
+        };
         let hot = shortest(always_hot);
-        let cold = longest(never_hot);
+        let cold = longest_until_floor(never_hot);
         eprintln!("P05 continuous-stream gather hold: hot={hot:?} cold={cold:?}");
         assert!(
             hot < std::time::Duration::from_micros(2200),
@@ -3764,8 +3782,8 @@ mod tests {
         // discriminating value, not the nominal one, so a late budget check
         // under load cannot fail it.
         assert!(
-            cold >= std::time::Duration::from_micros(1500),
-            "cold gather keeps holding past the hot budget, held {cold:?}"
+            cold >= COLD_FLOOR,
+            "cold gather keeps holding past the hot budget, held {cold:?} at best of fifteen"
         );
     }
 

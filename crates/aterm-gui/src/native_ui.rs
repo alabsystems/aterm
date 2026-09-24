@@ -498,6 +498,11 @@ pub(crate) struct ButtonSpec {
     /// fields use this instead of appending a font-dependent `v` glyph.
     pub(crate) trailing_icon: Option<ButtonIcon>,
     pub(crate) description: Option<String>,
+    /// An ATTENTION BADGE: a small dot in the danger role, painted at the end of
+    /// a rail row (on the pictogram of an icon-only one). Paint only — a control
+    /// that wears it states why in its semantic value, so the dot is never the
+    /// only carrier of the fact (the Settings rail's Packages entry, 2026-09-22).
+    pub(crate) badge: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -532,7 +537,14 @@ impl ButtonSpec {
             visual_icon: None,
             trailing_icon: None,
             description: None,
+            badge: false,
         }
+    }
+
+    /// Wear the attention badge ([`Self::badge`]) or not.
+    pub(crate) fn badge(mut self, on: bool) -> Self {
+        self.badge = on;
+        self
     }
 
     pub(crate) fn visual_label(mut self, label: impl Into<String>) -> Self {
@@ -2408,6 +2420,30 @@ fn navigation_label_type(
     }
 }
 
+/// The width a button's label gives up to its attention badge
+/// ([`ButtonSpec::badge`]): the dot and the gap before it. The painter and
+/// [`text_fit_audit`] read this one number, so the audit measures the slot the
+/// glass has.
+fn badge_reserve(spec: &ButtonSpec) -> f32 {
+    if spec.badge { 16.0 } else { 0.0 }
+}
+
+/// The attention badge: a 7pt dot in the danger role centred on `(cx, cy)`.
+fn paint_badge(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    cx: f32,
+    cy: f32,
+    roles: crate::settings::Roles,
+) {
+    prims.push(crate::widget::DrawPrim::Dot {
+        cx,
+        cy,
+        r: 3.5,
+        color: crate::widget::rgba(roles.danger, 255),
+        breathe: false,
+    });
+}
+
 fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
     match &node.content {
         UiContent::Text(spec) => {
@@ -2441,7 +2477,7 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                             .as_ref()
                             .unwrap_or(&control.spec.label),
                         node.rect.x + 40.0,
-                        node.rect.right() - 12.0,
+                        node.rect.right() - 12.0 - badge_reserve(&control.spec),
                     )
                 } else {
                     return None;
@@ -2462,7 +2498,7 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     38.0
                 } else {
                     10.0
-                };
+                } + badge_reserve(&control.spec);
                 (label, text_x, node.rect.right() - trailing_reserve)
             };
             let authored_available = (text_right - text_x).max(0.0);
@@ -3289,7 +3325,7 @@ fn paint_compiled_node(
                     // let the one row that grew ink overflow its own slot.
                     let label = elide_text_label(
                         visual_label,
-                        (rect.width - 52.0).max(0.0),
+                        (rect.width - 52.0 - badge_reserve(&control.spec)).max(0.0),
                         size.get(),
                         nav_face,
                     );
@@ -3302,8 +3338,25 @@ fn paint_compiled_node(
                         nav_face,
                         rgba(color, 255),
                     ));
+                    if control.spec.badge {
+                        paint_badge(
+                            prims,
+                            rect.right() - 18.0,
+                            rect.y + rect.height / 2.0,
+                            roles,
+                        );
+                    }
                 } else {
                     paint_button_icon(prims, rect, icon, color);
+                    if control.spec.badge {
+                        // On the pictogram's shoulder: an icon-only row has no end.
+                        paint_badge(
+                            prims,
+                            rect.x + rect.width / 2.0 + 9.0,
+                            rect.y + rect.height / 2.0 - 9.0,
+                            roles,
+                        );
+                    }
                 }
             } else {
                 let size = native_type_px(TypeStep::Secondary);
@@ -3325,10 +3378,19 @@ fn paint_compiled_node(
                 };
                 let painted_label = elide_text_label(
                     label,
-                    (rect.right() - trailing_reserve - text_x).max(0.0),
+                    (rect.right() - trailing_reserve - badge_reserve(&control.spec) - text_x)
+                        .max(0.0),
                     size.get(),
                     nav_face,
                 );
+                if control.spec.badge {
+                    paint_badge(
+                        prims,
+                        rect.right() - trailing_reserve - 8.0,
+                        rect.y + rect.height / 2.0,
+                        roles,
+                    );
+                }
                 prims.push(text_prim(
                     text_x,
                     row_baseline(rect.y, rect.height, size.get()),
@@ -5423,6 +5485,144 @@ mod tests {
         }
     }
 
+    /// THE ATTENTION BADGE (2026-09-22): a rail row that wears it paints ONE dot in
+    /// the danger role past its label — at the end of a wide row, on the
+    /// pictogram's shoulder of an icon-only one — and the label gives the dot its
+    /// room, in the painter and in the fit audit alike ([`badge_reserve`]). A row
+    /// without it paints no dot at all.
+    #[test]
+    fn a_badged_rail_row_paints_one_danger_dot_past_its_label() {
+        use crate::native_appearance::forced_chrome_theme;
+        use crate::widget::DrawPrim;
+        use aterm_render::Theme;
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let theme = forced_chrome_theme(Theme::default(), false);
+        let roles = crate::settings::Roles::from_theme(theme);
+        let paint = |spec: ButtonSpec, rect: LogicalRect| {
+            let node = PaintNode {
+                key: UiKey::new("settings/nav/packages"),
+                rect,
+                clip: rect,
+                content: UiContent::Button(
+                    Control::new(spec, ActionId::new("settings/route/packages"))
+                        .style(StyleRef::Navigation),
+                ),
+            };
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+            (node, prims)
+        };
+        let dots = |prims: &[DrawPrim]| -> Vec<(f32, f32)> {
+            prims
+                .iter()
+                .filter_map(|p| match p {
+                    DrawPrim::Dot { cx, cy, color, .. } if color[..3] == roles.danger => {
+                        Some((*cx, *cy))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let row = || ButtonSpec::new("Packages").visual_icon(ButtonIcon::Packages);
+        let wide = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
+        let (_, plain) = paint(row(), wide);
+        assert!(dots(&plain).is_empty(), "no badge, no dot");
+        let (node, badged) = paint(row().badge(true), wide);
+        let wide_dots = dots(&badged);
+        assert_eq!(wide_dots.len(), 1, "one dot: {wide_dots:?}");
+        let (cx, cy) = wide_dots[0];
+        assert!(
+            cx > wide.x + 40.0 && cx < wide.right(),
+            "at the row's end: {cx}"
+        );
+        assert!((cy - (wide.y + wide.height / 2.0)).abs() < 0.01);
+        // The label's slot is the painter's, badge and all.
+        let audit = text_fit_audit(&node).expect("a rail label is audited");
+        let plain_audit = text_fit_audit(&PaintNode {
+            content: UiContent::Button(
+                Control::new(row(), ActionId::new("settings/route/packages"))
+                    .style(StyleRef::Navigation),
+            ),
+            ..node.clone()
+        })
+        .expect("audited");
+        assert!(
+            (plain_audit.authored_available - audit.authored_available - 16.0).abs() < 0.01,
+            "the badge takes its 16pt from the label's slot: {} vs {}",
+            plain_audit.authored_available,
+            audit.authored_available
+        );
+        // Icon-only: the dot sits on the pictogram's shoulder, inside the row.
+        let narrow = LogicalRect::new(8.0, 40.0, 48.0, 34.0);
+        let (_, icon_only) = paint(row().badge(true), narrow);
+        let icon_dots = dots(&icon_only);
+        assert_eq!(icon_dots.len(), 1, "{icon_dots:?}");
+        let (cx, cy) = icon_dots[0];
+        assert!(narrow.contains(cx, cy), "{cx},{cy} inside {narrow:?}");
+    }
+
+    /// THE BADGE BESIDE A CHEVRON (review, 2026-09-22): the painter's third branch —
+    /// a rail row with no pictogram and a trailing chevron — keeps the dot clear of
+    /// the chevron's slot, and the label's elided slot, in the painter and in the
+    /// fit audit alike, ends before the dot does.
+    #[test]
+    fn a_badged_label_row_keeps_its_dot_clear_of_the_chevron() {
+        use crate::native_appearance::forced_chrome_theme;
+        use crate::widget::DrawPrim;
+        use aterm_render::Theme;
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let theme = forced_chrome_theme(Theme::default(), false);
+        let roles = crate::settings::Roles::from_theme(theme);
+        let rect = LogicalRect::new(0.0, 0.0, 320.0, 44.0);
+        let node = |badge: bool| PaintNode {
+            key: UiKey::new("settings/categories/packages"),
+            rect,
+            clip: rect,
+            content: UiContent::Button(
+                Control::new(
+                    ButtonSpec::new("Packages")
+                        .trailing_icon(ButtonIcon::Forward)
+                        .badge(badge),
+                    ActionId::new("settings/route/packages"),
+                )
+                .style(StyleRef::Navigation),
+            ),
+        };
+        let mut prims = Vec::new();
+        paint_compiled_node(&mut prims, &node(true), roles, theme, 14.0);
+        let dots: Vec<(f32, f32, f32)> = prims
+            .iter()
+            .filter_map(|p| match p {
+                DrawPrim::Dot {
+                    cx, cy, r, color, ..
+                } if color[..3] == roles.danger => Some((*cx, *cy, *r)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dots.len(), 1, "{dots:?}");
+        let (cx, cy, r) = dots[0];
+        // The chevron is painted in the row's last 34pt (`paint_compiled_node`).
+        let chevron_left = rect.right() - 34.0;
+        assert!(
+            cx + r < chevron_left,
+            "the dot ({cx}±{r}) stays left of the chevron's slot at {chevron_left}"
+        );
+        assert!(rect.contains(cx, cy));
+        let audit = text_fit_audit(&node(true)).expect("audited");
+        let plain = text_fit_audit(&node(false)).expect("audited");
+        assert!(
+            (plain.authored_available - audit.authored_available - 16.0).abs() < 0.01,
+            "the badge takes its 16pt from the label: {} vs {}",
+            plain.authored_available,
+            audit.authored_available
+        );
+        let label_right = rect.x + 12.0 + audit.authored_available;
+        assert!(
+            label_right < cx - r,
+            "the label's slot ends at {label_right}, before the dot at {cx}±{r}"
+        );
+    }
+
     /// SEMIBOLD is a rail DESTINATION's mark, and only a destination's.
     ///
     /// `StyleRef::Navigation` dresses three shapes, and the marks are not all
@@ -7002,6 +7202,7 @@ mod tests {
             ButtonIcon::Security,
             ButtonIcon::Diagnostics,
             ButtonIcon::Update,
+            ButtonIcon::Packages,
             ButtonIcon::Info,
         ] {
             let mut prims = Vec::new();

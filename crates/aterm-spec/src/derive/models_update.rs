@@ -913,9 +913,17 @@ pub fn native_update_auto_intent_model() -> Model {
 /// failure (`PhysicalFailure`) latches for the schedule's spacing while the
 /// clock keeps running underneath, and its `Lapse` resumes the ladder where the
 /// clock is; the mutant restarts the ladder at the lapse
-/// (`LapseRestartsTheLadder`), so one 600 s latch buys a fresh fifteen minutes —
+/// (`LapseRestartsTheLadder`), so one 600 s latch buys a fresh ladder —
 /// caught by `TheLadderNeverRestarts`, a high-water mark the phase may never
 /// fall below.
+///
+/// `WarmupStarts`/`WarmupEnds` (2026-09-23) are the user's consent warm-up,
+/// the one hold no phase relaxes: `Land` included, or a landing could arrive
+/// while the macOS dialog the user asked for is on screen.
+/// Every admitted park (`Park`, `ParkMissed`, `PhysicalFailure`) requires it
+/// ended, and `ParkedOnlyWhenTheLadderAdmits` records it; `WarmupEnds` is
+/// always enabled while it holds (the shipping hold is capped), so the ladder
+/// still always lands.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_apply_ladder_model() -> Model {
@@ -939,6 +947,8 @@ pub fn native_update_apply_ladder_model() -> Model {
             var parked_keys = 0;
             var parked_output = 0;
             var parked_focused = 0;
+            var warmup = 0;
+            var parked_warmup = 0;
             // The wall clock. Not guarded on the latch: the anchor keeps
             // counting while a physical-failure latch holds, and `reached` is
             // the high-water mark the phase may never fall below.
@@ -967,6 +977,14 @@ pub fn native_update_apply_ladder_model() -> Model {
             action Focus when (landed == 0 && manual_only == 0) {
                 focused = 1;
             }
+            // The user's consent warm-up: held in every phase, and bounded — it
+            // always ends.
+            action WarmupStarts when (landed == 0 && manual_only == 0 && warmup == 0) {
+                warmup = 1;
+            }
+            action WarmupEnds when (landed == 0 && manual_only == 0 && warmup == 1) {
+                warmup = 0;
+            }
             // The incident's typing hold: a busy terminal past `Hold` ticks
             // stands the lane down. Nothing is enabled afterwards.
             action StandDown when (
@@ -976,7 +994,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 manual_only = 1;
             }
             action Park when (
-                landed == 0 && manual_only == 0 && latched == 0 &&
+                landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
@@ -988,13 +1006,14 @@ pub fn native_update_apply_ladder_model() -> Model {
                 parked_keys = keys;
                 parked_output = output;
                 parked_focused = focused;
+                parked_warmup = warmup;
             }
             // A PARK THAT MISSED ITS FREEZE BUDGET: the readers are back, nothing
             // was granted, and the machine was busy. A fact about the moment,
             // filed with keystrokes and the hold cap — the lane keeps its phase
             // and its anchor and is gated afresh. Never a latch.
             action ParkMissed when (
-                landed == 0 && manual_only == 0 && latched == 0 &&
+                landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
@@ -1007,6 +1026,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             // physical schedule's spacing. Once, to keep the space finite.
             action PhysicalFailure when (
                 landed == 0 && manual_only == 0 && latched == 0 && failures == 0 &&
+                warmup == 0 &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
@@ -1023,7 +1043,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             // THE 2026-09-21 MUTANTS. A park miss filed as a physical failure
             // with a two-attempt lifetime: the lane latches.
             action ParkMissLatches when (
-                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 0 &&
+                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
@@ -1032,7 +1052,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 manual_only = 1;
             }
             // And a lapse that clears the anchor: the 600 s latch buys the
-            // artifact a fresh fifteen minutes.
+            // artifact a fresh ladder.
             action LapseRestartsTheLadder when (
                 Buggy == 1 && landed == 0 && manual_only == 0 && latched == 1
             ) {
@@ -1049,15 +1069,16 @@ pub fn native_update_apply_ladder_model() -> Model {
                 parked_keys = keys;
                 parked_output = output;
                 parked_focused = focused;
+                parked_warmup = warmup;
             }
             invariant ActivityNeverLatchesManualOnly: manual_only == 0;
             invariant TheLadderNeverRestarts: reached <= phase;
             invariant ParkedOnlyWhenTheLadderAdmits:
                 if landed == 1 {
-                    parked_phase == Land ||
+                    parked_warmup == 0 && (parked_phase == Land ||
                         (parked_keys == 1 && (parked_phase == 2 ||
                             (parked_phase == 1 && (parked_focused == 0 || parked_output == 1)) ||
-                            (parked_phase == 0 && parked_quiet == 1)))
+                            (parked_phase == 0 && parked_quiet == 1))))
                 } else {
                     landed <= 1
                 };

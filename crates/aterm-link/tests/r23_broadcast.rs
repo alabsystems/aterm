@@ -12,6 +12,10 @@
 
 mod harness;
 
+use aterm_spec::{
+    derive::{broadcast_cursor_checkpoint_model, broadcast_head_subscription_model},
+    interp,
+};
 use harness::{until, World, FLEET};
 
 /// Every record currently on the fleet's broadcast subtree.
@@ -32,9 +36,9 @@ fn say_records(w: &World) -> Vec<(u64, String, String)> {
     }
 }
 
-/// Add a topic and wait for the bridge to have sampled it — the set lives in
-/// aterm and the bridge reads it on the roster round, so "added" and "in
-/// effect" are two moments.
+/// Add a topic and wait for the bridge to hold it — the set lives in aterm and
+/// the bridge learns it from the push (or its one read of a new session), so
+/// "added" and "in effect" are two moments.
 fn subscribe(w: &World, sid: &str, spec: &str) {
     let reply = w.verb(&format!("@{sid} topic add {spec}"));
     assert!(reply.ok(), "topic add {spec}: {}", reply.header());
@@ -53,6 +57,14 @@ fn topic_rows(w: &World, sid: &str, topic: &str) -> Vec<String> {
         .into_iter()
         .filter(|r| r.contains(&format!(" topic={topic} ")))
         .collect()
+}
+
+fn persisted_topic_cursor(w: &World, sid: &str, topic: &str) -> Option<u64> {
+    let body = std::fs::read_to_string(w.state.join(format!("topics/{sid}"))).ok()?;
+    body.lines().find_map(|line| {
+        let (name, cursor) = line.split_once(' ')?;
+        (name == topic).then(|| cursor.parse().ok()).flatten()
+    })
 }
 
 /// **ONE RECORD, N DELIVERIES — and none at all to a session that never asked.**
@@ -157,6 +169,41 @@ fn a_late_subscriber_replays_and_head_takes_only_new() {
     subscribe(&w, &s_a, &format!("r23.late since=@{off}"));
     subscribe(&w, &s_b, "r23.late since=head");
 
+    // The bus accepted the backlog before this add, but its lower-priority
+    // broadcast reader need not have drained the record yet. The persisted
+    // cursor is the resolution itself: it must already be past the backlog,
+    // even if a `say` record is still waiting in the bridge's mailbox.
+    let resolved = std::fs::read_to_string(w.state.join(format!("topics/{s_b}")))
+        .expect("the head subscription has a persisted cursor");
+    let head_cursor = resolved
+        .lines()
+        .find_map(|line| line.strip_prefix("r23.late "))
+        .and_then(|n| n.parse::<u64>().ok())
+        .expect("the head subscription cursor is a broker offset");
+    assert!(
+        head_cursor > off,
+        "`since=head` resolved after backlog offset {off}, even if the say reader is behind: {resolved}"
+    );
+    // Tier-1: project the real, persisted cursor onto the derived model's
+    // broker-relative 0/1 timeline. The model deliberately leaves the say
+    // reader behind, the schedule that exposed the gate failure. The shipped
+    // bridge's head decision must agree even if it actually drained sooner.
+    let model = broadcast_head_subscription_model();
+    let mut state = model.init_state();
+    assert!(model.fire("PublishBacklog", &mut state));
+    assert!(model.action_enabled("AddHead", &state));
+    assert!(model.fire("AddHead", &mut state));
+    let real_cursor = if head_cursor > off { 1 } else { 0 };
+    assert_eq!(real_cursor, state["cursor"]);
+    let old = interp::with_buggy(&model, 1);
+    let mut stale = old.init_state();
+    assert!(old.fire("PublishBacklog", &mut stale));
+    assert!(old.fire("AddHead", &mut stale));
+    assert_ne!(
+        real_cursor, stale["cursor"],
+        "the old stale-head decision must be caught"
+    );
+
     // A NEW RECORD WHILE THE BACKLOG IS STILL OWED. This is not decoration: a
     // cursor that is BEHIND the live face must not be advanced past a record
     // the subscription hands over, or the live one silently cancels the
@@ -187,6 +234,12 @@ fn a_late_subscriber_replays_and_head_takes_only_new() {
         "`since=head` takes the new record and only that: {fresh:?}"
     );
     assert!(fresh[0].contains("text=r23fresh"), "{}", fresh[0]);
+    assert!(model.fire("TakeBacklog", &mut state));
+    assert!(old.fire("TakeBacklog", &mut stale));
+    let real_backlog = i64::from(fresh.iter().any(|r| r.contains("r23backlog")));
+    assert_eq!(real_backlog, state["backlog_delivered"]);
+    assert_ne!(real_backlog, stale["backlog_delivered"]);
+    assert!(!old.check_invariant("HeadSkipsEarlierRecord", &stale));
 }
 
 /// **A BROADCAST IS DATA, WHATEVER IT SAYS IT IS.**
@@ -337,14 +390,11 @@ fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
             .and_then(|r| r.split_whitespace().find_map(|t| t.strip_prefix("off=")))
             .and_then(|off| off.parse::<u64>().ok())
     });
-    // `<topic> <next> <serial>`; the serial is the endpoint's and not asserted.
     let cursor = |w: &World| {
         std::fs::read_to_string(w.state.join(format!("topics/{s_b}")))
             .unwrap_or_default()
             .trim()
-            .rsplit_once(' ')
-            .map(|(head, _serial)| head.to_string())
-            .unwrap_or_default()
+            .to_string()
     };
     // THE ROW AND THE CURSOR ARE TWO MOMENTS: the endpoint holds the row as
     // soon as `deliver` answers, and the bridge persists the cursor just after.
@@ -409,6 +459,129 @@ fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
         rows.iter().any(|r| r.contains("r23gap")),
         "nothing published across a restart is lost: {rows:?}"
     );
+}
+
+/// An unrelated live broadcast may leave the quiet topic's durable cursor
+/// behind its in-memory frontier. A crash must replay that irrelevant stretch
+/// and still deliver a matching record published across the restart; the first
+/// matching delivery then commits its cursor immediately, and the next live
+/// matching record must arrive exactly once.
+#[test]
+fn an_irrelevant_checkpoint_gap_replays_safely_and_live_delivery_stays_durable() {
+    let w = World::boot("r23checkpoint", &[]);
+    w.wait_ready();
+    let (s_a, s_b) = w.two_sessions();
+    subscribe(&w, &s_a, "r23.noisy");
+    subscribe(&w, &s_b, "r23.quiet");
+
+    // Tier-1 conformance: project the real file and delivered rows onto the
+    // derived cursor machine. Its clock counts say records rather than global
+    // broker offsets, which include unrelated presence and control records.
+    let model = broadcast_cursor_checkpoint_model();
+    let mut state = model.init_state();
+    let old = interp::with_buggy(&model, 1);
+    let mut buggy = old.init_state();
+
+    let mut stale = false;
+    for i in 0..2 {
+        let posted = w.verb(&format!("@{s_a} post to=say:r23.noisy kind=note noise{i}"));
+        assert!(posted.ok(), "{}", posted.header());
+        let rows = until("the noisy topic's live delivery", || {
+            let rows = topic_rows(&w, &s_a, "r23.noisy");
+            (rows.len() == i + 1).then_some(rows)
+        });
+        let off = rows[i]
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("off="))
+            .and_then(|part| part.parse::<u64>().ok())
+            .expect("noisy delivery's offset");
+        // The bridge writes this new opt-in only after it has completed the
+        // current say handler. That gives a deterministic barrier for the
+        // quiet cursor's checkpoint decision, not a timing guess.
+        subscribe(&w, &s_a, &format!("r23.barrier{i}"));
+        assert!(model.fire("Irrelevant", &mut state));
+        assert!(old.fire("Irrelevant", &mut buggy));
+        let on_disk =
+            persisted_topic_cursor(&w, &s_b, "r23.quiet").expect("quiet topic's durable cursor");
+        if on_disk == off + 1 {
+            assert!(model.fire("Checkpoint", &mut state));
+            assert!(old.fire("Checkpoint", &mut buggy));
+        }
+        stale = on_disk <= off;
+        assert_eq!(
+            !stale,
+            state["durable"] == state["memory"],
+            "real file and model must agree on whether this row was checkpointed"
+        );
+        if stale {
+            break;
+        }
+    }
+    assert!(
+        stale,
+        "at least one of two adjacent sweeps skips this SID's checkpoint"
+    );
+    assert!(topic_rows(&w, &s_b, "r23.quiet").is_empty());
+
+    let pid = w.bridge_pid();
+    harness::kill(pid, 9);
+    assert!(model.fire("Crash", &mut state));
+    assert!(old.fire("Crash", &mut buggy));
+    while state["memory"] < state["head"] {
+        assert!(model.fire("ReplayIrrelevant", &mut state));
+        assert!(old.fire("ReplayIrrelevant", &mut buggy));
+    }
+    let mut god = w.god();
+    let (gap_off, _) = god
+        .publish(
+            7_301,
+            1,
+            &format!("/f/{FLEET}/pub/n-elsewhere/s-peer/say/r23.quiet"),
+            b"v=1 t=1 kind=note from=s-peer text=quiet-gap",
+        )
+        .expect("publish matching record across restart");
+    until("the replacement bridge", || {
+        let back: i32 = std::fs::read_to_string(w.state.join("pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (back != pid).then_some(())
+    });
+    let first = until("the matching record after restart", || {
+        let rows = topic_rows(&w, &s_b, "r23.quiet");
+        (rows.len() == 1).then_some(rows)
+    });
+    assert!(first[0].contains("quiet-gap"), "{first:?}");
+    until("the delivered cursor's durable commit", || {
+        (persisted_topic_cursor(&w, &s_b, "r23.quiet") == Some(gap_off + 1)).then_some(())
+    });
+    assert!(model.fire("Deliver", &mut state));
+    assert!(old.fire("Deliver", &mut buggy));
+    assert_eq!(state["durable"], state["head"]);
+    assert!(buggy["durable"] < buggy["head"]);
+    assert!(old.fire("Crash", &mut buggy));
+    assert_eq!(
+        buggy["reoffered"], 1,
+        "the missing-write mutant is detected"
+    );
+
+    let posted = w.verb(&format!(
+        "@{s_a} post to=say:r23.quiet kind=note quiet-live"
+    ));
+    assert!(posted.ok(), "{}", posted.header());
+    let rows = until("the next matching live record", || {
+        let rows = topic_rows(&w, &s_b, "r23.quiet");
+        (rows.len() == 2).then_some(rows)
+    });
+    assert!(rows[1].contains("quiet-live"), "{rows:?}");
+    assert_eq!(topic_offsets(&w, &s_b, "r23.quiet").len(), 2);
+    let live_off = topic_offsets(&w, &s_b, "r23.quiet")[1];
+    until("the live delivered cursor's durable commit", || {
+        (persisted_topic_cursor(&w, &s_b, "r23.quiet") == Some(live_off + 1)).then_some(())
+    });
+    assert!(model.fire("Deliver", &mut state));
+    assert_eq!(state["durable"], state["head"]);
 }
 
 /// The `msg` rows of a session's ring that arrived on `topic`, with their
@@ -530,8 +703,10 @@ fn a_broadcast_the_lane_never_took_is_redelivered_by_the_replacement() {
 ///
 /// The documented way to ask for a different starting point. It was a silent
 /// no-op when both happened between two samples: the name survived, the old
-/// cursor was kept, the new `since=` never read. The add's serial (`serial=`)
-/// makes the re-add a new entry to the bridge.
+/// cursor was kept, the new `since=` never read. The endpoint now pushes each
+/// change on the event lane, so the drop and the re-add are two events in
+/// order and the bridge reads the second's `since=` — with no roster round in
+/// between, which is also the proof the push is what acts.
 #[test]
 fn drop_then_add_in_one_round_replays_from_the_new_offset() {
     let w = World::boot("r23readd", &[]);

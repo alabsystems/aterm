@@ -70,8 +70,8 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
     // filesystem, so the moves below are renames) and is removed on every exit
     // path. Its NAME begins with a dot, which is what actually keeps it out of
     // Spotlight — measured 2026-09-02, a dot-hidden directory and its whole
-    // subtree are absent from the index, while the `.metadata_never_index` file
-    // dist/ carries is inert (crates/atpkg/src/noindex.rs).
+    // subtree are absent from the index, while a `.metadata_never_index` marker file
+    // is inert (crates/atpkg/src/noindex.rs).
     let stage = out_dir.join(format!(".dmg-stage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;

@@ -224,9 +224,10 @@ impl App {
         {
             let src_drives = plan.connects.iter().any(|(f, _, _)| *f == src);
             let dst_drives = plan.connects.iter().any(|(f, _, _)| *f == dst);
-            self.notice = Some(crate::notice::TransientNotice::session_connection(
-                crate::connections::first_use_connect_notice_text(src_drives, dst_drives),
-                std::time::Instant::now(),
+            // A disclosure the tab's own mark and menu already show: a RECORD
+            // (R22, the owner's attention rule), never a row.
+            self.record_message(crate::message_reporters::session_connection_created(
+                &crate::connections::first_use_connect_notice_text(src_drives, dst_drives),
             ));
         }
         // The §2.4 freshness poke: marks + menus + tooltips recompose now (the

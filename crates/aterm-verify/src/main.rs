@@ -135,6 +135,9 @@ fn main() {
     // root this run will actually build — and BEFORE any stage runs, because the
     // whole point is that every child of one run is given the same answer.
     ctx = ctx.with_pinned_child_facts();
+    if let Some(gib) = parsed.disk_floor_gib {
+        ctx = ctx.with_disk_floor(gib * aterm_verify::disk::GIB);
+    }
 
     let started = Instant::now();
     let stdout = std::io::stdout();

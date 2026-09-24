@@ -8,13 +8,13 @@
 //!
 //! A managed vendor tool may carry its own updater. Claude Code's downloads newer
 //! versions into `~/.local/share/claude/versions/` that the managed shim never runs —
-//! wasted bandwidth and a `claude doctor` complaint — while the signed index re-pin is
-//! the only update path atpkg honours. Claude Code honours `DISABLE_AUTOUPDATER=1` (the
-//! background check stops; `claude update` still works — measured 2026-09-19, exit 0 —
-//! and on the MANAGED name it is answered, since that day, by the twin's self-update
-//! intercept ([`crate::selfupdate`]), which runs the standard `aterm pkg update claude`;
+//! wasted bandwidth and a `claude doctor` complaint — while aterm itself keeps the managed
+//! copy at Anthropic's latest ([`crate::vendor_direct`]). Claude Code honours
+//! `DISABLE_AUTOUPDATER=1` (the background check stops; `claude update` still works —
+//! measured 2026-09-19, exit 0 — and on the MANAGED name it is answered by the twin's
+//! self-update intercept ([`crate::selfupdate`]), which runs `aterm pkg update claude`;
 //! this switch stays the background-updater half) and `DISABLE_UPDATES=1` (blocks all).
-//! So the signed pkg manifest may declare
+//! So a program's policy may declare
 //!
 //! ```toml
 //! shim_env = ["DISABLE_AUTOUPDATER=1"]
@@ -26,7 +26,9 @@
 //!
 //! # Where it lives
 //!
-//! * **The signed manifest** ([`crate::manifest::PkgManifest::shim_env`]) — SIGNED
+//! * **The policy**: for a vendor-direct program, the compiled vendor table
+//!   ([`crate::vendor_direct::VendorSpec::shim_env`]) and nothing else; for an index
+//!   program, its signed manifest ([`crate::manifest::PkgManifest::shim_env`]) — SIGNED
 //!   metadata, validated at parse ([`ShimEnv::admit`], [`crate::sig::Reject::ShimEnv`]).
 //! * **The shim itself** — the Unix `sh` wrapper carries one `export NAME='VALUE'` line
 //!   per entry ahead of its `exec`; the Windows `.cmd` wrapper one `@set "NAME=VALUE"`
@@ -37,10 +39,14 @@
 //!   `doctor` add a trailing fix-line ([`ShimEnv::fix_line`]), never inside the
 //!   canonical state.
 //! * **A sibling sidecar** `store/<program>/<build>.shim-env` (beside `<build>.ready`,
-//!   the same shape as `.provenance`), written from the signed manifest before the
+//!   the same shape as `.provenance`), written from the policy before the
 //!   build is staged, so the verbs that hold NO manifest — the transaction's rollback,
-//!   the `rollback` verb, `unlink`'s restore — re-lay the shims of a build with the env
-//!   its manifest declared, exactly. `store::discard_build` removes it with the tree.
+//!   the `rollback` verb, `unlink`'s restore, `repair` — re-lay the shims of a build with
+//!   the env its policy declared, exactly. It is also the standard a laid shim is held
+//!   to (audit 2026-09-23): the pass re-lays a primary that exports otherwise
+//!   ([`crate::activate::reassert_shim_env`]), `doctor` names one, and `atpkg run` — which
+//!   execs past the shim — exports it itself ([`crate::ops::exec_env`]).
+//!   `store::discard_build` removes it with the tree.
 //!
 //! # The rule (validated once, at parse — and re-applied fail-closed on every read)
 //!
@@ -103,12 +109,12 @@ pub const NEVER_SET: &[&str] = &[
 pub const NEVER_SET_PREFIXES: &[&str] = &["LD_", "DYLD_"];
 
 /// The variables that mean "self-update off" to the vendor tools atpkg manages —
-/// Claude Code reads both. An env naming one earns the `self-update off (…)` fix-line;
-/// any other env is spelled as `runs with …`.
+/// Claude Code reads both. An env naming one earns the "own updater is off here"
+/// fix-line; any other env is spelled as `runs with …`.
 pub const SELF_UPDATE_SWITCHES: &[&str] = &["DISABLE_AUTOUPDATER", "DISABLE_UPDATES"];
 
 /// The sidecar file name suffix: `store/<program>/<build>.shim-env`.
-const SIDECAR_SUFFIX: &str = ".shim-env";
+pub(crate) const SIDECAR_SUFFIX: &str = ".shim-env";
 
 /// Bound for reading a sidecar or a shim back: eight short lines, generously.
 const MAX_SIDECAR_BYTES: usize = 4 * 1024;
@@ -179,13 +185,16 @@ impl ShimEnv {
         s
     }
 
-    /// The fix-line that rides AFTER a managed row on the surfaces that speak to a
-    /// person (`which`, `doctor`): `self-update off (DISABLE_AUTOUPDATER=1)` when an
-    /// entry names one of [`SELF_UPDATE_SWITCHES`], else `runs with NAME=VALUE`. `None`
-    /// for an empty env. NEVER part of the canonical state string — `status.toml` and
-    /// the Packages row carry the state alone, and `state.rs`'s parsers never see this.
+    /// The fix-line that rides AFTER `program`'s managed row on the surfaces that speak
+    /// to a person (`which`, `doctor`). An entry naming one of [`SELF_UPDATE_SWITCHES`]:
+    /// `Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)` for a vendor-direct
+    /// program, `its own updater is off here (…)` for any other; else `runs with
+    /// NAME=VALUE`. `None` for an empty env. It states the env and nothing about the
+    /// version: the row beside it says whether that is the vendor's latest, a hold or a
+    /// rollback. NEVER part of the canonical state string — `status.toml` and the Packages
+    /// row carry the state alone, and `state.rs`'s parsers never see this.
     #[must_use]
-    pub fn fix_line(&self) -> Option<String> {
+    pub fn fix_line(&self, program: &str) -> Option<String> {
         if self.0.is_empty() {
             return None;
         }
@@ -193,15 +202,21 @@ impl ShimEnv {
             .0
             .iter()
             .any(|(n, _)| SELF_UPDATE_SWITCHES.contains(&n.as_str()));
-        let mut s = String::from(if self_update {
-            "self-update off ("
-        } else {
-            "runs with "
-        });
-        s.push_str(&self.spelled());
-        if self_update {
-            s.push(')');
+        if !self_update {
+            let mut s = String::from("runs with ");
+            s.push_str(&self.spelled());
+            return Some(s);
         }
+        let mut s = match crate::vendor_direct::spec(program) {
+            Some(spec) => {
+                let mut s = String::from(spec.product);
+                s.push_str("'s own updater is off here (");
+                s
+            }
+            None => String::from("its own updater is off here ("),
+        };
+        s.push_str(&self.spelled());
+        s.push(')');
         Some(s)
     }
 
@@ -437,32 +452,34 @@ mod tests {
         assert_eq!(ShimEnv::admit(&eight).unwrap().entries().len(), 8);
     }
 
-    /// The fix-line spellings: the self-update switches earn `self-update off (…)`,
-    /// anything else `runs with …`, an empty env none at all.
+    /// The fix-line spellings: the self-update switches earn "own updater is off here"
+    /// — naming the product for a vendor-direct program, and never a claim about its
+    /// version, which a pin or a rollback makes false — anything else `runs with …`, an
+    /// empty env none at all.
     #[test]
     fn the_fix_line_is_exact() {
         assert_eq!(
             ShimEnv::admit(&raw(&["DISABLE_AUTOUPDATER=1"]))
                 .unwrap()
-                .fix_line()
+                .fix_line("claude")
                 .as_deref(),
-            Some("self-update off (DISABLE_AUTOUPDATER=1)")
+            Some("Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)")
         );
         assert_eq!(
             ShimEnv::admit(&raw(&["DISABLE_UPDATES=1", "FOO=bar"]))
                 .unwrap()
-                .fix_line()
+                .fix_line("tool")
                 .as_deref(),
-            Some("self-update off (DISABLE_UPDATES=1, FOO=bar)")
+            Some("its own updater is off here (DISABLE_UPDATES=1, FOO=bar)")
         );
         assert_eq!(
             ShimEnv::admit(&raw(&["FOO=bar"]))
                 .unwrap()
-                .fix_line()
+                .fix_line("claude")
                 .as_deref(),
             Some("runs with FOO=bar")
         );
-        assert_eq!(ShimEnv::NONE.fix_line(), None);
+        assert_eq!(ShimEnv::NONE.fix_line("claude"), None);
     }
 
     /// The sidecar round-trips, an empty env removes it, a hand-edited one that breaks

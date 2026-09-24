@@ -6,7 +6,8 @@
 //! It spawns your `$SHELL` in a PTY and passes I/O through **unchanged**, so it
 //! looks and behaves exactly like your shell. It does NOT model the screen by
 //! default: the host terminal draws the bytes and NOTHING in this process reads
-//! them back. The VT engine is DEMAND-DRIVEN — `$ATERM_SESSION_MODEL` builds a
+//! them back. The VT engine is DEMAND-DRIVEN — `$ATERM_SESSION_MODEL`, a development
+//! seam no shipped binary reads (`aterm_types::dev_seam!`), builds a
 //! [`Terminal`] and feeds it every output byte; unarmed (the default) the model
 //! is never constructed, so there is no VT parse, no grid mutation and no
 //! scrollback growth on the passthrough path. See [`session_model_armed`].
@@ -93,8 +94,7 @@ const HELP_HEAD: &str = concat!(
     "\n",
     "Spawns your $SHELL in a PTY and passes I/O through unchanged, so it looks and\n",
     "behaves exactly like your shell. The output is NOT modelled: the host terminal\n",
-    "draws the bytes and this process keeps no screen state (ATERM_SESSION_MODEL=1\n",
-    "builds the in-process VT model anyway — see ENVIRONMENT). The shell runs through\n",
+    "draws the bytes and this process keeps no screen state. The shell runs through\n",
     "the PROTECTED spawn seam: cap-gated, fail-closed, resource-bounded in the\n",
     "confinement modes only (safety/containment; user — the default — and master\n",
     "install no caps, so on macOS and Linux the shell inherits your shell's limits):\n",
@@ -186,7 +186,7 @@ pub enum Verb {
     Fleet,
     /// `aterm drive` — the agent drive CLI (sugar over await/send).
     Drive,
-    /// `aterm link` — the fabric bridge (`serve`, `ls`, `hook`, `mirror`, …).
+    /// `aterm link` — the fabric bridge (`serve`, `ls`, `hook`, `notify`, …).
     Link,
     /// `aterm fabric` — the fabric's state on one screen, its traffic live, and
     /// `on|off|doctor`: the one command that turns it on and proves it.
@@ -197,8 +197,11 @@ pub enum Verb {
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
-    /// `aterm harness` — the Claude Code harness: the hook bridge and the
-    /// read verbs (docs/DESIGN-aterm-wrapper-2026-09-17.md §4.5, §5.7).
+    /// `aterm harness` — the Claude Code harness's four read views and the live
+    /// agent upgrade (docs/DESIGN-aterm-wrapper-2026-09-17.md §0.4). Its hook
+    /// bridge is retired by decision "B" (2026-09-22), and its supervising verbs
+    /// were deleted with the second harness stack (2026-09-23): `aterm drive`
+    /// supervises; `upgrade` only restarts an agent onto a newer build.
     Harness,
     /// `aterm new-tab` — a tab, routed by `windowing_behavior` (S12 / design §5).
     NewTab,
@@ -379,11 +382,11 @@ impl Verb {
                 "a plain `aterm` shell session never does.",
             ],
             Verb::Harness => &[
-                "The Claude Code harness: answer the vendor's hooks, record",
-                "the statusLine, and read back what it saw (hook | statusline",
-                "| install | uninstall | status | usage | limits | ledger).",
-                "Hooks are ENRICHMENT: every read verb answers with none",
-                "installed and says so, because `--bare` removes them all.",
+                "The Claude Code harness's read views: a session's spend,",
+                "its limit, the disk, and the supervisor's approval ledger",
+                "(usage | limits | disk | ledger), and `upgrade`, which moves",
+                "a live Claude Code onto a newer build. It installs nothing",
+                "into the agent (decision \"B\"); `aterm drive` supervises.",
             ],
             Verb::NewTab => &[
                 "Open a terminal tab. Where it opens is the",
@@ -464,15 +467,7 @@ const HELP_TAIL: &str = concat!(
     "                              consulted when no --containment flag is given.\n",
     "                              A malformed value fails CLOSED to containment.\n",
     "    ATERM_VERBOSE             If set, print a one-line session summary (bytes\n",
-    "                              passed through, and whether the session model was\n",
-    "                              armed) to stderr on exit.\n",
-    "    ATERM_SESSION_MODEL       Arm the in-process VT model of the session: every\n",
-    "                              output byte is ALSO fed to the aterm engine, which\n",
-    "                              costs an O(bytes) VT parse plus O(scrollback) memory.\n",
-    "                              OFF by default, and 0/off/empty do not arm it. The\n",
-    "                              model is in-process only — a SESSION serves no control\n",
-    "                              socket, so nothing outside can read it; arm it only\n",
-    "                              for an in-process consumer of the engine.\n",
+    "                              passed through) to stderr on exit.\n",
     "\n",
     "EXAMPLES:\n",
     "    aterm                              Start an interactive shell (mode: user).\n",
@@ -693,10 +688,6 @@ fn explain_config_report() -> String {
         "  ATERM_CONTAINMENT_MODE  containment mode when no --containment flag is given.\n",
     );
     out.push_str("  ATERM_VERBOSE           print a one-line session summary to stderr on exit.\n");
-    out.push_str(
-        "  ATERM_SESSION_MODEL     arm the in-process VT model of the session; default OFF,\n",
-    );
-    out.push_str("                          and 0/off/empty do not arm it.\n");
     out.push_str(PRIVACY_CONFIG_PARAGRAPH);
     out.push_str(MACHINE_CONFIG_PARAGRAPH);
     out
@@ -704,10 +695,11 @@ fn explain_config_report() -> String {
 
 /// The `[machine]` paragraph of `explain-config`. Hand-written like the rest.
 ///
-/// Three things it must say, because each is otherwise guessed wrong: the
-/// settings are applied FIRST by every package pass and on the spot by
-/// `aterm pkg machine apply` (they used to run last, and only after a clean pass —
-/// so on a machine with one aborted program they never ran); `defaults` writes the
+/// Three things it must say, because each is otherwise guessed wrong: WHEN the
+/// settings are applied — by `aterm pkg machine apply`, which the window runs as it opens
+/// and a terminal session once a day, and by a package pass only when the table changed
+/// (Phase 3, 2026-09-22: they used to walk $HOME at the top of every pass);
+/// `defaults` writes the
 /// ACCOUNT's per-host domain and ignores `$HOME`, so a redirected home is refused
 /// rather than written through; and every change is undoable by one printed line.
 const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
@@ -722,18 +714,20 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         line in .cargo/config.toml elsewhere. Documents, Desktop,\n\
      \x20                         Downloads, Pictures, Movies, Music and Library are never\n\
      \x20                         walked: macOS asks a human before a program reads those.\n\
-     \x20 Both are applied FIRST by every package pass (update, seed, install) and on the\n\
-     \x20 spot by `aterm pkg machine apply`; `aterm pkg machine` reads the measured state,\n\
-     \x20 and Settings ▸ Security shows it with the two switches and an Apply now button.\n\
-     \x20 A saved change lands on the next package pass, or on Apply now. `defaults` writes\n\
-     \x20 the ACCOUNT's per-host domain regardless of $HOME, so a pass under a redirected\n\
-     \x20 HOME is refused and says so, as is a pass whose aterm.toml does not parse (the\n\
+     \x20 Both are applied by `aterm pkg machine apply`, which the window runs as it opens\n\
+     \x20 and a terminal session once a day (the day's first interactive one), and by a\n\
+     \x20 package pass (update, seed, install) when the [machine] table changed since\n\
+     \x20 they were last applied; `aterm pkg machine` reads the measured state, and\n\
+     \x20 Settings ▸ Security shows it with the two switches and an Apply now button. A\n\
+     \x20 saved change lands on the next package pass, or on Apply now. `defaults` writes\n\
+     \x20 the ACCOUNT's per-host domain regardless of $HOME, so an apply under a redirected\n\
+     \x20 HOME is refused and says so, as is one whose aterm.toml does not parse (the\n\
      \x20 switches cannot be read, and both defaults act). Undo Universal Control with the\n\
-     \x20 revert line the doctor prints (`defaults -currentHost delete\n\
+     \x20 revert line `aterm pkg machine` prints (`defaults -currentHost delete\n\
      \x20 com.apple.universalcontrol Disable`, then the same for DisableMagicEdges) AND set\n\
-     \x20 universal_control = \"leave\", or the next pass disables it again. Undo a rename in\n\
+     \x20 universal_control = \"leave\", or the next apply disables it again. Undo a rename in\n\
      \x20 a git checkout by removing the `target` symlink and renaming target.noindex back;\n\
-     \x20 elsewhere the pass left no symlink and pointed cargo with a `[build] target-dir`\n\
+     \x20 elsewhere the apply left no symlink and pointed cargo with a `[build] target-dir`\n\
      \x20 line in .cargo/config.toml, so delete that line as well.\n";
 
 /// The `[privacy]` paragraph of `explain-config` (design §4). Hand-written, like
@@ -1586,17 +1580,20 @@ fn front_door_bin_dir() -> Option<String> {
     dir.to_str().map(str::to_owned)
 }
 
-/// `atpkg::reroute::REROUTE_DIR_ENV` and `NO_REROUTE_ENV`, restated: this crate links
+/// `atpkg::reroute::REROUTE_DIR_ENV` and `PASSTHROUGH_ENV`, restated: this crate links
 /// `atpkg` for its tests only (Cargo.toml: "the router composes these crates, aterm-cli
 /// does not call atpkg"), and `reroute_env_names_match_atpkg` pins both spellings.
+/// `PASSTHROUGH_ENV` is INTERNAL protocol — the marker the front door establishes for an
+/// `aterm --no-reroute` session and clears on every other launch — never a setting.
 const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
-const NO_REROUTE_ENV: &str = "ATERM_NO_REROUTE";
+const PASSTHROUGH_ENV: &str = "__ATERM_REROUTE_PASSTHROUGH";
 
 /// The session's reroute directory, read at this edge from `$ATERM_REROUTE_DIR` — which the
 /// front door (`crates/aterm/src/main.rs`) resolves from the configured store, lays the
 /// stubs into, and establishes in THIS process's environment before `session_main` runs.
-/// `None` when `$ATERM_NO_REROUTE` is engaged (non-empty and not `0` — `env_flag_engaged`,
-/// THE reading, the same the stubs and the window apply), when the variable is unset or
+/// `None` when the `--no-reroute` marker (`$__ATERM_REROUTE_PASSTHROUGH`) is engaged
+/// (non-empty and not `0` — `env_flag_engaged`, THE reading, the same the stubs and the
+/// window apply), when the variable is unset or
 /// empty, when it does not name an existing directory (Windows lays no stubs; a stale
 /// value must never put a nonexistent entry first on every child's PATH), or when the
 /// value is RELATIVE (2026-09-16 audit: the front door always hands an absolute path, so a
@@ -1605,13 +1602,14 @@ const NO_REROUTE_ENV: &str = "ATERM_NO_REROUTE";
 /// created under the session's cwd).
 fn reroute_dir_from_env() -> Option<String> {
     reroute_dir_from_values(
-        std::env::var(NO_REROUTE_ENV).ok().as_deref(),
+        std::env::var(PASSTHROUGH_ENV).ok().as_deref(),
         std::env::var(REROUTE_DIR_ENV).ok().as_deref(),
     )
 }
 
 /// [`reroute_dir_from_env`] over explicit values, so the rule is testable without a
-/// process environment: `no_reroute` is `$ATERM_NO_REROUTE`, `dir` is `$ATERM_REROUTE_DIR`.
+/// process environment: `no_reroute` is `$__ATERM_REROUTE_PASSTHROUGH`, `dir` is
+/// `$ATERM_REROUTE_DIR`.
 fn reroute_dir_from_values(no_reroute: Option<&str>, dir: Option<&str>) -> Option<String> {
     if aterm_types::control_socket::env_flag_engaged(no_reroute) {
         return None;
@@ -1908,7 +1906,10 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
     }
 }
 
-/// The environment knob that ARMS the in-process VT model of a session.
+/// The DEVELOPMENT SEAM that ARMS the in-process VT model of a session
+/// (`aterm_types::dev_seam!`: a shipped binary does not read it, and `aterm --help` does
+/// not teach it — 2026-09-23, the owner's rule that environment variables are for
+/// development).
 ///
 /// DEMAND-DRIVEN, DEFAULT OFF. A session is a passthrough: `write_all(stdout)`
 /// runs BEFORE the engine ever sees a byte, and this crate depends on no
@@ -1944,8 +1945,16 @@ fn session_model_armed(value: Option<&str>) -> bool {
 /// lossily rather than dropped, so `ATERM_SESSION_MODEL=<garbage>` arms (it is not
 /// one of the three disabling spellings) instead of silently reading as unset.
 fn session_model_armed_from_env() -> bool {
-    let raw = std::env::var_os(SESSION_MODEL_ENV);
+    let raw = session_model_seam();
     session_model_armed(raw.as_ref().map(|v| v.to_string_lossy()).as_deref())
+}
+
+/// The raw [`SESSION_MODEL_ENV`] seam — `None` in every shipped binary, whatever the
+/// environment holds. The front door reads its PRESENCE too: a launch carrying it is a
+/// harness's child, never a person's terminal, so it provisions nothing.
+#[must_use]
+pub fn session_model_seam() -> Option<std::ffi::OsString> {
+    aterm_types::dev_seam!(SESSION_MODEL_ENV)
 }
 
 /// The [`aterm_sandbox::Limits`] the SESSION hands the protected spawn seam,
@@ -2106,8 +2115,8 @@ pub fn session_main(quiet: bool) -> ! {
     // when aterm was launched by an absolute path from a dir not on $PATH (inert for a
     // lone binary or when already on PATH), then the inherited PATH verbatim. The
     // reroute dir arrives as `$ATERM_REROUTE_DIR` from the front door, which owns the
-    // store (`reroute_dir_from_env`); `ATERM_NO_REROUTE` engaged ⇒ no prepend and no
-    // export, the same rule the stubs and the window apply.
+    // store (`reroute_dir_from_env`); `--no-reroute` (its marker engaged) ⇒ no prepend
+    // and no export, the same rule the stubs and the window apply.
     //
     // WHAT THIS PAIR IS IN THIS LANE (audit 2026-09-16): the PRE-RC environment of a
     // LOGIN shell (`aterm-pty` spawns `-zsh`) that carries NO aterm shell integration —
@@ -2226,7 +2235,7 @@ pub fn session_main(quiet: bool) -> ! {
 mod tests {
     use super::{
         AGENTS_DIR_ENV, CliAction, DIAG_COMMANDS, DrClass, FdaState, HOOK_AGENTS_ENV, Mark,
-        NO_REROUTE_ENV, PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV,
+        PASSTHROUGH_ENV, PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV,
         VERB_BLURB_COLUMN, Verb, agents_dir_mode, decide_args, diag_report, doctor_checks,
         doctor_report, explain_config_report, help_text, is_tool_candidate, list_fonts_report,
         list_themes_report, managed_agents_dir, prepend_path, reroute_dir_from_values,
@@ -2890,13 +2899,14 @@ mod tests {
     /// and pinned so the copies cannot drift apart. `ATERM_AGENTS_DIR` is
     /// `atpkg::reroute::AGENTS_DIR_ENV`, the front door's handoff (2026-09-18).
     /// `ATPKG_AGENTS` has no constant on atpkg's side; it is the name the shell hook
-    /// exports, so the pin is the hook body — and that hook must NOT mention the
-    /// handoff variable: it is a launcher→session handle, never the hook's or the shell
-    /// integration's to read.
+    /// exports, so the pin is the hook body — which READS the handoff as one of the
+    /// three markers of its agents gate (03513b5d7: the managed copy leads inside aterm
+    /// only, and no single marker covers every lane) and never sets it: it is a
+    /// launcher→session handle. `TERM_PROGRAM` is user-settable and is not a marker.
     #[test]
     fn reroute_env_names_match_atpkg() {
         assert_eq!(REROUTE_DIR_ENV, atpkg::reroute::REROUTE_DIR_ENV);
-        assert_eq!(NO_REROUTE_ENV, atpkg::reroute::NO_REROUTE_ENV);
+        assert_eq!(PASSTHROUGH_ENV, atpkg::reroute::PASSTHROUGH_ENV);
         assert_eq!(AGENTS_DIR_ENV, atpkg::reroute::AGENTS_DIR_ENV);
         assert_ne!(AGENTS_DIR_ENV, HOOK_AGENTS_ENV);
         let hooks = atpkg::hooks::hook_files(
@@ -2913,9 +2923,29 @@ mod tests {
             "the hook exports {HOOK_AGENTS_ENV}: {zsh}"
         );
         for (name, body) in &hooks {
+            for marker in [AGENTS_DIR_ENV, "ATERM_CHILD", "ATERM_SESSION_ID"] {
+                assert!(
+                    body.contains(marker),
+                    "{name} gates agents/ on {marker}: {body}"
+                );
+            }
             assert!(
-                !body.contains(AGENTS_DIR_ENV),
-                "{name} must not read the front door's handoff: {body}"
+                !body.contains("ATPKG_AGENTS_EVERYWHERE"),
+                "{name}: no environment escape widens the gate past aterm: {body}"
+            );
+            for write in [
+                format!("export {AGENTS_DIR_ENV}="),
+                format!("set -gx {AGENTS_DIR_ENV}"),
+                format!("$env:{AGENTS_DIR_ENV} ="),
+            ] {
+                assert!(
+                    !body.contains(&write),
+                    "{name} must never set the front door's handoff: {body}"
+                );
+            }
+            assert!(
+                !body.contains("TERM_PROGRAM"),
+                "{name}: TERM_PROGRAM is user-settable, not a marker: {body}"
             );
         }
         // And neither must the SHELL INTEGRATION itself — every dialect this workspace
@@ -3066,7 +3096,7 @@ mod tests {
     /// `$ATERM_REROUTE_DIR` is taken only as a non-empty ABSOLUTE path naming an existing
     /// directory (2026-09-16 audit: a relative inherited stray put first on PATH would
     /// resolve against every later cwd, and its derived `agents/` sibling would be created
-    /// in the session's cwd), and never while `$ATERM_NO_REROUTE` is engaged — by
+    /// in the session's cwd), and never while the `--no-reroute` marker is engaged — by
     /// `env_flag_engaged`'s reading, so `0` and the empty string do not engage it.
     #[test]
     fn reroute_dir_from_values_takes_only_an_absolute_existing_dir() {
@@ -3272,12 +3302,15 @@ mod tests {
     ///    `/opt/homebrew/bin`) — the honest shape of this lane's front-insert; both
     ///    survive, exactly once. Elsewhere only survival is asserted.
     /// 2. a `.zshrc` sourcing atpkg's REAL `00-atpkg.zsh` hook body (the crate is a
-    ///    test-only dependency here), the block atpkg wires into `~/.zshrc`: `agents/`
-    ///    is FIRST at the prompt, exactly once, the reroute dir still present — this is
-    ///    what makes the managed `claude`/`codex` lead in a TTY session.
+    ///    test-only dependency here), the block atpkg wires into `~/.zshrc`, measured
+    ///    twice: with none of the agents gate's markers the hook DEMOTES `agents/` —
+    ///    it leaves the prompt's PATH — and with `ATERM_CHILD` set it is FIRST, exactly
+    ///    once; the reroute dir is present either way, because the bin half is
+    ///    unconditional (03513b5d7: the managed `claude`/`codex` lead inside aterm only,
+    ///    the Trust toolchain in every terminal).
     #[cfg(unix)]
     #[test]
-    fn a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_moves_agents_first() {
+    fn a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_leads_agents_only_inside_aterm() {
         let zsh = std::path::Path::new("/bin/zsh");
         if !zsh.exists() {
             eprintln!("/bin/zsh not installed; skipping the login-zsh PATH measurement");
@@ -3302,18 +3335,20 @@ mod tests {
         )
         .expect("injects");
         assert!(seam_path.starts_with(&format!("{reroute}:{agents}:")));
-        let prompt_path = |rc: &str| -> Vec<String> {
+        let prompt_path = |rc: &str, inside_aterm: bool| -> Vec<String> {
             std::fs::write(zdotdir.join(".zshrc"), rc).unwrap();
-            let out = std::process::Command::new(zsh)
-                .args(["-l", "-i", "-c", "print -r -- $PATH"])
+            let mut cmd = std::process::Command::new(zsh);
+            cmd.args(["-l", "-i", "-c", "print -r -- $PATH"])
                 .env_clear()
                 .env("HOME", &home)
                 .env("ZDOTDIR", &zdotdir)
                 .env("TERM", "dumb")
                 .env("PATH", &seam_path)
-                .stdin(std::process::Stdio::null())
-                .output()
-                .expect("spawn /bin/zsh");
+                .stdin(std::process::Stdio::null());
+            if inside_aterm {
+                cmd.env("ATERM_CHILD", "1");
+            }
+            let out = cmd.output().expect("spawn /bin/zsh");
             assert!(
                 out.status.success(),
                 "zsh: {}",
@@ -3326,7 +3361,7 @@ mod tests {
                 .collect()
         };
         // 1. The pre-rc front-insert alone.
-        let bare = prompt_path("");
+        let bare = prompt_path("", false);
         assert_eq!(bare.iter().filter(|e| **e == agents).count(), 1, "{bare:?}");
         assert_eq!(
             bare.iter().filter(|e| **e == reroute).count(),
@@ -3352,19 +3387,27 @@ mod tests {
         let shell_d = home.join(".aterm/shell.d");
         std::fs::create_dir_all(&shell_d).unwrap();
         std::fs::write(shell_d.join("00-atpkg.zsh"), hook).unwrap();
-        let hooked = prompt_path(
-            "[ -f \"$HOME/.aterm/shell.d/00-atpkg.zsh\" ] && . \"$HOME/.aterm/shell.d/00-atpkg.zsh\"\n",
+        let rc = "[ -f \"$HOME/.aterm/shell.d/00-atpkg.zsh\" ] && . \"$HOME/.aterm/shell.d/00-atpkg.zsh\"\n";
+        let outside = prompt_path(rc, false);
+        assert!(
+            !outside.contains(&agents),
+            "outside aterm the hook demotes agents/: {outside:?}"
+        );
+        assert!(
+            outside.contains(&reroute),
+            "the bin half is unconditional: {outside:?}"
+        );
+        let inside = prompt_path(rc, true);
+        assert_eq!(
+            inside[0], agents,
+            "inside aterm the hook moves agents/ first: {inside:?}"
         );
         assert_eq!(
-            hooked[0], agents,
-            "the hook moves agents/ first: {hooked:?}"
-        );
-        assert_eq!(
-            hooked.iter().filter(|e| **e == agents).count(),
+            inside.iter().filter(|e| **e == agents).count(),
             1,
-            "{hooked:?}"
+            "{inside:?}"
         );
-        assert!(hooked.contains(&reroute), "{hooked:?}");
+        assert!(inside.contains(&reroute), "{inside:?}");
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -3499,7 +3542,8 @@ mod tests {
     }
 
     /// The `[machine]` paragraph: the two keys with their defaults, WHEN they
-    /// apply (first on every package pass; now by `aterm pkg machine apply`), the
+    /// apply (their own verb as the window opens and a session once a day; a pass only when the
+    /// table changed — Phase 3), the
     /// redirected-HOME refusal, and the undo for each — and, like every CLI
     /// string, no ask for a fresh launch.
     #[test]
@@ -3511,7 +3555,9 @@ mod tests {
             "spotlight_noindex",
             "\"off\" (default) | \"leave\"",
             "true (default)",
-            "applied FIRST by every package pass",
+            "which the window runs as it opens",
+            "a terminal session once a day",
+            "when the [machine] table changed since",
             "aterm pkg machine apply",
             "aterm pkg machine",
             "Settings ▸ Security",
@@ -3526,7 +3572,7 @@ mod tests {
             "[build] target-dir",
             ".cargo/config.toml, so delete that line as well",
             // And the half that makes the Universal Control revert stick.
-            "or the next pass disables it again",
+            "or the next apply disables it again",
             // The refusal a reader otherwise files as a bug.
             "does not parse",
         ] {

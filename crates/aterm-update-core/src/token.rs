@@ -9,17 +9,23 @@
 //! but the goal is **no *additional* secret** beyond the GitHub auth the machine may
 //! already have. Resolved at runtime, first hit wins, in order:
 //!
-//! 1. `$ATERM_UPDATE_TOKEN` — explicit, dedicated override (CI / power users who want
-//!    to provision a narrowly-scoped Contents:read PAT that beats any ambient one);
-//! 2. the macOS **keychain** generic-password item `aterm-update-token`
+//! 1. the macOS **keychain** generic-password item `aterm-update-token`
 //!    (`security find-generic-password -s aterm-update-token -w`);
-//! 3. a `0600` file `…/aterm/update-token` under Application Support;
-//! 4. `$GITHUB_TOKEN`, then `$GH_TOKEN` — the conventional ambient CI/tool env vars;
-//! 5. `gh auth token` — the credential a developer already has after `gh auth login`.
+//! 2. a `0600` file `…/aterm/update-token` under Application Support;
+//! 3. `gh auth token` — the credential a developer already has after `gh auth login`.
 //!
-//! (4)/(5) mean a machine that is already authenticated to GitHub self-updates with
-//! **no new secret**; the dedicated sources (1–3) stay highest-priority so a scoped
-//! token still wins. A fine-grained PAT with read-only **Contents** permission on the
+//! (3) means a machine that is already authenticated to GitHub reads a repointed
+//! channel with **no new secret**; the dedicated sources (1–2) stay highest-priority so
+//! a scoped token still wins.
+//!
+//! NO ENVIRONMENT RUNG (2026-09-23, owner direction R2: "NOT ENV VARS those are for
+//! development"). `$ATERM_UPDATE_TOKEN`, `$GITHUB_TOKEN` and `$GH_TOKEN` were rungs 1
+//! and 4; a credential in the environment reached only the processes a shell launched
+//! (never the window's launchd-spawned passes), so it was a second, partial spelling of
+//! the keychain and file rungs, which every process reads identically. And the chain
+//! runs only for a REPOINTED source — a development seam now (`[update]` owner/repo,
+//! `[packages]` account and repo links compile only in a dev build) — so a shipped
+//! binary reads its public channel with no credential and consults no rung at all. A fine-grained PAT with read-only **Contents** permission on the
 //! repo is sufficient (and is what `gh`'s token or a scoped PAT carries). Every
 //! resolved token is charset-validated ([`valid_token`]) before use — a value
 //! carrying a quote/backslash/whitespace is refused, so it can never break out of the
@@ -29,7 +35,7 @@
 //!
 //! # Provisioning, and what happens without it
 //!
-//! A machine with NONE of (1)–(5) can never read the private repo, so it never
+//! A machine with NONE of (1)–(3) can never read the private repo, so it never
 //! updates — and for a long time that state was near-invisible (one log line per
 //! process). Two things close that:
 //!
@@ -43,7 +49,7 @@
 //!   can never leak, the token value: [`SourceProbe`] holds a `&'static str`
 //!   label and an outcome, never bytes from a credential.
 //!
-//! There is deliberately NO auto-adoption of an ambient token (4)/(5) into the
+//! There is deliberately NO auto-adoption of an ambient token (3) into the
 //! durable file. Copying a broad `gh` credential to a new place on disk, silently,
 //! would outlive `gh auth logout` and rotate out of the user's control. Adoption is
 //! an explicit act (the installer, or [`PROVISION_COMMAND`]).
@@ -239,13 +245,6 @@ impl Probe {
             Self::Supplied(_) => ProbeOutcome::Supplied,
         }
     }
-
-    fn supplied(self) -> Option<String> {
-        match self {
-            Self::Supplied(token) => Some(token),
-            _ => None,
-        }
-    }
 }
 
 /// Whether the update source has been pointed away from the compiled-in channel.
@@ -262,23 +261,17 @@ fn needs_ambient_credential(owner: &str, repo: &str) -> bool {
 /// user is told to run when the channel cannot be read, or when their token was
 /// rejected.
 ///
-/// On the compiled-in public channel [`walk`] consults ONE rung, `$ATERM_UPDATE_TOKEN`,
-/// and deliberately never goes looking for an ambient credential (it would surface a
-/// broad developer PAT to read a public repo). So [`PROVISION_COMMAND`] — which writes
-/// the 0600 file — is a no-op there: the file is never read, and a user who followed
-/// that instruction would watch nothing change and have no way to tell why
-/// (2026-08-19). Name the rung this source will really consult.
+/// On the compiled-in public channel [`walk`] consults NO rung and never goes looking
+/// for an ambient credential (it would surface a broad developer PAT to read a public
+/// repo). So [`PROVISION_COMMAND`] — which writes the 0600 file — is a no-op there: the
+/// file is never read, and a user who followed that instruction would watch nothing
+/// change and have no way to tell why (2026-08-19). Say what is true for this source.
 #[must_use]
 pub fn provision_remedy(owner: &str, repo: &str) -> &'static str {
     if needs_ambient_credential(owner, repo) {
         PROVISION_COMMAND
     } else {
-        // Reachable only from a caller that consults the chain for the public
-        // channel — atpkg's index listing. The app updater never does: its web lane
-        // reads that channel with no credential and ignores every rung.
-        "export ATERM_UPDATE_TOKEN=$(gh auth token)   # the default channel is public: \
-         only this rung is ever read for it (by atpkg's index listing; the app updater \
-         reads it with no credential at all), never an ambient credential"
+        "nothing to provision — the public channel is read with no credential"
     }
 }
 
@@ -300,11 +293,9 @@ pub struct Rung {
 
 /// Every rung of the chain, in the order [`walk`] consults them. The labels here ARE
 /// the labels the walk reports — it iterates this table — so the two cannot drift.
-pub const RUNGS: [Rung; 6] = [
-    Rung {
-        label: "$ATERM_UPDATE_TOKEN",
-        id: "env",
-    },
+/// No rung reads the environment (module docs: the `env`, `github-env` and `gh-env`
+/// rungs are gone).
+pub const RUNGS: [Rung; 3] = [
     Rung {
         label: "keychain item aterm-update-token",
         id: "keychain",
@@ -314,22 +305,15 @@ pub const RUNGS: [Rung; 6] = [
         id: "file",
     },
     Rung {
-        label: "$GITHUB_TOKEN",
-        id: "github-env",
-    },
-    Rung {
-        label: "$GH_TOKEN",
-        id: "gh-env",
-    },
-    Rung {
         label: "gh auth token",
         id: "gh-cli",
     },
 ];
 
-/// The ledger identifier for a rung LABEL: `env`, `keychain`, `file`, `github-env`,
-/// `gh-env` or `gh-cli`. Total: a label the table does not name — none exists today —
-/// is `other`, still whitespace-free, so no caller can write a broken status line.
+/// The ledger identifier for a rung LABEL: `keychain`, `file` or `gh-cli`. Total: a
+/// label the table does not name — a ledger an older build wrote may carry a retired
+/// env rung's — is `other`, still whitespace-free, so no caller can write a broken
+/// status line.
 #[must_use]
 pub fn rung_id(label: &str) -> &'static str {
     RUNGS
@@ -361,9 +345,9 @@ pub fn resolve_with_source(
 /// both run. Each consulted source appends a [`SourceProbe`] to `probes` before the
 /// walk decides whether to stop, so the recorded chain is exactly the executed one.
 ///
-/// Order: dedicated sources first — a power user's scoped Contents:read PAT wins over
-/// any broader ambient credential — then the ambient GitHub credential the machine may
-/// already have, so an already-authenticated developer needs no additional secret.
+/// Order: dedicated sources first — a scoped Contents:read PAT in the keychain or the
+/// file wins over any broader ambient credential — then the `gh` credential the machine
+/// may already have, so an already-authenticated developer needs no additional secret.
 fn walk(
     support_dir: &Path,
     owner: &str,
@@ -377,11 +361,10 @@ fn walk(
     // chain runs ONLY when the source has been pointed somewhere else, which is
     // the only way to reach a repo that can actually require authentication.
     //
-    // The app updater does not consult this chain for the compiled-in channel AT
-    // ALL — its web lane reads that channel with no credential and ignores every
-    // rung. atpkg's index listing is the one caller that still can, and for it a
-    // token on the default channel is opt-in via the explicit `$ATERM_UPDATE_TOKEN`
-    // rung only, never something ambient we go looking for.
+    // Neither caller consults a rung for the compiled-in channel: the app updater's
+    // web lane and atpkg's index listing both read it with no credential. (The one
+    // opt-in rung the public channel used to have, `$ATERM_UPDATE_TOKEN`, went with
+    // every other environment rung, 2026-09-23.)
     //
     // "Pointed somewhere else" is judged on the `owner`/`repo` the CALLER resolved,
     // not on this crate's view of the environment: the app updater passes the
@@ -391,25 +374,18 @@ fn walk(
     // — every rung, including the ambient `gh auth token` — exactly as an env
     // repoint does. (This comment used to claim the opposite, that a config-file
     // repoint would never reach the ambient rungs; it never worked that way, and
-    // atpkg's `engages_credential_chain` documents the true rule. 2026-09-14.)
+    // atpkg's `engages_credential_chain` documents the true rule. 2026-09-14.) The
+    // config repoint is itself a development seam now, so in a shipped binary every
+    // source is the compiled one and this is the only branch that runs.
     if !needs_ambient_credential(owner, repo) {
-        // Record the one consulted rung either way, so `diagnose` still describes
-        // the chain that actually ran rather than an empty one.
-        let probe = probe_env("ATERM_UPDATE_TOKEN");
-        probes.push(SourceProbe {
-            source: "$ATERM_UPDATE_TOKEN",
-            outcome: probe.outcome(),
-        });
-        return probe.supplied().map(|token| (token, "$ATERM_UPDATE_TOKEN"));
+        // No rung is consulted, so `diagnose` describes an empty chain — the truth.
+        return None;
     }
     // One probe per [`RUNGS`] entry, in table order: the label the walk reports is the
     // table's, so the ledger id (`rung_id`) can never name a rung the walk did not.
-    let probes_in_order: [&dyn Fn() -> Probe; 6] = [
-        &|| probe_env("ATERM_UPDATE_TOKEN"),
+    let probes_in_order: [&dyn Fn() -> Probe; 3] = [
         &probe_keychain,
         &|| probe_file(&token_file(support_dir)),
-        &|| probe_env("GITHUB_TOKEN"),
-        &|| probe_env("GH_TOKEN"),
         &probe_gh_cli,
     ];
     for (rung, run) in RUNGS.iter().zip(probes_in_order) {
@@ -426,20 +402,6 @@ fn walk(
     None
 }
 
-/// Read a token from environment variable `key`: trim, then accept only if it passes
-/// [`valid_token`] (a set-but-malformed value is skipped with a warning so a stray
-/// export can't produce a mangled `Authorization` header, rather than silently used).
-// Skip: to_string_lossy on an env var for DISPLAY-side token validation —
-// hardened byte_loss class; a lossy mangling fails `valid_token` (fail-
-// closed), never corrupts stored bytes. Audited (update-atpkg).
-#[cfg_attr(trust_verify, trust::skip)]
-fn probe_env(key: &str) -> Probe {
-    let Some(raw) = std::env::var_os(key) else {
-        return Probe::Absent;
-    };
-    probe_raw(&raw.to_string_lossy(), &format!("${key}"))
-}
-
 /// Last-resort fallback: the `gh` CLI's stored token (`gh auth token`), found on
 /// `PATH`. Returns `None` if `gh` is absent, unauthenticated, or prints a malformed
 /// token.
@@ -449,8 +411,11 @@ fn probe_env(key: &str) -> Probe {
 /// hard-coding one package manager's macOS prefixes is the wrong shape for a
 /// cross-platform product, and this whole chain is now reached only when the update
 /// source has been pointed away from the public channel ([`walk`]) — a deliberate act
-/// by someone who can also export a token or run from a shell with a real `PATH`.
-// Skip: same audited display/validation byte_loss class as `probe_env`.
+/// by someone who can also provision the keychain or file rung, or run from a shell with
+/// a real `PATH`.
+// Skip: to_string_lossy on the tool's stdout for DISPLAY-side token validation —
+// hardened byte_loss class; a lossy mangling fails `valid_token` (fail-closed), never
+// corrupts stored bytes. Audited (update-atpkg).
 #[cfg_attr(trust_verify, trust::skip)]
 fn probe_gh_cli() -> Probe {
     // Distinguish "gh isn't installed" from "gh is installed but not logged in" —
@@ -478,7 +443,7 @@ fn probe_gh_cli() -> Probe {
 /// an embedded newline/quote/backslash cannot inject into the `curl --config`
 /// header line (this source once skipped that guard, which is why the chokepoint
 /// exists at all).
-// Skip: same audited display/validation byte_loss class as `probe_env`.
+// Skip: same audited display/validation byte_loss class as `probe_gh_cli`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn probe_keychain() -> Probe {
     let Ok(out) = Command::new("/usr/bin/security")
@@ -684,8 +649,8 @@ mod tests {
     use super::*;
 
     /// Every rung the chain can report maps to a distinct, whitespace-free ledger id
-    /// — `lane = "token:<id>"` is one token of a space-separated status line — and the
-    /// default-channel rung the walk names by literal is the table's first entry.
+    /// — `lane = "token:<id>"` is one token of a space-separated status line — and no
+    /// rung reads the environment.
     #[test]
     fn every_rung_has_a_distinct_whitespace_free_ledger_id() {
         let mut ids = std::collections::BTreeSet::new();
@@ -699,13 +664,15 @@ mod tests {
             assert!(ids.insert(rung.id), "duplicate id {:?}", rung.id);
             assert_eq!(rung_id(rung.label), rung.id);
         }
-        assert_eq!(RUNGS[0].label, "$ATERM_UPDATE_TOKEN");
-        assert_eq!(rung_id("$ATERM_UPDATE_TOKEN"), "env");
         assert_eq!(rung_id("keychain item aterm-update-token"), "keychain");
         assert_eq!(rung_id("0600 update-token file"), "file");
-        assert_eq!(rung_id("$GITHUB_TOKEN"), "github-env");
-        assert_eq!(rung_id("$GH_TOKEN"), "gh-env");
         assert_eq!(rung_id("gh auth token"), "gh-cli");
+        assert!(
+            RUNGS.iter().all(|rung| !rung.label.starts_with('$')),
+            "no environment rung (R2, 2026-09-23)"
+        );
+        // A retired env rung an older build recorded reads as `other`, never a gap.
+        assert_eq!(rung_id("$ATERM_UPDATE_TOKEN"), "other");
         // Total, and still safe for a label nobody emits.
         assert_eq!(rung_id("something with spaces"), "other");
     }
@@ -883,9 +850,9 @@ mod tests {
         let path = provision(&dir, token).expect("provision on a fresh machine");
         assert_eq!(path, token_file(&dir));
         assert_eq!(from_file(&path).as_deref(), Some(token));
-        // …and the chain now resolves from the durable file source. `$ATERM_UPDATE_TOKEN`
-        // and the keychain outrank it, so assert the FILE probe rather than the whole
-        // walk (the developer running this test may well have both).
+        // …and the chain now resolves from the durable file source. The keychain
+        // outranks it, so assert the FILE probe rather than the whole walk (the
+        // developer running this test may well have one).
         assert!(matches!(probe_file(&path), Probe::Supplied(_)));
         #[cfg(unix)]
         {
@@ -1063,11 +1030,10 @@ mod tests {
                 );
             }
             None => {
-                // On the DEFAULT (public) channel the walk consults exactly one
-                // rung — the explicit env token — and never goes looking for an
-                // ambient credential the public channel cannot need. Only an
-                // env-overridden source opens the full six-rung chain.
-                let expected = 1;
+                // On the DEFAULT (public) channel the walk consults NO rung and never
+                // goes looking for an ambient credential the public channel cannot
+                // need. Only a repointed source opens the three-rung chain.
+                let expected = 0;
                 assert_eq!(
                     d.probes.len(),
                     expected,
@@ -1108,7 +1074,7 @@ mod tests {
             resolved: None,
             probes: vec![
                 SourceProbe {
-                    source: "$ATERM_UPDATE_TOKEN",
+                    source: "keychain item aterm-update-token",
                     outcome: ProbeOutcome::Absent,
                 },
                 SourceProbe {

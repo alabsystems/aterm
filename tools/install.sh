@@ -20,13 +20,13 @@
 # private checkout, whose Cargo.toml derives that slug. No credential is
 # copied anywhere by default — the `token` half below is opt-in, because the
 # compiled-in public update channel reads none. The copy matters only for a
-# machine later REPOINTED at a private update source ($ATERM_UPDATE_OWNER/
-# _REPO), which then keeps updating without `gh` on PATH — which a
-# Finder-launched .app does not have.
+# DEVELOPMENT build repointed at a private update source (`[update] owner`/`repo`
+# in aterm.toml — a shipped build reads its compiled channel), which then keeps
+# updating without `gh` on PATH — which a Finder-launched .app does not have.
 #
 # The three halves, and when each can run:
 #   app — the released aterm.app from the GitHub Release (the bundle is macOS-
-#         only; linux-x86_64 takes this half as the released ONE binary — see
+#         only; supported Linux targets take this half as the released ONE binary — see
 #         the LINUX paragraph below; anonymous curl against a public repo,
 #         authenticated gh otherwise).
 #         Verified with a deliberately weaker bootstrap tier than the installed
@@ -60,14 +60,14 @@
 #         gh-authenticated API session, or TLS to api.github.com on the
 #         anonymous lane — and the manifest digest. Full Ed25519 verification
 #         lives in the installed updater.
-#         LINUX (x86_64 only): no bundle exists, so this half instead installs
-#         the elected release's aterm-<version>-linux-x86_64.tar.gz — the ONE
-#         binary — into the cli store below, exposed as the one `aterm`
-#         symlink. Same authoritative-tag selection as macOS; integrity anchor
-#         is the companion .sha256 digest asset over the same transport (the
-#         signed appcast carries no linux keys yet — planned for the next
-#         cut). A release published before the first Linux cut has no such
-#         asset: loud skip, and the cli half's source build is the remedy.
+#         LINUX (aarch64 and x86_64): installs the elected release's raw ELF
+#         aterm-<version>-linux-<arch> into the cli store below. Python 3.11+
+#         and OpenSSL verify the pinned paper-master roster, live machine
+#         signature, signed target name/size/hash, existing rollback floors,
+#         and ELF architecture before any execution. A checksum-only legacy
+#         tarball is never an automatic fallback. The installed runtime then
+#         independently verifies the proof and enrolls this managed binary for
+#         signed updates. A source fallback is NOT automatically enrolled.
 #   cli — the `aterm` command (transparent PTY passthrough + the front door
 #         for every verb). ONE name lands on PATH — the [workspace.metadata.
 #         atpkg] expose declaration; the verb siblings (aterm-ctl, atpkg,
@@ -92,23 +92,21 @@
 #         installed app. A PATH hint prints if ~/.local/bin isn't on PATH.
 #   token — OPT-IN: a per-machine GitHub token for the IN-APP UPDATER, written
 #         to "~/Library/Application Support/aterm/update-token" (0600, in a
-#         0700 dir). Sourced from $ATERM_UPDATE_TOKEN if set, else `gh auth
-#         token`. NOT needed for the default channel: the compiled-in update
-#         source is the PUBLIC repo, which the updater reads anonymously, and
-#         for it the token chain consults only an explicit $ATERM_UPDATE_TOKEN
+#         0700 dir). Sourced from `gh auth token`. NOT needed for the default
+#         channel: the compiled-in update source is the PUBLIC repo, which the
+#         updater reads anonymously, and for it the token chain consults NO rung
 #         — never the keychain and never this file
 #         (crates/aterm-update-core/src/token.rs, `needs_ambient_credential`).
-#         The file matters ONLY when a machine repoints the updater with
-#         $ATERM_UPDATE_OWNER/_REPO — so by DEFAULT this half is SKIPPED: a
-#         broad `gh auth token` credential must not land in a plaintext file
-#         nothing reads. It runs only when something will read the file or the
-#         operator asks: --token, a repointing $ATERM_UPDATE_OWNER/_REPO, or an
-#         explicit $ATERM_UPDATE_TOKEN. A one-line intent notice prints before
-#         the write; --no-token is a hard off over all of those.
-#         On the public channel a token only buys the faster check cadence
-#         (~75s vs ~30min), and ONLY via an exported $ATERM_UPDATE_TOKEN — this
-#         file cannot supply it there.
-#         macOS only (the updater is macOS-only); idempotent; the token is
+#         The file matters ONLY to a development build repointed with `[update]
+#         owner`/`repo` — so by DEFAULT this half is SKIPPED: a broad `gh auth
+#         token` credential must not land in a plaintext file nothing reads. It
+#         runs only when the operator asks: --token. A one-line intent notice
+#         prints before the write; --no-token is a hard off. No environment
+#         variable is read for it (the app's `$ATERM_UPDATE_TOKEN`, `$GITHUB_TOKEN`
+#         and `$GH_TOKEN` rungs are gone since 2026-09-23).
+#         This credential-store provisioning helper is macOS-only; the Linux
+#         public updater uses the committed signature chain and needs no
+#         provisioned secret. Idempotent; the token is
 #         never printed. Re-running refreshes a rotated token, and no failure
 #         here is fatal: the app is installed and, on the public channel,
 #         updating regardless.
@@ -182,7 +180,7 @@ usage() {
 		# Print the header comment: from line 5 to the first non-comment line, drop it.
 		sed -n '5,/^[^#]/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
 	else
-		echo "usage: install.sh [--no-cli] [--no-app] [--token] [--no-token] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_UPDATE_TOKEN, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
+		echo "usage: install.sh [--no-cli] [--no-app] [--token] [--no-token] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
 	fi
 }
 
@@ -441,7 +439,7 @@ validate_manifest_identity() {
 # gh lane's embedded jq emits for select_authoritative_tag.
 anon_release_rows() {
 	awk '
-		/^  \{$/ { open = 1; bad = 0; tag = ""; draft = ""; count = 0; next }
+		/^  \{$/ { open = 1; bad = 0; tag = ""; draft = ""; prerelease = "false"; count = 0; next }
 		open != 1 { next }
 		/^    "tag_name":/ {
 			if ($0 ~ /^    "tag_name": "[^"]*",?$/) {
@@ -457,13 +455,109 @@ anon_release_rows() {
 				sub(/,$/, "", draft)
 			} else bad = 1
 		}
+		/^    "prerelease":/ {
+			if ($0 ~ /^    "prerelease": (true|false),?$/) {
+				prerelease = $0
+				sub(/^    "prerelease": /, "", prerelease)
+				sub(/,$/, "", prerelease)
+			} else bad = 1
+		}
 		/^        "name": "aterm-appcast\.toml",?$/ { count += 1 }
 		/^  \},?$/ {
 			if (bad || tag == "" || draft == "") print "MALFORMED\tMALFORMED\tMALFORMED\tMALFORMED"
-			else print tag "\t" draft "\t" count
+			else print tag "\t" ((draft == "true" || prerelease == "true") ? "true" : "false") "\t" count
 			open = 0
 		}
 	'
+}
+
+# Linux additionally needs per-architecture hints and archived metadata for
+# older native targets. JSON is parsed, bounded and validated before row use;
+# the catalog identifies locations only, never authenticates a release.
+linux_catalog_page() {
+	python3 -c '
+import json, re, sys
+raw = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
+if len(raw) > 8 * 1024 * 1024: raise SystemExit("Linux catalog page exceeds8MiB")
+rows = json.loads(raw)
+if not isinstance(rows, list) or len(rows) > 100: raise SystemExit("invalid Linux catalog page")
+print("COUNT\t" + str(len(rows)))
+for row in rows:
+    tag, assets = row.get("tag_name"), row.get("assets", [])
+    draft, prerelease = row.get("draft", False), row.get("prerelease", False)
+    if not isinstance(tag, str) or not isinstance(assets, list) or type(draft) is not bool or type(prerelease) is not bool:
+        raise SystemExit("invalid Linux release metadata")
+    names = [asset["name"] for asset in assets]
+    if not all(isinstance(name, str) for name in names): raise SystemExit("invalid Linux asset name")
+    if draft or prerelease: continue
+    exact = names.count("aterm-appcast.toml")
+    archive = names.count("aterm-appcast-" + tag + ".toml")
+    if not names.count("aterm-appcast-" + tag + ".toml.sig"): archive = 0
+    raw_count = names.count("aterm-" + tag.removeprefix("v") + "-linux-" + sys.argv[1])
+    if not exact and not (archive and raw_count): continue
+    if re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag): continue
+    if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag) or any(int(p) > 2**64-1 for p in tag[1:].split(".")):
+        raise SystemExit("noncanonical APP release tag: " + tag)
+    print(tag, exact, archive, raw_count, sep="\t")
+' "$1"
+}
+
+linux_catalog_order() {
+	python3 -c '
+import sys
+seen = {}
+for row in sys.stdin:
+    if not row.strip(): continue
+    tag, exact, archive, native = row.rstrip("\n").split("\t")
+    if tag in seen: raise SystemExit("duplicate Linux APP release tag: " + tag)
+    seen[tag] = (int(exact), int(archive), int(native))
+for tag in sorted(seen, key=lambda t: tuple(map(int, t[1:].split("."))), reverse=True):
+    print(tag, *seen[tag], sep="\t")
+'
+}
+
+linux_load_catalog() {
+	local page=1 json rows count all="" tag exact archived native extra
+	while [[ "$page" -le 30 ]]; do
+		if [[ "$APP_LANE" == gh ]]; then
+			json="$(gh api "repos/$REPO_SLUG/releases?per_page=100&page=$page")" || return 1
+		else
+			json="$(curl -fsS --connect-timeout 10 --max-time 60 --retry 2 -H 'Accept: application/vnd.github+json' \
+				"https://api.github.com/repos/$REPO_SLUG/releases?per_page=100&page=$page")" || return 1
+		fi
+		rows="$(linux_catalog_page "$LINUX_ARCH" <<<"$json")" || return 2
+		count="${rows%%$'\n'*}"; count="${count#COUNT$'\t'}"
+		rows="$(printf '%s\n' "$rows" | sed '1d')"
+		all="${all}${rows:+$rows$'\n'}"
+		[[ "$count" -eq 100 ]] || break
+		page=$((page + 1))
+	done
+	[[ "$page" -le 30 ]] || { echo "install.sh: Linux release catalog exhausted its page bound" >&2; return 2; }
+	LINUX_CATALOG_ROWS="$(linux_catalog_order <<<"$all")" || return 2
+	LINUX_HEAD_TAG=""
+	while IFS=$'\t' read -r tag exact archived native extra; do
+		[[ -n "$tag" ]] || continue
+		if [[ "$exact" -gt 0 ]]; then
+			[[ "$exact" -eq 1 ]] || { echo "install.sh: current APP head has ambiguous appcasts" >&2; return 2; }
+			LINUX_HEAD_TAG="$tag"; break
+		fi
+	done <<<"$LINUX_CATALOG_ROWS"
+	[[ -n "$LINUX_HEAD_TAG" ]] || return 1
+	local requested="${TAG:-}" selected=""
+	while IFS=$'\t' read -r tag exact archived native extra; do
+		[[ -n "$tag" && "$native" -gt 0 ]] || continue
+		if [[ "$TAG_EXPLICIT" -eq 1 ]]; then [[ "$tag" == "$requested" ]] || continue; fi
+		compare_numeric_tags "$tag" "$LINUX_HEAD_TAG" || return 2
+		[[ "$TAG_COMPARE_RESULT" -le 0 ]] || continue
+		[[ "$native" -eq 1 && "$exact" -le 1 ]] || { echo "install.sh: native candidate has ambiguous assets" >&2; return 2; }
+		if [[ "$exact" -eq 1 ]]; then LINUX_MANIFEST_ASSET=aterm-appcast.toml
+		elif [[ "$archived" -eq 1 ]]; then LINUX_MANIFEST_ASSET="aterm-appcast-$tag.toml"
+		else echo "install.sh: native candidate has ambiguous archived appcasts" >&2; return 2; fi
+		selected="$tag"; break
+	done <<<"$LINUX_CATALOG_ROWS"
+	if [[ -n "$selected" ]]; then TAG="$selected"; else TAG="$LINUX_HEAD_TAG"; fi
+	LINUX_NATIVE_AVAILABLE=0
+	[[ -z "$selected" ]] || LINUX_NATIVE_AVAILABLE=1
 }
 
 # stdin: one /repos/<slug>/releases/tags/<tag> JSON document.
@@ -517,7 +611,8 @@ release_asset_records() {
 		return 2
 	}
 	case "$name" in
-	aterm-appcast.toml | aterm-appcast.toml.sig) ;;
+	aterm-appcast.toml | aterm-appcast.toml.sig | aterm-machines.toml | aterm-machines.toml.sig) ;;
+	"aterm-appcast-$tag.toml" | "aterm-appcast-$tag.toml.sig") ;;
 	*)
 		# Two canonical macOS container names, both anchored and version-shaped:
 		# the bare DMG and the lean zip. The zip is admitted because every
@@ -534,11 +629,12 @@ release_asset_records() {
 		# this gate is that a manifest cannot name an arbitrary asset in the
 		# release, and each suffix is exactly as constrained as `.dmg`.
 		#
-		# The Linux rows are the same shape: the released ONE binary's tarball
-		# and its sha256 sidecar — that sidecar is the Linux lane's integrity
-		# anchor while the signed appcast carries no linux keys.
+		# Linux release installation elects only the signed raw ELF spelling.
+		# Legacy checksum-only tarball names remain recognizable for archive
+		# diagnostics; recognizing a name does not authorize installation.
 		[[ "$name" =~ ^aterm-[0-9]+(\.[0-9]+)+\.dmg$ ||
 			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-mac\.zip$ ||
+			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-linux-(aarch64|x86_64)$ ||
 			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-linux-x86_64\.tar\.gz(\.sha256)?$ ]] || {
 			echo "install.sh: refusing asset lookup for noncanonical name $name" >&2
 			return 2
@@ -819,13 +915,13 @@ sha256_equal() {
 
 # Whether the token half RUNS. Pure, so the deterministic suite pins the
 # consent contract: a broad `gh auth token` credential is copied to disk only
-# when something will actually read the file (the ambient chain runs only for
-# a repointed updater — ATERM_UPDATE_OWNER/_REPO), when the operator supplies
-# the value (ATERM_UPDATE_TOKEN), or when asked outright (--token).
-# --no-token is a hard off over all of those.
-token_provisioning_wanted() { # <do_token> <token_flag> <env_token> <env_owner> <env_repo>
+# when asked outright (--token). The environment triggers it used to honour
+# (ATERM_UPDATE_TOKEN, a repointing ATERM_UPDATE_OWNER/_REPO) are gone with the
+# app's own environment knobs (2026-09-23): the only reader of the file is a
+# development build's repointed channel. --no-token is a hard off.
+token_provisioning_wanted() { # <do_token> <token_flag>
 	[[ "$1" -eq 1 ]] || return 1
-	[[ "$2" -eq 1 || -n "$3" || -n "$4" || -n "$5" ]]
+	[[ "$2" -eq 1 ]]
 }
 
 # The token half's destination (the update-token section further down owns the
@@ -1145,12 +1241,14 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 #     builtin printed /users/... while rustup printed
 #     `trust (overridden by '/Users//<user>/aterm/.../rust-toolchain.toml')`
 #     (measured 2026-09-10, bash 3.2.57, rustup 1.29.1). An ambient
-#     RUSTUP_TOOLCHAIN steers rustup and the proxy alike, so an unscrubbed
-#     gate proves, and builds under, whatever it names — measured on the
+#     RUSTUP_TOOLCHAIN steers rustup and the proxy alike — measured on the
 #     `trust` pin 2026-09-10: RUSTUP_TOOLCHAIN=1.97.1 gives
 #     `1.97.1-x86_64-apple-darwin (overridden by environment variable
 #     RUSTUP_TOOLCHAIN)`, and `rustup which cargo` names that toolchain's
-#     cargo. So it is scrubbed (env -u) from every probe AND from the build.
+#     cargo. Unscrubbed from the probes, it steers rustup off the file, so
+#     the file check refuses a checkout whose pin is installed; unscrubbed
+#     from the build, it runs the proved build under whatever it names. So
+#     it is scrubbed (env -u) from every probe AND from the build.
 #     What survives the scrub is a `rustup override` on this very directory,
 #     `<name> (directory override for '<dir>')`, refused by name; a parent
 #     directory's override never wins, rustup reading the checkout's own
@@ -1636,6 +1734,330 @@ rustup_dist_channel() { # <name>
 
 # Internal test seam: source this file to exercise the pure functions without
 # parsing CLI arguments or touching the host. Never part of the public surface.
+linux_release_arch() {
+	case "$1:$2" in
+	Linux:x86_64) echo x86_64 ;;
+	Linux:aarch64 | Linux:arm64) echo aarch64 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Linux has no Apple bootstrap chain. Verify the SAME paper-master -> live
+# machine -> appcast chain as update-core before interpreting an artifact claim.
+# Kept inside the one-file installer so the curl|bash path never fetches an
+# unverified executable helper. Python parses TOML; OpenSSL performs Ed25519.
+# tools/test-linux-bootstrap.py pins this interpreter to the committed root and
+# exercises signed synthetic fixtures without adding any production key override.
+linux_release_verify() {
+	python3 - "$@" <<'ATERM_LINUX_VERIFY_PY'
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+"""Read-only signed release verification shared by bootstrap and website sync.
+
+The installer embeds this exact module for its one-file curl|bash delivery.
+tools/test-linux-bootstrap.py checks the copy and the committed root pin.
+"""
+
+import base64
+import datetime
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+
+MASTER_PUBKEYS = ("DtiLfpk0iUSrK1/LkyIVf+4C2eGjD2Myf4Sr/FCoMPQ=",)
+MAX_BINARY = 512 * 1024 * 1024
+U64_MAX = 18446744073709551615
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def uint(value, name, maximum=U64_MAX):
+    require(type(value) is int and 0 <= value <= maximum, "invalid " + name)
+    return value
+
+
+def read_bounded(path, maximum):
+    with open(path, "rb") as stream:
+        data = stream.read(maximum + 1)
+    require(len(data) <= maximum, "oversized " + str(path))
+    return data
+
+
+def verify_ed25519(key, data, signature):
+    try:
+        raw = base64.b64decode(key, validate=True)
+    except (ValueError, TypeError):
+        return False
+    if len(raw) != 32 or base64.b64encode(raw).decode("ascii") != key or len(signature) != 64:
+        return False
+    # Anonymous in-memory descriptors: no temp files, including during a dry
+    # diagnostic, and no shell interpretation of keys or authenticated bytes.
+    descriptors = []
+    temporary = None
+    try:
+        payloads = (bytes.fromhex("302a300506032b6570032100") + raw, data, signature)
+        if hasattr(os, "memfd_create"):
+            for payload in payloads:
+                fd = os.memfd_create("aterm-bootstrap", os.MFD_CLOEXEC)
+                descriptors.append(fd)
+                os.write(fd, payload)
+                os.lseek(fd, 0, os.SEEK_SET)
+            key_path, data_path, sig_path = [f"/proc/self/fd/{fd}" for fd in descriptors]
+        else:
+            # Website sync also runs on macOS publishers. Only public bytes
+            # touch this private temporary directory; no installed-user state.
+            temporary = tempfile.TemporaryDirectory(prefix="aterm-signature-")
+            paths = [pathlib.Path(temporary.name) / name for name in ("key", "data", "sig")]
+            for path, payload in zip(paths, payloads):
+                path.write_bytes(payload)
+            key_path, data_path, sig_path = map(str, paths)
+        result = subprocess.run(
+            ["openssl", "pkeyutl", "-verify", "-pubin", "-keyform", "DER",
+             "-inkey", key_path, "-rawin", "-in", data_path, "-sigfile", sig_path],
+            pass_fds=descriptors, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=10, check=False,
+        )
+        return result.returncode == 0
+    finally:
+        for fd in descriptors:
+            os.close(fd)
+        if temporary is not None:
+            temporary.cleanup()
+
+
+def deadline(value):
+    require(isinstance(value, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", value),
+            "invalid roster expiry")
+    return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc).timestamp()
+
+
+def read_install_policy(store):
+    store = pathlib.Path(store).absolute()
+    private_boundary = False
+    for ancestor in reversed((store, *store.parents)):
+        meta = ancestor.lstat()
+        require(stat.S_ISDIR(meta.st_mode) and meta.st_uid in (0, os.getuid()),
+                "unsafe install path component: " + str(ancestor))
+        require(private_boundary or meta.st_mode & 0o022 == 0,
+                "writable unshielded install path component: " + str(ancestor))
+        # A user-owned private ancestor prevents another uid from traversing
+        # into the store, even when a child retains a group-writable umask.
+        private_boundary |= meta.st_uid == os.getuid() and meta.st_mode & 0o077 == 0
+    path = pathlib.Path(store) / ".aterm-update" / "state.toml"
+    try:
+        parent = path.parent.lstat()
+    except FileNotFoundError:
+        return {"floors": (0, 0, 0), "revoked_machines": (), "rejected_build": 0}
+    require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid()
+            and parent.st_mode & 0o077 == 0, "unsafe update-state directory")
+    try:
+        meta = path.lstat()
+    except FileNotFoundError:
+        return {"floors": (0, 0, 0), "revoked_machines": (), "rejected_build": 0}
+    require(stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid()
+            and meta.st_mode & 0o077 == 0, "unsafe update-state file")
+    state = tomllib.loads(read_bounded(path, 262144).decode("utf-8"))
+    require(state.get("schema") == 1, "unsupported update-state schema")
+    target = store / "aterm"
+    require(state.get("target") == str(target),
+            "update-state target mismatch")
+    installed = state.get("installed")
+    require(isinstance(installed, dict) and isinstance(installed.get("sha256"), str),
+            "invalid installed identity")
+    installed_build = uint(installed.get("build"), "installed build")
+    revoked = state.get("revoked_machines", [])
+    require(isinstance(revoked, list) and all(isinstance(item, str) and item for item in revoked),
+            "invalid durable revoked machines")
+    policy = {
+        "floors": tuple(uint(state.get(key), key) for key in ("high_water", "min_build", "roster_floor")),
+        "revoked_machines": revoked,
+        "rejected_build": uint(state.get("rejected_build", 0), "rejected build"),
+    }
+    try:
+        target_meta = target.lstat()
+    except FileNotFoundError:
+        require(state.get("enabled") is False and state.get("trial") is None,
+                "enrolled executable is absent or an update trial needs recovery")
+        require(re.fullmatch(r"[0-9a-f]{64}", installed["sha256"]) or
+                (installed["sha256"] == "" and installed_build == 0), "invalid fresh installed identity")
+        # First install may have persisted authenticated policy before probing or
+        # renaming the first executable. Runtime owns this disabled-state retry;
+        # preserve all floors instead of mistaking absence for a clean slate.
+        return policy
+    require(re.fullmatch(r"[0-9a-f]{64}", installed["sha256"]), "invalid installed identity")
+    require(stat.S_ISREG(target_meta.st_mode) and target_meta.st_uid == os.getuid()
+            and target_meta.st_mode & 0o6022 == 0 and target_meta.st_size <= MAX_BINARY,
+            "unsafe installed executable")
+    with open(target, "rb") as stream:
+        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    rejected = policy["rejected_build"]
+    trial = state.get("trial")
+    if trial:
+        require(isinstance(trial, dict), "invalid durable update trial")
+        old, new = trial.get("old"), trial.get("new")
+        require(all(isinstance(identity, dict) and isinstance(identity.get("sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) for identity in (old, new)),
+                "invalid durable trial identity")
+        phase = trial.get("phase")
+        prepared_old = phase == "Prepared" and actual == old["sha256"] == installed["sha256"]
+        healthy_new = phase == "Installed" and trial.get("healthy") is True and actual == new["sha256"] == installed["sha256"]
+        rolling_back = phase == "RollbackPrepared" and actual in (old["sha256"], new["sha256"])
+        require(prepared_old or healthy_new or rolling_back,
+                "an unresolved update trial requires a healthy launch or runtime recovery")
+        if rolling_back:
+            rejected = max(rejected, uint(new.get("build"), "rejected trial build"))
+        # Runtime owns recovery under its lock. This read-only preflight admits
+        # recoverable/healthy states without clearing intent or lowering floors.
+    else:
+        require(actual == installed["sha256"],
+                "installed executable disagrees with durable update identity")
+    policy["rejected_build"] = rejected
+    return policy
+
+
+def verify_manifest(directory, tag, slug, arch=None, floors=(0, 0, 0), now=None,
+                    revoked_machines=(), rejected_build=0, manifest_name="aterm-appcast.toml"):
+    require(arch is None or arch in ("x86_64", "aarch64"), "unsupported Linux architecture")
+    require(re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag),
+            "noncanonical release tag")
+    require(all(int(part) <= U64_MAX for part in tag[1:].split(".")), "release tag overflow")
+    require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug), "invalid repository")
+    root = pathlib.Path(directory)
+    roster_bytes = read_bounded(root / "aterm-machines.toml", 65536)
+    roster_sig = read_bounded(root / "aterm-machines.toml.sig", 64)
+    require(any(verify_ed25519(key, roster_bytes, roster_sig) for key in MASTER_PUBKEYS),
+            "roster is not signed by the pinned paper master")
+    roster = tomllib.loads(roster_bytes.decode("utf-8"))
+    require(uint(roster.get("schema"), "roster schema", 0xffffffff) <= 1, "newer roster schema")
+    seq = uint(roster.get("roster_seq"), "roster sequence")
+    require(seq >= floors[2], "roster rollback")
+    now = time.time() if now is None else now
+    require(now < deadline(roster.get("valid_until")), "roster expired")
+    machines, revoked = roster.get("machine", []), roster.get("revoked", [])
+    require(isinstance(machines, list) and len(machines) <= 16, "invalid machine roster")
+    require(isinstance(revoked, list) and all(isinstance(item, str) and item for item in revoked),
+            "invalid revoked machines")
+    ids, keys = set(), set()
+    for machine in machines:
+        require(isinstance(machine, dict), "invalid machine")
+        identity, key = machine.get("id"), machine.get("pubkey")
+        require(isinstance(identity, str) and identity and identity not in ids,
+                "empty or duplicate machine identity")
+        require(isinstance(key, str) and key and key not in keys, "empty or duplicate machine key")
+        try:
+            decoded = base64.b64decode(key, validate=True)
+        except (ValueError, TypeError) as error:
+            raise ValueError("invalid roster machine key") from error
+        require(len(decoded) == 32 and base64.b64encode(decoded).decode("ascii") == key,
+                "noncanonical roster machine key")
+        ids.add(identity)
+        keys.add(key)
+    require(manifest_name in ("aterm-appcast.toml", "aterm-policy-appcast.toml"), "invalid manifest proof name")
+    manifest_bytes = read_bounded(root / manifest_name, 5_000_000)
+    manifest_sig = read_bounded(root / (manifest_name + ".sig"), 64)
+    signer = None
+    for machine in machines:
+        if machine["id"] in revoked or machine["id"] in revoked_machines:
+            continue
+        if "not_after" in machine and now >= deadline(machine["not_after"]):
+            continue
+        if verify_ed25519(machine["pubkey"], manifest_bytes, manifest_sig):
+            signer = machine["id"]
+            break
+    require(signer is not None, "appcast has no authorized live machine signature")
+    manifest = tomllib.loads(manifest_bytes.decode("utf-8"))
+    require(uint(manifest.get("schema"), "manifest schema", 0xffffffff) <= 1, "newer manifest schema")
+    require(manifest.get("machine_id") == signer, "appcast signer attribution mismatch")
+    require(uint(manifest.get("roster_seq"), "appcast roster sequence") <= seq,
+            "appcast requires newer roster")
+    require(manifest.get("version") == tag[1:], "release tag/appcast version mismatch")
+    require(re.fullmatch(r"[0-9a-f]{40}", manifest.get("commit", "")), "invalid source commit")
+    dmg = f"aterm-{tag[1:]}.dmg"
+    require(manifest.get("dmg") == dmg and manifest.get("url") ==
+            f"https://github.com/{slug}/releases/download/{tag}/{dmg}", "signed release origin mismatch")
+    build = uint(manifest.get("build_number"), "build number")
+    require(build > 0 and build > rejected_build, "zero or previously rejected release build")
+    minimum = uint(manifest.get("min_build", 0), "minimum build")
+    require(build >= max(floors[0], floors[1], minimum), "release build rollback or below apply floor")
+    for target in ("x86_64", "aarch64"):
+        field = "linux_" + target
+        present = [field + suffix in manifest for suffix in ("", "_sha256", "_size")]
+        require(not any(present) or all(present), "incomplete Linux artifact triple")
+        if not any(present):
+            continue
+        require(manifest[field] == f"aterm-{tag[1:]}-linux-{target}", "noncanonical Linux asset")
+        require(isinstance(manifest[field + "_sha256"], str) and
+                re.fullmatch(r"[0-9a-f]{64}", manifest[field + "_sha256"]), "invalid Linux digest")
+        size = uint(manifest[field + "_size"], "Linux size", MAX_BINARY)
+        require(size >= 64, "Linux artifact too small")
+    if arch is None:
+        return manifest
+    field = "linux_" + arch
+    require(field in manifest, "signed release has no Linux artifact for " + arch)
+    return (manifest[field], manifest[field + "_sha256"], manifest[field + "_size"], build, seq)
+
+
+def verify_binary(path, arch, digest, size):
+    meta = pathlib.Path(path).lstat()
+    require(stat.S_ISREG(meta.st_mode) and meta.st_size == size, "Linux artifact size/type mismatch")
+    with open(path, "rb") as stream:
+        header = stream.read(64)
+        require(len(header) == 64 and header[:7] == b"\x7fELF\x02\x01\x01", "not a 64-bit little-endian ELF")
+        require(int.from_bytes(header[16:18], "little") in (2, 3), "ELF is not an executable")
+        require(int.from_bytes(header[20:24], "little") == 1 and
+                int.from_bytes(header[52:54], "little") == 64, "invalid ELF version/header size")
+        require(int.from_bytes(header[18:20], "little") == {"x86_64": 62, "aarch64": 183}[arch],
+                "Linux artifact ELF architecture mismatch")
+        stream.seek(0)
+        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    require(actual == digest, "Linux artifact SHA-256 mismatch")
+
+
+def main(args):
+    require(len(args) in (5, 6), "invalid Linux verifier invocation")
+    directory, tag, slug, arch, store = args[:5]
+    policy = read_install_policy(store)
+    head_path = pathlib.Path(directory) / "aterm-policy-appcast.toml"
+    head_sig = head_path.with_name(head_path.name + ".sig")
+    if head_path.exists() or head_sig.exists():
+        require(head_path.exists() and head_sig.exists(), "incomplete latest-policy proof pair")
+        # The version here is only a candidate parser input; the complete chain
+        # and signed origin are checked before any policy value is consumed.
+        head = tomllib.loads(read_bounded(head_path, 5_000_000).decode("utf-8"))
+        head = verify_manifest(directory, "v" + str(head.get("version", "")), slug,
+                               manifest_name="aterm-policy-appcast.toml", **policy)
+        require(tuple(map(int, head["version"].split("."))) >= tuple(map(int, tag[1:].split("."))),
+                "native candidate is newer than authenticated current APP head")
+        roster = tomllib.loads(read_bounded(pathlib.Path(directory) / "aterm-machines.toml", 65536).decode("utf-8"))
+        policy["floors"] = (policy["floors"][0], max(policy["floors"][1], head.get("min_build", 0)),
+                            max(policy["floors"][2], roster["roster_seq"]))
+        policy["revoked_machines"] = tuple(set(policy["revoked_machines"]) | set(roster.get("revoked", [])))
+    result = verify_manifest(directory, tag, slug, arch, **policy)
+    if len(args) == 6:
+        verify_binary(args[5], arch, result[1], result[2])
+    print("\t".join(map(str, result)))
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print("install.sh: Linux verification refused: " + str(error), file=sys.stderr)
+        sys.exit(1)
+ATERM_LINUX_VERIFY_PY
+}
+
 if [[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
 	return 0 2>/dev/null || exit 0
 fi
@@ -1736,16 +2158,8 @@ uninstall_everything() {
 	# reach out and delete the real /Applications/aterm.app.
 	local app_dirs=(/Applications "$HOME/Applications")
 	[[ -n "${ATERM_INSTALL_DIR:-}" ]] && app_dirs=("$ATERM_INSTALL_DIR")
-	# `aterm.app.rollback` is swept BESIDE `aterm.app`, under the same identity
-	# check. The updater's apply renames the outgoing bundle to that fixed name
-	# (crates/aterm-update/src/install.rs `rollback_path`) and normally collects
-	# it at the first healthy boot; a wedged trial leaves it behind. Uninstalling
-	# and leaving it there is worse than untidy: it is a complete, signed bundle
-	# carrying aterm's CFBundleIdentifier, and macOS keeps ONE code requirement
-	# per identifier — a stray claimant resets Full Disk Access for anything that
-	# ever shares that id again. Measured 2026-09-21: two such leftovers on the
-	# owner's Mac destroyed three grants in 55 seconds. The identity check is
-	# what keeps this ours to delete.
+	# `aterm.app.rollback` too: the updater's apply leaves the outgoing bundle there
+	# (install.rs `rollback_path`), and it carries aterm's bundle id.
 	for dir in "${app_dirs[@]}"; do
 		for name in aterm.app aterm.app.rollback; do
 			app="$dir/$name"
@@ -1763,8 +2177,9 @@ uninstall_everything() {
 
 	# 2. the `aterm` symlink — only when it still resolves into a bundle or our
 	#    store. A real file there is someone's own build, not ours to delete.
-	# The `atpkg` companion link, planted by the app itself on every run from a
-	# bundle (crates/atpkg/src/hooks.rs). Nothing else removes it, so leaving it
+	# The `atpkg` companion link, planted by the app itself on every run from the
+	# release-named aterm.app bundle (crates/atpkg/src/hooks.rs; a dev bundle plants
+	# nothing since 2026-09-23). Nothing else removes it, so leaving it
 	# behind guaranteed a dangling command after the app is gone
 	# (2026-08-20 round-9 audit).
 	# BOTH bin dirs when they differ: ensure_command_links (hooks.rs) hardcodes
@@ -2028,11 +2443,12 @@ print_install_plan() {
 	elif [[ "$LINUX_RELEASE" -eq 1 ]]; then
 		# The pre-flight already carried the tarball's exact records; bind them
 		# to one immutable asset here exactly as install_linux_app will.
-		record="$(require_unique_asset_record "$LINUX_TAR_RECORDS" "$LINUX_TAR" 1 2147483648)" || exit 1
+		record="$(require_unique_asset_record "$LINUX_ASSET_RECORDS" "$LINUX_ASSET" 64 536870912)" || exit 1
 		IFS=$'\t' read -r asset_id asset_size <<<"$record"
-		echo "install.sh: app: $REPO_SLUG $TAG (linux-x86_64, $lane_desc)"
-		echo "  download: $LINUX_TAR — $((asset_size / 1000000)) MB -> $tmp_hint/ (deleted after install)"
-		echo "  verify:   the release's own $LINUX_TAR.sha256 digest asset (the appcast carries no linux keys yet)"
+		echo "install.sh: app: $REPO_SLUG $TAG (linux-$LINUX_ARCH, $lane_desc)"
+		echo "  download: $LINUX_ASSET — $((asset_size / 1000000)) MB -> $tmp_hint/ (deleted after install)"
+		echo "  verify:   paper-master roster, live machine signature, signed size/hash, ELF architecture, rollback floors"
+		echo "  note:     this dry-run lists API assets only; signatures are verified before a real install"
 		echo "  install:  the released ONE binary -> $STORE_DIR/aterm, exposed as the $BIN_DIR/aterm symlink"
 	else
 		# The same read-only resolution install_app performs — one manifest,
@@ -2287,12 +2703,10 @@ fi
 # The token half's arbitration, decided ONCE and consulted by the excludes
 # gate here and the run phase below (see token_provisioning_wanted).
 TOKEN_WANTED=0
-token_provisioning_wanted "$DO_TOKEN" "$TOKEN_EXPLICIT" "${ATERM_UPDATE_TOKEN:-}" \
-	"${ATERM_UPDATE_OWNER:-}" "${ATERM_UPDATE_REPO:-}" && TOKEN_WANTED=1
+token_provisioning_wanted "$DO_TOKEN" "$TOKEN_EXPLICIT" && TOKEN_WANTED=1
 # Refuse only when every half that COULD run is out: app, cli, the default-on
 # toolchain and PATH halves, and a token half nothing opted into (the token
-# half is opt-in — --token, or a repointed updater via ATERM_UPDATE_OWNER/
-# _REPO or ATERM_UPDATE_TOKEN). Checking fewer halves made the toolchain-only
+# half is opt-in — --token). Checking fewer halves made the toolchain-only
 # repair (--no-app --no-cli against an already-installed app) unreachable.
 if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 && "$TOKEN_WANTED" -eq 0 &&
 	"$DO_TOOLCHAIN" -eq 0 && "$DO_PATH" -eq 0 ]]; then
@@ -2336,16 +2750,17 @@ APP_ALREADY=""
 APP_LANE=""
 DEST=""
 # The app half's Linux shape: there is no bundle, so the released artifact is
-# the ONE binary as aterm-<version>-linux-x86_64.tar.gz, landed in the SAME
-# store layout the source-build fallback fills. Only x86_64 is published;
-# every other OS/arch keeps the loud skip, with the source build as remedy.
+# the signed raw ONE binary for this architecture, landed in the SAME store
+# layout the source-build fallback fills. No archive extraction or unsigned
+# legacy tarball fallback is involved in this release lane.
 LINUX_RELEASE=0
-[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] && LINUX_RELEASE=1
-LINUX_TAR=""
-LINUX_TAR_RECORDS=""
+LINUX_ARCH="$(linux_release_arch "$(uname -s)" "$(uname -m)" || true)"
+[[ -n "$LINUX_ARCH" ]] && LINUX_RELEASE=1
+LINUX_ASSET=""
+LINUX_ASSET_RECORDS=""
 if [[ "$DO_APP" -eq 1 ]]; then
 	if [[ "$(uname -s)" != "Darwin" && "$LINUX_RELEASE" -eq 0 ]]; then
-		APP_SKIP="the released aterm.app is macOS-only, and the released Linux binary is x86_64-only — no artifact exists for $(uname -s)/$(uname -m)"
+		APP_SKIP="no supported release target for $(uname -s)/$(uname -m) — Linux supports aarch64 and x86_64; the app bundle supports macOS"
 	elif command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
 		# An authenticated gh serves ANY slug, and is the only way into the
 		# private staging repo. Decided ONCE here: every release/asset call
@@ -2371,14 +2786,25 @@ if [[ "$DO_APP" -eq 1 ]]; then
 	fi
 	if [[ -n "$APP_LANE" ]]; then
 		LIST_ERR=0
-		if [[ -z "$TAG" ]]; then
+		if [[ "$LINUX_RELEASE" -eq 1 ]]; then
+			if ! command -v python3 >/dev/null || ! python3 -c 'import tomllib' >/dev/null 2>&1; then
+				APP_FATAL="signed Linux discovery requires Python 3.11+"
+			else
+				LINUX_CATALOG_STATUS=0
+				linux_load_catalog || LINUX_CATALOG_STATUS=$?
+				case "$LINUX_CATALOG_STATUS" in
+				1) LIST_ERR=1; TAG="" ;;
+				2) APP_FATAL="Linux release catalog is malformed, ambiguous, or incomplete; refusing fallback" ;;
+				esac
+			fi
+		elif [[ -z "$TAG" ]]; then
 			# The repo also publishes non-app releases (for example the atpkg
 			# index), so enumerate every page and arbitrate the complete exact-name
 			# appcast catalog. GitHub does not promise REST release row order.
 			RELEASE_ROWS=""
 			if [[ "$APP_LANE" == gh ]]; then
 				if ! RELEASE_ROWS="$(gh api --paginate "repos/$REPO_SLUG/releases?per_page=100" \
-					--jq '.[] | [.tag_name, (.draft | tostring), ([((.assets // [])[] | select(.name == "aterm-appcast.toml"))] | length | tostring)] | @tsv' \
+					--jq '.[] | [.tag_name, ((.draft or .prerelease) | tostring), ([((.assets // [])[] | select(.name == "aterm-appcast.toml"))] | length | tostring)] | @tsv' \
 					2>/dev/null)"; then
 					LIST_ERR=1
 				fi
@@ -2434,22 +2860,23 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			# half before any download, per the failsafe policy. The resolved
 			# records are CARRIED into the install so the probed identity and
 			# the downloaded bytes cannot drift between two listings.
-			LINUX_TAR="aterm-${TAG#v}-linux-x86_64.tar.gz"
+			LINUX_ASSET="aterm-${TAG#v}-linux-$LINUX_ARCH"
 			# FAILSAFE POLICY: the verify/extract tools are environment facts,
 			# so probe them HERE — their absence used to surface as a
 			# mid-flight abort AFTER the full tarball download (sha256sum at
 			# the digest check, tar at extraction), the one failure shape the
 			# policy promises never to produce for a predictable impossibility.
-			if ! command -v sha256sum >/dev/null 2>&1 ||
-				! command -v tar >/dev/null 2>&1 ||
-				! command -v gzip >/dev/null 2>&1; then
-				APP_SKIP="needs sha256sum, tar, and gzip to verify and extract the released Linux binary — install them (coreutils/tar/gzip, in every distro repo) and re-run"
+			if ! command -v openssl >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1 ||
+				! python3 -c 'import tomllib, hashlib, os; assert hasattr(os, "memfd_create"); assert hasattr(hashlib, "file_digest")' >/dev/null 2>&1; then
+				APP_SKIP="signed Linux bootstrap needs Python 3.11+ and OpenSSL with Ed25519 support — install them and re-run; unsigned tarballs are not a fallback"
 			elif ! ensure_dirs_writable "$STORE_DIR" "$BIN_DIR"; then
 				APP_SKIP="cannot create/write $STORE_DIR or $BIN_DIR (set ATERM_STORE_DIR / ATERM_BIN_DIR to writable dirs)"
-			elif ! LINUX_TAR_RECORDS="$(release_asset_records "$TAG" "$LINUX_TAR")"; then
-				APP_SKIP="could not inspect release $TAG for $LINUX_TAR (network, or the GitHub API rate limit)"
-			elif [[ -z "$LINUX_TAR_RECORDS" ]]; then
-				APP_SKIP="release $TAG publishes no $LINUX_TAR — releases before the first Linux cut ship macOS artifacts only. Remedy: the cli half builds the same toolset from source (it runs next), or pin a release that ships the Linux artifact with --version"
+			elif [[ "${LINUX_NATIVE_AVAILABLE:-0}" -eq 0 ]]; then
+				APP_SKIP="no canonical signed-ELF candidate is listed for linux-$LINUX_ARCH (head $LINUX_HEAD_TAG). Legacy checksum-only tarballs are never selected; a release owner must cut native Linux artifacts"
+			elif ! LINUX_ASSET_RECORDS="$(release_asset_records "$TAG" "$LINUX_ASSET")"; then
+				APP_SKIP="could not inspect release $TAG for $LINUX_ASSET (network, or the GitHub API rate limit)"
+			elif [[ -z "$LINUX_ASSET_RECORDS" ]]; then
+				APP_SKIP="release $TAG publishes no signed Linux artifact $LINUX_ASSET. Legacy checksum-only tarballs are not auto-update-capable and are never selected. A source checkout can build locally; a release owner must cut signed Linux artifacts for public installation"
 			fi
 		else
 			# Destination: explicit env wins; else /Applications, else ~/Applications.
@@ -2918,8 +3345,7 @@ install_app() {
 	echo "  launch:  open '$DEST/aterm.app'"
 	# ONE line-set for both lanes, because the truth is lane-independent: the
 	# compiled-in update channel is the PUBLIC repo and the updater reads it
-	# anonymously (token.rs consults only an explicit $ATERM_UPDATE_TOKEN
-	# there). The old lane-split text promised updates "once the token half
+	# anonymously (token.rs consults no rung there). The old lane-split text promised updates "once the token half
 	# provisions a credential" — false, and contradicted minutes later by the
 	# token half's own no-credential message. Round-11 honesty: checks and
 	# staging run in the app AND in `aterm` terminal sessions; the APPLY (a
@@ -2927,104 +3353,92 @@ install_app() {
 	# rather than promising a silence that terminal-only machines cannot cash.
 	echo "  updates: automatic (silent, verified) — public channel, no credential needed; checks run"
 	echo "           in the app and in \`aterm\` sessions, and a staged update applies when the aterm"
-	echo "           window opens. Health: aterm update status — opt out with ATERM_NO_AUTO_UPDATE=1"
+	echo "           window opens. Health: aterm update status — to switch it off, Settings ▸ Terminal"
+	echo "           ▸ Updates (\`[update] enabled = false\` in ~/.config/aterm/aterm.toml)"
 	INSTALLED_ANY=1
 }
 
-# --- the app half on Linux: the released ONE binary, digest-verified -----------
-# No bundle, no DMG: the artifact is a tarball carrying the ONE `aterm` binary
-# at its root, landed in the SAME store layout the source build fills
-# (place_store_binary) — so `aterm` on PATH is identical either way, and
-# --uninstall's ownership checks match both producers. The pre-flight already
-# proved the tarball exists and carried its exact records in LINUX_TAR_RECORDS.
+# --- the app half on Linux: the released ONE binary, signature-verified --------
+# Same raw ELF contract as the runtime updater; no archive extraction surface.
+# Exact API identity metadata and signed appcast identity must agree before
+# placement. The release and source lanes share the canonical store layout.
 install_linux_app() {
-	echo "install.sh: installing $REPO_SLUG $TAG (linux-x86_64)"
-
+	echo "install.sh: installing $REPO_SLUG $TAG (linux-$LINUX_ARCH, signed raw ELF)"
 	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
 	cleanup() {
-		# Best-effort only, and never let a cleanup failure rewrite the exit status.
 		set +e
 		rm -rf "$TMP"
 	}
 	trap cleanup EXIT
 
-	local tar_name="$LINUX_TAR"
-	local sum_name="$tar_name.sha256"
-	local tar_record tar_id tar_size sum_record sum_id sum_size
-
-	# Pin the tarball to exactly one immutable API asset, same as the DMG lane —
-	# a filename-pattern download could pick an order-dependent duplicate.
-	tar_record="$(require_unique_asset_record "$LINUX_TAR_RECORDS" "$tar_name" 1 2147483648)" || exit 1
-	IFS=$'\t' read -r tar_id tar_size <<<"$tar_record"
-
-	# INTEGRITY ANCHOR: the companion digest asset. The signed appcast carries
-	# no linux keys yet (planned for the next cut), so this lane's anchor is the
-	# release's own sha256 sidecar over the same transport. Its absence is a
-	# refusal, not a skip: a tarball published without its digest is a malformed
-	# release, never something to install unverified.
-	sum_record="$(release_unique_asset_record "$TAG" "$sum_name" 64 1024)" ||
-		{ explain_anon_rate_limit; exit 1; }
-	IFS=$'\t' read -r sum_id sum_size <<<"$sum_record"
-	download_release_asset_id "$sum_id" "$sum_size" "$TMP/$sum_name"
-
-	# sha256sum-style sidecar: "<hex>  <filename>", exactly one line, bound to
-	# the canonical tarball name — a digest naming any OTHER file must never
-	# gate this download. Lowercase-only hex because sha256sum emits exactly
-	# that; accepting a second spelling would give one digest two forms.
-	local sha_want="" sum_file="" sum_extra=""
-	read -r sha_want sum_file sum_extra <"$TMP/$sum_name" || true
-	if [[ -n "$sum_extra" || "$sum_file" != "$tar_name" ]] ||
-		[[ ! "$sha_want" =~ ^[0-9a-f]{64}$ ]] ||
-		[[ "$(wc -l <"$TMP/$sum_name" | tr -d '[:space:]')" -gt 1 ]]; then
-		echo "install.sh: $sum_name is not one sha256sum line naming $tar_name — refusing to install" >&2
-		exit 1
+	local asset record asset_id asset_size minimum maximum proof verified remote_asset source_tag
+	local name digest size build roster_seq
+	for asset in aterm-machines.toml aterm-machines.toml.sig aterm-appcast.toml aterm-appcast.toml.sig; do
+		minimum=1
+		maximum=5000000
+		case "$asset" in
+		*.sig) minimum=64; maximum=64 ;;
+		aterm-machines.toml) maximum=65536 ;;
+		esac
+		source_tag="$TAG"; remote_asset="$asset"
+		case "$asset" in
+		aterm-machines.toml*) source_tag="${LINUX_HEAD_TAG:-$TAG}" ;;
+		aterm-appcast.toml) remote_asset="${LINUX_MANIFEST_ASSET:-aterm-appcast.toml}" ;;
+		aterm-appcast.toml.sig) remote_asset="${LINUX_MANIFEST_ASSET:-aterm-appcast.toml}.sig" ;;
+		esac
+		record="$(release_unique_asset_record "$source_tag" "$remote_asset" "$minimum" "$maximum")" || exit 1
+		IFS=$'\t' read -r asset_id asset_size <<<"$record"
+		download_release_asset_id "$asset_id" "$asset_size" "$TMP/$asset"
+		chmod 600 "$TMP/$asset"
+	done
+	if [[ "${LINUX_HEAD_TAG:-$TAG}" != "$TAG" ]]; then
+		for asset in aterm-appcast.toml aterm-appcast.toml.sig; do
+			minimum=1; maximum=5000000
+			[[ "$asset" != *.sig ]] || { minimum=64; maximum=64; }
+			record="$(release_unique_asset_record "$LINUX_HEAD_TAG" "$asset" "$minimum" "$maximum")" || exit 1
+			IFS=$'\t' read -r asset_id asset_size <<<"$record"
+			proof="${asset/aterm-appcast/aterm-policy-appcast}"
+			download_release_asset_id "$asset_id" "$asset_size" "$TMP/$proof"
+			chmod 600 "$TMP/$proof"
+		done
 	fi
 
-	echo "install.sh: BOOTSTRAP TRUST BOUNDARY: the Linux lane's integrity anchor is the release's" >&2
-	if [[ "${APP_LANE:-gh}" == gh ]]; then
-		echo "  own $sum_name digest asset, over gh-authenticated repo metadata. The signed appcast" >&2
-	else
-		echo "  own $sum_name digest asset, over TLS to api.github.com (anonymous). The signed appcast" >&2
-	fi
-	echo "  carries no linux keys yet (planned for the next cut), so no signature binds this artifact." >&2
+	# Authentication and existing durable floors precede the binary download.
+	# An older native candidate is accepted only beneath the authenticated current
+	# policy + current roster. Bad signatures never trigger another fallback.
+	verified="$(linux_release_verify "$TMP" "$TAG" "$REPO_SLUG" "$LINUX_ARCH" "$STORE_DIR")" || exit 1
+	IFS=$'\t' read -r name digest size build roster_seq <<<"$verified"
+	[[ "$name" == "$LINUX_ASSET" ]] || { echo "install.sh: Linux asset identity changed" >&2; exit 1; }
+	record="$(require_unique_asset_record "$LINUX_ASSET_RECORDS" "$name" 64 536870912)" || exit 1
+	IFS=$'\t' read -r asset_id asset_size <<<"$record"
+	[[ "$asset_size" == "$size" ]] || { echo "install.sh: API size disagrees with signed Linux size" >&2; exit 1; }
+	echo "install.sh: downloading authenticated $name ($((size / 1000000)) MB)"
+	download_release_asset_id "$asset_id" "$size" "$TMP/$name"
 
-	echo "install.sh: downloading $tar_name ($((tar_size / 1000000)) MB)"
-	download_release_asset_id "$tar_id" "$tar_size" "$TMP/$tar_name"
-	SHA_GOT="$(sha256sum "$TMP/$tar_name" | awk '{print $1}')"
-	if [[ "$SHA_GOT" != "$sha_want" ]]; then
-		echo "install.sh: SHA-256 MISMATCH for $tar_name — refusing to install" >&2
-		echo "  digest asset: $sha_want" >&2
-		echo "  download:     $SHA_GOT" >&2
-		exit 1
-	fi
-	echo "install.sh: sha256 verified (${SHA_GOT:0:12}…)"
-
-	mkdir -p "$TMP/extract"
-	tar -xzf "$TMP/$tar_name" -C "$TMP/extract" || {
-		echo "install.sh: could not extract $tar_name" >&2
+	# Recheck floors immediately before placement, then verify the exact file's
+	# hash/size/ELF architecture BEFORE executing it. No archive parser is used.
+	linux_release_verify "$TMP" "$TAG" "$REPO_SLUG" "$LINUX_ARCH" "$STORE_DIR" "$TMP/$name" >/dev/null || exit 1
+	chmod 755 "$TMP/$name"
+	local reported
+	reported="$(timeout 30 "$TMP/$name" --version)" || {
+		echo "install.sh: signed Linux binary cannot run on this userland; existing install kept" >&2
 		exit 1
 	}
-	# The ONE binary, a regular file at the archive root — the shape the
-	# publisher cuts. Anything else fails closed rather than guessing.
-	if [[ ! -f "$TMP/extract/aterm" || -L "$TMP/extract/aterm" ]]; then
-		echo "install.sh: no aterm binary at the root of $tar_name — refusing to install" >&2
+	[[ "$reported" == "aterm ${TAG#v}" || "$reported" == "aterm ${TAG#v}+"* || "$reported" == "aterm ${TAG#v} "* ]] || {
+		echo "install.sh: signed binary reports a different release version; existing install kept" >&2
 		exit 1
-	fi
-	# Smoke-run BEFORE placement: a binary this machine cannot execute (newer
-	# glibc, foreign userland) must refuse here, while the store still holds
-	# whatever last worked. `^aterm ` is the same self-identification
-	# find_bundle_cli demands of a bundle's one binary.
-	if ! "$TMP/extract/aterm" --version 2>/dev/null | grep -q '^aterm '; then
-		echo "install.sh: the extracted binary does not run on this machine (or does not identify as aterm) — refusing to install" >&2
+	}
+	# The authenticated candidate owns the replacement/enrollment transaction.
+	# It acquires the runtime lock, rechecks all durable policy, records rollback
+	# identity and atomically replaces the target. Shell placement followed by
+	# `enable` would discard the old binary if enrollment failed or raced updates.
+	"$TMP/$name" update install --target "$STORE_DIR/aterm" --proof-dir "$TMP" --candidate "$TMP/$name" || {
+		echo "install.sh: signed install transaction refused; inspect aterm update status before retrying" >&2
 		exit 1
-	fi
-
-	# STORE_DIR and BIN_DIR were pre-flighted (created + writability-checked)
-	# before any download.
-	place_store_binary "$TMP/extract/aterm"
-	echo "install.sh: installed the released ONE binary -> $STORE_DIR ($("$BIN_DIR/aterm" --version | head -n 1))"
-	echo "  ONE command on PATH: $BIN_DIR/aterm — the terminal, the window (--window), and every verb"
-	echo "  updates: re-run this installer — the in-app self-updater is macOS-only today"
+	}
+	expose_store_binary
+	echo "install.sh: installed signed aterm ${TAG#v} -> $STORE_DIR/aterm"
+	echo "  ONE command on PATH: $BIN_DIR/aterm; updates: aterm update status"
 	INSTALLED_ANY=1
 	LINUX_APP_INSTALLED=1
 }
@@ -3159,7 +3573,25 @@ install_cli_from_source() {
 # into different layouts, and --uninstall's ownership checks match either.
 # Callers pre-flight STORE_DIR and BIN_DIR before any build or download work.
 place_store_binary() {
-	install -m 755 "$1" "$STORE_DIR/aterm"
+	# An unsigned source fallback cannot replace enrolled bytes and leave the
+	# durable signed identity pointing at a different executable.
+	if [[ "$(uname -s)" == Linux && ( -e "$STORE_DIR/.aterm-update/state.toml" || -L "$STORE_DIR/.aterm-update/state.toml" ) ]]; then
+		echo "install.sh: source fallback cannot overwrite an enrolled Linux install; choose a separate ATERM_STORE_DIR for development" >&2
+		return 1
+	fi
+	# A running executable must never be truncated in place. Publish a complete
+	# same-filesystem sibling atomically; the old inode stays valid for users
+	# whose terminal is already running.
+	local staged
+	staged="$(mktemp "$STORE_DIR/.aterm-install.XXXXXX")" || return 1
+	if ! install -m 755 "$1" "$staged" || ! mv -f "$staged" "$STORE_DIR/aterm"; then
+		rm -f "$staged"
+		return 1
+	fi
+	expose_store_binary
+}
+
+expose_store_binary() {
 	# argv0 compat aliases beside it (matching the bundle's symlinks), so
 	# in-session \`aterm-ctl …\` scripts and \$ATERM_CTL keep resolving.
 	local alias
@@ -3432,19 +3864,17 @@ install_linux_desktop_entry() {
 #
 # So this half is NOT what decides whether a Mac updates. Per
 # crates/aterm-update-core/src/token.rs (`needs_ambient_credential` + `walk`):
-# for the compiled-in channel the chain consults ONLY an explicit
-# $ATERM_UPDATE_TOKEN and never touches the keychain or the file written below.
-# The ambient chain — keychain, this 0600 file, $GITHUB_TOKEN, $GH_TOKEN, `gh
-# auth token` — runs only when $ATERM_UPDATE_OWNER/_REPO repoint the source,
-# which is the one way to reach a repo that can require authentication.
+# for the compiled-in channel the chain consults NO rung and never touches the
+# keychain or the file written below. The chain — keychain, this 0600 file,
+# `gh auth token`; no environment rung since 2026-09-23 — runs only for a
+# repointed source, which only a DEVELOPMENT build honours (`[update]
+# owner`/`repo`).
 #
 # That is why this half is OPT-IN (token_provisioning_wanted): copying a broad
 # `gh auth token` credential into a plaintext file NOTHING reads is pure
 # exposure, so by default nothing is copied and the run says so. It runs only
-# for --token, a repointing ATERM_UPDATE_OWNER/_REPO, or an explicit
-# ATERM_UPDATE_TOKEN — the cases where the file (or value) is actually read —
-# and it keeps the repointed case working without `gh` on PATH (a
-# Finder-launched .app has a minimal one).
+# for --token, and it keeps a developer's repointed case working without `gh` on
+# PATH (a Finder-launched .app has a minimal one).
 #
 # It is idempotent (a matching token is left alone), it NEVER prints the token,
 # and --no-token is a hard off. No failure here is fatal.
@@ -3466,10 +3896,7 @@ provision_update_token() {
 	[[ "$(uname -s)" == "Darwin" ]] || return 0
 
 	local tok="" tok_source=""
-	if [[ -n "${ATERM_UPDATE_TOKEN:-}" ]]; then
-		tok="$ATERM_UPDATE_TOKEN"
-		tok_source="\$ATERM_UPDATE_TOKEN"
-	elif command -v gh >/dev/null 2>&1; then
+	if command -v gh >/dev/null 2>&1; then
 		tok="$(gh auth token 2>/dev/null || true)"
 		tok_source="gh auth token"
 	fi
@@ -3496,17 +3923,14 @@ provision_update_token() {
 		# NOT a warning: the compiled-in channel is public, so this Mac updates
 		# without any credential — just on the slower anonymous interval.
 		echo "install.sh: no GitHub token available — the update channel is public, so this Mac"
-		echo "install.sh:   still auto-updates. Unauthenticated checks share ~60 GitHub requests per"
-		echo "install.sh:   hour per IP, so it checks about every 30 minutes instead of every 75s."
-		echo "install.sh:   To get the faster cadence, export ATERM_UPDATE_TOKEN for the app — on the"
-		echo "install.sh:   public channel that is the ONLY token source the updater consults."
+		echo "install.sh:   auto-updates with no credential at all."
 		# NOT "$0": piped as `… | bash` that is literally "bash". Name the
 		# invocation for how this run ACTUALLY happened: tools/install.sh
 		# exists only for a checkout, and the audience that reaches this
 		# message is dominated by piped anon-lane users (no gh means no gh
 		# lane) — they need the one-liner, not a path they do not have.
-		echo "install.sh:   The file this step writes is read only when ATERM_UPDATE_OWNER/_REPO point"
-		echo "install.sh:   the updater at another repo; add it later with:"
+		echo "install.sh:   The file this step writes is read only by a development build whose"
+		echo "install.sh:   [update] owner/repo point the updater at another repo; add it later with:"
 		if self_on_disk; then
 			echo "install.sh:     gh auth login && tools/install.sh --token --no-app --no-cli --no-toolchain --no-path"
 		else
@@ -3538,7 +3962,7 @@ provision_update_token() {
 	# plaintext (0600) file, so intent prints BEFORE the write — what, where,
 	# why, and the off switch. (The half only runs at all when something will
 	# read the file or the operator asked; see token_provisioning_wanted.)
-	echo "install.sh: provisioning: copying the GitHub credential from $tok_source to $UPDATE_TOKEN_FILE (0600) so a repointed updater (ATERM_UPDATE_OWNER/_REPO) can authenticate without gh on PATH — --no-token skips this"
+	echo "install.sh: provisioning: copying the GitHub credential from $tok_source to $UPDATE_TOKEN_FILE (0600) so a development build's repointed updater ([update] owner/repo) can authenticate without gh on PATH — --no-token skips this"
 
 	if ! mkdir -p "$UPDATE_TOKEN_DIR" 2>/dev/null; then
 		echo "install.sh: WARNING: could not create $UPDATE_TOKEN_DIR — the update token was NOT provisioned (public-channel updates are unaffected)" >&2
@@ -3602,13 +4026,16 @@ cli_path_hint() {
 # one — no error, no notice, just ten programs that never existed.
 #
 # `atpkg seed` is the right thing to call rather than reimplementing any of
-# its decisions here: it is local-only (a DirFetcher over the sealed payload —
-# no network), and it already answers every "cannot seed" case as SUCCESS with
-# a stable spoken marker (`seed-unusable:` for a machine the registry
-# publishes nothing for, or a lapsed horizon, `seed-pending:` for
-# [packages].seed_install = false, and a plain note when a previous
-# `uninstall --all` declined the set). So a non-zero exit here is a REAL
-# failure — with ONE exception, ATPKG_CONTENDED_EXIT: the app is already open
+# its decisions here: it records adoption, lays the pending stubs, and already
+# answers every "cannot seed" case as SUCCESS with a stable spoken line
+# (`seed-unusable:` for a machine the signed index publishes nothing for, and a
+# plain note for [packages].auto_install = false or when a previous
+# `uninstall --all` declined the set). An app from a pinned pre-v0.63 release
+# (the only one that carries a sealed payload) reads that payload with its own,
+# older atpkg; a current atpkg reads none — Phase 5 of
+# docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md deleted that lane. So a
+# non-zero exit here is a REAL failure — with ONE exception,
+# ATPKG_CONTENDED_EXIT: the app is already open
 # and its own launch-time pass holds the store lock, which is the app doing
 # this function's job; the script stands aside and says so — and the config
 # knobs keep their meaning instead of being second-guessed in shell.

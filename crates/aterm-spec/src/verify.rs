@@ -49,9 +49,32 @@
 //!
 //! [`find_ty`]/[`find_trust_ir`] then discover them automatically at their canonical
 //! release paths — or anywhere the full-toolchain bootstrap (`build/<triple>/…`)
-//! dropped them, or on `PATH`. The home directory (`$HOME`, or `%USERPROFILE%` on
-//! Windows) and `PATH` are the only environment access; there is no path override
-//! and nothing to remember to set.
+//! dropped them, or through the atpkg-managed store's shim, or on `PATH`, in that
+//! order: a developer tree wins over the managed store (owner policy). The home
+//! directory (`$HOME`, or `%USERPROFILE%` on Windows), `%LOCALAPPDATA%` (Windows)
+//! and `PATH` are the only environment access; there is no path override and
+//! nothing to remember to set.
+//!
+//! ## The tier names the binary it ran
+//!
+//! Because a developer tree SHADOWS the store, which binary answered is not
+//! obvious — and it used to be invisible: a passing check named no binary, and
+//! the path reached output only inside a failure panic. The first discovery of
+//! each tool in a process now writes one line straight to stderr (not through
+//! `eprintln!`, which libtest swallows for a passing test):
+//!
+//! ```text
+//! VERIFY ESCALATION TIER: ty = $HOME/trust/build/host/stage1/bin/ty [bootstrap tree $HOME/trust/build; ty 0.15.0; built 2026-09-16] — discovery prefers the developer tree (owner policy), so this shadows the managed store's store/trust/9192/bin/ty (built 2026-09-19), store/ty/3007/bin/ty (built 2026-09-24)
+//! ```
+//!
+//! (Measured on m3, 2026-09-24. A `built` date is the file's mtime in UTC —
+//! a reinstall moves it — because `--version` does not change between builds of
+//! one package version.)
+//!
+//! It costs one `--version` spawn per tool per process (bounded at five
+//! seconds), a few `stat`s and a 256-byte head read per candidate; store
+//! copies are described from the filesystem alone, never by running them. [`locate_ty`]/[`locate_ay`]/[`locate_trust_ir`] return the same
+//! answer as a [`Located`] for a caller that wants the tier programmatically.
 //!
 //! ## Caller idioms
 //!
@@ -87,62 +110,164 @@ use crate::derive::Model;
 use crate::interp;
 
 /// Discover the Trust `ty` model-checker. Searches, in order: the canonical
-/// first-party cargo build, any full-toolchain bootstrap stage build, then `ty` on
-/// `PATH`. The home directory and `PATH` are the only environment access.
+/// first-party cargo build, any full-toolchain bootstrap stage build, the
+/// atpkg-managed store's shim, then `ty` on `PATH` (see [`locate_ty`] for which
+/// tier answered). The home directory, `PATH` and (Windows) `%LOCALAPPDATA%` are
+/// the only environment access.
+///
+/// The first discovery of each tool in a process prints ONE
+/// `VERIFY ESCALATION TIER: ty = …` line straight to stderr naming the binary,
+/// the tier it came from, its `--version` and build date, and every managed
+/// store copy it shadowed (the module doc, "The tier names the binary it ran").
 #[must_use]
 pub fn find_ty() -> Option<PathBuf> {
-    find_trust_bin("ty", "ty/target/release")
+    locate_ty().map(|l| l.path)
 }
 
 /// Discover the Trust `trust-ir` `spec-link` cross-referencer. Mirrors [`find_ty`].
 #[must_use]
 pub fn find_trust_ir() -> Option<PathBuf> {
-    find_trust_bin("trust-ir", "trust-ir/target/release")
+    locate_trust_ir().map(|l| l.path)
 }
 
 /// Discover the Trust `ay` SAT/SMT/CHC solver. Mirrors [`find_ty`] exactly
-/// (canonical first-party build → full-toolchain bootstrap stage scan → PATH),
-/// plus the standalone `~/ay` release checkout some proof bundles' `verify.sh`
-/// scripts also probe. Used by the always-on `sparkle_v2_ay_certificates`
-/// gate: hand-encoded SMT-LIB2 certificates are re-checked fail-closed, the
-/// same honesty ratchet as the `ty` Tier-0 gates.
+/// (canonical first-party build → full-toolchain bootstrap stage scan → store
+/// shim → PATH), plus the standalone `~/ay` release checkout some proof
+/// bundles' `verify.sh` scripts also probe. Used by the always-on
+/// `sparkle_v2_ay_certificates` gate: hand-encoded SMT-LIB2 certificates are
+/// re-checked fail-closed, the same honesty ratchet as the `ty` Tier-0 gates.
 #[must_use]
 pub fn find_ay() -> Option<PathBuf> {
-    if let Some(p) = find_trust_bin("ay", "ay/target/release") {
-        return Some(p);
-    }
-    // Standalone `~/ay` checkout, probed the same Windows-aware way as `find_trust_bin`
-    // (all candidate homes + the platform exe name) rather than `$HOME` only.
-    let exe = exe_name("ay");
-    for home in home_dirs() {
-        let standalone = home.join("ay/target/release").join(&exe);
-        if standalone.exists() {
-            return Some(standalone);
-        }
-    }
-    None
+    locate_ay().map(|l| l.path)
 }
 
-/// Shared discovery: the canonical `$HOME/trust/first-party/<rel_dir>/<bin>` cargo
-/// build, then any matching tool the full-toolchain bootstrap left under
-/// `$HOME/trust/build/<triple>/…`, then `<bin>` on `PATH`. All filesystem probes use
-/// the platform executable name (`ty` vs `ty.exe`).
-// Skip: drop glue for the `Vec<PathBuf>` search-path IntoIter (std/alloc
-// internals — the drop-glue lane). Build-tooling discovery; every miss
-// returns None (fail-closed).
+/// [`find_ty`], plus WHERE the binary came from.
+#[must_use]
+pub fn locate_ty() -> Option<Located> {
+    discover("ty", "ty/target/release", false)
+}
+
+/// [`find_trust_ir`], plus where the binary came from.
+#[must_use]
+pub fn locate_trust_ir() -> Option<Located> {
+    discover("trust-ir", "trust-ir/target/release", false)
+}
+
+/// [`find_ay`], plus where the binary came from.
+#[must_use]
+pub fn locate_ay() -> Option<Located> {
+    discover("ay", "ay/target/release", true)
+}
+
+/// The discovery tier that answered. The precedence is the variants' order
+/// (with `StandaloneAy` last, `ay` only) and is the owner's policy — a live
+/// `$HOME/trust` wins over the managed store; this type only makes the answer
+/// visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrustBinOrigin {
+    /// `$HOME/trust/first-party/<tool>/target/release/<tool>` — a developer cargo build.
+    FirstParty,
+    /// `$HOME/trust/build/<triple>/{stage2-tools-bin/<triple>,stage1/bin}/<tool>` —
+    /// a full-toolchain bootstrap on a machine that builds Trust.
+    Bootstrap,
+    /// The atpkg-managed store, through its `<prefix>/bin/<tool>` shim.
+    Store,
+    /// `<tool>` on `PATH`.
+    Path,
+    /// `ay` only: the standalone `~/ay/target/release/ay` checkout.
+    StandaloneAy,
+}
+
+impl TrustBinOrigin {
+    /// The tier as a developer reads it in the provenance line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FirstParty => "first-party cargo build $HOME/trust/first-party",
+            Self::Bootstrap => "bootstrap tree $HOME/trust/build",
+            Self::Store => "atpkg managed store",
+            Self::Path => "PATH",
+            Self::StandaloneAy => "standalone ~/ay checkout",
+        }
+    }
+
+    /// A developer tree that discovery prefers over the managed store.
+    fn is_developer_tree(self) -> bool {
+        matches!(
+            self,
+            Self::FirstParty | Self::Bootstrap | Self::StandaloneAy
+        )
+    }
+}
+
+/// A discovered Trust binary and the tier that answered.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Located {
+    /// What the caller will execute.
+    pub path: PathBuf,
+    /// Which discovery tier produced it.
+    pub origin: TrustBinOrigin,
+}
+
+/// The real-environment discovery + the once-per-process provenance report.
+// Skip: environment + filesystem discovery and a stderr report.
+// Build-tooling discovery; every miss returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
-fn find_trust_bin(bin: &str, first_party_rel_dir: &str) -> Option<PathBuf> {
+fn discover(bin: &'static str, first_party_rel_dir: &str, standalone_ay: bool) -> Option<Located> {
+    let homes = home_dirs();
+    let store_bin = atpkg_store_bin_dir();
+    let path_var = std::env::var_os("PATH");
+    let found = find_trust_bin(
+        bin,
+        first_party_rel_dir,
+        &homes,
+        store_bin.as_deref(),
+        path_var.as_deref(),
+    )
+    .or_else(|| {
+        standalone_ay
+            .then(|| locate_standalone_ay_in(&homes))
+            .flatten()
+    });
+    report_provenance_once(bin, found.as_ref(), &homes, store_bin.as_deref());
+    found
+}
+
+/// Shared discovery — THE precedence: the canonical
+/// `$HOME/trust/first-party/<rel_dir>/<bin>` cargo build, then any matching tool the
+/// full-toolchain bootstrap left under `$HOME/trust/build/<triple>/…`, then the atpkg
+/// store shim, then `<bin>` on `PATH`. All filesystem probes use the platform
+/// executable name (`ty` vs `ty.exe`). The environment (homes, the store's
+/// `bin/` dir, the `PATH` value) is passed in EXPLICITLY so the order is
+/// testable over a temp HOME without mutating the process environment.
+// Skip: drop glue for the `&[PathBuf]` search (std/alloc internals — the
+// drop-glue lane). Build-tooling discovery; every miss returns None
+// (fail-closed).
+#[cfg_attr(trust_verify, trust::skip)]
+fn find_trust_bin(
+    bin: &str,
+    first_party_rel_dir: &str,
+    homes: &[PathBuf],
+    store_bin_dir: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<Located> {
     let exe = exe_name(bin);
-    for home in home_dirs() {
+    for home in homes {
         let canonical = home
             .join("trust/first-party")
             .join(first_party_rel_dir)
             .join(&exe);
         if canonical.exists() {
-            return Some(canonical);
+            return Some(Located {
+                path: canonical,
+                origin: TrustBinOrigin::FirstParty,
+            });
         }
         if let Some(p) = scan_trust_bootstrap(&home.join("trust/build"), &exe) {
-            return Some(p);
+            return Some(Located {
+                path: p,
+                origin: TrustBinOrigin::Bootstrap,
+            });
         }
     }
     // The atpkg-managed store (batteries-included installs): the per-tool shim
@@ -153,34 +278,54 @@ fn find_trust_bin(bin: &str, first_party_rel_dir: &str) -> Option<PathBuf> {
     // / CI process, so without this probe a seeded toolchain is invisible to
     // those. A shim is trusted only when it resolves to a real file
     // (a dangling link after a GC must not satisfy discovery).
-    if let Some(p) = atpkg_store_probe(&exe) {
-        return Some(p);
+    if let Some(p) = store_bin_dir.and_then(|d| resolve_store_shim(&d.join(&exe))) {
+        return Some(Located {
+            path: p,
+            origin: TrustBinOrigin::Store,
+        });
     }
-    path_search(&exe)
+    path_search_in(&exe, path_var).map(|path| Located {
+        path,
+        origin: TrustBinOrigin::Path,
+    })
 }
 
-/// The default atpkg store shim for `exe`, resolved. The prefix mirrors
+/// `ay`'s last resort: the standalone `~/ay` checkout, probed the same
+/// Windows-aware way as the shared discovery (all candidate homes + the
+/// platform exe name) rather than `$HOME` only.
+#[cfg_attr(trust_verify, trust::skip)]
+fn locate_standalone_ay_in(homes: &[PathBuf]) -> Option<Located> {
+    let exe = exe_name("ay");
+    homes
+        .iter()
+        .map(|home| home.join("ay/target/release").join(&exe))
+        .find(|p| p.exists())
+        .map(|path| Located {
+            path,
+            origin: TrustBinOrigin::StandaloneAy,
+        })
+}
+
+/// The atpkg store's `bin/` directory. The prefix mirrors
 /// `atpkg::platform::default_prefix` (`~/Library/Application Support/aterm/pkg`
-/// on Unix, `%LOCALAPPDATA%\aterm\pkg` on Windows) — kept as a PATH MIRROR, not
+/// on macOS, `%LOCALAPPDATA%\aterm\pkg` on Windows) — kept as a PATH MIRROR, not
 /// a dependency edge, so the spec crate never drags the package manager (ring,
 /// tar, zstd) into every conformance consumer; if atpkg ever moves its prefix,
 /// update both sites (each carries this cross-reference).
-// Skip: fs syscall wrappers (exists/canonicalize — absent std bodies); every
-// miss returns None (fail-closed). Build-tooling discovery, not runtime code.
+// Skip: environment reads; every miss returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
-fn atpkg_store_probe(exe: &str) -> Option<PathBuf> {
-    let bin_dir = if cfg!(windows) {
+fn atpkg_store_bin_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
         let local = std::env::var("LOCALAPPDATA")
             .ok()
             .filter(|d| !d.is_empty())?;
-        PathBuf::from(local).join("aterm").join("pkg").join("bin")
+        Some(PathBuf::from(local).join("aterm").join("pkg").join("bin"))
     } else {
-        unix_store_bin_dir(&home_dirs().into_iter().next()?)
-    };
-    resolve_store_shim(&bin_dir.join(exe))
+        Some(unix_store_bin_dir(&home_dirs().into_iter().next()?))
+    }
 }
 
-/// The Unix half of the prefix mirror (see [`atpkg_store_probe`]):
+/// The Unix half of the prefix mirror (see [`atpkg_store_bin_dir`]):
 /// `<home>/Library/Application Support/aterm/pkg/bin` on macOS,
 /// `<home>/.local/share/aterm/pkg/bin` elsewhere.
 fn unix_store_bin_dir(home: &Path) -> PathBuf {
@@ -202,25 +347,80 @@ fn unix_store_bin_dir(home: &Path) -> PathBuf {
     }
 }
 
-/// A shim is trusted only when it is a SYMLINK that resolves to a real file.
+/// A shim is trusted only when it FORWARDS to a real file: a symlink an older
+/// atpkg laid, or the `#!/bin/sh` exec stub atpkg lays today.
 ///
-/// The symlink requirement is load-bearing, not incidental: atpkg disables a
-/// yanked or below-floor build by REPLACING the forwarding symlink with a
-/// failing regular-file TOMBSTONE script (`atpkg::activate::install_tombstone_shim`).
-/// Accepting any regular file would hand discovery that tombstone — and because
-/// this probe runs before the PATH search, a revoked build would then SHADOW a
+/// Today's shape is the stub (`atpkg::platform::unix` writes one on purpose:
+/// `targo` refuses a symlinked `current_exe`, so a shim `exec`s the store file
+/// at its real path). Its target is the first trimmed line that reads
+/// `exec '<path>' "$@"` — the same rule as atpkg's own
+/// `platform::parse_sh_shim_target`, which every store answer (`which`, gc,
+/// `prune_stale_shims`) is built on, including a routed shim whose guard line
+/// starts with `[` and so never matches. Until 2026-09-23 this probe accepted
+/// ONLY a symlink, so it answered `None` for every shim atpkg had laid since
+/// the stubs replaced the links (measured on m3: 0 of 62 `bin/` entries are
+/// symlinks) and the store tier never answered at all.
+///
+/// A TOMBSTONE must still read as ABSENT: atpkg disables a yanked or
+/// below-floor build by replacing the shim with a failing notice script
+/// (`atpkg::activate::install_tombstone_shim`) that carries no `exec` line, and
+/// the pending-program stub `exec`s `"$ATPKG"`, never a quoted literal path.
+/// Neither parses, so neither can satisfy discovery — and because this probe
+/// runs before the PATH search, a revoked build would otherwise SHADOW a
 /// working tool the developer already has on PATH (adversarial review
-/// 2026-07-30). A tombstone therefore reads as "absent", which is exactly what
-/// a revoked build should look like to the verification tier.
-// Skip: fs syscall wrappers (symlink_metadata/canonicalize — absent std
+/// 2026-07-30). Anything that is not a symlink or a readable regular file of
+/// at most 64 KiB (atpkg's own bound) — a directory, a FIFO — is absent too.
+///
+/// The answer is the RESOLVED target — what the shim would exec — never the
+/// shim. The target must be an absolute path to a regular file (a GC'd store
+/// build must not satisfy). It is deliberately NOT anchored to `<prefix>/store`:
+/// a `aterm pkg dev link` points a shim at a checkout, the symlink branch always
+/// accepted such a link, and the tool a developer linked is the one they meant.
+///
+/// Public for ONE consumer: atpkg's test
+/// `aterm_spec_discovery_reads_every_shim_atpkg_lays` lays each shim shape through
+/// atpkg's real writers and asks this function to read it — the pin that turns a
+/// future change to atpkg's stub into a red test instead of a silently dead tier.
+// Skip: fs syscall wrappers (symlink_metadata/canonicalize/read — absent std
 // bodies); every miss returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
-fn resolve_store_shim(shim: &Path) -> Option<PathBuf> {
-    if !std::fs::symlink_metadata(shim).is_ok_and(|m| m.file_type().is_symlink()) {
+#[must_use]
+pub fn resolve_store_shim(shim: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(shim).ok()?;
+    let target = if meta.file_type().is_symlink() {
+        shim.to_path_buf()
+    } else if meta.file_type().is_file() && meta.len() <= MAX_STORE_SHIM_BYTES {
+        let content = std::fs::read_to_string(shim).ok()?;
+        let target = parse_exec_stub_target(&content)?;
+        if !target.is_absolute() {
+            return None;
+        }
+        target
+    } else {
         return None;
-    }
-    let resolved = std::fs::canonicalize(shim).ok()?;
+    };
+    let resolved = std::fs::canonicalize(target).ok()?;
     resolved.is_file().then_some(resolved)
+}
+
+/// The size bound on a shim this probe will read — atpkg's own `MAX_SHIM_BYTES`.
+const MAX_STORE_SHIM_BYTES: u64 = 64 * 1024;
+
+/// The target an atpkg `sh` exec stub forwards to: the first trimmed line of the
+/// form `exec '<path>' "$@"`, with `'\''` unquoted — a mirror of
+/// `atpkg::platform::parse_sh_shim_target` (kept as a mirror, not a dependency
+/// edge, for the same reason as [`atpkg_store_bin_dir`]'s prefix; if atpkg ever
+/// changes its stub, update both sites). `None` for a tombstone or a pending stub.
+fn parse_exec_stub_target(content: &str) -> Option<PathBuf> {
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("exec '")
+            && let Some(end) = rest.rfind("' \"$@\"")
+        {
+            return Some(PathBuf::from(rest[..end].replace("'\\''", "'")));
+        }
+    }
+    None
 }
 
 /// `<bin>` with the platform executable suffix (`.exe` on Windows, none on Unix).
@@ -279,14 +479,379 @@ fn scan_trust_bootstrap(build: &Path, exe: &str) -> Option<PathBuf> {
 }
 
 /// `PATH` lookup via `std::env::split_paths` — portable, no shell dependency.
+/// `path_var` is the value of `PATH` (passed in, so discovery is testable).
 // Skip: `Path::is_file` is an fs syscall wrapper (absent body); every
 // miss returns None (fail-closed). Build-tooling discovery.
 #[cfg_attr(trust_verify, trust::skip)]
-fn path_search(exe: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+fn path_search_in(exe: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path_var?)
         .map(|dir| dir.join(exe))
         .find(|cand| cand.is_file() && !is_pending_stub(cand))
+}
+
+// ---------------------------------------------------------------------------
+// PROVENANCE: the escalation tier names the binary it ran.
+//
+// Discovery prefers a developer tree over the managed store — that order is the
+// owner's policy and is not changed here. What WAS wrong is that it was silent:
+// a passing check printed "additionally model-checked clean by ty" and nothing
+// about WHICH ty, and the binary path reached output only inside a failure
+// panic. Measured 2026-09-23 on m3: every derived-model check ran
+// `$HOME/trust/build/host/stage1/bin/ty` (a bootstrap build from 2026-09-16) and
+// every spec-link ran `$HOME/trust/first-party/trust-ir` 0.2.0 from 2026-08-17
+// while the managed store held trust-ir 0.14.0 — a stale override nothing
+// reported. Now the first discovery of each tool in a process prints one line
+// naming the binary, its tier, its `--version`, its build date, and every
+// managed-store copy it shadowed.
+// ---------------------------------------------------------------------------
+
+/// A copy of a tool in the atpkg store: `<prefix>/store/<program>/current/bin/<exe>`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StoreCopy {
+    /// The store program that carries it (`ty`, or `trust` for the toolchain bundle).
+    program: String,
+    /// The build `current` points at (the store directory name, e.g. `3007`).
+    build: String,
+    /// The resolved file.
+    path: PathBuf,
+    /// Its mtime as a UTC date, when readable.
+    built: Option<String>,
+}
+
+impl StoreCopy {
+    fn describe(&self) -> String {
+        let exe = self
+            .path
+            .file_name()
+            .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+        format!(
+            "store/{}/{}/bin/{exe} (built {})",
+            self.program,
+            self.build,
+            self.built.as_deref().unwrap_or("date unknown")
+        )
+    }
+}
+
+/// Every live store copy of `exe`: for each program in `store_root`, the file
+/// `current/bin/<exe>` resolves to, if it is a real file and not a pending
+/// stub. No process is spawned for a copy — a `stat`, and the bounded head read
+/// [`is_pending_stub`] makes (the one `--version` spent per tool goes to the
+/// binary discovery actually chose). Sorted by program name so the report is
+/// deterministic.
+// Skip: read_dir / canonicalize — fs iteration with absent std bodies.
+#[cfg_attr(trust_verify, trust::skip)]
+fn store_copies_in(store_root: &Path, exe: &str) -> Vec<StoreCopy> {
+    let Ok(entries) = std::fs::read_dir(store_root) else {
+        return Vec::new();
+    };
+    let mut copies: Vec<StoreCopy> = entries
+        .flatten()
+        .filter_map(|e| {
+            let build_dir = std::fs::canonicalize(e.path().join("current")).ok()?;
+            let path = build_dir.join("bin").join(exe);
+            if !path.is_file() || is_pending_stub(&path) {
+                return None;
+            }
+            Some(StoreCopy {
+                program: e.file_name().to_string_lossy().into_owned(),
+                build: build_dir.file_name()?.to_string_lossy().into_owned(),
+                built: build_date(&path),
+                path,
+            })
+        })
+        .collect();
+    copies.sort_by(|a, b| a.program.cmp(&b.program));
+    copies
+}
+
+/// The target `p` forwards to when it is an atpkg exec stub (read through
+/// [`parse_exec_stub_target`], the same rule the store probe uses), else
+/// `None`. Bounded: a file over atpkg's shim size is not read, so a
+/// multi-megabyte binary is never slurped to learn it is not a shim.
+// Skip: bounded file read. Build-tooling discovery.
+#[cfg_attr(trust_verify, trust::skip)]
+fn exec_stub_target(p: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(p).ok()?;
+    if !meta.is_file() || meta.len() > MAX_STORE_SHIM_BYTES {
+        return None;
+    }
+    parse_exec_stub_target(&std::fs::read_to_string(p).ok()?)
+}
+
+/// A file's mtime as a UTC `YYYY-MM-DD` — the build date a developer can act
+/// on (`--version` does not move between builds of one package version).
+#[cfg_attr(trust_verify, trust::skip)]
+fn build_date(p: &Path) -> Option<String> {
+    let secs = std::fs::metadata(p)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let (y, m, d) = civil_from_unix_days(i64::try_from(secs / 86_400).ok()?);
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// Days since 1970-01-01 → proleptic Gregorian (year, month, day), UTC.
+/// Howard Hinnant's `civil_from_days`, so the report needs no date crate.
+fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    // Both are range-bounded by construction (1..=31, 1..=12).
+    (
+        y,
+        u32::try_from(m).unwrap_or(0),
+        u32::try_from(d).unwrap_or(0),
+    )
+}
+
+/// The first line `<bin> --version` prints, or `None` if it fails, prints
+/// nothing, or does not answer within five seconds (it is then killed — a
+/// wedged probe must never wedge the suite). Called at most ONCE per tool per
+/// process, from [`report_provenance_once`].
+// Skip: spawns a subprocess and polls it. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn probe_version(bin: &Path) -> Option<String> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let first = |b: &[u8]| {
+        String::from_utf8_lossy(b)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| l.chars().take(160).collect::<String>())
+    };
+    first(&out.stdout).or_else(|| first(&out.stderr))
+}
+
+/// `p` with the home directory written as `~`, for a line a human reads.
+fn tilde(p: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| p.strip_prefix(h).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
+    }
+}
+
+/// What the store's own `<prefix>/bin/<exe>` shim is — the reason a store copy
+/// can be present yet unreached.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum StoreShim {
+    /// No file by that name in the store's `bin/`.
+    Absent,
+    /// A regular file with no `exec '<path>'` line — a tombstone or a pending
+    /// stub, which [`resolve_store_shim`] reads as absent on purpose.
+    Refusal,
+    /// A symlink or exec stub whose target is not an absolute path to a real
+    /// file (a reclaimed build) — or, if discovery took it, a live shim.
+    Forwarding,
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn classify_store_shim(shim: &Path) -> StoreShim {
+    match std::fs::symlink_metadata(shim) {
+        Err(_) => StoreShim::Absent,
+        Ok(m) if m.file_type().is_symlink() => StoreShim::Forwarding,
+        Ok(_) if exec_stub_target(shim).is_some() => StoreShim::Forwarding,
+        Ok(_) => StoreShim::Refusal,
+    }
+}
+
+/// The one-line provenance report — PURE, so the wording is testable without a
+/// spawn. `found` is what discovery chose (`None` = nothing on any tier);
+/// `version`/`built` describe it; `shadowed` are the store copies OTHER than
+/// the chosen binary; `shim` explains a miss.
+fn render_provenance(
+    bin: &str,
+    found: Option<&Located>,
+    version: Option<&str>,
+    built: Option<&str>,
+    shadowed: &[StoreCopy],
+    shim: &StoreShim,
+    home: Option<&Path>,
+) -> String {
+    let copies = shadowed
+        .iter()
+        .map(StoreCopy::describe)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Some(found) = found else {
+        let standalone = if bin == "ay" { ", ~/ay" } else { "" };
+        let mut line = format!(
+            "VERIFY ESCALATION TIER: {bin} = NOT FOUND (probed $HOME/trust/first-party, \
+             $HOME/trust/build, the atpkg store shim, PATH{standalone})"
+        );
+        if !shadowed.is_empty() {
+            let why = match shim {
+                StoreShim::Absent => {
+                    format!("no `{bin}` shim in the store's bin/ exposes it")
+                }
+                StoreShim::Refusal => format!(
+                    "the store's `{bin}` shim is a refusal script (tombstone or pending stub)"
+                ),
+                StoreShim::Forwarding => format!(
+                    "the store's `{bin}` shim does not resolve to a file (a reclaimed build?)"
+                ),
+            };
+            line.push_str(&format!(
+                " — the managed store holds {copies} but discovery does not reach it: {why}"
+            ));
+        }
+        return line;
+    };
+    let shim_note = if found.origin == TrustBinOrigin::Path {
+        exec_stub_target(&found.path)
+            .map(|t| format!(" (atpkg shim → {})", tilde(&t, home)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut line = format!(
+        "VERIFY ESCALATION TIER: {bin} = {} [{}{shim_note}; {}; built {}]",
+        tilde(&found.path, home),
+        found.origin.label(),
+        version.unwrap_or("version unknown"),
+        built.unwrap_or("date unknown"),
+    );
+    if !shadowed.is_empty() {
+        if found.origin.is_developer_tree() {
+            line.push_str(&format!(
+                " — discovery prefers the developer tree (owner policy), so this shadows the \
+                 managed store's {copies}"
+            ));
+        } else {
+            line.push_str(&format!(" — the managed store also holds {copies}"));
+        }
+    }
+    line
+}
+
+/// Everything the provenance line needs except the one spawn (`version`),
+/// over an explicit environment: the store copies other than the chosen
+/// binary, what the store's own shim is, the chosen binary's build date.
+// Skip: fs probes + formatting. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn provenance_line(
+    bin: &str,
+    found: Option<&Located>,
+    version: Option<&str>,
+    homes: &[PathBuf],
+    store_bin: Option<&Path>,
+) -> String {
+    let exe = exe_name(bin);
+    let copies = store_bin
+        .and_then(Path::parent)
+        .map(|prefix| store_copies_in(&prefix.join("store"), &exe))
+        .unwrap_or_default();
+    // The chosen binary's real file (through an exec-stub shim when discovery
+    // took one off PATH), so the store copy it IS is not listed as shadowed.
+    let chosen = found.and_then(|f| {
+        let real = exec_stub_target(&f.path).unwrap_or_else(|| f.path.clone());
+        std::fs::canonicalize(real).ok()
+    });
+    let shadowed: Vec<StoreCopy> = copies
+        .into_iter()
+        .filter(|c| std::fs::canonicalize(&c.path).ok() != chosen)
+        .collect();
+    let shim = store_bin.map_or(StoreShim::Absent, |d| classify_store_shim(&d.join(&exe)));
+    let built = found.and_then(|f| build_date(&f.path));
+    render_provenance(
+        bin,
+        found,
+        version,
+        built.as_deref(),
+        &shadowed,
+        &shim,
+        homes.first().map(PathBuf::as_path),
+    )
+}
+
+/// First-report-per-tool bookkeeping: `true` exactly once per `bin` per `set`.
+fn claim_first_report(set: &Mutex<BTreeSet<&'static str>>, bin: &'static str) -> bool {
+    set.lock().unwrap_or_else(|e| e.into_inner()).insert(bin)
+}
+
+/// Print the provenance line for `bin`, ONCE per process (the first discovery
+/// wins; the ~hundreds of later `find_ty` calls in a suite stay silent and
+/// spawn nothing).
+///
+/// Written straight to the process's stderr handle rather than via
+/// `eprintln!`: libtest captures the print macros for a PASSING test and
+/// throws the text away, which is exactly why the success lines never told
+/// anyone which `ty` ran. A direct handle write is not captured, so the line
+/// reaches the developer's terminal and the gate's stage log on a green run.
+// Skip: fs probes, one subprocess, a stderr write. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn report_provenance_once(
+    bin: &'static str,
+    found: Option<&Located>,
+    homes: &[PathBuf],
+    store_bin: Option<&Path>,
+) {
+    use std::io::Write;
+    static REPORTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+    if !claim_first_report(&REPORTED, bin) {
+        return;
+    }
+    let version = found.and_then(|f| probe_version(&f.path));
+    let line = provenance_line(bin, found, version.as_deref(), homes, store_bin);
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// For a NOT RUN notice: the managed-store copies of `bin` that exist but that
+/// discovery did not reach, as a sentence — empty when there are none.
+#[cfg_attr(trust_verify, trust::skip)]
+fn unreached_store_note(bin: &str) -> String {
+    let copies = atpkg_store_bin_dir()
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|prefix| store_copies_in(&prefix.join("store"), &exe_name(bin)))
+        .unwrap_or_default();
+    if copies.is_empty() {
+        return String::new();
+    }
+    let list = copies
+        .iter()
+        .map(StoreCopy::describe)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        " The managed store holds {list}, but no discovery tier reaches it (see the \
+         `VERIFY ESCALATION TIER: {bin} = NOT FOUND` line)."
+    )
 }
 
 /// Is this candidate atpkg's PENDING-PROGRAM stub rather than the tool?
@@ -300,14 +865,30 @@ fn path_search(exe: &str) -> Option<PathBuf> {
 /// `trust-ir` stub reached PATH, where before it had cleanly skipped). The stub
 /// names itself on its second line; anything unreadable is treated as a real
 /// binary, because a false "pending" would hide an installed tool.
+///
+/// Only the HEAD is read. The marker sits on the stub's second line, and the
+/// real tool is big (ty is ~157 MB in the store on m3, trust's bundled ty ~165
+/// MB), so reading the whole file — which this did until 2026-09-24 — cost a
+/// full read of every candidate and, with the store copies now described too,
+/// hundreds of megabytes per tool per test process.
+// Skip: bounded file read. Build-tooling discovery.
+#[cfg_attr(trust_verify, trust::skip)]
 fn is_pending_stub(cand: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(cand) else {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(cand) else {
         return false;
     };
-    let head = &bytes[..bytes.len().min(256)];
+    let mut head = Vec::new();
+    if file.take(PENDING_STUB_HEAD).read_to_end(&mut head).is_err() {
+        return false;
+    }
     head.windows(PENDING_STUB_MARKER.len())
         .any(|w| w == PENDING_STUB_MARKER)
 }
+
+/// How much of a candidate [`is_pending_stub`] reads: the stub's marker is on
+/// its second line, well inside this.
+const PENDING_STUB_HEAD: u64 = 256;
 
 /// The self-identifying line atpkg writes into every pending-program stub.
 const PENDING_STUB_MARKER: &[u8] = b"atpkg pending-program stub";
@@ -386,11 +967,19 @@ fn require(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> 
 /// Shared escalation report + early-return decision.
 fn escalation(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> Option<PathBuf> {
     if found.is_none() {
+        // "Not installed" is only true when the store holds no copy either; a
+        // copy discovery cannot reach is named, never reported as absent.
+        let store_note = unreached_store_note(bin);
+        let state = if store_note.is_empty() {
+            "is not installed"
+        } else {
+            "was not found by discovery"
+        };
         eprintln!(
-            "VERIFY ESCALATION TIER NOT RUN: Trust `{bin}` is not installed, so `{label}` \
+            "VERIFY ESCALATION TIER NOT RUN: Trust `{bin}` {state}, so `{label}` \
              (an external-tool-analysis obligation) did not run on this machine. The \
              applicable in-process derived-model checks still ran. Enable the \
-             escalation tier once: {build_hint}."
+             escalation tier once: {build_hint}.{store_note}"
         );
     }
     found
@@ -1709,6 +2298,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The stub check reads the HEAD of a candidate and nothing more: a real
+    /// tool is ~160 MB, and every store copy of it is checked. Proved with a
+    /// FIFO whose writer sends a stub's head and then holds the pipe OPEN — a
+    /// whole-file read never sees EOF and blocks, a bounded one answers.
+    #[cfg(unix)]
+    #[test]
+    fn the_pending_stub_check_reads_only_the_head() {
+        let dir = std::env::temp_dir().join(format!("aterm_stub_head_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mk probe dir");
+        let fifo = dir.join("endless");
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer_path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut w = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open fifo for write");
+            let mut head = b"#!/bin/sh\n# atpkg pending-program stub v1\n".to_vec();
+            // Longer than the bound, so a bounded read stops inside it.
+            head.resize(320, b'#');
+            assert!(head.len() as u64 > super::PENDING_STUB_HEAD);
+            let _ = w.write_all(&head);
+            // Hold the pipe open: no EOF until the check has answered.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(is_pending_stub(&reader_path));
+        });
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = release_tx.send(());
+        let _ = writer.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            answer,
+            Ok(true),
+            "the check must answer from the head while the writer holds the pipe open — \
+             a whole-file read blocks here waiting for an EOF that never comes"
+        );
+    }
+
     use super::*;
     use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
     use crate::ty_model;
@@ -1781,8 +2419,9 @@ mod tests {
         );
     }
 
-    /// A dangling store shim never satisfies discovery; a live one resolves to
-    /// the real store target (what the caller will execute), not the link.
+    /// A dangling store shim never satisfies discovery; a live one — a symlink an
+    /// older atpkg laid, or today's exec stub — resolves to the real store target
+    /// (what the caller will execute), not the shim.
     #[cfg(unix)]
     #[test]
     fn store_shim_resolution_is_fail_closed() {
@@ -1812,7 +2451,395 @@ mod tests {
         std::os::unix::fs::symlink(&target, &shim).unwrap();
         let got = resolve_store_shim(&shim).expect("live shim resolves");
         assert_eq!(got, std::fs::canonicalize(&target).unwrap());
+        // THE SHAPE ATPKG LAYS TODAY: a `#!/bin/sh` exec stub, never a symlink. Its first
+        // `exec '<path>' "$@"` line is the target — including a path with a quote in it.
+        std::fs::remove_file(&shim).unwrap();
+        let quoted = d.join("store/it's/ty");
+        std::fs::create_dir_all(quoted.parent().unwrap()).unwrap();
+        std::fs::write(&quoted, b"#!/bin/sh\n").unwrap();
+        let stub = |target: &str| {
+            let _ = std::fs::remove_file(&shim);
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n\
+                     exec '{target}' \"$@\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        stub(&quoted.to_string_lossy().replace('\'', "'\\''"));
+        assert_eq!(
+            resolve_store_shim(&shim),
+            Some(std::fs::canonicalize(&quoted).unwrap()),
+            "an exec stub resolves to the file it execs"
+        );
+        // A stub whose build was reclaimed never satisfies discovery, and neither does one
+        // naming a RELATIVE path — which would resolve against the cwd: `Cargo.toml` is a
+        // real file relative to a `targo test` run's cwd, so only the absolute-path rule
+        // refuses it.
+        stub(&d.join("store/gone/ty").to_string_lossy());
+        assert_eq!(
+            resolve_store_shim(&shim),
+            None,
+            "a reclaimed build is absent"
+        );
+        assert!(
+            Path::new("Cargo.toml").is_file(),
+            "fixture: the relative file exists"
+        );
+        stub("Cargo.toml");
+        assert_eq!(
+            resolve_store_shim(&shim),
+            None,
+            "a relative target is absent"
+        );
+        // atpkg's pending-program stub execs `"$ATPKG"`, never a quoted literal path.
+        std::fs::remove_file(&shim).unwrap();
+        std::fs::write(
+            &shim,
+            b"#!/bin/sh\n# atpkg pending-program stub v1\nATPKG='/a/atpkg'\n\
+              if [ -x \"$ATPKG\" ]; then\n  exec \"$ATPKG\" __pending 'ty' \"$@\"\nfi\nexit 127\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_store_shim(&shim), None, "a pending stub is absent");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // -----------------------------------------------------------------------
+    // PROVENANCE — the escalation tier names the binary it ran. Every test
+    // below runs over a TEMP home + store prefix through the explicit-env
+    // resolver, so nothing reads or mutates the process environment and no
+    // test depends on what this machine has installed.
+    // -----------------------------------------------------------------------
+
+    /// A scratch HOME and atpkg prefix for one test.
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("aterm-spec-prov-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("home")).unwrap();
+            std::fs::create_dir_all(root.join("prefix/bin")).unwrap();
+            // Canonical, so `~` shortening matches the paths discovery returns
+            // (macOS temp_dir is itself behind the /var -> /private/var link).
+            let root = std::fs::canonicalize(&root).unwrap();
+            Self { root }
+        }
+        fn home(&self) -> PathBuf {
+            self.root.join("home")
+        }
+        fn store_bin(&self) -> PathBuf {
+            self.root.join("prefix/bin")
+        }
+        fn file(&self, rel: &str) -> PathBuf {
+            let p = self.root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"\x7fELF not really\n").unwrap();
+            p
+        }
+        /// `prefix/store/<program>/<build>/bin/<exe>` + `current -> <build>`.
+        #[cfg(unix)]
+        fn store_copy(&self, program: &str, build: &str, exe: &str) -> PathBuf {
+            let p = self.file(&format!("prefix/store/{program}/{build}/bin/{exe}"));
+            let dir = self.root.join(format!("prefix/store/{program}"));
+            std::os::unix::fs::symlink(dir.join(build), dir.join("current")).unwrap();
+            p
+        }
+        fn locate(&self, bin: &str, path_var: Option<&std::ffi::OsStr>) -> Option<Located> {
+            find_trust_bin(
+                bin,
+                &format!("{bin}/target/release"),
+                &[self.home()],
+                Some(&self.store_bin()),
+                path_var,
+            )
+        }
+        fn line(&self, bin: &str, found: Option<&Located>) -> String {
+            provenance_line(
+                bin,
+                found,
+                Some("ty 9.9.9"),
+                &[self.home()],
+                Some(&self.store_bin()),
+            )
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Cell 1 — bootstrap PRESENT, store PRESENT (m3's shape, measured
+    /// 2026-09-23): discovery keeps the owner's order and takes the bootstrap
+    /// build, and the line says so AND names the store copy it shadowed.
+    /// Before this change nothing on a passing run named either path.
+    #[cfg(unix)]
+    #[test]
+    fn provenance_bootstrap_present_store_present_names_both() {
+        let s = Scratch::new("bs-st");
+        let boot = s.file("home/trust/build/host/stage1/bin/ty");
+        s.store_copy("ty", "3007", "ty");
+        s.store_copy("trust", "9192", "ty");
+        let found = s.locate("ty", None).expect("bootstrap ty is found");
+        assert_eq!(found.origin, TrustBinOrigin::Bootstrap);
+        assert_eq!(found.path, boot);
+        let line = s.line("ty", Some(&found));
+        assert!(
+            line.starts_with(
+                "VERIFY ESCALATION TIER: ty = $HOME/trust/build/host/stage1/bin/ty \
+                 [bootstrap tree $HOME/trust/build; ty 9.9.9; built 2"
+            ),
+            "the line names the binary, its tier, its version and its build date: {line}"
+        );
+        assert!(
+            line.contains(
+                "discovery prefers the developer tree (owner policy), so this shadows the \
+                 managed store's store/trust/9192/bin/ty (built 2"
+            ) && line.contains("store/ty/3007/bin/ty (built 2"),
+            "every shadowed store copy is named beside the chosen one: {line}"
+        );
+    }
+
+    /// Cell 2 — bootstrap PRESENT, store ABSENT: the bootstrap build, and no
+    /// store clause (there is nothing to shadow).
+    #[test]
+    fn provenance_bootstrap_present_store_absent_has_no_store_clause() {
+        let s = Scratch::new("bs-nost");
+        s.file(&format!(
+            "home/trust/build/aarch64-apple-darwin/stage1/bin/{}",
+            exe_name("ty")
+        ));
+        let found = s.locate("ty", None).expect("bootstrap ty is found");
+        assert_eq!(found.origin, TrustBinOrigin::Bootstrap);
+        let line = s.line("ty", Some(&found));
+        assert!(
+            line.contains("[bootstrap tree $HOME/trust/build; ty 9.9.9; built "),
+            "{line}"
+        );
+        assert!(
+            !line.contains("store/"),
+            "no store, no store clause: {line}"
+        );
+        assert!(!line.contains(" — "), "{line}");
+    }
+
+    /// Cell 3 — bootstrap ABSENT, store PRESENT, PATH empty. With no usable
+    /// `ty` shim (m3's store lost its own-name `ty`/`ay` shims to a trust
+    /// rollback, measured 2026-09-23) nothing is found, and the line names the
+    /// store copy and WHY discovery missed it instead of implying the tool is
+    /// not installed. With a live shim — today's exec stub, or an older
+    /// symlink — the store tier answers and the line says so.
+    #[cfg(unix)]
+    #[test]
+    fn provenance_bootstrap_absent_store_present_names_the_unreached_copy() {
+        let s = Scratch::new("nobs-st");
+        s.store_copy("ty", "3007", "ty");
+        let shim = s.store_bin().join("ty");
+        let unreached = |why: &str| {
+            assert_eq!(s.locate("ty", None), None, "{why}");
+            let line = s.line("ty", None);
+            assert!(
+                line.starts_with("VERIFY ESCALATION TIER: ty = NOT FOUND"),
+                "{line}"
+            );
+            assert!(
+                line.contains("the managed store holds store/ty/3007/bin/ty (built 2")
+                    && line.ends_with(&format!("but discovery does not reach it: {why}")),
+                "{line}"
+            );
+        };
+        unreached("no `ty` shim in the store's bin/ exposes it");
+
+        std::fs::write(&shim, "#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
+        unreached("the store's `ty` shim is a refusal script (tombstone or pending stub)");
+
+        let stub = |target: &Path| {
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n\
+                     exec '{}' \"$@\"\n",
+                    target.display()
+                ),
+            )
+            .unwrap();
+        };
+        stub(&s.root.join("prefix/store/ty/2999/bin/ty"));
+        unreached("the store's `ty` shim does not resolve to a file (a reclaimed build?)");
+
+        // atpkg's CURRENT shim form, live: the store tier answers, and the copy
+        // it resolves to is not listed as shadowing itself.
+        let target = s.root.join("prefix/store/ty/3007/bin/ty");
+        stub(&target);
+        let found = s
+            .locate("ty", None)
+            .expect("a live exec stub is the store tier");
+        assert_eq!(
+            (found.origin, found.path.clone()),
+            (TrustBinOrigin::Store, target.clone())
+        );
+        let line = s.line("ty", Some(&found));
+        assert!(
+            line.starts_with(&format!(
+                "VERIFY ESCALATION TIER: ty = {} [atpkg managed store; ty 9.9.9; built 2",
+                target.display()
+            )),
+            "{line}"
+        );
+        assert!(
+            !line.contains(" — "),
+            "the chosen copy is not its own shadow: {line}"
+        );
+
+        // An older atpkg's symlink shim is the store tier too.
+        std::fs::remove_file(&shim).unwrap();
+        std::os::unix::fs::symlink(&target, &shim).unwrap();
+        let found = s
+            .locate("ty", None)
+            .expect("a symlink shim is the store tier");
+        assert_eq!(found.origin, TrustBinOrigin::Store);
+    }
+
+    /// Cell 4 — bootstrap ABSENT, store ABSENT: not found, and the plain
+    /// notice with no store clause.
+    #[test]
+    fn provenance_nothing_installed_is_a_plain_not_found() {
+        let s = Scratch::new("none");
+        assert_eq!(s.locate("ty", None), None);
+        assert_eq!(
+            s.line("ty", None),
+            "VERIFY ESCALATION TIER: ty = NOT FOUND (probed $HOME/trust/first-party, \
+             $HOME/trust/build, the atpkg store shim, PATH)"
+        );
+    }
+
+    /// The owner's order, pinned: first-party beats bootstrap beats the store
+    /// shim beats PATH; `ay` alone falls back to the standalone `~/ay` checkout.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_order_is_first_party_bootstrap_store_path() {
+        let s = Scratch::new("order");
+        let on_path = s.file("pathdir/trust-ir");
+        let path_var = std::ffi::OsString::from(on_path.parent().unwrap());
+        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
+        assert_eq!(got.origin, TrustBinOrigin::Path);
+
+        let store = s.store_copy("trust-ir", "1123", "trust-ir");
+        std::os::unix::fs::symlink(&store, s.store_bin().join("trust-ir")).unwrap();
+        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
+        assert_eq!(got.origin, TrustBinOrigin::Store);
+
+        s.file("home/trust/build/host/stage1/bin/trust-ir");
+        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
+        assert_eq!(got.origin, TrustBinOrigin::Bootstrap);
+
+        let fp = s.file("home/trust/first-party/trust-ir/target/release/trust-ir");
+        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
+        assert_eq!(
+            (got.origin, got.path.clone()),
+            (TrustBinOrigin::FirstParty, fp)
+        );
+        // m3's trust-ir shape: a first-party 0.2.0 over store 1123 — the stale
+        // override this change exists to make visible.
+        let line = s.line("trust-ir", Some(&got));
+        assert!(
+            line.contains("[first-party cargo build $HOME/trust/first-party; ")
+                && line.contains("shadows the managed store's store/trust-ir/1123/bin/trust-ir"),
+            "{line}"
+        );
+
+        assert_eq!(locate_standalone_ay_in(&[s.home()]), None);
+        s.file("home/ay/target/release/ay");
+        assert_eq!(
+            locate_standalone_ay_in(&[s.home()]).map(|l| l.origin),
+            Some(TrustBinOrigin::StandaloneAy)
+        );
+    }
+
+    /// A PATH hit that is an atpkg exec stub (a shim dir on PATH other than
+    /// this prefix's `bin/`) names the store file it execs, and that store copy
+    /// is not listed as shadowed (it is the one that ran).
+    #[cfg(unix)]
+    #[test]
+    fn a_path_exec_stub_names_its_target() {
+        let s = Scratch::new("pathstub");
+        let target = s.store_copy("trust-ir", "1123", "trust-ir");
+        let shim = s.root.join("pathbin/trust-ir");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let path_var = std::ffi::OsString::from(shim.parent().unwrap());
+        let found = s.locate("trust-ir", Some(&path_var)).unwrap();
+        assert_eq!(found.origin, TrustBinOrigin::Path);
+        let line = s.line("trust-ir", Some(&found));
+        let want = format!("[PATH (atpkg shim → {}); ", target.display());
+        assert!(line.contains(&want), "{line}");
+        assert!(!line.contains(" — "), "{line}");
+    }
+
+    /// The exec-stub reader mirrors `atpkg::platform::parse_sh_shim_target`.
+    #[test]
+    fn exec_stub_target_reads_atpkg_shims_and_rejects_refusals() {
+        let s = Scratch::new("stubparse");
+        let shim = s.root.join("shim");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\nexec '/a/it'\\''s/ty' \"$@\"\n",
+        )
+        .unwrap();
+        assert_eq!(exec_stub_target(&shim), Some(PathBuf::from("/a/it's/ty")));
+        std::fs::write(&shim, "#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
+        assert_eq!(exec_stub_target(&shim), None, "a tombstone has no target");
+        assert_eq!(classify_store_shim(&shim), StoreShim::Refusal);
+        assert_eq!(classify_store_shim(&s.root.join("nope")), StoreShim::Absent);
+    }
+
+    /// The report is once per tool per process: the first claim wins, every
+    /// later one (the hundreds of `find_ty` calls in a suite) is silent and
+    /// spawns nothing.
+    #[test]
+    fn provenance_is_claimed_once_per_tool() {
+        let set = Mutex::new(BTreeSet::new());
+        assert!(claim_first_report(&set, "ty"));
+        assert!(!claim_first_report(&set, "ty"));
+        assert!(claim_first_report(&set, "ay"));
+        assert!(!claim_first_report(&set, "ay"));
+    }
+
+    #[test]
+    fn build_dates_are_utc_civil_dates() {
+        assert_eq!(civil_from_unix_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_unix_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_unix_days(19_723), (2024, 1, 1));
+        assert_eq!(civil_from_unix_days(20_719), (2026, 9, 23));
+        let s = Scratch::new("date");
+        let d = build_date(&s.file("x")).expect("a fresh file has an mtime");
+        assert_eq!((d.len(), &d[4..5], &d[7..8]), (10, "-", "-"), "{d}");
+    }
+
+    /// The one spawn: `--version`'s first non-empty line. `/bin/echo` echoes
+    /// its argument on the BSD userland and names itself on GNU — either way a
+    /// line, from a binary that is not freshly written (a fresh file can stall
+    /// in exec assessment under load, measured on this host).
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_returns_the_first_line() {
+        let v = probe_version(Path::new("/bin/echo")).expect("echo answers");
+        assert!(!v.is_empty() && !v.contains('\n'), "{v:?}");
+        assert_eq!(probe_version(Path::new("/nonexistent/ty")), None);
     }
 
     /// A SCALAR model can never report [`NotRun`] — that is the fact

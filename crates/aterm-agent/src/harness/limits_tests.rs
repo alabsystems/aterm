@@ -993,14 +993,41 @@ fn banner_words_map_to_classes_and_a_stray_notice_is_unknown() {
             "You've hit your monthly spend limit",
             Some(Class::SpendBilling),
         ),
-        ("API Error: Rate limit reached for requests", None),
+        // aterm-phase's wall table reads a rate-limit API error with no
+        // status as the vendor's retryable kind — as the supervisor and
+        // `status agent=` do (one table, the laws review of 2026-09-24).
+        (
+            "API Error: Rate limit reached for requests",
+            Some(Class::TransientCapacity),
+        ),
     ];
     for (text, expected) in table {
         assert_eq!(banner_class(text), expected, "{text}");
     }
-    let c = cls(&[banner("API Error: Rate limit reached for requests")]);
+    let c = cls(&[banner("You've hit an unfamiliar ceiling today")]);
     assert_eq!(c.class, Class::Unknown);
     assert!(c.unpaired);
+}
+
+/// The laws review of 2026-09-24: `harness limits` classified banners with
+/// its own phrase table, which disagreed with aterm-phase's on real notices
+/// — `Out of usage credits` (money, not a model bucket) and `You've hit your
+/// limit · resets 3pm` (the session window, not nothing). Every notice the
+/// wall table places is now its kind, whatever this module's needles say.
+/// NEGATIVE CONTROL: a full context is no limit class.
+#[test]
+fn a_notice_the_wall_table_places_is_classed_by_it() {
+    for (text, class) in [
+        ("Out of usage credits", Class::SpendBilling),
+        ("You've hit your limit · resets 3pm", Class::Session5hLimit),
+    ] {
+        let wall = aterm_phase::classify_wall(text).expect("the wall table places it");
+        assert_eq!(banner_class(text), Some(class), "{text}: {wall:?}");
+    }
+    assert_eq!(
+        banner_class("Context limit reached · /compact or /clear to continue"),
+        None
+    );
 }
 
 #[test]

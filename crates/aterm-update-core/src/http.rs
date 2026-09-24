@@ -43,6 +43,11 @@
 //! a token), so [`HttpError`] classifies that state separately: a rate limit is not an
 //! auth failure and must not be reported as one. The web lane never meets it — the only
 //! throttle `github.com` has is a 429 of its own.
+//!
+//! A third lane fetches for the vendor-direct agents ([`vendor_get`],
+//! [`vendor_content_length`], [`vendor_download_to`]): anonymous, https on every hop,
+//! byte-capped, with the CA-trust overrides dropped from curl's environment, and the only
+//! lane that asks conditionally.
 
 use std::path::Path;
 use std::process::Command;
@@ -80,12 +85,23 @@ pub enum HttpError {
     /// The `-w`-appended status trailer was not a number: a proxy/portal mangled the
     /// response. Carries the whole historical message.
     Malformed(String),
+    /// A status the vendor lane ([`vendor_get`], [`vendor_content_length`],
+    /// [`vendor_download_to`]) does not accept. Unclassified on purpose: these hosts are
+    /// not GitHub's API, so the rate-limit and token wording above would be false for them.
+    VendorStatus { code: u16, url: String },
+    /// A vendor-lane verdict about the request or the document, returned on the first
+    /// attempt: a URL, cap or ETag refused before spawning, a response over its cap, or a
+    /// curl refusal that recurs on every attempt (a hop off https, too many redirects, a
+    /// certificate that does not verify). Never `Transport`, which callers read as offline.
+    VendorRefused(String),
 }
 
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Transport(message) | Self::Malformed(message) => f.write_str(message),
+            Self::Transport(message) | Self::Malformed(message) | Self::VendorRefused(message) => {
+                f.write_str(message)
+            }
             Self::RateLimited {
                 code,
                 url,
@@ -122,6 +138,9 @@ impl std::fmt::Display for HttpError {
             ),
             Self::Status { code, url } => {
                 write!(f, "GitHub API returned HTTP {code} for {url}")
+            }
+            Self::VendorStatus { code, url } => {
+                write!(f, "the vendor host answered HTTP {code} for {url}")
             }
         }
     }
@@ -365,6 +384,26 @@ fn api_get_args() -> [&'static str; 11] {
     ]
 }
 
+/// One short, anonymous listing hint. Unlike the full signed update's API read,
+/// the background hint never retries or waits thirty seconds on a dead link.
+fn api_get_quick_args() -> [&'static str; 13] {
+    [
+        "-sS",
+        "--max-time",
+        "5",
+        "--connect-timeout",
+        "3",
+        "--max-filesize",
+        "16777216",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "-w",
+        "\n%{http_code}",
+    ]
+}
+
 /// GET a GitHub API JSON resource, returning the raw body bytes. Distinguishes an
 /// authentication failure (401/403 — expired/revoked/insufficient token, or no token
 /// against a private repo) from a rate limit and from a transient error, so the
@@ -390,6 +429,13 @@ pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, Htt
     api_get_with_headers(url, token, None)
 }
 
+/// A single five-second anonymous API GET for an untrusted background wake hint.
+/// The signed update pass still uses [`api_get_classified`] with its full retries.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn api_get_classified_quick(url: &str) -> Result<Vec<u8>, HttpError> {
+    api_get_with_policy(url, None, None, true)
+}
+
 /// [`api_get_args`] plus the response-header dump, when the caller wants one.
 ///
 /// Kept as its own function so a unit test can assert BOTH sides: with no sink the list
@@ -409,12 +455,12 @@ fn api_get_args_dumping(header_dump: Option<&str>) -> Vec<&str> {
     args
 }
 
-/// The `x-ratelimit-*` block of a GitHub API response, read back from a curl
-/// `--dump-header` capture.
+/// The `x-ratelimit-*` block of a GitHub API response, and its `retry-after`, read back
+/// from a curl `--dump-header` capture.
 ///
 /// Every field is optional because every field is server-supplied: a proxy may strip
 /// any of them, and a consumer that needs one must treat its absence as "unknown", never
-/// as "plenty". `reset` is a unix epoch, already clamped by the parser.
+/// as "plenty". `reset` and `retry_after` are unix epochs, already clamped by the parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RateLimitHeaders {
     /// `x-ratelimit-limit`: the hourly allowance (~60 anonymous, 5000 with a token).
@@ -428,6 +474,20 @@ pub struct RateLimitHeaders {
     /// (a skewed clock, a mangled header) that would otherwise hold a machine off
     /// GitHub indefinitely.
     pub reset: Option<u64>,
+    /// `retry-after` in delta-seconds (a secondary rate limit's), as the unix second it
+    /// names — clamped like `reset`. The HTTP-date form is not read.
+    pub retry_after: Option<u64>,
+}
+
+impl RateLimitHeaders {
+    /// When a REFUSED request may be made again, by GitHub's documented rule: after
+    /// `retry-after` when it was sent, else at `x-ratelimit-reset` when the window is spent
+    /// (`x-ratelimit-remaining: 0`); `None` when neither names a time.
+    #[must_use]
+    pub fn resume_at(&self) -> Option<u64> {
+        self.retry_after
+            .or_else(|| self.reset.filter(|_| self.remaining == Some(0)))
+    }
 }
 
 /// How far past `now` a server-supplied reset epoch is believed. GitHub's window is an
@@ -438,7 +498,7 @@ const RATE_LIMIT_RESET_HORIZON_SECS: u64 = 3600;
 /// body was kept — a redirect chain writes one block per hop, and a block boundary is
 /// an `HTTP/` status line). Names are matched case-insensitively (GitHub emits them
 /// lowercase; a proxy may not); a non-numeric value is treated as absent, never as 0 or
-/// as a guess. `None` when the last block carries none of the four.
+/// as a guess. `None` when the last block carries none of the five.
 ///
 /// `now` is injected so the clamp is testable without a clock.
 #[must_use]
@@ -472,6 +532,12 @@ pub fn parse_rate_limit_headers(text: &str, now: u64) -> Option<RateLimitHeaders
                 .ok()
                 .map(|reset| reset.min(now.saturating_add(RATE_LIMIT_RESET_HORIZON_SECS)));
             any |= found.reset.is_some();
+        } else if name.eq_ignore_ascii_case("retry-after") {
+            found.retry_after = value
+                .parse::<u64>()
+                .ok()
+                .map(|secs| now.saturating_add(secs.min(RATE_LIMIT_RESET_HORIZON_SECS)));
+            any |= found.retry_after.is_some();
         }
     }
     any.then_some(found)
@@ -509,10 +575,25 @@ pub fn api_get_with_headers(
     token: Option<&str>,
     header_sink: Option<&Path>,
 ) -> Result<Vec<u8>, HttpError> {
+    api_get_with_policy(url, token, header_sink, false)
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn api_get_with_policy(
+    url: &str,
+    token: Option<&str>,
+    header_sink: Option<&Path>,
+    quick: bool,
+) -> Result<Vec<u8>, HttpError> {
     let sink = header_sink.and_then(|p| p.to_str());
-    let args = api_get_args_dumping(sink);
-    // Bounded: `last` is true on attempt `CURL_ATTEMPTS`, and every branch returns
-    // there, so the loop cannot run more than `CURL_ATTEMPTS` times.
+    let args = if quick {
+        api_get_quick_args().to_vec()
+    } else {
+        api_get_args_dumping(sink)
+    };
+    let attempts = if quick { 1 } else { CURL_ATTEMPTS };
+    // Bounded: `last` is true on attempt `attempts` (one for a hint, three for a
+    // full API read), and every branch returns there.
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -520,7 +601,7 @@ pub fn api_get_with_headers(
             // curl's own inter-retry backoff, preserved: 1 s, then 2 s.
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
-        let last = attempt >= CURL_ATTEMPTS;
+        let last = attempt >= attempts;
         if let Some(sink) = header_sink {
             // Never let a PREVIOUS response's headers be read as THIS one's. curl
             // truncates the dump file on open, so this is belt-and-suspenders — but a
@@ -619,13 +700,17 @@ pub struct HeadAnswer {
 /// reads, not a failure. No `--retry`: the stdout capture is retried per process like
 /// the API lane's (a concatenated hop would be parsed as one).
 fn head_args() -> [&'static str; 8] {
+    head_args_with_timeout("30")
+}
+
+fn head_args_with_timeout(timeout_secs: &'static str) -> [&'static str; 8] {
     [
         "-sS",
         "-I",
         "--max-redirs",
         "0",
         "--max-time",
-        "30",
+        timeout_secs,
         "-w",
         "\n%{http_code}",
     ]
@@ -642,16 +727,31 @@ fn head_args() -> [&'static str; 8] {
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn head_no_redirect(url: &str) -> Result<HeadAnswer, HttpError> {
+    head_no_redirect_with(url, &head_args(), CURL_ATTEMPTS)
+}
+
+/// A HEAD for a background discovery hint: one try with a five-second curl
+/// deadline. The caller's full signed update has its own retry policy, so a
+/// failed hint should yield cheaply and let the next cadence or full scan retry.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn head_no_redirect_quick(url: &str) -> Result<HeadAnswer, HttpError> {
+    head_no_redirect_with(url, &head_args_with_timeout("5"), 1)
+}
+
+// Skip: this is the original head_no_redirect body, moved here so a short hint
+// and the normal update request share the same audited response parser.
+#[cfg_attr(trust_verify, trust::skip)]
+fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<HeadAnswer, HttpError> {
     require_https_url(url).map_err(HttpError::Transport)?;
-    let args = head_args();
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
         if attempt > 1 {
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
-        let last = attempt >= CURL_ATTEMPTS;
-        let out = curl_fetch(&args, url, None).map_err(HttpError::Transport)?;
+        let last = attempt >= attempts;
+        let out = curl_fetch(args, url, None).map_err(HttpError::Transport)?;
         if !out.status.success() {
             if !last {
                 continue;
@@ -1229,7 +1329,8 @@ pub fn download_to_resumable(
     dest: &Path,
     max_filesize: u64,
 ) -> Result<(), String> {
-    download_to_resumable_with(asset_url, token, dest, max_filesize, false)
+    download_to_resumable_with(asset_url, token, dest, max_filesize, ResumeLane::Release)
+        .map_err(|e| e.to_string())
 }
 
 /// [`download_to_resumable`] for a VENDOR-hosted asset: identical transfer, `.part`
@@ -1248,11 +1349,26 @@ pub fn download_to_resumable_https_only(
     dest: &Path,
     max_filesize: u64,
 ) -> Result<(), String> {
-    download_to_resumable_with(asset_url, token, dest, max_filesize, true)
+    download_to_resumable_with(asset_url, token, dest, max_filesize, ResumeLane::HttpsOnly)
+        .map_err(|e| e.to_string())
 }
 
-/// The shared body of [`download_to_resumable`] / [`download_to_resumable_https_only`];
-/// `https_only` selects the argv builder and nothing else.
+/// Which request and child a resumable download runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeLane {
+    /// The release lanes: the historical argv and child.
+    Release,
+    /// A signed index row's vendor URL: `--proto =https` added to the argv.
+    HttpsOnly,
+    /// A vendor-direct payload: [`ResumeLane::HttpsOnly`]'s argv, run as
+    /// [`vendor_command`], with [`vendor_download_verdict`] classifying a failure.
+    VendorDirect,
+}
+
+/// The shared body of [`download_to_resumable`], [`download_to_resumable_https_only`] and
+/// [`vendor_download_to`]; `lane` selects the argv, the child and the verdicts. Every
+/// error but a vendor-direct verdict is [`HttpError::Transport`], whose text is the
+/// historical message.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn download_to_resumable_with(
@@ -1260,14 +1376,18 @@ fn download_to_resumable_with(
     token: Option<&str>,
     dest: &Path,
     max_filesize: u64,
-    https_only: bool,
-) -> Result<(), String> {
-    require_https_url(asset_url)?;
-    refuse_credential_off_api(asset_url, token)?;
+    lane: ResumeLane,
+) -> Result<(), HttpError> {
+    require_https_url(asset_url).map_err(HttpError::Transport)?;
+    refuse_credential_off_api(asset_url, token).map_err(HttpError::Transport)?;
     let Some(part) = part_path(dest) else {
-        return Err("destination has no file name".to_string());
+        return Err(HttpError::Transport(
+            "destination has no file name".to_string(),
+        ));
     };
-    let part_s = part.to_str().ok_or("non-UTF-8 destination path")?;
+    let part_s = part
+        .to_str()
+        .ok_or_else(|| HttpError::Transport("non-UTF-8 destination path".to_string()))?;
     // At most ONE fresh retry per call: the loop runs a second iteration only through
     // the range-refused arm below, which sets this flag and deletes the `.part` — so
     // the second iteration is provably a fresh (offset-0) attempt and provably the last.
@@ -1292,12 +1412,17 @@ fn download_to_resumable_with(
         let offset_text = plan.offset.to_string();
         // `None` at offset 0: a fresh transfer must carry no range at all.
         let offset = (plan.offset > 0).then_some(offset_text.as_str());
-        let args = if https_only {
-            download_resume_args_https_only(&cap, &max_time, part_s, offset)
-        } else {
+        let args = if lane == ResumeLane::Release {
             download_resume_args(&cap, &max_time, part_s, offset)
+        } else {
+            download_resume_args_https_only(&cap, &max_time, part_s, offset)
         };
-        let out = curl_fetch(&args, asset_url, token)?;
+        let out = if lane == ResumeLane::VendorDirect {
+            vendor_fetch(&args, asset_url)
+        } else {
+            curl_fetch(&args, asset_url, token)
+        }
+        .map_err(HttpError::Transport)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             // A RESUMED attempt the server refused at the range itself: discard the
@@ -1317,25 +1442,652 @@ fn download_to_resumable_with(
             if !keep_partial_after_failure(asset_url, &stderr, existing, after) {
                 let _ = std::fs::remove_file(&part);
             }
+            if lane == ResumeLane::VendorDirect
+                && let Some(verdict) =
+                    vendor_download_verdict(out.status.code(), &stderr, asset_url, max_filesize)
+            {
+                return Err(verdict);
+            }
             // Same per-host classification as `download_to`: a rate limit is named so
             // the check lane can defer instead of booking a broken pipeline.
             if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
-                return Err(verdict);
+                return Err(HttpError::Transport(verdict));
             }
-            return Err(format!(
+            return Err(HttpError::Transport(format!(
                 "curl download failed ({}): {}",
                 out.status,
                 stderr.trim()
-            ));
+            )));
         }
         // ONLY a curl success promotes the part. `dest` therefore never holds a prefix,
         // and every existing caller's "the file at `dest` is the whole asset" assumption
         // is untouched.
         return std::fs::rename(&part, dest).map_err(|e| {
             let _ = std::fs::remove_file(&part);
-            format!("finalize download: {e}")
+            HttpError::Transport(format!("finalize download: {e}"))
         });
     }
+}
+
+// -----------------------------------------------------------------------------
+// THE VENDOR DOCUMENT LANE (vendor-direct agents)
+// -----------------------------------------------------------------------------
+
+/// What [`vendor_get`] came back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VendorResponse {
+    /// HTTP 200: the whole body (at most the cap), the response's ETag when it carried a
+    /// well-formed one, and the URL curl ended on after redirects.
+    Body {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+        effective_url: String,
+    },
+    /// HTTP 304 to a conditional request: unchanged. `etag` is the validator to keep: the
+    /// 304's own ETag, or the one sent when the 304 carried none (RFC 9110 says only
+    /// SHOULD), so the next poll stays conditional.
+    NotModified { etag: String },
+}
+
+/// The curl child environment a vendor request drops: the curlrc redirections every lane
+/// drops, plus everything that changes which certificate authorities curl trusts — the CA
+/// overrides, and the TLS backend switch (`CURL_SSL_BACKEND=secure-transport` makes a
+/// multi-backend curl trust the keychain's user-added roots; 8.7.1, measured). A vendor
+/// document's TLS session is the evidence for its digest, so nothing ambient may vouch
+/// for it.
+const VENDOR_ENV_SCRUB: [&str; 6] = [
+    "CURL_HOME",
+    "XDG_CONFIG_HOME",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_SSL_BACKEND",
+];
+
+/// How many redirects a vendor request may follow. The measured chains are one hop
+/// (github.com → release-assets) or none; curl's own default is 50.
+const VENDOR_MAX_REDIRS: &str = "5";
+
+/// The longest ETag this lane stores or sends back.
+const ETAG_MAX: usize = 256;
+
+/// The smallest `--max-filesize` a vendor GET hands curl. curl applies it to every hop's
+/// Content-Length, redirects included (8.7.1, measured: a 150-byte 302 body under a
+/// 64-byte cap is exit 63), so curl's cap is only a backstop and the exact bound is
+/// [`read_capped`]'s, on the final body alone.
+const VENDOR_CURL_CAP_FLOOR: u64 = 16 * 1024;
+
+/// The `--max-filesize` for a vendor GET whose document cap is `cap`.
+fn vendor_curl_cap(cap: u64) -> u64 {
+    cap.max(VENDOR_CURL_CAP_FLOOR)
+}
+
+/// Whether a failed curl run hit `--max-filesize`: exit 63 when the size is known up
+/// front, exit 56 with this message when it is crossed mid-transfer (curl 8.7.1, measured).
+/// A verdict about the document, never retried.
+fn filesize_exceeded(exit: Option<i32>, stderr: &str) -> bool {
+    exit == Some(63) || stderr.contains("Maximum file size exceeded")
+}
+
+/// The curl exits that recur on every attempt and are about the host, not the network:
+/// 1 (a hop that is not https, refused by `--proto`/`--proto-redir`), 47 (too many
+/// redirects) — both measured on 8.7.1 — and 51/60 (a certificate that does not verify).
+/// A verdict, never retried and never reported as a transport failure.
+fn vendor_curl_refusal(exit: Option<i32>, stderr: &str, url: &str) -> Option<HttpError> {
+    let why = match exit? {
+        1 => "a hop that is not https",
+        47 => "too many redirects",
+        51 | 60 => "a TLS certificate that does not verify",
+        _ => return None,
+    };
+    Some(HttpError::VendorRefused(format!(
+        "curl refused {url}: {why} ({})",
+        stderr.trim()
+    )))
+}
+
+/// Whether `etag` may ride an `If-None-Match` header: 1..=[`ETAG_MAX`] bytes of visible
+/// ASCII (RFC 9110 `entity-tag` has no space or control byte), so a stored value can
+/// never inject a header line.
+fn etag_ok(etag: &str) -> bool {
+    !etag.is_empty() && etag.len() <= ETAG_MAX && etag.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// The value of header `name` in the LAST block of a header capture (a redirect chain
+/// writes one block per hop), trimmed; `None` when absent, empty, or given twice with
+/// different values in that block.
+fn last_block_header(headers: &str, name: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    let mut conflict = false;
+    for line in headers.lines() {
+        if line.starts_with("HTTP/") {
+            found = None;
+            conflict = false;
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let value = value.trim();
+        match &found {
+            Some(previous) if previous != value => conflict = true,
+            _ => found = (!value.is_empty()).then(|| value.to_string()),
+        }
+    }
+    if conflict { None } else { found }
+}
+
+/// The response ETag from a vendor header capture, only when [`etag_ok`] admits it.
+fn etag_header(headers: &str) -> Option<String> {
+    last_block_header(headers, "etag").filter(|e| etag_ok(e))
+}
+
+/// The final hop's `Content-Length`: all ASCII digits, and never zero — the value is used
+/// as a `--max-filesize` cap, where curl reads `0` as "no limit".
+fn content_length_header(headers: &str) -> Option<u64> {
+    let value = last_block_header(headers, "content-length")?;
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// Split the vendor GET's `-w` trailer (`<http_code> <url_effective>`). `None` unless the
+/// code is numeric and the URL is https with no whitespace or control byte.
+fn vendor_trailer(stdout: &str) -> Option<(u16, String)> {
+    let (code, url) = stdout.trim().split_once(' ')?;
+    let code = code.parse::<u16>().ok()?;
+    if !url.starts_with("https://") || url.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return None;
+    }
+    Some((code, url.to_string()))
+}
+
+/// One finished vendor-lane curl run: its exit code (`None` when a signal ended it),
+/// stdout and stderr.
+struct CurlRun<'a> {
+    exit: Option<i32>,
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
+impl CurlRun<'_> {
+    /// The transport failure a run that exhausted its attempts reports.
+    fn failure(&self, verb: &str, url: &str) -> HttpError {
+        let exit = self
+            .exit
+            .map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}"));
+        HttpError::Transport(format!(
+            "curl {verb} {url} failed ({exit}): {}",
+            self.stderr.trim()
+        ))
+    }
+}
+
+/// What one vendor-lane attempt decided.
+#[derive(Debug, PartialEq, Eq)]
+enum Step<T> {
+    /// Another attempt may cure it. Never answered when the attempt was the last.
+    Retry,
+    /// The answer, or a verdict no further attempt changes.
+    Done(Result<T, HttpError>),
+}
+
+/// One vendor GET attempt's decision, from its curl run and this attempt's header dump;
+/// `body` reads the capped body and is called only for a 200. `sent_etag` is the
+/// `If-None-Match` value the request carried. A 304 answers only a conditional request —
+/// to an unconditional one it is a protocol violation, not "unchanged".
+fn vendor_get_step(
+    run: &CurlRun<'_>,
+    headers: &str,
+    last: bool,
+    url: &str,
+    cap: u64,
+    sent_etag: Option<&str>,
+    body: impl FnOnce() -> Result<Vec<u8>, HttpError>,
+) -> Step<VendorResponse> {
+    if run.exit != Some(0) {
+        if filesize_exceeded(run.exit, run.stderr) {
+            return Step::Done(Err(HttpError::VendorRefused(format!(
+                "vendor document {url} exceeds its {cap}-byte cap"
+            ))));
+        }
+        if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
+            return Step::Done(Err(refusal));
+        }
+        return if last {
+            Step::Done(Err(run.failure("GET", url)))
+        } else {
+            Step::Retry
+        };
+    }
+    let Some((code, effective_url)) = vendor_trailer(run.stdout) else {
+        return Step::Done(Err(HttpError::Malformed(format!(
+            "the vendor host answered an unreadable status for {url}: {}",
+            run.stdout.trim()
+        ))));
+    };
+    if !last && transient_api_status(&code.to_string()) {
+        return Step::Retry;
+    }
+    let etag = etag_header(headers);
+    Step::Done(match (code, sent_etag) {
+        (200, _) => body().map(|bytes| VendorResponse::Body {
+            bytes,
+            etag,
+            effective_url,
+        }),
+        (304, Some(sent)) => Ok(VendorResponse::NotModified {
+            etag: etag.unwrap_or_else(|| sent.to_string()),
+        }),
+        _ => Err(HttpError::VendorStatus {
+            code,
+            url: url.to_string(),
+        }),
+    })
+}
+
+/// One vendor HEAD attempt's decision. stdout is every hop's headers, then a newline and
+/// the final status (the `-w` trailer); only the last hop's `Content-Length` counts.
+fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
+    if run.exit != Some(0) {
+        if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
+            return Step::Done(Err(refusal));
+        }
+        return if last {
+            Step::Done(Err(run.failure("HEAD", url)))
+        } else {
+            Step::Retry
+        };
+    }
+    let (headers, code) = match run.stdout.rfind('\n') {
+        Some(i) => (&run.stdout[..i], run.stdout[i + 1..].trim()),
+        None => ("", run.stdout.trim()),
+    };
+    if !last && transient_api_status(code) {
+        return Step::Retry;
+    }
+    let Ok(code) = code.parse::<u16>() else {
+        return Step::Done(Err(HttpError::Malformed(format!(
+            "the vendor host answered HTTP {code} to HEAD {url}"
+        ))));
+    };
+    if code != 200 {
+        return Step::Done(Err(HttpError::VendorStatus {
+            code,
+            url: url.to_string(),
+        }));
+    }
+    Step::Done(content_length_header(headers).ok_or_else(|| {
+        HttpError::Malformed(format!(
+            "the vendor host sent no usable Content-Length for {url}"
+        ))
+    }))
+}
+
+/// The verdict a failed vendor-direct payload run carries, when it is one: over the cap,
+/// a [`vendor_curl_refusal`], or a `-f` status (exit 22) that no retry changes — anything
+/// but 408, 429 and 5xx. `None` leaves it a transport failure.
+fn vendor_download_verdict(
+    exit: Option<i32>,
+    stderr: &str,
+    url: &str,
+    cap: u64,
+) -> Option<HttpError> {
+    if filesize_exceeded(exit, stderr) {
+        return Some(HttpError::VendorRefused(format!(
+            "vendor payload {url} exceeds its {cap}-byte cap"
+        )));
+    }
+    if let Some(refusal) = vendor_curl_refusal(exit, stderr, url) {
+        return Some(refusal);
+    }
+    let code = curl_http_error_code(stderr).filter(|_| exit == Some(22))?;
+    (!matches!(code, 408 | 429 | 500..=599)).then(|| HttpError::VendorStatus {
+        code,
+        url: url.to_string(),
+    })
+}
+
+/// A vendor GET's time budget: curl's connect and whole-transfer bounds (seconds), and how
+/// many attempts a network failure gets.
+#[derive(Clone, Copy, Debug)]
+struct VendorBounds {
+    connect_secs: &'static str,
+    max_secs: &'static str,
+    attempts: u32,
+}
+
+/// A document the lane needs: patient, and retried.
+const LANE_BOUNDS: VendorBounds = VendorBounds {
+    connect_secs: "30",
+    max_secs: "60",
+    attempts: CURL_ATTEMPTS,
+};
+
+/// A head read as a hint ([`vendor_get_hint`]): one short attempt, because the caller asks
+/// again on its own cadence.
+const HINT_BOUNDS: VendorBounds = VendorBounds {
+    connect_secs: "5",
+    max_secs: "15",
+    attempts: 1,
+};
+
+/// The option list for [`vendor_get`]. https on the first hop and every redirect, a bounded
+/// redirect count, `bounds`' connect and wall-clock limits, curl's own size cap, the body
+/// and the header dump into the caller's private scratch files, and the status + effective
+/// URL on stdout. No `-f` (a 304 is an answer) and no `--retry` (the subprocess is
+/// retried). The `If-None-Match` line is appended only when `condition` is given.
+fn vendor_get_args<'a>(
+    bounds: VendorBounds,
+    cap: &'a str,
+    body: &'a str,
+    headers: &'a str,
+    condition: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "-sS",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "-L",
+        "--max-redirs",
+        VENDOR_MAX_REDIRS,
+        "--connect-timeout",
+        bounds.connect_secs,
+        "--max-time",
+        bounds.max_secs,
+        "--max-filesize",
+        cap,
+        "-o",
+        body,
+        "--dump-header",
+        headers,
+        "-w",
+        "%{http_code} %{url_effective}",
+    ];
+    if let Some(line) = condition {
+        args.push("-H");
+        args.push(line);
+    }
+    args
+}
+
+/// The option list for [`vendor_content_length`]: a HEAD that follows redirects under the
+/// same https pins and bounds as [`vendor_get_args`]; every hop's headers land on stdout,
+/// followed by the final status.
+fn vendor_head_args() -> [&'static str; 15] {
+    [
+        "-sS",
+        "-I",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "-L",
+        "--max-redirs",
+        VENDOR_MAX_REDIRS,
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        "60",
+        "-w",
+        "\n%{http_code}",
+    ]
+}
+
+/// The vendor-lane curl process: the anonymous argv (`-q` first, `--` before the URL,
+/// never a credential channel) with [`VENDOR_ENV_SCRUB`] removed from its environment.
+fn vendor_command(args: &[&str], url: &str) -> Command {
+    let mut command = curl_command(args, url, false);
+    for var in VENDOR_ENV_SCRUB {
+        command.env_remove(var);
+    }
+    command
+}
+
+/// Spawn [`vendor_command`] with no stdin and wait for it.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn vendor_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    vendor_command(args, url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn curl: {e}"))
+}
+
+/// Pause before attempt `attempt` (2 → 1 s, 3 → 2 s); nothing before the first.
+fn vendor_backoff(attempt: u32) {
+    if attempt > 1 {
+        std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
+    }
+}
+
+/// A fresh private directory for one vendor request's body and header dump, removed on
+/// drop. `create_dir` on a new name (never an existing path) at mode `0700` on unix, so no
+/// other user can pre-plant or read what curl writes there.
+struct VendorScratch(std::path::PathBuf);
+
+impl VendorScratch {
+    // Skip: same audited display-lossy Err-path class as `api_get`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn new() -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        for _ in 0..8 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("aterm-vendor-{}-{n}-{nanos}", std::process::id()));
+            match builder.create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("create vendor scratch dir: {e}")),
+            }
+        }
+        Err("create vendor scratch dir: no free name".to_string())
+    }
+}
+
+impl Drop for VendorScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read at most `cap` bytes of `path`, the body fetched from `url`; more is a verdict
+/// about the document. A missing file is an empty body (curl creates no `-o` file for a
+/// zero-length response).
+fn read_capped(path: &Path, cap: u64, url: &str) -> Result<Vec<u8>, HttpError> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(HttpError::Transport(format!("read vendor body: {e}"))),
+    };
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| HttpError::Transport(format!("read vendor body: {e}")))?;
+    if bytes.len() as u64 > cap {
+        return Err(HttpError::VendorRefused(format!(
+            "vendor document {url} exceeds its {cap}-byte cap"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// GET a small vendor document (a release head, a manifest, a signature, a SHA256SUMS)
+/// anonymously: https on every hop, at most `cap` bytes of final body, bounded in time,
+/// and with the CA-trust overrides dropped from curl's environment. `if_none_match` makes
+/// the request conditional; a 304 answers [`VendorResponse::NotModified`]. The GitHub
+/// listing lanes above never ask conditionally.
+///
+/// The caller owns the URL policy (which prefixes, which effective URLs); this layer
+/// enforces only the scheme, and returns the effective URL so the caller can check it.
+///
+/// # Errors
+/// [`HttpError::VendorRefused`] for a non-https URL, a zero cap, or an `if_none_match`
+/// that is not a visible-ASCII ETag (before any spawn), a document over its cap, or a
+/// [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for any status but 200 and a
+/// conditional 304; [`HttpError::Malformed`] for an unreadable trailer; and
+/// [`HttpError::Transport`] only when the network failed all three attempts.
+pub fn vendor_get(
+    url: &str,
+    cap: u64,
+    if_none_match: Option<&str>,
+) -> Result<VendorResponse, HttpError> {
+    vendor_get_within(url, cap, if_none_match, LANE_BOUNDS)
+}
+
+/// [`vendor_get`] for a head read only as a hint (the window's head watch): the same
+/// pins, cap, anonymity and environment, but one attempt of at most 15 s, so a network
+/// that drops packets costs seconds, not minutes.
+///
+/// # Errors
+/// As [`vendor_get`]; a network failure is [`HttpError::Transport`] after the one attempt.
+pub fn vendor_get_hint(
+    url: &str,
+    cap: u64,
+    if_none_match: Option<&str>,
+) -> Result<VendorResponse, HttpError> {
+    vendor_get_within(url, cap, if_none_match, HINT_BOUNDS)
+}
+
+/// [`vendor_get`] under `bounds`.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn vendor_get_within(
+    url: &str,
+    cap: u64,
+    if_none_match: Option<&str>,
+    bounds: VendorBounds,
+) -> Result<VendorResponse, HttpError> {
+    require_https_url(url).map_err(HttpError::VendorRefused)?;
+    if cap == 0 {
+        return Err(HttpError::VendorRefused(format!(
+            "refusing a zero byte cap for {url}"
+        )));
+    }
+    if let Some(etag) = if_none_match
+        && !etag_ok(etag)
+    {
+        return Err(HttpError::VendorRefused(format!(
+            "refusing a malformed If-None-Match value for {url}"
+        )));
+    }
+    let condition = if_none_match.map(|etag| format!("If-None-Match: {etag}"));
+    let scratch = VendorScratch::new().map_err(HttpError::Transport)?;
+    let body = scratch.0.join("body");
+    let headers = scratch.0.join("headers");
+    let (Some(body_s), Some(headers_s)) = (body.to_str(), headers.to_str()) else {
+        return Err(HttpError::Transport(
+            "non-UTF-8 temporary directory".to_string(),
+        ));
+    };
+    let curl_cap = vendor_curl_cap(cap).to_string();
+    let args = vendor_get_args(bounds, &curl_cap, body_s, headers_s, condition.as_deref());
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        vendor_backoff(attempt);
+        // A previous attempt's body or headers must never be read as this one's.
+        let _ = std::fs::remove_file(&body);
+        let _ = std::fs::remove_file(&headers);
+        let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
+        let dump = std::fs::read(&headers).unwrap_or_default();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let run = CurlRun {
+            exit: out.status.code(),
+            stdout: &stdout,
+            stderr: &stderr,
+        };
+        let step = vendor_get_step(
+            &run,
+            &String::from_utf8_lossy(&dump),
+            attempt >= bounds.attempts,
+            url,
+            cap,
+            if_none_match,
+            || read_capped(&body, cap, url),
+        );
+        if let Step::Done(result) = step {
+            return result;
+        }
+    }
+}
+
+/// The final `Content-Length` of `url` after redirects, from an anonymous HEAD under the
+/// vendor lane's https pins, bounds and environment — the exact byte cap for a payload no
+/// signed document sizes. Never zero (curl reads a zero cap as unlimited).
+///
+/// # Errors
+/// [`HttpError::VendorRefused`] for a non-https URL (before any spawn) or a
+/// [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for a final status other than
+/// 200; [`HttpError::Malformed`] for a final hop with no single positive numeric
+/// `Content-Length`; [`HttpError::Transport`] only when the network failed all three
+/// attempts.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
+    require_https_url(url).map_err(HttpError::VendorRefused)?;
+    let args = vendor_head_args();
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        vendor_backoff(attempt);
+        let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let run = CurlRun {
+            exit: out.status.code(),
+            stdout: &stdout,
+            stderr: &stderr,
+        };
+        if let Step::Done(result) = vendor_head_step(&run, attempt >= CURL_ATTEMPTS, url) {
+            return result;
+        }
+    }
+}
+
+/// Download a vendor-direct PAYLOAD to `dest`, capped at exactly `cap` bytes: the
+/// resumable transfer of [`download_to_resumable_https_only`] (argv, `.part` lifecycle,
+/// cap arithmetic) run as a vendor-lane child — anonymous, with [`VENDOR_ENV_SCRUB`]
+/// dropped from its environment.
+///
+/// # Errors
+/// [`HttpError::VendorRefused`] for a non-https URL or a zero cap (before any spawn), a
+/// payload over its cap, or a [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for a
+/// status no retry changes (anything but 408, 429 and 5xx); [`HttpError::Transport`] for
+/// everything else, the network included.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn vendor_download_to(url: &str, dest: &Path, cap: u64) -> Result<(), HttpError> {
+    require_https_url(url).map_err(HttpError::VendorRefused)?;
+    if cap == 0 {
+        return Err(HttpError::VendorRefused(format!(
+            "refusing a zero byte cap for {url}"
+        )));
+    }
+    download_to_resumable_with(url, None, dest, cap, ResumeLane::VendorDirect)
 }
 
 #[cfg(test)]
@@ -1443,7 +2195,13 @@ X-RateLimit-Reset: 1788392970
                 remaining: Some(1),
                 used: Some(23),
                 reset: Some(1_788_392_970),
+                retry_after: None,
             }
+        );
+        assert_eq!(
+            h.resume_at(),
+            None,
+            "the window is not spent: no time named"
         );
         // A reset beyond the horizon is clamped to now + 3600.
         let far = "HTTP/2 403
@@ -1453,6 +2211,26 @@ x-ratelimit-reset: 9999999999
         let h = super::parse_rate_limit_headers(far, now).unwrap();
         assert_eq!(h.reset, Some(now + 3600));
         assert_eq!(h.remaining, Some(0));
+        assert_eq!(
+            h.resume_at(),
+            Some(now + 3600),
+            "a spent window resumes at its reset"
+        );
+        // A secondary limit's `retry-after` (delta-seconds) wins, clamped the same way; the
+        // HTTP-date form is not read.
+        let secondary = "HTTP/2 403
+x-ratelimit-remaining: 12
+x-ratelimit-reset: 1788392970
+Retry-After: 120
+";
+        let h = super::parse_rate_limit_headers(secondary, now).unwrap();
+        assert_eq!(h.retry_after, Some(now + 120));
+        assert_eq!(h.resume_at(), Some(now + 120));
+        let long = "HTTP/2 429\nretry-after: 99999\n";
+        let h = super::parse_rate_limit_headers(long, now).unwrap();
+        assert_eq!(h.resume_at(), Some(now + 3600));
+        let dated = "HTTP/2 429\nretry-after: Wed, 21 Oct 2026 07:28:00 GMT\n";
+        assert_eq!(super::parse_rate_limit_headers(dated, now), None);
         // A later hop WITHOUT the headers yields none — the kept response had none.
         let stripped = "HTTP/2 302
 x-ratelimit-remaining: 40
@@ -1501,12 +2279,13 @@ x-ratelimit-limit: 60
     }
 
     use super::{
-        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, api_get_args_dumping, curl_argv,
-        curl_bin, curl_fetch, curl_prepared, download_bytes_args, download_max_time_secs,
-        download_resume_args, download_resume_args_https_only, download_to_args,
-        download_to_resumable, download_to_resumable_https_only, head_args, keep_partial,
-        keep_partial_after_failure, location_header, part_path, range_refused, resume_plan,
-        token_config_safe, transient_api_status,
+        CURL_ATTEMPTS, HINT_BOUNDS, HttpError, LANE_BOUNDS, RELEASE_ASSET_DOWNLOAD_BOUND,
+        api_get_args, api_get_args_dumping, api_get_quick_args, curl_argv, curl_bin, curl_fetch,
+        curl_prepared, download_bytes_args, download_max_time_secs, download_resume_args,
+        download_resume_args_https_only, download_to_args, download_to_resumable,
+        download_to_resumable_https_only, head_args, keep_partial, keep_partial_after_failure,
+        location_header, part_path, range_refused, resume_plan, token_config_safe,
+        transient_api_status, vendor_get_args,
     };
     use std::process::Command;
 
@@ -1946,6 +2725,28 @@ x-ratelimit-limit: 60
         );
     }
 
+    #[test]
+    fn a_listing_hint_has_one_short_bounded_anonymous_get() {
+        let args = api_get_quick_args();
+        assert!(args.windows(2).any(|pair| pair == ["--max-time", "5"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--connect-timeout", "3"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--max-filesize", "16777216"])
+        );
+        assert!(!args.contains(&"--retry"));
+        let argv = curl_argv(
+            &args,
+            "https://api.github.com/repos/alabsystems/aterm/releases?per_page=100&page=1",
+            false,
+        );
+        assert!(!argv.iter().any(|arg| arg == "--config"));
+        assert_eq!(argv[argv.len() - 2], "--");
+    }
+
     /// …and a header-dumping one adds EXACTLY one flag pair, in front of the `--` marker
     /// `curl_argv` appends (callers must never place their own — the v0.5.10 bricking
     /// regression).
@@ -1966,9 +2767,723 @@ x-ratelimit-limit: 60
         );
         // The base list survives verbatim underneath.
         assert_eq!(&args[..base], &api_get_args()[..]);
-        // No conditional-request machinery survives: a 304 can never be produced
-        // because nothing is ever asked conditionally.
+        // The GitHub listing lane never asks conditionally: a 304 there still spends the
+        // anonymous rate limit (cdn.rs). Only `vendor_get` sends If-None-Match.
         assert!(!args.iter().any(|a| a.starts_with("If-None-Match")));
+    }
+
+    /// Conditional requests exist ONLY on the vendor lane: no GitHub lane's option list
+    /// carries an `If-None-Match`, with or without a header sink.
+    #[test]
+    fn only_the_vendor_lane_asks_conditionally() {
+        let cap = "1024";
+        let lanes: [Vec<&str>; 6] = [
+            api_get_args().to_vec(),
+            api_get_args_dumping(Some("/tmp/aterm-updates/list.headers")),
+            head_args().to_vec(),
+            download_bytes_args(cap).to_vec(),
+            download_to_args(cap, "600", "/tmp/x").to_vec(),
+            download_resume_args_https_only(cap, "600", "/tmp/x.part", Some("4")),
+        ];
+        for lane in &lanes {
+            assert!(
+                !lane.iter().any(|a| a.contains("If-None-Match")),
+                "{lane:?}"
+            );
+        }
+        let conditional = vendor_get_args(
+            LANE_BOUNDS,
+            cap,
+            "/s/body",
+            "/s/headers",
+            Some("If-None-Match: \"x\""),
+        );
+        assert_eq!(
+            conditional
+                .iter()
+                .filter(|a| a.starts_with("If-None-Match"))
+                .count(),
+            1
+        );
+        let plain = vendor_get_args(LANE_BOUNDS, cap, "/s/body", "/s/headers", None);
+        assert!(!plain.iter().any(|a| a.contains("If-None-Match")));
+        assert_eq!(conditional.len(), plain.len() + 2, "exactly one `-H` pair");
+    }
+
+    /// The vendor GET: `-q` first, https pinned on the first hop and every redirect, a
+    /// bounded redirect count and wall clock, curl's size cap, body and headers into the
+    /// scratch files, the status + effective URL trailer, no credential channel, no `-f`
+    /// and no `--retry`, and `--` last before the URL.
+    #[test]
+    fn the_vendor_get_argv_pins_https_bounds_and_carries_no_credential() {
+        const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
+        let args = vendor_get_args(
+            LANE_BOUNDS,
+            "64",
+            "/s/body",
+            "/s/headers",
+            Some("If-None-Match: \"e\""),
+        );
+        let value_of = |flag: &str| {
+            let i = args
+                .iter()
+                .position(|a| *a == flag)
+                .unwrap_or_else(|| panic!("{flag} present in {args:?}"));
+            args[i + 1]
+        };
+        assert_eq!(value_of("--proto"), "=https");
+        assert_eq!(value_of("--proto-redir"), "=https");
+        assert_eq!(value_of("--max-redirs"), "5");
+        assert_eq!(value_of("--connect-timeout"), "30");
+        assert_eq!(value_of("--max-time"), "60");
+        assert_eq!(value_of("--max-filesize"), "64");
+        assert_eq!(value_of("-o"), "/s/body");
+        assert_eq!(value_of("--dump-header"), "/s/headers");
+        assert_eq!(value_of("-w"), "%{http_code} %{url_effective}");
+        assert!(args.contains(&"-L"));
+        for absent in [
+            "-f", "--fail", "--retry", "--config", "-K", "--netrc", "-u", "--",
+        ] {
+            assert!(
+                !args.contains(&absent),
+                "{absent} must not be on the vendor lane"
+            );
+        }
+        let v = argv_of(&super::vendor_command(&args, URL));
+        assert_eq!(v[0], "-q", "the curlrc defense comes first");
+        assert_eq!(v.iter().filter(|a| *a == "--").count(), 1);
+        assert_eq!(v[v.len() - 2], "--");
+        assert_eq!(v[v.len() - 1], URL);
+        assert!(
+            !v.iter().any(|a| {
+                let a = a.to_ascii_lowercase();
+                a.contains("authorization") || a.contains("bearer")
+            }),
+            "{v:?}"
+        );
+    }
+
+    /// A head read as a hint is one short attempt under the lane's own pins: only the
+    /// connect and wall-clock bounds differ from the lane's GET.
+    #[test]
+    fn the_hint_get_is_one_short_attempt_under_the_same_pins() {
+        let lane = vendor_get_args(LANE_BOUNDS, "64", "/s/body", "/s/headers", None);
+        let hint = vendor_get_args(HINT_BOUNDS, "64", "/s/body", "/s/headers", None);
+        let value_of = |args: &[&str], flag: &str| {
+            let i = args.iter().position(|a| *a == flag).expect(flag);
+            args[i + 1].to_string()
+        };
+        assert_eq!(value_of(&hint, "--connect-timeout"), "5");
+        assert_eq!(value_of(&hint, "--max-time"), "15");
+        assert_eq!(HINT_BOUNDS.attempts, 1, "no retry: the caller's cadence is");
+        assert_eq!(LANE_BOUNDS.attempts, CURL_ATTEMPTS);
+        let without = |args: &[&str]| {
+            let mut rest = Vec::new();
+            let mut skip = false;
+            for a in args {
+                if skip {
+                    skip = false;
+                } else if matches!(*a, "--connect-timeout" | "--max-time") {
+                    skip = true;
+                } else {
+                    rest.push(a.to_string());
+                }
+            }
+            rest
+        };
+        assert_eq!(without(&hint), without(&lane), "the same pins otherwise");
+    }
+
+    /// The vendor HEAD follows redirects under the same pins and bounds, reads headers
+    /// only, and ends on the status trailer.
+    #[test]
+    fn the_vendor_head_argv_follows_redirects_under_the_same_pins() {
+        let args = super::vendor_head_args();
+        for flag in ["-I", "-L"] {
+            assert!(args.contains(&flag), "{flag}: {args:?}");
+        }
+        for (flag, value) in [
+            ("--proto", "=https"),
+            ("--proto-redir", "=https"),
+            ("--max-redirs", "5"),
+            ("--max-time", "60"),
+            ("-w", "\n%{http_code}"),
+        ] {
+            let i = args.iter().position(|a| *a == flag).expect(flag);
+            assert_eq!(args[i + 1], value, "{flag}");
+        }
+        for absent in ["-f", "--fail", "--retry", "--config", "--", "-o"] {
+            assert!(!args.contains(&absent), "{absent}: {args:?}");
+        }
+    }
+
+    /// The vendor child drops the CA-trust overrides and the TLS backend switch as well as
+    /// the curlrc redirections; the GitHub lanes keep their historical environment.
+    #[test]
+    fn the_vendor_child_env_drops_the_ca_overrides() {
+        let removed = |command: &Command| -> Vec<String> {
+            command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect()
+        };
+        let vendor = removed(&super::vendor_command(
+            &["-sS"],
+            "https://releases.openai.com/x",
+        ));
+        for var in [
+            "CURL_HOME",
+            "XDG_CONFIG_HOME",
+            "CURL_CA_BUNDLE",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_SSL_BACKEND",
+        ] {
+            assert!(
+                vendor.iter().any(|k| k == var),
+                "{var} scrubbed: {vendor:?}"
+            );
+        }
+        let github = removed(&super::curl_command(&["-sS"], WEB_ASSET, false));
+        assert!(!github.iter().any(|k| k == "SSL_CERT_FILE"), "{github:?}");
+    }
+
+    /// An ETag is sendable only as visible ASCII, so a stored value can never inject a
+    /// header line; the reader takes the last hop's, case-insensitively, and drops one it
+    /// could not send back.
+    #[test]
+    fn etags_are_read_from_the_last_hop_and_only_well_formed_ones_survive() {
+        for good in [
+            "\"5dc26bfe87ab1b83497e1f21c94fb98d\"",
+            "W/\"x\"",
+            "\"0x8DF18E1A1B206AB\"",
+        ] {
+            assert!(super::etag_ok(good), "{good}");
+        }
+        let long = "x".repeat(super::ETAG_MAX + 1);
+        for bad in [
+            "",
+            "\"a b\"",
+            "\"a\"\r\nX-Evil: 1",
+            "\"a\"\n",
+            "\"a\t\"",
+            long.as_str(),
+        ] {
+            assert!(!super::etag_ok(bad), "{bad:?}");
+        }
+        let dump = "HTTP/2 302\r\netag: \"first\"\r\nlocation: https://b/\r\n\r\n\
+                    HTTP/2 200\r\nETag: \"second\"\r\ncontent-length: 7\r\n\r\n";
+        assert_eq!(super::etag_header(dump).as_deref(), Some("\"second\""));
+        assert_eq!(
+            super::etag_header("HTTP/2 302\r\netag: \"first\"\r\n\r\nHTTP/2 200\r\n\r\n"),
+            None,
+            "the kept hop carried none"
+        );
+        assert_eq!(super::etag_header("HTTP/2 200\r\netag: \"a b\"\r\n"), None);
+        assert_eq!(
+            super::etag_header("HTTP/2 304\r\netag: \"e\"\r\n\r\n").as_deref(),
+            Some("\"e\"")
+        );
+    }
+
+    /// The final hop's Content-Length, only as one positive decimal: a zero would reach
+    /// curl as an unlimited `--max-filesize`, and two different values are ambiguous.
+    #[test]
+    fn the_content_length_is_the_final_hops_single_positive_decimal() {
+        let chain = "HTTP/2 302\r\ncontent-length: 0\r\nlocation: https://x/\r\n\r\n\
+                     HTTP/2 200\r\nContent-Length: 127316185\r\n\r\n";
+        assert_eq!(super::content_length_header(chain), Some(127_316_185));
+        for bad in [
+            "HTTP/2 200\r\ncontent-length: 0\r\n",
+            "HTTP/2 200\r\ncontent-length: -5\r\n",
+            "HTTP/2 200\r\ncontent-length: 12, 12\r\n",
+            "HTTP/2 200\r\ncontent-length: 1e3\r\n",
+            "HTTP/2 200\r\ncontent-length: 5\r\ncontent-length: 6\r\n",
+            "HTTP/2 200\r\ncontent-type: text/plain\r\n",
+            "HTTP/2 200\r\ncontent-length: 99999999999999999999999\r\n",
+            "",
+        ] {
+            assert_eq!(super::content_length_header(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            super::content_length_header(
+                "HTTP/2 200\r\ncontent-length: 5\r\ncontent-length: 5\r\n"
+            ),
+            Some(5),
+            "a repeated identical value is one value"
+        );
+    }
+
+    /// The `-w` trailer: a numeric code and an https effective URL, or nothing.
+    #[test]
+    fn the_vendor_trailer_yields_a_code_and_an_https_effective_url() {
+        assert_eq!(
+            super::vendor_trailer("200 https://release-assets.githubusercontent.com/a?b=c"),
+            Some((
+                200,
+                "https://release-assets.githubusercontent.com/a?b=c".to_string()
+            ))
+        );
+        assert_eq!(
+            super::vendor_trailer("304 https://downloads.claude.ai/claude-code-releases/latest\n")
+                .map(|t| t.0),
+            Some(304)
+        );
+        for bad in [
+            "",
+            "200",
+            "abc https://x/",
+            "200 http://x/",
+            "200 https://x/ y",
+            "200 file:///etc/passwd",
+        ] {
+            assert_eq!(super::vendor_trailer(bad), None, "{bad:?}");
+        }
+    }
+
+    /// A finished run for the step tests: exit 0 unless given, empty stderr.
+    fn run<'a>(exit: Option<i32>, stdout: &'a str, stderr: &'a str) -> super::CurlRun<'a> {
+        super::CurlRun {
+            exit,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// The body reader a step must not call.
+    fn no_body() -> Result<Vec<u8>, HttpError> {
+        panic!("the body is read only for a 200")
+    }
+
+    /// One GET attempt, decided from its run alone: 200 keeps the body with the last hop's
+    /// ETag and the effective URL; a conditional 304 keeps a validator (its own ETag, else
+    /// the one sent); an unconditional 304 and every other status are the host's refusal,
+    /// worded without GitHub's rate-limit or token claims.
+    #[test]
+    fn a_vendor_get_attempt_answers_body_not_modified_or_the_status() {
+        use super::{Step, VendorResponse, vendor_get_step};
+        const URL: &str = "https://releases.openai.com/codex/channels/latest";
+        let ok = run(
+            Some(0),
+            "200 https://releases.openai.com/codex/channels/latest",
+            "",
+        );
+        let dump = "HTTP/2 200\r\netag: \"new\"\r\ncontent-length: 7\r\n\r\n";
+        for sent in [None, Some("\"old\"")] {
+            assert_eq!(
+                vendor_get_step(&ok, dump, false, URL, 64, sent, || Ok(b"{}".to_vec())),
+                Step::Done(Ok(VendorResponse::Body {
+                    bytes: b"{}".to_vec(),
+                    etag: Some("\"new\"".into()),
+                    effective_url: URL.into(),
+                }))
+            );
+        }
+        let not_modified = run(
+            Some(0),
+            "304 https://releases.openai.com/codex/channels/latest",
+            "",
+        );
+        assert_eq!(
+            vendor_get_step(
+                &not_modified,
+                "HTTP/2 304\r\netag: \"e2\"\r\n\r\n",
+                false,
+                URL,
+                64,
+                Some("\"e\""),
+                no_body
+            ),
+            Step::Done(Ok(VendorResponse::NotModified {
+                etag: "\"e2\"".into()
+            })),
+            "the 304's own ETag is the validator to keep"
+        );
+        assert_eq!(
+            vendor_get_step(
+                &not_modified,
+                "HTTP/2 304\r\n\r\n",
+                false,
+                URL,
+                64,
+                Some("\"e\""),
+                no_body
+            ),
+            Step::Done(Ok(VendorResponse::NotModified {
+                etag: "\"e\"".into()
+            })),
+            "a 304 without an ETag keeps the one sent"
+        );
+        for (stdout, sent) in [
+            (
+                "304 https://releases.openai.com/codex/channels/latest",
+                None,
+            ),
+            (
+                "404 https://releases.openai.com/codex/channels/latest",
+                Some("\"e\""),
+            ),
+            (
+                "429 https://releases.openai.com/codex/channels/latest",
+                None,
+            ),
+            (
+                "206 https://releases.openai.com/codex/channels/latest",
+                None,
+            ),
+            (
+                "503 https://releases.openai.com/codex/channels/latest",
+                None,
+            ),
+        ] {
+            let code: u16 = stdout[..3].parse().unwrap();
+            let Step::Done(Err(err)) =
+                vendor_get_step(&run(Some(0), stdout, ""), "", true, URL, 64, sent, no_body)
+            else {
+                panic!("{stdout}: a final status is an error");
+            };
+            assert_eq!(
+                err,
+                HttpError::VendorStatus {
+                    code,
+                    url: URL.into()
+                }
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("vendor host") && !text.contains("GitHub"),
+                "{text}"
+            );
+        }
+        let mangled = run(Some(0), "<html>portal</html>", "");
+        assert!(matches!(
+            vendor_get_step(&mangled, "", false, URL, 64, None, no_body),
+            Step::Done(Err(HttpError::Malformed(_)))
+        ));
+        // The capped read's own verdict passes through untouched.
+        let over = || Err(HttpError::VendorRefused("over".into()));
+        assert_eq!(
+            vendor_get_step(&ok, dump, false, URL, 64, None, over),
+            Step::Done(Err(HttpError::VendorRefused("over".into())))
+        );
+    }
+
+    /// Only the network is retried, and only while attempts remain: a transient status or
+    /// a transport exit retries, the last attempt reports it as `Transport`, and a size
+    /// verdict or a curl refusal is final on the first attempt and never `Transport`.
+    #[test]
+    fn a_vendor_get_attempt_retries_only_the_network() {
+        use super::{Step, vendor_get_step};
+        const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
+        let dns = run(Some(6), "", "curl: (6) Could not resolve host");
+        let busy = run(
+            Some(0),
+            "503 https://downloads.claude.ai/claude-code-releases/latest",
+            "",
+        );
+        for transient in [&dns, &busy] {
+            assert_eq!(
+                vendor_get_step(transient, "", false, URL, 64, None, no_body),
+                Step::Retry
+            );
+        }
+        assert!(matches!(
+            vendor_get_step(&dns, "", true, URL, 64, None, no_body),
+            Step::Done(Err(HttpError::Transport(ref m))) if m.contains("exit 6") && m.contains("resolve")
+        ));
+        for (exit, stderr) in [
+            (Some(63), "curl: (63) Maximum file size exceeded"),
+            (Some(56), "curl: (56) Maximum file size exceeded"),
+            (
+                Some(1),
+                "curl: (1) Protocol \"http\" disabled (in redirect)",
+            ),
+            (Some(47), "curl: (47) Maximum (5) redirects followed"),
+            (Some(60), "curl: (60) SSL certificate problem"),
+            (
+                Some(51),
+                "curl: (51) SSL: no alternative certificate subject name",
+            ),
+        ] {
+            let Step::Done(Err(HttpError::VendorRefused(message))) =
+                vendor_get_step(&run(exit, "", stderr), "", false, URL, 64, None, no_body)
+            else {
+                panic!("{exit:?} is a verdict on the first attempt");
+            };
+            assert!(message.contains(URL), "{message}");
+        }
+        // A last attempt never answers Retry, so the loop always ends.
+        for last_run in [&dns, &busy, &run(None, "", "")] {
+            assert_ne!(
+                vendor_get_step(last_run, "", true, URL, 64, None, no_body),
+                Step::Retry
+            );
+        }
+    }
+
+    /// One HEAD attempt: the trailer is split off the last line, only the final hop's
+    /// Content-Length counts, the network is retried while attempts remain, and a curl
+    /// refusal is final.
+    #[test]
+    fn a_vendor_head_attempt_reads_the_final_hop_under_the_trailer() {
+        use super::{Step, vendor_head_step};
+        const URL: &str = "https://github.com/openai/codex/releases/download/rust-v0.156.0/\
+                           codex-package_SHA256SUMS";
+        let chain = "HTTP/2 302\r\nlocation: https://release-assets.githubusercontent.com/x\r\n\
+                     content-length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 1631\r\n\r\n\n200";
+        assert_eq!(
+            vendor_head_step(&run(Some(0), chain, ""), false, URL),
+            Step::Done(Ok(1631))
+        );
+        let gone = "HTTP/2 302\r\ncontent-length: 5\r\n\r\nHTTP/2 404\r\n\r\n\n404";
+        assert_eq!(
+            vendor_head_step(&run(Some(0), gone, ""), false, URL),
+            Step::Done(Err(HttpError::VendorStatus {
+                code: 404,
+                url: URL.into()
+            }))
+        );
+        let no_length = "HTTP/2 200\r\ncontent-type: text/plain\r\n\r\n\n200";
+        assert!(matches!(
+            vendor_head_step(&run(Some(0), no_length, ""), false, URL),
+            Step::Done(Err(HttpError::Malformed(_)))
+        ));
+        assert!(matches!(
+            vendor_head_step(&run(Some(0), "HTTP/2 200\r\n\r\n\nabc", ""), false, URL),
+            Step::Done(Err(HttpError::Malformed(_)))
+        ));
+        let busy = "HTTP/2 503\r\n\r\n\n503";
+        assert_eq!(
+            vendor_head_step(&run(Some(0), busy, ""), false, URL),
+            Step::Retry
+        );
+        assert_eq!(
+            vendor_head_step(&run(Some(0), busy, ""), true, URL),
+            Step::Done(Err(HttpError::VendorStatus {
+                code: 503,
+                url: URL.into()
+            }))
+        );
+        let dns = run(Some(6), "", "curl: (6) Could not resolve host");
+        assert_eq!(vendor_head_step(&dns, false, URL), Step::Retry);
+        assert!(matches!(
+            vendor_head_step(&dns, true, URL),
+            Step::Done(Err(HttpError::Transport(_)))
+        ));
+        assert!(matches!(
+            vendor_head_step(&run(Some(60), "", "curl: (60) SSL"), false, URL),
+            Step::Done(Err(HttpError::VendorRefused(_)))
+        ));
+    }
+
+    /// A payload failure is a verdict when no retry changes it — over the cap, a curl
+    /// refusal, a `-f` status other than 408/429/5xx — and a transport failure otherwise.
+    #[test]
+    fn a_vendor_payload_failure_is_a_verdict_only_when_it_recurs() {
+        use super::vendor_download_verdict as verdict;
+        const URL: &str =
+            "https://downloads.claude.ai/claude-code-releases/2.1.280/darwin-arm64/claude";
+        let http = |code: u16| format!("curl: (22) The requested URL returned error: {code}");
+        assert!(matches!(
+            verdict(Some(63), "curl: (63) Maximum file size exceeded", URL, 9),
+            Some(HttpError::VendorRefused(ref m)) if m.contains("9-byte cap")
+        ));
+        assert!(matches!(
+            verdict(Some(1), "", URL, 9),
+            Some(HttpError::VendorRefused(_))
+        ));
+        for code in [403, 404, 410] {
+            assert_eq!(
+                verdict(Some(22), &http(code), URL, 9),
+                Some(HttpError::VendorStatus {
+                    code,
+                    url: URL.into()
+                })
+            );
+        }
+        for code in [408, 429, 500, 503] {
+            assert_eq!(verdict(Some(22), &http(code), URL, 9), None, "{code}");
+        }
+        assert_eq!(
+            verdict(Some(28), "curl: (28) Operation timed out", URL, 9),
+            None
+        );
+        assert_eq!(verdict(None, "", URL, 9), None);
+    }
+
+    /// curl's cap never undercuts a redirect's HTML body; the exact bound is the read's.
+    #[test]
+    fn curl_gets_headroom_over_a_tiny_document_cap() {
+        assert_eq!(super::vendor_curl_cap(64), super::VENDOR_CURL_CAP_FLOOR);
+        assert_eq!(super::vendor_curl_cap(65_536), 65_536);
+        assert!(
+            super::vendor_curl_cap(1) >= 4096,
+            "a redirect's HTML body fits"
+        );
+    }
+
+    /// Every refusal the vendor lane owes before spawning — a non-https URL, a zero cap,
+    /// and an If-None-Match value that could inject a header — is a verdict, not
+    /// `Transport` (which callers read as offline), on the payload lane too.
+    #[test]
+    fn the_vendor_lane_refuses_before_spawning() {
+        const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
+        let dest = std::env::temp_dir().join("aterm-vendor-refused-never-written");
+        let refused = |result: Result<(), HttpError>, needle: &str| match result {
+            Err(HttpError::VendorRefused(m)) => assert!(m.contains(needle), "{m}"),
+            other => panic!("{needle}: {other:?}"),
+        };
+        for url in [
+            "http://downloads.claude.ai/x",
+            "file:///etc/passwd",
+            "-K/tmp/evil",
+        ] {
+            refused(super::vendor_get(url, 64, None).map(drop), "non-https");
+            refused(super::vendor_content_length(url).map(drop), "non-https");
+            refused(super::vendor_download_to(url, &dest, 64), "non-https");
+        }
+        refused(super::vendor_get(URL, 0, None).map(drop), "zero byte cap");
+        refused(super::vendor_download_to(URL, &dest, 0), "zero byte cap");
+        refused(
+            super::vendor_get(URL, 64, Some("\"a\"\r\nX-Evil: 1")).map(drop),
+            "If-None-Match",
+        );
+        assert!(!dest.exists(), "a refusal writes nothing");
+    }
+
+    /// Both of curl's spellings of "over the cap" are a verdict, and nothing else is.
+    #[test]
+    fn only_the_size_cap_is_read_as_a_size_verdict() {
+        assert!(super::filesize_exceeded(Some(63), ""));
+        assert!(super::filesize_exceeded(
+            Some(56),
+            "curl: (56) Maximum file size exceeded"
+        ));
+        assert!(!super::filesize_exceeded(
+            Some(56),
+            "curl: (56) Recv failure"
+        ));
+        assert!(!super::filesize_exceeded(
+            Some(28),
+            "curl: (28) Operation timed out"
+        ));
+        assert!(!super::filesize_exceeded(None, ""));
+    }
+
+    /// The body bound is exact: `cap` bytes are kept, `cap + 1` refused, and a missing
+    /// file (curl writes none for an empty body) is an empty document.
+    #[test]
+    fn the_vendor_body_read_is_capped_exactly() {
+        let scratch = super::VendorScratch::new().expect("scratch dir");
+        let path = scratch.0.join("body");
+        std::fs::write(&path, b"2.1.280\n").unwrap();
+        assert_eq!(super::read_capped(&path, 8, "u").unwrap(), b"2.1.280\n");
+        let Err(HttpError::VendorRefused(err)) = super::read_capped(&path, 7, "u") else {
+            panic!("one byte over the cap is a verdict about the document");
+        };
+        assert!(err.contains("7-byte cap"), "{err}");
+        assert!(
+            super::read_capped(&scratch.0.join("absent"), 8, "u")
+                .unwrap()
+                .is_empty()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&scratch.0).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "the scratch dir is private");
+        }
+        let dir = scratch.0.clone();
+        drop(scratch);
+        assert!(!dir.exists(), "the scratch dir is removed on drop");
+    }
+
+    /// LIVE: a real conditional GET of Anthropic's release head — 200 with a version body
+    /// and an ETag on the pinned host, then 304 for that ETag.
+    ///
+    /// ```text
+    ///   targo --unverified test -p aterm-update-core vendor_get_live -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "network: fetches https://downloads.claude.ai/claude-code-releases/latest"]
+    fn vendor_get_live_conditional_claude_head() {
+        const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
+        let first = super::vendor_get(URL, 64, None).expect("first GET");
+        let super::VendorResponse::Body {
+            bytes,
+            etag,
+            effective_url,
+        } = first
+        else {
+            panic!("an unconditional GET must answer a body: {first:?}");
+        };
+        let text = String::from_utf8(bytes).expect("utf-8 head");
+        let version = text.strip_suffix('\n').unwrap_or(&text);
+        let parts: Vec<&str> = version.split('.').collect();
+        assert!(
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+            "{text:?}"
+        );
+        assert_eq!(effective_url, URL, "no redirect off the pinned URL");
+        let etag = etag.expect("the head carries an ETag");
+        let second = super::vendor_get(URL, 64, Some(&etag)).expect("conditional GET");
+        println!("head={version} etag={etag} second={second:?}");
+        assert!(
+            matches!(second, super::VendorResponse::NotModified { .. }),
+            "{second:?}"
+        );
+    }
+
+    /// LIVE: the codex SHA256SUMS through GitHub's redirect — a HEAD that sizes it, a GET
+    /// whose effective URL ends on GitHub's release-asset storage, and the payload lane.
+    ///
+    /// ```text
+    ///   targo --unverified test -p aterm-update-core vendor_live_codex_sums -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "network: fetches a codex release asset from github.com"]
+    fn vendor_live_codex_sums() {
+        const URL: &str = "https://github.com/openai/codex/releases/download/rust-v0.156.0/\
+                           codex-package_SHA256SUMS";
+        let size = super::vendor_content_length(URL).expect("HEAD");
+        let got = super::vendor_get(URL, 65_536, None).expect("GET");
+        let super::VendorResponse::Body {
+            bytes,
+            effective_url,
+            ..
+        } = got
+        else {
+            panic!("{got:?}");
+        };
+        println!("size={size} len={} effective={effective_url}", bytes.len());
+        assert_eq!(bytes.len() as u64, size, "the HEAD sized the GET exactly");
+        assert!(
+            effective_url.starts_with("https://release-assets.githubusercontent.com/"),
+            "{effective_url}"
+        );
+        let err = super::vendor_get(URL, size - 1, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cap"),
+            "one byte under the size is refused: {err}"
+        );
+        // The payload lane moves the same bytes, and refuses one byte under the size as a
+        // verdict, not as the network.
+        let scratch = super::VendorScratch::new().expect("scratch dir");
+        let dest = scratch.0.join("codex-package_SHA256SUMS");
+        super::vendor_download_to(URL, &dest, size).expect("payload lane");
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        let short = scratch.0.join("short");
+        assert!(matches!(
+            super::vendor_download_to(URL, &short, size - 1),
+            Err(HttpError::VendorRefused(_))
+        ));
+        assert!(!short.exists(), "a refused payload never lands");
     }
 
     /// THE web-lane steady-state request: headers only, ONE hop, no credential channel,
@@ -1978,6 +3493,12 @@ x-ratelimit-limit: 60
     fn the_head_argv_stops_at_the_first_hop_and_carries_no_credential() {
         let args = head_args();
         assert!(args.contains(&"-I"), "{args:?}");
+        let timeout = args.iter().position(|a| *a == "--max-time").unwrap();
+        assert_eq!(args[timeout + 1], "30");
+        let quick = super::head_args_with_timeout("5");
+        assert_eq!(quick[timeout + 1], "5");
+        assert_eq!(&quick[..timeout + 1], &args[..timeout + 1]);
+        assert_eq!(&quick[timeout + 2..], &args[timeout + 2..]);
         let i = args
             .iter()
             .position(|a| *a == "--max-redirs")
@@ -2000,6 +3521,8 @@ x-ratelimit-limit: 60
         assert_eq!(dashdash, v.len() - 2);
         // The scheme gate runs before any spawn.
         let err = super::head_no_redirect("http://github.com/x").unwrap_err();
+        assert!(err.to_string().contains("non-https"), "{err}");
+        let err = super::head_no_redirect_quick("http://github.com/x").unwrap_err();
         assert!(err.to_string().contains("non-https"), "{err}");
     }
 

@@ -397,7 +397,7 @@ pub(crate) fn normalize_commit(commit: &str) -> Option<String> {
 /// BYTE-IDENTITY LAW (the fix for the cross-version `AdoptionMismatch`): this is
 /// a pure function of the *wire the parent writes*, and both sides MUST hash
 /// those same bytes. The parent writes exactly `layout.to_toml()` to the layout
-/// sidecar (`restore::write_to`) and hashes it here; the child hashes the bytes
+/// sidecar (`restore::write_once_to`) and hashes it here; the child hashes the bytes
 /// it READ from that sidecar ([`layout_wire_digest`]) instead of re-serializing
 /// its own parse. Re-serialization was the bug: it required the NEW binary's
 /// TOML codec to be a byte fixed point on the OLD binary's wire, which no
@@ -1980,13 +1980,17 @@ pub(crate) fn retire_outgoing_controls(nonce: &str) {
 
 /// Remove the handoff files (`seamless-<pid>-…`: manifests, layouts, grids,
 /// control sidecars) a process that is no longer alive left in the control
-/// dir. An attempt's own rollback retires its files and a successor consumes
+/// dir, and the restore machinery's hidden siblings of its layout
+/// (`.seamless-<pid>-….aterm-restore.lock` and the like, [`crate::restore`]).
+/// An attempt's own rollback retires its files and a successor consumes
 /// them, but a sender that CRASHED between writing and either left them on
 /// disk forever — screens, and since the control carry, submitted turn text
-/// and scrolled-off rows. Run at startup. A live pid's files — ours, and a
-/// running handoff's, whose successor may not have read them yet — are
-/// never touched; a reused pid only keeps a dead process's files a while
-/// longer.
+/// and scrolled-off rows — and the layout's lock file used to be left by
+/// every handoff, one more per update. Run at startup and again after a
+/// committed handoff (`control::sweep_after_handoff`). A live pid's files —
+/// ours, and a running handoff's, whose successor may not have read them
+/// yet — are never touched; a reused pid only keeps a dead process's files a
+/// while longer.
 pub(crate) fn sweep_dead_handoff_leftovers() {
     if let Some(dir) = crate::control_auth::socket_dir() {
         sweep_dead_handoff_leftovers_in(&dir, &crate::control_auth::pid_alive);
@@ -2010,8 +2014,10 @@ fn sweep_dead_handoff_leftovers_in(dir: &std::path::Path, alive: &dyn Fn(u32) ->
     }
 }
 
-/// The `<pid>` of a `seamless-<pid>-<rest>` file name.
+/// The `<pid>` of a `seamless-<pid>-<rest>` file name, or of the restore
+/// machinery's hidden `.seamless-<pid>-<rest>` sibling of one.
 fn handoff_leftover_pid(name: &str) -> Option<u32> {
+    let name = name.strip_prefix('.').unwrap_or(name);
     let (pid, rest) = name.strip_prefix("seamless-")?.split_once('-')?;
     (!pid.is_empty() && !rest.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
         .then(|| pid.parse().ok())
@@ -5457,6 +5463,9 @@ mod tests {
                 outer_y: Some(64),
                 status_bar_rows: 0,
                 bars: Vec::new(),
+                update_verified_unix_ms: None,
+                messages: Vec::new(),
+                next_message_id: 0,
             }),
             // Tokenless connection carry (§1.4#6): a full `both` set 0 → 1
             // whenever the stage has two shells, `(src, dst, op)`-sorted like

@@ -39,12 +39,12 @@ impl Staging {
     /// Resolve (and create, `0700`, ownership-verified) the staging layout.
     /// Returns `None` if `HOME` is unset or the directory cannot be made private.
     pub fn resolve() -> Option<Self> {
-        // The base derivation — `ATERM_UPDATE_ROOT` test/demo override first
+        // The base derivation — the `ATERM_UPDATE_ROOT` development seam first
         // (2026-08-15: without it every `cargo test -p aterm-gui` run drove
-        // the REAL per-user ledgers), else the HOME-keyed Application Support
-        // base — lives in `aterm_update_core::seal_guard::updates_root` so
-        // the seal-read marker atpkg writes and the staging layout this
-        // struct describes can never disagree about where `Updates/` is.
+        // the REAL per-user ledgers; a shipped binary reads no seam, and a
+        // scratch `$HOME` isolates it), else the HOME-keyed Application Support
+        // base — lives in `aterm_update_core::seal_guard::updates_root`, the one
+        // derivation every reader of `Updates/` shares.
         let root = aterm_update_core::seal_guard::updates_root()?;
         let download = root.join("download");
         ensure_private_dir(&download).ok()?;

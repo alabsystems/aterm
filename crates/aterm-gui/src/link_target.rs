@@ -9,7 +9,7 @@
 //! renderer stamps on a linked cell says "this is a link" and nothing at all
 //! about WHERE. A mark that invites a click without disclosing its destination
 //! is half an affordance; the other half is this band, which reuses the
-//! `config_notice`/`paste_banner` mechanics (a pure `RenderCell` row builder
+//! `paste_banner` mechanics (a pure `RenderCell` row builder
 //! plus a splice that overwrites one frame row in place) rather than inventing a
 //! floating widget of its own.
 //!
@@ -84,7 +84,7 @@ use aterm_render::Theme;
 use crate::chrome_band;
 use crate::settings::{blank_row, write_str};
 
-/// The caption's left/right margin, in cells (mirrors `config_notice`).
+/// The caption's left/right margin, in cells (mirrors `paste_banner`).
 const MARGIN: usize = 2;
 /// Gap between the lead-in and the URL.
 const GAP: usize = 2;
@@ -370,7 +370,7 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
 /// row in place. The lead-in names the gesture, the site's own labels are the
 /// one emphasized run — full contrast and bold — and everything else recedes to
 /// the secondary tone: hierarchy the flat string could not express, exactly as
-/// `notice::caption_parts` argues for its own caption grammar. The seam is
+/// the retired notice card's caption grammar argued for its own. The seam is
 /// painted from its own channel rather than from the cells' inks, which is what
 /// lets the row carry two of them (see the module header).
 ///
@@ -433,8 +433,9 @@ pub(crate) fn caption_row(
     // THE SEAM IS THE WHOLE EDGE, AND ONE TONE — closed across the finished row,
     // after every write, in the seam's own ink rather than each cell's. This band
     // stated that rule first and kept it inline; it now lives in `chrome_band` so
-    // the config-notice and paste bands, which were both quietly chipping their
-    // own top edge, close theirs from the same three lines. See the module header
+    // the paste banner and the find bar close their edges from the same three
+    // lines (as the retired config-notice band did), and the message band closes
+    // its bottom edge with the twin, `seal_band_bottom`. See the module header
     // for why the ink is the band's and not the text's.
     if seam {
         chrome_band::seal_band_top(&mut row, c.label);

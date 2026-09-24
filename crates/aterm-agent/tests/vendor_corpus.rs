@@ -3,7 +3,7 @@
 
 //! The VENDOR CORPUS replay: every fixture under `tests/testdata/vendor/` is
 //! bytes a real Claude Code really sent or really painted, and this suite
-//! drives the shipping harness over them offline.
+//! drives the shipping harness readers over them offline.
 //!
 //! # Why this suite exists, in one paragraph
 //!
@@ -19,31 +19,33 @@
 //!
 //! # What a green run here does and does not mean
 //!
-//! It means: for every payload this vendor build was OBSERVED to send, the
-//! harness reaches a decision, that decision agrees with the pure policy that
-//! is supposed to decide it, and the class discipline of the hook protocol is
-//! kept (an event-class hook prints nothing; a decide-class hook prints
-//! either nothing or a well-formed decision). It does NOT mean the vendor
-//! will not send something else tomorrow — nothing can mean that. It means
-//! the day it does, re-capturing makes this suite say so.
+//! It means: for every Bash command this vendor build was OBSERVED to send,
+//! the rm policy reaches a verdict, and at least one of them is an allow; the
+//! vendor's own statusLine payloads read into one HUD line carrying their
+//! figures; and the painted `/usage` panel yields window evidence. It does NOT
+//! mean the vendor will not send something else tomorrow — nothing can mean
+//! that. It means the day it does, re-capturing makes this suite say so.
+//!
+//! The hook payloads are DATA now, not a channel: decision "B" (2026-09-22)
+//! retired the hook bridge, and its reply builder went with the second
+//! harness stack on 2026-09-23. They stay because they are the vendor's own
+//! record of the commands a session runs and of its rate-limit windows.
 //!
 //! # Non-vacuity
 //!
 //! An empty corpus would make every assertion below true of nothing, which is
 //! the exact failure this suite is here to prevent elsewhere. So
 //! [`the_corpus_is_not_empty_and_covers_the_events_that_decide`] fails on a
-//! corpus that is missing, empty, or missing any event class the harness
-//! registers a DECIDE channel for. Deleting the fixtures does not make this
-//! suite pass.
+//! corpus that is missing, empty, or missing either event that carries the
+//! Bash command a permission box asks about. Deleting the fixtures does not
+//! make this suite pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aterm_agent::harness::cli::{
-    Env, HookClass, HookReply, hook_class, hook_reply, hud_from_statusline,
-};
 use aterm_agent::harness::rm_policy::{CwdPrefix, HookEvent, RmDecision, RmPolicy, evaluate};
+use aterm_agent::harness::usage::{self, AccountView, UsageView};
 use aterm_digest::Sha256;
 
 /// Where the corpus lives, relative to this crate.
@@ -202,31 +204,6 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<Fixture>) {
     }
 }
 
-/// An `Env` a replay can use: every path is under `dir`, the clock is fixed,
-/// and nothing here reaches the real state directory, the real settings or the
-/// real environment. [`hook_reply`] is pure and never opens `state`, so these
-/// paths name nothing that has to exist.
-fn replay_env(dir: &Path) -> Env {
-    Env {
-        state: dir.join("state"),
-        cwd: dir.join("work"),
-        home: Some(dir.join("home")),
-        settings: dir.join("settings.json"),
-        now: 1_790_000_000,
-        sid: "s-replay".to_string(),
-        nonce: String::new(),
-        utc_offset_s: 0,
-        sock: None,
-        config: None,
-        no_harness: None,
-        caps_env: None,
-        tree: None,
-        against: None,
-        aterm_build: String::new(),
-        claude_config_dir: None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The non-vacuity floor
 // ---------------------------------------------------------------------------
@@ -240,8 +217,10 @@ fn the_corpus_is_not_empty_and_covers_the_events_that_decide() {
     let caps = captures();
     assert!(
         !caps.is_empty(),
-        "no vendor capture under {} — run tools/harness-capture.sh against a live Claude Code. \
-         A green run of this suite over an empty corpus would mean nothing.",
+        "no vendor capture under {} — tools/harness-capture.sh records one, but its live mode \
+         is suspended while `aterm harness install` is retired (decision B); `--from-raw` \
+         rebuilds from a kept raw/ tree. A green run of this suite over an empty corpus would \
+         mean nothing.",
         corpus_root().display()
     );
     for cap in &caps {
@@ -355,127 +334,24 @@ fn every_fixture_is_the_bytes_the_manifest_recorded() {
 // The replay
 // ---------------------------------------------------------------------------
 
-/// THE PAYLOAD IS READ, not merely survived.
+/// THE POLICY DECIDES REAL COMMANDS, and says yes to at least one.
 ///
-/// This law used to assert three things that were true BY CONSTRUCTION of
-/// `hook_reply` — an event-class reply has an empty `stdout` because the
-/// struct is built that way; a decide-class reply names its own event because
-/// `allow_json` builds that field from the same argument the test compared it
-/// against; and every reply carries a row because only `StatusLine` does not,
-/// and `StatusLine` was skipped. Three tautologies wearing assertions'
-/// clothes: `truncate -s 0` on every fixture left it green.
+/// Until 2026-09-23 this law compared `rm_policy::evaluate` with the hook
+/// bridge's reply over the same payloads. The bridge is retired (decision
+/// "B") and deleted; the policy is what the supervisor's rm breaker asks
+/// (`supervise::policy::rm_breaker`), so what is replayed now is the policy
+/// itself over every Bash command the vendor really sent — built the way the
+/// bridge built it (the payload's own cwd, `home`, the `SessionCwd` prefix),
+/// so a verdict here is a verdict about the COMMAND.
 ///
-/// What it asserts now is a property of the PAYLOAD reaching the decision: the
-/// ledger row the firing leaves must carry the session id that payload
-/// carries. An empty file, a payload the reader ignored, or a reader that
-/// stopped copying the vendor's identifiers all fail here. The class-discipline
-/// checks are kept BELOW that, and honestly labelled: they are regression
-/// guards against a future change to `hook_reply`, not evidence about the
-/// corpus.
+/// Its non-vacuity counter counts ALLOWS — the outcome the policy exists for
+/// — not mentions of two letters, which `npm run format` would satisfy.
 #[test]
-fn every_captured_payload_reaches_a_well_formed_answer() {
+fn every_captured_bash_command_reaches_a_policy_verdict() {
     let dir = corpus_root();
-    let env = replay_env(&dir);
-    let mut replayed = 0usize;
-    for cap in captures() {
-        for f in &cap.fixtures {
-            if f.kind == "screen" || f.kind == STATUSLINE {
-                continue;
-            }
-            let reply: HookReply = hook_reply(&f.kind, &f.text(), Some("rm-approve"), &env, 1);
-            replayed += 1;
-
-            // THE DISCRIMINATING PART. `event_row_json` copies a closed set of
-            // the vendor's own fields into the row; `session_id` is in it and
-            // in every payload this vendor sends. A row that does not carry it
-            // means the payload did not reach the row.
-            let parsed: aterm_json::Value =
-                aterm_json::from_str(&f.text()).unwrap_or(aterm_json::Value::Null);
-            let row = reply
-                .event_row
-                .as_deref()
-                .or(reply.rm_row.as_deref())
-                .unwrap_or_else(|| panic!("{}/{}: no ledger row at all", cap.version, f.rel));
-            // REQUIRED, not conditional. An `if let Some(..)` here would skip
-            // the whole check for exactly the fixture that deserves it most —
-            // an empty or stub file, which carries no session id to compare.
-            let want = parsed
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{}/{}: no session_id in the payload — not a capture",
-                        cap.version, f.rel
-                    )
-                });
-            assert!(
-                row.contains(want),
-                "{}/{}: the ledger row does not carry the payload's session_id {want:?}: {row}",
-                cap.version,
-                f.rel
-            );
-            match hook_class(&f.kind) {
-                HookClass::Event => assert!(
-                    reply.stdout.is_empty(),
-                    "{}/{}: an event-class hook wrote {:?} to stdout",
-                    cap.version,
-                    f.rel,
-                    reply.stdout
-                ),
-                HookClass::Decide => {
-                    if reply.stdout.is_empty() {
-                        continue;
-                    }
-                    let parsed: aterm_json::Value = aterm_json::from_str(&reply.stdout)
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "{}/{}: the decision is not JSON ({e}): {:?}",
-                                cap.version, f.rel, reply.stdout
-                            )
-                        });
-                    let inner = parsed.get("hookSpecificOutput").unwrap_or_else(|| {
-                        panic!("{}/{}: no hookSpecificOutput", cap.version, f.rel)
-                    });
-                    assert_eq!(
-                        inner.get("hookEventName").and_then(|v| v.as_str()),
-                        Some(f.kind.as_str()),
-                        "{}/{}: the decision names another event",
-                        cap.version,
-                        f.rel
-                    );
-                }
-            }
-        }
-    }
-    assert!(replayed > 0, "no hook payload was replayed");
-}
-
-/// THE BRIDGE AND THE POLICY AGREE, on real payloads.
-///
-/// `rm_policy::evaluate` is the pure verdict and `hook_reply` is the thing the
-/// vendor actually calls. They are two code paths over one question, and a
-/// drift between them is the defect that would auto-approve something the
-/// policy refuses.
-///
-/// TWO CORRECTIONS the first version of this law needed. It fed the two paths
-/// DIFFERENT questions — `evaluate` got the replay `Env`'s cwd and a default
-/// policy while `hook_reply` uses the PAYLOAD's cwd and `home`/`SessionCwd`
-/// (`rm_verdict`) — so a payload whose cwd differs from the replay root would
-/// have reported harness drift with both halves behaving correctly. And its
-/// non-vacuity counter incremented on `cmd.contains("rm")`, which `npm run
-/// format` satisfies: the counter could be met by a command that never
-/// reaches the decision this law exists to check. It now builds the policy
-/// exactly as the bridge does, and counts ALLOWS — the outcome function 1 is
-/// for — not mentions of two letters.
-#[test]
-fn the_decision_the_vendor_receives_is_the_one_the_policy_reached() {
-    let dir = corpus_root();
-    let env = replay_env(&dir);
-    // Built the way `cli::rm_verdict` builds it — the same `home` and the
-    // same `SessionCwd` prefix — so a disagreement is a disagreement about the
-    // COMMAND and not about how the test configured the policy.
+    let fallback_cwd = dir.join("work");
     let policy = RmPolicy {
-        home: env.home.clone(),
+        home: Some(dir.join("home")),
         require_cwd_prefix: CwdPrefix::SessionCwd,
         ..RmPolicy::default()
     };
@@ -496,31 +372,20 @@ fn the_decision_the_vendor_receives_is_the_one_the_policy_reached() {
             else {
                 continue;
             };
-            // The bridge computes against the PAYLOAD's cwd when it is
-            // absolute (`cli::rm_verdict`), so this must too, or the two
-            // paths are answering different questions.
+            // The PAYLOAD's cwd when it is absolute, as the bridge read it.
             let cwd = payload
                 .get("cwd")
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| env.cwd.clone());
+                .unwrap_or_else(|| fallback_cwd.clone());
             let verdict = evaluate(cmd, &cwd, event, &policy);
-            let reply = hook_reply(&f.kind, &f.text(), Some("rm-approve"), &env, 1);
-            let bridge_allowed = !reply.stdout.is_empty();
-            assert_eq!(
-                bridge_allowed,
-                verdict.decision == RmDecision::Allow,
-                "{}/{}: the bridge {} but the policy said {} for {cmd:?} (reason {:?})",
+            // A verdict always names itself; an allow always says why.
+            assert!(
+                verdict.decision != RmDecision::Allow || !verdict.reason.is_empty(),
+                "{}/{}: an allow with no reason for {cmd:?}",
                 cap.version,
-                f.rel,
-                if bridge_allowed {
-                    "allowed"
-                } else {
-                    "abstained"
-                },
-                verdict.decision.as_str(),
-                verdict.reason
+                f.rel
             );
             compared += 1;
             if verdict.decision == RmDecision::Allow {
@@ -540,19 +405,29 @@ fn the_decision_the_vendor_receives_is_the_one_the_policy_reached() {
     );
 }
 
-/// THE HUD, over the vendor's own statusLine payloads.
+/// THE HUD LINE, over the vendor's own statusLine payloads.
 ///
-/// The vendor renders whatever this prints in its footer once a second, so
-/// the contract is narrow and absolute: exactly one line, never empty, and
-/// never a panic. A payload that will not parse still yields a line — the
-/// harness does not shout at the owner from inside someone else's footer.
+/// Nothing installs a statusLine any more (decision "B"), but the payloads
+/// are still the vendor's own record of its windows, and `usage`'s reader is
+/// still how aterm reads one: exactly one line, never empty, never a panic,
+/// and the five-hour figure reaches it.
 #[test]
 fn every_captured_statusline_renders_one_footer_line() {
     let mut rendered = 0usize;
     let mut carried = 0usize;
     for cap in captures() {
         for f in cap.fixtures.iter().filter(|f| f.kind == STATUSLINE) {
-            let (line, view) = hud_from_statusline(&f.text(), 1_790_000_000, 0);
+            let parsed = usage::parse_statusline(&f.text()).unwrap_or_else(|e| {
+                panic!(
+                    "{}/{}: the vendor's own statusLine did not parse ({e:?})",
+                    cap.version, f.rel
+                )
+            });
+            let mut view = UsageView::new(1_790_000_000);
+            let mut account = AccountView::new("account", true);
+            account.add_statusline(&parsed, 0);
+            view.accounts.push(account);
+            let line = usage::hud_line(&view, 0);
             assert!(
                 !line.is_empty(),
                 "{}/{}: the HUD rendered nothing",
@@ -565,28 +440,10 @@ fn every_captured_statusline_renders_one_footer_line() {
                 cap.version,
                 f.rel
             );
-            // THE DISCRIMINATING PART. The branch that used to be here —
-            // "if no view came back, the payload must not have parsed" — is
-            // true by construction of `hud_from_statusline`, which returns
-            // `None` on exactly the `Err` arm. Six empty files passed it.
-            //
-            // What is checked now is that the FIGURES reach the footer: a
-            // payload carrying `rate_limits.five_hour.used_percentage` must
-            // produce a line naming that percentage. A HUD that dropped the
-            // payload, or read the wrong window, fails.
-            let parsed =
-                aterm_agent::harness::usage::parse_statusline(&f.text()).unwrap_or_else(|e| {
-                    panic!(
-                        "{}/{}: the vendor's own statusLine did not parse ({e:?})",
-                        cap.version, f.rel
-                    )
-                });
-            assert!(
-                view.is_some(),
-                "{}/{}: parsed but no view",
-                cap.version,
-                f.rel
-            );
+            // THE DISCRIMINATING PART: a payload carrying
+            // `rate_limits.five_hour.used_percentage` must produce a line
+            // naming that percentage. A reader that dropped the payload, or
+            // read the wrong window, fails.
             if let Some(pct) = parsed
                 .rate_limits
                 .as_ref()
@@ -724,8 +581,9 @@ fn the_corpus_says_which_vendor_build_it_describes() {
         }
         Some(v) => println!(
             "vendor corpus: SKEW — the installed build is {v} and the corpus describes \
-             {versions:?}. Re-run tools/harness-capture.sh; nothing here has been shown to \
-             hold for {v}."
+             {versions:?}; nothing here has been shown to hold for {v}. Re-recording needs \
+             tools/harness-capture.sh's live mode, suspended while `aterm harness install` is \
+             retired (decision B)."
         ),
     }
     for cap in &caps {

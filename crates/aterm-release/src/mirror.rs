@@ -31,7 +31,7 @@
 //! a two-component tag, would produce a channel that is live, plausible, and
 //! permanently unelectable — the exact silent-never-updates failure this whole
 //! effort exists to remove. [`required_asset_names`] is that rule as data, and
-//! [`validate_mirror_asset_set`] is enforced against the REAL remote listing
+//! [`validate_mirror_asset_set_with_linux`] is enforced against the REAL remote listing
 //! before the mirrored draft is ever flipped visible.
 //!
 //! ## What is deliberately NOT mirrored
@@ -43,7 +43,7 @@
 //! text and the dSYM archive stay private — they are debugging aids for the
 //! owner, the client never reads them, and a public channel should carry the
 //! smallest surface that still satisfies the updater. Keeping the set exact
-//! also makes [`validate_mirror_asset_set`] a total check (no "and maybe some
+//! also makes [`validate_mirror_asset_set_with_linux`] a total check (no "and maybe some
 //! extras" hole).
 //!
 //! RETIRED 2026-08-26 (owner direction: ONE lean self-provisioning macOS
@@ -335,13 +335,30 @@ pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<
 /// other foreign name is still refused outright.
 pub const SOURCE_ATTESTATION_ASSETS: [&str; 2] = ["SHA256SUMS", "SHA256SUMS.sig"];
 
-pub fn validate_mirror_asset_set(
+pub fn validate_mirror_asset_set_with_linux(
     names: &[String],
     version: &str,
     signed: bool,
     rostered: bool,
+    linux: &[String],
 ) -> Result<()> {
-    let required = required_asset_names(version, signed, rostered);
+    let mut required = required_asset_names(version, signed, rostered);
+    for name in linux {
+        if !aterm_update_core::linux::LinuxTarget::X86_64
+            .asset_name(version)
+            .eq(name)
+            && !aterm_update_core::linux::LinuxTarget::Aarch64
+                .asset_name(version)
+                .eq(name)
+        {
+            return Err(Error::new("noncanonical Linux asset requested for mirror"));
+        }
+        if required.contains(name) {
+            return Err(Error::new("duplicate Linux asset requested for mirror"));
+        }
+        required.push(name.clone());
+    }
+    required.sort();
     // Split off the source-attestation pair before the exactness check: at most
     // one of each, and what remains must match the required set EXACTLY.
     for src in SOURCE_ATTESTATION_ASSETS {
@@ -430,24 +447,24 @@ mod tests {
         let mut with_pair = required_asset_names("0.65.0", true, true);
         with_pair.push("SHA256SUMS".to_string());
         with_pair.push("SHA256SUMS.sig".to_string());
-        validate_mirror_asset_set(&with_pair, "0.65.0", true, true)
+        validate_mirror_asset_set_with_linux(&with_pair, "0.65.0", true, true, &[])
             .expect("the pub pair shares the tag by design");
 
         let mut dup = with_pair.clone();
         dup.push("SHA256SUMS".to_string());
-        validate_mirror_asset_set(&dup, "0.65.0", true, true)
+        validate_mirror_asset_set_with_linux(&dup, "0.65.0", true, true, &[])
             .expect_err("a duplicated attestation asset is still refused");
 
         let mut foreign = with_pair.clone();
         foreign.push("aterm-offline.dmg".to_string());
-        validate_mirror_asset_set(&foreign, "0.65.0", true, true)
+        validate_mirror_asset_set_with_linux(&foreign, "0.65.0", true, true, &[])
             .expect_err("a retired container beside the pair is still foreign");
 
         let only_pair: Vec<String> = SOURCE_ATTESTATION_ASSETS
             .iter()
             .map(|s| s.to_string())
             .collect();
-        validate_mirror_asset_set(&only_pair, "0.65.0", true, true)
+        validate_mirror_asset_set_with_linux(&only_pair, "0.65.0", true, true, &[])
             .expect_err("the pair alone is a source release, not a mirrored cut");
     }
 
@@ -491,7 +508,7 @@ mod tests {
         ] {
             let mut stale = ok.clone();
             stale.push(retired.to_string());
-            let err = validate_mirror_asset_set(&stale, "0.62.0", true, false)
+            let err = validate_mirror_asset_set_with_linux(&stale, "0.62.0", true, false, &[])
                 .expect_err("a retired container on the channel head is a foreign object");
             assert!(err.to_string().contains(retired), "{err}");
         }
@@ -768,7 +785,7 @@ update_channel = \"someone/else\"
             "aterm-mac.zip".to_string(),
             "aterm-mac.zip.sha256".to_string(),
         ];
-        validate_mirror_asset_set(&ok, "0.5.0", false, false).unwrap();
+        validate_mirror_asset_set_with_linux(&ok, "0.5.0", false, false, &[]).unwrap();
         // Order is irrelevant — GitHub does not promise listing order.
         let reordered = vec![
             "aterm-0.5.0-mac.zip".to_string(),
@@ -781,7 +798,7 @@ update_channel = \"someone/else\"
             "aterm.dmg.sha256".to_string(),
             "aterm-appcast.toml".to_string(),
         ];
-        validate_mirror_asset_set(&reordered, "0.5.0", false, false).unwrap();
+        validate_mirror_asset_set_with_linux(&reordered, "0.5.0", false, false, &[]).unwrap();
 
         // Every way a plausible-looking mirror silently never updates:
         let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
@@ -989,7 +1006,7 @@ update_channel = \"someone/else\"
         ];
         for (names, version, signed, needle) in cases {
             let names: Vec<String> = names.into_iter().map(str::to_string).collect();
-            let err = validate_mirror_asset_set(&names, version, signed, false)
+            let err = validate_mirror_asset_set_with_linux(&names, version, signed, false, &[])
                 .expect_err(&format!("{names:?} must be refused"));
             assert!(
                 err.to_string().contains(needle),

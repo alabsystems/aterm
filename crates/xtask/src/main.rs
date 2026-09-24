@@ -97,7 +97,8 @@ fn main() -> ExitCode {
                                    --fmt-only keeps only it (both passes, no compiler,\n\
                                    seconds), nothing else narrowed either way\n\
                                    `gate help-surfaces --diff PATH` — not the gate: the\n\
-                                   prose PATH changed since its row's recorded read\n\
+                                   prose PATH changed since its row's recorded read (a .rs\n\
+                                   file's string literals and doc comments; a .md in full)\n\
                                    see docs/EXCEED_GHOSTTY_PLAN.md\n\
                  verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
                                    (this is what the `cargo verify` alias dispatches to)"

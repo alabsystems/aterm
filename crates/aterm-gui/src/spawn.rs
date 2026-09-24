@@ -104,6 +104,26 @@ const AGENT_PRIME_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// the window never launches a second thread.
 static AGENT_PRIME_LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// Set once, at launch, when this process runs `--headless`
+/// ([`mark_headless_instance`]). A headless aterm is a test or an agent's
+/// private instance, often launched with the human's real `$HOME` still in
+/// its environment; the primer writes agent context files under `$HOME`, so
+/// a headless instance never runs it.
+static HEADLESS_INSTANCE: AtomicBool = AtomicBool::new(false);
+
+/// Record that this process is a headless instance. Called by `main` once the
+/// mode is decided, before the first session spawns.
+pub(crate) fn mark_headless_instance() {
+    HEADLESS_INSTANCE.store(true, Ordering::Release);
+}
+
+/// Whether a fresh spawn may run the primer at all, pure: never in a unit
+/// test (none may write the developer's real `$HOME`), never in a headless
+/// instance. The throttle and the `agents_auto_prime` knob come after this.
+const fn agent_prime_permitted(test_build: bool, headless: bool) -> bool {
+    !test_build && !headless
+}
+
 /// The result of the most recent auto-prime pass — what actually happened,
 /// recorded for the same reason [`SHELL_INTEGRATION_OUTCOME`] is: a surface
 /// that reports on the primer must read the outcome, never assume success.
@@ -113,6 +133,14 @@ pub(crate) enum AgentPrimeOutcome {
     Disabled,
     /// `$HOME` is unset or empty: nowhere to look.
     NoHome,
+    /// This process runs from an app bundle that is not the release `aterm.app` (a dev
+    /// bundle from `tools/dev-app.sh`, a renamed copy): nothing was read or written. The
+    /// agents' context files are shared user state, and the release writes them unattended;
+    /// a dev build primes them only when asked (`aterm agents install`). Measured
+    /// 2026-09-23: a stale dev bundle launched from the Dock rewrote `~/.claude/CLAUDE.md`
+    /// and the skills with its older text within the second it started
+    /// (`atpkg::hooks::runs_from_non_release_bundle`, the one rule for such writers).
+    NotReleaseBundle,
     /// The installer ran; its per-agent result and one-line summary.
     Ran(aterm_primer::AutoPrime),
 }
@@ -161,13 +189,15 @@ fn due(last: Option<Instant>, now: Instant) -> bool {
 /// pass changed nothing, because a line per spawn would be noise.
 fn run_agent_prime(
     enabled: bool,
+    non_release_bundle: bool,
     home: Option<std::path::PathBuf>,
-    lane: Option<&aterm_primer::HookLane>,
 ) -> AgentPrimeOutcome {
     let outcome = if !enabled {
         AgentPrimeOutcome::Disabled
+    } else if non_release_bundle {
+        AgentPrimeOutcome::NotReleaseBundle
     } else if let Some(home) = home {
-        let pass = aterm_primer::auto_prime_with_lane(&home, lane);
+        let pass = aterm_primer::auto_prime(&home);
         if pass.changed() {
             aterm_log::info!("{}", pass.summary);
         }
@@ -185,135 +215,6 @@ fn run_agent_prime(
     outcome
 }
 
-/// How long the primer thread waits for this instance's control socket before a
-/// pass. Session 0 is spawned BEFORE the control listener binds, so on the
-/// first pass of every launch [`crate::proxy::self_sock_path`] is still `None`.
-const SELF_SOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// How often that wait looks again.
-const SELF_SOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
-
-/// This instance's control socket, waiting up to `wait` for the listener to
-/// bind. `None` once `wait` has passed: a disabled socket never binds, and the
-/// pass must still run (the installer's self-test then finds an instance the
-/// way `aterm ctl` does).
-fn await_self_sock(wait: std::time::Duration) -> Option<String> {
-    let deadline = Instant::now() + wait;
-    loop {
-        if let Some(sock) = crate::proxy::self_sock_path() {
-            return Some(sock);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(SELF_SOCK_POLL);
-    }
-}
-
-/// Set once the automatic pass has said it skipped the hooks for a build-tree
-/// binary, so the line is logged once per process, not once a minute.
-static HOOK_LANE_BUILD_TREE_LOGGED: AtomicBool = AtomicBool::new(false);
-
-/// The lane the AUTOMATIC pass may use: `lane` when it names an installed aterm
-/// ([`aterm_primer::installed_exe`]), `None` for a raw build in a cargo target
-/// tree — whose path must not be written into the human's
-/// `~/.claude/settings.json`, where the next rebuild replaces it and `targo
-/// clean` deletes it. The pass still runs without the lane (the primer and the
-/// skills land); the skip is logged once per process (`logged`). `aterm agents
-/// install`, the operator's explicit ask, is not gated.
-fn automatic_hook_lane(
-    lane: Option<aterm_primer::HookLane>,
-    logged: &AtomicBool,
-) -> Option<aterm_primer::HookLane> {
-    let lane = lane?;
-    if aterm_primer::installed_exe(&lane.exe) {
-        return Some(lane);
-    }
-    if !logged.swap(true, Ordering::Relaxed) {
-        aterm_log::info!(
-            "agent primer: Claude Code hooks not installed — {} is a build-tree binary; `aterm \
-             agents install` or `aterm link hook install claude --merge --settings \
-             ~/.claude/settings.json` installs them by hand",
-            lane.exe.display()
-        );
-    }
-    None
-}
-
-/// What the automatic pass does with the Claude Code hook block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HookPlan {
-    /// Build the lane and install/update the block (the default).
-    Install,
-    /// `[harness] enabled = false`: no lane, and this executable's own block
-    /// ([`aterm_primer::HookState::Installed`]) is removed.
-    Withdraw,
-    /// `agents_auto_prime = false`: the pass reads and writes nothing, the
-    /// hook file included.
-    Nothing,
-}
-
-/// The hook decision, pure. `agents_auto_prime = false` wins outright — that
-/// switch promises nothing is read or written — so the master switch acts
-/// only on a pass that runs at all.
-fn hook_plan(auto_prime: bool, harness_enabled: bool) -> HookPlan {
-    match (auto_prime, harness_enabled) {
-        (false, _) => HookPlan::Nothing,
-        (true, true) => HookPlan::Install,
-        (true, false) => HookPlan::Withdraw,
-    }
-}
-
-/// The aterm wrapper's durable master switch, `[harness] enabled` in
-/// aterm.toml, read WITHOUT [`crate::app_config::load_config`]'s user-visible
-/// side effects (this runs on the primer thread, once a minute). Default ON:
-/// no config path, a missing or unreadable file, and an unset key all read
-/// `true`, exactly as [`crate::app_config::agents_auto_prime_setting`] resolves
-/// its own knob.
-fn harness_enabled_setting() -> bool {
-    let Some(path) = crate::app_config::config_path() else {
-        return true;
-    };
-    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
-        Ok(observation) => harness_enabled_from_text(&observation.text),
-        Err(_) => true,
-    }
-}
-
-/// Pure core of [`harness_enabled_setting`]. The harness's OWN reader
-/// (`aterm_agent::harness::cli::toml_bool`, the one `Env::master_switch` and
-/// `aterm harness status` use), so the window and the harness can never
-/// disagree about whether the owner switched it off — only an explicit
-/// `false` turns it off.
-fn harness_enabled_from_text(text: &str) -> bool {
-    aterm_agent::harness::cli::toml_bool(text, "harness", "enabled") != Some(false)
-}
-
-/// `[harness] enabled = false`: take this executable's own hook block out of
-/// `~/.claude/settings.json` ([`aterm_primer::withdraw_hooks_with_lane`]); a
-/// block another aterm wrote is left alone. Logged only when something was
-/// removed or the remover refused — once a block is gone every later pass is
-/// a silent `absent`.
-fn withdraw_own_hooks(home: Option<std::path::PathBuf>) {
-    let Some(home) = home else {
-        return;
-    };
-    // No socket: `status` and `remove` run no self-test.
-    let Some(lane) = aterm_primer::HookLane::from_current_exe(None) else {
-        return;
-    };
-    match aterm_primer::withdraw_hooks_with_lane(&home, &lane) {
-        Ok(Some(line)) => aterm_log::info!(
-            "agent primer: harness.enabled = false — Claude Code hooks removed from \
-             ~/.claude/settings.json ({line})"
-        ),
-        Ok(None) => {}
-        Err(e) => aterm_log::warn!(
-            "agent primer: harness.enabled = false, but the Claude Code hooks could not be \
-             removed: {e}"
-        ),
-    }
-}
-
 /// Prime detected coding agents if the throttle says a pass is due — called at
 /// the top of every FRESH [`spawn_session`]. Returns at once either way: the
 /// pass runs on a DETACHED thread, because the spawn path is the event loop's
@@ -321,10 +222,10 @@ fn withdraw_own_hooks(home: Option<std::path::PathBuf>) {
 /// disk I/O the caret must never wait on. The handle is dropped on purpose:
 /// nothing joins it, and a pass the process outlives wrote whole files only.
 pub(crate) fn prime_agents_if_due() {
-    // Unit tests construct `App`s that reach spawn seams; none may ever write
-    // the developer's real `$HOME`. The integration lane (a headless aterm
-    // under a scratch HOME) is where this runs for real.
-    if cfg!(test) {
+    // Unit tests construct `App`s that reach spawn seams, and headless
+    // instances are tests and agents' private instances: neither may write
+    // the `$HOME` it happened to inherit. A windowed aterm is where this runs.
+    if !agent_prime_permitted(cfg!(test), HEADLESS_INSTANCE.load(Ordering::Acquire)) {
         return;
     }
     let now = Instant::now();
@@ -339,39 +240,11 @@ pub(crate) fn prime_agents_if_due() {
         .name("aterm-agent-prime".to_string())
         .spawn(|| {
             let enabled = crate::app_config::agents_auto_prime_setting();
-            // THE HOOK LANE: this binary, and this instance's socket, so the
-            // installer's self-test can prove each hook command runs and
-            // reaches THIS aterm before a byte lands in the vendor's settings
-            // file — from a thread that has no session of its own. Session 0
-            // is spawned before the control listener binds, so on the first
-            // pass of every launch there is no socket YET: without the wait
-            // the self-test would fall through to the `latest` alias (another
-            // instance, or nothing). So wait for it — up to SELF_SOCK_WAIT,
-            // polling every SELF_SOCK_POLL. This thread is detached and off
-            // the event loop, so the wait costs the caret nothing; a disabled
-            // socket never binds, and the pass then runs without one.
-            //
-            // THE MASTER SWITCH: `[harness] enabled = false` in aterm.toml
-            // (wrapper design §4.6.2) reaches this pass too. The hooks are
-            // installed by DEFAULT — the owner's instruction of 2026-09-21,
-            // "claude code harness for aterm must be BATTERIES INCLUDED ON BY
-            // DEFAULT for features", is the consent basis — and the durable
-            // `false` is the recorded way to say no: no lane is built, and
-            // this executable's own block is taken back out.
-            let plan = hook_plan(enabled, harness_enabled_setting());
-            let lane = if plan == HookPlan::Install {
-                let sock = await_self_sock(SELF_SOCK_WAIT);
-                automatic_hook_lane(
-                    aterm_primer::HookLane::from_current_exe(sock),
-                    &HOOK_LANE_BUILD_TREE_LOGGED,
-                )
-            } else {
-                None
-            };
-            if plan == HookPlan::Withdraw {
-                withdraw_own_hooks(aterm_primer::home_dir());
-            }
-            let _ = run_agent_prime(enabled, aterm_primer::home_dir(), lane.as_ref());
+            let _ = run_agent_prime(
+                enabled,
+                atpkg::hooks::runs_from_non_release_bundle(),
+                aterm_primer::home_dir(),
+            );
         });
     if let Err(e) = spawned {
         aterm_log::warn!("agent primer: could not start the installer thread: {e}");
@@ -987,6 +860,31 @@ pub(crate) struct Adopted {
     pub topics: Vec<String>,
 }
 
+/// THE ADOPTED SHELL'S NONCE, authorized on the successor engine right after
+/// `restore_checkpoint` put the parent's `require_shell_integration_nonce` back
+/// in `modes`. The running shell keeps signing its OSC 133/633 marks with the
+/// nonce it was spawned with, so the successor authorizes that same value
+/// (carried by `checkpoint_carry`) — or every mark (`detail=`, blocks, exit
+/// codes) is dropped for the session's life. A parent that carried none leaves
+/// the requirement STANDING: clearing it would let any program's output forge
+/// marks. `status integration=degraded` says the loss instead.
+pub(crate) fn authorize_adopted_shell_nonce(
+    engine: &mut aterm_core::terminal::Terminal,
+    cp: &aterm_core::terminal::TerminalCheckpoint,
+    id: u64,
+) {
+    match cp.shell_integration_nonce {
+        Some(nonce) => engine.authorize_shell_integration(nonce.0),
+        None if engine.is_require_shell_integration_nonce() => {
+            aterm_log::warn!(
+                "adopted session {id}: the handoff carried no shell-integration nonce; \
+                 its OSC 133/633 marks stay dropped (status integration=degraded)"
+            );
+        }
+        None => {}
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "threads the id/window/geometry/factory/proxy context plus the per-spawn \
@@ -1345,6 +1243,7 @@ pub(crate) fn spawn_session(
     if let Some(cp) = &adopt_checkpoint {
         let mut engine = term_lock(&term);
         engine.restore_checkpoint(cp);
+        authorize_adopted_shell_nonce(&mut engine, cp, id);
         if let Some(control) = adopt_control.take() {
             let _ = control.install(&mut engine);
         }
@@ -1433,6 +1332,7 @@ pub(crate) fn spawn_session(
         child_reaped: std::sync::atomic::AtomicBool::new(false),
         id,
         term,
+        vi_active: Arc::new(AtomicBool::new(false)),
         master,
         pid,
         handoff_local_id,
@@ -1562,70 +1462,23 @@ impl DeferredReaderGate {
 #[cfg(test)]
 mod agent_prime_tests {
     use super::{
-        AGENT_PRIME_INTERVAL, AgentPrimeOutcome, HookPlan, agent_prime_outcome,
-        automatic_hook_lane, due, harness_enabled_from_text, hook_plan, run_agent_prime,
+        AGENT_PRIME_INTERVAL, AgentPrimeOutcome, agent_prime_outcome, agent_prime_permitted, due,
+        run_agent_prime,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    /// The automatic pass never writes a build-tree binary into the human's
-    /// settings: a lane naming `target*/…/release|debug` is dropped (said
-    /// once, however many passes), an installed aterm's lane is kept, and no
-    /// lane stays no lane without a word.
+    /// A headless instance never primes, and neither does a unit test; a
+    /// windowed, non-test process does (the negative control: the gate is
+    /// not simply closed).
     #[test]
-    fn the_automatic_pass_drops_a_build_tree_lane_and_says_so_once() {
-        let lane = |exe: &str| {
-            Some(aterm_primer::HookLane {
-                exe: exe.into(),
-                sock: None,
-            })
-        };
-        let logged = AtomicBool::new(false);
-        assert_eq!(automatic_hook_lane(None, &logged), None);
-        assert!(!logged.load(Ordering::Relaxed), "no lane, nothing to say");
-
-        let raw = "/Users//x/aterm/target.noindex/release/aterm";
-        assert_eq!(automatic_hook_lane(lane(raw), &logged), None);
-        assert!(logged.load(Ordering::Relaxed), "the skip is said");
-        assert_eq!(
-            automatic_hook_lane(lane(raw), &logged),
-            None,
-            "and stays skipped"
+    fn a_headless_instance_never_primes() {
+        assert!(!agent_prime_permitted(false, true), "headless instance");
+        assert!(!agent_prime_permitted(true, false), "unit test");
+        assert!(!agent_prime_permitted(true, true));
+        assert!(
+            agent_prime_permitted(false, false),
+            "a windowed aterm primes"
         );
-
-        let bundle = "/Applications/aterm (dev).app/Contents/MacOS/aterm";
-        assert_eq!(automatic_hook_lane(lane(bundle), &logged), lane(bundle));
-    }
-
-    /// The master switch reaches the automatic hook install: an explicit
-    /// `[harness] enabled = false` (either TOML spelling) withdraws, and
-    /// everything else — an empty file, an unset key, `true`, a non-boolean,
-    /// unparseable text — is the default ON. `agents_auto_prime = false`
-    /// outranks it: that pass touches nothing.
-    #[test]
-    fn the_harness_master_switch_withdraws_the_hooks_and_defaults_on() {
-        for off in [
-            "[harness]\nenabled = false\n",
-            "harness.enabled = false\n",
-            "[harness]\nenabled = true\nenabled = false # last wins\n",
-        ] {
-            assert!(!harness_enabled_from_text(off), "{off:?}");
-        }
-        for on in [
-            "",
-            "[harness]\n",
-            "[harness]\nenabled = true\n",
-            "[other]\nenabled = false\n",
-            "[harness]\nenabled = \"no\"\n",
-            "[harness]\n# enabled = false\n",
-            "this is not toml [[[",
-        ] {
-            assert!(harness_enabled_from_text(on), "{on:?}");
-        }
-        assert_eq!(hook_plan(true, true), HookPlan::Install);
-        assert_eq!(hook_plan(true, false), HookPlan::Withdraw);
-        assert_eq!(hook_plan(false, true), HookPlan::Nothing);
-        assert_eq!(hook_plan(false, false), HookPlan::Nothing);
     }
 
     /// The throttle: the first spawn is due, a burst inside the window is not,
@@ -1656,11 +1509,14 @@ mod agent_prime_tests {
     #[test]
     fn a_pass_records_exactly_what_it_did() {
         assert_eq!(
-            run_agent_prime(false, None, None),
+            run_agent_prime(false, false, None),
             AgentPrimeOutcome::Disabled
         );
         assert_eq!(agent_prime_outcome(), Some(AgentPrimeOutcome::Disabled));
-        assert_eq!(run_agent_prime(true, None, None), AgentPrimeOutcome::NoHome);
+        assert_eq!(
+            run_agent_prime(true, false, None),
+            AgentPrimeOutcome::NoHome
+        );
         assert_eq!(agent_prime_outcome(), Some(AgentPrimeOutcome::NoHome));
 
         let home = aterm_tempfile::tempdir().expect("scratch home");
@@ -1672,7 +1528,7 @@ mod agent_prime_tests {
         // pass writes into THAT test's scratch "human" tree. Measured
         // 2026-09-22: both failed together, 2 runs in 3.
         let AgentPrimeOutcome::Ran(pass) = aterm_log::env::scoped_unset("XDG_CONFIG_HOME", || {
-            run_agent_prime(true, Some(home.path().to_path_buf()), None)
+            run_agent_prime(true, false, Some(home.path().to_path_buf()))
         }) else {
             panic!("enabled with a home must run");
         };
@@ -1687,6 +1543,27 @@ mod agent_prime_tests {
         assert!(
             !home.path().join(".claude").exists(),
             "never creates an agent dir"
+        );
+
+        // A DEV BUNDLE PRIMES NOTHING UNASKED (2026-09-23): a stale `aterm (dev).app`
+        // launched from the Dock rewrote the agents' context files with its older text.
+        // Enabled, with a home and a detected agent, the pass from a non-release bundle
+        // writes nothing, and the record says why. In THIS test, not beside it: the
+        // record is one process-wide slot, and a parallel test writing it made the
+        // read-backs above flaky.
+        let dev_home = aterm_tempfile::tempdir().expect("scratch home");
+        std::fs::create_dir_all(dev_home.path().join(".codex")).expect("detect codex");
+        assert_eq!(
+            run_agent_prime(true, true, Some(dev_home.path().to_path_buf())),
+            AgentPrimeOutcome::NotReleaseBundle
+        );
+        assert_eq!(
+            agent_prime_outcome(),
+            Some(AgentPrimeOutcome::NotReleaseBundle)
+        );
+        assert!(
+            !dev_home.path().join(".codex/AGENTS.md").exists(),
+            "nothing is written from a non-release bundle"
         );
     }
 }
@@ -4375,6 +4252,14 @@ pub(crate) fn managed_agents_dir(layout: &atpkg::store::Layout) -> Option<String
     dir.to_str().filter(|_| dir.is_dir()).map(str::to_owned)
 }
 
+/// [`atpkg_child_path`], resolved ONCE per process for readers — the Settings page's
+/// read-time SHADOWED rows, refreshed after every pass — so a page refresh never runs the
+/// login shell again. The passes resolve their own, per lane.
+pub(crate) fn atpkg_child_path_once() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(atpkg_child_path)
+}
+
 /// THE PATH THE CO-LOCATED atpkg CHILDREN RUN WITH (2026-09-10, R1). A Finder-launched
 /// app inherits launchd's `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (measured on m21:
 /// `ps -E` on the running window), so the `atpkg seed`/`atpkg update` children it
@@ -4388,7 +4273,7 @@ pub(crate) fn managed_agents_dir(layout: &atpkg::store::Layout) -> Option<String
 pub(crate) fn atpkg_child_path() -> String {
     login_shell_path().unwrap_or_else(|| {
         // The managed dirs the shell hook would have put on PATH — `agents/` first,
-        // `bin/` last — so a fallback PATH cannot make `reconcile_shadowed` record a
+        // `bin/` last — so a fallback PATH cannot make a pass or the Settings page read a
         // false SHADOWED row for a `claude` the managed twin in fact out-ranks
         // (audit 2026-09-14).
         let layout = atpkg::store::resolve_configured();

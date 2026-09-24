@@ -15,9 +15,9 @@
 //! print the `--wait-lock` lane's two markers a typed `aterm pkg update` never prints
 //! (`lock-waiting:` after the 2 s grace, `lock-acquired:` when the holder lets go;
 //! review, 2026-09-19: the child IS a `--wait-lock` caller, so a person's terminal sees
-//! them); then, the holder gone, the child runs its verb, and against a registry that
-//! does not exist fails on its own line, so the verb answers with the incomplete line,
-//! exit 1 — never 75 while a pass is merely busy. The 75 ending itself (the whole bound
+//! them); then, the holder gone, the child runs its verb — claude's vendor-direct lane,
+//! which a `dir:` registry cannot reach — and fails on its own line, so the verb answers
+//! with the incomplete line, exit 1 — never 75 while a pass is merely busy. The 75 ending itself (the whole bound
 //! elapsing) is not drivable here without a knob, and there is none: it is pinned
 //! in-process by `cli.rs`'s own test, where `selfupdate_check` takes the bound as a
 //! parameter and the same dev binary waits one second at a lock that test holds. The
@@ -168,8 +168,6 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("ATPKG_REGISTRY", format!("dir:{}", self.registry.display()))
-            .env("ATPKG_BUNDLED_SEED", "off")
-            .env_remove("ATPKG_DISABLE")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -305,6 +303,12 @@ impl Streamed {
     }
 }
 
+/// The child's own line when it cannot check: claude updates vendor-direct (design
+/// §1.5), a `dir:` registry reaches no vendor, and the legacy build the fixture laid is
+/// named by its index build number — the line an unreachable Anthropic channel prints.
+const UNREACHABLE_LINE: &str =
+    "atpkg: claude — Anthropic's release channel is unreachable; keeping build 2026091601";
+
 /// Generous for a loaded CI box; the grace itself is 2 s.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(15);
 
@@ -331,16 +335,16 @@ fn wait_markers(stdout: &[String]) -> Vec<&str> {
 /// --wait-lock 1800` — does not exit 75 while a pass is merely busy. It announces the
 /// wait on STDOUT once the 2 s grace has passed (`lock-waiting:`, naming THIS fixture's
 /// lock and the 1800 s bound), stands there until the holder lets go, answers
-/// `lock-acquired:`, and only then runs its verb — which, against a registry that does
-/// not exist, fails on the child's own `atpkg: update claude failed:` line, so the verb
-/// answers with the incomplete line and exit 1, the announce line FIRST on stderr, the
+/// `lock-acquired:`, and only then runs its verb — claude's vendor-direct lane, which the
+/// fixture's `dir:` registry cannot reach, so it fails on its own [`UNREACHABLE_LINE`] —
+/// and the verb answers with the incomplete line and exit 1, the announce line FIRST on stderr, the
 /// active build named as the one that stays, nothing of the vendor's on stdout. Exactly
 /// those two markers and no `seed-busy:` — that is the terminal of a wait that ran OUT,
 /// pinned in-process by `cli.rs`'s test with a one-second bound, since no knob exists
 /// to shorten this one (and none may).
 #[test]
 fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS, false) {
+    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
         // A build that pins no root key is disabled everywhere; the verb refuses before
         // the child (pinned below) and this ending is unreachable.
         return;
@@ -404,7 +408,7 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     let lines: Vec<&str> = stderr.lines().collect();
     assert_eq!(
         lines.first().copied(),
-        Some(atpkg::selfupdate::announce_line(Fixture::row(), "update").as_str()),
+        Some(atpkg::selfupdate::announce_line(Fixture::row(), "build 2026091601").as_str()),
         "the announce line first: {shown}"
     );
     assert!(
@@ -412,10 +416,8 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
         "no refusal on stderr — the child got the lock: {shown}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("atpkg: update claude failed:")),
-        "the child's own failure line, after the wait: {shown}"
+        lines.contains(&UNREACHABLE_LINE),
+        "the child's own line, after the wait: {shown}"
     );
     assert_eq!(
         lines.last().copied(),
@@ -430,13 +432,14 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     let _ = atpkg::lock::try_lock_store(&fx.layout()).expect("released by the child");
 }
 
-/// THE INCOMPLETE ENDING: the registry does not exist, so the child's `update claude`
-/// fails on its own line (the typed lane's pre-existing wording) and the verb exits 1
+/// THE INCOMPLETE ENDING: claude updates vendor-direct and the fixture's `dir:` registry
+/// reaches no vendor, so the child's `update claude` fails on its own line
+/// ([`UNREACHABLE_LINE`], formerly the index lane's `update claude failed:`) and the verb exits 1
 /// with the announce line first and the incomplete line last — the build that stays
 /// named — and the store lock, taken by the child for its try, released again.
 #[test]
 fn an_unreachable_registry_answers_1_with_the_childs_line_then_the_incomplete_line() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS, false) {
+    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
         // A build that pins no root key is disabled everywhere; the verb refuses before
         // the child (pinned below) and this ending is unreachable.
         return;
@@ -455,14 +458,12 @@ fn an_unreachable_registry_answers_1_with_the_childs_line_then_the_incomplete_li
     let lines: Vec<&str> = stderr.lines().collect();
     assert_eq!(
         lines.first().copied(),
-        Some(atpkg::selfupdate::announce_line(Fixture::row(), "install latest").as_str()),
+        Some(atpkg::selfupdate::announce_line(Fixture::row(), "build 2026091601").as_str()),
         "{shown}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("atpkg: update claude failed:")),
-        "the child's own failure line: {shown}"
+        lines.contains(&UNREACHABLE_LINE),
+        "the child's own line: {shown}"
     );
     assert_eq!(
         lines.last().copied(),
@@ -564,30 +565,22 @@ fn an_unrostered_program_forwards_silently() {
     assert!(!fx.lock_held());
 }
 
-/// THE DISABLED MANAGER (`ATPKG_DISABLE=1`) refuses with its line — naming the build
-/// that stays and `aterm pkg doctor`, no bypass — exit 1, the vendor's verb never run,
-/// no child, no lock.
+/// NO ENVIRONMENT KILL SWITCH (2026-09-23): `ATPKG_DISABLE=1`, which used to reach the
+/// disabled line, is inert — the verb a person typed goes on to its check. The disabled
+/// line itself is an unpinned build's alone now, pinned as a pure render elsewhere.
 #[test]
-fn a_disabled_manager_refuses_with_its_line_and_runs_nothing() {
+fn an_environment_variable_does_not_disable_the_intercept() {
     let fx = Fixture::new("disabled");
     fx.install_claude(2026091601);
     let out = fx.selfupdate("claude", &["update"], &[("ATPKG_DISABLE", "1")]);
     let shown = describe(&out);
-    assert_eq!(out.status.code(), Some(1), "{shown}");
-    assert_eq!(
-        text(&out.stderr),
-        format!(
-            "{}\n",
-            atpkg::selfupdate::disabled_line(Fixture::row(), Some(2026091601))
-        ),
-        "{shown}"
-    );
     assert!(
-        text(&out.stderr).contains("`aterm pkg doctor` says why"),
+        !text(&out.stderr).contains(&atpkg::selfupdate::disabled_line(
+            Fixture::row(),
+            Some(2026091601)
+        )),
         "{shown}"
     );
-    assert_eq!(text(&out.stdout), "", "{shown}");
-    assert!(!fx.lock_held());
 }
 
 /// THE PREFIX CROSS-CHECK at the edge: the twin's operand names a store other than the
@@ -609,7 +602,6 @@ fn a_prefix_the_environment_does_not_resolve_is_refused_with_both_named() {
         .env("HOME", &fx.home)
         .env("XDG_CONFIG_HOME", &fx.config_home)
         .env("ATPKG_REGISTRY", format!("dir:{}", fx.registry.display()))
-        .env_remove("ATPKG_DISABLE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

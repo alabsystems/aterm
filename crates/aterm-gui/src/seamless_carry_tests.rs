@@ -691,10 +691,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             identity: Some("worker".to_string()),
             // NON-EMPTY on purpose: the topic set is consent, and this is the
             // roundtrip that proves a seamless update does not drop it.
-            topics: vec![
-                "build.failed head 1".to_string(),
-                "sat-comp @42 2".to_string(),
-            ],
+            topics: vec!["build.failed head".to_string(), "sat-comp @42".to_string()],
         }],
     };
     let wire = new.to_toml().unwrap();
@@ -744,13 +741,21 @@ fn the_startup_sweep_retires_only_a_dead_senders_files() {
         "seamless-9999-aaaa.layout.toml",
         "seamless-9999-aaaa.s0.grid",
         "seamless-9999-aaaa.s0.ctl",
+        // The restore machinery's hidden siblings of the layout: its lock, and a
+        // temporary a crash left mid-publish.
+        ".seamless-9999-aaaa.layout.toml.aterm-restore.lock",
+        ".seamless-9999-aaaa.layout.toml.aterm-write-9999-1-0.tmp",
     ];
     let kept = [
         "seamless-4242-bbbb.toml".to_string(),
         "seamless-4242-bbbb.s1.ctl".to_string(),
+        ".seamless-4242-bbbb.layout.toml.aterm-restore.lock".to_string(),
         format!("seamless-{own}-cccc.s0.ctl"),
+        format!(".seamless-{own}-cccc.layout.toml.aterm-restore.lock"),
         "seamless-x9-dddd.toml".to_string(),
         "seamless-9999".to_string(),
+        ".seamless-9999".to_string(),
+        ".session.toml.aterm-restore.lock".to_string(),
         "aterm-9999.sock".to_string(),
     ];
     for name in dead.iter().copied().chain(kept.iter().map(String::as_str)) {

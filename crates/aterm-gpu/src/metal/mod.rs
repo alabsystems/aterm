@@ -1689,6 +1689,10 @@ mod tests {
         /// the `translucent` arm is non-vacuous inside the content rect too —
         /// not only on the bands.
         translucent_source: bool,
+        /// Blit the CHROME source (rendered with a metered chrome bleed), so
+        /// the uniform carries a non-zero `chrome_y1` and the bands beside the
+        /// chrome rows take the edge-continuation arm (design ruling 55).
+        chrome_source: bool,
     }
 
     /// THE FALSIFIABLE GATE: the first-party Metal blit must be BYTE-IDENTICAL
@@ -1787,6 +1791,30 @@ mod tests {
              would be vacuous inside the content rect"
         );
 
+        // THE CHROME SOURCE: two chrome rows, the second METERED (its own
+        // gutter tones), so the edge-continuation arm has three distinct tones
+        // to carry into the bands.
+        let chrome_bleed = || aterm_render::ChromeBleed {
+            rows: 2,
+            color: 0x0030_3135,
+            seam: Some(0x0060_6164),
+            top_extends_cells: false,
+            row_edges: [
+                Some(aterm_render::ChromeRowEdges {
+                    row: 1,
+                    left: 0x0050_FA7B,
+                    right: 0x0044_4750,
+                }),
+                None,
+                None,
+            ],
+        };
+        gpu.set_background_opacity(1.0);
+        gpu.set_chrome_bleed(Some(chrome_bleed()));
+        let chrome = gpu.render_input(&mut win, &input, None);
+        let chrome_rgba = frame_to_rgba8(&chrome);
+        gpu.set_chrome_bleed(None);
+
         let crop = PresentCrop {
             source_y: 3,
             height: sh - 3,
@@ -1799,6 +1827,7 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
+                chrome_source: false,
             },
             Case {
                 name: "exact fit, bell invert",
@@ -1810,6 +1839,7 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
+                chrome_source: false,
             },
             Case {
                 name: "oversized, W1 bands",
@@ -1818,6 +1848,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
+                chrome_source: false,
             },
             Case {
                 name: "cropped + drop overlay",
@@ -1830,6 +1861,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
+                chrome_source: false,
             },
             Case {
                 name: "cropped + overlay on the PRESENTED Bgra8Unorm format",
@@ -1842,6 +1874,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
+                chrome_source: false,
             },
             Case {
                 name: "linear->sRGB re-encode (encode_srgb)",
@@ -1853,6 +1886,7 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
+                chrome_source: false,
             },
             Case {
                 name: "translucent glass, content + bands",
@@ -1864,6 +1898,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: true,
+                chrome_source: false,
             },
             Case {
                 name: "premultiplied glass (premult over translucent)",
@@ -1876,6 +1911,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: true,
+                chrome_source: false,
             },
             Case {
                 name: "EDR present (hdr grid clamp)",
@@ -1887,6 +1923,29 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
+                chrome_source: false,
+            },
+            Case {
+                name: "chrome rows continue their edges through the bands",
+                target: BlitTestTarget::Bgra8Unorm,
+                fx: BlitTestEffects::PLAIN,
+                extra_w: 37,
+                extra_h: 23,
+                translucent_source: false,
+                chrome_source: true,
+            },
+            Case {
+                name: "chrome edge continuation under the bell invert",
+                target: BlitTestTarget::Rgba8Unorm,
+                fx: BlitTestEffects {
+                    invert: true,
+                    crop: Some(crop),
+                    ..BlitTestEffects::PLAIN
+                },
+                extra_w: 37,
+                extra_h: 23,
+                translucent_source: false,
+                chrome_source: true,
             },
             Case {
                 name: "EDR + scRGB reference white, with bands",
@@ -1899,6 +1958,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
+                chrome_source: false,
             },
         ];
 
@@ -1908,9 +1968,13 @@ mod tests {
             // The wgpu arm re-renders the source it needs. `render_input` is
             // deterministic for a fixed input and opacity, so this reproduces
             // the exact texels captured above rather than a new frame.
+            gpu.set_chrome_bleed(c.chrome_source.then(chrome_bleed));
             let src_rgba = if c.translucent_source {
                 gpu.set_background_opacity(0.55);
                 &glass_rgba
+            } else if c.chrome_source {
+                gpu.set_background_opacity(1.0);
+                &chrome_rgba
             } else {
                 gpu.set_background_opacity(1.0);
                 &opaque_rgba
@@ -1926,6 +1990,16 @@ mod tests {
                 MetalBlit::UNIFORM_BYTES,
                 "BlitUniform grew: add the member to `shaders/blit.metal`'s \
                  `Blit` struct before widening this constant"
+            );
+            // `chrome_y1` rides bytes 28..32 (the old accent alpha's slot): the
+            // chrome cases must actually carry it, the others must not.
+            let chrome_y1 =
+                f32::from_ne_bytes([uniform[28], uniform[29], uniform[30], uniform[31]]);
+            assert_eq!(
+                chrome_y1 > 0.0,
+                c.chrome_source,
+                "[{}] chrome_y1 = {chrome_y1}",
+                c.name
             );
 
             if !blits.iter().any(|(t, _)| *t == c.target) {
@@ -1995,6 +2069,7 @@ mod tests {
         }
         // Leave the renderer as it was found.
         gpu.set_background_opacity(1.0);
+        gpu.set_chrome_bleed(None);
     }
 
     /// P4 — THE END-TO-END DIFFERENTIAL ON A REAL VERTEX ROW. The blit gate

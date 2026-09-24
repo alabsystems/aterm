@@ -608,7 +608,7 @@ pub struct FailedMark {
     pub quarantined: bool,
     /// TRIAL markers only: the install root (`…/aterm.app`) the armed trial belongs
     /// to. The sentinel and this marker are per USER, while a build can sit at
-    /// several paths at once (a dev machine's `dist/aterm.app` beside
+    /// several paths at once (`~/Applications/aterm.app` beside
     /// `/Applications/aterm.app`, a duplicate copy of a release): a same-build
     /// process launched from a DIFFERENT bundle used to count launches against, or
     /// disarm, a trial it did not own — three sibling launches could revert and

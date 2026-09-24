@@ -106,7 +106,7 @@ mod macos {
     };
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
-    use winit::event_loop::{ActiveEventLoop, EventLoop};
+    use winit::event_loop::ActiveEventLoop;
     use winit::platform::macos::{MonitorHandleExtMacOS, WindowExtMacOS};
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1742,7 +1742,9 @@ mod macos {
 
     /// Drive the loop until every stage has run, then report.
     pub fn run() -> i32 {
-        let mut el = match EventLoop::new() {
+        // The quiet builder (Accessory, no launch activation): the gate runs this
+        // drive beside a developer who is typing somewhere else.
+        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
                 eprintln!("objc-window-drive: NOT RUN — no event loop: {e}");

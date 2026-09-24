@@ -34,10 +34,10 @@
 //!
 //! # The mechanism
 //!
-//! Two halves, the landing wait's shape ([`crate::landing`]):
+//! Two halves, the shape of the retired landing hand-over ([`crate::landing`]):
 //!
-//! * **The twin's block** ([`crate::platform::sh_selfupdate_prelude`]), rendered AHEAD of
-//!   the landing block: `case "$1" in update|upgrade|install) … exec "$__atpkg"
+//! * **The twin's block** ([`crate::platform::sh_selfupdate_prelude`]), the whole of the
+//!   twin's prelude: `case "$1" in update|upgrade|install) … exec "$__atpkg"
 //!   __selfupdate 'claude' '<prefix>' -- "$@"; …; esac`. THE FIRST TOKEN, EXACTLY, and
 //!   nothing else: `claude -p update` is a prompt, and `claude --debug install` is not an
 //!   install at all — commander's `--debug [filter]` takes an OPTIONAL value and swallows
@@ -49,15 +49,15 @@
 //!   the block is a literal `exec '` or an `export `, so every reader of the twin's
 //!   target and env answers as before. THE EXEC IS THE GUARANTEE: when the embedded
 //!   co-located `atpkg` is not executable the arm falls through to the twin's own
-//!   exports and store `exec`, and the vendor's verb runs as it did before — the
-//!   landing rule (review, 2026-09-16), never a stranded tool.
+//!   exports and store `exec`, and the vendor's verb runs as it did before (review,
+//!   2026-09-16), never a stranded tool.
 //! * **The hidden verb** (`cli::cmd_selfupdate`): re-checks the argv in Rust with
 //!   [`classify`] — help never mutates (`-h`/`--help` forwards to the vendor after one
 //!   stderr note), a shape aterm can honour prints ONE announce line and runs the
 //!   STANDARD update as a foreground child (`<embedded atpkg> update <program>
 //!   --wait-lock 1800` — [`WAIT_LOCK_SECS`], the window's own bound — with
 //!   `ATPKG_SPAWNER_PID` set and stdio inherited) so the real dispatch edge — the store
-//!   lock, the orphan watch, the landing marker other tabs wait on — is what runs and
+//!   lock, the orphan watch — is what runs and
 //!   the child's own lines are byte-identical to a typed `aterm pkg update claude` —
 //!   plus, because the child is a `--wait-lock` caller, the wait lane's stdout markers
 //!   a typed verb never prints (measured 2026-09-19 under a held lock: `atpkg:
@@ -71,17 +71,16 @@
 //!   installs a copy this name never runs; there is no bypass and no environment knob
 //!   (owner, 2026-09-19: *"remove all these env flags so that aterm works correctly by
 //!   default"*). The child's own stdout line is the verdict an agent reads (`atpkg:
-//!   claude already current (build N)` / `installed … build N` / `held by local pin`);
-//!   this module adds exactly one stderr line only when the child did not decide (exit
-//!   1 → the build you have stays, how to retry; exit 75 → another pass held the store
-//!   for the whole wait and is the one moving packages).
+//!   claude 2.1.278 → 2.1.280 (Anthropic latest)` / `atpkg: claude 2.1.280 is Anthropic's
+//!   latest` / `held by local pin`); this module adds exactly one stderr line only when
+//!   the child did not decide (exit 1 → the version you have stays, how to retry; exit
+//!   75 → another pass held the store for the whole wait and is the one moving packages).
 //!
-//! "Current" is stated as THE SIGNED PIN, never as the vendor's head: no client-side
-//! vendor probe ships — the managed copy's version is not knowable offline (no
-//! `<build>.version` sidecar exists; the lines say `build N`, the words
-//! `landing::build_words` uses with no version), the channel head is an unauthenticated
-//! hint, and a pin briefly behind upstream is the hourly publishing lane's normal state
-//! that a client cannot act on through any sanctioned path.
+//! "Current" is THE VENDOR'S HEAD (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`
+//! §1.7): the child runs the vendor-direct lane ([`crate::vendor_direct`]), which reads
+//! the vendor's `latest` pointer, verifies the build on this client under the vendor's
+//! own anchors, and installs it — no ALab index sits in between. The lines name
+//! versions (the `.vendor` record's), never a store build id.
 //!
 //! # Exposure accepted, like `__landing`'s
 //!
@@ -127,20 +126,20 @@ use std::path::Path;
 /// mutates the store.
 pub const HIDDEN_VERB: &str = "__selfupdate";
 
-/// The child's `--wait-lock` bound, in seconds: THIRTY MINUTES, a constant — the same
-/// bound the window's own passes wait (`aterm-gui`'s `ATPKG_WAIT_LOCK_SECS`, `30 * 60`;
-/// atpkg cannot depend on that crate, so `no_environment_knob_reaches_the_intercept`
-/// reads its source and pins the two equal). A typed `claude update` asks FOR the
-/// update, so it waits for a pass already running it — the 6-hourly tick, a landing, a
-/// typed `aterm pkg` verb — and the wait is never silent: the child prints
-/// `lock-waiting:` after the 2 s grace and `lock-acquired:` when it gets the store, and
-/// Ctrl-C ends it. There is no environment knob for it (owner, 2026-09-19: *"remove all
+/// The child's `--wait-lock` bound, in seconds: THIRTY MINUTES, a constant — the one
+/// every scheduled pass waits ([`aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS`]: the
+/// window's `ATPKG_WAIT_LOCK_SECS` and the terminal session's pass bind it too, and
+/// `no_environment_knob_reaches_the_intercept` reads the window's source to pin that). A
+/// typed `claude update` asks FOR the update, so it waits for a pass already running it —
+/// the window loop's, a landing, a typed `aterm pkg` verb — and the wait is never silent:
+/// the child prints `lock-waiting:` after the 2 s grace and `lock-acquired:` when it gets
+/// the store, and Ctrl-C ends it. There is no environment knob for it (owner, 2026-09-19: *"remove all
 /// these env flags so that aterm works correctly by default"*); an in-process test
 /// drives the 75 ending with a 1 s bound through `cli::selfupdate_check`'s parameter.
-pub const WAIT_LOCK_SECS: u64 = 30 * 60;
+pub const WAIT_LOCK_SECS: u64 = aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS;
 
-/// One rostered agent program: the verbs its twin intercepts, the channel words its
-/// lines speak, and the measurement the row rests on.
+/// One rostered agent program: the verbs its twin intercepts and the measurement the row
+/// rests on. Its lines name the product and vendor from [`crate::vendor_direct::VENDORS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
     /// The program, as [`crate::stub::AGENT_PROGRAMS`] spells it.
@@ -150,9 +149,6 @@ pub struct Row {
     /// has no self-updater and its twin carries no block" — an explicit decision, never
     /// a missing row (the coherence test forces a row per agent program).
     pub verbs: &'static [&'static str],
-    /// The channel aterm's signed index tracks for it, as the lines name it:
-    /// ``Claude's `latest` channel (downloads.claude.ai)``.
-    pub channel: &'static str,
     /// Where the verbs come from — the measurement, dated, so a reader of the table can
     /// tell a fact from a guess.
     pub measured: &'static str,
@@ -164,7 +160,6 @@ pub const ROSTER: &[Row] = &[
     Row {
         program: "claude",
         verbs: &["update", "upgrade", "install"],
-        channel: "Claude's `latest` channel (downloads.claude.ai)",
         measured: "claude 2.1.278 `--help`, 2026-09-19: `install [options] [target]` \
                    (stable|latest|<version>; --force), `update|upgrade`; \
                    DISABLE_AUTOUPDATER=1 leaves `claude update` live (measured exit 0, \
@@ -173,7 +168,6 @@ pub const ROSTER: &[Row] = &[
     Row {
         program: "codex",
         verbs: &["update"],
-        channel: "Codex's `latest` channel (releases.openai.com)",
         measured: "openai/codex codex-rs/cli/src/main.rs `Subcommand::Update` (no alias, \
                    no flags), read 2026-09-19; not run on this box (codex hangs off a TTY)",
     },
@@ -238,11 +232,12 @@ pub enum Verdict<'a> {
 /// Why a shape is declined — each its own sentence ([`declined_line`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decline<'a> {
-    /// `install stable`: aterm's index tracks the vendor's `latest` and publishes no
-    /// other channel.
+    /// `install stable`: aterm updates the program from the vendor's `latest` and installs
+    /// no other channel.
     NotAChannel { verb: &'a str, target: &'a str },
-    /// `install 2.1.200` / `install v2.1.200`: the index pins the build; a version of
-    /// the user's choosing cannot be honoured.
+    /// `install 2.1.200` / `install v2.1.200`: aterm updates from the vendor's latest; a
+    /// version of the user's choosing cannot be honoured (`aterm pkg rollback` and `pin`
+    /// can).
     Version { verb: &'a str, target: &'a str },
     /// Anything else after the verb (`update now`, `install --foo`, a repeated word):
     /// not a shape the updater answers, and not one to hand to the vendor's installer
@@ -261,7 +256,8 @@ pub enum Decline<'a> {
 /// 3. `update` / `upgrade` with no further token ⇒ `Check`; with any ⇒ `Declined(Shape)`;
 /// 4. `install` whose operands are drawn only from the closed set {`latest`, `--force`},
 ///    each at most once ⇒ `Check` with the words as typed (a bare `install` is a check of
-///    the pin; Claude's own default target for a bare `install` was NOT measured); else
+///    the vendor's latest; Claude's own default target for a bare `install` was NOT
+///    measured); else
 ///    the first operand not starting with `-` decides: `stable` ⇒ `Declined(NotAChannel)`,
 ///    a version (a leading digit, or `v` + digit) ⇒ `Declined(Version)`, anything else or
 ///    none ⇒ `Declined(Shape)`.
@@ -421,36 +417,44 @@ fn lead_verb(row: &Row) -> &'static str {
     row.verbs.first().copied().unwrap_or("update")
 }
 
-/// `build N`, or `(no build recorded)` when the layout has no active build of the
-/// program — the offline words (`ops::active_builds` reads the `bin/` shims; no version
-/// is knowable offline, see the module doc).
+/// The version the store's active build is (`2.1.280`; a legacy index build `build N`),
+/// or `(no version recorded)` when the layout has no active build of the program — offline
+/// words (`ops::active_builds` reads the `bin/` shims).
 fn build_words(build: Option<u64>) -> String {
-    match build {
-        Some(b) => {
-            let mut s = String::from("build ");
-            s.push_str(&crate::dec_u64(b));
-            s
-        }
-        None => String::from("(no build recorded)"),
-    }
+    build.map_or_else(
+        || String::from("(no version recorded)"),
+        crate::vendor_direct::build_words,
+    )
 }
 
-/// The announce line, stderr, before the child: `` atpkg: `claude update` — this claude
-/// is managed by aterm's package manager, which keeps it at Claude's `latest` channel
-/// (downloads.claude.ai) through the signed index (re-pinned within about an hour of a
-/// vendor release); checking that pin now with `aterm pkg update claude` (a new build
-/// can take a minute to land) `` — `words` is what the user typed, verb first. The last
-/// parenthesis is there because the download is SILENT on a terminal (`curl -sS`, no
-/// progress sink without `--progress-file`) and a 60 MB fetch must not read as a hang.
+/// `(product, vendor)` for the row's program — `("Claude Code", "Anthropic")` — from the
+/// vendor table; the program itself and `its vendor` for a row the table lacks (the
+/// roster and the table are the same programs, pinned by a test).
+fn keeper(row: &Row) -> (&'static str, &'static str) {
+    crate::vendor_direct::spec(row.program)
+        .map_or((row.program, "its vendor"), |s| (s.product, s.vendor))
+}
+
+/// The announce line, stderr, before the child: `` atpkg: aterm updates Claude Code from
+/// Anthropic — you have 2.1.278; checking now: `aterm pkg update claude` (a new version
+/// downloads silently, ~1 min) `` — facts in the order a person needs them (owner,
+/// 2026-09-22: *"more concise and with facts, like the current version, that this triggers
+/// a check"*): who updates it and from whom, what you HAVE (`have` is
+/// [`crate::vendor_direct::have_words`] of the active build, read offline before the
+/// child: the version of a vendor-direct build, the version an earlier pass recorded for
+/// a legacy index build, else `build N`; `(no version recorded)` with none), that a check
+/// is running NOW and the verb that runs it, and the one thing that would otherwise
+/// misread — a download that is SILENT on a terminal (no progress sink without
+/// `--progress-file`; 200 MB must not read as a hang). No claim that the running copy is
+/// the latest: a pin or a rollback may hold it, and the child's verdict line says so.
+/// The words typed are not echoed: they are the line above this one in every transcript.
 #[must_use]
-pub fn announce_line(row: &Row, words: &str) -> String {
+pub fn announce_line(row: &Row, have: &str) -> String {
     let p = row.program;
+    let (product, vendor) = keeper(row);
     format!(
-        "atpkg: `{p} {words}` — this {p} is managed by aterm's package manager, which keeps \
-         it at {} through the signed index (re-pinned within about an hour of a vendor \
-         release); checking that pin now with `aterm pkg update {p}` (a new build can take a \
-         minute to land)",
-        row.channel
+        "atpkg: aterm updates {product} from {vendor} — you have {have}; checking now: `aterm \
+         pkg update {p}` (a new version downloads silently, ~1 min)"
     )
 }
 
@@ -462,17 +466,18 @@ pub fn announce_line(row: &Row, words: &str) -> String {
 #[must_use]
 pub fn declined_line(row: &Row, d: &Decline<'_>) -> String {
     let p = row.program;
+    let (product, vendor) = keeper(row);
     match d {
         Decline::NotAChannel { verb, target } => format!(
-            "atpkg: `{p} {verb} {target}` — aterm's signed index pins this {p} to {} and \
-             publishes no `{target}`; `{p} {verb}` (or `{p} {verb} latest`) checks that pin, \
-             and `aterm pkg pin {p}` holds the build you have",
-            row.channel
+            "atpkg: `{p} {verb} {target}` — aterm updates {product} from {vendor} and installs \
+             no `{target}`; `{p} {verb}` (or `{p} {verb} latest`) checks {vendor}'s latest \
+             now, and `aterm pkg pin {p}` holds the version you have"
         ),
         Decline::Version { verb, target } => format!(
-            "atpkg: `{p} {verb} {}` — this {p} is pinned by aterm's signed index and cannot \
-             be moved to a version of your choosing; `{p} {verb}` (or `{p} {verb} latest`) \
-             checks that pin, and `aterm pkg pin {p}` holds the build you have",
+            "atpkg: `{p} {verb} {}` — aterm updates {product} from {vendor} and cannot install \
+             a version of your choosing; `{p} {verb}` (or `{p} {verb} latest`) checks \
+             {vendor}'s latest now, `aterm pkg rollback {p}` returns to the version before, \
+             and `aterm pkg pin {p}` holds the version you have",
             echo_words(std::slice::from_ref(&(*target).to_string()))
         ),
         Decline::Shape { verb, rest } => {
@@ -480,7 +485,7 @@ pub fn declined_line(row: &Row, d: &Decline<'_>) -> String {
             typed.extend(rest.iter().cloned());
             format!(
                 "atpkg: `{p} {}` is not a shape aterm's updater answers — `{p} {verb}` checks \
-                 the signed pin",
+                 {vendor}'s latest now",
                 echo_words(&typed)
             )
         }
@@ -501,8 +506,8 @@ pub fn help_line(row: &Row) -> String {
     )
 }
 
-/// The disabled line, stderr, exit 1, nothing run: the manager is off (`ATPKG_DISABLE`,
-/// or a build that pins no root key), so nothing is checked — and the vendor's updater
+/// The disabled line, stderr, exit 1, nothing run: the manager is off (a build that pins
+/// no root key), so nothing is checked — and the vendor's updater
 /// is NOT handed the verb either, because the copy it would install is one this name
 /// never runs; `aterm pkg doctor` says why the manager is off.
 #[must_use]
@@ -516,7 +521,7 @@ pub fn disabled_line(row: &Row, build: Option<u64>) -> String {
 }
 
 /// The epilogue for a child that exited 1 (offline, disabled inside the child, any flow
-/// error), stderr, after the child's own failure line: the build you have stays, and how
+/// error), stderr, after the child's own failure line: the version you have stays, and how
 /// to retry. (The typed lane's offline sentence — `no signature-valid index at/above the
 /// floor` — is pre-existing and reads as a trust problem; this line is what says what
 /// actually happened to the copy.)
@@ -662,10 +667,9 @@ mod tests {
                 row.program
             );
             assert!(
-                row.channel.contains("`latest`"),
-                "{}: {}",
-                row.program,
-                row.channel
+                crate::vendor_direct::spec(row.program).is_some(),
+                "{}: its lines name the vendor table's product and vendor",
+                row.program
             );
         }
         assert_eq!(verbs_of("claude"), &["update", "upgrade", "install"]);
@@ -838,29 +842,65 @@ mod tests {
     fn every_line_is_exact() {
         let c = claude();
         let x = codex();
+        let v2_1_280 = crate::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        // The announce line: what you HAVE, from the active build alone — the version of
+        // a vendor-direct build, `build N` for a legacy index build, `(no version
+        // recorded)` with none — then the check running now and its verb; the words
+        // typed are not echoed. Under 180 bytes in every render (the 2026-09-19 line
+        // was 315, the 2026-09-22 one 200).
         assert_eq!(
-            announce_line(c, "update"),
-            "atpkg: `claude update` — this claude is managed by aterm's package manager, \
-             which keeps it at Claude's `latest` channel (downloads.claude.ai) through the \
-             signed index (re-pinned within about an hour of a vendor release); checking \
-             that pin now with `aterm pkg update claude` (a new build can take a minute to \
-             land)"
+            announce_line(c, "2.1.280"),
+            "atpkg: aterm updates Claude Code from Anthropic — you have 2.1.280; checking now: \
+             `aterm pkg update claude` (a new version downloads silently, ~1 min)"
         );
         assert_eq!(
-            announce_line(c, "install latest"),
-            "atpkg: `claude install latest` — this claude is managed by aterm's package \
-             manager, which keeps it at Claude's `latest` channel (downloads.claude.ai) \
-             through the signed index (re-pinned within about an hour of a vendor release); \
-             checking that pin now with `aterm pkg update claude` (a new build can take a \
-             minute to land)"
+            announce_line(c, "build 2026091902"),
+            "atpkg: aterm updates Claude Code from Anthropic — you have build 2026091902; \
+             checking now: `aterm pkg update claude` (a new version downloads silently, ~1 min)"
         );
         assert_eq!(
-            announce_line(x, "update"),
-            "atpkg: `codex update` — this codex is managed by aterm's package manager, which \
-             keeps it at Codex's `latest` channel (releases.openai.com) through the signed \
-             index (re-pinned within about an hour of a vendor release); checking that pin \
-             now with `aterm pkg update codex` (a new build can take a minute to land)"
+            announce_line(c, "(no version recorded)"),
+            "atpkg: aterm updates Claude Code from Anthropic — you have (no version recorded); \
+             checking now: `aterm pkg update claude` (a new version downloads silently, ~1 min)"
         );
+        assert_eq!(
+            announce_line(x, "0.156.0"),
+            "atpkg: aterm updates Codex CLI from OpenAI — you have 0.156.0; checking now: \
+             `aterm pkg update codex` (a new version downloads silently, ~1 min)"
+        );
+        // The words are the vendor-direct module's, offline: a vendor-direct build id
+        // decodes to its version, a legacy index build renders as `build N` unless an
+        // earlier pass recorded its version in the program stamp, none is `(no version
+        // recorded)` — `have_words` over an empty layout, so no stamp.
+        let empty = crate::store::Layout {
+            prefix: std::env::temp_dir().join(format!("atpkg-announce-{}", std::process::id())),
+        };
+        assert_eq!(
+            crate::vendor_direct::have_words(&empty, "claude", Some(v2_1_280)),
+            "2.1.280"
+        );
+        assert_eq!(
+            crate::vendor_direct::have_words(&empty, "claude", Some(2_026_091_902)),
+            "build 2026091902"
+        );
+        assert_eq!(
+            crate::vendor_direct::have_words(&empty, "claude", None),
+            "(no version recorded)"
+        );
+        for line in [
+            announce_line(c, "2.1.280"),
+            announce_line(c, "build 2026091902"),
+            announce_line(c, "(no version recorded)"),
+            announce_line(x, "(no version recorded)"),
+        ] {
+            assert!(line.len() < 180, "{}: {line}", line.len());
+            assert!(
+                !line.contains('`') || !line.contains("` — "),
+                "no typed words echoed: {line}"
+            );
+        }
         assert_eq!(
             help_line(c),
             "atpkg: on this copy `claude update` is answered by `aterm pkg update claude` \
@@ -872,14 +912,14 @@ mod tests {
              (aterm help pkg) — the vendor's own help follows"
         );
         assert_eq!(
-            disabled_line(c, Some(2_026_091_902)),
+            disabled_line(c, Some(v2_1_280)),
             "atpkg: the aterm package manager is disabled here — nothing checked; claude \
-             build 2026091902 stays in place; `aterm pkg doctor` says why"
+             2.1.280 stays in place; `aterm pkg doctor` says why"
         );
         assert_eq!(
             disabled_line(x, None),
             "atpkg: the aterm package manager is disabled here — nothing checked; codex (no \
-             build recorded) stays in place; `aterm pkg doctor` says why"
+             version recorded) stays in place; `aterm pkg doctor` says why"
         );
         assert_eq!(
             declined_line(
@@ -889,10 +929,9 @@ mod tests {
                     target: "stable"
                 }
             ),
-            "atpkg: `claude install stable` — aterm's signed index pins this claude to \
-             Claude's `latest` channel (downloads.claude.ai) and publishes no `stable`; \
-             `claude install` (or `claude install latest`) checks that pin, and `aterm pkg \
-             pin claude` holds the build you have"
+            "atpkg: `claude install stable` — aterm updates Claude Code from Anthropic and \
+             installs no `stable`; `claude install` (or `claude install latest`) checks \
+             Anthropic's latest now, and `aterm pkg pin claude` holds the version you have"
         );
         assert_eq!(
             declined_line(
@@ -902,10 +941,10 @@ mod tests {
                     target: "2.1.200"
                 }
             ),
-            "atpkg: `claude install 2.1.200` — this claude is pinned by aterm's signed index \
-             and cannot be moved to a version of your choosing; `claude install` (or `claude \
-             install latest`) checks that pin, and `aterm pkg pin claude` holds the build \
-             you have"
+            "atpkg: `claude install 2.1.200` — aterm updates Claude Code from Anthropic and \
+             cannot install a version of your choosing; `claude install` (or `claude install \
+             latest`) checks Anthropic's latest now, `aterm pkg rollback claude` returns to \
+             the version before, and `aterm pkg pin claude` holds the version you have"
         );
         let rest = a(&["--foo"]);
         assert_eq!(
@@ -917,7 +956,7 @@ mod tests {
                 }
             ),
             "atpkg: `claude update --foo` is not a shape aterm's updater answers — `claude \
-             update` checks the signed pin"
+             update` checks Anthropic's latest now"
         );
         let rest = a(&["now"]);
         assert_eq!(
@@ -929,8 +968,14 @@ mod tests {
                 }
             ),
             "atpkg: `codex update now` is not a shape aterm's updater answers — `codex \
-             update` checks the signed pin"
+             update` checks OpenAI's latest now"
         );
+        assert_eq!(
+            incomplete_line(c, Some(v2_1_280)),
+            "atpkg: the claude check did not complete (see above) — claude 2.1.280 stays in \
+             place; `aterm pkg update claude` retries it and `aterm pkg doctor` explains"
+        );
+        // A legacy index build, not yet replaced, keeps its number.
         assert_eq!(
             incomplete_line(c, Some(2_026_091_902)),
             "atpkg: the claude check did not complete (see above) — claude build 2026091902 \
@@ -939,23 +984,23 @@ mod tests {
         );
         assert_eq!(
             incomplete_line(x, None),
-            "atpkg: the codex check did not complete (see above) — codex (no build \
+            "atpkg: the codex check did not complete (see above) — codex (no version \
              recorded) stays in place; `aterm pkg update codex` retries it and `aterm pkg \
              doctor` explains"
         );
         assert_eq!(
-            contended_line(c, Some(2_026_091_902), WAIT_LOCK_SECS),
+            contended_line(c, Some(v2_1_280), WAIT_LOCK_SECS),
             "atpkg: another atpkg pass held the store for the whole 30 min wait — that pass \
              (the window's own update, or a typed `aterm pkg` verb) is the one moving \
-             packages; claude build 2026091902 stays in place until it finishes, then \
-             `claude update` again"
+             packages; claude 2.1.280 stays in place until it finishes, then `claude update` \
+             again"
         );
         assert_eq!(
             contended_line(x, None, 1),
             "atpkg: another atpkg pass held the store for the whole 1 s wait — that pass (the \
              window's own update, or a typed `aterm pkg` verb) is the one moving packages; \
-             codex (no build recorded) stays in place until it finishes, then `codex update` \
-             again"
+             codex (no version recorded) stays in place until it finishes, then `codex \
+             update` again"
         );
         // The bound as a person reads it: seconds under two minutes, else minutes, a
         // remainder spelled out — never rounded.
@@ -1047,7 +1092,7 @@ mod tests {
         // none names an environment variable.
         let rest = a(&["now"]);
         for line in [
-            announce_line(x, "update"),
+            announce_line(x, "(no version recorded)"),
             help_line(x),
             disabled_line(x, None),
             incomplete_line(x, None),
@@ -1223,7 +1268,8 @@ mod tests {
         ] {
             assert!(bullet.contains(said), "the manual's bullet says {said:?}");
         }
-        // The bound is the window's own: `aterm-gui` declares it as `30 * 60`.
+        // The bound is the window's own: `aterm-gui` binds the one every scheduled pass
+        // waits (`pkg_check::PASS_WAIT_LOCK_SECS`, Phase 3), and so does this child.
         let gui = read("../aterm-gui/src/lib.rs");
         let decl = gui
             .lines()
@@ -1233,8 +1279,16 @@ mod tests {
             .split(" = ")
             .nth(1)
             .and_then(|v| v.trim().strip_suffix(';'))
-            .expect("a literal");
-        assert_eq!(value.trim(), "30 * 60", "{decl}");
+            .expect("a binding");
+        assert_eq!(
+            value.trim(),
+            "aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS",
+            "{decl}"
+        );
+        assert_eq!(
+            WAIT_LOCK_SECS,
+            aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS
+        );
         assert_eq!(WAIT_LOCK_SECS, 30 * 60);
     }
 

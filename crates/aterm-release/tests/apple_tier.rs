@@ -1163,6 +1163,7 @@ fn journal_with(done: &[&str]) -> Journal {
         commit: "aed5a06caed5a06caed5a06caed5a06caed5a06c".into(),
         min_build: None,
         arm64_only: false,
+        linux: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

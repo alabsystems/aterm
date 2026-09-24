@@ -74,10 +74,9 @@
 //
 // THE WORKLOADS, in the campaign's priority order:
 //
-//   1. effects_off_frame  — CF-6's price: `tick_cursor_fx` on a frame with
-//      EVERY cursor effect off. The driver still resolves policies + configs
-//      and runs the TypingCadence triple + `ignite` before any `cfg.enabled`
-//      is consulted; the guard PROVES that from outside (see below).
+//   1. effects_off_frame  — CF-6's post-fix price: `tick_cursor_fx` on a frame
+//      with EVERY cursor effect off. The driver still resolves policies and
+//      configs, but skips the cadence decay; the guard pins that from outside.
 //   2. pet_invisible_frame — PET-03's price: a composed frame with the pet
 //      configured but provably invisible; the unconditional per-frame
 //      `pet_ink()` + `sense_ink()` pair still runs. Its exact pair is also
@@ -171,17 +170,11 @@
 // controls: the identical script through a fixture missing only the off
 // switch, which must light up.
 //
-// HOW THE CF-6 REACH IS PROVED FROM OUTSIDE. `ignite` heat-blends the
-// returned `trail_color` from the cadence intensity/warmth pair
-// UNCONDITIONALLY — before any enabled bit is consulted — so on an all-off
-// frame the returned colour still moves with typing heat. The guard pins:
-// hot-cadence trail_color != cold-cadence trail_color while every fingerprint
-// and fill stays dark. That inequality IS the observable proof the cadence
-// reads ran and were consumed on the off frame (pre-fix reality). The
-// shared-sample adoption (`TypingCadence::sample`, already landed engine-side)
-// keeps it bit-identical; an early-out fix that stops blending on all-off
-// frames must revisit this guard — at which point the whole span this
-// workload times is the win being claimed.
+// HOW THE CF-6 FIX IS PROVED FROM OUTSIDE. A typed-hot all-off fixture and a
+// cold all-off fixture now return the SAME trail_color while every fingerprint
+// and fill stays dark. Before the fix, `ignite` blended typing heat into the
+// colour even though no cursor effect could draw; the guard below pins that
+// the unused cadence read and blend stay skipped.
 //
 // REACH WAS ALSO CONFIRMED ONCE, OUT OF BAND, with temporary counters at the
 // audit sites themselves (added, observed, removed — the campaign's
@@ -689,12 +682,11 @@ fn wheel_arm(b: &mut BenchApp, dir: &mut i32) {
 ///     "every cursor effect off" claim, read from the very config the
 ///     engines were ticked with.
 ///   * HOT: the cadence intensity stays >= 0.9 across the window — the
-///     pulsed arm really is sustaining the state whose per-frame decay cost
-///     CF-6 prices (a cold tracker short-circuits before the `powf`).
-///   * CONSUMED (the CF-6 witness): the returned `trail_color` on the hot
-///     fixture differs from a COLD control's — `ignite`'s heat blend ran on
-///     an all-off frame, observed from outside. Pre-fix reality; see the
-///     file header for what each fix shape does to this guard.
+///     pulsed arm keeps the underlying tracker hot, so skipping its decay
+///     on the all-off frame is a real saving.
+///   * SKIPPED (the CF-6 witness): the returned `trail_color` on the hot
+///     fixture equals a COLD control's — no unused heat blend reaches an
+///     all-off frame.
 ///   * LIT CONTROL (DarkUnless): the identical script through a fixture
 ///     missing only the off switch (rainbow kitty on, cursor moving) must
 ///     light `glow_fp` on most frames — otherwise the off arm's zero would

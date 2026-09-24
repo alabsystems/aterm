@@ -123,6 +123,16 @@ pub(crate) fn read_bounded_regular(path: &Path, limit: usize) -> io::Result<Vec<
     Ok(bytes)
 }
 
+/// The first `limit` bytes (fewer when the file is shorter) of one regular, non-link file,
+/// through the same no-follow, non-blocking open — for sniffing a file's kind by magic.
+pub(crate) fn read_head(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let file = open_regular(path)?;
+    let mut head = Vec::with_capacity(limit);
+    file.take(u64::try_from(limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut head)?;
+    Ok(head)
+}
+
 /// Read one admitted metadata file and require complete UTF-8.
 pub(crate) fn read_bounded_regular_utf8(path: &Path, limit: usize) -> io::Result<String> {
     String::from_utf8(read_bounded_regular(path, limit)?).map_err(|error| {

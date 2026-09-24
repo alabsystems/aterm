@@ -629,7 +629,7 @@ impl App {
                 // Spawn failed: do NOT mint a broken (session-less) window. The id is
                 // burned (never reused), which is fine — ids are monotonic, not dense.
                 crate::logging::stderr_line!("aterm-gui: could not open a new window: {e}");
-                self.surface_gesture_failure(&format!("✕ New window failed: {e}"));
+                self.post_message(crate::message_reporters::new_window_failed(&e.to_string()));
                 return None;
             }
         };
@@ -674,8 +674,9 @@ impl App {
         // Clone the mirror Arcs BEFORE moving the session into the pool (the pool
         // then OWNS it; these are the window's active-tab mirror, source-of-truth in
         // the pool).
-        let (term, master, sink, ui_waiting) = (
+        let (term, session_vi_active, master, sink, ui_waiting) = (
             session.term.clone(),
+            session.vi_active.clone(),
             session.master,
             session.ctx.sink.clone(),
             session.ctx.ui_waiting.clone(),
@@ -694,6 +695,7 @@ impl App {
         let metrics = self.unattached_window_metrics();
         let ws = WindowState::new_terminal(
             term,
+            session_vi_active,
             master,
             sink,
             ui_waiting,
@@ -1029,14 +1031,14 @@ impl App {
         );
         // The honesty half: this runs during the FIRST attach, before any window is
         // on glass, on a process whose stderr a Start-Menu launch discarded. Queue
-        // the sentence for the notice banner and latch the cause so `aterm-ctl
+        // the message for the band (design R6) and latch the cause so `aterm-ctl
         // chrome` reads `client=opaque(dcomp_unavailable)` rather than a bare
         // `opaque` that could mean five different things.
-        crate::config_notice::queue_deferred(
-            "background_material is styling the title bar only: this display stack refused \
-             the DirectComposition backdrop swapchain, so the terminal body stays opaque."
-                .to_string(),
-        );
+        crate::message_inbox::queue_message(crate::message_reporters::backdrop_declined(
+            "background_material is styling the title bar only",
+            "this display stack refused the DirectComposition backdrop swapchain, so the \
+             terminal body stays opaque",
+        ));
         crate::platform_win::note_client_backdrop_declined(
             crate::platform_win::ClientBackdropDecline::DcompUnavailable,
         );

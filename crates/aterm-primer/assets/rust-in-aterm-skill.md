@@ -8,8 +8,9 @@ description: Use whenever you are about to build, check, test, lint, format or r
 
 aterm installs the ALab **verified** Rust toolchain beside stock Rust. On this
 machine, **use it by default** — the owner's instruction, verbatim: *"USE TRUST
-TOOLCHAIN NOT RUST."* Stock `cargo`/`rustc` is never blocked, but it is the
-exception: if you run it, say in your reply that you did and why.
+TOOLCHAIN NOT RUST! this needs to be very strongly encouraged by the aterm system
+itself."* Stock `cargo`/`rustc` is not blocked; it is the exception: if you run it,
+say in your reply that you did and why.
 
 ## The tools
 
@@ -65,7 +66,7 @@ your exact command in both lanes and then runs upstream. Two verbs are the
 exception: `cargo clippy` and `cargo fmt` print **one** branded spelling
 (`targo tippy`, `targo fmt`) and no lane question, because linting and
 formatting neither prove nor build. That printout is the answer;
-`ATERM_REROUTE_QUIET=1` silences it if you have decided.
+`[reroute] announce = false` in aterm.toml silences it if you have decided.
 
 ## Before the first build in a project: measure, do not guess
 

@@ -239,9 +239,10 @@ fn shell_command(shell: &str) -> Command {
         // The reroute seam's pair (2026-09-07): a developer running the suite
         // inside an aterm session inherits a live `$ATERM_REROUTE_DIR`, and every
         // script would then re-order the test shell's PATH; a live
-        // `$ATERM_NO_REROUTE` is that session's choice, not this fixture's.
+        // `$__ATERM_REROUTE_PASSTHROUGH` (the `aterm --no-reroute` marker) is that
+        // session's choice, not this fixture's.
         "ATERM_REROUTE_DIR",
-        "ATERM_NO_REROUTE",
+        "__ATERM_REROUTE_PASSTHROUGH",
         // The agents dir (2026-09-10): exported by a live session's atpkg shell.d
         // hook, and every script moves it to the front beside the reroute dir, so an
         // inherited one would re-order the test shell's PATH the same way.
@@ -4556,7 +4557,7 @@ impl LiveFixture {
 /// re-sourced (zstat sees the new inode). PATH then reads reroute, agents, …, bin
 /// last, each once, and ATERM_REROUTE_DIR was derived beside agents/. Then the two
 /// negatives: outside a session nothing happens live, and an engaged
-/// ATERM_NO_REROUTE derives no reroute dir.
+/// __ATERM_REROUTE_PASSTHROUGH (the `aterm --no-reroute` marker) derives no reroute dir.
 /// An interactive zsh through the crate's own ZDOTDIR wrapper, reading the
 /// fixture home's .zshrc — `rc_prelude` (a user's `setopt` lines, say) then the
 /// foreign prepend — exactly the real launch shape.
@@ -4699,9 +4700,13 @@ fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
     );
     sh.finish();
 
-    // 3. ATERM_NO_REROUTE engaged: agents/ is fronted, no reroute dir is derived.
+    // 3. The `--no-reroute` marker engaged: agents/ is fronted, no reroute dir is
+    //    derived.
     let fx = LiveFixture::new();
-    let mut sh = spawn(&fx, &[("ATERM_CHILD", "1"), ("ATERM_NO_REROUTE", "1")]);
+    let mut sh = spawn(
+        &fx,
+        &[("ATERM_CHILD", "1"), ("__ATERM_REROUTE_PASSTHROUGH", "1")],
+    );
     sh.send("claude");
     let at = sh.wait_for_after("foreign", 0);
     fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
@@ -4716,7 +4721,7 @@ fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
     );
     assert!(
         !path.contains(fx.reroute.to_str().expect("UTF-8")),
-        "zsh: no reroute dir on PATH under ATERM_NO_REROUTE=1: {path:?}"
+        "zsh: no reroute dir on PATH under __ATERM_REROUTE_PASSTHROUGH=1: {path:?}"
     );
     assert_eq!(sh.value_before("LIVERR=", at), "unset");
     sh.finish();

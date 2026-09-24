@@ -23,7 +23,7 @@
 //!     the window centre and fades, rasterized as a paint-only [`DrawPrim`] card
 //!     (the `level_up_card` tray-quad slot) — rides the landing only.
 //!
-//! GLOBAL (App-level), like `notice`/`config_notice`, and it borrows the SAME timed
+//! GLOBAL (App-level), like `notice`, and it borrows the SAME timed
 //! lifecycle shape (`is_expired` + `deadline` + a quantized `fingerprint`). It
 //! animates for its WHOLE life, so `deadline` steps every [`FRAME`] — except under
 //! reduced motion, where the rim holds still (information kept, movement removed:

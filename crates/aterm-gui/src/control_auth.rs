@@ -3282,8 +3282,12 @@ pub fn resolve_socket_plan() -> SocketResolution {
 }
 
 /// Remove per-instance sockets/tokens left behind by instances whose pid is
-/// no longer alive (a crashed session cannot clean up after itself). Live
-/// instances — including ourselves — and the fixed filenames are untouched.
+/// no longer alive (a crashed session cannot clean up after itself, and an
+/// update handoff's predecessor leaves at Commit without cleaning up). Live
+/// instances — including ourselves — and the fixed filenames are untouched, and
+/// so is the pair the `latest` alias ([`SOCK_FILE`]) names: that alias is
+/// repointed by the next instance to bind, and its old target goes at the sweep
+/// after that. A pid is dead only when `kill(pid, 0)` says so ([`pid_alive`]).
 pub fn sweep_stale_instances(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -3292,7 +3296,12 @@ pub fn sweep_stale_instances(dir: &Path) {
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let aliased = aterm_uds::latest::target_name(&dir.join(SOCK_FILE))
+        .and_then(|target| control_socket::instance_pid(&target.to_string_lossy()));
     for stale in control_socket::stale_instance_files(&refs, &imp::pid_alive) {
+        if aliased.is_some() && control_socket::instance_pid(&stale) == aliased {
+            continue;
+        }
         let _ = std::fs::remove_file(dir.join(stale));
     }
 }
@@ -4768,6 +4777,22 @@ mod tests {
             dir.join(control_socket::token_name_for_sock("private.sock"))
                 .exists()
         );
+
+        // THE ALIAS'S TARGET IS NEVER SWEPT, dead or not: the `latest` alias
+        // names a dead instance's pair between a crash and the next bind, and
+        // the pair goes at the sweep after the alias moves on.
+        touch(&control_socket::instance_sock_name(dead));
+        touch(&control_socket::instance_token_name(dead));
+        let link = dir.join(SOCK_FILE);
+        publish_latest_link(&link, &control_socket::instance_sock_name(dead));
+        sweep_stale_instances(&dir);
+        assert!(dir.join(control_socket::instance_sock_name(dead)).exists());
+        assert!(dir.join(control_socket::instance_token_name(dead)).exists());
+        publish_latest_link(&link, &control_socket::instance_sock_name(us));
+        sweep_stale_instances(&dir);
+        assert!(!dir.join(control_socket::instance_sock_name(dead)).exists());
+        assert!(!dir.join(control_socket::instance_token_name(dead)).exists());
+        assert!(dir.join(control_socket::instance_sock_name(us)).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

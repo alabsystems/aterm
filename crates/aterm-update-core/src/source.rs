@@ -1,17 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resolving the GitHub release source (`github.com/<owner>/<repo>`) by the
-//! precedence **env > config > compiled default**, with a URL-safety allowlist on
-//! every candidate so a configured value can never redirect the updater at a
-//! different host/path. Artifact-agnostic: the owner/repo only decide *where the
+//! Resolving the GitHub release source (`github.com/<owner>/<repo>`): the compiled
+//! default, which a DEVELOPMENT build may repoint through `[update]` owner/repo in
+//! aterm.toml, with a URL-safety allowlist on every candidate so a configured value can
+//! never redirect the updater at a different host/path. Artifact-agnostic: the owner/repo only decide *where the
 //! bytes come from*, never *whether they are trusted* (the authenticity anchor
 //! lives in the consuming crate, e.g. the pinned Team ID + Apple notarization).
 
 /// Default GitHub owner of the release repository (the `OWNER` in
-/// `github.com/OWNER/REPO`). This is the *fallback* — the source is configurable at
-/// runtime (env `ATERM_UPDATE_OWNER`, then the GUI's `[update] owner` config), so a
-/// fork/relocation needs no code change. Compiled in only as the last resort.
+/// `github.com/OWNER/REPO`) — THE channel of every shipped binary. A development build
+/// may repoint it through the GUI's `[update] owner` config ([`REPOINT_IS_A_DEV_SEAM`]);
+/// the `$ATERM_UPDATE_OWNER` override is gone (2026-09-23, R2: no env alternatives).
 ///
 /// NOT a hand-maintained literal: `build.rs` derives it from the single tracked
 /// source of truth — `[workspace.metadata.aterm] update_channel` in the workspace
@@ -24,9 +24,9 @@
 /// anyone has provisioned it a token.
 pub const DEFAULT_OWNER: &str = env!("ATERM_DEFAULT_OWNER");
 
-/// Default GitHub repository name the updater pulls releases from. Overridable at
-/// runtime exactly like [`DEFAULT_OWNER`] (env `ATERM_UPDATE_REPO`, then `[update]
-/// repo` config), and likewise derived from the workspace manifest by `build.rs`.
+/// Default GitHub repository name the updater pulls releases from. Repointable in a
+/// development build exactly like [`DEFAULT_OWNER`] (`[update] repo` config), and
+/// likewise derived from the workspace manifest by `build.rs`.
 pub const DEFAULT_REPO: &str = env!("ATERM_DEFAULT_REPO");
 
 /// GitHub account this project is PUBLISHED under — derived by `build.rs` from
@@ -58,13 +58,19 @@ pub const PUBLISH_REPO: &str = env!("ATERM_PUBLISH_REPO");
 /// (`pins`), which verifies the same signed index wherever it is hosted.
 pub const ATPKG_INDEX_OWNER: &str = env!("ATERM_ATPKG_INDEX_OWNER");
 
+/// Whether this build honours a REPOINTED update source (`[update]` owner/repo in
+/// aterm.toml): only a development build does — `debug_assertions`, or this crate's
+/// `dev-seams` feature, which the release cutter never enables. The owner's rule
+/// (2026-09-23): one true path; alternatives are for development. A shipped binary
+/// reads its compiled channel and names a configured repoint once in the log.
+pub const REPOINT_IS_A_DEV_SEAM: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
+
 /// The resolved GitHub release source: `github.com/<owner>/<repo>`. Construct it
-/// with [`Source::resolve`], which applies the precedence
-/// **env > config > compiled default**:
+/// with [`Source::resolve`]:
 ///
-/// 1. `$ATERM_UPDATE_OWNER` / `$ATERM_UPDATE_REPO` (per-machine override);
-/// 2. the values the caller threads in from the GUI's `[update]` config table;
-/// 3. [`DEFAULT_OWNER`] / [`DEFAULT_REPO`].
+/// 1. in a DEVELOPMENT build ([`REPOINT_IS_A_DEV_SEAM`]), the values the caller threads
+///    in from the GUI's `[update]` config table;
+/// 2. [`DEFAULT_OWNER`] / [`DEFAULT_REPO`] — the only source of a shipped binary.
 ///
 /// Repointing the source is **not** an authenticity downgrade: the real anchor is
 /// the compiled-in pinned Team ID (plus Apple notarization), so even a source
@@ -81,41 +87,54 @@ pub struct Source {
 
 impl Source {
     /// Resolve the update source. `cfg_owner`/`cfg_repo` are the values the caller
-    /// read from the GUI config (`None` when unset); env overrides them, and an
-    /// unset/blank/syntactically-invalid value at any level falls through to the next.
+    /// read from the GUI config (`None` when unset). A development build honours them
+    /// ([`REPOINT_IS_A_DEV_SEAM`]); a shipped binary names them once in the log and
+    /// reads its compiled channel. An unset/blank/syntactically-invalid value falls
+    /// through to the compiled default.
     #[must_use]
     pub fn resolve(cfg_owner: Option<&str>, cfg_repo: Option<&str>) -> Self {
+        Self::resolve_with(REPOINT_IS_A_DEV_SEAM, cfg_owner, cfg_repo)
+    }
+
+    /// [`Self::resolve`] with the build's seam posture as an input, so both postures
+    /// are pinned by a test in one build.
+    #[must_use]
+    pub fn resolve_with(dev_seams: bool, cfg_owner: Option<&str>, cfg_repo: Option<&str>) -> Self {
+        if !dev_seams {
+            if cfg_owner.or(cfg_repo).is_some_and(|v| !v.trim().is_empty()) {
+                note_ignored_repoint();
+            }
+            return Self {
+                owner: DEFAULT_OWNER.to_string(),
+                repo: DEFAULT_REPO.to_string(),
+            };
+        }
         Self {
-            owner: resolve_slug("ATERM_UPDATE_OWNER", cfg_owner, DEFAULT_OWNER),
-            repo: resolve_slug("ATERM_UPDATE_REPO", cfg_repo, DEFAULT_REPO),
+            owner: pick_slug("[update] owner", cfg_owner, DEFAULT_OWNER),
+            repo: pick_slug("[update] repo", cfg_repo, DEFAULT_REPO),
         }
     }
 }
 
-/// Resolve one slug (owner or repo) by precedence env > config > default. Reads the
-/// environment, then delegates the (pure, testable) precedence + validation to
-/// [`pick_slug`].
-fn resolve_slug(env_key: &str, cfg: Option<&str>, default: &str) -> String {
-    let env_val = std::env::var(env_key).ok();
-    pick_slug(env_key, env_val.as_deref(), cfg, default)
+/// The one log line a shipped binary gives a configured `[update]` repoint it will not
+/// use — once per process, however often the source is resolved.
+fn note_ignored_repoint() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        aterm_log::warn!(
+            "aterm-update: [update] owner/repo is a development setting — this build \
+             reads its compiled channel ({DEFAULT_OWNER}/{DEFAULT_REPO}); remove the keys"
+        );
+    }
 }
 
-/// Pure precedence + validation for one slug: the first of `env`, then `cfg` that is
-/// present, non-blank, AND a valid GitHub owner/repo name wins; a present-but-invalid
-/// value is skipped with a warning; if neither qualifies, the (trusted, compiled-in)
-/// `default` is used. Side-effect-free apart from the warning, so it is unit-testable
-/// without mutating the process environment.
-// Skip: the `for .. in [..; 2]` array-literal iterator's drop glue (std
-// array::IntoIter over ManuallyDrop internals) is not yet in the drop
-// classifier's std scaffold set; the elements are refs + Option<&str>
-// (no drop glue of their own). Pure precedence logic, unit-tested.
-// Droppable when the array::IntoIter scaffold arm lands.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn pick_slug(env_key: &str, env: Option<&str>, cfg: Option<&str>, default: &str) -> String {
-    for (origin, cand) in [(env_key, env), ("[update] config", cfg)] {
-        let Some(v) = cand.map(str::trim).filter(|s| !s.is_empty()) else {
-            continue;
-        };
+/// Validation for one slug: `value` wins when it is present, non-blank AND a valid
+/// GitHub owner/repo name; a present-but-invalid value is skipped with a warning that
+/// names `origin` (the config key it came from); otherwise the (trusted, compiled-in)
+/// `default` is used. Side-effect-free apart from the warning, so it is unit-testable.
+#[must_use]
+pub fn pick_slug(origin: &str, value: Option<&str>, default: &str) -> String {
+    if let Some(v) = value.map(str::trim).filter(|s| !s.is_empty()) {
         if is_valid_slug(v) {
             return v.to_string();
         }
@@ -192,41 +211,29 @@ mod tests {
     }
 
     #[test]
-    fn pick_slug_precedence_env_over_config_over_default() {
-        // env wins when valid.
+    fn pick_slug_takes_a_valid_value_else_the_default() {
         assert_eq!(
-            pick_slug("E", Some("envowner"), Some("cfgowner"), "default"),
-            "envowner"
-        );
-        // config used when env absent.
-        assert_eq!(
-            pick_slug("E", None, Some("cfgowner"), "default"),
+            pick_slug("[update] owner", Some("cfgowner"), "default"),
             "cfgowner"
         );
-        // default used when both absent.
-        assert_eq!(pick_slug("E", None, None, "default"), "default");
-        // blank/whitespace at a level is treated as absent → fall through.
+        assert_eq!(pick_slug("[update] owner", None, "default"), "default");
+        // blank/whitespace is treated as absent → the default.
         assert_eq!(
-            pick_slug("E", Some("   "), Some("cfgowner"), "default"),
-            "cfgowner"
+            pick_slug("[update] owner", Some("   "), "default"),
+            "default"
         );
         // values are trimmed.
         assert_eq!(
-            pick_slug("E", Some("  envowner \n"), None, "default"),
-            "envowner"
+            pick_slug("[update] owner", Some("  cfg \n"), "default"),
+            "cfg"
         );
-    }
-
-    #[test]
-    fn pick_slug_skips_invalid_and_falls_through() {
-        // An invalid env value is skipped, the valid config value is used.
+        // An invalid value never redirects: the trusted default.
         assert_eq!(
-            pick_slug("E", Some("bad/owner"), Some("goodowner"), "default"),
-            "goodowner"
+            pick_slug("[update] owner", Some("c/d"), "default"),
+            "default"
         );
-        // Invalid at env AND config → trusted default (never an attacker-shaped slug).
         assert_eq!(
-            pick_slug("E", Some("a b"), Some("c/d"), "default"),
+            pick_slug("[update] owner", Some("a b"), "default"),
             "default"
         );
     }
@@ -241,19 +248,34 @@ mod tests {
         // (a fall-through to `repository` would spell "alabsystems" here).
         // The release cutter's `mirror` step targets the same slug; the binding
         // is asserted publisher-side in aterm-release's `mirror` module.
-        // (Env-independent — the env-override path is covered by `pick_slug`.)
         assert_eq!(DEFAULT_OWNER, "alabsystems");
         assert_eq!(DEFAULT_REPO, "aterm");
-        // `Source::resolve` reads the real `ATERM_UPDATE_OWNER`/`_REPO`; only assert it
-        // yields the defaults when neither is set, so an ambient override (e.g. a dev
-        // testing a fork) can't make this flake.
-        if std::env::var_os("ATERM_UPDATE_OWNER").is_none()
-            && std::env::var_os("ATERM_UPDATE_REPO").is_none()
-        {
-            let s = Source::resolve(None, None);
-            assert_eq!(s.owner, DEFAULT_OWNER);
-            assert_eq!(s.repo, DEFAULT_REPO);
-        }
+        // No environment is read any more, so this holds on every machine.
+        let s = Source::resolve(None, None);
+        assert_eq!(s.owner, DEFAULT_OWNER);
+        assert_eq!(s.repo, DEFAULT_REPO);
+    }
+
+    /// THE REPOINT IS A DEVELOPMENT SEAM (2026-09-23). A development build honours a
+    /// configured `[update]` owner/repo; a shipped binary reads its compiled channel
+    /// whatever the file says — and a test build is a development build, so the
+    /// shipped posture is pinned through [`Source::resolve_with`].
+    #[test]
+    fn a_config_repoint_is_honoured_only_by_a_development_build() {
+        let dev = Source::resolve_with(true, Some("fork-owner"), Some("fork-repo"));
+        assert_eq!(
+            (dev.owner.as_str(), dev.repo.as_str()),
+            ("fork-owner", "fork-repo")
+        );
+        let shipped = Source::resolve_with(false, Some("fork-owner"), Some("fork-repo"));
+        assert_eq!(
+            (shipped.owner.as_str(), shipped.repo.as_str()),
+            (DEFAULT_OWNER, DEFAULT_REPO),
+            "a shipped binary is never repointed by a config file"
+        );
+        // Half a repoint in a dev build keeps the other half compiled.
+        let half = Source::resolve_with(true, Some("fork-owner"), None);
+        assert_eq!(half.repo, DEFAULT_REPO);
     }
 
     #[test]

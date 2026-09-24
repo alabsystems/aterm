@@ -78,6 +78,11 @@
 //!   and swapped in by `rename(2)`, and the parts that still match are not re-laid. A
 //!   clone that cannot be made (the store on another volume) refuses the attach: atpkg
 //!   never byte-copies a toolchain in place of a clone.
+//! * A view a live process runs from — or one whose process table cannot be read — is not
+//!   re-laid at all: a running `targo` spawns the `trustc` beside it by the view's name, so
+//!   a swap switched compilers mid-build. It is left as it stands, the re-assertion says so
+//!   in a line of its own — naming `aterm pkg repair` for once the build has finished —
+//!   and the first pass that finds nothing running from it lays it ([`Deferred`]).
 //! * A successful attach is RECORDED in `status.toml` as `seams = ["rustup:trust"]`
 //!   (load, modify, save through the atomic writer — other fields are never clobbered).
 //! * Detach removes the entry only when it is a symlink resolving into the prefix (or
@@ -94,10 +99,10 @@
 //!
 //! The library entry points take the rustup home as DATA ([`attach`], [`detach`],
 //! [`status`], [`reassert`]); only the CLI edge reads `RUSTUP_HOME` / `HOME`
-//! ([`rustup_home`], [`arm_from_env`]). flow.rs — whose tests activate a program
-//! named `trust` inside temp layouts — calls [`reassert_if_armed`], which does nothing
-//! unless the real process edge armed it, so no unit test can reach a developer's
-//! live `~/.rustup`.
+//! ([`rustup_home`]), and it re-asserts after a pass or an activation itself
+//! (`reassert_rustup_seam` in cli.rs). flow.rs never reads a rustup home (it lays only
+//! the exec roots, through [`crate::compat`]), so no unit test that activates a program
+//! named `trust` inside a temp layout can reach a developer's live `~/.rustup`.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -281,6 +286,51 @@ pub struct Refreshed {
     pub stock: Vec<(&'static str, &'static str)>,
     /// Whether the view's `bin/` changed (a rebuild that produced the same set is silent).
     pub changed: bool,
+    /// `Some` when the view did NOT match `build` and was left as it stands, because a live
+    /// process runs from it or whether one does could not be read ([`Deferred`]). The view
+    /// still presents what it had; `tools` and `stock` are `build`'s plan, not yet laid.
+    pub deferred: Option<Deferred>,
+}
+
+/// Why [`refresh_view_in_process`] left an out-of-date view as it stands.
+///
+/// A build that runs from the view keeps finding its compiler by the view's NAME: `targo`
+/// spawns the `trustc` beside its own executable for every crate, and a `cargo` rustup
+/// proxies into the view does the same, both by `current_exe()` unresolved — so
+/// `<prefix>/rustup/trust/bin/trustc`, whatever the view holds at that moment. Re-laying
+/// `bin/` and `lib/` under it hands the build's remaining crates to the new compiler,
+/// against the artifacts the old one wrote: `error[E0514]: found crate … compiled by an
+/// incompatible version of rustc`, measured end to end with two real store builds
+/// (2026-09-23 audit). gc's in-use guard cannot see this: the view is clones, reclaiming
+/// the store build never touches them, and it is this swap that does.
+///
+/// NOT COVERED HERE, and open: a `targo` started as `store/trust/current/bin/targo`. The
+/// same unresolved `current_exe()` makes its sibling `current/bin/trustc`, and the
+/// `current` flip alone switches it — E0514 measured the same way — with no view involved,
+/// so nothing this guard reads can see it (gc keeps the build: the kernel names the
+/// resolved path). Its one caller in this repo is `aterm-dev`'s `ship_driver`, whose
+/// fallback step 3 runs that spelling as it stands; the fix belongs there — resolve the
+/// candidate before running it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deferred {
+    /// A live process runs from the view — the executable the kernel names for it.
+    InUse(PathBuf),
+    /// The process table could not be read, so a build running from the view cannot be
+    /// ruled out; unknown is priced as in use (a stale view is one pass late, a swapped
+    /// one fails a build).
+    Unknown,
+}
+
+impl fmt::Display for Deferred {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Deferred::InUse(exe) => write!(f, "{} is running from it", exe.display()),
+            Deferred::Unknown => f.write_str(
+                "the process table could not be read, so a build running from it cannot be \
+                 ruled out",
+            ),
+        }
+    }
 }
 
 /// How closely [`view_matches`] holds a view — or a [`crate::compat`] exec root, which is
@@ -748,23 +798,32 @@ pub fn decode_spec(text: &str) -> Result<(PathBuf, ViewJob), String> {
     }
 }
 
-/// The one line the helper answers with: `<changed> <tools> <hex build> <stock pairs>`.
+/// The one line the helper answers with: `<changed> <tools> <hex build> <stock pairs>
+/// <deferred>`, the last `-` (re-laid or already current), `?` ([`Deferred::Unknown`]) or
+/// the hex of the executable running from the view ([`Deferred::InUse`]) — the helper
+/// reads the process table in its own process, and a deferral it could not hand back
+/// would read as a view that is current.
 fn encode_refreshed(r: &Refreshed) -> String {
     let stock: Vec<String> = r.stock.iter().map(|(p, t)| format!("{p}:{t}")).collect();
+    let hex_path =
+        |p: &Path| crate::tree::hex(crate::call1(crate::platform::os_str_bytes, p.as_os_str()));
+    let deferred = match &r.deferred {
+        None => String::from("-"),
+        Some(Deferred::Unknown) => String::from("?"),
+        Some(Deferred::InUse(exe)) => hex_path(exe),
+    };
     format!(
-        "{} {} {} {}",
+        "{} {} {} {} {deferred}",
         u8::from(r.changed),
         r.tools,
-        crate::tree::hex(crate::call1(
-            crate::platform::os_str_bytes,
-            r.build.as_os_str()
-        )),
+        hex_path(&r.build),
         stock.join(",")
     )
 }
 
 /// [`encode_refreshed`], read back. A stock pair the allowlist does not name is a
 /// refusal: the parent hands out `&'static` names, never ones a result file spelled.
+#[cfg(any(target_os = "macos", test))]
 fn decode_refreshed(body: &str) -> Result<Refreshed, String> {
     let mut fields = body.split(' ');
     let changed = match fields.next() {
@@ -799,11 +858,25 @@ fn decode_refreshed(body: &str) -> Result<Refreshed, String> {
         };
         stock.push((public, trust));
     }
+    // Required, not defaulted: the helper is this binary, and a line without the field is
+    // one that cannot say whether the view was left behind.
+    let deferred = match fields.next() {
+        Some("-") => None,
+        Some("?") => Some(Deferred::Unknown),
+        Some(hex) if !hex.is_empty() => Some(Deferred::InUse(crate::stage_helper::path_of(
+            crate::stage_helper::unhex(hex)?,
+        ))),
+        other => return Err(format!("malformed view result: deferred={other:?}")),
+    };
+    if fields.next().is_some() {
+        return Err(String::from("malformed view result: trailing fields"));
+    }
     Ok(Refreshed {
         build,
         tools,
         stock,
         changed,
+        deferred,
     })
 }
 
@@ -868,10 +941,11 @@ pub fn run_helper(args: &[std::ffi::OsString]) -> std::process::ExitCode {
 /// built the way the bundle is staged and the shims are laid: by a launchd job
 /// running this binary (in place, from a clean copy, or from a copy of its whole
 /// bundle — [`crate::stage_helper::plan_helper`]), with the outcome MEASURED on a
-/// file that was clean before the job. A tracked process with no lane, or one whose
-/// lane fails, does what [`crate::lay::tracked_policy`] says: builds in-process and
-/// says so (the default — a view that follows the build beats one that does not, and
-/// `aterm pkg doctor` names the tag), or refuses under `ATPKG_REFUSE_TRACKED_INSTALL=1`.
+/// file that was clean before the job. A tracked process with no lane builds in place.
+/// One whose lane fails does what [`crate::lay::tracked_policy`] says: by default it keeps
+/// the view that stands, or — with none — builds it in-process and clears the tag
+/// ([`crate::provenance::heal_laid`]); under `[packages] tracked_install = "refuse"` it
+/// refuses.
 /// An untracked process — every pass from an untagged app, every test harness —
 /// builds in place exactly as before.
 ///
@@ -919,45 +993,36 @@ pub fn refresh_view_with(
         Ok(refreshed) => Ok(refreshed),
         Err(why) => match policy {
             crate::lay::TrackedPolicy::Refuse => Err(io::Error::other(
-                crate::lay::tracked_refusal("refresh the rustup view", &why),
+                crate::lay::tracked_refusal("refreshing the rustup view", &why),
             )),
             crate::lay::TrackedPolicy::Allow if linked => {
-                eprintln!(
-                    "atpkg: note — this process is provenance-tracked and the untracked lane \
-                     could not refresh the rustup view ({why}); the dev-linked view is laid \
-                     from this process — links into the checkout, its stubs through the shim \
-                     lane, no file of the store written or linked"
-                );
+                // Links into the checkout and stubs through the shim lane: no file of the
+                // store written or linked, and the stubs' own lay clears their tag.
+                crate::provenance::log_line(&format!(
+                    "could not refresh the rustup view the clean way ({why}); laid the \
+                     dev-linked view directly"
+                ));
                 refresh_view_in_process(layout, name)
             }
             crate::lay::TrackedPolicy::Allow => {
                 // KEEP THE VIEW THAT IS THERE (audit 2026-09-14): an in-process rebuild
-                // lays every file of the view from this tracked process — and so tags
-                // them, and everything the toolchain then writes — to gain a view one
-                // build fresher. A stale view runs the previous compiler until the next pass;
-                // a tagged store cannot cut a release until it is re-seeded. Only when
-                // there is NO view at all — rustup's `trust` would dangle, the message
-                // that reads as a blocked machine — is the in-process build worth its
-                // tag, and it says so.
+                // lays every file of the view from this tracked process — tagged — to gain
+                // a view one build fresher, and the lane that failed usually means the heal
+                // that would clear it cannot run either. A stale view runs the previous
+                // compiler until the next pass. Only when there is NO view at all — rustup's
+                // `trust` would dangle — is it built in-process, and then cleared
+                // ([`crate::provenance::heal_laid`]).
                 if let Some(existing) = existing_view(layout, name) {
-                    eprintln!(
-                        "atpkg: note — this process is provenance-tracked and the untracked lane \
-                         could not refresh the rustup view ({why}); the view keeps presenting \
-                         {} rather than lay it — and tag it — from this process; \
-                         the next pass refreshes it",
+                    crate::provenance::log_line(&format!(
+                        "could not refresh the rustup view ({why}); it keeps {} until the \
+                         next pass",
                         existing.build.display()
-                    );
+                    ));
                     return Ok(existing);
                 }
-                eprintln!(
-                    "atpkg: note — this process is provenance-tracked and the untracked lane \
-                     could not refresh the rustup view ({why}); there is no view yet, so it is \
-                     built in-process, and every file of the view it clones WILL \
-                     carry com.apple.provenance — `aterm pkg doctor` names what that breaks; \
-                     `aterm pkg uninstall trust && aterm pkg install trust` re-seeds it clean \
-                     once the lane runs"
-                );
-                refresh_view_in_process(layout, name)
+                let refreshed = refresh_view_in_process(layout, name)?;
+                crate::provenance::heal_laid(layout, "the rustup view", &[view_dir(layout, name)]);
+                Ok(refreshed)
             }
         },
     }
@@ -992,6 +1057,7 @@ fn existing_view(layout: &Layout, name: &str) -> Option<Refreshed> {
         tools,
         stock,
         changed: false,
+        deferred: None,
     })
 }
 
@@ -1165,19 +1231,40 @@ fn refresh_view_untracked(
 /// `bin/` holds a symlink does not get that entry: every Trust frontend refuses a
 /// symlinked sibling, so the view never presents one.
 ///
+/// # A view a build runs from is not re-laid
+///
+/// A view that does not match, but that a live process runs from — or one whose process
+/// table cannot be read — is LEFT AS IT STANDS and the result says so
+/// ([`Refreshed::deferred`], [`Deferred`] for why): replacing `bin/` and `lib/` under a
+/// running `targo` switches its compiler between two crates of one build. The table is
+/// read at most once, and only once the view is known not to match, so a pass that finds
+/// the view current reads no table at all. The next re-assertion that finds nothing
+/// running from the view lays it. A view with nothing laid in it yet has nothing a process
+/// could run from, and its first lay never waits on the table.
+///
 /// # Errors
 /// `store/trust/current` is not a link atpkg can read, `<prefix>/rustup` or the view is
 /// not a directory atpkg may write, the build's `bin/` cannot be listed, or a clone
 /// cannot be made — the last is the store on another volume, and it refuses rather than
 /// byte-copying the toolchain.
 pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refreshed> {
+    refresh_view_in_process_with(layout, name, &crate::gc::process_table)
+}
+
+/// [`refresh_view_in_process`] with the process enumeration injected (`running`, answering
+/// as [`crate::gc::running_from`] takes it), so the in-use arm is provable from a test.
+pub(crate) fn refresh_view_in_process_with(
+    layout: &Layout,
+    name: &str,
+    running: &dyn Fn() -> Option<Vec<PathBuf>>,
+) -> io::Result<Refreshed> {
     // First, before every early return below: the debris a killed rebuild left under
     // another pid. It is not a mismatch (`first_mismatch` ignores it on purpose), so a view
     // that already matches is exactly where an abandoned sysroot's clones would sit forever.
     sweep_view_debris(&view_dir(layout, name));
     #[cfg(unix)]
     if let ViewSource::Linked(checkout) = view_source(layout) {
-        return refresh_linked_view(layout, name, &checkout);
+        return refresh_linked_view(layout, name, &checkout, running);
     }
     let current = store_current(layout);
     let build = std::fs::read_link(&current).map(|raw| absolute_target(&raw, &current))?;
@@ -1192,6 +1279,20 @@ pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refres
             tools: plan.tools,
             stock: plan.stock,
             changed: false,
+            deferred: None,
+        });
+    }
+    // A BUILD RUNNING FROM THE VIEW KEEPS IT ([`Deferred`]). After the match, so a current
+    // view reads no table; before the first rename, so a deferred view is never left
+    // half-swapped.
+    if let Some(deferred) = relay_blocked(&view, running) {
+        let plan = bin_plan(&src_bin)?;
+        return Ok(Refreshed {
+            build,
+            tools: plan.tools,
+            stock: plan.stock,
+            changed: false,
+            deferred: Some(deferred),
         });
     }
     let pid = crate::dec_u64(u64::from(std::process::id()));
@@ -1233,6 +1334,7 @@ pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refres
             tools: plan.tools,
             stock: plan.stock,
             changed: false,
+            deferred: None,
         });
     }
     let staged = view.join(format!(".bin.tmp-{pid}"));
@@ -1255,7 +1357,28 @@ pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refres
         tools,
         stock,
         changed,
+        deferred: None,
     })
+}
+
+/// Whether the out-of-date view at `view` must be left as it stands this pass: a live
+/// process runs from under it (the kernel's path, in either spelling — the kernel reports
+/// resolved paths, the layout may not be one), or the process table could not be read.
+/// `None` — go ahead — also when nothing is laid in the view yet: a fresh view has nothing
+/// a process could run from, and waiting on the table there would leave rustup's entry
+/// naming an empty directory wherever the table cannot be read.
+fn relay_blocked(view: &Path, running: &dyn Fn() -> Option<Vec<PathBuf>>) -> Option<Deferred> {
+    let laid = std::iter::once("bin")
+        .chain(VIEW_DIRS.iter().copied())
+        .any(|part| std::fs::symlink_metadata(view.join(part)).is_ok());
+    if !laid {
+        return None;
+    }
+    match crate::gc::running_from(view, running) {
+        Some(None) => None,
+        Some(Some(exe)) => Some(Deferred::InUse(exe)),
+        None => Some(Deferred::Unknown),
+    }
 }
 
 /// Whether `name` is the dot-named scratch a view rebuild makes for itself:
@@ -1440,9 +1563,16 @@ fn take_down(view: &Path, at: &Path, stem: &str, pid: &str) -> io::Result<()> {
 /// entry — laid in one [`crate::lay::lay_executables`] call, so a provenance-tracked process
 /// uses one untracked job for all of them — and swapped in by `rename(2)` when it differs.
 /// Writes no file of the store: a store view standing there is taken down ([`take_down`]),
-/// never followed.
+/// never followed — and not while a build runs from it ([`Deferred`]; `running` as
+/// [`refresh_view_in_process_with`] takes it): a `link` switches rustup's compiler for the
+/// next build, never for the rest of one in flight.
 #[cfg(unix)]
-fn refresh_linked_view(layout: &Layout, name: &str, checkout: &Path) -> io::Result<Refreshed> {
+fn refresh_linked_view(
+    layout: &Layout,
+    name: &str,
+    checkout: &Path,
+    running: &dyn Fn() -> Option<Vec<PathBuf>>,
+) -> io::Result<Refreshed> {
     let view = view_dir(layout, name);
     layout.ensure_dir(&views_root(layout))?;
     layout.ensure_dir(&view)?;
@@ -1454,6 +1584,16 @@ fn refresh_linked_view(layout: &Layout, name: &str, checkout: &Path) -> io::Resu
             tools: plan.tools,
             stock: plan.stock,
             changed: false,
+            deferred: None,
+        });
+    }
+    if let Some(deferred) = relay_blocked(&view, running) {
+        return Ok(Refreshed {
+            build: checkout.to_path_buf(),
+            tools: plan.tools,
+            stock: plan.stock,
+            changed: false,
+            deferred: Some(deferred),
         });
     }
     let pid = crate::dec_u64(u64::from(std::process::id()));
@@ -1482,6 +1622,7 @@ fn refresh_linked_view(layout: &Layout, name: &str, checkout: &Path) -> io::Resu
             tools: plan.tools,
             stock: plan.stock,
             changed,
+            deferred: None,
         });
     }
     let staged = view.join(format!(".bin.tmp-{pid}"));
@@ -1499,6 +1640,7 @@ fn refresh_linked_view(layout: &Layout, name: &str, checkout: &Path) -> io::Resu
         tools: plan.tools,
         stock: plan.stock,
         changed,
+        deferred: None,
     })
 }
 
@@ -1856,13 +1998,33 @@ impl std::error::Error for Refusal {}
 /// atpkg's, the view could not be built, or the filesystem failed. The rustup entry is
 /// unchanged on any `Err`.
 pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attached, Refusal> {
+    attach_reporting(layout, rustup_home, name, &refresh_view).map(|(attached, _)| attached)
+}
+
+/// A view [`attach`] found out of date and left as it stands ([`Refreshed::deferred`]):
+/// the build it was not re-laid onto, and why.
+type LeftView = (PathBuf, Deferred);
+
+/// How [`attach_reporting`] brings the view in line: [`refresh_view`] in every shipped
+/// call, a test's own refresh — an injected process table, a failed re-lay — in a test.
+type Refresh<'a> = &'a dyn Fn(&Layout, &str) -> io::Result<Refreshed>;
+
+/// [`attach`], also answering whether the view was left behind ([`LeftView`]) — what
+/// [`reassert`] says in a line of its own. The entry is laid, adopted or re-pointed either
+/// way: what it names is the view, and a view one pass stale still presents a compiler.
+fn attach_reporting(
+    layout: &Layout,
+    rustup_home: &Path,
+    name: &str,
+    refresh: Refresh<'_>,
+) -> Result<(Attached, Option<LeftView>), Refusal> {
     if !name_allowed(name) {
         return Err(Refusal::BadName(name.to_string()));
     }
     let key = record_key(name);
     let toolchains = toolchains_dir(rustup_home);
     if !toolchains.is_dir() {
-        return Ok(Attached::NoRustup { key, toolchains });
+        return Ok((Attached::NoRustup { key, toolchains }, None));
     }
     let target = seam_target(layout, name);
     let p = probe(layout, rustup_home, name)?;
@@ -1897,45 +2059,76 @@ pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attache
             }
         }
     }
-    let refreshed = refresh_view(layout, name)?;
-    match p.entry {
+    let refreshed = refresh(layout, name)?;
+    let left = refreshed
+        .deferred
+        .clone()
+        .map(|why| (refreshed.build.clone(), why));
+    let attached = match p.entry {
         Entry::Absent => {
             crate::activate::atomic_symlink(&target, &p.path)?;
             record(layout, name)?;
-            Ok(Attached::Created {
+            Attached::Created {
                 key,
                 path: p.path,
                 target,
-            })
+            }
+        }
+        Entry::Link(_) if p.targets_view => {
+            record(layout, name)?;
+            Attached::Adopted {
+                key,
+                path: p.path,
+                target,
+                view_build: refreshed.changed.then_some(refreshed.build),
+            }
         }
         Entry::Link(raw) => {
-            if p.targets_view {
-                record(layout, name)?;
-                return Ok(Attached::Adopted {
-                    key,
-                    path: p.path,
-                    target,
-                    view_build: refreshed.changed.then_some(refreshed.build),
-                });
-            }
             // A link into the store — `current`, or a numbered build — from before the
             // view existed: `rename(2)` a fresh link over it. The existing link is
             // replaced, never followed.
             crate::activate::atomic_symlink(&target, &p.path)?;
             record(layout, name)?;
-            Ok(Attached::Repointed {
+            Attached::Repointed {
                 key,
                 path: p.path,
                 from: raw,
                 to: target,
-            })
+            }
         }
         // Every other shape was refused above.
-        other => Err(Refusal::Foreign {
-            what: other.describe(layout),
-            path: p.path,
-        }),
-    }
+        other => {
+            return Err(Refusal::Foreign {
+                what: other.describe(layout),
+                path: p.path,
+            });
+        }
+    };
+    Ok((attached, left))
+}
+
+/// The line [`reassert`] says for a view it left behind: which view, the build it was not
+/// re-laid onto, why, what `cargo +<name>` runs meanwhile, and the verb that lays it once
+/// the build in flight has finished. A line, not a refusal: the seam is attached and
+/// presents a working compiler — the previous one.
+///
+/// `aterm pkg repair` is NAMED, not left implied by "the next pass": on an unattended
+/// machine that pass can be six hours away, and until it comes `cargo +trust` and the
+/// `targo` on PATH are two compilers under one name — most of all right after a `link`
+/// or an `install` the user ran, which re-asserts the seam and then leaves.
+fn left_view_line(layout: &Layout, name: &str, (build, why): &LeftView) -> String {
+    let once = match why {
+        Deferred::InUse(_) => "once that process has exited",
+        Deferred::Unknown => "once the process table can be read",
+    };
+    format!(
+        "{}: {} was left as it stands, not re-laid onto {} — {why}; until it is, `cargo \
+         +{name}` runs the compiler it still holds — `aterm pkg repair` lays it {once}, as \
+         does the next pass that finds nothing running from it",
+        record_key(name),
+        view_dir(layout, name).display(),
+        build.display()
+    )
 }
 
 /// What a [`detach`] did.
@@ -2217,6 +2410,21 @@ pub fn recorded_names(layout: &Layout) -> Vec<String> {
         .collect()
 }
 
+/// The `seams` keys the disk itself proves: every allowlisted rustup toolchain entry that
+/// resolves into this prefix. What a record rebuilt after it was lost carries
+/// ([`crate::status::rebuilt_from_store`]), so `uninstall --all` still detaches them.
+#[must_use]
+pub fn attached_keys(layout: &Layout) -> Vec<String> {
+    let Some(home) = rustup_home() else {
+        return Vec::new();
+    };
+    SEAM_NAMES
+        .iter()
+        .filter(|name| status(layout, &home, name).in_prefix)
+        .map(|name| record_key(name))
+        .collect()
+}
+
 /// Add `rustup:<name>` to `status.toml`'s `seams` (load, modify, save). Idempotent.
 ///
 /// Seeded through [`crate::status::seed_for_rewrite`]: the save rewrites the WHOLE
@@ -2320,11 +2528,18 @@ fn clear_refusal(layout: &Layout, name: &str) -> io::Result<()> {
 
 /// Re-assert every recorded seam, plus a first attach of [`DEFAULT_SEAM`] when rustup
 /// is present, the entry is absent and trust is installed. Best-effort and quiet:
-/// the returned lines name only what CHANGED (created, re-pointed) and what was
-/// refused — an adopted, already-correct seam says nothing, so the 6-hour pass does
-/// not narrate a no-op.
+/// the returned lines name only what CHANGED (created, re-pointed), what was
+/// refused, and a view left as it stands because a build runs from it ([`Deferred`]) —
+/// an adopted, already-correct seam says nothing, so the 6-hour pass does not narrate a
+/// no-op.
 #[must_use]
 pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
+    reassert_with(layout, rustup_home, &refresh_view)
+}
+
+/// [`reassert`] with the view's refresh injected ([`Refresh`]), so what a pass records
+/// around a view it left behind — or one it failed to lay — is provable from a test.
+fn reassert_with(layout: &Layout, rustup_home: &Path, refresh: Refresh<'_>) -> Vec<String> {
     let mut lines = Vec::new();
     if !toolchains_dir(rustup_home).is_dir() {
         return lines;
@@ -2348,13 +2563,27 @@ pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
         names.insert(DEFAULT_SEAM.to_string());
     }
     for name in names {
-        match attach(layout, rustup_home, &name) {
-            Ok(a) => {
+        match attach_reporting(layout, rustup_home, &name, refresh) {
+            Ok((a, left)) => {
                 // A seam that attaches (or was already right) clears the refusal the
-                // last pass may have recorded — the record follows the disk.
+                // last pass may have recorded — the record follows the disk. A view left
+                // behind clears it too, although no re-lay was tried: every refusal that
+                // is ever recorded (a foreign entry, trust not installed, a dev-link with
+                // no sysroot, a name off the allowlist) is decided BEFORE the view is
+                // touched, so this pass asked it again and it no longer holds; and a
+                // failed re-lay is `Io`, which is never recorded (below). Keeping the
+                // record through a deferral would keep a refusal the disk has answered —
+                // "not a sysroot" for a stage2 whose rebuild finished while a build ran
+                // from the view.
                 let _ = clear_refusal(layout, &name);
                 if a.changed() {
                     lines.push(a.to_string());
+                }
+                // A view left behind is SAID: it answered `changed: false`, and read as
+                // nothing more it passed for a current view — while doctor went on naming
+                // `repair` for a mismatch `repair` had just declined to touch.
+                if let Some(left) = &left {
+                    lines.push(left_view_line(layout, &name, left));
                 }
             }
             Err(e) => {
@@ -2451,13 +2680,21 @@ pub fn dissent_line(st: &SeamStatus) -> Option<String> {
     }
 }
 
-/// [`dissent_line`] for `program`, against the rustup home the REAL process edge armed —
+/// [`dissent_line`] for `program`, against the rustup home [`arm_from_env`] armed —
 /// `None` for any program but [`SEAM_PROGRAM`], and `None` in every unit test by
-/// construction ([`arm_from_env`]), so no test can be made to depend on the developer's own
-/// `~/.rustup`.
+/// construction, so no test can be made to depend on the developer's own `~/.rustup`.
 ///
 /// This is the accessor the update and install lanes call. Their tests reach
 /// [`dissent_line`] directly, which is where the words are.
+///
+/// NOT LIVE (measured 2026-09-23, Phase 5 of
+/// `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): nothing calls
+/// [`arm_from_env`] — no caller since the seam landed (`ecb1d6691`) — so [`armed`] is
+/// `None` in every shipped process and this answers `None` everywhere. The three lanes'
+/// "but not what this machine runs" sentence has never printed. Wiring the edge is a
+/// behaviour change (on m7 it would qualify every trust "up to date" line: rustup's
+/// `trust` there is a hand link into `$HOME/trust/build/host/stage2`), so it is the owner's
+/// call, not a deletion's.
 #[must_use]
 pub fn dissent_if_armed(layout: &Layout, program: &str) -> Option<String> {
     if program != SEAM_PROGRAM {
@@ -2480,15 +2717,15 @@ pub fn detach_recorded(layout: &Layout, rustup_home: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The rustup home the REAL process edge armed, if any. `None` inside the crate's
-/// own test harness by construction — see [`arm_from_env`].
+/// The rustup home [`arm_from_env`] armed, if any. `None` inside the crate's own test
+/// harness by construction, and — while nothing calls [`arm_from_env`] — `None` in every
+/// shipped process too (see [`dissent_if_armed`]).
 static ARMED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
-/// Arm the in-flow re-assertions with this process's [`rustup_home`]. Called ONCE at
-/// the CLI dispatch edge for store-mutating verbs. A deliberate no-op under
-/// `cfg(test)`: flow.rs's tests activate a program named `trust` inside temp
-/// layouts, and an armed hook there would lay a link in the developer's live
-/// `~/.rustup/toolchains` pointing into a temp dir.
+/// Arm [`dissent_if_armed`] with this process's [`rustup_home`]: meant to be called ONCE
+/// at the CLI dispatch edge, and today called by NOTHING (see [`dissent_if_armed`]). A
+/// deliberate no-op under `cfg(test)`, so no unit test reads the developer's live
+/// `~/.rustup`.
 pub fn arm_from_env() {
     if cfg!(test) {
         return;
@@ -2500,17 +2737,6 @@ pub fn arm_from_env() {
 #[must_use]
 pub fn armed() -> Option<&'static Path> {
     ARMED.get().and_then(|h| h.as_deref())
-}
-
-/// [`reassert`] against the armed rustup home; nothing when unarmed. The hook flow.rs
-/// calls after an activation or rollback of `trust`. Silent: the lines are returned
-/// for a caller that wants to print them, and flow.rs discards them (it is hermetic).
-#[must_use]
-pub fn reassert_if_armed(layout: &Layout) -> Vec<String> {
-    match armed() {
-        Some(h) => reassert(layout, h),
-        None => Vec::new(),
-    }
 }
 
 #[cfg(test)]
@@ -2651,7 +2877,10 @@ mod tests {
     }
 
     /// The helper's one result line round-trips, its stock pairs resolved back to the
-    /// allowlist's own statics; a pair the allowlist does not name is refused.
+    /// allowlist's own statics; a pair the allowlist does not name is refused. A view the
+    /// helper left behind comes back as left behind — both reasons, the executable's path
+    /// with its spaces — and a line that does not say either way is refused, never read as
+    /// a current view.
     #[test]
     fn the_view_result_round_trips_through_the_allowlist() {
         let r = Refreshed {
@@ -2659,6 +2888,7 @@ mod tests {
             tools: 21,
             stock: STOCK_NAMES.to_vec(),
             changed: true,
+            deferred: None,
         };
         assert_eq!(decode_refreshed(&encode_refreshed(&r)).unwrap(), r);
         let none = Refreshed {
@@ -2666,10 +2896,23 @@ mod tests {
             tools: 0,
             stock: Vec::new(),
             changed: false,
+            deferred: None,
         };
         assert_eq!(decode_refreshed(&encode_refreshed(&none)).unwrap(), none);
-        assert!(decode_refreshed("1 21 2f70 rustc:nope").is_err());
-        assert!(decode_refreshed("2 21 2f70 ").is_err());
+        for deferred in [
+            Deferred::Unknown,
+            Deferred::InUse(PathBuf::from("/p/App Support/rustup/trust/bin/targo")),
+        ] {
+            let left = Refreshed {
+                deferred: Some(deferred),
+                ..none.clone()
+            };
+            assert_eq!(decode_refreshed(&encode_refreshed(&left)).unwrap(), left);
+        }
+        assert!(decode_refreshed("1 21 2f70 rustc:nope -").is_err());
+        assert!(decode_refreshed("2 21 2f70  -").is_err());
+        assert!(decode_refreshed("0 21 2f70 ").is_err(), "no deferred field");
+        assert!(decode_refreshed("0 21 2f70  - extra").is_err());
     }
 
     /// The policy table for the view, with the lane's outcome forced: an untracked
@@ -2701,8 +2944,8 @@ mod tests {
         let err = refresh_view_with(&f.layout, "trust", true, &broken, TrackedPolicy::Refuse)
             .expect_err("a tracked process with a broken lane must refuse under Refuse");
         let msg = err.to_string();
-        assert!(msg.contains("provenance-tracked"), "{msg}");
-        assert!(msg.contains("refresh the rustup view"), "{msg}");
+        assert!(msg.contains("com.apple.provenance"), "{msg}");
+        assert!(msg.contains("refreshing the rustup view"), "{msg}");
         refresh_view_with(&f.layout, "trust", true, &broken, TrackedPolicy::Allow)
             .expect("the default builds in-process");
         assert!(view_trustc.is_file());
@@ -3189,7 +3432,13 @@ mod tests {
                 last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
+                last_pass: String::new(),
+                last_pass_at: String::new(),
+                last_pass_attempted_index_build: 0,
+                last_pass_attempted_at: String::new(),
+                metered_hold_until: String::new(),
                 programs,
+                extra: Default::default(),
             },
         )
         .unwrap();
@@ -3209,12 +3458,12 @@ mod tests {
         assert_eq!(back.programs["trust"].installed_build, Some(6808));
     }
 
-    /// The seam recorder REBUILDS `status.toml` from what it read, so an unreadable
-    /// record is an error to report, never a file to replace: replacing it would drop the
-    /// `seams` list `uninstall --all` walks, stranding the rustup `trust` link the
-    /// uninstall was supposed to detach.
+    /// The seam recorder REBUILDS `status.toml` from what it read, so an unreadable record
+    /// is kept aside and healed (Phase 3), never replaced blind and never refused for ever:
+    /// the seam is recorded on the healed record, and the unreadable bytes survive as
+    /// `status.toml.corrupt-<unix>`.
     #[test]
-    fn recording_a_seam_refuses_an_unreadable_record() {
+    fn recording_a_seam_heals_an_unreadable_record() {
         let prefix =
             std::env::temp_dir().join(format!("atpkg-seam-unreadable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&prefix);
@@ -3222,16 +3471,18 @@ mod tests {
         let layout = Layout { prefix };
         let corrupt = "seams = [\"rustup:trust\"]\nthis is not valid toml {{{\n";
         std::fs::write(layout.status(), corrupt).unwrap();
-        assert!(record(&layout, "trust").is_err(), "the recorder declines");
-        assert!(
-            record_refusal(&layout, "trust", "rustup is absent").is_err(),
-            "the refusal recorder declines too"
-        );
-        assert_eq!(
-            std::fs::read_to_string(layout.status()).unwrap(),
-            corrupt,
-            "the record is left exactly as it was"
-        );
+        record(&layout, "trust").expect("the recorder heals and records");
+        assert_eq!(recorded_keys(&layout), vec![record_key("trust")]);
+        let aside = std::fs::read_dir(&layout.prefix)
+            .unwrap()
+            .flatten()
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("status.toml.corrupt-")
+            })
+            .expect("the unreadable record is kept aside");
+        assert_eq!(std::fs::read_to_string(aside.path()).unwrap(), corrupt);
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
@@ -3332,9 +3583,8 @@ mod tests {
     }
 
     #[test]
-    fn hook_is_unarmed_inside_the_test_harness() {
-        // The flow.rs hook must be inert here: flow's own tests activate `trust` in
-        // temp layouts, and an armed hook would write into the developer's ~/.rustup.
+    fn arming_is_inert_inside_the_test_harness() {
+        // A test that armed the edge would read the developer's ~/.rustup.
         arm_from_env();
         assert!(
             armed().is_none(),
@@ -3342,7 +3592,7 @@ mod tests {
         );
         let fx = Fixture::new("unarmed");
         fx.install_trust(6808);
-        assert!(reassert_if_armed(&fx.layout).is_empty());
+        assert_eq!(dissent_if_armed(&fx.layout, SEAM_PROGRAM), None);
         assert!(std::fs::symlink_metadata(fx.seam("trust")).is_err());
         assert!(fx.seams_recorded().is_empty());
     }
@@ -3458,6 +3708,343 @@ mod tests {
             seam_target(&fx.layout, "trust"),
             "the rustup entry never moved; only the view's contents did"
         );
+    }
+
+    /// A VIEW A LIVE PROCESS RUNS FROM IS LEFT AS IT STANDS, and says so. A `targo`
+    /// launched from the view spawns `<view>/bin/trustc` for every crate, so swapping
+    /// `bin/` and `lib/` under it switched compilers mid-build (E0514, measured
+    /// 2026-09-23). Held for the executable's path in the layout's spelling and in the
+    /// resolved one the kernel reports, and for an unreadable table; the table is read
+    /// once per refresh, and not at all for a first lay or a view already current. A
+    /// process running from a SIBLING view or from the store build is not one running from
+    /// this view — and once nothing is, the view follows `current`.
+    #[cfg(unix)]
+    #[test]
+    fn a_view_a_live_process_runs_from_is_left_as_it_stands() {
+        let fx = Fixture::new("view-in-use");
+        fx.install_trust(9178);
+        let first =
+            refresh_view_in_process_with(&fx.layout, "trust", &|| -> Option<Vec<PathBuf>> {
+                panic!("a first lay has nothing a process could run from, and reads no table")
+            })
+            .unwrap();
+        assert!(first.changed && first.deferred.is_none(), "{first:?}");
+        let view = view_dir(&fx.layout, "trust");
+        let reads = &std::cell::Cell::new(0_u32);
+        let table = |exes: Option<Vec<PathBuf>>| {
+            move || {
+                reads.set(reads.get() + 1);
+                exes.clone()
+            }
+        };
+        let current =
+            refresh_view_in_process_with(&fx.layout, "trust", &table(Some(Vec::new()))).unwrap();
+        assert!(!current.changed && current.deferred.is_none());
+        assert_eq!(reads.get(), 0, "a current view reads no table");
+
+        let new = fx.install_trust(9192);
+        let exe = view.join("bin").join("targo");
+        let resolved = std::fs::canonicalize(&exe).unwrap();
+        for (running, why) in [
+            (Some(vec![exe.clone()]), Deferred::InUse(exe.clone())),
+            (
+                Some(vec![resolved.clone()]),
+                Deferred::InUse(resolved.clone()),
+            ),
+            (None, Deferred::Unknown),
+        ] {
+            reads.set(0);
+            let r = refresh_view_in_process_with(&fx.layout, "trust", &table(running)).unwrap();
+            assert_eq!(reads.get(), 1, "the table is read once per refresh");
+            assert!(!r.changed, "{r:?}");
+            assert_eq!(r.deferred, Some(why), "{r:?}");
+            assert_eq!(r.build, new, "the build it was NOT re-laid onto");
+            assert_eq!(
+                std::fs::read_to_string(view.join("bin").join("trustc")).unwrap(),
+                "trustc of build 9178",
+                "the running build's sibling compiler stays"
+            );
+            assert_eq!(
+                std::fs::read_to_string(view.join("lib").join("libtrust.dylib")).unwrap(),
+                "driver of 9178",
+                "and so does the driver it loads"
+            );
+        }
+
+        let elsewhere = vec![
+            view_dir(&fx.layout, "trust-dev").join("bin").join("targo"),
+            new.join("bin").join("targo"),
+        ];
+        let r = refresh_view_in_process_with(&fx.layout, "trust", &table(Some(elsewhere))).unwrap();
+        assert!(r.changed && r.deferred.is_none(), "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(view.join("bin").join("trustc")).unwrap(),
+            "trustc of build 9192"
+        );
+        assert!(view_matches(&new, &view, Depth::Deep));
+    }
+
+    /// The dev-link arm takes a clone view down to lay its stubs; not while a build runs
+    /// from that clone view. `link` switches rustup's compiler for the next build.
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_link_does_not_take_down_a_view_a_build_runs_from() {
+        let fx = Fixture::new("dev-link-in-use");
+        let store = fx.install_trust(6808);
+        refresh_view(&fx.layout, "trust").unwrap();
+        let view = view_dir(&fx.layout, "trust");
+        let exe = view.join("bin").join("targo");
+        let checkout = sysroot_checkout(&fx, "stage2");
+        crate::linkmode::link(
+            &fx.layout,
+            "trust",
+            &checkout,
+            &[PathBuf::from("bin/trustc"), PathBuf::from("bin/targo")],
+        )
+        .unwrap();
+        let r =
+            refresh_view_in_process_with(&fx.layout, "trust", &|| Some(vec![exe.clone()])).unwrap();
+        assert_eq!(r.deferred, Some(Deferred::InUse(exe.clone())), "{r:?}");
+        assert_eq!(r.build, checkout);
+        assert!(cloned(
+            &store.join("bin").join("trustc"),
+            &view.join("bin").join("trustc")
+        ));
+        assert!(
+            is_real_dir(&view.join("lib")),
+            "the clone view's lib/ stays"
+        );
+        let r = refresh_view_in_process_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
+        assert!(r.changed && r.deferred.is_none(), "{r:?}");
+        assert_eq!(
+            std::fs::read_link(view.join("lib")).unwrap(),
+            checkout.join("lib")
+        );
+        crate::linkmode::unlink(&fx.layout, "trust").unwrap();
+    }
+
+    /// THE LINE FOR A VIEW LEFT BEHIND NAMES THE VERB THAT LAYS IT. "The next pass" can be
+    /// six hours away on an unattended machine, and until it comes `cargo +trust` runs the
+    /// previous compiler while `targo` on PATH runs the new one — so the line says what
+    /// `cargo +trust` runs meanwhile and names `aterm pkg repair` for once the process has
+    /// exited, or once the table can be read. A line, not a refusal: the seam stays
+    /// attached and recorded, and nothing is recorded as refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_view_left_behind_names_repair_for_once_the_build_has_finished() {
+        let fx = Fixture::new("left-view-line");
+        fx.install_trust(9178);
+        assert_eq!(
+            reassert(&fx.layout, &fx.rustup).len(),
+            1,
+            "the first attach"
+        );
+        let exe = view_dir(&fx.layout, "trust").join("bin").join("targo");
+        let new = fx.install_trust(9192);
+        for (running, once) in [
+            (Some(vec![exe.clone()]), "once that process has exited"),
+            (None, "once the process table can be read"),
+        ] {
+            let lines = reassert_with(&fx.layout, &fx.rustup, &|l: &Layout, n: &str| {
+                refresh_view_in_process_with(l, n, &|| running.clone())
+            });
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            assert!(
+                line.contains("left as it stands") && line.contains(&new.display().to_string()),
+                "{line}"
+            );
+            assert!(
+                line.contains("`cargo +trust` runs the compiler it still holds"),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("`aterm pkg repair` lays it {once}")),
+                "{line}"
+            );
+            assert!(refusals(&fx.layout).is_empty(), "a line, not a refusal");
+            assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
+        }
+    }
+
+    /// WHAT A PASS THAT LEAVES THE VIEW BEHIND DOES TO THE REFUSAL RECORD, and why it may
+    /// clear one without trying the re-lay (review of 2026-09-23 asked it to keep it). Every
+    /// refusal that is ever recorded is decided BEFORE the view is touched, so a pass that
+    /// gets as far as leaving the view has asked it again and found it gone: a dev-link
+    /// refused as "not a sysroot" is not still "refused" once the stage2 rebuild put its
+    /// `lib/` back, merely because a build runs from the view. And a re-lay that FAILS is
+    /// `Io`, which is never recorded — so no refusal exists that a re-lay attempt wrote and
+    /// a deferral could erase.
+    #[cfg(unix)]
+    #[test]
+    fn a_deferral_keeps_no_refusal_the_disk_answered_and_a_failed_relay_records_none() {
+        let fx = Fixture::new("left-view-refusal");
+        fx.install_trust(6808);
+        assert_eq!(
+            reassert(&fx.layout, &fx.rustup).len(),
+            1,
+            "the first attach"
+        );
+        let exe = view_dir(&fx.layout, "trust").join("bin").join("targo");
+        // A stage2 mid-rebuild, its `lib/` not back yet: refused, and recorded.
+        let checkout = sysroot_checkout(&fx, "stage2");
+        let aside = fx.root.join("stage2-lib-aside");
+        std::fs::rename(checkout.join("lib"), &aside).unwrap();
+        crate::linkmode::link(
+            &fx.layout,
+            "trust",
+            &checkout,
+            &[PathBuf::from("bin/trustc")],
+        )
+        .unwrap();
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert!(
+            lines.len() == 1 && lines[0].contains("not a sysroot"),
+            "{lines:?}"
+        );
+        assert_eq!(refusals(&fx.layout).len(), 1);
+
+        // The rebuild finishes while a build still runs from the store's view.
+        std::fs::rename(&aside, checkout.join("lib")).unwrap();
+        let in_use =
+            |l: &Layout, n: &str| refresh_view_in_process_with(l, n, &|| Some(vec![exe.clone()]));
+        let lines = reassert_with(&fx.layout, &fx.rustup, &in_use);
+        assert!(
+            lines.len() == 1
+                && lines[0].contains("left as it stands")
+                && lines[0].contains(&checkout.display().to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            refusals(&fx.layout).is_empty(),
+            "the checkout is a sysroot again, and the record says what the disk does: {:?}",
+            refusals(&fx.layout)
+        );
+
+        // A re-lay that fails is SAID, and not recorded: `Io` is a hiccup, not a posture.
+        let failed = |_: &Layout, _: &str| -> io::Result<Refreshed> {
+            Err(io::Error::other("clonefile: operation not supported"))
+        };
+        let lines = reassert_with(&fx.layout, &fx.rustup, &failed);
+        assert!(
+            lines.len() == 1 && lines[0].contains("clonefile"),
+            "{lines:?}"
+        );
+        assert!(
+            refusals(&fx.layout).is_empty(),
+            "{:?}",
+            refusals(&fx.layout)
+        );
+        assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
+        crate::linkmode::unlink(&fx.layout, "trust").unwrap();
+    }
+
+    /// END TO END, a real process and the real process table: a copy of this test binary
+    /// stands in the store as `targo`, is laid into the view, and runs FROM THE VIEW
+    /// (parked by [`probe_parks_in_the_view_until_killed`]). An update lands; the
+    /// re-assertion leaves the view as it stands and says so in a line of its own. Once the
+    /// process is gone, the next re-assertion lays the new build.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn reassert_leaves_a_view_a_live_build_runs_from_and_says_so() {
+        if std::env::var_os(VIEW_PROBE_ENV).is_some() {
+            return;
+        }
+        let fx = Fixture::new("view-live");
+        let old = fx.install_trust(100);
+        let store_targo = old.join("bin").join("targo");
+        std::fs::remove_file(&store_targo).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &store_targo)
+            .expect("copy this test binary");
+        std::fs::set_permissions(&store_targo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert!(
+            lines.len() == 1 && lines[0].contains("attached"),
+            "{lines:?}"
+        );
+        let view = view_dir(&fx.layout, "trust");
+
+        /// Kills the probe however the test ends, so no stray outlives a failed assertion.
+        struct Probe(std::process::Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut probe = Probe(
+            std::process::Command::new(view.join("bin").join("targo"))
+                .args(["--exact", "--nocapture", "--quiet", VIEW_PROBE])
+                .env(VIEW_PROBE_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the view's targo"),
+        );
+        // `spawn` does not promise the exec happened; the table is what is measured.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::gc::runs_from(&view) != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe never came up running from {} within 30 s — the spawn failed, \
+                 which is not what this case is about",
+                view.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let new = fx.install_trust(200);
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("left as it stands")
+                && lines[0].contains(&new.display().to_string())
+                && lines[0].contains("is running from it")
+                && lines[0].contains("`aterm pkg repair` lays it once that process has exited"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.join("bin").join("trustc")).unwrap(),
+            "trustc of build 100",
+            "a live build's next compiler did not change under it"
+        );
+        assert!(cloned(&store_targo, &view.join("bin").join("targo")));
+
+        let _ = probe.0.kill();
+        let _ = probe.0.wait();
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert!(
+            lines.len() == 1 && lines[0].contains("now presents") && lines[0].ends_with("200"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.join("bin").join("trustc")).unwrap(),
+            "trustc of build 200"
+        );
+    }
+
+    /// The env that puts the copy above into its parked mode, and the case it runs there.
+    const VIEW_PROBE_ENV: &str = "ATPKG_SEAM_VIEW_PROBE";
+    const VIEW_PROBE: &str = "seam::tests::probe_parks_in_the_view_until_killed";
+
+    /// The copy's whole job: run from the view until the parent kills it — or goes away,
+    /// so a parent that dies first leaves no stray in the process table.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn probe_parks_in_the_view_until_killed() {
+        if std::env::var_os(VIEW_PROBE_ENV).is_none() {
+            return;
+        }
+        // SAFETY: `getppid` takes no arguments, reads no memory we own and cannot fail.
+        let spawner = unsafe { libc::getppid() };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: as above.
+            if unsafe { libc::getppid() } != spawner {
+                return;
+            }
+        }
     }
 
     /// A dev checkout shaped like a sysroot: Trust-named tools in `bin/`, a `lib/`

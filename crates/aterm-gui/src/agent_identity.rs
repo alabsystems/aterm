@@ -11,12 +11,10 @@
 //! roster read through its `var` column) gets its home variable pointed at
 //! its own conventional subdirectory there: `CLAUDE_CONFIG_DIR=<idir>/.claude`,
 //! `CODEX_HOME=<idir>/.codex`. The subdirs carry the agents' OWN names so the
-//! primer and the fabric hooks work unchanged: `ensure` runs
-//! [`aterm_primer::auto_prime`] over the identity dir (detection-only, so the
-//! 0700 subdirs aterm just made are what it detects) and carries the human's
-//! `~/.claude/settings.json` aterm hook block into the identity's — a worker
-//! under `identity=worker` has the aterm skills, the inbox hook and the manual
-//! pointer, and its OWN login.
+//! primer works unchanged: `ensure` runs [`aterm_primer::auto_prime`] over the
+//! identity dir (detection-only, so the 0700 subdirs aterm just made are what
+//! it detects) — a worker under `identity=worker` has the aterm skills and the
+//! manual pointer, and its OWN login.
 //!
 //! aterm never opens a login. It knows nothing of what the agent keeps in the
 //! dir beyond the directory names it made; `agents=<prog>:present|absent`
@@ -55,12 +53,6 @@ use std::path::{Path, PathBuf};
 
 /// The longest name: a directory name, and one that fits an `ls` row.
 pub(crate) const NAME_MAX: usize = 64;
-
-/// The mark of aterm's own hook entry in a Claude settings file — the SAME
-/// mark `aterm-link hook install` uses (`hook.rs`'s `OWN_MARK`): its command
-/// runs `hook run`, under either spelling (`aterm-link hook run …`,
-/// `aterm link hook run …`). The carry copies exactly the entries wearing it.
-const HOOK_MARK: &str = " hook run ";
 
 /// Parse (and FOLD) a spawn-time identity name. `Worker` and `worker` are one
 /// identity; the folded spelling is the directory name. Refused: an empty
@@ -110,16 +102,10 @@ pub(crate) fn dir_for(name: &str) -> Option<PathBuf> {
     aterm_types::dirs::identities_dir().map(|root| root.join(name))
 }
 
-/// The human's Claude settings file — the hook block a fresh identity carries
-/// is read from here (never written to).
-fn human_claude_settings() -> Option<PathBuf> {
-    aterm_primer::home_dir().map(|home| home.join(".claude").join("settings.json"))
-}
-
 /// Resolve `name` to its identity directory. With `create`, provision it —
 /// `<identities>/<name>/` and each agent subdir, 0700, owned by us (a foreign
 /// owner is REFUSED, fail-closed: [`aterm_types::fs_restricted::ensure_private_dir`]),
-/// prime it and carry the hooks — idempotently: a second call over the same
+/// prime it — idempotently: a second call over the same
 /// name is the same directory, verified again, and nothing rewritten that is
 /// current. Without `create`, an identity is what the `identities` verb calls
 /// one ([`identity_dir`]: a REAL directory, never a symlink — measured
@@ -135,18 +121,11 @@ pub(crate) fn ensure(name: &str, create: bool) -> io::Result<PathBuf> {
             "no state root resolves (HOME and ATERM_STATE_HOME both unset)",
         )
     })?;
-    ensure_in(&root, name, create, human_claude_settings().as_deref())
+    ensure_in(&root, name, create)
 }
 
-/// [`ensure`] with its roots injected: `root` is the identities dir,
-/// `human_settings` the Claude settings file whose aterm hook block is
-/// carried (`None` = carry nothing).
-pub(crate) fn ensure_in(
-    root: &Path,
-    name: &str,
-    create: bool,
-    human_settings: Option<&Path>,
-) -> io::Result<PathBuf> {
+/// [`ensure`] with its root injected: `root` is the identities dir.
+pub(crate) fn ensure_in(root: &Path, name: &str, create: bool) -> io::Result<PathBuf> {
     let name = parse_name(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     if !create {
         return identity_dir(root, &name).ok_or_else(|| {
@@ -168,17 +147,6 @@ pub(crate) fn ensure_in(
     let pass = aterm_primer::auto_prime_identity(&dir);
     for (agent, err) in pass.errors() {
         aterm_log::warn!("identity {name}: primer: {agent}: {err}");
-    }
-    if let Some(human) = human_settings {
-        match carry_claude_hooks(human, &dir.join(".claude").join("settings.json")) {
-            Ok(HookCarry::Written) => {
-                aterm_log::info!(
-                    "identity {name}: carried the aterm hooks into its .claude/settings.json"
-                );
-            }
-            Ok(HookCarry::NoBlock | HookCarry::Unchanged) => {}
-            Err(e) => aterm_log::warn!("identity {name}: hooks not carried: {e}"),
-        }
     }
     Ok(dir)
 }
@@ -217,210 +185,6 @@ pub(crate) fn restorable(name: &str) -> Option<String> {
 /// said so) to spawn that bootstrap.
 pub(crate) fn existing(name: &str) -> Option<String> {
     ensure(name, false).ok().map(|_| name.to_string())
-}
-
-/// What [`carry_claude_hooks`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HookCarry {
-    /// The human's settings carry no aterm hook entry (or no file): nothing to carry.
-    NoBlock,
-    /// The identity's settings already carry exactly these entries.
-    Unchanged,
-    /// The identity's settings were (re)written with the entries.
-    Written,
-}
-
-/// Carry the aterm hook entries of the human's Claude `settings.json` into the
-/// identity's — the entries whose `command` carries [`HOOK_MARK`], grouped as
-/// they are in the source, and NOTHING else of the human's file (their
-/// permissions, model, env, other hooks stay theirs). In the identity's file
-/// the same rule `aterm-link hook install --merge` applies: entries wearing
-/// the mark are replaced, every other key and hook is kept, a group emptied
-/// by the replacement goes. Written whole, atomically, 0600 — a settings file
-/// can carry `env` keys. The hook commands were self-tested when the human
-/// installed them; at run time each resolves its session from the identity
-/// session's own `ATERM_SESSION_ID`, so nothing here needs a live socket.
-pub(crate) fn carry_claude_hooks(human: &Path, ours: &Path) -> io::Result<HookCarry> {
-    use aterm_json::{Map, Value};
-    let text = match std::fs::read_to_string(human) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HookCarry::NoBlock),
-        Err(e) => return Err(e),
-    };
-    let doc: Value = aterm_json::from_str(&text).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: not JSON: {e}", human.display()),
-        )
-    })?;
-    let carried = marked_hook_groups(&doc);
-    if carried.is_empty() {
-        return Ok(HookCarry::NoBlock);
-    }
-
-    let previous = match std::fs::read_to_string(ours) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e),
-    };
-    let mut existing: Value = match &previous {
-        Some(text) => aterm_json::from_str(text).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: not JSON: {e}", ours.display()),
-            )
-        })?,
-        None => Value::Object(Map::new()),
-    };
-    replace_marked_hook_groups(&mut existing, carried).map_err(|why| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: {why}", ours.display()),
-        )
-    })?;
-    let rendered = format!(
-        "{}\n",
-        aterm_json::to_string(&existing)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-    );
-    if previous.as_deref() == Some(rendered.as_str()) {
-        return Ok(HookCarry::Unchanged);
-    }
-    write_private_atomically(ours, rendered.as_bytes())?;
-    Ok(HookCarry::Written)
-}
-
-/// The aterm hook groups of a Claude settings document, per event: each
-/// source group narrowed to its marked entries (matcher kept), groups and
-/// events with none dropped.
-fn marked_hook_groups(doc: &aterm_json::Value) -> aterm_json::Map {
-    use aterm_json::{Map, Value};
-    let mut carried: Map = Map::new();
-    for (event, groups) in doc
-        .get("hooks")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-    {
-        let Some(groups) = groups.as_array() else {
-            continue;
-        };
-        let mut kept = Vec::new();
-        for group in groups {
-            let Some(entries) = group.get("hooks").and_then(Value::as_array) else {
-                continue;
-            };
-            let marked: Vec<Value> = entries
-                .iter()
-                .filter(|e| carries_mark(e))
-                .cloned()
-                .collect();
-            if marked.is_empty() {
-                continue;
-            }
-            let mut group = group.clone();
-            if let Some(obj) = group.as_object_mut() {
-                obj.insert("hooks".to_string(), Value::Array(marked));
-            }
-            kept.push(group);
-        }
-        if !kept.is_empty() {
-            carried.insert(event.clone(), Value::Array(kept));
-        }
-    }
-    carried
-}
-
-/// `aterm-link hook install --merge`'s rule over the identity's document:
-/// entries wearing the mark go (a group emptied by that goes with them, an
-/// event emptied too), every other key and hook stays, then `carried` is
-/// appended per event. `Err` names a document shape no merge is safe into.
-fn replace_marked_hook_groups(
-    existing: &mut aterm_json::Value,
-    carried: aterm_json::Map,
-) -> Result<(), String> {
-    use aterm_json::{Map, Value};
-    let obj = existing
-        .as_object_mut()
-        .ok_or_else(|| "not a JSON object".to_string())?;
-    let events = obj
-        .entry("hooks".to_string())
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| "`hooks` is not a JSON object".to_string())?;
-    for groups in events.values_mut() {
-        let Some(groups) = groups.as_array_mut() else {
-            continue;
-        };
-        for group in groups.iter_mut() {
-            if let Some(entries) = group
-                .as_object_mut()
-                .and_then(|g| g.get_mut("hooks"))
-                .and_then(Value::as_array_mut)
-            {
-                entries.retain(|e| !carries_mark(e));
-            }
-        }
-        groups.retain(|g| {
-            g.get("hooks")
-                .and_then(Value::as_array)
-                .is_none_or(|entries| !entries.is_empty())
-        });
-    }
-    events.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
-    for (event, groups) in carried {
-        let Value::Array(groups) = groups else {
-            continue;
-        };
-        let slot = events
-            .entry(event)
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if !slot.is_array() {
-            *slot = Value::Array(Vec::new());
-        }
-        if let Some(slot) = slot.as_array_mut() {
-            slot.extend(groups);
-        }
-    }
-    Ok(())
-}
-
-/// Whether one hook entry is aterm's own (its `command` runs `hook run`).
-fn carries_mark(entry: &aterm_json::Value) -> bool {
-    entry
-        .get("command")
-        .and_then(aterm_json::Value::as_str)
-        .is_some_and(|c| c.contains(HOOK_MARK))
-}
-
-/// Whole-file replace: a 0600 temp file beside the target, renamed over it —
-/// nothing is ever half-written, not even for the instant of the write.
-fn write_private_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write as _;
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("settings.json"),
-        std::process::id()
-    ));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
 }
 
 /// The `identities` verb's usage line — the whole grammar in one row.
@@ -672,27 +436,6 @@ mod tests {
         dir
     }
 
-    /// A human's settings file carrying the aterm hook block beside their own
-    /// keys and a foreign hook — the shape `aterm-link hook install --merge`
-    /// leaves behind.
-    const HUMAN_SETTINGS: &str = r#"{
-  "model": "opus",
-  "env": {"SECRET_OF_THE_HUMAN": "never-copied"},
-  "hooks": {
-    "SessionStart": [
-      {"hooks": [{"type": "command", "command": "/opt/aterm/aterm-link hook run session-start"}]}
-    ],
-    "Stop": [
-      {"hooks": [{"type": "command", "command": "/opt/aterm/aterm-link hook run stop --wake-budget 3/4 --timeout 600", "timeout": 600}]},
-      {"matcher": "", "hooks": [{"type": "command", "command": "/usr/local/bin/their-own-stop-hook"}]}
-    ],
-    "PreToolUse": [
-      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/their-lint"}]}
-    ]
-  }
-}
-"#;
-
     #[test]
     fn names_fold_to_lowercase_and_follow_the_grammar() {
         assert_eq!(parse_name("Worker").as_deref(), Ok("worker"));
@@ -725,7 +468,7 @@ mod tests {
     #[test]
     fn ensure_creates_0700_dirs_once_primes_them_and_never_creates_on_restore() {
         let root = scratch("ensure").join("identities");
-        let dir = ensure_in(&root, "Worker", true, None).expect("created");
+        let dir = ensure_in(&root, "Worker", true).expect("created");
         assert_eq!(
             dir,
             root.join("worker"),
@@ -755,7 +498,7 @@ mod tests {
             "no human settings given: no settings file is invented"
         );
         // Once: the same name (any case) is the same dir, and nothing errs.
-        let again = ensure_in(&root, "WORKER", true, None).expect("idempotent");
+        let again = ensure_in(&root, "WORKER", true).expect("idempotent");
         assert_eq!(again, dir);
         assert_eq!(
             std::fs::read_dir(&root).unwrap().count(),
@@ -763,17 +506,17 @@ mod tests {
             "one directory for the one identity"
         );
         // Two names, two dirs.
-        let other = ensure_in(&root, "reviewer", true, None).expect("second identity");
+        let other = ensure_in(&root, "reviewer", true).expect("second identity");
         assert_ne!(other, dir);
         assert!(other.join(".claude").is_dir() && other.join(".codex").is_dir());
         // The restore rule: existing is found; missing is NotFound and stays missing.
-        assert_eq!(ensure_in(&root, "worker", false, None).unwrap(), dir);
-        let missing = ensure_in(&root, "ghost", false, None).unwrap_err();
+        assert_eq!(ensure_in(&root, "worker", false).unwrap(), dir);
+        let missing = ensure_in(&root, "ghost", false).unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         assert!(!root.join("ghost").exists(), "create=false never creates");
         // A bad name is refused before anything is touched.
         assert_eq!(
-            ensure_in(&root, "-", true, None).unwrap_err().kind(),
+            ensure_in(&root, "-", true).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
@@ -799,115 +542,6 @@ mod tests {
             ]
         );
         assert_eq!(env.len(), aterm_primer::agent_homes().count());
-    }
-
-    /// THE HOOK MERGE. When the human's settings carry the aterm hook block, a
-    /// fresh identity's `.claude/settings.json` carries exactly those entries —
-    /// grouped as they were, the human's own hooks and every other key left
-    /// behind. On an identity whose settings already exist, the aterm entries
-    /// are replaced and everything else kept; a second pass is unchanged.
-    #[test]
-    fn the_hook_merge_carries_exactly_the_aterm_entries() {
-        let root = scratch("hooks");
-        let human = root.join("human-settings.json");
-        std::fs::write(&human, HUMAN_SETTINGS).unwrap();
-        let ours = root.join("identities/worker/.claude/settings.json");
-        let dir = ensure_in(&root.join("identities"), "worker", true, Some(&human)).unwrap();
-        assert_eq!(dir.join(".claude/settings.json"), ours);
-        let text = std::fs::read_to_string(&ours).expect("written");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&ours).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-        let doc: aterm_json::Value = aterm_json::from_str(&text).unwrap();
-        let obj = doc.as_object().unwrap();
-        assert_eq!(
-            obj.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["hooks"],
-            "{text}"
-        );
-        assert!(!text.contains("SECRET_OF_THE_HUMAN") && !text.contains("opus"));
-        assert!(!text.contains("their-own-stop-hook") && !text.contains("their-lint"));
-        let hooks = doc.get("hooks").and_then(|h| h.as_object()).unwrap();
-        assert_eq!(
-            hooks.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["SessionStart", "Stop"]
-        );
-        assert_eq!(text.matches(HOOK_MARK).count(), 2, "{text}");
-        assert!(
-            text.contains("--wake-budget 3/4"),
-            "the entry rides whole: {text}"
-        );
-        assert!(
-            text.contains("\"timeout\":600") || text.contains("\"timeout\": 600"),
-            "{text}"
-        );
-
-        // A second pass over the same human file: unchanged, byte for byte.
-        assert_eq!(
-            carry_claude_hooks(&human, &ours).unwrap(),
-            HookCarry::Unchanged
-        );
-        assert_eq!(std::fs::read_to_string(&ours).unwrap(), text);
-
-        // The identity's file grew a hook and a key of its own; the human's
-        // aterm command moved. The carry replaces aterm's entries and keeps
-        // the rest.
-        let mut own: aterm_json::Value = aterm_json::from_str(&text).unwrap();
-        let own_obj = own.as_object_mut().unwrap();
-        own_obj.insert(
-            "permissions".to_string(),
-            aterm_json::from_str(r#"{"allow": ["Bash(ls:*)"]}"#).unwrap(),
-        );
-        own_obj
-            .get_mut("hooks")
-            .and_then(|h| h.as_object_mut())
-            .unwrap()
-            .insert(
-                "UserPromptSubmit".to_string(),
-                aterm_json::from_str(
-                    r#"[{"hooks": [{"type": "command", "command": "/their/own/prompt-hook"}]}]"#,
-                )
-                .unwrap(),
-            );
-        std::fs::write(&ours, aterm_json::to_string(&own).unwrap()).unwrap();
-        std::fs::write(
-            &human,
-            HUMAN_SETTINGS.replace("/opt/aterm/aterm-link", "/new/aterm-link"),
-        )
-        .unwrap();
-        assert_eq!(
-            carry_claude_hooks(&human, &ours).unwrap(),
-            HookCarry::Written
-        );
-        let text = std::fs::read_to_string(&ours).unwrap();
-        assert!(text.contains("/their/own/prompt-hook"), "kept: {text}");
-        assert!(text.contains("Bash(ls:*)"), "kept: {text}");
-        assert!(!text.contains("/opt/aterm/aterm-link"), "replaced: {text}");
-        assert_eq!(text.matches("/new/aterm-link").count(), 2, "{text}");
-
-        // No block in the human's file: nothing is written for a fresh identity.
-        std::fs::write(&human, r#"{"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/their/stop"}]}]}}"#).unwrap();
-        let bare = ensure_in(&root.join("identities"), "bare", true, Some(&human)).unwrap();
-        assert!(!bare.join(".claude/settings.json").exists());
-        assert_eq!(
-            carry_claude_hooks(&human, &bare.join(".claude/settings.json")).unwrap(),
-            HookCarry::NoBlock
-        );
-        // No human file at all: the same.
-        assert_eq!(
-            carry_claude_hooks(
-                &root.join("absent.json"),
-                &bare.join(".claude/settings.json")
-            )
-            .unwrap(),
-            HookCarry::NoBlock
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The public `ensure` resolves through `ATERM_STATE_HOME`, the knob a
@@ -946,7 +580,7 @@ mod tests {
     #[test]
     fn identities_lists_names_live_counts_and_presence_by_non_empty_subdir() {
         let root = scratch("verb-list");
-        ensure_in(&root, "worker", true, None).unwrap();
+        ensure_in(&root, "worker", true).unwrap();
         let bare = root.join("bare");
         std::fs::create_dir_all(bare.join(".claude")).unwrap();
         std::fs::create_dir_all(bare.join(".codex")).unwrap();
@@ -1024,7 +658,7 @@ mod tests {
     #[test]
     fn identities_forget_needs_the_confirm_word_refuses_a_live_user_then_removes_the_tree() {
         let root = scratch("verb-forget");
-        let dir = ensure_in(&root, "worker", true, None).unwrap();
+        let dir = ensure_in(&root, "worker", true).unwrap();
         let confirm_line = format!(
             "ERR confirm: identities forget worker confirm=worker removes {}\n",
             pct_path(&dir)
@@ -1110,7 +744,7 @@ mod tests {
         std::fs::create_dir_all(&humans_opencode).unwrap();
         let root = scratch.join("identities");
         aterm_log::env::scoped("XDG_CONFIG_HOME", &xdg, || {
-            let dir = ensure_in(&root, "worker", true, None).expect("created");
+            let dir = ensure_in(&root, "worker", true).expect("created");
             assert!(
                 dir.join(".claude/CLAUDE.md").is_file(),
                 "the identity IS primed"
@@ -1158,7 +792,7 @@ mod tests {
             identities_reply(&root, &[], "forget link confirm=link"),
             "ERR no such identity link\n"
         );
-        let restore = ensure_in(&root, "link", false, None);
+        let restore = ensure_in(&root, "link", false);
         assert_eq!(
             restore.as_ref().map_err(io::Error::kind),
             Err(io::ErrorKind::NotFound),
@@ -1177,12 +811,12 @@ mod tests {
             "ERR no such identity file\n"
         );
         assert_eq!(
-            ensure_in(&root, "file", false, None).unwrap_err().kind(),
+            ensure_in(&root, "file", false).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
-        let real = ensure_in(&root, "real", true, None).unwrap();
+        let real = ensure_in(&root, "real", true).unwrap();
         assert!(identities_reply(&root, &[], "real").starts_with("OK 3\nreal dir="));
-        assert_eq!(ensure_in(&root, "real", false, None).unwrap(), real);
+        assert_eq!(ensure_in(&root, "real", false).unwrap(), real);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

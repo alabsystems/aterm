@@ -30,6 +30,56 @@ pub const MAX_LINK_MARKER_BINS: usize = 1024;
 /// linked-program enumeration.
 pub const MAX_LINKED_PROGRAMS: usize = 256;
 
+/// Proven local provisioning shared by doctor and unattended update. A marker
+/// protects a checkout from registry replacement but is not evidence that its
+/// tools still exist, execute, or resolve inside the declared checkout.
+pub(crate) fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<String>, Vec<String>) {
+    let mut live = std::collections::BTreeSet::new();
+    let mut problems = Vec::new();
+    let programs = match linked_programs_checked(layout) {
+        Ok(programs) => programs,
+        Err(e) => return (live, vec![format!("cannot read development links: {e}")]),
+    };
+    for program in programs {
+        let checkout =
+            linked_checkout(layout, &program).and_then(|path| fs::canonicalize(path).ok());
+        let tools = linked_tool_names(layout, &program).unwrap_or_default();
+        let healthy = checkout.as_ref().is_some_and(|root| {
+            !tools.is_empty()
+                && tools.iter().all(|name| {
+                    let Some(tool) = crate::store::ToolName::new(name) else {
+                        return false;
+                    };
+                    let Some(target) = crate::platform::resolve_shim(&layout.shim(&tool))
+                        .and_then(|path| fs::canonicalize(path).ok())
+                    else {
+                        return false;
+                    };
+                    let Ok(meta) = fs::metadata(&target) else {
+                        return false;
+                    };
+                    #[cfg(unix)]
+                    let executable = {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        meta.permissions().mode() & 0o111 != 0
+                    };
+                    #[cfg(not(unix))]
+                    let executable = true;
+                    target.starts_with(root) && meta.is_file() && executable
+                })
+        });
+        if healthy {
+            live.insert(program);
+        } else {
+            problems.push(format!(
+                "{program}: development link has a missing, non-executable, or redirected tool; \
+                 rebuild its checkout and run `aterm pkg refresh {program}`"
+            ));
+        }
+    }
+    (live, problems)
+}
+
 /// What a [`link`]/[`refresh`] did: the bins symlinked, and any refused (sensitive-name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkOutcome {

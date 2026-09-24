@@ -3,7 +3,7 @@
 
 //! `App` glue for the UPDATE FLOW: the ONE-CLICK apply every "update ready" affordance
 //! fires ([`App::apply_update_or_details`] — the Version menu's ⬆️ item, the palette's
-//! Version row, a press on the staged status-bar row ([`App::press_update_bar`]), the
+//! Version row, a press on the staged band row's `Install now` (`App::perform_intent`), the
 //! off-macOS tab-strip ↻), the live Version-menu
 //! re-sync ([`App::refresh_version_menu`]), and the process updater state projected into
 //! the native Settings `/updates` route. (The retired own-rendered modal's glue —
@@ -14,6 +14,15 @@
 use crate::App;
 use crate::native_app::UpdateOutcome;
 use crate::update_screen::UpdateState;
+
+/// Whether an apply outcome's `source` is the AUTOMATIC lane's own — every
+/// automatic caller labels itself `automatic…` ("automatic", "automatic handoff",
+/// "automatic · retrying later", "automatic policy fallback"); a person's lanes
+/// are "manual", "manual handoff" and "control request". Only a retry of the
+/// lane's OWN attempt goes unannounced.
+fn source_is_automatic(source: &str) -> bool {
+    source.starts_with("automatic")
+}
 
 /// Serializes tests that record failures or read standing failure facts in the
 /// process-wide scratch update ledger.
@@ -45,19 +54,69 @@ pub(crate) fn hold_update_ledger_for_test() -> std::sync::MutexGuard<'static, ()
 
 #[cfg(test)]
 impl App {
-    /// The update bar's live words, `"<title> — <detail>"`, or `None` with no
-    /// update row up — the lane's ONE surface (2026-09-07), for the tests that
-    /// used to read the floating pill.
+    /// The update lane's NEWEST live row's words, `"<title> — <detail>"`, or
+    /// `None` with no update row up — for the tests that used to read the
+    /// floating pill and then the one bar. The center can hold the progress
+    /// row and an outcome row side by side (design §5.3); the newest — the
+    /// highest id — is the one an outcome test asks about.
     pub(crate) fn update_row_text(&self) -> Option<String> {
-        self.status_bars
-            .bars()
-            .find(|(lane, _)| *lane == crate::status_bars::Lane::Update)
-            .map(|(_, bar)| format!("{} — {}", bar.text.title, bar.text.detail))
+        self.messages
+            .live_rows()
+            .filter(|l| l.msg.tag == aterm_messages::tags::UPDATE)
+            .max_by_key(|l| l.id)
+            .map(|l| format!("{} — {}", l.msg.title, l.msg.detail.join("; ")))
+    }
+
+    /// The update lane's NEWEST RECORDED outcome's words, `"<title> — <detail>"`
+    /// — ruling 143: an outcome the lane answers by itself is a record, never a
+    /// band row, so the tests that read its words read them off the log.
+    pub(crate) fn update_record_text(&self) -> Option<String> {
+        self.messages
+            .log()
+            .records()
+            .rev()
+            .find(|r| {
+                r.tag == aterm_messages::tags::UPDATE
+                    && r.retired() == Some(&aterm_messages::Retired::Recorded)
+            })
+            .map(|r| format!("{} — {}", r.title, r.detail.join("; ")))
+    }
+
+    /// The update lane's PROGRESS row's detail, its lines joined back with
+    /// `; ` (the staged sentence is split at those joints when it exceeds the
+    /// line cap); `None` with no progress row up.
+    pub(crate) fn update_row_detail(&self) -> Option<String> {
+        self.messages
+            .live_by_key(crate::update_words::KEY_PROGRESS)
+            .map(|l| l.msg.detail.join("; "))
+    }
+
+    /// Start the center over: an empty ring, nothing live — what a test that
+    /// wants a clean lane does between cases.
+    pub(crate) fn clear_messages_for_test(&mut self) {
+        self.messages = aterm_messages::MessageCenter::new(
+            aterm_messages::MessageLog::empty(),
+            std::time::Instant::now(),
+        );
+        self.update_row_before_install = None;
+        // A fresh center mints ids from 1 again: a remembered flow id would
+        // name whatever row the next test posts under it.
+        self.update_flow = None;
+        self.staged_decision_raised = None;
+        // The committed count mirrors the center's; a fresh center commits
+        // nothing, so the geometry gives its rows back at once.
+        if self.message_band_rows != 0 {
+            self.message_band_rows = 0;
+            self.regrid_for_chrome_rows();
+        }
+        self.sync_messages();
     }
 }
 
 /// `true` while the `ATERM_DEBUG_SEAMLESS_REEXEC` QA seam is armed — and it SAYS
-/// SO, once per process, the first time anything asks.
+/// SO, once per process, the first time anything asks. A DEVELOPMENT SEAM
+/// (`aterm_types::dev_seam!`, 2026-09-23): a shipped binary never reads it, so it is
+/// always `false` there.
 ///
 /// The seam re-execs the SAME binary through the full seamless handoff + adopt
 /// path so the shell-survives-an-update contract is testable without cutting a
@@ -82,7 +141,7 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
         // species — and an armed seam re-execs THIS binary and reports the apply
         // as done while the staged build never lands (2026-09-14 audit).
         let on = aterm_types::control_socket::env_flag_engaged(
-            std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC")
+            aterm_types::dev_seam!("ATERM_DEBUG_SEAMLESS_REEXEC")
                 .map(|v| v.to_string_lossy().into_owned())
                 .as_deref(),
         );
@@ -98,11 +157,22 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
     })
 }
 
-/// The update bar's words for a build that is already installed on disk: the
-/// reducer imports it as an ACTIVATION stage. Installed bytes alone do not mean
-/// activation is running: policy may require a manual request.
+/// The update bar's words for a build that is already installed on disk where
+/// nothing will switch to it by itself: the reducer imports it as an ACTIVATION
+/// stage, and policy requires a person's request. (With a retry scheduled the
+/// flow row says the lane is still on it, and no outcome is posted.)
 pub(crate) const UPDATE_INSTALLED_TITLE: &str = "Update installed";
-pub(crate) const UPDATE_INSTALLED_DETAIL: &str = "activation pending \u{b7} see Version menu";
+pub(crate) const UPDATE_INSTALLED_DETAIL: &str = "finish it from the Version menu";
+/// An update the lane has stopped trying by itself: the person's next step is
+/// the Version menu's "Install aterm vX now" — the row's `Install now`.
+pub(crate) const UPDATE_DIDNT_INSTALL: &str = "Update didn't install";
+/// An attempt that failed with no staged build left to retry (main's words,
+/// ruling 68): a failure row with the details page.
+pub(crate) const UPDATE_DIDNT_FINISH: &str = "Update didn't finish";
+/// The install waits on work only the person can save or close (the close
+/// preflight's blocker, painted beneath it — ruling 143's editor block, said
+/// on its own row when no flow row is up to say it).
+pub(crate) const UPDATE_WAITS_FOR_YOU: &str = "Update waits for you";
 
 /// The three answers about this process [`App::apply_posture_for`] folds in,
 /// read ONCE at the call site so the pure half ([`App::apply_posture_with`]) is
@@ -117,7 +187,8 @@ pub(crate) struct ApplyPostureEnv {
     /// the cold lane only with zero live PTYs), so no promise about WHEN it
     /// applies is true.
     pub(crate) handoff_unavailable: Option<crate::app_update_handoff::HandoffUnavailable>,
-    /// `[update] auto_apply` folded with `$ATERM_NO_AUTO_APPLY`.
+    /// `[update] auto_apply` (the environment veto that was folded in here is gone,
+    /// 2026-09-23).
     pub(crate) auto_apply: crate::app_config::AutoApplySetting,
     /// `$ATERM_DEBUG_RELAUNCH_NUDGE` is set: the screenshot seam vetoes the lane.
     pub(crate) nudge_seam: bool,
@@ -149,7 +220,10 @@ impl App {
         // and the answer is half of what a person needs from a failed apply ("wait" vs
         // "press this").
         let retry = self.apply_retry_for(snapshot.staged.as_ref().map(|staged| staged.build));
-        UpdateState::from_service(snapshot, checking, retry)
+        UpdateState::from_service(snapshot, checking, retry).with_automatic_checks(
+            self.update_checks_running,
+            crate::app_config::update_checks_automatic(&self.config),
+        )
     }
 
     /// Whether the automatic apply lane still INTENDS this exact staged build — the
@@ -218,13 +292,13 @@ impl App {
         }
     }
 
-    /// HOW the staged `build` will be applied — the status bar's finer law
-    /// ([`crate::status_bars::ApplyPosture`]), which must agree with
+    /// HOW the staged `build` will be applied — the band row's finer law
+    /// ([`crate::update_words::ApplyPosture`]), which must agree with
     /// [`Self::apply_retry_for`]: a `ManualOnlyLatched { lapses: true }` bar and a
     /// `Scheduled` row are the same fact. The bar says this instead of "restart
     /// aterm to apply", which it said over the in-session handoff until
     /// 2026-08-30.
-    pub(crate) fn apply_posture_for(&self, build: u64) -> crate::status_bars::ApplyPosture {
+    pub(crate) fn apply_posture_for(&self, build: u64) -> crate::update_words::ApplyPosture {
         self.apply_posture_with(build, ApplyPostureEnv::observe(self))
     }
 
@@ -232,25 +306,22 @@ impl App {
     /// this process supplied, the lane's own state read from `self`. Order: an
     /// unavailable handoff first, whatever its reason (it changes WHETHER
     /// anything applies while a terminal is open, so it outranks everything that
-    /// only changes WHEN), then policy — config, then the environment — then the
-    /// screenshot seam, then this build's own stand-down latch; what is left is
+    /// only changes WHEN), then policy (the config), then the screenshot seam (a
+    /// development build's only), then this build's own stand-down latch; what is left is
     /// the automatic lane.
     pub(crate) fn apply_posture_with(
         &self,
         build: u64,
         env: ApplyPostureEnv,
-    ) -> crate::status_bars::ApplyPosture {
+    ) -> crate::update_words::ApplyPosture {
         use crate::app_config::AutoApplySetting;
-        use crate::status_bars::{ApplyPosture as P, AutoApplyVeto};
+        use crate::update_words::{ApplyPosture as P, AutoApplyVeto};
         if let Some(why) = env.handoff_unavailable {
             // The warning outranks policy, but its fallback clause depends on
             // it: a vetoed automatic lane never takes the cold apply at zero
             // live PTYs, so the bar must not promise that landing. Same
             // precedence as the standalone arms below.
             let veto = match env.auto_apply {
-                AutoApplySetting::OffByEnv => Some(AutoApplyVeto::Env {
-                    var: "ATERM_NO_AUTO_APPLY",
-                }),
                 AutoApplySetting::OffByConfig => Some(AutoApplyVeto::Config),
                 AutoApplySetting::On if env.nudge_seam => Some(AutoApplyVeto::Env {
                     var: "ATERM_DEBUG_RELAUNCH_NUDGE",
@@ -260,11 +331,6 @@ impl App {
             return P::HandoffDisabled { why, veto };
         }
         match env.auto_apply {
-            AutoApplySetting::OffByEnv => {
-                return P::VetoedByEnv {
-                    var: "ATERM_NO_AUTO_APPLY",
-                };
-            }
             AutoApplySetting::OffByConfig => return P::ManualByConfig,
             AutoApplySetting::On => {}
         }
@@ -294,44 +360,212 @@ impl App {
     }
 
     /// One report from the updater's own check reached the event loop
-    /// (`Wake::UpdateProgress`): feed the update STATUS BAR — with the apply
-    /// posture computed for a `Staged` build, so the bar says how it applies —
-    /// then settle, re-grid and repaint. The `Staged` report is emitted from the
-    /// check thread BEFORE the `on_staged` callback posts `Wake::UpdateStaged`,
-    /// so it lands here before the stage is reconciled and armed: only the
-    /// POLICY posture is knowable now; the ARMED fact is re-stated onto the bar a
-    /// moment later by `arm_native_auto_apply`, typically well inside the hold.
+    /// (`Wake::UpdateProgress`): the update's FLOW ROW moves on — with the
+    /// apply posture computed for a `Staged` build, so the row says how it
+    /// installs — which settles, re-grids and repaints. A check that DOWNLOADS
+    /// is a check that works: a health warning that said checking (or, once
+    /// the build is staged, downloading) was broken is over. The
+    /// `Staged` report is emitted from the check thread BEFORE the `on_staged`
+    /// callback posts `Wake::UpdateStaged`, so it lands here before the stage
+    /// is reconciled and armed: only the POLICY posture is knowable now; the
+    /// ARMED fact is re-stated onto the row a moment later by
+    /// `arm_native_auto_apply`. A POSTPONED download posts no row: a live
+    /// download row leaves quietly and the updater's sentence is a record.
     pub(crate) fn note_update_progress(&mut self, progress: &aterm_update::Progress) {
+        use crate::messages_host::FlowPhase;
+        // The updater's own sentence for how a download ended is the log's (and
+        // the row's further detail): the row says it in the flow's words.
+        match progress {
+            aterm_update::Progress::Failed { detail } => {
+                aterm_log::warn!("update download failed: {detail}");
+            }
+            aterm_update::Progress::Deferred { detail } => {
+                aterm_log::info!("update download postponed: {detail}");
+            }
+            _ => {}
+        }
         let posture = if let aterm_update::Progress::Staged { build, .. } = progress {
             Some(self.apply_posture_for(*build))
         } else {
             None
         };
-        self.status_bars
-            .update_progress(progress, posture, std::time::Instant::now());
-        self.sync_status_bars();
+        // A check that downloads is a check that works — and a download that
+        // staged is a download that works; neither says an install does
+        // (`App::heal_update_health` heals only the warning its proof answers).
+        match progress {
+            aterm_update::Progress::Downloading { .. }
+            | aterm_update::Progress::Verifying { .. } => {
+                self.heal_update_health(crate::messages_host::HealthProof::Checked);
+            }
+            aterm_update::Progress::Staged { .. } => {
+                self.heal_update_health(crate::messages_host::HealthProof::Downloaded);
+            }
+            aterm_update::Progress::Deferred { .. } | aterm_update::Progress::Failed { .. } => {}
+        }
+        // The version a failed or postponed report does not carry: the live
+        // download's.
+        let downloading = self
+            .live_update_flow()
+            .filter(|flow| matches!(flow.phase, FlowPhase::Downloading | FlowPhase::Checking));
+        let flow_version = downloading
+            .map(|flow| flow.version.clone())
+            .unwrap_or_default();
+        let downloading = downloading.map(|flow| flow.id);
+        let msg = crate::update_words::progress(progress, posture, &flow_version);
+        if msg.hold == aterm_messages::Hold::LogOnly {
+            // A RECORD (ruling 143) — a staged build that lands by itself later
+            // or once the terminals close, a download postponed or failed: the
+            // live download row, if one is up, is over first — `Ok` when the
+            // download DELIVERED (a staged build: its Complete echo), `Warn` when
+            // it failed (the Fault echo), and a postponement leaves with no
+            // outcome to claim (a fade, never `⚠ failed`) — and the words are
+            // recorded. A record never supersedes a live row (the engine's
+            // rule, ruling 47), so the row is ended by id.
+            if let Some(id) = downloading {
+                self.update_flow = None;
+                match progress {
+                    aterm_update::Progress::Staged { .. } => {
+                        self.resolve_message(id, aterm_messages::Outcome::Ok);
+                    }
+                    aterm_update::Progress::Failed { .. } => {
+                        self.resolve_message(id, aterm_messages::Outcome::Warn);
+                    }
+                    _ => {
+                        self.withdraw_message(id);
+                    }
+                }
+            }
+            self.record_message(msg);
+            return;
+        }
+        // A staged DECISION is raised once per build and posture (ruling 119,
+        // [`Self::ensure_staged_decision_in`]): a check that stages the same
+        // build again under the same posture, after the person let the
+        // question lapse, records it rather than asking again.
+        let decision = match (progress, posture) {
+            (aterm_update::Progress::Staged { build, .. }, Some(posture))
+                if crate::update_words::staged_is_decision(Some(posture)) =>
+            {
+                Some((*build, posture))
+            }
+            _ => None,
+        };
+        if decision.is_some()
+            && decision == self.staged_decision_raised
+            && self.staged_update_row().is_none()
+        {
+            if let Some(id) = downloading {
+                self.update_flow = None;
+                self.resolve_message(id, aterm_messages::Outcome::Ok);
+            }
+            self.record_message(msg.hold(aterm_messages::Hold::LogOnly));
+            return;
+        }
+        if decision.is_some() {
+            self.staged_decision_raised = decision;
+        }
+        let (version, phase) = match progress {
+            aterm_update::Progress::Downloading { version, .. } => {
+                (version.clone(), FlowPhase::Downloading)
+            }
+            aterm_update::Progress::Verifying { version } => (version.clone(), FlowPhase::Checking),
+            aterm_update::Progress::Staged { version, build } => (
+                version.clone(),
+                FlowPhase::Staged {
+                    build: *build,
+                    flow: crate::update_words::lane_is_working(posture),
+                },
+            ),
+            // Both are records, answered above.
+            aterm_update::Progress::Failed { .. } | aterm_update::Progress::Deferred { .. } => {
+                return;
+            }
+        };
+        // A report that moves only the METER — the download poller's next
+        // byte count under the same words — restates the live row in place
+        // (no log line; the meter is volatile), exactly as the toolchain
+        // tailer's reads do. A report with new WORDS — the next phase — posts,
+        // and the key supersedes the last phase's row so the log keeps every
+        // one. Posted as-is the byte tick would be the center's Duplicate
+        // (same key, same words) and the meter would never move.
+        let same_words = self
+            .live_update_flow()
+            .and_then(|flow| self.messages.live(flow.id))
+            .is_some_and(|l| l.msg.title == msg.title && l.msg.detail == msg.detail);
+        if same_words {
+            self.restate_update_flow(crate::messages_host::restatement_of(&msg), None);
+        } else {
+            self.post_update_row(msg, &version, phase);
+        }
     }
 
-    /// Re-state HOW the staged `build` applies on the live update bar, if the
-    /// bar is still up for it, and repaint only when the words changed.
+    /// Re-state HOW the staged `build` installs on its live staged row, if the
+    /// row is still up for it (`App::update_flow`, never its words), and repaint
+    /// only when the words changed — the full words, so a change between the
+    /// ready row and the flow row re-words, re-tones and re-lives the same row:
+    /// a lane that installs by itself makes it LIVE again under its backstop
+    /// (extended, never shortened), and one that waits for a press re-anchors
+    /// the ready row's short hold (shortened, never extended). A no-op must not
+    /// re-anchor a manual hold, so identical words restate nothing.
     ///
     /// EVERY site that changes the posture calls this — arming the lane and
     /// each of the physical stand-down paths that latch manual-only (the
     /// refused physical attempt, the policy fallback, the reaped abort, the
     /// returned-apply reconcile). Until 2026-08-30 only the first two did:
-    /// an admission refusal is synchronous and lands inside the `Staged` bar's
-    /// hold, so the bar kept promising "applies in place within ~2 min" while
-    /// the Version-menu row already said the attempt did not start — two
-    /// surfaces, two answers — and the folded sentence went into the ledger.
-    /// A no-op once the bar has folded.
+    /// an admission refusal is synchronous and lands inside the `Staged` row's
+    /// hold, so the row kept promising the old words while the Version-menu
+    /// row already said the attempt did not start — two surfaces, two answers.
+    ///
+    /// A posture whose words are a RECORD (ruling 143: a stand-down that
+    /// retries later, the handoff off) folds the live staged row — withdrawn,
+    /// no outcome to claim — and records the words. With no staged row up, a
+    /// posture that has just become a DECISION (the lane stopped) raises the
+    /// ready row once ([`Self::ensure_staged_decision`], ruling 119); anything
+    /// else is a no-op.
     pub(crate) fn restate_staged_bar_posture(&mut self, build: u64) {
+        use crate::messages_host::FlowPhase;
         let posture = self.apply_posture_for(build);
-        if self
-            .status_bars
-            .restate_apply_posture(build, posture, std::time::Instant::now())
-        {
-            self.sync_status_bars();
+        let Some((id, version)) = self
+            .live_update_flow()
+            .filter(|flow| matches!(flow.phase, FlowPhase::Staged { build: b, .. } if b == build))
+            .map(|flow| (flow.id, flow.version.clone()))
+        else {
+            if crate::update_words::staged_is_decision(Some(posture)) {
+                self.ensure_staged_decision(build);
+            }
+            return;
+        };
+        let words = crate::update_words::staged(&version, build, Some(posture));
+        if words.hold == aterm_messages::Hold::LogOnly {
+            self.update_flow = None;
+            self.withdraw_message(id);
+            self.record_message(words);
+            return;
         }
+        if crate::update_words::staged_is_decision(Some(posture)) {
+            self.staged_decision_raised = Some((build, posture));
+        }
+        let r = crate::update_words::restate_apply_posture(&version, build, posture);
+        let same = self
+            .live_update_flow()
+            .and_then(|flow| self.messages.live(flow.id))
+            .is_some_and(|l| {
+                r.title.as_ref() == Some(&l.msg.title)
+                    && r.detail.as_ref() == Some(&l.msg.detail)
+                    && r.actions.as_ref() == Some(&l.msg.actions)
+                    && r.severity == Some(l.msg.severity)
+                    && r.meter.as_ref() == Some(&l.msg.meter)
+            });
+        if same {
+            return;
+        }
+        self.restate_update_flow(
+            r,
+            Some(FlowPhase::Staged {
+                build,
+                flow: crate::update_words::lane_is_working(Some(posture)),
+            }),
+        );
     }
 
     /// The apply lane's standing trouble for the build a surface is offering, or
@@ -430,7 +664,7 @@ impl App {
     /// ONE-CLICK UPDATE (the owner's "click-upgrade" ask): every "update ready"
     /// affordance — the Version menu's ⬆️ item ([`crate::menu::MenuAction::ApplyUpdate`]),
     /// the palette's Version row, a press on the staged status-bar row
-    /// ([`Self::press_update_bar`]), the off-macOS tab-strip ↻ — lands here. A strictly-newer STAGED build applies IMMEDIATELY via
+    /// (the band row's `Install now` capsule), the off-macOS tab-strip ↻ — lands here. A strictly-newer STAGED build applies IMMEDIATELY via
     /// the process updater's one-shot apply authorization (which consumes the same
     /// `apply_staged_update_now` path after close preflight) — no intermediate overlay.
     /// With nothing actually staged
@@ -601,6 +835,23 @@ impl App {
         outcome: crate::native_app::UpdateOutcome,
         open_details: bool,
     ) {
+        // ONE ROW PER UPDATE (2026-09-23; ruling 143): a retry the lane has
+        // scheduled raises NOTHING on the glass — the flow row, where one is up,
+        // already says the lane is on it, and the log keeps every attempt. Each
+        // "Update postponed / waiting / delayed" row the owner read that day
+        // described a retry he could do nothing about, and each covered the row
+        // for 8 s and re-painted it. What the person CAN act on is a row: unsaved
+        // editor work, and a lane that stopped (`Install now`, the Version
+        // menu's press on the glass).
+        let staged = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map(|stage| (stage.build, stage.version.clone()));
+        let retry_scheduled = staged
+            .as_ref()
+            .is_some_and(|(build, _)| self.automatic_apply_retry_scheduled(*build));
         match outcome {
             crate::native_app::UpdateOutcome::Accepted => {
                 aterm_log::info!("update apply ({source}): accepted");
@@ -614,52 +865,37 @@ impl App {
                 if open_details {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
+                } else if retry_scheduled {
+                    self.restate_staged_bar_posture(build);
                 } else {
-                    self.note_update_outcome(
-                        '\u{2191}',
-                        UPDATE_INSTALLED_TITLE,
-                        if retry_scheduled {
-                            "activation pending \u{b7} retries on its own"
-                        } else {
-                            UPDATE_INSTALLED_DETAIL
-                        },
-                        crate::status_bars::Tone::Info,
-                    );
                     // The download's ready row is obsolete now that its bytes
-                    // are installed, even if activation awaits a manual request.
-                    self.status_bars.forget_staged_behind_outcome();
+                    // are installed; the switch is the person's to request, and
+                    // the decision says so with its press.
+                    self.retire_staged_update_row(true);
+                    self.note_update_outcome(crate::update_words::needs_install(
+                        UPDATE_INSTALLED_TITLE,
+                        UPDATE_INSTALLED_DETAIL,
+                        aterm_messages::Severity::Info,
+                        build,
+                    ));
                 }
             }
             crate::native_app::UpdateOutcome::Deferred { reason } => {
                 aterm_log::info!("update apply ({source}) deferred: {reason}");
                 // THE SCREEN FROZE AND THEN CAME BACK. On the automatic lane a
                 // deferral lands AFTER the readers parked (the user touched the
-                // keyboard, and the lane stood down for them), so the terminal
-                // stopped echoing, the rim charged, and both then stopped. With a
-                // staged row up the restored words explain it; with no row up —
-                // the ordinary case, since the ready row may have folded long
-                // before — the freeze would be explained by nothing at all.
+                // keyboard, and the lane stood down for them): the flow row the
+                // attempt rewrote comes back with its words (`retire_update_installing`)
+                // and says the lane is still on it. Only a lane that will NOT
+                // come back by itself, with no ready row up to say how the build
+                // installs, owes the person a row.
                 self.retire_update_installing();
                 if open_details {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
-                } else if !self.status_bars.update_bar_is_staged() {
-                    let retry_scheduled = self
-                        .native_updater_service
-                        .snapshot()
-                        .staged
-                        .as_ref()
-                        .is_some_and(|stage| self.automatic_apply_retry_scheduled(stage.build));
-                    self.note_update_outcome(
-                        '\u{21bb}',
-                        "Update postponed",
-                        if retry_scheduled {
-                            "you were using the terminal \u{b7} it retries on its own"
-                        } else {
-                            "you were using the terminal \u{b7} see Version menu"
-                        },
-                        crate::status_bars::Tone::Info,
-                    );
+                } else if !retry_scheduled && self.staged_update_row().is_none() {
+                    let msg = self.stopped_lane_outcome(UPDATE_DIDNT_INSTALL);
+                    self.note_update_outcome(msg);
                 }
             }
             crate::native_app::UpdateOutcome::Blocked { reasons } => {
@@ -670,28 +906,7 @@ impl App {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
                 } else {
-                    // The AUTOMATIC lane keeps its intent through a preflight block
-                    // and retries on its cooldown — so the row says the lane is
-                    // still acting, never "see Version menu" as if it had stopped
-                    // (2026-09-18; the Deferred arm above already follows this
-                    // rule). Only a lane that has genuinely stopped hands the
-                    // person the menu.
-                    let retry_scheduled = self
-                        .native_updater_service
-                        .snapshot()
-                        .staged
-                        .as_ref()
-                        .is_some_and(|stage| self.automatic_apply_retry_scheduled(stage.build));
-                    self.note_update_outcome(
-                        '\u{2191}',
-                        "Update waiting",
-                        if retry_scheduled {
-                            "it retries by itself"
-                        } else {
-                            "see Version menu"
-                        },
-                        crate::status_bars::Tone::Info,
-                    );
+                    self.note_update_blockers(&reasons, retry_scheduled);
                 }
             }
             crate::native_app::UpdateOutcome::Failed { message } => {
@@ -700,125 +915,183 @@ impl App {
                     self.retire_charging_surge();
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
-                } else if let Some(staged_build) = self
-                    .native_updater_service
-                    .snapshot()
-                    .staged
-                    .as_ref()
-                    .map(|staged| staged.build)
-                {
-                    // "Update paused — manual retry" named a mechanism, not an
-                    // action: there is no "retry" control anywhere in the UI, so a
-                    // user who read it had nothing to click. Worse, it was flatly
-                    // wrong half the time — a physical handoff failure inside its
-                    // budget schedules another automatic attempt, and this arm
-                    // claimed the automatic lane had given up.
-                    //
-                    // WHICH ANSWER IS TRUE IS A QUESTION ABOUT SCHEDULING STATE,
-                    // so ask every carrier of it rather than one. There are two —
-                    // a live `auto_apply_intent` (this failure did not consume it;
-                    // a control-request apply, for one, leaves it armed) and a
-                    // manual-only latch carrying a lapse deadline — and either
-                    // means a wake is already folded into the event loop. Both
-                    // must name THIS staged artifact, because a leftover for a
-                    // superseded build schedules nothing for the one on screen,
-                    // and automatic apply must actually be enabled or the lapse
-                    // would re-arm into a poll that answers `Clear`.
-                    let retry_scheduled = self.automatic_apply_retry_scheduled(staged_build);
+                } else if let Some((staged_build, version)) = staged {
+                    // WHICH ANSWER IS TRUE IS A QUESTION ABOUT SCHEDULING STATE
+                    // (`automatic_apply_retry_scheduled` asks every carrier of it:
+                    // a live intent, or a manual-only latch with a lapse deadline,
+                    // each for THIS artifact, with automatic apply enabled). A
+                    // physical failure inside its budget schedules another attempt,
+                    // so the flow row is re-stated to the stand-down's words and
+                    // nothing else is said — unless a PERSON asked for this one: a
+                    // person's failure charges the lane nothing, so the flow row
+                    // would not change, and whoever just asked is exactly who must
+                    // be told it did not happen (once, and that the lane has it). A
+                    // lane that has stopped names the one control that moves it.
                     if retry_scheduled {
-                        // …AND A SCHEDULED RETRY IS NOT AUTOMATICALLY WORTH A PILL.
-                        // The physical lane may spend nine attempts before it gives
-                        // up, so painting this on every one of them is a pill every
-                        // ~40 minutes for most of a day — describing a state whose
-                        // only honest advice is "wait", which the user is already
-                        // doing. Owner instruction: do not notify on a schedule for
-                        // a failure that is not going to fix itself. So the first
-                        // failure for an artifact speaks and the rest are quiet;
-                        // the log line above still records every one, and the
-                        // moment the lane genuinely runs out the `else` below fires
-                        // once with a control the user can press.
-                        if self.physical_failure_deserves_a_pill(staged_build) {
-                            self.note_update_outcome(
-                                '\u{2191}',
-                                "Update delayed",
-                                "retries on its own",
-                                crate::status_bars::Tone::Info,
-                            );
-                        } else {
-                            self.retire_charging_surge();
+                        self.retire_charging_surge();
+                        self.restate_staged_bar_posture(staged_build);
+                        if !source_is_automatic(source) {
+                            // The person's own press: its switch row ends in the
+                            // Fault echo, and the lane has it — a self-retry is a
+                            // RECORD (ruling 143).
+                            self.note_update_outcome(crate::update_words::outcome(
+                                '\u{21bb}',
+                                &format!("Couldn't install aterm v{version}"),
+                                "will try again by itself",
+                                aterm_messages::Severity::Info,
+                            ));
                         }
                     } else {
-                        self.note_update_outcome(
-                            '\u{2191}',
-                            "Update paused",
-                            "see Version menu",
-                            crate::status_bars::Tone::Warn,
-                        );
+                        self.note_update_outcome(crate::update_words::needs_install(
+                            &format!("Couldn't install aterm v{version}"),
+                            crate::update_words::INSTALL_FROM_MENU,
+                            aterm_messages::Severity::Warn,
+                            staged_build,
+                        ));
                     }
                 } else {
-                    // A retired/consumed artifact is not "still ready". Keep the
-                    // status honest while the native Settings reducer carries detail.
-                    self.note_update_outcome(
-                        '\u{26a0}',
-                        "Update stopped safely",
-                        "see Settings \u{25b8} Software Update",
-                        crate::status_bars::Tone::Warn,
-                    );
-                    // …and the ready row does not come back behind it: the
-                    // artifact this row was offering is the one that is gone.
-                    self.status_bars.forget_staged_behind_outcome();
+                    // A retired/consumed artifact is not "still ready". The row
+                    // says only that it did not finish: the details page is the
+                    // Warn row's `Software Update` capsule and its `Details ›`
+                    // (R37: the "click for details" clause became those capsules),
+                    // so the row carries no excerpt.
+                    self.note_update_outcome(crate::update_words::failed(
+                        UPDATE_DIDNT_FINISH,
+                        "",
+                        false,
+                    ));
+                    // …and the ready row does not stand beside it: the
+                    // artifact this row was offering is the one that is gone,
+                    // so it is WITHDRAWN — resolved `Ok`, the automatic lane's
+                    // busy `Installing aterm vX` would echo `✓ Installed …`
+                    // beside this failure (ruling 159).
+                    self.retire_staged_update_row(false);
                 }
             }
         }
     }
 
-    /// One apply-lane OUTCOME on the update STATUS BAR (2026-09-07 — the row,
-    /// never a floating card): waiting, delayed, paused, stopped, installed. A
-    /// charging surge is retired with it: the attempt it explained is over.
-    pub(crate) fn note_update_outcome(
-        &mut self,
-        glyph: char,
-        title: &str,
-        detail: &str,
-        tone: crate::status_bars::Tone,
-    ) {
-        // Over an "Installing" row the attempt is over: the words it replaced
-        // come back first, so the outcome covers the Staged row — which then
-        // returns when the outcome folds (`StatusBars::update_outcome`).
-        self.retire_update_installing();
-        self.status_bars
-            .update_outcome(glyph, title, detail, tone, std::time::Instant::now());
-        self.sync_status_bars();
+    /// A close preflight refused the AUTOMATIC install of `build`: re-state the
+    /// posture on its row ([`Self::restate_staged_bar_posture`]) and, while the
+    /// refusal is work a person has to save ([`App::update_blocker_for_person`]),
+    /// have the flow row say so instead of "installs within a minute"
+    /// ([`Self::restate_update_flow_holds`], `Holds::Editor`). Words only — a
+    /// restatement, never a row.
+    pub(crate) fn restate_blocked_update_bar(&mut self, build: u64, reasons: &[String]) {
+        self.restate_staged_bar_posture(build);
+        if Self::update_blocker_for_person(reasons).is_some() {
+            let _ = self.restate_update_flow_holds(build, crate::update_words::Holds::Editor);
+        }
     }
 
-    /// The update lane's press rule for its status-bar row: a STAGED row whose
-    /// build is really ready applies it in place (the retired floating card's
-    /// one-click gesture, moved to the row) — but never where the seamless
-    /// handoff is off: the row's title omits the affordance there, and a press
+    /// A close preflight refused the install: name the one blocker a PERSON can
+    /// clear ([`App::update_blocker_for_person`] — unsaved editor or Settings
+    /// work) — on the flow row when it is up (it already says so,
+    /// [`Self::restate_blocked_update_bar`]), as an outcome row otherwise — and say
+    /// nothing else while the lane will try again by itself; a lane that has
+    /// stopped points at the Version menu.
+    pub(crate) fn note_update_blockers(&mut self, reasons: &[String], retry_scheduled: bool) {
+        if let Some(blocker) = Self::update_blocker_for_person(reasons) {
+            let staged = self
+                .native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|stage| stage.build);
+            if staged
+                .and_then(|build| self.update_flow_row_for(build))
+                .is_none()
+            {
+                // The blocker IS what the person does: painted (ruling 77).
+                self.note_update_outcome(crate::update_words::failed(
+                    UPDATE_WAITS_FOR_YOU,
+                    blocker,
+                    true,
+                ));
+            }
+        } else if !retry_scheduled {
+            let msg = self.stopped_lane_outcome(UPDATE_DIDNT_INSTALL);
+            self.note_update_outcome(msg);
+        }
+    }
+
+    /// A lane that STOPPED, titled `title` (ruling 143): a decision row whose
+    /// `Install now` is the Version menu's press for the staged build — or,
+    /// with no build staged to press for, the same words on record.
+    fn stopped_lane_outcome(&self, title: &str) -> aterm_messages::Message {
+        let staged = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map(|stage| stage.build);
+        match staged {
+            Some(build) => crate::update_words::needs_install(
+                title,
+                crate::update_words::INSTALL_FROM_MENU,
+                aterm_messages::Severity::Warn,
+                build,
+            ),
+            None => crate::update_words::outcome(
+                '\u{26a0}',
+                title,
+                crate::update_words::INSTALL_FROM_MENU,
+                aterm_messages::Severity::Warn,
+            ),
+        }
+    }
+
+    /// One apply-lane OUTCOME (ruling 143): a stopped lane, an install that
+    /// needs a press, a person's failed attempt — a row of its own
+    /// (`update.outcome`) beside the flow row when the person acts on it, a
+    /// RECORD when the lane answers it by itself (`msg`'s hold says which,
+    /// `update_words`). A charging surge is retired with it: the attempt it
+    /// explained is over.
+    pub(crate) fn note_update_outcome(&mut self, msg: aterm_messages::Message) {
+        // Over an "installing…" row the attempt is over: the words it replaced
+        // come back first (or the row it added faults out), so the outcome
+        // stands beside the flow row.
+        self.retire_update_installing();
+        if msg.hold == aterm_messages::Hold::LogOnly {
+            self.record_message(msg);
+            return;
+        }
+        // ONE DECISION PER STOPPED LANE (rulings 119 and 143; review
+        // 2026-09-24). An outcome that carries `Install now` IS the lane's
+        // decision: a staged row still up — the ready row a stand-down's
+        // posture restatement just turned the flow row into — would be a
+        // second row with the same press for the same fact. It leaves first,
+        // withdrawn (no outcome to claim: the attempt it offered failed), so
+        // the outcome's words — why it did not install — are the one row.
+        if msg
+            .actions
+            .iter()
+            .any(|a| matches!(a, aterm_messages::Intent::ApplyUpdate { .. }))
+            && let Some(id) = self.staged_update_row()
+        {
+            self.update_flow = None;
+            self.withdraw_message(id);
+        }
+        // A HELD outcome this one replaces is resolved first, so `appstatus`
+        // keeps every outcome of one update as a finished activity (a
+        // superseded row records nothing).
+        self.resolve_held_row_under(crate::update_words::KEY_OUTCOME);
+        self.post_message(msg);
+    }
+
+    /// The update lane's press rule for its `Install now` capsule: a STAGED row
+    /// whose build is really ready applies it in place (the retired floating
+    /// card's one-click gesture, moved to the row) — but never where the
+    /// seamless handoff is off: the row carries no capsule there, and a press
     /// that could only record a refusal opens the details page instead, like
     /// every other row. Pure, so the two press paths (mouse, screen reader)
-    /// cannot drift.
+    /// cannot drift (`App::perform_intent`, the `ApplyUpdate` arm).
     pub(crate) fn update_bar_press_applies(
         bar_is_staged: bool,
         staged_ready: bool,
         handoff_available: bool,
     ) -> bool {
         bar_is_staged && staged_ready && handoff_available
-    }
-
-    /// A press on the update bar: apply the staged build, or open the details.
-    pub(crate) fn press_update_bar(&mut self) {
-        let staged_ready = self.staged_update_ready();
-        let handoff_available = self.seamless_handoff_unavailable().is_none();
-        if Self::update_bar_press_applies(
-            self.status_bars.update_bar_is_staged(),
-            staged_ready,
-            handoff_available,
-        ) {
-            self.apply_update_or_details();
-        } else {
-            let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
-        }
     }
 
     /// The surge's motion amplitude for `phase`, or `None` when this phase must
@@ -910,9 +1183,10 @@ impl App {
     /// built next reads the rows the successor must reproduce; the automatic
     /// lane adds none — its own re-check reads the re-grid's SIGWINCH as
     /// activity and stands down — and there the surge alone explains the frozen
-    /// frame. What the bar showed before is kept so a refusal can put it back
+    /// frame. What the row said before is kept so a refusal can put it back
     /// (`retire_update_installing`).
     pub(crate) fn begin_update_installing(&mut self, build: u64, explicit: bool) {
+        use crate::messages_host::FlowPhase;
         let version = self
             .native_updater_service
             .snapshot()
@@ -920,12 +1194,28 @@ impl App {
             .as_ref()
             .map(|staged| staged.version.clone())
             .unwrap_or_default();
-        let now = std::time::Instant::now();
-        self.update_bar_before_install = None;
-        if let Some(previous) = self.status_bars.update_installing(&version, now) {
-            self.update_bar_before_install = Some(previous);
-        } else if explicit && self.status_bars.update_installing_added(&version, now) {
-            self.sync_status_bars();
+        let installing = crate::update_words::installing(&version);
+        self.update_row_before_install = None;
+        let live = self
+            .live_update_flow()
+            .cloned()
+            .and_then(|flow| self.messages.live(flow.id).map(|l| (flow, l.msg.clone())));
+        if let Some((flow, previous)) = live {
+            // The flow row is re-worded in place — a repaint, not a re-grid; no
+            // log line.
+            let id = flow.id;
+            self.update_row_before_install = Some((previous, flow));
+            self.messages.restate(
+                id,
+                crate::messages_host::restatement_of(&installing),
+                std::time::Instant::now(),
+            );
+            if let Some(flow) = self.update_flow.as_mut() {
+                flow.phase = FlowPhase::Installing;
+            }
+        } else if explicit {
+            // Posted through the seam that commits the re-grid at once.
+            self.post_update_row(installing, &version, FlowPhase::Installing);
         }
         self.spawn_upgrade_surge(crate::level_up::Phase::Charging, build);
         self.request_redraw_all_windows();
@@ -933,72 +1223,48 @@ impl App {
 
     /// The handoff did not take over — a synchronous refusal before the park, or
     /// an asynchronous one after it (a failed proof, a revoked lane, a dead
-    /// successor): the row goes back to what it was (or to no row) and the
-    /// charging surge ends. Idempotent, and a no-op for a row an outcome has
-    /// already been posted over.
+    /// successor): the row goes back to what it was — its words, its animation
+    /// and its phase — (or to no row) and the charging surge ends. Idempotent,
+    /// and a no-op for a row an outcome has already been posted over. The row is
+    /// identified by its STATE (`FlowPhase::Installing`), never its words.
     pub(crate) fn retire_update_installing(&mut self) {
-        let previous = self.update_bar_before_install.take();
-        self.status_bars.retire_installing(previous);
+        use crate::messages_host::FlowPhase;
+        let previous = self.update_row_before_install.take();
+        let now = std::time::Instant::now();
+        if let Some(id) = self
+            .live_update_flow()
+            .filter(|flow| flow.phase == FlowPhase::Installing)
+            .map(|flow| flow.id)
+        {
+            match previous {
+                Some((words, flow)) => {
+                    self.messages
+                        .restate(id, crate::messages_host::restatement_of(&words), now);
+                    self.update_flow = Some(flow);
+                }
+                // The explicit lane added it; the refusal takes it away — a
+                // refusal is not a delivery, so it resolves `Warn` and its
+                // indicator ends in the Fault echo (design §10.2 #7).
+                None => {
+                    self.messages
+                        .resolve(id, aterm_messages::Outcome::Warn, now);
+                    self.update_flow = None;
+                }
+            }
+        }
         self.retire_charging_surge();
         // WORDS ONLY — no row sync here. A refusal is followed, in the same
         // wake, by the outcome that explains it (`surface_update_apply_outcome`),
         // and on the explicit lane that outcome takes the very row this attempt
         // added: a sync here would re-grid every window twice (1→0→1). The one
         // trailing sync — `Wake::UpdateHandoffFinished`'s, or the next park's
-        // row check in `about_to_wait` — commits whatever the bars finally want.
+        // row check in `about_to_wait` — commits whatever the center finally wants.
         self.request_redraw_all_windows();
-    }
-
-    /// Automatic/background updater status must never enter AppKit's nested modal
-    /// loop. Paint a short in-app pill and leave full detail in native Settings/logs.
-    pub(crate) fn surface_nonmodal_update_status(&mut self, text: &str) {
-        self.notice = Some(crate::notice::TransientNotice::update_status(
-            text,
-            std::time::Instant::now(),
-        ));
-        self.request_redraw_all_windows();
-    }
-
-    /// The transient card for a FAILED USER GESTURE (see
-    /// [`crate::notice::TransientNotice::gesture_failure`]): every call site
-    /// pairs this with the stderr line that carries the full error — the card
-    /// answers the person, the log answers the investigator.
-    /// [`Self::surface_nonmodal_update_status`] with an explicit lifetime — for
-    /// the first-open install doctor (`resumed`), which borrows the admin step's
-    /// lifetime. (The handoff's own moments are status-bar rows, 2026-09-07.)
-    pub(crate) fn surface_update_status_for(&mut self, text: &str, ttl: std::time::Duration) {
-        self.notice = Some(crate::notice::TransientNotice::update_status_for(
-            text,
-            ttl,
-            std::time::Instant::now(),
-        ));
-        self.request_redraw_all_windows();
-    }
-
-    pub(crate) fn surface_gesture_failure(&mut self, text: &str) {
-        self.notice = Some(crate::notice::TransientNotice::gesture_failure(
-            text,
-            std::time::Instant::now(),
-        ));
-        self.request_redraw_all_windows();
-    }
-
-    /// Whether the celebration card's pixels are actually MOVING right now — sparkles
-    /// enabled and motion live. The notice cannot know either: one is config, the
-    /// other is the reduced-motion amplitude. Both must be true before the card earns
-    /// a per-frame wake and a re-raster (2026-08-20 round-12 audit).
-    pub(crate) fn notice_is_sparkling(&self) -> bool {
-        self.config.notice_sparkle_or_default()
-            && self
-                .motion_policy(true)
-                .amplitude(crate::motion::MotionEffect::NoticePill)
-                > 0.0
     }
 
     /// Re-sync the macOS VERSION menu (the rightmost menu-bar title) to the live update
-    /// state: `v<cur> ⬆️` + the one-click "Update to v<staged> — apply now, shells keep
-    /// running" first item
-    /// while a strictly-newer build is staged; `v<cur> ⬆️` + the "Updated to v<cur> just
+    /// state: `v<cur> ⬆️` + the one-click "Install aterm v<staged> now" first item
+    /// while a strictly-newer build is staged; `v<cur> ⬆️` + the "Updated to aterm v<cur> just
     /// now" celebration item while the post-update realized arrow is live; plain
     /// `v<cur>` otherwise. The PERSISTENT update affordance lives here now (the titlebar
     /// "Update" capsule is retired). A no-op headless / off macOS (no menu handle).
@@ -1026,171 +1292,6 @@ impl App {
                 realized,
             );
         }
-    }
-
-    /// Route a left press that landed on the notice card: the admin card's
-    /// Install / Not now, the macOS access card's Open Settings / Not now, and a
-    /// dismiss for the rest. The click is CONSUMED (`true`). (The clickable
-    /// "Update ready" card is retired — the staged status-bar row's press is the
-    /// one-click apply now — and its arm survives for the painter fixture only.)
-    ///
-    /// Two gates keep this from firing on a card the user cannot see:
-    ///
-    /// * The card must be ON GLASS IN THIS WINDOW
-    ///   ([`crate::WindowState::notice_is_on_glass`]). `self.notice` is App-global and the
-    ///   paint-only cards share ONE composited slot, so without this a window whose card
-    ///   was suppressed — serious mode, a zero-column window, a rejected paint rect — or
-    ///   one where the level-up flourish still owns the slot, hit-tested a rectangle of
-    ///   empty screen, and a click there silently re-execed the app.
-    /// * The card must still be legible ([`crate::notice::CLICK_MIN_ALPHA`]). The exit
-    ///   tail runs to nothing, and a target you cannot see is a trap.
-    ///
-    /// DISMISSING A NON-ACTIONABLE CARD IS NOT A COURTESY, IT IS A ROUTING FIX. This runs
-    /// BEFORE the tab-strip and terminal mouse paths, so a press the card visually caught
-    /// used to fall straight through a status card into whatever was underneath — with an
-    /// in-grid tab strip under the old placement, that could CLOSE A TAB.
-    ///
-    /// Reads the SAME geometry the painter uses ([`crate::notice::notice_rect`]) — same
-    /// `now`, same motion amplitude, same reserved chrome rows — so the hit region is the
-    /// pixels. `false` when there is no visible card or the point misses it (the click
-    /// flows on).
-    pub(crate) fn notice_click(&mut self, wid: crate::WindowId, x: f64, y: f64) -> bool {
-        let Some(n) = self.notice.as_ref() else {
-            return false;
-        };
-        let Some(ws) = self.windows.get(&wid) else {
-            return false;
-        };
-        if !ws.notice_is_on_glass() {
-            return false;
-        }
-        let now = std::time::Instant::now();
-        if n.alpha(now) < crate::notice::CLICK_MIN_ALPHA {
-            return false;
-        }
-        let access = n.is_macos_access();
-        let admin_names = n.admin_step_names().map(<[String]>::to_vec);
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid) as f32;
-        let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
-        let geom = crate::settings::SettingsGeom {
-            cw: cw as f32,
-            ch: ch as f32,
-            font_px: self.win_font_px(wid),
-            cols: ws.cols as usize,
-            panel_rows: 0,
-        };
-        // The SAME (now, motion, reserved chrome) the painter used, so the hit region
-        // tracks the card through its slide instead of lagging behind the pixels.
-        let motion = self
-            .motion_policy(true)
-            .amplitude(crate::motion::MotionEffect::NoticePill);
-        let (x, y) = self.window_to_frame(wid, x, y);
-        let (px, py) = (x as f32 - pad, y as f32 - top);
-        let Some(hit) =
-            crate::notice::notice_hit(n, &geom, now, motion, self.notice_clear_rows(wid), px, py)
-        else {
-            return false;
-        };
-        self.notice_hit_dispatch(admin_names, access, hit, now);
-        true
-    }
-
-    /// What a resolved press on the notice card DOES — split from the
-    /// geometry so the arms can be driven without a window. The card is
-    /// dismissed first on every arm; a press that opens another surface puts
-    /// its own pill in the slot afterwards.
-    pub(crate) fn notice_hit_dispatch(
-        &mut self,
-        admin_names: Option<Vec<String>>,
-        access: bool,
-        hit: crate::notice::NoticeHit,
-        now: std::time::Instant,
-    ) {
-        self.notice = None;
-        match (admin_names, hit) {
-            // THE ADMIN CARD'S INSTALL: the osascript door, through the very seam the
-            // Packages page's buttons use (`execute_native_packages`, busy-gated, one
-            // worker). macOS raises its own dialog; nothing here sees a password. A
-            // refusal (inert manager, a verb already running) is answered on a plain
-            // status card so the press is never silently swallowed.
-            (Some(names), crate::notice::NoticeHit::Primary) => {
-                let outcome = self.execute_native_packages(
-                    crate::native_app::PackagesRequest::InstallElevated { names },
-                );
-                match outcome {
-                    crate::native_app::PackagesOutcome::Accepted => {
-                        self.surface_nonmodal_update_status(
-                            "\u{21e3} Installing through macOS \u{2014} progress in Settings \u{25b8} Packages",
-                        );
-                    }
-                    crate::native_app::PackagesOutcome::Blocked { message }
-                    | crate::native_app::PackagesOutcome::Failed { message } => {
-                        aterm_log::warn!("admin install did not start: {message}");
-                        self.surface_gesture_failure(&format!(
-                            "Admin install did not start \u{2014} {message}"
-                        ));
-                    }
-                }
-            }
-            // NOT NOW: record the exact set so the card is not raised again until the
-            // set changes (`packages_screen::admin_step_should_show`). The write is a
-            // tiny file, but it is still a disk write, so it leaves the UI thread; a
-            // failure only means the card comes back next pass.
-            (Some(names), crate::notice::NoticeHit::NotNow) => {
-                let config_path = crate::app_config::config_path();
-                let spawned = std::thread::Builder::new()
-                    .name("aterm-admin-step-dismiss".into())
-                    .spawn(move || {
-                        if let Err(error) = crate::packages_screen::record_admin_step_dismissal(
-                            config_path.as_deref(),
-                            &names,
-                        ) {
-                            aterm_log::warn!("admin step dismissal not recorded: {error}");
-                        }
-                    });
-                if let Err(error) = spawned {
-                    aterm_log::warn!("admin step dismissal not recorded: {error}");
-                }
-            }
-            // A press on the admin card's body dismisses it for now — nothing is
-            // recorded, and the next pass re-raises it.
-            (Some(_), crate::notice::NoticeHit::Body) => {}
-            // THE ACCESS CARD'S OPEN SETTINGS (design §3.4, amended 2026-09-07): the
-            // Full Disk Access deep link through the Security page's own gesture arm,
-            // and a pill naming the route in words. It opens a pane; it grants nothing
-            // — the switch is the human's, in Settings — and the card keeps watching
-            // the probe so the flip is noticed on its own.
-            (None, crate::notice::NoticeHit::Primary) if access => {
-                self.open_macos_access_settings(now);
-            }
-            // NOT NOW: record the answer beside aterm.toml (off the UI thread) so the
-            // card is not raised again for the life of the config directory, and
-            // settle it for this process.
-            (None, crate::notice::NoticeHit::NotNow) if access => {
-                self.record_macos_access_marker(crate::consent_card::Marker::NotNow);
-                self.consent_card.settle();
-            }
-            // A press on the access card's body dismisses it for now — nothing is
-            // recorded, the watch for the grant continues, it is not re-raised in
-            // this process, and the next launch asks again.
-            (None, crate::notice::NoticeHit::Body) if access => {
-                self.consent_card.on_owner_acted();
-            }
-            // Every other card is dismissed by the press and does nothing else: no
-            // notice kind carries a one-press action since the update lane moved onto
-            // the status bar (2026-09-07).
-            (None, _) => {}
-        }
-        self.request_redraw_all_windows();
-    }
-
-    /// The in-grid chrome rows the notice card must sit BELOW: the tab strip and the
-    /// status bars own the first [`Self::chrome_rows`] rows of the terminal area, and
-    /// the card is not allowed to cover chrome the user clicks (or reads). One
-    /// accessor so the painter and the hit test cannot disagree about where the card is.
-    pub(crate) fn notice_clear_rows(&self, wid: crate::WindowId) -> f32 {
-        f32::from(self.chrome_rows(wid))
     }
 }
 
@@ -1243,9 +1344,10 @@ fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
-        ApplyLedgerVerdict, ApplyPostureEnv, apply_ledger_verdict, debug_seamless_reexec_armed,
+        ApplyLedgerVerdict, ApplyPostureEnv, UPDATE_DIDNT_INSTALL, UPDATE_WAITS_FOR_YOU,
+        apply_ledger_verdict, debug_seamless_reexec_armed,
     };
     use crate::App;
     use crate::WindowId;
@@ -1301,16 +1403,27 @@ mod tests {
         // no strictly-newer build; a headless process has no handoff either)
         // opens the details route — never a modal, never a ledger entry.
         let mut app = App::headless_for_test();
-        app.status_bars.update_progress(
-            &aterm_update::Progress::Staged {
-                version: "9.9.9".into(),
+        let id = app.post_update_row(
+            crate::update_words::progress(
+                &aterm_update::Progress::Staged {
+                    version: "9.9.9".into(),
+                    build: 1,
+                },
+                None,
+                "",
+            ),
+            "9.9.9",
+            crate::messages_host::FlowPhase::Staged {
                 build: 1,
+                flow: false,
             },
-            None,
-            std::time::Instant::now(),
         );
-        assert!(app.status_bars.update_bar_is_staged());
-        app.press_update_bar();
+        assert_eq!(app.staged_update_row(), Some(id));
+        app.perform_intent(
+            WindowId(0),
+            id,
+            aterm_messages::Intent::ApplyUpdate { build: 1 },
+        );
         let (_, view) = app
             .active_native_view(WindowId(0))
             .expect("native Settings tab");
@@ -1336,16 +1449,25 @@ mod tests {
             version: "9.9.9".into(),
             build: 41,
         };
-        app.status_bars
-            .update_progress(&staged, None, std::time::Instant::now());
+        app.post_update_row(
+            crate::update_words::progress(&staged, None, ""),
+            "9.9.9",
+            crate::messages_host::FlowPhase::Staged {
+                build: 41,
+                flow: false,
+            },
+        );
         assert!(app.update_row_text().unwrap().contains("is ready"));
 
         app.begin_update_installing(41, false);
         assert_eq!(phase(&app), Some(Phase::Charging));
         // (No staged VERSION in the test ledger: the title says "update".)
-        assert!(app.update_row_text().unwrap().contains("Installing update"));
         assert_eq!(
-            app.status_bars.rows(),
+            app.update_row_text().unwrap(),
+            "Installing update \u{2014} installing\u{2026}"
+        );
+        assert_eq!(
+            app.messages.live_rows().count(),
             1,
             "the row was rewritten, not added"
         );
@@ -1363,16 +1485,15 @@ mod tests {
 
         // No row up: the automatic lane adds none; an explicit apply adds one,
         // and a refusal takes it away again.
-        app.status_bars = crate::status_bars::StatusBars::default();
-        app.sync_status_bars();
-        assert_eq!(app.status_bar_rows, 0);
+        app.clear_messages_for_test();
+        assert_eq!(app.message_band_rows, 0);
         app.begin_update_installing(41, false);
         assert_eq!(
-            app.status_bars.rows(),
+            app.messages.live_rows().count(),
             0,
             "the automatic lane never adds a row"
         );
-        assert_eq!(app.status_bar_rows, 0);
+        assert_eq!(app.message_band_rows, 0);
         assert_eq!(
             phase(&app),
             Some(Phase::Charging),
@@ -1381,62 +1502,90 @@ mod tests {
         app.retire_update_installing();
         assert_eq!(phase(&app), None);
         app.begin_update_installing(41, true);
-        assert_eq!(app.status_bars.rows(), 1, "an explicit apply adds the row");
         assert_eq!(
-            app.status_bar_rows, 1,
+            app.messages.live_rows().count(),
+            1,
+            "an explicit apply adds the row"
+        );
+        assert_eq!(
+            app.message_band_rows, 1,
             "…and commits it at once, before the carry reads the window"
         );
-        assert!(app.update_row_text().unwrap().contains("Installing update"));
+        assert!(
+            app.update_row_text()
+                .unwrap()
+                .contains("installing\u{2026}")
+        );
         app.retire_update_installing();
-        assert_eq!(app.status_bars.rows(), 0);
+        assert_eq!(app.messages.live_rows().count(), 0);
         assert_eq!(
-            app.status_bar_rows, 1,
+            app.message_band_rows, 1,
             "a refusal retires the words without a re-grid of its own…"
         );
         // …the trailing sync (the completion wake's, or the next park's) commits
-        // the count once the outcome has had its say.
-        app.sync_status_bars();
-        assert_eq!(app.status_bar_rows, 0);
+        // the count once the outcome has had its say — the D1 hysteresis
+        // shrinks only after its quiet, measured from the first sync that saw
+        // the smaller want.
+        let now = std::time::Instant::now();
+        let _ = app.settle_messages(now);
+        assert_eq!(
+            app.message_band_rows, 1,
+            "grow at once, shrink after the quiet"
+        );
+        assert!(app.settle_messages(now + aterm_messages::SHRINK_QUIET));
+        assert_eq!(app.message_band_rows, 0);
 
         // A landing outlives the outcome posted with it; a charging surge ends
-        // with it, and the outcome's words replace the row's.
+        // with it, and the outcome's words stand beside the row's.
         app.spawn_upgrade_surge(Phase::Landing, 41);
-        app.note_update_outcome(
-            '\u{2191}',
-            "Update waiting",
-            "x",
-            crate::status_bars::Tone::Info,
-        );
+        app.note_update_outcome(crate::update_words::failed(
+            super::UPDATE_WAITS_FOR_YOU,
+            App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            true,
+        ));
         assert_eq!(phase(&app), Some(Phase::Landing));
         app.level_up = None;
-        app.status_bars = crate::status_bars::StatusBars::default();
-        app.status_bars
-            .update_progress(&staged, None, std::time::Instant::now());
-        app.begin_update_installing(41, false);
-        app.note_update_outcome(
-            '\u{2191}',
-            "Update waiting",
-            "x",
-            crate::status_bars::Tone::Info,
+        app.clear_messages_for_test();
+        app.post_update_row(
+            crate::update_words::progress(&staged, None, ""),
+            "9.9.9",
+            crate::messages_host::FlowPhase::Staged {
+                build: 41,
+                flow: false,
+            },
         );
+        app.begin_update_installing(41, false);
+        app.note_update_outcome(crate::update_words::failed(
+            super::UPDATE_WAITS_FOR_YOU,
+            App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            true,
+        ));
         assert_eq!(phase(&app), None);
-        assert!(app.update_row_text().unwrap().contains("Update waiting"));
+        assert!(
+            app.update_row_text()
+                .unwrap()
+                .contains(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY)
+        );
         app.retire_update_installing();
         assert!(
-            app.update_row_text().unwrap().contains("Update waiting"),
+            app.update_row_text()
+                .unwrap()
+                .contains(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY),
             "a row an outcome moved on is not retired"
         );
-        // The outcome covered the Staged row the attempt had rewritten: when
-        // the outcome folds, the ready row is back, in place.
+        // The outcome stands beside the Staged row the attempt had rewritten:
+        // the ready row is back, in place, and outlives the outcome's fold.
         assert!(
-            app.status_bars
-                .settle(std::time::Instant::now() + crate::status_bars::HOLD_OK)
+            app.update_row_detail() == Some(crate::update_words::staged_detail_unknown()),
+            "the refusal put the ready row's words back: {:?}",
+            app.update_row_detail()
         );
+        assert!(app.settle_messages(std::time::Instant::now() + aterm_messages::HOLD_WARN));
         assert!(
             app.update_row_text().unwrap().contains("is ready"),
-            "the staged row returns once the outcome has had its say"
+            "the staged row stands once the outcome has had its say"
         );
-        assert_eq!(app.status_bars.rows(), 1);
+        assert_eq!(app.messages.live_rows().count(), 1);
     }
 
     /// ONE-CLICK fallback (MenuAction::ApplyUpdate with nothing staged): the unit-test
@@ -1535,6 +1684,8 @@ mod tests {
             .map(crate::app_native::durable_update_status)
             .expect("the scratch staging root yields a status under test");
         let status = crate::native_updater_service::DurableUpdateStatus {
+            linux_host: false,
+            linux: None,
             enabled: true,
             staged_build: Some(build),
             staged_version: Some(format!("1.0.{build}")),
@@ -1691,14 +1842,18 @@ mod tests {
                 },
                 false,
             );
-            let installed = app.update_row_text().expect("installed outcome is visible");
-            assert!(installed.contains("activation pending"), "{installed}");
-            assert!(!installed.contains("activating in place"), "{installed}");
-            assert_eq!(installed.contains("retries on its own"), automatic && armed);
-            assert_eq!(
-                installed.contains("see Version menu"),
-                !(automatic && armed)
-            );
+            // A retry the lane has scheduled posts NO row (2026-09-23): the flow
+            // row, where one is up, already says the lane is on it.
+            let scheduled = automatic && armed;
+            let installed = app.update_row_text();
+            if scheduled {
+                assert_eq!(installed, None, "no row for a retry that happens by itself");
+            } else {
+                assert_eq!(
+                    installed.as_deref(),
+                    Some("Update installed \u{2014} finish it from the Version menu")
+                );
+            }
 
             app.react_to_update_apply_outcome(
                 "manual",
@@ -1707,10 +1862,18 @@ mod tests {
                 },
                 false,
             );
-            let deferred = app.update_row_text().expect("deferred outcome is visible");
-            assert!(deferred.contains("Update postponed"), "{deferred}");
-            assert_eq!(deferred.contains("retries on its own"), automatic && armed);
-            assert_eq!(deferred.contains("see Version menu"), !(automatic && armed));
+            let deferred = app.update_row_text();
+            if scheduled {
+                assert_eq!(deferred, None, "no row for a retry that happens by itself");
+            } else {
+                assert_eq!(
+                    deferred,
+                    Some(format!(
+                        "{UPDATE_DIDNT_INSTALL} \u{2014} {}",
+                        crate::update_words::INSTALL_FROM_MENU
+                    ))
+                );
+            }
         }
     }
 
@@ -1729,13 +1892,12 @@ mod tests {
     fn apply_posture_names_config_env_latch_and_disabled_handoff_in_that_order() {
         use crate::app_config::AutoApplySetting;
         use crate::app_update_handoff::HandoffUnavailable;
-        use crate::status_bars::ApplyPosture as P;
         use crate::update_apply_trouble::ApplyRetry;
+        use crate::update_words::ApplyPosture as P;
         let mut app = App::headless_for_test();
         assert!(
             crate::app_config::update_auto_apply(&app.config)
                 && !App::relaunch_nudge_seam_suppresses_auto_apply()
-                && !crate::app_update_handoff::seamless_handoff_opted_out()
                 && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
             "PRECONDITION: no update veto may be set in the test environment"
         );
@@ -1813,20 +1975,7 @@ mod tests {
             ),
             P::ManualByConfig
         );
-        // …the environment veto names its variable…
-        assert_eq!(
-            app.apply_posture_with(
-                build,
-                ApplyPostureEnv {
-                    auto_apply: AutoApplySetting::OffByEnv,
-                    ..clean
-                }
-            ),
-            P::VetoedByEnv {
-                var: "ATERM_NO_AUTO_APPLY"
-            }
-        );
-        // …so does the screenshot seam…
+        // …the screenshot seam (a development build's) names its variable…
         assert_eq!(
             app.apply_posture_with(
                 build,
@@ -1857,7 +2006,7 @@ mod tests {
                 ),
                 P::HandoffDisabled {
                     why,
-                    veto: Some(crate::status_bars::AutoApplyVeto::Config)
+                    veto: Some(crate::update_words::AutoApplyVeto::Config)
                 }
             );
         }
@@ -1873,7 +2022,7 @@ mod tests {
             ),
             P::HandoffDisabled {
                 why: HandoffUnavailable::Headless,
-                veto: Some(crate::status_bars::AutoApplyVeto::Env {
+                veto: Some(crate::update_words::AutoApplyVeto::Env {
                     var: "ATERM_DEBUG_RELAUNCH_NUDGE"
                 })
             }
@@ -1921,7 +2070,7 @@ mod tests {
             app.apply_posture_for(build),
             P::HandoffDisabled {
                 why: HandoffUnavailable::Headless,
-                veto: Some(crate::status_bars::AutoApplyVeto::Config)
+                veto: Some(crate::update_words::AutoApplyVeto::Config)
             }
         );
     }
@@ -1940,12 +2089,11 @@ mod tests {
     fn a_staged_report_paints_the_bar_with_the_posture_the_app_computed() {
         use crate::app_config::AutoApplySetting;
         use crate::app_update_handoff::HandoffUnavailable;
-        use crate::status_bars::{ApplyPosture, Lane, staged_detail};
+        use crate::update_words::{ApplyPosture, staged_detail};
         let mut app = App::headless_for_test();
         assert!(
             crate::app_config::update_auto_apply(&app.config)
                 && !App::relaunch_nudge_seam_suppresses_auto_apply()
-                && !crate::app_update_handoff::seamless_handoff_opted_out()
                 && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
             "PRECONDITION: no update veto may be set in the test environment"
         );
@@ -1954,48 +2102,46 @@ mod tests {
             version: "9.9.9".to_string(),
             build,
         };
-        let bar_detail = |app: &App| {
-            app.status_bars
-                .bars()
-                .next()
-                .expect("the update bar is up")
-                .1
-                .text
-                .detail
-                .clone()
+        let bar_detail = |app: &App| app.update_row_detail().expect("the update row is up");
+        // Ruling 143: a staged build nothing can press, that the lane does not
+        // land within a minute, is a RECORD — the log carries the posture's
+        // words, the glass never shows them.
+        let staged_record = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .rev()
+                .find(|r| r.key.as_deref() == Some(crate::update_words::KEY_PROGRESS))
+                .filter(|r| r.retired() == Some(&aterm_messages::Retired::Recorded))
+                .map(|r| (r.title.clone(), r.detail.join("; ")))
+                .expect("the staged report is recorded")
         };
         app.note_update_progress(&staged);
-        let (lane, bar) = app
-            .status_bars
-            .bars()
-            .next()
-            .expect("the staged report raised the update bar");
-        assert_eq!(lane, Lane::Update);
-        assert_eq!(bar.text.title, "aterm v9.9.9 is ready");
+        assert!(
+            app.messages
+                .live_by_key(crate::update_words::KEY_PROGRESS)
+                .is_none(),
+            "a staged build nothing can press is not a band row"
+        );
+        let (title, detail) = staged_record(&app);
+        assert_eq!(title, "aterm v9.9.9 is ready");
         let headless = ApplyPosture::HandoffDisabled {
             why: HandoffUnavailable::Headless,
             veto: None,
         };
-        assert_eq!(bar.text.detail, staged_detail(build, headless));
+        assert_eq!(detail, staged_detail(headless));
         assert!(
-            bar.text.detail.contains("--headless")
-                && bar
-                    .text
-                    .detail
-                    .contains("will NOT apply while any terminal is open")
-                && !bar.text.detail.contains("~2 min")
-                && !bar.text.detail.contains("Version menu")
-                && !bar.text.detail.to_lowercase().contains("restart"),
-            "{}",
-            bar.text.detail
+            detail.contains("--headless")
+                && detail.contains("installs once every terminal is closed")
+                && !detail.contains("minute")
+                && !detail.contains("Version menu")
+                && !detail.to_lowercase().contains("restart"),
+            "{detail}"
         );
-        assert_eq!(
-            app.status_bar_rows, 1,
-            "…and the row is reserved on the grid"
-        );
+        assert_eq!(app.message_band_rows, 0, "…and no row is reserved");
 
         // A stand-down latch for this build changes nothing here: the lane that
-        // cannot run outranks the latch, and the bar keeps its warning.
+        // cannot run outranks the latch, and nothing is re-stated.
         let latch = |retry_at| crate::AutoApplyManualOnly {
             build,
             dmg_sha256: [0xab; 32],
@@ -2003,11 +2149,9 @@ mod tests {
         };
         app.auto_apply_manual_only = Some(latch(None));
         assert_eq!(app.apply_posture_for(build), headless);
-        assert!(
-            !app.status_bars
-                .restate_apply_posture(build, headless, std::time::Instant::now()),
-            "the words did not change"
-        );
+        let before = app.messages.revision();
+        app.restate_staged_bar_posture(build);
+        assert_eq!(app.messages.revision(), before, "the words did not change");
 
         // With the lane AVAILABLE — the pure seam, since a headless test process
         // cannot build an event loop — the automatic promise, then the stand-down
@@ -2022,31 +2166,38 @@ mod tests {
             app.apply_posture_with(build, available),
             ApplyPosture::Automatic
         );
-        app.status_bars.update_progress(
-            &staged,
-            Some(ApplyPosture::Automatic),
-            std::time::Instant::now(),
+        app.post_update_row(
+            crate::update_words::progress(&staged, Some(ApplyPosture::Automatic), ""),
+            "9.9.9",
+            crate::messages_host::FlowPhase::Staged { build, flow: true },
         );
         let detail = bar_detail(&app);
-        assert!(
-            detail.contains("applies by itself at the next quiet moment")
-                && detail.contains("within 15 min regardless")
-                && detail.contains("your shells keep running")
-                && !detail.to_lowercase().contains("restart")
-                && !detail.contains("~2 min"),
-            "{detail}"
+        assert_eq!(detail, "installs within a minute \u{2014} keep working");
+        assert_eq!(
+            app.update_row_text().unwrap(),
+            "Installing aterm v9.9.9 \u{2014} installs within a minute \u{2014} keep working"
         );
         app.auto_apply_manual_only = Some(latch(None));
         let posture = app.apply_posture_with(build, available);
         assert_eq!(posture, ApplyPosture::ManualOnlyLatched { lapses: false });
-        assert!(
-            app.status_bars
-                .restate_apply_posture(build, posture, std::time::Instant::now())
-        );
+        assert!(app.restate_update_flow(
+            crate::update_words::restate_apply_posture("9.9.9", build, posture),
+            None,
+        ));
         let detail = bar_detail(&app);
         assert!(
-            detail.contains("until you apply it") && !detail.to_lowercase().contains("restart"),
+            detail.contains("automatic install") && !detail.to_lowercase().contains("restart"),
             "{detail}"
+        );
+        let row = app
+            .messages
+            .live_by_key(crate::update_words::KEY_PROGRESS)
+            .expect("the staged row");
+        assert_eq!(row.msg.title, "aterm v9.9.9 is ready");
+        assert_eq!(
+            row.msg.actions,
+            vec![aterm_messages::Intent::ApplyUpdate { build }],
+            "a lane that stopped offers the press"
         );
     }
 
@@ -2092,7 +2243,7 @@ mod tests {
                 "9.9.9",
                 app.apply_trouble_for(build).as_ref()
             ),
-            "\u{2191} Update to v9.9.9 \u{2014} apply now, shells keep running"
+            "\u{2191} Install aterm v9.9.9 now"
         );
 
         // ONE REAL FAILURE, through the door the handoff completion uses. Nothing
@@ -2112,8 +2263,8 @@ mod tests {
             .expect("the failure that just happened is standing trouble for this build");
         assert_eq!(
             crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&trouble)),
-            "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
-             retrying on its own"
+            "\u{2191} Install aterm v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
+             will try again"
         );
 
         // THE PALETTE ROW, gathered by `palette_live` exactly as the real repaint
@@ -2149,7 +2300,7 @@ mod tests {
             "one failure is already below `PERSISTENT_AFTER` and already news"
         );
         let log_pointer = if projection.apply_is_failing {
-            " See aterm.log."
+            " Details in Settings \u{25b8} Messages."
         } else {
             ""
         };
@@ -2157,16 +2308,15 @@ mod tests {
             projection.detail.as_deref(),
             Some(
                 format!(
-                    "Version 1.0.{build} \u{b7} build {build} \u{b7} aterm tried to update once \
-                     and the new version did not finish starting. It will try again by \
-                     itself.{log_pointer}"
+                    "Version 1.0.{build} \u{b7} aterm tried to update once and the new \
+                     version did not finish starting. It will try again by itself.{log_pointer}"
                 )
                 .as_str()
             )
         );
         assert_eq!(
             crate::native_settings::compact_update_detail(&projection),
-            "Tried once, didn\u{2019}t start \u{b7} retrying."
+            "Tried once, didn\u{2019}t start \u{b7} will try again."
         );
         assert_eq!(
             crate::native_settings::compact_update_headline(&projection),
@@ -2199,8 +2349,8 @@ mod tests {
             .expect("still standing trouble");
         assert_eq!(
             crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&latched)),
-            "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
-             apply now to retry"
+            "\u{2191} Install aterm v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
+             try again now"
         );
         assert!(
             app.update_snapshot(false)
@@ -2251,8 +2401,8 @@ mod tests {
             .expect("the ledger remembers what this process never saw");
         assert_eq!(
             crate::menu::staged_apply_label("\u{2191}", staged, "9.9.9", Some(&trouble)),
-            "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t take over; \
-             apply now to retry",
+            "\u{2191} Install aterm v9.9.9 \u{2014} tried once, didn\u{2019}t take over; \
+             try again now",
             "the CAUSE came off the disk, and so did the fact that nothing is scheduled"
         );
         assert!(
@@ -2324,7 +2474,7 @@ mod tests {
                 "9.9.9",
                 app.apply_trouble_for(fresh).as_ref()
             ),
-            "\u{2191} Update to v9.9.9 \u{2014} apply now, shells keep running"
+            "\u{2191} Install aterm v9.9.9 now"
         );
         assert!(
             app.update_snapshot(false)
@@ -2346,8 +2496,8 @@ mod tests {
         let trouble = app.apply_trouble_for(fresh).expect("its own failure");
         assert_eq!(
             crate::menu::staged_apply_label("\u{2191}", fresh, "9.9.9", Some(&trouble)),
-            "\u{2191} Update to v9.9.9 \u{2014} tried once, too slow to start; \
-             retrying on its own",
+            "\u{2191} Install aterm v9.9.9 \u{2014} tried once, too slow to start; \
+             will try again",
             "the count restarted with the artifact, and the CAUSE moved with it"
         );
     }
@@ -2381,7 +2531,7 @@ mod tests {
         );
     }
 
-    fn stage_one_build(app: &mut App) -> u64 {
+    pub(crate) fn stage_one_build(app: &mut App) -> u64 {
         let current_build = app.native_updater_service.snapshot().current_build;
         let build = current_build + 1;
         let CheckStart::Start(ticket) = app.native_updater_service.request_check() else {
@@ -2391,6 +2541,8 @@ mod tests {
             app.native_updater_service.finish_check(
                 ticket,
                 crate::native_updater_service::DurableUpdateStatus {
+                    linux_host: false,
+                    linux: None,
                     enabled: true,
                     current_build,
                     staged_build: Some(build),
@@ -2408,6 +2560,7 @@ mod tests {
                     apply_failures_for_target: 0,
                     installable: true,
                     channel_unreadable: false,
+                    checked_at: None,
                 },
             ),
             crate::native_updater_service::CheckCompletion::Reduced,
@@ -2420,7 +2573,7 @@ mod tests {
     #[test]
     fn retry_and_latch_posture_require_the_exact_current_artifact() {
         use crate::app_config::AutoApplySetting;
-        use crate::status_bars::ApplyPosture;
+        use crate::update_words::ApplyPosture;
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
         let later = std::time::Instant::now() + std::time::Duration::from_secs(600);
@@ -2475,20 +2628,22 @@ mod tests {
         assert!(!app.automatic_apply_retry_scheduled(build));
     }
 
-    /// THE PILL MUST NOT ASSERT THE PESSIMISTIC ANSWER WHEN A RETRY IS ALREADY
-    /// SCHEDULED.
+    /// A RETRY THE LANE SCHEDULED POSTS NO ROW; A LANE THAT STOPPED SAYS SO ONCE.
     ///
-    /// "Update paused — manual retry" named a mechanism, not an action (there is
-    /// no "retry" control in the UI), and it was flatly wrong half the time: a
-    /// physical handoff failure inside its budget schedules another automatic
-    /// attempt, and this arm claimed the lane had given up. Which answer is true
-    /// is a question about SCHEDULING STATE, so every carrier of it is consulted —
-    /// a live intent, or a latch with a deadline — and each must name THIS staged
-    /// artifact.
+    /// "Update paused — manual retry" named a mechanism, not an action, and it was
+    /// flatly wrong half the time: a physical handoff failure inside its budget
+    /// schedules another automatic attempt. Which answer is true is a question
+    /// about SCHEDULING STATE, so every carrier of it is consulted — a live
+    /// intent, or a latch with a deadline — and each must name THIS staged
+    /// artifact. Since 2026-09-23 the scheduled answer is SILENCE: the flow row
+    /// says the lane is on it, and the owner read every "delayed / waiting /
+    /// postponed" row that day as noise about a retry he could do nothing about.
+    /// Only a PERSON whose own attempt failed is told, because nothing else would
+    /// tell them.
     ///
     /// The user-facing strings are the assertion, because they are the contract.
     #[test]
-    fn the_failure_pill_says_retrying_only_when_a_retry_is_actually_scheduled() {
+    fn a_scheduled_retry_is_silent_and_a_stopped_lane_names_the_menu() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         assert!(
@@ -2497,92 +2652,67 @@ mod tests {
              the shipped default is ON"
         );
         let build = stage_one_build(&mut app);
+        let version = app
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map(|stage| stage.version.clone())
+            .expect("a stage");
         let failed = || UpdateOutcome::Failed {
             message: "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
         };
         // THE ROW, NOT A PILL (2026-09-07): the outcome is the update bar's
         // words — "<title> — <detail>" — and silence is an empty lane.
-        let pill = |app: &App| {
-            app.status_bars
-                .bars()
-                .find(|(lane, _)| *lane == crate::status_bars::Lane::Update)
-                .map(|(_, bar)| format!("{} — {}", bar.text.title, bar.text.detail))
-                .expect("this case must paint the update row; silence is checked directly")
-        };
+        let row = |app: &App| app.update_row_text();
+        let stopped = Some(format!(
+            "Couldn't install aterm v{version} \u{2014} {}",
+            crate::update_words::INSTALL_FROM_MENU
+        ));
 
         // NOTHING SCHEDULED: no intent, no latch. The honest answer is that the
         // user has to reach for the control.
         app.auto_apply_intent = None;
         app.auto_apply_manual_only = None;
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.clear_messages_for_test();
         app.surface_update_apply_outcome("automatic", failed(), false);
-        assert_eq!(pill(&app), "Update paused — see Version menu");
+        assert_eq!(row(&app), stopped);
 
         // A LIVE INTENT for this artifact: a wake is already folded into the event
-        // loop, so telling the user to act would be false.
+        // loop — nothing to say.
         app.auto_apply_intent = Some(crate::AutoApplyIntent {
             build,
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
         });
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.clear_messages_for_test();
         app.surface_update_apply_outcome("automatic", failed(), false);
-        assert_eq!(pill(&app), "Update delayed — retries on its own");
+        assert_eq!(row(&app), None);
 
         // A LEFTOVER intent for a SUPERSEDED build schedules nothing for the
-        // artifact on screen, so it must not borrow the optimistic answer.
+        // artifact on screen, so it must not borrow the silence.
         app.auto_apply_intent = Some(crate::AutoApplyIntent {
             build: build + 7,
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
         });
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.clear_messages_for_test();
         app.surface_update_apply_outcome("automatic", failed(), false);
-        assert_eq!(pill(&app), "Update paused — see Version menu");
+        assert_eq!(row(&app), stopped);
 
         // A LATCH WITH A DEADLINE is the other carrier: the lane is standing down
-        // but `about_to_wait` will lapse it, so it does come back on its own.
+        // but `about_to_wait` will lapse it, so it does come back on its own —
+        // on every physical attempt, the first included.
         app.auto_apply_intent = None;
-        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        let lapsing = crate::AutoApplyManualOnly {
             build,
             dmg_sha256: [0xab; 32],
             retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
-        });
-        app.status_bars = crate::status_bars::StatusBars::default();
-        app.surface_update_apply_outcome("automatic", failed(), false);
-        assert_eq!(pill(&app), "Update delayed — retries on its own");
-
-        // A DEADLINE-LESS latch (the policy-mismatch fail-safe) genuinely does not
-        // come back by itself. This is the case the old wording described, and the
-        // only one it was ever right about.
-        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-            build,
-            dmg_sha256: [0xab; 32],
-            retry_at: None,
-        });
-        app.status_bars = crate::status_bars::StatusBars::default();
-        app.surface_update_apply_outcome("automatic", failed(), false);
-        assert_eq!(pill(&app), "Update paused — see Version menu");
-
-        // …AND A SCHEDULED RETRY IS STILL NOT AUTOMATICALLY A PILL. The physical
-        // lane can spend nine attempts before it gives up; repeating "retries on
-        // its own" on each of them is a notification every ~40 minutes for most of
-        // a day, about a state whose only advice is "wait". The first failure for
-        // an artifact speaks; the rest are silent. (Convergence is not silent — it
-        // clears `retry_at`, which is the deadline-less case two blocks up.)
-        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-            build,
-            dmg_sha256: [0xab; 32],
-            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
-        });
-        for (cycles, expected) in [
-            (1_u8, Some("Update delayed — retries on its own")),
-            (2, None),
-            (5, None),
-            (8, None),
-        ] {
+        };
+        app.auto_apply_manual_only = Some(lapsing);
+        for cycles in [1_u8, 2, 5, 8] {
             app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
                 build,
                 dmg_sha256: [0xab; 32],
@@ -2590,50 +2720,34 @@ mod tests {
                 cycles,
                 last_attempt: std::time::Instant::now(),
             });
-            app.status_bars = crate::status_bars::StatusBars::default();
+            app.clear_messages_for_test();
             app.surface_update_apply_outcome("automatic handoff", failed(), false);
             assert_eq!(
-                app.status_bars
-                    .bars()
-                    .find(|(lane, _)| *lane == crate::status_bars::Lane::Update)
-                    .map(|(_, bar)| format!("{} — {}", bar.text.title, bar.text.detail))
-                    .as_deref(),
-                expected,
+                row(&app),
+                None,
                 "physical failure {cycles} for this artifact"
             );
         }
-        // A record for a DIFFERENT artifact says nothing about this one, so the
-        // suppression must not leak across builds.
-        app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
-            build: build + 7,
-            dmg_sha256: [0xab; 32],
-            activation: false,
-            cycles: 8,
-            last_attempt: std::time::Instant::now(),
-        });
-        app.status_bars = crate::status_bars::StatusBars::default();
-        app.surface_update_apply_outcome("automatic handoff", failed(), false);
-        assert_eq!(pill(&app), "Update delayed — retries on its own");
+        app.auto_apply_physical_retry = None;
 
-        // AND A PERSON IS NEVER SILENCED BY THE AUTOMATIC LANE'S BUDGET.
+        // A DEADLINE-LESS latch (the policy-mismatch fail-safe, or a converged
+        // artifact) genuinely does not come back by itself: said once, with the
+        // control.
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: None,
+        });
+        app.clear_messages_for_test();
+        app.surface_update_apply_outcome("automatic", failed(), false);
+        assert_eq!(row(&app), stopped);
+
+        // AND A PERSON IS NEVER SILENCED BY THE AUTOMATIC LANE'S SCHEDULE.
         //
-        // THIS BLOCK USED TO REST ON A FALSE PREMISE AND PASS ANYWAY. It asserted
-        // that a person's lane "spends nothing", and then proved it by HAND-SETTING
-        // a record 600 s old and calling the surfacing function directly — a fixture
-        // that is stale by construction, so the pill was guaranteed whether or not a
-        // person's failure charged the budget. It did charge it: the returned-handoff
-        // completion dropped the attempt's `ApplyMode`, so a Version-menu apply that
-        // failed physically spent `auto_apply_physical_retry` MICROSECONDS before
-        // surfacing — landing inside the freshness window this predicate uses to
-        // recognise the automatic lane's own quiet retries, and silencing the one
-        // person who had just asked for the update.
-        //
-        // So the premise is now DRIVEN: a real person-initiated returned handoff,
-        // through the same call the completion path's `(Some(attempt), None)` arm
-        // makes, followed by the real surfacing. The inherited record is mid-budget
-        // and 600 s old — the physical schedule's own MINIMUM spacing, so it is the
-        // freshest record the automatic lane can leave behind between attempts — and
-        // both assertions below fail if the person's failure re-stamps it.
+        // A person's returned handoff spends nothing (driven, not hand-set: the
+        // real completion path's `(Some(attempt), None)` arm), so the posture —
+        // and the flow row — would not move; whoever just asked for the update is
+        // exactly who must be told it did not happen.
         let manual_ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
             build,
             "0123456789abcdef0123456789abcdef01234567",
@@ -2647,12 +2761,8 @@ mod tests {
             cycles: 5,
             last_attempt: std::time::Instant::now() - std::time::Duration::from_secs(600),
         });
-        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-            build,
-            dmg_sha256: [0xab; 32],
-            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
-        });
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.auto_apply_manual_only = Some(lapsing);
+        app.clear_messages_for_test();
         let person = app.abort_reaped_native_apply_before_reconcile(
             &manual_ticket,
             "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
@@ -2665,11 +2775,24 @@ mod tests {
              is how three clicks on a bad afternoon converged the background lane"
         );
         app.surface_update_apply_outcome("manual handoff", person, false);
+        // (The test ticket stages its own artifact, version and all.)
+        let asked = app
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map(|stage| stage.version.clone())
+            .expect("the ticket's stage");
+        // Ruling 143: the lane retries it by itself, so the person's own press
+        // ends in its switch row's Fault echo and a RECORD in main's words —
+        // never a second row for a retry nobody can hurry.
+        assert_eq!(row(&app), None, "a self-retry takes no row");
         assert_eq!(
-            pill(&app),
-            "Update delayed — retries on its own",
-            "whoever just asked for the update is exactly who must be told it did \
-             not happen; the automatic lane's mid-budget silence is not theirs"
+            app.update_record_text(),
+            Some(format!(
+                "Couldn't install aterm v{asked} \u{2014} will try again by itself"
+            )),
+            "whoever just asked for the update finds it did not happen, on record"
         );
         app.auto_apply_physical_retry = None;
 
@@ -2683,14 +2806,212 @@ mod tests {
             !crate::app_config::update_auto_apply(&app.config),
             "PRECONDITION: the opt-out actually took"
         );
-        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-            build,
-            dmg_sha256: [0xab; 32],
-            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
-        });
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.auto_apply_manual_only = Some(lapsing);
+        app.clear_messages_for_test();
         app.surface_update_apply_outcome("automatic", failed(), false);
-        assert_eq!(pill(&app), "Update paused — see Version menu");
+        assert_eq!(
+            row(&app),
+            Some(format!(
+                "Couldn't install aterm v{asked} \u{2014} {}",
+                crate::update_words::INSTALL_FROM_MENU
+            ))
+        );
+    }
+
+    /// THE FLOW SAYS WHAT HAPPENS TO THE PERSON'S WORK ONCE (2026-09-23). "Your
+    /// shells keep running" was on four rows of one update — the staged row, the
+    /// installing row, the finishing row, the landing — and a row that lasts under
+    /// a second cannot even be read. Walked through every phase on the band, the
+    /// one sentence about the person's typing appears exactly once (the switch,
+    /// where keys are queued), the title is one from the first byte to the switch,
+    /// and the landing claims nothing.
+    #[test]
+    fn the_flow_says_what_happens_to_the_persons_work_once() {
+        use crate::messages_host::FlowPhase;
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let mut said: Vec<String> = Vec::new();
+        let look = |app: &App, said: &mut Vec<String>| {
+            said.push(app.update_row_text().expect("the flow row is up"));
+        };
+        app.note_update_progress(&aterm_update::Progress::Downloading {
+            version: "0.79.0".into(),
+            bytes_done: 1,
+            bytes_total: 2,
+        });
+        look(&app, &mut said);
+        app.note_update_progress(&aterm_update::Progress::Verifying {
+            version: "0.79.0".into(),
+        });
+        look(&app, &mut said);
+        // A windowed App's automatic posture (a headless one has no seamless
+        // lane), then the ladder's keys-only phase.
+        app.post_update_row(
+            crate::update_words::staged(
+                "0.79.0",
+                7,
+                Some(crate::update_words::ApplyPosture::Automatic),
+            ),
+            "0.79.0",
+            FlowPhase::Staged {
+                build: 7,
+                flow: true,
+            },
+        );
+        look(&app, &mut said);
+        assert!(app.restate_update_flow_holds(7, crate::update_words::Holds::Typing));
+        look(&app, &mut said);
+        assert!(app.restate_update_flow(
+            crate::messages_host::restatement_of(&crate::update_words::installing("0.79.0")),
+            Some(FlowPhase::Installing),
+        ));
+        look(&app, &mut said);
+        assert!(app.restate_update_flow(
+            crate::messages_host::restatement_of(&crate::update_words::finishing("0.79.0")),
+            Some(FlowPhase::Finishing),
+        ));
+        look(&app, &mut said);
+        app.post_update_landed("0.79.0", 7);
+        // The landing is the flow row's Complete echo and a record (ruling 141).
+        assert_eq!(app.update_row_text(), None, "the landing takes no row");
+        assert!(
+            app.messages
+                .log()
+                .records()
+                .any(|r| r.title == "Updated to aterm v0.79.0" && r.detail.is_empty()),
+            "the landing's record claims nothing"
+        );
+        let mentions = said
+            .iter()
+            .filter(|line| line.contains("shells") || line.contains("what you type"))
+            .count();
+        assert_eq!(mentions, 1, "{said:#?}");
+        // A title per phase, verb first (ruling 143), one row throughout.
+        let titles: Vec<&str> = said
+            .iter()
+            .map(|line| line.split(" \u{2014} ").next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Downloading aterm v0.79.0",
+                "Checking aterm v0.79.0",
+                "Installing aterm v0.79.0",
+                "Installing aterm v0.79.0",
+                "Installing aterm v0.79.0",
+                "Finishing aterm v0.79.0",
+            ],
+            "{said:#?}"
+        );
+    }
+
+    /// ONLY WHAT A PERSON CAN ACT ON IS NAMED (2026-09-23): a close preflight that
+    /// refuses the install for unsaved editor or Settings work puts that one
+    /// sentence on the row, whatever the schedule; a blocker that clears by
+    /// itself (a restore landing, a checkpoint running) posts nothing while the
+    /// lane will try again, and a stopped lane points at the Version menu.
+    #[test]
+    fn only_a_blocker_a_person_can_clear_is_named_on_the_row() {
+        let mut app = App::headless_for_test();
+        let blocked = |reasons: &[&str]| UpdateOutcome::Blocked {
+            reasons: reasons.iter().map(|r| (*r).to_string()).collect(),
+        };
+        for reason in [
+            App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            "Review Settings Drafts: 1 Settings view(s) have unsaved text",
+            "Checkpoint Drafts: 2 document(s) have uncheckpointed edits",
+            "Retry: 1 document checkpoint(s) previously failed",
+        ] {
+            app.clear_messages_for_test();
+            app.react_to_update_apply_outcome("automatic", blocked(&[reason]), false);
+            assert_eq!(
+                app.update_row_text(),
+                Some(format!(
+                    "{UPDATE_WAITS_FOR_YOU} \u{2014} {}",
+                    App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY
+                )),
+                "{reason}"
+            );
+        }
+        // Clears by itself, and nothing is scheduled here (no stage): the lane
+        // has stopped, and the menu is named — on record, since with no build
+        // staged there is no `Install now` to press (ruling 143).
+        app.clear_messages_for_test();
+        app.react_to_update_apply_outcome(
+            "automatic",
+            blocked(&[App::RESTORE_IN_FLIGHT_BLOCKS_APPLY]),
+            false,
+        );
+        assert_eq!(app.update_row_text(), None);
+        assert_eq!(
+            app.update_record_text(),
+            Some(format!(
+                "{UPDATE_DIDNT_INSTALL} \u{2014} {}",
+                crate::update_words::INSTALL_FROM_MENU
+            ))
+        );
+        // …and while a retry IS scheduled, nothing at all.
+        app.clear_messages_for_test();
+        app.note_update_blockers(&[App::RESTORE_IN_FLIGHT_BLOCKS_APPLY.to_string()], true);
+        assert_eq!(app.update_row_text(), None);
+        assert!(
+            super::source_is_automatic("automatic · retrying later")
+                && super::source_is_automatic("automatic policy fallback")
+                && !super::source_is_automatic("manual handoff")
+                && !super::source_is_automatic("control request")
+        );
+    }
+
+    /// THE BLOCKED LANE'S RESTATEMENT puts the editor words only where the lane
+    /// installs by itself (`App::restate_update_flow_holds` carries the positive
+    /// case). It re-states the posture FIRST: a headless App has no seamless lane,
+    /// so the automatic flow row a check painted becomes the ready row that says
+    /// how this process installs — and the words about the editor never land on
+    /// it, because nothing here is on its way in.
+    #[test]
+    fn a_blocked_restatement_names_the_editor_only_on_a_row_the_lane_installs() {
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        app.post_update_row(
+            crate::update_words::staged(
+                &format!("1.0.{build}"),
+                build,
+                Some(crate::update_words::ApplyPosture::Automatic),
+            ),
+            &format!("1.0.{build}"),
+            crate::messages_host::FlowPhase::Staged { build, flow: true },
+        );
+        app.restate_blocked_update_bar(build, &[App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()]);
+        // Headless: the posture's words are a RECORD (ruling 143) — the flow
+        // row folds into it, and the editor words land nowhere.
+        assert!(
+            app.messages
+                .live_by_key(crate::update_words::KEY_PROGRESS)
+                .is_none(),
+            "headless: no flow row stands"
+        );
+        let record = app
+            .messages
+            .log()
+            .records()
+            .rev()
+            .find(|r| r.key.as_deref() == Some(crate::update_words::KEY_PROGRESS))
+            .expect("the staged record");
+        assert_eq!(
+            record.detail,
+            vec![crate::update_words::staged_detail(
+                crate::update_words::ApplyPosture::HandoffDisabled {
+                    why: crate::app_update_handoff::HandoffUnavailable::Headless,
+                    veto: None,
+                }
+            )]
+        );
+        assert_ne!(record.detail[0], crate::update_words::EDITOR_HOLDS_IT);
+        assert_eq!(
+            app.update_flow_row_for(build),
+            None,
+            "the ready row is not the flow"
+        );
     }
 
     /// SUBMISSION IS NOT COMPLETION, AND THE LEDGER MUST BE ABLE TO ESCALATE.
@@ -2795,5 +3116,209 @@ mod tests {
             Some(AppViewState::Settings(state))
                 if state.route == crate::native_settings::SettingsRoute::SoftwareUpdate
         ));
+    }
+
+    /// The staged DECISION is raised once (design §10.5 H2, ruling 119), and
+    /// only under a posture where a press is how the build installs.
+    #[test]
+    fn a_stopped_lane_raises_the_staged_decision_once() {
+        use crate::update_words::ApplyPosture;
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        // No staged build of that number: nothing to offer.
+        app.ensure_staged_decision_in(build + 1, ApplyPosture::ManualByConfig);
+        assert_eq!(app.messages.live_rows().count(), 0);
+        for posture in [
+            ApplyPosture::Automatic,
+            ApplyPosture::ManualOnlyLatched { lapses: true },
+        ] {
+            app.ensure_staged_decision_in(build, posture);
+            assert_eq!(
+                app.messages.live_rows().count(),
+                0,
+                "{posture:?}: the lane still acts, so nothing is asked"
+            );
+        }
+        app.ensure_staged_decision_in(build, ApplyPosture::ManualOnlyLatched { lapses: false });
+        let id = app.staged_update_row().expect("the decision row");
+        app.ensure_staged_decision_in(build, ApplyPosture::ManualOnlyLatched { lapses: false });
+        app.ensure_staged_decision_in(build, ApplyPosture::ManualByConfig);
+        assert_eq!(app.messages.live_rows().count(), 1, "raised once");
+        assert_eq!(app.staged_update_row(), Some(id));
+        let row = app.messages.live(id).expect("live");
+        assert_eq!(
+            row.msg.actions,
+            vec![aterm_messages::Intent::ApplyUpdate { build }]
+        );
+        assert_eq!(row.msg.actions[0].label(), "Install now");
+        // The person lets it lapse (its hold ran out). Every later reconcile
+        // re-states the same posture: the question stays off the glass — the
+        // Version menu and Software Update still offer it (review 2026-09-24).
+        let lapsed = std::time::Instant::now() + aterm_messages::HOLD_STAGED_MANUAL * 2;
+        app.messages.settle(lapsed, true);
+        app.sync_messages();
+        assert_eq!(app.staged_update_row(), None, "the question lapsed");
+        for _ in 0..3 {
+            app.ensure_staged_decision_in(build, ApplyPosture::ManualOnlyLatched { lapses: false });
+        }
+        assert_eq!(
+            app.staged_update_row(),
+            None,
+            "a reconcile never asks again"
+        );
+        // A posture that has just become a decision (the lane stopped under
+        // another one) raises it once more.
+        app.ensure_staged_decision_in(build, ApplyPosture::ManualByConfig);
+        assert!(
+            app.staged_update_row().is_some(),
+            "a new posture asks again"
+        );
+    }
+
+    /// THE PERSON'S PRESS AGAINST THE LANE (ruling 143): a failure the lane
+    /// retries by itself is a RECORD in main's words, whoever pressed — the
+    /// person's switch row ends in the Fault echo; a lane that STOPPED is a
+    /// decision row whose `Install now` is the Version menu's press.
+    #[test]
+    fn a_retried_failure_is_a_record_and_a_stopped_lane_a_decision() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let failed = || UpdateOutcome::Failed {
+            message: "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+        };
+        app.clear_messages_for_test();
+        app.react_to_update_apply_outcome("automatic handoff", failed(), false);
+        let row = app
+            .update_row_text()
+            .expect("with nothing retrying, the stopped lane is a row");
+        assert!(row.starts_with("Couldn't install aterm v"), "{row}");
+        let live = app
+            .messages
+            .live_by_key(crate::update_words::KEY_OUTCOME)
+            .expect("the outcome row");
+        assert_eq!(
+            live.msg.actions,
+            vec![aterm_messages::Intent::ApplyUpdate { build }],
+            "the press is on the glass"
+        );
+        assert_eq!(app.message_band_rows, 1);
+    }
+
+    /// ONE DECISION PER STOPPED LANE (rulings 119 and 143; review
+    /// 2026-09-24). A stand-down's posture restatement turns the flow row
+    /// into the ready row (`aterm vX is ready`, `Install now`); the stopped
+    /// lane's outcome that follows carries the same press. The outcome is the
+    /// one row: the ready row is withdrawn under it — on the Failed path and
+    /// on the Blocked one.
+    #[test]
+    fn a_stopped_lane_is_one_decision_row_never_two() {
+        use crate::update_words::ApplyPosture;
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let presses = |app: &App| {
+            app.messages
+                .live_rows()
+                .filter(|l| {
+                    l.msg
+                        .actions
+                        .contains(&aterm_messages::Intent::ApplyUpdate { build })
+                })
+                .count()
+        };
+        let outcomes = [
+            UpdateOutcome::Failed {
+                message: "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+            },
+            UpdateOutcome::Blocked {
+                reasons: vec!["the handoff helper is not ready".to_string()],
+            },
+        ];
+        for (outcome, posture) in outcomes.into_iter().zip([
+            ApplyPosture::ManualOnlyLatched { lapses: false },
+            ApplyPosture::ManualByConfig,
+        ]) {
+            app.clear_messages_for_test();
+            app.ensure_staged_decision_in(build, posture);
+            assert!(
+                app.staged_update_row().is_some(),
+                "PRECONDITION: the ready row is up ({posture:?})"
+            );
+            assert_eq!(presses(&app), 1);
+            app.react_to_update_apply_outcome("automatic handoff", outcome, false);
+            assert_eq!(
+                presses(&app),
+                1,
+                "one `Install now` on the glass: {:?}",
+                app.messages
+                    .live_rows()
+                    .map(|l| l.msg.title.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(app.staged_update_row(), None, "the ready row left");
+            let live = app
+                .messages
+                .live_by_key(crate::update_words::KEY_OUTCOME)
+                .expect("the outcome is the decision");
+            assert_eq!(live.msg.severity, aterm_messages::Severity::Warn);
+            app.sync_messages();
+            assert_eq!(app.message_band_rows, 1, "one row for one fact");
+        }
+    }
+    /// NO ✓ BESIDE A FAILURE (ruling 159). The automatic lane's staged row is
+    /// the busy `Installing aterm vX`; resolved `Ok` its Complete echo says
+    /// `✓ Installed aterm vX` (ruling 154). That is true once the bytes are
+    /// installed (`InstalledNeedsRelaunch`) and false when the artifact is
+    /// gone (`Failed` with no staged build): there the row is withdrawn and
+    /// only `Update didn't finish` speaks.
+    #[test]
+    fn a_gone_artifact_never_echoes_installed_beside_its_failure() {
+        use aterm_messages::EchoKind;
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let build = 41;
+        for (outcome, echo) in [
+            (
+                UpdateOutcome::InstalledNeedsRelaunch {
+                    build,
+                    message: "activation pending".to_string(),
+                },
+                Some(EchoKind::Complete),
+            ),
+            (
+                UpdateOutcome::Failed {
+                    message: "the staged artifact was retired".to_string(),
+                },
+                None,
+            ),
+        ] {
+            let mut app = App::headless_for_test();
+            assert!(
+                app.native_updater_service.snapshot().staged.is_none(),
+                "PRECONDITION: no staged build"
+            );
+            app.post_update_row(
+                crate::update_words::staged(
+                    "9.9.9",
+                    build,
+                    Some(crate::update_words::ApplyPosture::Automatic),
+                ),
+                "9.9.9",
+                crate::messages_host::FlowPhase::Staged { build, flow: true },
+            );
+            assert!(
+                app.staged_update_row().is_some(),
+                "PRECONDITION: staged row"
+            );
+            app.react_to_update_apply_outcome("automatic handoff", outcome.clone(), false);
+            assert_eq!(app.staged_update_row(), None, "{outcome:?}: the row left");
+            let complete = app
+                .messages
+                .echoes()
+                .iter()
+                .find(|e| e.kind == EchoKind::Complete)
+                .map(|e| e.kind);
+            assert_eq!(complete, echo, "{outcome:?}");
+        }
     }
 }

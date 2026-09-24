@@ -18,9 +18,8 @@ use harness::{until, World, FLEET};
 /// one of its SESSIONS adds `from=<sid>`" — and §8.3's residual is "a node can
 /// attribute a post to any of its OWN SESSIONS". `render_from` validated the
 /// claim with `is_principal` alone, which also accepts `h-`, so a node holding
-/// nothing but its own §8.2 ring could render `h-andrew@n-rogue`. Two consumers
-/// key off that `h-` prefix: `hook::accepted`, which decides whether a row may
-/// exit-2 a parked `Stop` hook, and `InboxRow::is_human`, which is the eviction
+/// nothing but its own §8.2 ring could render `h-andrew@n-rogue`. One consumer
+/// keys off that `h-` prefix: `InboxRow::is_human`, which is the eviction
 /// order §6.2 promises "never evicts an `h-*` row ahead of anyone else's".
 #[test]
 fn a_node_cannot_attest_a_human_in_from() {

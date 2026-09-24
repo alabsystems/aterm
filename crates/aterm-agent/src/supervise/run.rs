@@ -29,15 +29,15 @@
 //! measured 2026-09-15 → 2026-09-17: one account's weekly limit stopped the
 //! manager and the worker at once, the watcher printed `EVENT limited` and
 //! ran out its budget, and nobody could act for two days). On `EVENT
-//! limited` the watcher sets the worker's `attention` meta and posts
-//! `kind=control` mail to the manager ([`Session::escalate`], once an
-//! episode), never exits on a limit — a budget that would run out before a
+//! limited` the watcher sets the worker's `attention` meta and, while the
+//! fabric is connected, posts `kind=control` mail to the manager
+//! ([`Session::escalate`], once an episode), never exits on a limit — a budget that would run out before a
 //! reset the notice named is stretched past it ([`Session::extend`]) — and,
-//! with `--resume` ([`Session::set_resume`]), probes the worker at the reset
-//! with ONE guarded turn ([`Session::probe`]), says `EVENT resumed` or
-//! `EVENT still-limited`, and restates the standing rules from a file. The
-//! episode is [`Episode`]; `supervise` — one look, the manager right there —
-//! does none of it ([`Review::unattended`]). An episode ends when the worker
+//! with `--resume` ([`Session::set_resume`]), the turn-end policy types the
+//! continuation a minute past the reset (the rules file's text with it), as
+//! at any other turn end the policy acts on (below). The episode is
+//! [`Episode`]; `supervise` — one look, the manager right there — does none
+//! of it ([`Review::unattended`]). An episode ends when the worker
 //! works again: a notice that says Claude Code goes on by itself (`⚠ Usage
 //! limit reached · continuing automatically at 1:50pm · esc to cancel`,
 //! measured 2026-09-17; [`limit::resumes_by_itself`]) is over at the FIRST
@@ -53,15 +53,45 @@
 //! answered is the retry that hit it, the SAME episode opened again
 //! ([`Retry`], [`Session::open_episode`]) — the attention set again, the
 //! manager mailed once, not once a retry.
+//!
+//! **The approval policy, the wake, the lifecycle** (lane B stage 2,
+//! 2026-09-23). Every press on an approval box is decided by ONE function,
+//! [`super::policy::approval::decide`], and pressed under the guard it
+//! returns — the judged row, anchored, fenced on the judged read's content
+//! sequence where the server can (`approval_loop.rs`, `press.rs`); every
+//! decision is a row of the approval ledger ([`super::approvals`]). A busy
+//! read re-arms `await gone <busy footer>`, so a box that replaces the footer
+//! under an animating screen is read the moment it is drawn, not at the next
+//! 20 s step (audit LV-3). `ERR halted` parks the loop until the hold lifts,
+//! `ERR busy …`/`ERR rate` back it off, and neither ends it; a watch starts by
+//! reconciling an attention a previous watcher left and ends by clearing its
+//! own (`lifecycle.rs`). A box or a question no rule answers is escalated as
+//! `<program> <kind>: <subject> (<reason>)`, mailed only while the fabric is
+//! connected (`escalate.rs`). [`Session::run_hosted`] is the in-GUI host's
+//! entry: the same loop under [`SuperviseOpts::hosted`], ended by a stop flag.
+//!
+//! **The turn-end policy** (lane B2 stage 2, 2026-09-23). Every point where
+//! a worker's turn ended — idle, a question, a wall — is decided by ONE pure
+//! function, [`super::policy::turn_end::decide_turn_end`]: continue (the
+//! worker's own suggestion first), wait out a wall and continue after it,
+//! switch a model at its bucket and back at its reset, compact, log in, or
+//! escalate. The loop only executes what it returns (`turn_end_loop.rs`):
+//! text through the guarded submit (`turn submit=guarded:<the composer row>`),
+//! a suggestion through the vendor's accept key and a fenced Enter, a wait
+//! as the deadline of the loop's own wait for the screen to move — a change
+//! decides again at once, nothing sleeps. Every act is a ledger row under
+//! its rule id.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::approvals::{self, Ledger};
 use super::classify::{DEFAULT_PYTHON_ALLOW, Verdict, classify_command_with};
+use super::config::SupervisorConfig;
 use super::journal::Journal;
 use super::limit::{self, ResetSpec};
 use super::mail::{self, Delivery, MailOpts};
@@ -69,7 +99,11 @@ use super::phase::{
     Phase, busy_signal, composer_draft, composer_text, context_left, has_composer_frame,
     is_placeholder, last_said_index, last_said_row, status_row, survey_open, worker_phase,
 };
-use super::prompt::{Prompt, PromptKind, parse_prompt, prompt_box_span};
+use super::policy::approval::{ApprovalToggles, FooterMode, footer_mode};
+use super::policy::turn_end::{
+    ModelSwitch, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming,
+};
+use super::prompt::{Prompt, PromptKind, parse_prompt, prompt_box_first_row, prompt_box_span};
 use super::report::ReportOpts;
 use super::screen::{Screen, parse_text_json};
 
@@ -123,9 +157,36 @@ impl CtlReply {
         digits.parse().ok()
     }
     /// A guarded write that matched no row: `OK skipped seq=<n>` — nothing
-    /// was written.
+    /// was written. (`OK skipped reason=changed` is a fenced press whose
+    /// screen moved: [`Self::skipped_changed`].)
     pub fn skipped(&self) -> bool {
         self.ok() && self.stdout.trim_start().starts_with("OK skipped")
+    }
+    /// A press fenced on a screen generation (`key if-gen=<epoch>.<seq>`)
+    /// that the server skipped because the screen moved past it.
+    pub fn skipped_changed(&self) -> bool {
+        self.skipped() && self.stdout.contains("reason=changed")
+    }
+    /// `turn`'s verdict line (`turn submitted=<0|1> status=… seq=…`): the
+    /// client prints it on stderr and the settled rows on stdout; a reply
+    /// whose first stdout line carries it (a scripted one) is read there.
+    pub fn turn_verdict(&self) -> Option<&str> {
+        self.stderr
+            .lines()
+            .chain(self.stdout.lines().take(1))
+            .find(|l| l.contains("submitted="))
+    }
+    /// The turn was submitted: its verdict says `submitted=1`.
+    pub fn submitted(&self) -> bool {
+        self.turn_verdict()
+            .is_some_and(|v| v.split_whitespace().any(|w| w == "submitted=1"))
+    }
+    /// `turn`'s `seq=<n>`, read from its verdict line (never from the rows).
+    pub fn turn_seq(&self) -> Option<u64> {
+        let v = self.turn_verdict()?;
+        v.split_whitespace()
+            .find_map(|w| w.strip_prefix("seq="))
+            .and_then(|n| n.parse().ok())
     }
     /// The request was not served: the client could not reach the instance
     /// hosting the session, or lost it mid-exchange — the connection closed
@@ -229,6 +290,17 @@ pub struct Caps {
     pub gone: Option<bool>,
     /// `key if=<re> <key>` — the press happens only if a visible row matches.
     pub key_if: Option<bool>,
+    /// `key if-gen=<epoch>.<seq> …` — the press happens only if the screen
+    /// generation is still the judged read's (probed from `help key`, before
+    /// the first approval).
+    pub gen_fence: Option<bool>,
+    /// `turn submit=guarded:<re>` — Enter only while the cursor's row still
+    /// matches (learned from the first turn the turn-end policy types).
+    pub guarded_submit: Option<bool>,
+    /// `send if-gen=<epoch>.<seq> …` — the write happens only if the screen
+    /// generation is still the judged read's (probed from `help send`
+    /// before the turn-end policy's first fenced write).
+    pub send_gen: Option<bool>,
 }
 
 /// A turn's end: the phase it ended in and the screen it was read from.
@@ -241,9 +313,19 @@ pub struct Turn {
 }
 
 /// `supervise`'s knobs (and `watch`'s: the same loop).
+///
+/// Every policy SWITCH is [`Self::policy`], the owner's `[harness]` table
+/// ([`SupervisorConfig`]) — the host sets it whole ([`Self::hosted_with`]),
+/// the CLI maps its flags onto it — so a later policy reads its switch from
+/// that one place. The two booleans beside it are the CLI's opt-in GATES,
+/// off by default so a bare `supervise`/`watch` acts on nothing:
+/// `--auto-reads` lets the approval rules [`Self::policy`] turns on press,
+/// `--dismiss-surveys` lets its survey switch press.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SuperviseOpts {
-    /// Approve (option 1) a Bash prompt whose command classifies read-only.
+    /// `--auto-reads`: the approval rules `policy.approvals` turns on may
+    /// press ([`super::policy::approval::decide`]); off, every box is
+    /// escalated.
     pub auto_reads: bool,
     /// The wall-clock budget.
     pub max: Duration,
@@ -254,10 +336,11 @@ pub struct SuperviseOpts {
     /// `watch --report`: an idle, question or limited point's EVENT line
     /// carries `complete=<0|1> rows=<n>` of `report` before its summary.
     pub report: bool,
-    /// `--dismiss-surveys`: when Claude Code's session survey appears, press
-    /// `0` on it with the guarded press (`key if=^●.How.is.Claude.doing 0`)
-    /// and, once it has left, say `DISMISSED survey seq=<n>`, instead of
-    /// saying `EVENT survey …`. `0` only, ever: a rating is the human's to give.
+    /// `--dismiss-surveys`: when Claude Code's session survey appears — and
+    /// `policy.dismiss_surveys` is on — press `0` on it with the guarded
+    /// press (`key if=^●.How.is.Claude.doing 0`) and, once it has left, say
+    /// `DISMISSED survey seq=<n>`, instead of saying `EVENT survey …`. `0`
+    /// only, ever: a rating is the human's to give.
     pub dismiss_surveys: bool,
     /// `--context-warn`: the percentage of the worker's context left
     /// ([`context_left`]) at or below which the loop says `EVENT context
@@ -284,9 +367,65 @@ pub struct SuperviseOpts {
     /// begin), else `EVENT idle-no-report seq=<n> <summary>`. `None` — no
     /// flag — leaves every line as it was.
     pub mail: Option<MailOpts>,
+    /// The owner's policy ([`SupervisorConfig`], all of the adopted owner
+    /// decisions by default): which approval rules may press
+    /// (`policy.approvals`, behind [`Self::auto_reads`]), the trust roots,
+    /// the survey switch (behind [`Self::dismiss_surveys`]), and the
+    /// continuation, retry and limit switches the loop reads.
+    pub policy: SupervisorConfig,
+    /// `--resume` for a loop that sets it through its options (the hosted
+    /// loop); `watch` sets it on the session ([`Session::set_resume`]).
+    pub resume: Option<Resume>,
+    /// Behind ANOTHER holder's supervisor claim, END the loop — `Err` whose
+    /// text starts with [`CLAIM_HELD`] and names the holder — instead of
+    /// watching behind it. The in-GUI host sets it
+    /// ([`Self::hosted`]): it parks the session and starts a loop again
+    /// when a claim is released or lapses (the server's own event), so one
+    /// supervisor acts per session with no loop idling behind another's
+    /// claim. `watch` leaves it off and watches (`WATCHING …`). The loop's
+    /// OWN claim is the only claim either way: a host that ran the loop
+    /// under a second claim of its own would put the loop behind itself.
+    pub yield_when_held: bool,
 }
 
 impl SuperviseOpts {
+    /// The in-GUI host's loop: no time budget, the approval policy on, the
+    /// session survey dismissed, every turn end decided by the turn-end
+    /// policy (a usage limit continued past its reset among them), the
+    /// context indicator watched. Outages are ridden out (the session's
+    /// reconnect window), a point no rule answers is escalated to the
+    /// worker's attention, and mail goes to a manager only while the fabric
+    /// is connected (`escalate`). No `--mail` lane: the host has no inbox of
+    /// its own to fold reports from.
+    pub fn hosted() -> Self {
+        Self {
+            auto_reads: true,
+            max: UNBOUNDED,
+            dismiss_surveys: true,
+            context_warn: DEFAULT_CONTEXT_WARN,
+            policy: SupervisorConfig::default(),
+            resume: Some(Resume::default()),
+            yield_when_held: true,
+            ..Self::default()
+        }
+    }
+
+    /// The approval rules that may press: `policy.approvals` behind
+    /// `--auto-reads`, every rule off without it.
+    pub(super) fn approval_toggles(&self) -> ApprovalToggles {
+        if self.auto_reads {
+            self.policy.approvals
+        } else {
+            ApprovalToggles::off()
+        }
+    }
+
+    /// Whether the survey is dismissed: `--dismiss-surveys` and the
+    /// policy's switch.
+    pub(super) fn dismissing(&self) -> bool {
+        self.dismiss_surveys && self.policy.dismiss_surveys
+    }
+
     fn allow(&self) -> Vec<String> {
         if self.python_allow.is_empty() {
             DEFAULT_PYTHON_ALLOW.iter().map(|s| s.to_string()).collect()
@@ -296,16 +435,37 @@ impl SuperviseOpts {
     }
 }
 
+/// Why a stopped loop's write was refused before the transport
+/// ([`Session::call`]). The run ends as a stop, not as this failure
+/// ([`Session::run_hosted`]).
+const STOPPED_WRITE: &str = "the supervisor was stopped: nothing is written after the stop";
+
+/// A budget that never runs out (`--max-s 0`, [`SuperviseOpts::hosted`]).
+pub const UNBOUNDED: Duration = Duration::MAX;
+/// The hosted loop's `context_warn` (the CLI's default).
+const DEFAULT_CONTEXT_WARN: u8 = 10;
 /// How many rows a screen read asks for when the server can tail.
 const TAIL_ROWS: &str = "40";
 /// The longest single wait, so the budget is re-checked between waits.
 const WAIT_STEP: Duration = Duration::from_secs(20);
 /// The idle window that means "the screen settled".
 const IDLE_MS: &str = "2000";
-/// The busy footer whose LEAVING ends a turn (one token: the wire never quotes).
-const BUSY_FOOTER: &str = "esc.to.interrupt";
-/// The row `key if=` requires before pressing an option.
-const PROCEED: &str = "Do.you.want.to.proceed";
+/// The short settle after a press, a review point or a reconnect: the
+/// screen holding still this long, or [`SETTLE_CAP`] at most — a worker
+/// that went busy animates and never holds still, and waiting out
+/// [`WAIT_STEP`] for it cost 12-18 s per box (audit LV-3).
+const SETTLE_MS: &str = "500";
+const SETTLE_CAP: Duration = Duration::from_millis(1500);
+/// The longest idle wait on a screen without the composer frame before it is
+/// read again (measured live: a watch started on the shell prompt a worker
+/// then replaced waited out a 20 s step before it saw the worker's box).
+const WRITING_CAP: Duration = Duration::from_secs(3);
+/// The busy footer whose LEAVING ends a turn (one token: the wire never
+/// quotes), from aterm-phase's anchor table (`busy.interrupt`):
+/// `esc.to.interrupt`.
+fn busy_footer() -> String {
+    aterm_phase::anchors::guard_regex(aterm_phase::anchor("busy.interrupt"))
+}
 /// The row `key if=` requires before pressing `0` on the session survey: its
 /// question row, `●` in column 0. The server tests the pattern against EVERY
 /// row on the screen, and a copy of the survey — a tool's output under the
@@ -314,7 +474,14 @@ const PROCEED: &str = "Do.you.want.to.proceed";
 /// when the survey itself has gone lets nothing through to the composer. The
 /// one copy that does match is a worker message that opens with the question
 /// itself on a platform that draws the message glyph as `●`, not `⏺`.
-const SURVEY_ROW: &str = "^●.How.is.Claude.doing";
+/// The words are aterm-phase's (`survey.question`, its first four):
+/// `^●.How.is.Claude.doing`.
+fn survey_row() -> String {
+    format!(
+        "^●.{}",
+        aterm_phase::anchors::guard_prefix("survey.question", 4)
+    )
+}
 /// How many points higher than its last reading the context indicator must
 /// read, after `EVENT context`, for the worker to have compacted — a
 /// compaction replaces the history with a summary and frees most of the
@@ -325,7 +492,10 @@ const COMPACTED_RISE: u8 = 30;
 /// looking for one that landed in the composer.
 const STRAY_SETTLE: Duration = Duration::from_millis(2000);
 /// `ERR busy sink` is transient (a spill ahead of the frame, another writer):
-/// retried this many times, this far apart, before it is an error.
+/// the survey's `0` is retried this many times, this far apart, before it is
+/// an error. The approval press is never re-sent on it: the loop backs off,
+/// reads and decides again, so a box that changed meanwhile is not answered
+/// on the old verdict.
 const BUSY_SINK_RETRIES: u32 = 3;
 const BUSY_SINK_BACKOFF: Duration = Duration::from_millis(250);
 /// The same read-only prompt is approved this many times; the next time it
@@ -346,42 +516,57 @@ const KEY_ROWS: usize = 8;
 pub const EXIT_TIMEOUT: u8 = 124;
 
 /// How far past a reset the notice named the budget is stretched
-/// ([`Session::extend`]): time for the probe and its answer.
+/// ([`Session::extend`]): time for the continuation and the turn it starts.
 const RESET_GRACE: Duration = Duration::from_secs(10 * 60);
-/// How long a probe waits for the worker to REACT — a new done row, a box,
-/// or a busy spell — before it is `still-limited` (measured 2026-09-17: the
-/// real answer took 23 s). A worker busy on the answer at the window's end
-/// is waited for as any turn is, within the budget: the window bounds the
-/// silence, not the answer (the question invites a look at the handoff).
-const ANSWER_WINDOW: Duration = Duration::from_secs(120);
-/// After a probe that got no answer, or the notice again: the next is this
-/// long away, then the last entry for every one after.
-const PROBE_BACKOFF: [Duration; 2] = [Duration::from_secs(10 * 60), Duration::from_secs(30 * 60)];
 /// How far off the reset a limit names can be — a weekly limit's, a week. A
 /// notice read as further off than this is misread, and stretches no budget
 /// ([`Session::extend`]): a watcher never extends itself by a year on a
 /// misreading.
 const RESET_HORIZON: Duration = Duration::from_secs(8 * 86_400);
-/// The probe's and the rebrief's `turn`: as `task`'s nudge, not waited on —
-/// `submitted=1` is what counts, the answer is awaited by the loop's own
-/// waits.
-const PROBE_IDLE: &str = "idle=600";
-const PROBE_TIMEOUT: &str = "timeout=2500";
-/// The one line the watcher types after a limit, and nothing else, ever: it
-/// asks, it never assigns.
-pub const PROBE: &str = "Manager's watcher: the usage limit should have reset. Answer with one line: \
-                         can you work now, and what was the last thing you completed?";
-/// What the rules file is sent under.
-pub const REBRIEF: &str = "Manager's watcher, standing rules restated after a limit: ";
-/// `meta set attention` takes 256 bytes at most (the server's cap).
-const ATTENTION_BYTES: usize = 256;
-/// The prefix every attention this loop writes opens with
-/// ([`Session::open_episode`]), and the ONLY attention it ever unsets
-/// ([`Session::close_episode`]). The worker's `attention` is shared: the
-/// link Notification hook writes `claude needs approval: …` there and the
-/// harness writes `aterm harness: …`, and each writer sets and clears only
-/// its own prefix (docs/DESIGN-aterm-wrapper-2026-09-17.md §4.3 L1).
+/// The turn-end policy's `turn`: as `task`'s nudge, not waited on —
+/// `submitted=1` is what counts, what the worker does with it is the next
+/// point the loop awaits.
+const TURN_IDLE: &str = "idle=600";
+const TURN_TIMEOUT: &str = "timeout=2500";
+/// The owner key of this loop's attention entry (`meta set attention
+/// owner=supervisor …`, lane C's keyed attention): a human's badge and this
+/// loop's are separate entries, raised and cleared independently.
+pub const ATTENTION_OWNER: &str = "supervisor";
+
+/// The most one attention entry of this loop's holds: the server's cap for a
+/// KEYED entry (`meta set attention owner=supervisor …`), 200 bytes — not
+/// the bare field's 256, which a keyed write past 200 is refused under.
+const ATTENTION_BYTES: usize = aterm_types::control_verbs::META_ATTENTION_KEYED_MAX;
+/// The prefix a limit episode's attention opens with
+/// ([`Session::open_episode`]), the one [`Session::close_episode`] unsets.
+/// Ownership of the entry is its KEY, not its text: this loop writes and
+/// clears only `meta … attention owner=supervisor` ([`ATTENTION_OWNER`]),
+/// and a person's or another writer's entry is theirs.
 pub const ATTENTION_PREFIX: &str = "limited:";
+/// The mark of the box escalation's attention text an EARLIER build wrote,
+/// `<program> needs approval: <the box's first line>`: still read as this
+/// loop's own (`escalate::is_ours`), so a watcher started over one clears it.
+/// The escalation now writes `<program> <kind>: <subject> (<reason>)`
+/// ([`Session::escalate_point`]); both are unset when their point has left
+/// ([`Session::close_box`]).
+pub const APPROVAL_MARK: &str = " needs approval: ";
+/// The program the box escalation names: the box grammar this loop reads is
+/// Claude Code's ([`aterm_phase::prompt`]).
+const PROGRAM: &str = "claude";
+/// How much of the box's first line the attention text carries, in terminal CELLS — a
+/// wide character is two ([`approval_line`]).
+const APPROVAL_LINE_CELLS: usize = 64;
+
+/// A fenced press skipped `reason=changed` this many times in a row hands
+/// the box to the manager: a screen that ticks faster than a read and a
+/// press never holds one generation, and the row guard alone binds only the
+/// judged box's FIRST command row — a swapped box that shows that row
+/// anywhere satisfies it (the safety review of 2026-09-24) — so nothing is
+/// ever pressed with the generation fence dropped.
+const MAX_CHANGED_PRESSES: u32 = 5;
+/// The first back-off after `ERR busy …` / `ERR rate`, and the longest.
+const REFUSAL_PAUSE: Duration = Duration::from_millis(250);
+const REFUSAL_PAUSE_MAX: Duration = Duration::from_secs(8);
 
 /// How long an outage is ridden out before it ends the loop, unless
 /// `--reconnect-s` says otherwise.
@@ -424,6 +609,35 @@ enum Wait {
     Unsupported,
 }
 
+/// The wait before the next read of a turn ([`Session::await_turn_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// `await gone <busy footer>`.
+    Gone,
+    /// The short settle ([`SETTLE_MS`], at most [`SETTLE_CAP`]).
+    Settle,
+    /// `await idle 2000`, a step at most.
+    Idle,
+}
+
+/// The anchored guard of an open box's first row under its header — its
+/// command, path or question — for `await gone`: the box leaving the screen,
+/// and no other change, ends the wait on it.
+fn box_anchor(rows: &[String]) -> Option<String> {
+    let (header, esc) = prompt_box_span(rows)?;
+    let row = rows[header + 1..esc]
+        .iter()
+        .find(|r| !r.trim().is_empty())?;
+    Some(super::policy::row_guard(row))
+}
+
+/// Claude Code's busy footer (aterm-phase's `busy.interrupt`) is on the
+/// screen.
+fn busy_footer_up(rows: &[String]) -> bool {
+    let footer = aterm_phase::anchor("busy.interrupt");
+    rows.iter().any(|r| r.contains(footer))
+}
+
 /// Whether one wait saw the content move past a seq ([`Session::moved_past`]).
 enum Past {
     Moved,
@@ -439,6 +653,8 @@ enum Rode {
     Back { fresh: bool },
     /// The budget (`--max-s`, `--timeout`) ran out first: the loop's TIMEOUT.
     Spent,
+    /// The hosted loop was told to stop.
+    Stopped,
 }
 
 /// An outage: from the first request the server did not serve until the loop
@@ -449,7 +665,7 @@ struct Outage {
     /// When that first request came back unserved: the window runs from here.
     since: Instant,
     /// Its kind, the verb and the verb's first word (`await seq`, `key
-    /// if=Do.you.want.to.proceed`, `text --json`): a request of the same kind
+    /// if=<row>`, `text --json`): a request of the same kind
     /// served again — the probe read aside — ends the outage.
     kind: String,
     /// `RECONNECT` was said.
@@ -469,6 +685,33 @@ enum End {
     Stopped(Turn, Option<Fold>),
     /// The budget ran out; the last screen read.
     Timeout(Turn),
+    /// The hosted loop's stop flag was set ([`Session::run_hosted`]).
+    Quit,
+}
+
+/// The loop ended because the session is gone (`ERR exited`, `ERR no such
+/// session`): there is no attention left to clear.
+fn session_gone(end: &Result<End, String>) -> bool {
+    matches!(end, Err(e) if e.contains("ERR exited") || e.contains("no such session"))
+}
+
+/// `watch`'s last line and exit code for how its loop ended.
+fn watch_end_line(end: Result<End, String>) -> (String, u8) {
+    match end {
+        Ok(End::Timeout(_)) => ("TIMEOUT".to_string(), EXIT_TIMEOUT),
+        // `Lines` never stops at a review point; kept for the match.
+        Ok(End::Stopped(..)) => ("EXIT stopped at a review point".to_string(), 1),
+        Ok(End::Quit) => ("EXIT stopped".to_string(), 0),
+        Err(e) => (format!("EXIT {}", exit_reason(&e)), 1),
+    }
+}
+
+/// `now + max`; a budget no clock can reach ([`UNBOUNDED`]) is a century.
+fn deadline_after(max: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(max)
+        .or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 86_400)))
+        .unwrap_or(now)
 }
 
 /// How `--mail` settled an idle point (`Session::hold_for_report`).
@@ -510,7 +753,7 @@ impl MailIn {
     /// Whether a delivery is the turn's that ends at the point being held
     /// (`now`): after the turn was seen to begin (`busy_at`) it is, whatever
     /// its age; between a handed-over point and that read it is the ended
-    /// turn's late report (the Stop hook fires a moment after the screen
+    /// turn's late report (one the worker posts a moment after its screen
     /// settles) and is not; before the turn was seen to begin — the loop's
     /// first turn, or one too short to be read busy — it is when it came
     /// within the window, the only thing then known about it.
@@ -677,6 +920,13 @@ struct Looking {
     carried: Option<Screen>,
 }
 
+/// The box escalated to the manager, kept so its badge can be cleared when it leaves
+/// ([`Session::close_box`]). One ask per REVIEW POINT ([`Session::escalate_point`]): however
+/// many looks show the same point, [`review_key`] never moves with a footer tick.
+struct BoxAsk {
+    key: String,
+}
+
 /// The session survey, as the loop left it at a look ([`Session::survey`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Survey {
@@ -708,14 +958,16 @@ enum Context {
 /// `watch --resume [RULES]` ([`Session::set_resume`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Resume {
-    /// The standing rules to restate, as ONE turn, once the worker answers
-    /// again; `None` probes and restates nothing.
+    /// The standing rules, typed with every continuation the turn-end policy
+    /// types (`policy.rules_file` when that is set instead); `None` types the
+    /// continuation alone.
     pub rules: Option<PathBuf>,
 }
 
 /// A limit episode: from the `EVENT limited` that opened it until the worker
-/// works again ([`Session::limit_before`], [`Session::limit_after`],
-/// [`Session::limit_on_busy`]).
+/// works again ([`Session::limit_after`], [`Session::limit_on_busy`]). When
+/// to continue is the turn-end policy's ([`Session::turn_end_due`]); the
+/// episode is what the person is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Episode {
     /// The read the `EVENT limited` that opened the episode was of — the
@@ -733,41 +985,24 @@ struct Episode {
     /// line's, and the reset's identity — the same text read again is the
     /// same reset ([`Session::refresh_reset`]).
     reset_text: String,
-    /// When the next probe is due (`--resume`): the reset, then the backoff
-    /// after a failed probe; `None` leaves only a screen change to trigger
-    /// one.
-    probe_at: Option<Instant>,
-    /// Probes that failed in a row: indexes [`PROBE_BACKOFF`].
-    failed: usize,
     /// `EXTEND` was said for this reset.
     extended: bool,
+    /// The episode was escalated: opened on a wall the turn-end policy did
+    /// not act on at once, or found waiting on one since.
+    raised: bool,
 }
 
 /// An episode closed at a busy read ([`Session::limit_on_busy`]), kept
 /// until the worker answers on a point that is not the notice
-/// ([`Session::look`], [`Session::settle_probe`]). The wall again before
-/// that — the retry's spinner, then `continuing shortly` (the round-20
-/// review: three mails for three notices in a row) — is round 17's retry
-/// that hit the wall: the same episode, opened again with what it kept
-/// ([`Session::open_episode`]): the attention set again, no second mail,
-/// the probe's backoff standing.
+/// ([`Session::look`]). The wall again before that — the retry's spinner,
+/// then `continuing shortly` (the round-20 review: three mails for three
+/// notices in a row) — is round 17's retry that hit the wall: the same
+/// episode, opened again ([`Session::open_episode`]): the attention set
+/// again, no second mail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Retry {
     /// [`Episode::seq`] of the episode that closed.
     seq: u64,
-    /// [`Episode::failed`], carried: a backoff in force stands.
-    failed: usize,
-    /// [`Episode::probe_at`], carried with it.
-    probe_at: Option<Instant>,
-}
-
-/// What one probe came to ([`Session::probe`]).
-enum Probed {
-    /// The worker answered: a new done row, or a box (it is working).
-    Answered(Turn),
-    /// The notice again, or nothing within the window: `why` is the
-    /// `still-limited` line's tail.
-    Failed { turn: Turn, why: String },
 }
 
 /// What [`Session::auto_read`] made of a turn.
@@ -797,7 +1032,7 @@ trait Review {
     /// An informational line (`RECONNECT …`, `RECONNECTED …`), said as it
     /// happens.
     fn say(&mut self, line: &str) -> Result<(), String>;
-    /// A line for the journal alone (`ESCALATED …`, `CLEARED …`, `PROBE …`):
+    /// A line for the journal alone (`ESCALATED …`, `CLEARED …`, `WAITING …`):
     /// recorded, never printed, so the lines a harness reads are the same
     /// with and without a limit.
     fn note(&mut self, line: &str);
@@ -961,6 +1196,10 @@ enum Press {
     /// (or, on the fallback path, the digit landed in the composer and was
     /// backspaced — the prompt had resolved on its own).
     Skipped { seq: u64 },
+    /// Nothing was written: the press was fenced on the judged read's
+    /// content sequence and the screen had moved past it
+    /// (`OK skipped reason=changed`).
+    Changed { seq: u64 },
 }
 
 /// A guarded press, and whether the connection held until it was seen
@@ -976,10 +1215,25 @@ enum Pressing {
     /// did — `None` when the press itself got no answer, so the `1` may or may
     /// not have been written — and `why` the failure.
     Lost { known: Option<Press>, why: String },
+    /// Nothing was written: the session is held (`ERR halted …`).
+    Halted { why: String },
+    /// Nothing was written: the server turned the press away for now (`ERR
+    /// busy …` — another writer, a lease, a sink that cannot take the frame
+    /// — or `ERR rate`).
+    Refused { why: String },
+    /// The choice could not be made as decided — a focus move with no
+    /// generation fence, a focus that did not land where it was sent — and
+    /// the box is handed over, with `why`. What was written (an arrow at
+    /// most, never a choice) moved the focus only.
+    Unconfirmed { why: String },
 }
 
+/// The most focus moves an unnumbered dialog's choice may take (the
+/// measured trust dialog takes one).
+const MAX_FOCUS_STEPS: u32 = 3;
+
 /// What `--dismiss-surveys`' guarded `0` did ([`Session::dismiss_survey`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Dismiss {
     /// The `0` was written while the survey was up; `seq` is the server's
     /// stamp (the screen read before it, when it stamped none).
@@ -991,6 +1245,9 @@ enum Dismiss {
     /// The host has no `key if=`: nothing is pressed unguarded, and the
     /// survey is said as `EVENT survey …` instead.
     Unguarded,
+    /// Nothing was written: the session is held (`halted`) or the server
+    /// turned the press away for now; the survey is tried again after.
+    Refused { halted: bool, why: String },
 }
 
 /// One driven session: the transport, the target selector, the probed caps,
@@ -1047,20 +1304,117 @@ pub struct Session<'a, C: Ctl> {
     /// The episode a busy read closed, until the worker answers
     /// ([`Retry`]): the notice again before that opens it again.
     retry: Option<Retry>,
-    /// The rules are owed at the next idle point with nothing typed: the
-    /// episode closed on a point the rules could not be sent at (a box up,
-    /// a draft in the composer).
-    rebrief_due: bool,
+    /// The box escalated to the manager, until it leaves the screen
+    /// ([`Self::escalate_point`]).
+    box_ask: Option<BoxAsk>,
     /// A fixed clock, Unix seconds (tests); `None` reads the system's.
     clock: Option<i64>,
     /// The local zone's offset, read once from `date` when first needed.
     local_offset: Option<i64>,
     /// A zone's offset by name ([`limit::zone_offset_s`]; a table in tests).
     zone_offset: fn(&str) -> Option<i64>,
-    /// The wait after a failed probe, by how many failed in a row.
-    probe_backoff: Vec<Duration>,
-    /// How long a probe waits for its answer.
-    answer_window: Duration,
+    /// What the turn-end policy remembers of this session
+    /// ([`super::policy::turn_end::TurnEndState`]).
+    turn_end: TurnEndState,
+    /// When the turn-end policy decides again at the point still showing
+    /// (its `WaitUntil`), and why — the deadline of the loop's wait for the
+    /// screen to move ([`Self::wait_for_next`]).
+    turn_end_due: Option<(Instant, String)>,
+    /// The first busy read since the last review point: the turn's work,
+    /// as the loop saw it ([`TurnEndReading::worked`]).
+    busy_since: Option<Instant>,
+    /// A wall's reset as read, by its notice's text: the same text is the
+    /// same reset (a span counts from the print, not from every read).
+    wall_reset: Option<(String, Option<Instant>)>,
+    /// What the approval policy takes from the supervisor's own process
+    /// (the owner's home, uid and `$TMPDIR`; fixed in tests).
+    approval_env: ApprovalEnv,
+    /// The session's working directory as its `meta` last said it (`None`
+    /// for `cwd=-` or unread; read fresh for every box that needs it).
+    cwd: Option<PathBuf>,
+    /// The permission mode the worker's footer last showed: Claude Code
+    /// 2.1.280 draws a box where the footer was, so the box's own read
+    /// cannot say whether the session bypasses permissions.
+    footer: Option<FooterMode>,
+    /// Where the approval ledger goes ([`Self::set_approval_ledger`]);
+    /// `None` keeps none.
+    ledger_path: Option<PathBuf>,
+    /// The ledger of the loop in progress.
+    ledger: Ledger,
+    /// The turn-end policy's typing budget was seeded from the ledger
+    /// ([`TurnEndState::seed_acts`]): once per session, at its first run.
+    turn_end_seeded: bool,
+    /// Why the policy handed the box on the screen over, for its escalation
+    /// text: the box's review key and the reason.
+    box_reason: Option<(String, String)>,
+    /// A fenced press that came back `reason=changed` this many times in a
+    /// row: past [`MAX_CHANGED_PRESSES`] the box is handed over.
+    changed_streak: u32,
+    /// The back-off after `ERR busy …`/`ERR rate`: doubles to
+    /// [`REFUSAL_PAUSE_MAX`], reset by a press the server takes.
+    refusal_pause: Duration,
+    /// Set by the hosted loop's owner: the loop ends at its next look.
+    stop: Option<Arc<AtomicBool>>,
+    /// Set by the hosted loop's owner, BEFORE [`Self::stop`], when the stop
+    /// hands the session to a loop it starts right after (a changed
+    /// policy): the badges this loop raised are left standing for that one
+    /// to adopt ([`Self::reconcile`]), never cleared and raised again.
+    handover: Option<Arc<AtomicBool>>,
+    /// A `limited:` attention a previous watcher left over the notice still
+    /// showing, adopted at the start: the episode it opens posts no mail.
+    adopted_limit: bool,
+    /// A box point's attention a previous watcher left, still showing,
+    /// adopted at the start ([`Self::reconcile`]): that point's first review
+    /// posts no second ask ([`Self::escalate_point`]).
+    adopted_box: bool,
+    /// The session's foreground program as `status program=` last named it
+    /// (read for every box the policy decides; `None` from a host that does
+    /// not publish it).
+    program: Option<String>,
+    /// Where the loop stands on the session's supervisor claim
+    /// ([`claim::Claim`]).
+    claim: claim::Claim,
+    /// What the claim's renewals changed, for the next look to say.
+    claim_said: Vec<String>,
+    /// The claim's renewal step and lease ([`claim::CLAIM_RENEW`],
+    /// [`claim::CLAIM_TTL_MS`]; tests shorten them).
+    claim_renew: Duration,
+    claim_ttl_ms: u64,
+    /// The holder the claim is taken under ([`Self::set_supervisor_name`]).
+    supervisor_name: Option<String>,
+    /// The text of this loop's own keyed attention entry (owner
+    /// [`ATTENTION_OWNER`]), as last set and not yet unset.
+    attention_ours: Option<String>,
+    /// The turn-end policy raised a badge that no point carries (`/login`
+    /// typed, "finish sign-in in the browser"): cleared once the worker
+    /// works again.
+    turn_end_badge: bool,
+}
+
+/// The approval policy's inputs from the supervisor's own process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalEnv {
+    pub home: Option<PathBuf>,
+    pub uid: u32,
+    pub tmpdir: Option<PathBuf>,
+}
+
+impl ApprovalEnv {
+    /// This process's: `$HOME`, the real uid, `$TMPDIR`.
+    pub fn of_process() -> Self {
+        #[cfg(unix)]
+        // SAFETY: getuid(2) cannot fail and touches no memory.
+        let uid = unsafe { libc::getuid() };
+        #[cfg(not(unix))]
+        let uid = 0;
+        Self {
+            home: aterm_types::dirs::home_dir(),
+            uid,
+            tmpdir: std::env::var_os("TMPDIR")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute()),
+        }
+    }
 }
 
 impl<'a, C: Ctl> Session<'a, C> {
@@ -1086,13 +1440,66 @@ impl<'a, C: Ctl> Session<'a, C> {
             resume: None,
             limit: None,
             retry: None,
-            rebrief_due: false,
+            box_ask: None,
             clock: None,
             local_offset: None,
             zone_offset: limit::zone_offset_s,
-            probe_backoff: PROBE_BACKOFF.to_vec(),
-            answer_window: ANSWER_WINDOW,
+            turn_end: TurnEndState::default(),
+            turn_end_due: None,
+            busy_since: None,
+            wall_reset: None,
+            approval_env: ApprovalEnv::of_process(),
+            cwd: None,
+            footer: None,
+            ledger_path: None,
+            ledger: Ledger::off(),
+            turn_end_seeded: false,
+            box_reason: None,
+            changed_streak: 0,
+            refusal_pause: REFUSAL_PAUSE,
+            stop: None,
+            handover: None,
+            adopted_limit: false,
+            adopted_box: false,
+            program: None,
+            claim: claim::Claim::Off,
+            claim_said: Vec::new(),
+            claim_renew: claim::CLAIM_RENEW,
+            claim_ttl_ms: claim::CLAIM_TTL_MS,
+            supervisor_name: None,
+            attention_ours: None,
+            turn_end_badge: false,
         }
+    }
+
+    /// The holder an unattended loop claims the session under (`meta set
+    /// supervisor <holder>`); unset, `aterm-supervise:<pid>`. The in-GUI
+    /// host names itself so a CLI `watch` on the same session is second.
+    pub fn set_supervisor_name(&mut self, name: Option<String>) {
+        self.supervisor_name = name;
+    }
+
+    /// The hosted loop's hand-over flag ([`Self::handover`]): the host sets
+    /// it before the stop when a new loop takes the session straight after.
+    pub fn set_handover(&mut self, flag: Arc<AtomicBool>) {
+        self.handover = Some(flag);
+    }
+
+    /// Tests: the claim's renewal step and lease.
+    pub fn set_claim_timing(&mut self, renew: Duration, ttl_ms: u64) {
+        self.claim_renew = renew;
+        self.claim_ttl_ms = ttl_ms;
+    }
+
+    /// Keep the approval ledger at `path` ([`approvals::default_path`] for
+    /// the CLI and the host); `None` keeps none.
+    pub fn set_approval_ledger(&mut self, path: Option<PathBuf>) {
+        self.ledger_path = path;
+    }
+
+    /// Tests: the approval policy's process inputs.
+    pub fn set_approval_env(&mut self, env: ApprovalEnv) {
+        self.approval_env = env;
     }
 
     /// The manager's session (`--inbox @sid`, else `@$ATERM_PARENT_SESSION_ID`):
@@ -1103,10 +1510,10 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.manager = manager;
     }
 
-    /// `watch --resume [RULES]`: probe the worker at the reset a limit notice
-    /// names (or as soon as the screen leaves the notice), and restate the
-    /// rules file, as one turn, once it answers ([`Self::probe`],
-    /// [`Self::rebrief`]).
+    /// `watch --resume [RULES]`: the turn-end policy continues the worker a
+    /// minute past the reset a usage limit names (or as soon as the screen
+    /// leaves the notice with no work), the rules file's text with the
+    /// continuation. Without it, a usage limit is escalated and waited on.
     pub fn set_resume(&mut self, resume: Option<Resume>) {
         self.resume = resume;
     }
@@ -1123,10 +1530,10 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.zone_offset = lookup;
     }
 
-    /// Tests: the probe's backoff and answer window, shortened.
-    pub fn set_probe_timing(&mut self, backoff: &[Duration], answer_window: Duration) {
-        self.probe_backoff = backoff.to_vec();
-        self.answer_window = answer_window;
+    /// The turn-end policy's timings (tests shorten them; the host keeps
+    /// the defaults). Starts the policy's memory of the session afresh.
+    pub fn set_turn_end_timing(&mut self, timing: TurnEndTiming) {
+        self.turn_end = TurnEndState::new(timing);
     }
 
     /// How long an outage is ridden out before the loop ends
@@ -1162,6 +1569,20 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// does an `await seq` that latched — the content moved on the instance
     /// that answers now. The probe read's answer ends nothing.
     pub(super) fn call(&mut self, args: &[&str]) -> Result<CtlReply, Fail> {
+        // A STOPPED loop writes nothing into the worker. The host's stop can
+        // land between the loop's last look and its press (the guarded `1`,
+        // the survey's `0`) or its continuation (`send`, `turn`, the fenced
+        // Enter): every one of those goes through here, and is refused here
+        // before it reaches the transport — the host's own transport refusal
+        // after its cut (aterm-gui `HostCtl`) is the second fence, not the
+        // only one. Reads and the badge/claim cleanup still go out.
+        if self.stopped() && claim::is_input(args) {
+            return Err(Fail::Hard(STOPPED_WRITE.to_string()));
+        }
+        self.renew_claim_if_due();
+        if let Some(refused) = self.claim_refuses(args) {
+            return Ok(refused);
+        }
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
         if let Some(sid) = &self.sid {
             full.push(sid.as_str());
@@ -1227,6 +1648,9 @@ impl<'a, C: Ctl> Session<'a, C> {
     fn screen(&mut self) -> Result<Screen, Fail> {
         let screen = self.read_once()?;
         self.survey_gone |= !survey_open(&screen.rows);
+        if let Some(mode) = footer_mode(&screen.rows) {
+            self.footer = Some(mode);
+        }
         self.last = Some(screen.clone());
         Ok(screen)
     }
@@ -1305,12 +1729,20 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     /// Block until the worker's phase is no longer busy, or `timeout` passes.
     ///
-    /// The loop: wait for the screen to settle (`await idle 2000`, capped at
-    /// 20 s a step); read; done unless busy; else wait for the next content
-    /// change (`await seq <seq>`) and go again. Where the server knows `await
-    /// gone`, the FIRST wait is the busy footer leaving — the signal that holds
-    /// when a thinking worker sits static for seconds — falling back to idle on
-    /// an older build. A screen without Claude Code's composer frame (a build,
+    /// The loop: wait; read; done unless busy; else wait again. Where the
+    /// server knows `await gone`, the wait after a busy read that shows the
+    /// busy footer is the footer LEAVING (`await gone esc.to.interrupt`,
+    /// re-armed after every such read): the turn ending and a box drawn where
+    /// the footer was both latch it at once, however the screen above it
+    /// animates (Claude Code's tool row blinks ⏺ twice a second, so `await
+    /// idle` never latched under a box and the loop saw it only at its 20 s
+    /// step — 12-18 s per box, audit LV-3). A busy read without the footer
+    /// waits for the next content change and a short settle
+    /// ([`SETTLE_MS`], at most [`SETTLE_CAP`]); the first wait of a turn is
+    /// the footer leaving, or that settle right after a press or a review
+    /// point. An older build without `await gone` settles with `await idle
+    /// 2000`, capped at 20 s a step, as it always did. A screen without
+    /// Claude Code's composer frame (a build,
     /// a script, a REPL) that never held still for the 2 s and shows no
     /// approval box is output still arriving, and counts as busy: its turn
     /// ends when the output pauses. An outage is ridden out
@@ -1337,8 +1769,10 @@ impl<'a, C: Ctl> Session<'a, C> {
                         log_line(&mut *log, line);
                         Ok(())
                     })?;
-                    if let Rode::Spent = rode {
-                        return Ok(self.spent_turn());
+                    match rode {
+                        Rode::Spent => return Ok(self.spent_turn()),
+                        Rode::Stopped => return Err("stopped".to_string()),
+                        Rode::Back { .. } => {}
                     }
                     // What the instance that answers now serves may still be
                     // arriving: settle first.
@@ -1369,29 +1803,52 @@ impl<'a, C: Ctl> Session<'a, C> {
         review: &mut dyn Review,
     ) -> Result<Turn, Fail> {
         let deadline = Instant::now() + timeout;
-        let mut first = gone_first;
+        let mut next = if gone_first { Next::Gone } else { Next::Settle };
         loop {
+            // The hosted loop's stop ends a turn that may run for hours:
+            // the look it returns to says so ([`Self::look`]).
+            if self.stopped() {
+                return Ok(self.spent_turn());
+            }
             let step = deadline
                 .saturating_duration_since(Instant::now())
                 .min(WAIT_STEP);
-            // The first wait was the busy footer leaving, which says nothing
-            // about the screen holding still.
-            let mut gone = false;
+            // A wait that said nothing about the screen holding still: the
+            // footer leaving, or the short settle.
+            let mut unsettled = false;
             // The screen held still for IDLE_MS right before the read.
             let mut settled = false;
-            if first && self.caps.gone != Some(false) {
-                match self.wait(&["gone", BUSY_FOOTER], step)? {
-                    Wait::Unsupported => self.caps.gone = Some(false),
+            let modern = self.caps.gone != Some(false);
+            match next {
+                Next::Gone if modern => match self.wait(&["gone", busy_footer().as_str()], step)? {
+                    Wait::Unsupported => {
+                        self.caps.gone = Some(false);
+                        settled = matches!(self.wait(&["idle", IDLE_MS], step)?, Wait::Latched);
+                    }
                     _ => {
                         self.caps.gone = Some(true);
-                        gone = true;
+                        unsettled = true;
                     }
+                },
+                Next::Settle if modern => {
+                    self.wait(&["idle", SETTLE_MS], step.min(SETTLE_CAP))?;
+                    unsettled = true;
+                }
+                // A screen without the composer frame is settled by the full
+                // idle window, re-read every few seconds: output still
+                // arriving never holds still, and the program writing it may
+                // be the agent drawing its first frame, whose footer then
+                // takes over the wait.
+                Next::Idle if modern => {
+                    settled = matches!(
+                        self.wait(&["idle", IDLE_MS], step.min(WRITING_CAP))?,
+                        Wait::Latched
+                    );
+                }
+                Next::Gone | Next::Settle | Next::Idle => {
+                    settled = matches!(self.wait(&["idle", IDLE_MS], step)?, Wait::Latched);
                 }
             }
-            if !gone {
-                settled = matches!(self.wait(&["idle", IDLE_MS], step)?, Wait::Latched);
-            }
-            first = false;
             let screen = self.screen()?;
             if Instant::now() < deadline {
                 self.watch_context(&screen, &mut |line| review.say(line))?;
@@ -1412,8 +1869,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             if writing {
                 phase = Phase::Busy;
             }
-            if !(writing && gone) {
+            if !(writing && unsettled) {
                 *saw_busy = true;
+                // The turn's work, as the turn-end policy measures it.
+                self.busy_since.get_or_insert_with(Instant::now);
                 // `--mail`: the turn has begun by now (`MailIn::busy_at`).
                 if let Some(m) = &mut self.mail
                     && m.busy_at.is_none()
@@ -1433,12 +1892,23 @@ impl<'a, C: Ctl> Session<'a, C> {
                     timed_out: true,
                 });
             }
-            if writing && gone {
+            if writing && unsettled {
                 // Settle first: the next wait is the idle one.
+                next = Next::Idle;
+                continue;
+            }
+            if !writing && busy_footer_up(&screen.rows) && self.caps.gone != Some(false) {
+                // Level-triggered: it latches the moment the footer leaves.
+                next = Next::Gone;
                 continue;
             }
             let seq = screen.seq.to_string();
             self.wait(&["seq", &seq], step)?;
+            next = if writing || !has_composer_frame(&screen.rows) {
+                Next::Idle
+            } else {
+                Next::Settle
+            };
         }
     }
 
@@ -1582,6 +2052,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                     EXIT_TIMEOUT,
                 ))
             }
+            Ok(End::Quit) => Err("stopped".to_string()),
             Err(e) => {
                 sink.lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1760,21 +2231,17 @@ impl<'a, C: Ctl> Session<'a, C> {
                 sid,
             }),
         });
-        let end = self.run_loop(
-            opts,
-            &sink,
-            lane,
-            &mut Lines {
-                sink: &sink,
-                allow: &allow,
-            },
-        );
-        let (line, code) = match end {
-            Ok(End::Timeout(_)) => ("TIMEOUT".to_string(), EXIT_TIMEOUT),
-            // `Lines` never stops at a review point; kept for the match.
-            Ok(End::Stopped(..)) => ("EXIT stopped at a review point".to_string(), 1),
-            Err(e) => (format!("EXIT {}", exit_reason(&e)), 1),
+        let mut review = Lines {
+            sink: &sink,
+            allow: &allow,
         };
+        let end = self.run_loop(opts, &sink, lane, &mut review);
+        // The badge this watcher raised goes with it: nobody is left to
+        // clear it when its point leaves the screen.
+        if !session_gone(&end) {
+            self.release_attention(&mut review);
+        }
+        let (line, code) = watch_end_line(end);
         // Nothing is left to report a failed write to.
         let _ = sink
             .lock()
@@ -1794,12 +2261,58 @@ impl<'a, C: Ctl> Session<'a, C> {
     fn drive(&mut self, opts: &SuperviseOpts, review: &mut dyn Review) -> Result<End, String> {
         // Mutable: a limit notice naming a reset past it stretches it
         // (`extend`), once a reset.
-        let mut deadline = Instant::now() + opts.max;
+        let mut deadline = deadline_after(opts.max);
         let allow = opts.allow();
         // Every read of this loop's turns is shown to the context watch
         // (`await_turn_from`), armed from the start.
         self.context_warn = opts.context_warn;
         self.context = Context::Armed;
+        if self.resume.is_none() {
+            self.resume = opts.resume.clone();
+        }
+        if !self.turn_end_seeded
+            && let Some(path) = self.ledger_path.as_deref()
+        {
+            approvals::bound(path);
+        }
+        self.ledger = Ledger::open(
+            self.ledger_path.as_deref(),
+            self.sid.as_deref(),
+            &mut std::io::stderr(),
+        );
+        // The typing budget is the session's, not this loop's: the acts a
+        // previous loop on it typed within the window count (lane B2's
+        // review — a loop re-spawned by its host started with a fresh six).
+        if !std::mem::replace(&mut self.turn_end_seeded, true)
+            && let Some(path) = self.ledger_path.as_deref()
+        {
+            let now_ms = super::journal::unix_ms();
+            let ages: Vec<Duration> = approvals::typed_at(path, self.sid.as_deref())
+                .into_iter()
+                .filter_map(|ts| u64::try_from(now_ms - ts).ok())
+                .map(Duration::from_millis)
+                .collect();
+            self.turn_end.seed_acts(&ages, Instant::now());
+            // A model switch an earlier loop made is switched back at its
+            // reset by this one (owner decision 3's "back at reset").
+            if let Some(open) = approvals::open_model_switch(path, self.sid.as_deref()) {
+                let now = Instant::now();
+                let back_at = open.back_at_unix.map(|unix| {
+                    let delta = unix - self.now_unix();
+                    let d = Duration::from_secs(delta.unsigned_abs());
+                    if delta >= 0 {
+                        now + d
+                    } else {
+                        now.checked_sub(d).unwrap_or(now)
+                    }
+                });
+                self.turn_end.seed_model(ModelSwitch {
+                    from: open.from,
+                    to: open.to,
+                    back_at,
+                });
+            }
+        }
         let mut state = Looking {
             approved: Vec::new(),
             gone_first: true,
@@ -1808,12 +2321,36 @@ impl<'a, C: Ctl> Session<'a, C> {
             survey: Survey::Closed,
             carried: None,
         };
+        // An attention a previous watcher left is settled before the first
+        // wait: cleared when the screen no longer shows its point, adopted
+        // when it does. A request not served here is the first look's to
+        // ride out.
+        if review.unattended() {
+            self.take_claim(review);
+            if let Some(held) = self.yield_to_holder(opts) {
+                return Err(held);
+            }
+            match self.reconcile(&allow, review) {
+                Ok(()) | Err(Fail::Lost(_)) => {}
+                Err(Fail::Hard(e)) => return Err(e),
+            }
+        }
         loop {
+            if self.stopped() {
+                return Ok(End::Quit);
+            }
+            // A renewal that found another holder (this loop's lease lapsed
+            // in an outage and someone claimed the session) ends a hosted
+            // loop here, before it looks again.
+            if let Some(held) = self.yield_to_holder(opts) {
+                return Err(held);
+            }
             match self.look(opts, &allow, &mut state, &mut deadline, review) {
                 Ok(Some(end)) => return Ok(end),
                 Ok(None) => self.outage = None,
                 Err(Fail::Lost(why)) => {
                     match self.ride_out(why, deadline, &mut |line| review.say(line))? {
+                        Rode::Stopped => return Ok(End::Quit),
                         Rode::Spent => return Ok(End::Timeout(self.spent_turn())),
                         // Nothing could be read while the session was out of
                         // reach, so nothing says the worker did not move: the
@@ -1845,15 +2382,18 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// `0`, and the loop looks again from a fresh read, where what the `0`
     /// did is said. The context watch's lines (`--context-warn`,
     /// [`Self::watch_context`]) are said as the turn's reads come, ahead of
-    /// all of it. Unattended (`watch`), a limit episode is looked at around
-    /// the point: in the wait for the turn ([`Self::limit_on_busy`]: a busy
-    /// read closes the episode of a notice that said the worker would go
-    /// on by itself), before it is reported ([`Self::limit_before`]: a point
-    /// that ends the episode, or one the probe takes instead), after
-    /// ([`Self::limit_after`]: the escalation and the budget's extension on
-    /// a limited point, the rebrief on an idle one), and in the wait for
-    /// the screen to move past it ([`Self::wait_for_next`]: the probe when
-    /// its time comes).
+    /// all of it. Unattended (`watch`, the hosted loop), a new point is
+    /// decided by the turn-end policy ([`Self::turn_end_at_point`]) before
+    /// it is reported — an offer the policy continues is not escalated as a
+    /// question, a point it escalates is — and what it decided is done
+    /// after the report ([`Self::turn_end_execute`]); a limit episode is
+    /// looked at around the point: in the wait for the turn
+    /// ([`Self::limit_on_busy`]: a busy read closes the episode of a notice
+    /// that said the worker would go on by itself) and after the report
+    /// ([`Self::limit_after`]: the escalation — none for a wall the policy
+    /// acts on at once — and the budget's extension on a limited point).
+    /// The wait for the screen to move past the point is bounded by the
+    /// policy's `WaitUntil` ([`Self::wait_for_next`]).
     fn look(
         &mut self,
         opts: &SuperviseOpts,
@@ -1877,10 +2417,34 @@ impl<'a, C: Ctl> Session<'a, C> {
             },
             None => self.await_turn_from(remaining, state.gone_first, &mut state.moved, review)?,
         };
+        // What the claim's renewals changed while the turn was awaited.
+        self.claim_said(review);
+        if self.stopped() {
+            return Ok(Some(End::Quit));
+        }
         // A read since the last point saw the worker busy: it worked.
         let worked = std::mem::take(&mut state.moved);
         if worked {
             state.handed = None;
+            // A badge the turn-end policy raised with no point to carry it
+            // (`/login` typed): the worker works again, so it is done.
+            if std::mem::take(&mut self.turn_end_badge) {
+                let said = self.unset_if_ours(escalate::is_ours)?;
+                review.note(&format!(
+                    "CLEARED seq={} turn-end attention={said}",
+                    turn.screen.seq
+                ));
+            }
+        }
+        // The point escalated to the manager has left the screen — a box
+        // answered, cancelled or another in its place, a question answered:
+        // the badge it raised goes.
+        if self
+            .box_ask
+            .as_ref()
+            .is_some_and(|b| b.key != review_key(&turn, allow))
+        {
+            self.close_box(turn.screen.seq, review)?;
         }
         // The budget bounds every action: a turn read at or after the
         // deadline is neither pressed nor reported — it is the TIMEOUT.
@@ -1889,13 +2453,12 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
         // A limit episode ends the moment the worker works again — a turn
         // after it was read busy (the manager's after the reset, a human's,
-        // a probe's late answer), or a box up — before anything is pressed:
-        // an auto-approved read is work too ([`Self::close_episode`]; with
-        // `--resume` and a rules file the rebrief is owed at the next idle
-        // point, [`Self::limit_after`]). A busy spell that ends on the
-        // notice again is a retry that hit the wall: the same episode. (A
-        // notice that said the worker would go on by itself closed at the
-        // busy read already, [`Self::limit_on_busy`].)
+        // the turn-end policy's continuation), or a box up — before anything
+        // is pressed: an auto-approved read is work too
+        // ([`Self::close_episode`]). A busy spell that ends on the notice
+        // again is a retry that hit the wall: the same episode. (A notice
+        // that said the worker would go on by itself closed at the busy read
+        // already, [`Self::limit_on_busy`].)
         if review.unattended()
             && self.limit.is_some()
             && !matches!(turn.phase, Phase::Limited { .. })
@@ -1907,7 +2470,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                 "a box is up: it is working"
             };
             self.close_episode(turn.screen.seq, why, review)?;
-            self.rebrief_due = self.rules().is_some();
         }
         // The worker answered on a point that is not the notice: an episode
         // a busy read closed is over for good ([`Retry`]).
@@ -1959,15 +2521,15 @@ impl<'a, C: Ctl> Session<'a, C> {
             if Instant::now() >= *deadline {
                 return Ok(Some(End::Timeout(point)));
             }
-            // A limit episode in progress: the point may end it, or be the
-            // probe's rather than the manager's.
-            if review.unattended()
-                && let Some(next) = self.limit_before(&point, allow, deadline, state, review)?
-            {
-                state.gone_first = false;
-                state.carried = next;
-                return Ok(None);
-            }
+            // The turn-end policy's decision, made ONCE, when the point is
+            // new ([`Self::turn_end_at_point`]): the work the turn did is the
+            // time since the first busy read after the last point.
+            let busy_for = self.busy_since.take().map(|t| t.elapsed());
+            let turn_end = if review.unattended() {
+                self.turn_end_at_point(&point, busy_for, opts)
+            } else {
+                TurnEndAction::Nothing
+            };
             // `--mail`: an idle point waits for the worker's report of this
             // turn first; a folded one reads no report from the screen (the
             // mail IS what was said).
@@ -1987,6 +2549,32 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else {
                 None
             };
+            // A box the loop did not approve, a question the worker asked
+            // that the turn-end policy does not take as an offer, and a point
+            // the policy escalates, is the manager's: escalated once
+            // ([`Self::escalate_point`]; `supervise`, one look with the
+            // manager right there, does none of it). A limit's escalation is
+            // its episode's ([`Self::limit_after`]).
+            if review.unattended() {
+                match (&point.phase, &turn_end) {
+                    (Phase::Prompt, _) => {
+                        self.escalate_point(&point, allow, None, review)?;
+                    }
+                    // A turn a person stopped with Esc reads as the
+                    // vendor's question (`What should Claude do
+                    // instead?`): the person is at the keyboard; nothing
+                    // is raised to them.
+                    (Phase::Question, TurnEndAction::Nothing)
+                        if !aterm_phase::interrupted(&point.screen.rows) =>
+                    {
+                        self.escalate_point(&point, allow, None, review)?;
+                    }
+                    (Phase::Question | Phase::Idle, TurnEndAction::Escalate { reason }) => {
+                        self.escalate_point(&point, allow, Some(reason), review)?;
+                    }
+                    _ => {}
+                }
+            }
             if !review.review(&point, report, fold)? {
                 return Ok(Some(End::Stopped(point, fold)));
             }
@@ -1994,7 +2582,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             state.approved.clear();
             state.handed = Some(review_key(&point, allow));
             if review.unattended() {
-                self.limit_after(&point, allow, deadline, state, review)?;
+                let handled = turn_end.rule_id().is_some();
+                self.limit_after(&point, deadline, handled, review)?;
             }
             // `--mail`: a turn ended here; the next begins after it.
             if let Some(m) = &mut self.mail
@@ -2005,14 +2594,18 @@ impl<'a, C: Ctl> Session<'a, C> {
                 m.handed = true;
             }
             if carried.is_some() {
-                // The screen has moved past the point already, and was read.
+                // The screen has moved past the point already, and was read:
+                // what the policy decided on it is not done on another.
                 state.carried = carried;
                 state.gone_first = false;
                 return Ok(None);
             }
+            if review.unattended() {
+                self.turn_end_execute(&point, turn_end, opts, review)?;
+            }
             point
         };
-        if let Some(end) = self.wait_for_next(seen, allow, deadline, state, review)? {
+        if let Some(end) = self.wait_for_next(seen, opts, allow, deadline, review)? {
             return Ok(Some(end));
         }
         state.gone_first = false;
@@ -2117,7 +2710,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         if !open || waits || state.survey == Survey::Said {
             return Ok(false);
         }
-        if opts.dismiss_surveys {
+        if opts.dismissing() && self.claim.watching_behind().is_none() {
             match self.dismiss_survey(turn.screen.seq)? {
                 Dismiss::Pressed { seq } => {
                     state.survey = Survey::Tried { pressed: Some(seq) };
@@ -2125,6 +2718,13 @@ impl<'a, C: Ctl> Session<'a, C> {
                 }
                 Dismiss::Skipped => {
                     state.survey = Survey::Tried { pressed: None };
+                    return Ok(true);
+                }
+                // Nothing written: the survey stays as it was, tried again
+                // once the hold lifts or the back-off passes.
+                Dismiss::Refused { halted, why } => {
+                    self.survey_gone |= left;
+                    self.refused(halted, &why, turn.screen.seq, review)?;
                     return Ok(true);
                 }
                 Dismiss::Unguarded => {}
@@ -2153,52 +2753,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         state.survey = Survey::Said;
         review.say(&survey_event_line(turn.screen.seq, self.sid.as_deref()))?;
         Ok(())
-    }
-
-    /// `--dismiss-surveys`' press: `key if=^●.How.is.Claude.doing 0`, the
-    /// check and the press under one server lock, as the approval press
-    /// guards its `1` — `OK skipped seq=<n>` means no row matched and nothing
-    /// was written, so a survey that left first never gets a `0` in the
-    /// composer (a copy quoted in the transcript does not match:
-    /// [`SURVEY_ROW`]).
-    /// `0` is the only key it ever presses. A host without the guard (a usage
-    /// line or a bare `ERR`) is never pressed unguarded: [`Dismiss::Unguarded`],
-    /// and the survey is said instead. `ERR busy sink` is retried as the
-    /// approval press retries it; a request not served is ridden out; any
-    /// other `ERR` ends the loop. `seen` is the seq of the screen read before.
-    fn dismiss_survey(&mut self, seen: u64) -> Result<Dismiss, Fail> {
-        if self.caps.key_if == Some(false) {
-            return Ok(Dismiss::Unguarded);
-        }
-        let cond = format!("if={SURVEY_ROW}");
-        let mut busy = 0;
-        loop {
-            let r = self.call(&["key", &cond, "0"])?;
-            if r.ok() {
-                self.caps.key_if = Some(true);
-                return Ok(if r.skipped() {
-                    Dismiss::Skipped
-                } else {
-                    Dismiss::Pressed {
-                        seq: r.seq().unwrap_or(seen),
-                    }
-                });
-            }
-            let why = format!("key {cond} 0 failed: {}", r.stderr.trim());
-            if self.unserved(&r) {
-                return Err(Fail::Lost(why));
-            }
-            if r.unknown_form() {
-                self.caps.key_if = Some(false);
-                return Ok(Dismiss::Unguarded);
-            }
-            if r.is_err("busy sink") && busy < BUSY_SINK_RETRIES {
-                busy += 1;
-                std::thread::sleep(BUSY_SINK_BACKOFF);
-                continue;
-            }
-            return Err(Fail::Hard(why));
-        }
     }
 
     /// `watch --report`'s count of the report at a point. A request not served
@@ -2236,9 +2790,9 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// once — the rest are forgotten, an earlier turn's — and none pending,
     /// the point is HELD until one lands (a fold) or the grace runs out
     /// ([`Fold::NoReport`]), the budget bounding the hold as it bounds every
-    /// wait. Claude Code's Stop hook posts the report as the turn ends, a
-    /// moment before or after the screen settles, so the hold is short where
-    /// there is a hook and the grace where there is none.
+    /// wait. A worker that posts its report as the turn ends, a moment before
+    /// or after the screen settles, makes the hold short; the grace bounds a
+    /// worker that posts none.
     ///
     /// THE SCREEN IS THE SAFETY NET UNDER THE HOLD: once a `hold_step` (20 s)
     /// of it has passed with no report, the screen is read once — a footer
@@ -2414,6 +2968,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.caps = Caps::default();
         let mut last = why;
         loop {
+            if self.stopped() {
+                return Ok(Rode::Stopped);
+            }
             let now = Instant::now();
             if now >= end {
                 return if now >= deadline {
@@ -2448,142 +3005,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// `--auto-reads` on one turn: a Bash prompt whose command classifies
-    /// read-only is approved with the guarded press (noted, and reported to
-    /// `review`), and the loop looks again once the box has LEFT; anything
-    /// else — not a prompt, not Bash, not read-only, the same read back after
-    /// two approvals, a guard that matched no row of this very box, a box that
-    /// did not move after the press, a fallback press withheld because the
-    /// session survey is open ([`Pressing::Withheld`]) — is a review point.
-    /// When the connection is lost before the press is seen through, what the
-    /// loop knows it did is noted — a `1` the server confirmed is an approval,
-    /// a press whose answer never came is noted as such and is not — and the
-    /// loss is ridden out.
-    fn auto_read(
-        &mut self,
-        turn: Turn,
-        opts: &SuperviseOpts,
-        allow: &[String],
-        approved: &mut Vec<String>,
-        deadline: Instant,
-        review: &mut dyn Review,
-    ) -> Result<Step, Fail> {
-        let bash = (opts.auto_reads && turn.phase == Phase::Prompt)
-            .then(|| parse_prompt(&turn.screen.rows))
-            .flatten()
-            .filter(|p| p.kind == PromptKind::Bash);
-        let Some(p) = bash else {
-            return Ok(Step::Review(turn));
-        };
-        let v = classify_command_with(&p.command, allow);
-        let repeats = approved.iter().filter(|c| **c == p.command).count();
-        let handed = if !v.read_only {
-            Some(v.reason.clone())
-        } else if repeats >= MAX_APPROVALS_OF_ONE_COMMAND {
-            Some("the same prompt came back after two approvals".to_string())
-        } else {
-            None
-        };
-        if let Some(why) = handed {
-            append_note(
-                opts.notes.as_deref(),
-                &format!("handed to the manager ({why}): {}", p.command),
-            )?;
-            return Ok(Step::Review(turn));
-        }
-        let mut approve = |seq: u64| -> Result<(), String> {
-            approved.push(p.command.clone());
-            append_note(
-                opts.notes.as_deref(),
-                &format!("approved read-only: {}", p.command),
-            )?;
-            review.approved(seq, &p.command)
-        };
-        let press = match self.press_one_guarded(&p, &turn.screen)? {
-            Pressing::Done(press) => press,
-            Pressing::Withheld => {
-                append_note(
-                    opts.notes.as_deref(),
-                    &format!(
-                        "handed to the manager (the session survey is open and this host has \
-                         no guarded press: an unguarded 1 could rate the session): {}",
-                        p.command
-                    ),
-                )?;
-                return Ok(Step::Review(turn));
-            }
-            Pressing::Lost { known, why } => {
-                match known {
-                    Some(Press::Pressed { seq }) => approve(seq)?,
-                    Some(Press::Skipped { .. }) => append_note(
-                        opts.notes.as_deref(),
-                        &format!(
-                            "nothing pressed, the box had left the screen: {}",
-                            p.command
-                        ),
-                    )?,
-                    None => append_note(
-                        opts.notes.as_deref(),
-                        &format!(
-                            "pressed, no answer came; the box is read again after the \
-                             reconnect: {}",
-                            p.command
-                        ),
-                    )?,
-                }
-                return Err(Fail::Lost(why));
-            }
-        };
-        match press {
-            Press::Pressed { seq } => {
-                approve(seq)?;
-                // The box must LEAVE before the next look: `await gone` is
-                // level-triggered and a box shows no busy footer, so an
-                // immediate re-read of an unchanged screen would match the same
-                // box and press it again — the stray digit the guard exists to
-                // prevent.
-                let screen = match self.moved_past(seq, deadline)? {
-                    Past::Moved => return Ok(Step::Again { settle: true }),
-                    Past::Still(Some(screen)) => screen,
-                    // The budget ran out waiting: nothing is read or handed
-                    // over after it — the box as last read is the TIMEOUT's
-                    // ([`Self::look`]).
-                    Past::Still(None) => return Ok(Step::Review(turn)),
-                };
-                append_note(
-                    opts.notes.as_deref(),
-                    &format!(
-                        "handed to the manager (the box did not change after the press): {}",
-                        p.command
-                    ),
-                )?;
-                Ok(Step::Review(turn_of(screen)))
-            }
-            Press::Skipped { seq } => {
-                if seq == turn.screen.seq {
-                    // The very screen we parsed, and the guard found no row:
-                    // this box is not one the supervisor answers.
-                    append_note(
-                        opts.notes.as_deref(),
-                        &format!(
-                            "handed to the manager (the guarded press matched no row): {}",
-                            p.command
-                        ),
-                    )?;
-                    return Ok(Step::Review(turn));
-                }
-                append_note(
-                    opts.notes.as_deref(),
-                    &format!(
-                        "nothing pressed, the box had left the screen: {}",
-                        p.command
-                    ),
-                )?;
-                Ok(Step::Again { settle: false })
-            }
-        }
-    }
-
     /// Wait (one step, capped by `deadline`) for the content to move past
     /// `seq`. A step that runs out is checked with a read: `await seq <n>`
     /// latches only once THIS instance's count passes `n`, so after a handoff
@@ -2612,118 +3033,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                 "await seq is not known to this host".to_string(),
             )),
         }
-    }
-
-    /// Press option 1 so that a prompt that resolved meanwhile never gets a
-    /// stray `1` in the composer: `key if=Do.you.want.to.proceed 1` where the
-    /// server has it (the check and the press happen under one lock; `OK
-    /// skipped seq=<n>` means no row matched and nothing was written), else
-    /// read → confirm the same box is still up → press → wait for the worker
-    /// to take it → re-read → backspace a digit that landed in the composer.
-    /// The fallback presses nothing while the session survey is open on the
-    /// confirming read ([`Pressing::Withheld`]): a `1` that reaches the
-    /// survey instead of the box is a rating, and no digit is left to find.
-    ///
-    /// The capability probe is the reply: `OK …` proves the guard (pressed or
-    /// skipped); a usage line or a bare `ERR` — what a build without `if=`
-    /// answers, reading `if=…` as a key name — falls back for good; `ERR busy
-    /// sink` is retried; every other `ERR` (`halted`, `no such session`,
-    /// `badregex`) is an error, never an approval.
-    ///
-    /// A lost connection is [`Pressing::Lost`]: a press whose answer never
-    /// came is not an approval, and is not sent again as it was — the loop
-    /// rides the connection out, then reads and classifies again
-    /// ([`Self::drive`]), the box may have moved or gone. On the fallback path
-    /// a `1` the server confirmed is written, lost connection or not: it is
-    /// the approval it was, and what could not be checked after it — a digit
-    /// in the composer — is checked on the next turn ([`Self::stray`]), as it
-    /// is after a fallback press whose answer never came.
-    fn press_one_guarded(&mut self, prompt: &Prompt, seen: &Screen) -> Result<Pressing, Fail> {
-        if self.caps.key_if != Some(false) {
-            let cond = format!("if={PROCEED}");
-            let mut busy = 0;
-            loop {
-                let r = self.call(&["key", &cond, "1"])?;
-                if r.ok() {
-                    self.caps.key_if = Some(true);
-                    let seq = r.seq().unwrap_or(seen.seq);
-                    return Ok(Pressing::Done(if r.skipped() {
-                        Press::Skipped { seq }
-                    } else {
-                        Press::Pressed { seq }
-                    }));
-                }
-                let why = format!("key {cond} 1 failed: {}", r.stderr.trim());
-                if self.unserved(&r) {
-                    // The guard ran under the server's lock or not at all: a
-                    // `1` it wrote went to the box, never the composer.
-                    return Ok(Pressing::Lost { known: None, why });
-                }
-                if r.unknown_form() {
-                    self.caps.key_if = Some(false);
-                    break;
-                }
-                if r.is_err("busy sink") && busy < BUSY_SINK_RETRIES {
-                    busy += 1;
-                    std::thread::sleep(BUSY_SINK_BACKOFF);
-                    continue;
-                }
-                return Err(Fail::Hard(why));
-            }
-        }
-        let now = self.screen()?;
-        match parse_prompt(&now.rows) {
-            Some(q) if q.command == prompt.command => {}
-            _ => return Ok(Pressing::Done(Press::Skipped { seq: now.seq })),
-        }
-        // An unguarded `1` goes wherever keys go when it lands: to the box,
-        // or — the box resolved first — to the session survey parked above
-        // the composer, where it is the rating `Bad`, the human's to give, and
-        // leaves no digit in the composer to find. With the survey open,
-        // nothing is pressed: the box is the manager's.
-        if survey_open(&now.rows) {
-            return Ok(Pressing::Withheld);
-        }
-        let r = self.call(&["key", "1"])?;
-        if !r.ok() {
-            let why = format!("key 1 failed: {}", r.stderr.trim());
-            if self.unserved(&r) {
-                self.stray = Some(prompt.command.clone());
-                return Ok(Pressing::Lost { known: None, why });
-            }
-            return Err(Fail::Hard(why));
-        }
-        let seq = r.seq().unwrap_or(now.seq);
-        let pressed = Press::Pressed { seq };
-        // Let the worker take the press before looking for a stray digit: the
-        // first content change after it, bounded.
-        let after = match self
-            .wait(&["seq", &seq.to_string()], STRAY_SETTLE)
-            .and_then(|_| self.screen())
-        {
-            Ok(after) => after,
-            Err(Fail::Lost(why)) => {
-                self.stray = Some(prompt.command.clone());
-                return Ok(Pressing::Lost {
-                    known: Some(pressed),
-                    why,
-                });
-            }
-            Err(e) => return Err(e),
-        };
-        if stray_digit(&after, "1") {
-            let r = self.call(&["key", "backspace"])?;
-            let skipped = Press::Skipped { seq: after.seq };
-            if self.unserved(&r) {
-                self.stray = Some(prompt.command.clone());
-                return Ok(Pressing::Lost {
-                    known: Some(skipped),
-                    why: format!("key backspace failed: {}", r.stderr.trim()),
-                });
-            }
-            return Ok(Pressing::Done(skipped));
-        }
-        Ok(Pressing::Done(pressed))
     }
 }
 
@@ -2755,75 +3064,19 @@ impl<C: Ctl> Session<'_, C> {
         Some(limit::reset_at(&spec, now, local, self.zone_offset))
     }
 
-    /// A Unix time as the loop's clock: now, when it has passed.
-    fn instant_of(&self, unix: i64) -> Instant {
-        Instant::now() + Duration::from_secs(u64::try_from(unix - self.now_unix()).unwrap_or(0))
-    }
-
     /// `--resume`'s rules file, if one was named.
-    fn rules(&self) -> Option<PathBuf> {
+    pub(super) fn rules(&self) -> Option<PathBuf> {
         self.resume.as_ref().and_then(|r| r.rules.clone())
     }
 
-    /// Whether a probe is due, and when: `--resume`, an episode open, and a
-    /// time armed ([`Episode::probe_at`]).
-    fn probe_due(&self) -> Option<Instant> {
-        self.resume.as_ref()?;
-        self.limit.as_ref()?.probe_at
-    }
-
-    /// Arm the probe for the reset (`--resume`): at once, when it has
-    /// passed; never, when the notice named none the watcher could read
-    /// (only the screen leaving the notice triggers one then). After a
-    /// failed probe the backoff stands: the notice printed again (a retry's,
-    /// an outage's re-report of the point) never brings the probe forward
-    /// of it — only a later reset moves it, later. A notice that says Claude
-    /// Code goes on by itself at that time ([`Episode::resumes_itself`])
-    /// gets the probe [`limit::SHORTLY`] after it, not at it: Claude Code's
-    /// own continuation goes first — a probe typed as it starts would be
-    /// queued behind the resumed turn and answered later, for nothing — and
-    /// the worker read busy in the meantime closes the episode with no
-    /// probe at all ([`Self::limit_on_busy`]).
-    fn arm_probe_at_reset(&mut self) {
-        if self.resume.is_none() {
-            return;
-        }
-        let at = self.limit.as_ref().and_then(|ep| {
-            let grace = if ep.resumes_itself {
-                i64::try_from(limit::SHORTLY.as_secs()).unwrap_or(0)
-            } else {
-                0
-            };
-            ep.reset_unix.map(|unix| unix + grace)
-        });
-        let at = at.map(|unix| self.instant_of(unix));
-        if let Some(ep) = self.limit.as_mut() {
-            ep.probe_at = match (at, ep.probe_at) {
-                (Some(reset), Some(held)) if ep.failed > 0 => Some(reset.max(held)),
-                (Some(reset), _) => Some(reset),
-                (None, held) => held,
-            };
-        }
-    }
-
-    /// Arm the probe `wait` from now.
-    fn arm_probe_in(&mut self, wait: Duration) {
-        if let Some(ep) = self.limit.as_mut() {
-            ep.probe_at = Some(Instant::now() + wait);
-        }
-    }
-
     /// The notice's reset read again — the notice printed again after the
-    /// episode opened (a retry's, [`Self::limit_after`]) or the probe's turn
-    /// answered with it ([`Self::settle_probe`]). The same text is the same
+    /// episode opened (a retry's, or the answer to a continuation,
+    /// [`Self::limit_after`]). The same text is the same
     /// reset and is not read again: a span (`in 3h`) counts from the print,
     /// not from every read, and reading it again would push the reset out by
-    /// the span each time (measured by the round-17 review: the probe every
-    /// 3 h forever, `EXTEND` each time, the backoff never applied). Other
-    /// text is read, and a later reset it names is the one waited for,
-    /// `EXTEND` owed again for it. A notice reprinted minutes later with the
-    /// same span names a reset minutes later: the probe finds the notice
-    /// again and backs off — the backoff covers it.
+    /// the span each time (measured by the round-17 review: `EXTEND` every
+    /// 3 h forever). Other text is read, and a later reset it names is the
+    /// one waited for, `EXTEND` owed again for it.
     fn refresh_reset(&mut self, reset: Option<&str>) {
         let text = reset.unwrap_or("-");
         if self.limit.as_ref().is_none_or(|ep| ep.reset_text == text) {
@@ -2840,8 +3093,9 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// `--mail`: a turn the watcher sent (the probe, the rebrief) begins a
-    /// turn as a handed-over point does — its report is not the last point's.
+    /// `--mail`: a turn the watcher sent (a continuation, a command) begins
+    /// a turn as a handed-over point does — its report is not the last
+    /// point's.
     fn mail_turn_boundary(&mut self) {
         if let Some(m) = &mut self.mail {
             m.floor = Instant::now();
@@ -2850,181 +3104,84 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Before a point is reported, with an episode still open — so the
-    /// worker did not work since the notice ([`Self::look`] closed the
-    /// episode otherwise). A limited point is the manager's (reported as
-    /// ever; [`Self::limit_after`] opens or refreshes the episode). Any
-    /// other point is the screen leaving the notice with no busy spell (an
-    /// account switch, the `/model` output): with `--resume` the probe
-    /// takes it — sent at once when the composer is idle and empty
-    /// ([`Self::probe_ready`]; else deferred a step, or, on a question, left
-    /// to the manager), and `Some` says so, carrying the screen the next
-    /// look starts from; without it the point is reported as ever and the
-    /// episode stays open.
-    fn limit_before(
-        &mut self,
-        point: &Turn,
-        allow: &[String],
-        deadline: &mut Instant,
-        state: &mut Looking,
-        review: &mut dyn Review,
-    ) -> Result<Option<Option<Screen>>, Fail> {
-        if self.limit.is_none()
-            || self.resume.is_none()
-            || matches!(point.phase, Phase::Limited { .. } | Phase::Prompt)
-        {
-            return Ok(None);
-        }
-        if let Err((why, retry)) = self.probe_ready(point) {
-            review.note(&format!("PROBE deferred seq={} {why}", point.screen.seq));
-            if retry {
-                self.arm_probe_in(WAIT_STEP);
-            }
-            return Ok(None);
-        }
-        let probed = self.probe(point, *deadline, review)?;
-        Ok(Some(
-            self.settle_probe(probed, allow, deadline, state, review)?,
-        ))
-    }
-
     /// After a point was reported. A limited point opens the episode
     /// ([`Self::open_episode`]: the escalation, once — or the same episode
-    /// again after a busy read closed it) — or, the notice again (a
-    /// retry's) with the episode open, refreshes it ([`Self::refresh_reset`]:
-    /// other text naming a later reset is the one waited for; the same text
-    /// is the same reset); then the probe is armed for the reset — a
-    /// backoff in force stands — and the budget stretched past it
-    /// ([`Self::extend`]). An idle point with nothing typed gets the rebrief
-    /// the episode's close left owed ([`Self::rebrief`]).
+    /// again after a busy read closed it; none when the turn-end policy acts
+    /// on the wall at once, `handled`) — or, the notice again (a retry's)
+    /// with the episode open, refreshes it ([`Self::refresh_reset`]: other
+    /// text naming a later reset is the one waited for; the same text is the
+    /// same reset) and escalates it if it never was and the policy now waits
+    /// on the wall; then the budget is stretched past the reset
+    /// ([`Self::extend`]).
     fn limit_after(
         &mut self,
         point: &Turn,
-        _allow: &[String],
         deadline: &mut Instant,
-        _state: &mut Looking,
+        handled: bool,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         if let Phase::Limited { message, reset } = &point.phase {
-            if self.limit.is_some() {
+            if let Some(raised) = self.limit.as_ref().map(|ep| ep.raised) {
                 self.refresh_reset(reset.as_deref());
+                // Opened on a wall the policy acted on at once, and waiting
+                // on it now (the wall again after the act): escalated now.
+                if !handled && !raised {
+                    let text = format!(
+                        "{ATTENTION_PREFIX} {} reset={}",
+                        one_line(message),
+                        reset.as_deref().unwrap_or("-")
+                    );
+                    self.escalate(point.screen.seq, &text, None, "control", review)?;
+                    if let Some(ep) = self.limit.as_mut() {
+                        ep.raised = true;
+                    }
+                }
             } else {
-                self.open_episode(point.screen.seq, message, reset.as_deref(), review)?;
+                self.open_episode(point.screen.seq, message, reset.as_deref(), handled, review)?;
             }
-            self.arm_probe_at_reset();
             return self.extend(deadline, review);
-        }
-        if self.rebrief_due && point.phase == Phase::Idle && !typed_draft(&point.screen) {
-            self.rebrief(point, review)?;
         }
         Ok(())
     }
 
     /// A limited point with no episode open: the episode opens on it. A
-    /// new one is escalated ([`Self::escalate`]). One a busy read closed
-    /// and the worker has not answered since ([`Retry`]) is the retry that
-    /// hit the wall again — the SAME episode, opened again: the attention
-    /// set again (the worker is at the wall), no second mail, its seq and
-    /// the probe's backoff carried, the reset the notice names now (`EXTEND`
-    /// owed for a later one, as for any retry's notice).
+    /// new one is escalated ([`Self::escalate`]) — unless the turn-end policy
+    /// acts on the wall at once (`handled`: a model switch), which is
+    /// journaled `LIMITED seq=<n> handled: <message>` and raises nothing.
+    /// One a busy read closed and the worker has not answered since
+    /// ([`Retry`]) is the retry that hit the wall again — the SAME episode,
+    /// opened again: the attention set again (the worker is at the wall), no
+    /// second mail, its seq carried, the reset the notice names now
+    /// (`EXTEND` owed for a later one, as for any retry's notice).
     fn open_episode(
         &mut self,
         seq: u64,
         message: &str,
         reset: Option<&str>,
+        handled: bool,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let reset_text = reset.map_or_else(|| "-".to_string(), str::to_string);
         let reset_unix = self.reset_unix(reset);
-        let text = format!(
-            "{ATTENTION_PREFIX} {} reset={}",
-            one_line(message),
-            reset_text
-        );
         let retry = self.retry.take();
-        self.escalate(seq, &text, retry.as_ref().map(|r| r.seq), review)?;
+        if handled {
+            review.note(&format!("LIMITED seq={seq} handled: {}", clip(message)));
+        } else {
+            let text = format!(
+                "{ATTENTION_PREFIX} {} reset={}",
+                one_line(message),
+                reset_text
+            );
+            self.escalate(seq, &text, retry.as_ref().map(|r| r.seq), "control", review)?;
+        }
         self.limit = Some(Episode {
-            seq: retry.as_ref().map_or(seq, |r| r.seq),
+            seq: retry.map_or(seq, |r| r.seq),
             resumes_itself: limit::resumes_by_itself(message),
             reset_unix,
             reset_text,
-            probe_at: retry.as_ref().and_then(|r| r.probe_at),
-            failed: retry.map_or(0, |r| r.failed),
             extended: false,
+            raised: !handled,
         });
-        Ok(())
-    }
-
-    /// The escalation, once an episode: `meta set attention limited:
-    /// <message> reset=<when>` on the worker (cut to the server's 256 bytes;
-    /// aterm's menu bar badges a set attention), the same text posted from
-    /// the worker's session as `kind=control` to the manager's
-    /// ([`Self::set_manager`]; skipped, and said so, with none), and one
-    /// journal line, `ESCALATED seq=<n> attention=<reply> mail=<reply>`,
-    /// with the server's first word for each — a refusal is recorded, never
-    /// the loop's end. The same episode opened again (`again`: the seq of
-    /// the escalation it keeps, [`Retry`]) sets the attention and posts
-    /// nothing: `mail=skipped: the retry hit the wall again, the episode of
-    /// seq=<m>`.
-    fn escalate(
-        &mut self,
-        seq: u64,
-        text: &str,
-        again: Option<u64>,
-        review: &mut dyn Review,
-    ) -> Result<(), Fail> {
-        let attention = fit_bytes(text, ATTENTION_BYTES);
-        let r = self.call(&["meta", "set", "attention", &attention])?;
-        let attention_said = reply_word(&r);
-        let mail_said = match (again, self.manager.clone()) {
-            (Some(of), _) => {
-                format!("skipped: the retry hit the wall again, the episode of seq={of}")
-            }
-            (None, None) => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
-            (None, Some(to)) => {
-                let to = format!("to={to}");
-                let r = self.call(&["post", &to, "kind=control", text])?;
-                reply_word(&r)
-            }
-        };
-        review.note(&format!(
-            "ESCALATED seq={seq} attention={attention_said} mail={mail_said}"
-        ));
-        Ok(())
-    }
-
-    /// The episode is over: the attention cleared IF IT IS STILL OURS, and
-    /// journaled as `CLEARED seq=<n> attention=<said> <why>`, `seq` the read
-    /// it closed on.
-    ///
-    /// The attention is read first (`meta`), and `meta unset attention` (on
-    /// the wire `meta set attention ''` is a usage error, measured) goes only
-    /// when the standing text opens with [`ATTENTION_PREFIX`]. The field is
-    /// shared: while the episode was open the link Notification hook may have
-    /// raised `claude needs approval: …` over ours, and that box is still
-    /// open when the limit ends — an unconditional unset wiped the badge the
-    /// human was meant to answer. So `<said>` is the unset's reply word when
-    /// it went, `kept` when another writer's text stands (untouched), `none`
-    /// when nothing stands, and the read's own reply word when the read was
-    /// refused (nothing is unset on a read that did not say it was ours).
-    fn close_episode(&mut self, seq: u64, why: &str, review: &mut dyn Review) -> Result<(), Fail> {
-        if self.limit.take().is_none() {
-            return Ok(());
-        }
-        let read = self.call(&["meta"])?;
-        let said = if read.ok() {
-            match standing_attention(&read.stdout) {
-                Some(text) if text.starts_with(ATTENTION_PREFIX) => {
-                    let r = self.call(&["meta", "unset", "attention"])?;
-                    reply_word(&r)
-                }
-                Some(_) => "kept".to_string(),
-                None => "none".to_string(),
-            }
-        } else {
-            reply_word(&read)
-        };
-        review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
         Ok(())
     }
 
@@ -3036,36 +3193,24 @@ impl<C: Ctl> Session<'_, C> {
     /// review point, which the turn it resumed may keep hours off (measured
     /// 2026-09-17: a background shell ran fourteen hours under the notice,
     /// the badge set all the while); the notice row still on the screen
-    /// changes nothing. With `--resume` and a rules file the rebrief is owed
-    /// at the next idle point ([`Self::limit_after`]). An episode whose
-    /// notice named a reset is not touched: a busy spell after it may be a
-    /// retry that hits the wall again ([`Self::look`]). The closed episode
-    /// is kept ([`Retry`]) until the worker answers on a point that is not
-    /// the notice: this busy may be the retry that hits the wall again
-    /// (`continuing shortly` in a moment), and the notice again is then the
-    /// same episode, opened again with no second mail
-    /// ([`Self::open_episode`]). A probe's answer awaited changes nothing
-    /// (the round-20 review: with the probe pending, the continuation ran
-    /// its hours under the notice with the episode open and the badge set):
-    /// the worker works, whichever turn it is on; an answer then says
-    /// `EVENT resumed` on an episode already closed, the notice again opens
-    /// it again with the backoff ([`Self::settle_probe`]).
+    /// changes nothing. An episode whose notice named a reset is not
+    /// touched: a busy spell after it may be a retry that hits the wall
+    /// again ([`Self::look`]). The closed episode is kept ([`Retry`]) until
+    /// the worker answers on a point that is not the notice: this busy may
+    /// be the retry that hits the wall again (`continuing shortly` in a
+    /// moment), and the notice again is then the same episode, opened again
+    /// with no second mail ([`Self::open_episode`]).
     fn limit_on_busy(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         let Some(ep) = self.limit.as_ref().filter(|ep| ep.resumes_itself) else {
             return Ok(());
         };
-        let retry = Retry {
-            seq: ep.seq,
-            failed: ep.failed,
-            probe_at: ep.probe_at,
-        };
+        let retry = Retry { seq: ep.seq };
         self.close_episode(
             seq,
             "the worker works again: the notice said it would continue by itself",
             review,
         )?;
         self.retry = Some(retry);
-        self.rebrief_due = self.rules().is_some();
         Ok(())
     }
 
@@ -3107,57 +3252,45 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Whether the probe may go now: Claude Code's composer on the screen
-    /// (a limit notice sits at one; the `/login` dialog that leaves the
-    /// notice has none, and a `turn` typed there lands in its code field),
-    /// idle, with nothing typed. `Err` names why not, and whether a step's
-    /// wait may change it (a draft is typed, the composer is not up) or the
-    /// point is the manager's (a question the WORKER asked — one whose last
-    /// row is a `❯` user row is the watcher's own probe, typed and
-    /// unanswered, and is idle).
-    fn probe_ready(&self, turn: &Turn) -> Result<(), (&'static str, bool)> {
-        // A question whose last row is a `❯` user row is the watcher's own
-        // probe, typed and unanswered (it ends in `?`): the composer is idle.
-        let own_row =
-            last_said_row(&turn.screen.rows).is_some_and(|r| r.trim_start().starts_with('❯'));
-        let empty_composer = |screen: &Screen| {
-            if !has_composer_frame(&screen.rows) {
-                Err(("no composer on the screen", true))
-            } else if typed_draft(screen) {
-                Err(("text is typed in the composer", true))
-            } else {
-                Ok(())
-            }
-        };
-        match turn.phase {
-            Phase::Idle | Phase::Limited { .. } => empty_composer(&turn.screen),
-            Phase::Question if own_row => empty_composer(&turn.screen),
-            Phase::Question => Err((
-                "the worker asked a question: the manager's to answer",
-                false,
-            )),
-            Phase::Prompt => Err(("a box is up", false)),
-            Phase::Busy => Err(("the worker is busy", false)),
-        }
-    }
-
     /// The wait for the screen to move past `seen` — as it always was,
-    /// step after step until the budget — bounded, with `--resume` and a
-    /// probe due ([`Self::probe_due`]), by that time: then the probe goes on
-    /// the point still showing ([`Self::probe_now`]) and the loop looks
-    /// again. `Some(End::Timeout)` when the budget runs out first.
+    /// step after step until the budget — bounded by the turn-end policy's
+    /// `WaitUntil` ([`Self::turn_end_due`]): then the policy decides again on
+    /// the point still showing ([`Self::turn_end_now`]) and the loop looks
+    /// again. A screen change first ends the wait, and the next look decides
+    /// on what it shows. `Some(End::Timeout)` when the budget runs out first.
     fn wait_for_next(
         &mut self,
         seen: Turn,
+        opts: &SuperviseOpts,
         allow: &[String],
         deadline: &mut Instant,
-        state: &mut Looking,
         review: &mut dyn Review,
     ) -> Result<Option<End>, Fail> {
+        // A box handed over is waited on by its own row LEAVING, not by any
+        // change: Claude Code blinks the tool row above an open box twice a
+        // second, and every blink would be a look at the same box.
+        let anchor = (seen.phase == Phase::Prompt)
+            .then(|| box_anchor(&seen.screen.rows))
+            .flatten();
         loop {
-            let until = self.probe_due().map_or(*deadline, |t| t.min(*deadline));
+            if self.stopped() {
+                return Ok(None);
+            }
+            let due = self.turn_end_due.as_ref().map(|(at, _)| *at);
+            let until = due.map_or(*deadline, |t| t.min(*deadline));
             if Instant::now() < until {
-                if let Past::Moved = self.moved_past(seen.screen.seq, until)? {
+                if let Some(anchor) = anchor.as_deref()
+                    && self.caps.gone != Some(false)
+                {
+                    let step = until
+                        .saturating_duration_since(Instant::now())
+                        .min(WAIT_STEP);
+                    match self.wait(&["gone", anchor], step)? {
+                        Wait::Latched => return Ok(None),
+                        Wait::TimedOut => {}
+                        Wait::Unsupported => self.caps.gone = Some(false),
+                    }
+                } else if let Past::Moved = self.moved_past(seen.screen.seq, until)? {
                     return Ok(None);
                 }
                 if Instant::now() < until {
@@ -3167,276 +3300,76 @@ impl<C: Ctl> Session<'_, C> {
             if Instant::now() >= *deadline {
                 return Ok(Some(End::Timeout(seen)));
             }
-            self.probe_now(&seen, allow, deadline, state, review)?;
+            self.turn_end_now(&seen, opts, allow, review)?;
             return Ok(None);
         }
     }
+}
 
-    /// The probe when its time came, on the point still showing: sent when
-    /// the composer is idle and empty ([`Self::probe_ready`]), else deferred
-    /// a step (a draft typed) or left to the manager (a question), the
-    /// journal told either way.
-    fn probe_now(
-        &mut self,
-        seen: &Turn,
-        allow: &[String],
-        deadline: &mut Instant,
-        state: &mut Looking,
-        review: &mut dyn Review,
-    ) -> Result<(), Fail> {
-        if let Err((why, retry)) = self.probe_ready(seen) {
-            review.note(&format!("PROBE deferred seq={} {why}", seen.screen.seq));
-            if retry {
-                self.arm_probe_in(WAIT_STEP);
-            } else if let Some(ep) = self.limit.as_mut() {
-                ep.probe_at = None;
-            }
-            return Ok(());
+/// The box's first line as the badge and the ask carry it: the box's OWN first row
+/// ([`prompt_box_first_row`] — never a transcript row), every character that breaks a
+/// line ([`limit::breaks_a_line`]) as a space, trimmed, and cut to
+/// [`APPROVAL_LINE_CELLS`] terminal cells — a wide character counts two
+/// ([`aterm_grapheme::char_width`]), so a CJK line is not twice as wide as the cap
+/// says (round-25 review, 2026-09-23).
+fn approval_line(rows: &[String]) -> String {
+    let first = prompt_box_first_row(rows).map_or("", |i| rows[i].as_str());
+    cut_cells(first, APPROVAL_LINE_CELLS).0
+}
+
+/// `text` on one line — every character that breaks a line
+/// ([`limit::breaks_a_line`]) a space — trimmed, and cut to `cap` terminal cells, a
+/// wide character counting two ([`aterm_grapheme::char_width`]); `true` when
+/// something was cut. The one sanitizer and cap the escalation's texts share
+/// ([`approval_line`], and the subject and reason of `escalate::attention_text`).
+fn cut_cells(text: &str, cap: usize) -> (String, bool) {
+    let clean: String = text
+        .chars()
+        .map(|c| if limit::breaks_a_line(c) { ' ' } else { c })
+        .collect();
+    let mut cells = 0;
+    let mut out = String::new();
+    for c in clean.trim().chars() {
+        let w = aterm_grapheme::char_width(c);
+        if cells + w > cap {
+            return (out, true);
         }
-        let probed = self.probe(seen, *deadline, review)?;
-        state.carried = self.settle_probe(probed, allow, deadline, state, review)?;
-        Ok(())
+        cells += w;
+        out.push(c);
     }
+    (out, false)
+}
 
-    /// ONE turn, [`PROBE`], typed as `task`'s nudge is (`turn idle=600
-    /// timeout=2500 <text>`, `submitted=1` the proof), journaled as `PROBE
-    /// sent seq=<n>`; then the answer is awaited with the loop's own waits:
-    /// a new done row — the status row not the one the probe went on, or
-    /// the worker read busy in between — or a box up is the answer
-    /// ([`Probed::Answered`]); the notice again (a retry's), a turn not
-    /// submitted, or [`ANSWER_WINDOW`] spent with no reaction is not
-    /// ([`Probed::Failed`]). A worker read busy as the window runs out is on
-    /// the answer: the window starts over, as often as that, within
-    /// `deadline` — neither `still-limited` while it visibly works nor
-    /// probed again once it has answered (measured by the round-17 review:
-    /// an answer past the window was both). A request not served is the
-    /// outage the loop rides out; the screen then says what the probe did.
-    fn probe(
-        &mut self,
-        from: &Turn,
-        deadline: Instant,
-        review: &mut dyn Review,
-    ) -> Result<Probed, Fail> {
-        review.note(&format!("PROBE sent seq={}", from.screen.seq));
-        let r = self.call(&["turn", PROBE_IDLE, PROBE_TIMEOUT, PROBE])?;
-        if self.unserved(&r) {
-            return Err(Fail::Lost(format!(
-                "turn (the probe) failed: {}",
-                r.stderr.trim()
-            )));
-        }
-        if !r.stdout.contains("submitted=1") && !r.timed_out() {
-            return Ok(Probed::Failed {
-                turn: from.clone(),
-                why: format!("the probe was not submitted: {}", one_line(r.err_text())),
-            });
-        }
-        self.mail_turn_boundary();
-        self.await_probe_answer(from, deadline, review)
-    }
-
-    /// The probe's answer, awaited ([`Self::probe`]) with the loop's own
-    /// waits: a busy read on the way is shown to the episode as any is
-    /// ([`Self::limit_on_busy`]) — the worker works, on the probe's turn
-    /// or on Claude Code's own continuation, which the probe could not
-    /// tell apart and which may run for hours.
-    fn await_probe_answer(
-        &mut self,
-        from: &Turn,
-        deadline: Instant,
-        review: &mut dyn Review,
-    ) -> Result<Probed, Fail> {
-        let answer_window = self.answer_window;
-        let window = || answer_window.min(deadline.saturating_duration_since(Instant::now()));
-        let mut until = Instant::now() + window();
-        let no_answer = format!("no answer within {} s", mail::secs(answer_window));
-        let mut saw_busy = false;
-        let mut first = true;
-        let mut last = from.clone();
-        loop {
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(Probed::Failed {
-                    turn: last,
-                    why: no_answer,
-                });
-            }
-            let turn = self.await_turn_from(left, first, &mut saw_busy, review)?;
-            first = false;
-            // A turn timed out was read busy as the window ran out: the
-            // answer is on its way, and waited for — until the budget.
-            if turn.timed_out {
-                if Instant::now() < deadline {
-                    until = Instant::now() + window();
-                    last = turn;
-                    continue;
-                }
-                return Ok(Probed::Failed {
-                    turn,
-                    why: "the budget ran out while it was answering".to_string(),
-                });
-            }
-            match &turn.phase {
-                Phase::Limited { message, reset } => {
-                    let why = format!(
-                        "message={} reset={}",
-                        clip(message),
-                        reset.as_deref().map_or_else(|| "-".to_string(), clip)
-                    );
-                    return Ok(Probed::Failed { turn, why });
-                }
-                Phase::Prompt => return Ok(Probed::Answered(turn)),
-                // A done row that is not the probe point's: the probe typed
-                // and taken but not answered shows NONE (the point's done
-                // row is history above the `❯` row), and is no answer.
-                Phase::Idle | Phase::Question
-                    if saw_busy
-                        || matches!(status_row(&turn.screen.rows),
-                            Some(row) if Some(row) != status_row(&from.screen.rows)) =>
-                {
-                    return Ok(Probed::Answered(turn));
-                }
-                _ => {
-                    let seq = turn.screen.seq.to_string();
-                    self.wait(&["seq", &seq], left.min(WAIT_STEP))?;
-                    last = turn;
-                }
-            }
-        }
-    }
-
-    /// What the probe came to, said and set up for the next look. An answer
-    /// prints `EVENT resumed seq=<n> <its line>`, closes the episode
-    /// ([`Self::close_episode`]; one a busy read closed already stays
-    /// closed, for good: [`Retry`]) and, with a rules file, restates the
-    /// rules ([`Self::rebrief`]) — at once on an idle answer with nothing
-    /// typed, else at the next such point; a box is the manager's, carried
-    /// to the next look. A failure prints `EVENT still-limited seq=<n>
-    /// <why>` — the notice again after a busy read closed the episode opens
-    /// it again, the same one ([`Self::open_episode`]) — counts against the
-    /// backoff ([`PROBE_BACKOFF`]: the next probe 10 min away, then 30,
-    /// never before a later reset the notice named) and looks at the budget
-    /// again ([`Self::extend`]); the point it ended on is not reported
-    /// again.
-    fn settle_probe(
-        &mut self,
-        probed: Probed,
-        allow: &[String],
-        deadline: &mut Instant,
-        state: &mut Looking,
-        review: &mut dyn Review,
-    ) -> Result<Option<Screen>, Fail> {
-        self.mail_turn_boundary();
-        match probed {
-            Probed::Answered(turn) => {
-                review.say(&format!(
-                    "EVENT resumed seq={} {}",
-                    turn.screen.seq,
-                    event_summary(&turn, allow)
-                ))?;
-                self.close_episode(turn.screen.seq, "resumed", review)?;
-                self.retry = None;
-                self.rebrief_due = self.rules().is_some();
-                if turn.phase == Phase::Prompt {
-                    state.handed = None;
-                    return Ok(Some(turn.screen));
-                }
-                state.handed = Some(review_key(&turn, allow));
-                if self.rebrief_due && turn.phase == Phase::Idle && !typed_draft(&turn.screen) {
-                    self.rebrief(&turn, review)?;
-                }
-                Ok(None)
-            }
-            Probed::Failed { turn, why } => {
-                review.say(&format!(
-                    "EVENT still-limited seq={} {why}",
-                    turn.screen.seq
-                ))?;
-                if let Phase::Limited { message, reset } = &turn.phase {
-                    if self.limit.is_some() {
-                        self.refresh_reset(reset.as_deref());
-                    } else {
-                        self.open_episode(turn.screen.seq, message, reset.as_deref(), review)?;
-                    }
-                }
-                let now_unix = self.now_unix();
-                let backoff = self.probe_backoff.clone();
-                if let Some(ep) = self.limit.as_mut() {
-                    ep.failed += 1;
-                    let back = backoff
-                        .get(
-                            ep.failed
-                                .saturating_sub(1)
-                                .min(backoff.len().saturating_sub(1)),
-                        )
-                        .copied()
-                        .unwrap_or(WAIT_STEP);
-                    let due = Instant::now() + back;
-                    let reset = ep.reset_unix.filter(|&r| r > now_unix).map(|r| {
-                        Instant::now()
-                            + Duration::from_secs(u64::try_from(r - now_unix).unwrap_or(0))
-                    });
-                    ep.probe_at = Some(match reset {
-                        Some(r) if r > due => r,
-                        _ => due,
-                    });
-                }
-                self.extend(deadline, review)?;
-                state.handed = Some(review_key(&turn, allow));
-                Ok(None)
-            }
-        }
-    }
-
-    /// The standing rules restated: the file read now (an edit since the
-    /// launch counts), as ONE line ([`limit::one_line`]) under [`REBRIEF`],
-    /// typed as the probe is, then `EVENT rebriefed seq=<n>` — or `EVENT
-    /// rebrief-failed seq=<n> <why>` for a file that cannot be read, is
-    /// empty, or a turn not submitted (the rules are then the manager's to
-    /// send; nothing is retried blind).
-    fn rebrief(&mut self, at: &Turn, review: &mut dyn Review) -> Result<(), Fail> {
-        self.rebrief_due = false;
-        let Some(path) = self.rules() else {
-            return Ok(());
+/// The journal's word for an escalation's post: the reply's own ([`reply_word`]), except
+/// the two answers that mean QUEUED. The server records a post before it waits, so
+/// `ERR timeout id=<n>` (an `ask` under `--wait=0`: not landed yet) and `ERR fabric
+/// <state> id=<n> …` (no bridge up to carry it) are `queued id=<n> (…)` — journaling
+/// them as a refusal said the manager was not asked when it was (round-25 review).
+fn post_word(r: &CtlReply) -> String {
+    if !r.ok() {
+        let err = r.err_text();
+        let queued = if let Some(rest) = err.strip_prefix("ERR timeout ") {
+            Some((rest, "not landed yet".to_string()))
+        } else if let Some(rest) = err.strip_prefix("ERR fabric ") {
+            let (state, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+            Some((rest, format!("fabric {state}")))
+        } else {
+            None
         };
-        let seq = at.screen.seq;
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => limit::one_line(&t),
-            Err(e) => {
-                review.say(&format!(
-                    "EVENT rebrief-failed seq={seq} cannot read {}: {e}",
-                    path.display()
-                ))?;
-                return Ok(());
+        if let Some((rest, why)) = queued {
+            let mut words = rest.split_whitespace();
+            if let Some(id) = words.next().filter(|w| w.starts_with("id=")) {
+                let more: Vec<&str> = words.collect();
+                let why = if more.is_empty() {
+                    why
+                } else {
+                    format!("{why}, {}", more.join(" "))
+                };
+                return clip(&one_line(&format!("queued {id} ({why})")));
             }
-        };
-        if text.is_empty() {
-            review.say(&format!(
-                "EVENT rebrief-failed seq={seq} {} is empty",
-                path.display()
-            ))?;
-            return Ok(());
         }
-        let line = format!("{REBRIEF}{text}");
-        let r = self.call(&["turn", PROBE_IDLE, PROBE_TIMEOUT, &line])?;
-        if self.unserved(&r) {
-            self.rebrief_due = true;
-            return Err(Fail::Lost(format!(
-                "turn (the rules) failed: {}",
-                r.stderr.trim()
-            )));
-        }
-        if !r.stdout.contains("submitted=1") && !r.timed_out() {
-            review.say(&format!(
-                "EVENT rebrief-failed seq={seq} not submitted: {}",
-                one_line(r.err_text())
-            ))?;
-            return Ok(());
-        }
-        self.mail_turn_boundary();
-        review.say(&format!("EVENT rebriefed seq={}", r.seq().unwrap_or(seq)))?;
-        Ok(())
     }
+    reply_word(r)
 }
 
 /// The first `n` bytes of `s` on a character boundary.
@@ -3525,7 +3458,10 @@ fn typed_draft(screen: &Screen) -> bool {
 /// as a rating.
 fn survey_event_line(seq: u64, sid: Option<&str>) -> String {
     let target = sid.map(|s| format!(" {s}")).unwrap_or_default();
-    format!("EVENT survey seq={seq} dismiss with: aterm ctl{target} key 'if={SURVEY_ROW}' 0")
+    format!(
+        "EVENT survey seq={seq} dismiss with: aterm ctl{target} key 'if={}' 0",
+        survey_row()
+    )
 }
 
 /// What `phase` prints: [`render_phase`]'s lines, then `survey 0` when the
@@ -3791,11 +3727,8 @@ fn render_prompt(p: &Prompt, python_allow: &[String]) -> String {
     for (n, text) in &p.options {
         out.push_str(&format!("option {n} {text}\n"));
     }
-    out.push_str(if p.has_cancel {
-        "cancel esc\n"
-    } else {
-        "cancel none\n"
-    });
+    // Every box is found by its `Esc to …` footer.
+    out.push_str("cancel esc\n");
     out
 }
 
@@ -3886,10 +3819,25 @@ pub fn utc_stamp(secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+#[path = "approval_loop.rs"]
+mod approval_loop;
+#[path = "claim.rs"]
+mod claim;
+pub use claim::CLAIM_HELD;
+#[path = "escalate.rs"]
+mod escalate;
+#[path = "lifecycle.rs"]
+mod lifecycle;
+#[path = "press.rs"]
+mod press;
+#[path = "turn_end_loop.rs"]
+mod turn_end_loop;
+
 #[cfg(test)]
 mod tests {
     use super::super::prompt::fixtures::{
-        bash_multi_row, bash_multi_row_with_note, bash_one_row, composer, rows, workflow_box,
+        bash_multi_row, bash_multi_row_with_note, bash_one_row, composer, read_box, rows,
+        trust_box, workflow_box,
     };
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
@@ -3976,8 +3924,15 @@ mod tests {
         verb_replies: BTreeMap<&'static str, VecDeque<CtlReply>>,
         /// `await seq` on this screen index TIMES OUT — as on the last —
         /// until a `turn` has been sent: the screen sits (a limit notice
-        /// through its reset) and moves only once the watcher types.
+        /// through its reset) and moves only once the watcher types. A
+        /// `text` read meanwhile shows the same screen again, unmoved.
         turn_releases: Option<usize>,
+        /// The same, for several: the `k`-th entry's screen sits until more
+        /// than `k` turns have been sent.
+        turn_gates: Vec<usize>,
+        /// The cursor's column on the screen of this index, over
+        /// `cursor_col` (a suggestion drawn at column 2, then filled).
+        screen_cols: BTreeMap<usize, usize>,
         /// A `turn` was sent.
         turned: bool,
         /// How many `turn`s were sent.
@@ -4000,9 +3955,65 @@ mod tests {
         /// episode's close reads the `limited: …` its escalation wrote.
         attention: Option<String>,
         /// Another writer's text that lands over ours right after the
-        /// loop's `meta set attention` — the link Notification hook raising
+        /// loop's `meta set attention` — another writer raising
         /// `claude needs approval: …` while the episode is open.
         foreign_attention: Option<String>,
+        /// The session's `cwd=` in the `meta` reply (`None`: `-`).
+        cwd: Option<String>,
+        /// What `help …` answers (stdout): by default the catalog line for
+        /// `key` of a host that has no generation fence.
+        help: String,
+        /// `status`'s `hold=` and `fabric=`.
+        hold: &'static str,
+        fabric: &'static str,
+        /// `hold=` after this many `status` reads is `0` (the hold lifts).
+        hold_lifts_after: Option<usize>,
+        status_reads: usize,
+        /// At the first `key`, the screen is replaced by this one before the
+        /// guard is judged (and the next read serves it): a box swapped
+        /// between the loop's read and its press.
+        swap_at_key: Option<Vec<String>>,
+        /// `key if-gen=<e.s>` is known: a press whose generation is not the
+        /// screen's (`1.<content seq>`) answers `OK skipped reason=changed
+        /// seq=<now>`, and the retired `if-seq=` is `ERR usage`, as the host
+        /// with the fence answers.
+        gen_fence: bool,
+        /// `text --json` carries `"gen":"1.<seq>"` (a host with the fence).
+        sends_gen: bool,
+        /// Requests not counted in the script's indexes (the start-up
+        /// reconcile read).
+        uncounted: usize,
+        /// `await idle` never latches — a screen that animates (Claude
+        /// Code's blinking tool row) — and answers `OK timeout` after at most
+        /// 50 ms of its own timeout.
+        idle_never: bool,
+        /// This many `key` requests find the content seq moved one on (a row
+        /// that ticks between the read and the press, the box unchanged).
+        tick_at_key: usize,
+        /// `status program=` (lane C): the session's foreground program.
+        program: &'static str,
+        /// The program's name as the server resolves it late (lane C
+        /// resolves it off its event loop): `await agent …` makes it this,
+        /// and latches. Without one, `await agent` latches only while the
+        /// program is an agent, as the server publishes no verdict for
+        /// anything else, and times out otherwise.
+        program_resolves_to: Option<&'static str>,
+        /// `status agent=`: the server's own verdict on the screen (`-`:
+        /// none, as for a shell showing a captured box).
+        agent: &'static str,
+        /// The supervisor-claim requests (`meta set|unset supervisor …`),
+        /// kept apart from `requests` — the claim is the loop's
+        /// bookkeeping, and every script's indexes run without it — and the
+        /// replies they get, in order (none left: `OK`).
+        claims: Vec<String>,
+        claim_replies: VecDeque<CtlReply>,
+        /// Every request in arrival order, the claim's included, each with
+        /// whether it was answered `OK` — what a Tier-1 bind projects.
+        order: Vec<(String, bool)>,
+        /// A person's own (bare-owner) attention entry, and whether it was
+        /// set after this loop's (the server shows the most recent).
+        human_attention: Option<String>,
+        human_on_top: bool,
     }
 
     fn ok(stdout: &str) -> CtlReply {
@@ -4078,6 +4089,8 @@ mod tests {
                 release_at: BTreeMap::new(),
                 verb_replies: BTreeMap::new(),
                 turn_releases: None,
+                turn_gates: Vec::new(),
+                screen_cols: BTreeMap::new(),
                 turned: false,
                 turns: 0,
                 stall_sleep: None,
@@ -4085,53 +4098,140 @@ mod tests {
                 cursor_col: None,
                 attention: None,
                 foreign_attention: None,
+                cwd: None,
+                help: "key [id=<key>] [if=<re>] <name>: send a named key\n".to_string(),
+                hold: "0",
+                fabric: "connected",
+                hold_lifts_after: None,
+                status_reads: 0,
+                swap_at_key: None,
+                gen_fence: false,
+                sends_gen: false,
+                uncounted: 0,
+                idle_never: false,
+                tick_at_key: 0,
+                program: "claude",
+                program_resolves_to: None,
+                agent: "-",
+                claims: Vec::new(),
+                claim_replies: VecDeque::new(),
+                order: Vec::new(),
+                human_attention: None,
+                human_on_top: false,
             }
         }
         /// The bare `meta` reply, `attention=` pct-encoded as the server
-        /// spells it (`-` = unset).
+        /// spells it (`-` = unset): the most recent entry of the loop's
+        /// keyed one (`attention`, owner `supervisor`) and a person's bare
+        /// one, its owner, and how many stand (lane C's keyed attention).
         fn meta_line(&self) -> String {
-            let attention = self.attention.as_deref().map_or_else(
-                || "-".to_string(),
-                |t| {
-                    t.bytes()
-                        .map(|b| {
-                            if b.is_ascii_graphic() && b != b'%' {
-                                char::from(b).to_string()
-                            } else {
-                                format!("%{b:02X}")
-                            }
-                        })
-                        .collect()
-                },
-            );
+            let pct = |t: &str| -> String {
+                t.bytes()
+                    .map(|b| {
+                        if b.is_ascii_graphic() && b != b'%' {
+                            char::from(b).to_string()
+                        } else {
+                            format!("%{b:02X}")
+                        }
+                    })
+                    .collect()
+            };
+            let shown = match (&self.attention, &self.human_attention) {
+                (Some(_), Some(h)) if self.human_on_top => Some((h, "%2D")),
+                (Some(a), _) => Some((a, "supervisor")),
+                (None, Some(h)) => Some((h, "%2D")),
+                (None, None) => None,
+            };
+            let (attention, owner) = shown.map_or(("-".to_string(), "-"), |(t, o)| (pct(t), o));
+            let owners =
+                usize::from(self.attention.is_some()) + usize::from(self.human_attention.is_some());
+            let cwd = self.cwd.as_deref().unwrap_or("-");
             format!(
                 "OK title=- user_title=- description=- icon=- role=- attention={attention} \
-                 cwd=- state=alive\n"
+                 cwd={cwd} state=alive attention_owner={owner} attention_owners={owners} \
+                 supervisor=-\n"
+            )
+        }
+        /// The `status` reply: the fields the loop reads.
+        fn status_line(&mut self) -> String {
+            self.status_reads += 1;
+            if self.hold_lifts_after.is_some_and(|n| self.status_reads > n) {
+                self.hold = "0";
+            }
+            format!(
+                "OK schema=1 sid=- phase=running hold={} fabric={} program={} agent={} seq={}\n",
+                self.hold, self.fabric, self.program, self.agent, self.seq
             )
         }
         fn last_served(&self) -> &[String] {
             &self.screens[self.served.saturating_sub(1).min(self.screens.len() - 1)]
         }
+        /// The screen the loop is on sits until a `turn` releases it
+        /// ([`Self::turn_releases`], [`Self::turn_gates`]).
+        fn held(&self) -> bool {
+            self.turn_releases
+                .is_some_and(|i| self.served == i + 1 && !self.turned)
+                || self
+                    .turn_gates
+                    .iter()
+                    .enumerate()
+                    .any(|(k, &g)| self.served == g + 1 && self.turns <= k)
+        }
         fn screen_json(&mut self) -> String {
-            let i = self.served.min(self.screens.len() - 1);
-            self.served += 1;
-            self.seq += 1;
+            let i = if self.held() {
+                self.served - 1
+            } else {
+                let i = self.served.min(self.screens.len() - 1);
+                self.served += 1;
+                self.seq += 1;
+                i
+            };
             let rows: Vec<String> = self.screens[i]
                 .iter()
                 .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
                 .collect();
-            let composer_col = self.cursor_col.unwrap_or_else(|| {
-                if self.screens[i].iter().any(|r| r == "❯ 1" || r == "❯ 0") {
-                    3
-                } else {
-                    2
-                }
-            });
+            let composer_col = self
+                .screen_cols
+                .get(&i)
+                .copied()
+                .or(self.cursor_col)
+                .unwrap_or_else(|| {
+                    if self.screens[i].iter().any(|r| r == "❯ 1" || r == "❯ 0") {
+                        3
+                    } else {
+                        2
+                    }
+                });
+            let generation = if self.sends_gen {
+                format!(",\"gen\":\"1.{}\"", self.seq)
+            } else {
+                String::new()
+            };
             format!(
-                "{{\"rows\":[{}],\"cursor\":{{\"row\":10,\"col\":{composer_col},\"visible\":true,\"style\":\"block\"}},\"dims\":{{\"rows\":40,\"cols\":120}},\"seq\":{}}}\n",
+                "{{\"rows\":[{}],\"cursor\":{{\"row\":10,\"col\":{composer_col},\"visible\":true,\"style\":\"block\"}},\"dims\":{{\"rows\":40,\"cols\":120}},\"seq\":{}{generation}}}\n",
                 rows.join(","),
                 self.seq
             )
+        }
+        /// A wait on a screen that sits: `ERR exited` once `vanish_after`
+        /// stalls have passed, else (after `stall_sleep`) `OK timeout`.
+        fn stall(&mut self, tail: &[&str]) -> CtlReply {
+            if let Some(n) = self.vanish_after {
+                if self.stalls >= n {
+                    return err("exited");
+                }
+                self.stalls += 1;
+            }
+            if let Some(nap) = self.stall_sleep {
+                let asked = tail
+                    .iter()
+                    .position(|a| *a == "timeout")
+                    .and_then(|i| tail.get(i + 1))
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                    .map_or(nap, Duration::from_millis);
+                std::thread::sleep(nap.min(asked));
+            }
+            timeout()
         }
         fn presses(&self) -> Vec<&String> {
             self.requests
@@ -4176,8 +4276,35 @@ mod tests {
                     let body = self.screen_json();
                     Ok(ok(&body))
                 }
+                "await" if tail.first() == Some(&"agent") => {
+                    if let Some(p) = self.program_resolves_to.take() {
+                        self.program = p;
+                    }
+                    Ok(if matches!(self.program, "claude" | "codex") {
+                        ok("OK agent prompt rev=1\n")
+                    } else {
+                        timeout()
+                    })
+                }
                 "await" if tail.first() == Some(&"gone") && !self.modern => {
                     Ok(usage("await <idle|seq|match|block>"))
+                }
+                // `await gone <re>`: latches at once when no row of the
+                // screen matches, and — as `await seq` — while another
+                // screen is still to come (the worker moved on); on the last
+                // screen, with a row still matching, it stalls like `seq`.
+                "await" if tail.first() == Some(&"gone") => {
+                    if let Some(r) = self.replies.pop_front() {
+                        return Ok(r);
+                    }
+                    let clear = tail
+                        .get(1)
+                        .and_then(|p| aterm_observe::row_matcher(p).ok())
+                        .is_none_or(|m| !self.last_served().iter().any(|r| m.matches(r)));
+                    if clear || self.served < self.screens.len() {
+                        return Ok(ok(&format!("OK gone {}\n", self.seq)));
+                    }
+                    Ok(self.stall(tail))
                 }
                 "await" if tail.first() == Some(&"seq") => {
                     if let Some(r) = self.replies.pop_front() {
@@ -4187,30 +4314,30 @@ mod tests {
                         .get(1)
                         .and_then(|n| n.parse::<u64>().ok())
                         .is_some_and(|n| n > self.seq);
-                    let held = self
-                        .turn_releases
-                        .is_some_and(|i| self.served == i + 1 && !self.turned);
-                    if held {
-                        return Ok(timeout());
-                    }
-                    if self.served < self.screens.len() && !stale {
-                        return Ok(ok("OK seq\n"));
-                    }
-                    if let Some(n) = self.vanish_after {
-                        if self.stalls >= n {
-                            return Ok(err("exited"));
-                        }
-                        self.stalls += 1;
-                    }
-                    if let Some(nap) = self.stall_sleep {
+                    if self.held() {
+                        // As a real wait on a screen that sits: not at once.
                         let asked = tail
                             .iter()
                             .position(|a| *a == "timeout")
                             .and_then(|i| tail.get(i + 1))
                             .and_then(|ms| ms.parse::<u64>().ok())
-                            .map_or(nap, Duration::from_millis);
-                        std::thread::sleep(nap.min(asked));
+                            .unwrap_or(0);
+                        std::thread::sleep(Duration::from_millis(asked.min(2)));
+                        return Ok(timeout());
                     }
+                    if self.served < self.screens.len() && !stale {
+                        return Ok(ok("OK seq\n"));
+                    }
+                    Ok(self.stall(tail))
+                }
+                "await" if tail.first() == Some(&"idle") && self.idle_never => {
+                    let asked = tail
+                        .iter()
+                        .position(|a| *a == "timeout")
+                        .and_then(|i| tail.get(i + 1))
+                        .and_then(|ms| ms.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    std::thread::sleep(Duration::from_millis(asked.min(50)));
                     Ok(timeout())
                 }
                 "await" if tail.first() == Some(&"idle") && self.idle_skips_busy => {
@@ -4226,8 +4353,38 @@ mod tests {
                     Ok(ok("OK idle\n"))
                 }
                 "key" => {
+                    if self.tick_at_key > 0 {
+                        self.tick_at_key -= 1;
+                        self.seq += 1;
+                    }
+                    if let Some(swapped) = self.swap_at_key.take() {
+                        let at = self.served.saturating_sub(1).min(self.screens.len() - 1);
+                        self.screens[at] = swapped.clone();
+                        self.screens.insert(at + 1, swapped);
+                        self.seq += 1;
+                    }
                     if let Some(r) = self.key_replies.pop_front() {
                         return Ok(r);
+                    }
+                    let mut tail = tail;
+                    if tail.first().is_some_and(|a| a.starts_with("if-seq=")) {
+                        return Ok(if self.gen_fence && self.modern {
+                            err("usage: key [id=<key>] [if=<re>] [if-gen=<g>] <name>")
+                        } else {
+                            bare_err()
+                        });
+                    }
+                    if let Some(fence) = tail.first().and_then(|a| a.strip_prefix("if-gen=")) {
+                        if !self.gen_fence || !self.modern {
+                            return Ok(bare_err());
+                        }
+                        if fence != format!("1.{}", self.seq) {
+                            return Ok(ok(&format!(
+                                "OK skipped reason=changed seq={}\n",
+                                self.seq
+                            )));
+                        }
+                        tail = &tail[1..];
                     }
                     let guard = tail.first().and_then(|a| a.strip_prefix("if="));
                     if guard.is_some() && !self.modern {
@@ -4244,6 +4401,29 @@ mod tests {
                     }
                     Ok(ok(&format!("OK seq={seq}\n")))
                 }
+                // `send [if-gen=<g>] [if=<re>] [--] <text>` on a host with
+                // the fences: as `key`'s, then `OK seq=<n>`.
+                "send" if self.gen_fence && self.modern => {
+                    let mut tail = tail;
+                    if let Some(fence) = tail.first().and_then(|a| a.strip_prefix("if-gen=")) {
+                        if fence != format!("1.{}", self.seq) {
+                            return Ok(ok(&format!(
+                                "OK skipped reason=changed seq={}\n",
+                                self.seq
+                            )));
+                        }
+                        tail = &tail[1..];
+                    }
+                    if let Some(pattern) = tail.first().and_then(|a| a.strip_prefix("if=")) {
+                        let Ok(matcher) = aterm_observe::row_matcher(pattern) else {
+                            return Ok(err("badregex"));
+                        };
+                        if !self.last_served().iter().any(|r| matcher.matches(r)) {
+                            return Ok(ok(&format!("OK skipped seq={}\n", self.seq)));
+                        }
+                    }
+                    Ok(ok(&format!("OK seq={}\n", self.seq)))
+                }
                 // A host without the verbs answers what an older build does.
                 "history" => Ok(self
                     .history
@@ -4254,17 +4434,33 @@ mod tests {
                     .pop_front()
                     .unwrap_or_else(|| err("unknown verb (try: help)"))),
                 "meta" if tail.is_empty() => Ok(ok(&self.meta_line())),
+                "status" => {
+                    let line = self.status_line();
+                    Ok(ok(&line))
+                }
+                "help" => Ok(ok(&self.help.clone())),
                 "meta" => {
                     let r = self.replies.pop_front().unwrap_or_else(|| ok("OK\n"));
                     if r.ok() && tail.get(1) == Some(&"attention") {
-                        match tail.first() {
-                            Some(&"set") => {
-                                self.attention = Some(tail[2..].join(" "));
+                        // Keyed: `owner=supervisor` is the loop's entry; the
+                        // bare form is a person's.
+                        let keyed = tail.get(2) == Some(&"owner=supervisor");
+                        let text = tail[if keyed { 3 } else { 2 }..].join(" ");
+                        match (tail.first(), keyed) {
+                            (Some(&"set"), true) => {
+                                self.attention = Some(text);
+                                self.human_on_top = false;
                                 if let Some(f) = self.foreign_attention.take() {
-                                    self.attention = Some(f);
+                                    self.human_attention = Some(f);
+                                    self.human_on_top = true;
                                 }
                             }
-                            Some(&"unset") => self.attention = None,
+                            (Some(&"unset"), true) => self.attention = None,
+                            (Some(&"set"), false) => {
+                                self.human_attention = Some(text);
+                                self.human_on_top = true;
+                            }
+                            (Some(&"unset"), false) => self.human_attention = None,
                             _ => {}
                         }
                     }
@@ -4277,40 +4473,74 @@ mod tests {
 
     impl Ctl for Mock {
         fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
-            let at = self.requests.len();
-            if let Some(pause) = self.delay.remove(&at) {
-                std::thread::sleep(pause);
+            // The supervisor claim: the loop's bookkeeping, outside every
+            // script's indexes (see `claims`).
+            let words: Vec<&str> = args
+                .iter()
+                .copied()
+                .filter(|a| !a.starts_with('@'))
+                .collect();
+            if words.len() >= 3 && words[0] == "meta" && words[2] == "supervisor" {
+                self.claims.push(args.join(" "));
+                let r = self.claim_replies.pop_front().unwrap_or_else(|| ok("OK\n"));
+                self.order.push((args.join(" "), r.ok()));
+                return Ok(r);
             }
-            if let Some(replies) = self.release_at.remove(&at)
-                && let Some(tx) = &self.release
-            {
-                for r in replies {
-                    let _ = tx.send(r);
+            let r = self.call_counted(args)?;
+            self.order.push((args.join(" "), r.ok()));
+            Ok(r)
+        }
+    }
+
+    impl Mock {
+        /// [`Ctl::call`] past the claim: the scripts' indexed requests.
+        fn call_counted(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+            // A watch's start-up reconcile read (`meta` as the very first
+            // request) is not counted: the indexes the scripts name run from
+            // the loop's first wait, and only `down` answers it.
+            let first_meta = self.requests.is_empty()
+                && args
+                    .iter()
+                    .filter(|a| !a.starts_with('@'))
+                    .eq(["meta"].iter());
+            let at = self.requests.len() - self.uncounted;
+            if first_meta {
+                self.uncounted = 1;
+            } else {
+                if let Some(pause) = self.delay.remove(&at) {
+                    std::thread::sleep(pause);
                 }
-            }
-            if let Some((i, seq)) = self.restart
-                && i == at
-            {
-                self.seq = seq;
-                self.restart = None;
+                if let Some(replies) = self.release_at.remove(&at)
+                    && let Some(tx) = &self.release
+                {
+                    for r in replies {
+                        let _ = tx.send(r);
+                    }
+                }
+                if let Some((i, seq)) = self.restart
+                    && i == at
+                {
+                    self.seq = seq;
+                    self.restart = None;
+                }
             }
             let verb = args
                 .iter()
                 .find(|a| !a.starts_with('@'))
                 .copied()
                 .unwrap_or("");
-            let scripted = self
-                .by_index
-                .remove(&at)
-                .or_else(|| {
-                    self.down
-                        .as_ref()
-                        .filter(|(from, _)| at >= *from)
-                        .map(|(_, r)| r.clone())
-                })
-                .or_else(|| {
+            let down = self
+                .down
+                .as_ref()
+                .filter(|(from, _)| at >= *from)
+                .map(|(_, r)| r.clone());
+            let scripted = if first_meta {
+                down
+            } else {
+                self.by_index.remove(&at).or(down).or_else(|| {
                     (verb == "await" && self.drop_awaits_from.is_some_and(|d| at >= d)).then(closed)
-                });
+                })
+            };
             let reply = match scripted {
                 Some(r) => {
                     self.requests.push(args.join(" "));
@@ -4326,6 +4556,9 @@ mod tests {
             Ok(reply)
         }
     }
+
+    /// The guarded press on `bash_one_row`'s box: its command row, anchored.
+    const G_PRESS: &str = "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1";
 
     fn busy_screen() -> Vec<String> {
         let mut r = rows(&["⏺ Working.", "", "✻ Synthesizing… (18s)", ""]);
@@ -4369,11 +4602,16 @@ mod tests {
             context_warn: 10,
             journal: None,
             mail: None,
+            // The CLI's: a `watch` types nothing unless asked (`--resume`).
+            policy: SupervisorConfig::cli(false),
+            resume: None,
+            yield_when_held: false,
         }
     }
 
     /// Modern host: the first wait is `await gone`, reads use `tail=40`, and a
-    /// busy read is followed by `await seq <seq>` before the next idle wait.
+    /// busy read that shows the busy footer re-arms `await gone` — no idle
+    /// step (under an animating screen `await idle` never latches: LV-3).
     #[test]
     fn await_turn_uses_gone_then_idle_seq_on_a_modern_host() {
         let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
@@ -4388,8 +4626,7 @@ mod tests {
             [
                 "@s-1 await gone esc.to.interrupt timeout 20000",
                 "@s-1 text --json tail=40",
-                "@s-1 await seq 101 timeout 20000",
-                "@s-1 await idle 2000 timeout 20000",
+                "@s-1 await gone esc.to.interrupt timeout 20000",
                 "@s-1 text --json tail=40",
             ]
         );
@@ -4446,9 +4683,11 @@ mod tests {
     }
 
     /// `--auto-reads`: a read-only Bash prompt is approved with the guarded
-    /// press, noted, the loop waits for the box to LEAVE (`await seq`) and
-    /// continues with the settle wait, not `await gone`; the next (write)
-    /// prompt is handed to the manager with the box printed.
+    /// press (the judged command row, anchored; the fence asked of `help key`
+    /// once), noted, the loop waits for the box to LEAVE (`await seq`) and
+    /// continues with the short settle, not `await gone`; the busy read after
+    /// it re-arms `await gone`, and the next (write) prompt is handed to the
+    /// manager with the box printed.
     #[test]
     fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
         let (dir, notes) = notes_file("approve");
@@ -4476,16 +4715,19 @@ mod tests {
             [
                 "@s-9 await gone esc.to.interrupt timeout 20000",
                 "@s-9 text --json tail=40",
-                "@s-9 key if=Do.you.want.to.proceed 1",
+                "@s-9 status",
+                "@s-9 help key",
+                "@s-9 key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "@s-9 await seq 101 timeout 20000",
-                "@s-9 await idle 2000 timeout 20000",
+                "@s-9 await idle 500 timeout 1500",
                 "@s-9 text --json tail=40",
-                "@s-9 await seq 102 timeout 20000",
-                "@s-9 await idle 2000 timeout 20000",
+                "@s-9 await gone esc.to.interrupt timeout 20000",
                 "@s-9 text --json tail=40",
+                "@s-9 status",
             ],
             "one guarded press, then the box must leave before the next look; \
-             after it the settle wait, not `await gone` (the footer is not up yet)"
+             after it the settle wait, not `await gone` (the footer is not up yet); \
+             each box decided reads the session's program first"
         );
         let lines = read_notes(&dir, &notes);
         assert_eq!(lines.len(), 2, "{lines:?}");
@@ -4494,7 +4736,9 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines[1].ends_with("Z handed to the manager (rm): rm -rf target"),
+            lines[1].ends_with(
+                "Z handed to the manager (not read-only (space reading): rm): rm -rf target"
+            ),
             "{lines:?}"
         );
         assert!(lines[0].starts_with("20"), "utc stamp: {lines:?}");
@@ -4531,7 +4775,9 @@ mod tests {
                 "await idle 2000 timeout 20000",
                 "text --json tail=40",
                 "text --json",
-                "key if=Do.you.want.to.proceed 1",
+                "status",
+                "help key",
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "text --json",
                 "key 1",
                 "await seq 102 timeout 2000",
@@ -4569,7 +4815,10 @@ mod tests {
         assert!(out.starts_with("idle\n--\n"), "{out}");
         assert_eq!(
             m.presses(),
-            ["key if=Do.you.want.to.proceed 1", "key 1"],
+            [
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
+                "key 1"
+            ],
             "{:?}",
             m.requests
         );
@@ -4596,7 +4845,10 @@ mod tests {
         assert_eq!(code, 0);
         assert!(out.starts_with("idle\n--\n"), "{out}");
         assert_eq!(s.caps().key_if, Some(true), "a skip still proves the guard");
-        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1"]);
+        assert_eq!(
+            m.presses(),
+            ["key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1"]
+        );
         let lines = read_notes(&dir, &notes);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
@@ -4607,25 +4859,25 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("approved")), "{lines:?}");
     }
 
-    /// A guard that misses on the VERY screen that was parsed (a Bash box with
-    /// no `Do you want to proceed?` row) is the manager's, not a loop.
+    /// A guard that misses on the VERY screen that was parsed (the server
+    /// answers `OK skipped` at the read's own seq) is the manager's, not a
+    /// loop.
     #[test]
     fn a_guard_that_matches_no_row_of_the_parsed_box_is_handed_over() {
-        let mut box_without_question = bash_one_row();
-        box_without_question.retain(|r| !r.contains("Do you want to proceed?"));
-        assert_eq!(
-            parse_prompt(&box_without_question).map(|p| p.kind),
-            Some(PromptKind::Bash)
-        );
         let (dir, notes) = notes_file("norow");
-        let mut m = Mock::new(true, vec![box_without_question]);
+        let mut m = Mock::new(true, vec![bash_one_row()]);
+        // The read is seq 101; the guard found no row on that very screen.
+        m.key_replies.push_back(ok("OK skipped seq=101\n"));
         let mut s = Session::new(&mut m, None);
         let (out, code) = s
             .supervise(&auto(30, Some(notes.clone())))
             .expect("supervise");
         assert_eq!(code, 0);
         assert!(out.starts_with("prompt\nkind bash\n"), "{out}");
-        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1"]);
+        assert_eq!(
+            m.presses(),
+            ["key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1"]
+        );
         let lines = read_notes(&dir, &notes);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
@@ -4635,12 +4887,17 @@ mod tests {
     }
 
     /// The other `ERR`s a modern host can answer the guard with are never an
-    /// approval: `busy sink` is retried and then pressed; `halted` and `no such
-    /// session` surface as errors with nothing approved.
+    /// approval. `busy sink` is never re-sent as it was: the loop backs off,
+    /// reads and decides again, and presses the box still up after that
+    /// fresh read; `no such session` and `badregex` surface as errors with
+    /// nothing approved.
     #[test]
     fn guard_errors_are_retried_or_surfaced_never_approved() {
         let (dir, notes) = notes_file("busy");
-        let mut m = Mock::new(true, vec![bash_one_row(), busy_screen(), idle_screen()]);
+        let mut m = Mock::new(
+            true,
+            vec![bash_one_row(), bash_one_row(), busy_screen(), idle_screen()],
+        );
         m.key_replies.push_back(err("busy sink"));
         let mut s = Session::new(&mut m, None);
         let (out, code) = s
@@ -4648,19 +4905,22 @@ mod tests {
             .expect("supervise");
         assert_eq!(code, 0);
         assert!(out.starts_with("idle\n--\n"), "{out}");
-        assert_eq!(
-            m.presses(),
-            [
-                "key if=Do.you.want.to.proceed 1",
-                "key if=Do.you.want.to.proceed 1"
-            ],
-            "retried once, then the model pressed"
+        let press = G_PRESS;
+        assert_eq!(m.presses(), [press, press], "{:?}", m.requests);
+        let first = m.requests.iter().position(|r| r == press).expect("press");
+        assert!(
+            m.requests[first + 1..]
+                .iter()
+                .take_while(|r| *r != press)
+                .any(|r| r.starts_with("text --json")),
+            "the second press follows a fresh read: {:?}",
+            m.requests
         );
         let lines = read_notes(&dir, &notes);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("approved read-only"), "{lines:?}");
 
-        for what in ["halted", "no such session", "badregex"] {
+        for what in ["no such session", "badregex"] {
             let (dir, notes) = notes_file("halted");
             let mut m = Mock::new(true, vec![bash_one_row()]);
             m.key_replies.push_back(err(what));
@@ -4674,15 +4934,25 @@ mod tests {
             assert!(lines.is_empty(), "{what}: nothing approved: {lines:?}");
         }
 
-        // busy sink that never clears is an error too.
+        // A busy sink that never clears ends nothing: every try is a fresh
+        // read and decision after a back-off that doubles, until the budget.
         let mut m = Mock::new(true, vec![bash_one_row()]);
-        for _ in 0..=BUSY_SINK_RETRIES {
+        for _ in 0..20 {
             m.key_replies.push_back(err("busy sink"));
         }
+        m.stall_sleep = Some(Duration::from_secs(10));
         let mut s = Session::new(&mut m, None);
-        let e = s.supervise(&auto(30, None)).expect_err("surfaces");
-        assert!(e.contains("ERR busy sink"), "{e}");
-        assert_eq!(m.presses().len(), 1 + BUSY_SINK_RETRIES as usize);
+        let (out, code) = s.supervise(&auto_ms(1_200, None)).expect("supervise");
+        assert_eq!(code, EXIT_TIMEOUT, "{out}");
+        let presses = m.presses().len();
+        assert!((2..=4).contains(&presses), "{presses}: {:?}", m.requests);
+        let reads_between = m
+            .requests
+            .split(|r| r == press)
+            .skip(1)
+            .filter(|chunk| chunk.iter().any(|r| r.starts_with("text --json")))
+            .count();
+        assert!(reads_between >= presses - 1, "{:?}", m.requests);
     }
 
     /// Without `--auto-reads` even a read-only prompt is the manager's; a
@@ -4733,7 +5003,9 @@ mod tests {
             [
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                "key if=Do.you.want.to.proceed 1",
+                "status",
+                "help key",
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "await seq 101 timeout 20000",
                 "text --json tail=40",
             ],
@@ -5132,25 +5404,33 @@ mod tests {
         assert_eq!(
             m.requests,
             [
+                // The start-up reconcile read: no attention stands.
+                "meta",
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                "await seq 101 timeout 20000",
-                "await idle 2000 timeout 20000",
+                // Busy under the footer: its leaving is the next wait.
+                "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                "key if=Do.you.want.to.proceed 1",
+                "status",
+                "help key",
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
+                // The box must leave; then the short settle.
                 "await seq 102 timeout 20000",
-                "await idle 2000 timeout 20000",
+                "await idle 500 timeout 1500",
                 "text --json tail=40",
-                "await seq 103 timeout 20000",
-                "await idle 2000 timeout 20000",
+                "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                // EVENT question: wait for the screen to move past it.
+                // The question is escalated to the worker's attention (no
+                // manager to mail); then the wait past it.
+                "meta set attention owner=supervisor claude question: Keep the harness or rewrite it? (the worker \
+                 asked a question)",
                 "await seq 104 timeout 20000",
-                "await idle 2000 timeout 20000",
+                "await idle 500 timeout 1500",
                 "text --json tail=40",
-                "await seq 105 timeout 20000",
-                "await idle 2000 timeout 20000",
+                "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
+                // The question has gone: its badge, still ours, is cleared.
+                "meta unset attention owner=supervisor",
                 // EVENT idle: the screen never moves again. Each step that
                 // runs out is checked with a read — its seq is not below 106,
                 // so the count did not start over — and nothing is reported.
@@ -5555,7 +5835,8 @@ mod tests {
                 "EXTEND until=2026-09-18T02:40:00Z reset=7:30pm (America/Los_Angeles)",
                 "EVENT prompt seq=105 kind=workflow classify=- command=Fan out the 12 benchmark \
                  families to 4 agents and collect the standings table.",
-                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)",
+                // The workflow box handed over: waited on by its own row leaving.
+                "EXIT session gone (await gone ^\\x20{2}│\\x20Fan\\x20out\\x20the\\x2012\\x20benchmark\\x20families\\x20to\\x204\\x20agents\\x20and\\x20collect\\x20the\\s*$ failed: aterm-ctl: ERR exited)",
             ]
         );
         assert!(m.presses().is_empty(), "{:?}", m.requests);
@@ -5581,7 +5862,8 @@ mod tests {
                 "APPROVED seq=101 git log --oneline -5",
                 "APPROVED seq=103 git log --oneline -5",
                 "EVENT prompt seq=105 kind=bash classify=read-only command=git log --oneline -5",
-                "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)",
+                "EXIT session gone (await gone ^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ failed: \
+                 aterm-ctl: ERR exited)",
             ]
         );
         assert_eq!(m.presses().len(), 2, "{:?}", m.requests);
@@ -5612,10 +5894,10 @@ mod tests {
             [
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                "await idle 2000 timeout 20000",
+                "await idle 2000 timeout 3000",
                 "text --json tail=40",
                 "await seq 102 timeout 20000",
-                "await idle 2000 timeout 20000",
+                "await idle 2000 timeout 3000",
                 "text --json tail=40",
             ]
         );
@@ -5669,7 +5951,9 @@ mod tests {
         // with it: the approval stands, and the box that did not move is the
         // TIMEOUT, not an EVENT printed after the deadline.
         let mut m = Mock::new(true, vec![bash_one_row()]);
-        m.delay.insert(3, Duration::from_millis(200));
+        // 0 the wait, 1 the read, 2 `help key`, 3 the press, 4 the wait for
+        // the box to leave.
+        m.delay.insert(4, Duration::from_millis(200));
         let opts = SuperviseOpts {
             max: Duration::from_millis(100),
             ..auto(0, None)
@@ -5685,7 +5969,9 @@ mod tests {
                 EXIT_TIMEOUT
             )
         );
-        assert_eq!(m.requests.len(), 4, "nothing read after: {:?}", m.requests);
+        // The start-up `meta`, then the five (the box's `status` among
+        // them); nothing read after.
+        assert_eq!(m.requests.len(), 7, "nothing read after: {:?}", m.requests);
     }
 
     #[test]
@@ -5820,11 +6106,12 @@ mod tests {
         assert_eq!(
             m.requests,
             [
+                "meta",
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
                 "key if=^●.How.is.Claude.doing 0",
                 // Looked at again from a fresh read: the settle wait first.
-                "await idle 2000 timeout 20000",
+                "await idle 500 timeout 1500",
                 "text --json tail=40",
                 "await seq 102 timeout 20000",
                 "text --json tail=40",
@@ -6046,7 +6333,7 @@ mod tests {
         assert_eq!(
             m.presses(),
             [
-                "key if=Do.you.want.to.proceed 1",
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "key if=^●.How.is.Claude.doing 0"
             ],
             "{:?}",
@@ -6067,7 +6354,7 @@ mod tests {
                 lines,
                 [
                     "EVENT prompt seq=101 kind=bash classify=not-read-only:rm command=rm -rf target",
-                    "EXIT session gone (await seq 101 failed: aterm-ctl: ERR exited)",
+                    "EXIT session gone (await gone ^\\x20{3}rm\\x20-rf\\x20target\\s*$ failed: aterm-ctl: ERR exited)",
                 ],
                 "dismiss_surveys={dismiss_surveys}"
             );
@@ -6114,7 +6401,7 @@ mod tests {
     /// bare `How.is.Claude.doing` matched all three.)
     #[test]
     fn the_survey_guard_matches_the_open_survey_and_no_copy_of_it() {
-        let guard = aterm_observe::row_matcher(SURVEY_ROW).expect("the guard compiles");
+        let guard = aterm_observe::row_matcher(&survey_row()).expect("the guard compiles");
         let open = with_survey(idle_screen());
         assert!(survey_open(&open));
         assert_eq!(
@@ -6122,7 +6409,10 @@ mod tests {
             [SURVEY_ROWS[0]]
         );
         let event = survey_event_line(7, Some("@s-1"));
-        let help = format!("                       aterm ctl @sid key 'if={SURVEY_ROW}' 0");
+        let help = format!(
+            "                       aterm ctl @sid key 'if={}' 0",
+            survey_row()
+        );
         for copy in [
             framed(&[
                 "⏺ Bash(cat survey-open.txt)",
@@ -6364,7 +6654,9 @@ mod tests {
                 "await idle 2000 timeout 20000",
                 "text --json tail=40",
                 "text --json",
-                "key if=Do.you.want.to.proceed 1",
+                "status",
+                "help key",
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "text --json",
             ],
             "{:?}",
@@ -6389,7 +6681,13 @@ mod tests {
             .supervise(&auto(30, None))
             .expect("supervise");
         assert_eq!(code, 0);
-        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1", "key 1"]);
+        assert_eq!(
+            m.presses(),
+            [
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
+                "key 1"
+            ]
+        );
     }
 
     /// A draft can fill more than one row of the composer, and a `0` pressed
@@ -6965,8 +7263,8 @@ mod tests {
         assert!(!s.unserved(&err("halted")));
     }
 
-    /// The measured failure: the connection drops under `await seq` while the
-    /// worker is busy. One `RECONNECT` line however many reads fail (two here;
+    /// The measured failure: the connection drops under the wait while the
+    /// worker is busy (the wait for its footer to leave). One `RECONNECT` line however many reads fail (two here;
     /// the third, after pauses of 5 + 10 + 20 ms, answers), then `RECONNECTED
     /// after <ms> ms`, and the loop goes on — settling first, then reading —
     /// to the next review point, on the seq the new instance counts.
@@ -6982,7 +7280,7 @@ mod tests {
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert_eq!(
             lines[0],
-            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+            format!("RECONNECT await gone esc.to.interrupt failed: aterm-ctl: {CLOSED}")
         );
         assert!(
             reconnected_ms(&lines[1]) >= 35,
@@ -6999,17 +7297,21 @@ mod tests {
         assert_eq!(
             m.requests,
             [
+                "meta",
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                // The instance goes under the wait.
-                "await seq 101 timeout 20000",
+                // The instance goes under the wait for the footer to leave.
+                "await gone esc.to.interrupt timeout 20000",
                 // Three reads of the same session: two fail, one answers.
                 "text --json tail=40",
                 "text --json tail=40",
                 "text --json tail=40",
-                // The loop again: settle, read, report, wait past the point.
-                "await idle 2000 timeout 20000",
+                // The loop again: settle, read, report (the question to the
+                // worker's attention), wait past the point.
+                "await idle 500 timeout 1500",
                 "text --json tail=40",
+                "meta set attention owner=supervisor claude question: Keep the harness or rewrite it? (the worker \
+                 asked a question)",
                 "await seq 22 timeout 20000",
             ],
             "{:?}",
@@ -7061,19 +7363,20 @@ mod tests {
         assert_eq!(
             m.requests,
             [
+                "meta",
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
                 "await seq 101 timeout 20000",
                 "text --json tail=40",
-                "await idle 2000 timeout 20000",
+                "await idle 500 timeout 1500",
                 "text --json tail=40",
                 // The same point, reported again, waited past at the new
                 // instance's seq 12.
                 "await seq 12 timeout 20000",
-                "await idle 2000 timeout 20000",
+                "await idle 500 timeout 1500",
                 "text --json tail=40",
-                "await seq 13 timeout 20000",
-                "await idle 2000 timeout 20000",
+                // Busy under the footer: its leaving is the next wait.
+                "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
                 "await seq 14 timeout 20000",
             ],
@@ -7109,13 +7412,15 @@ mod tests {
         assert_eq!(
             m.requests,
             [
+                // The start-up reconcile read: no attention stands.
+                "meta",
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
                 // Served, and ran out: the count is another instance's now.
                 "await seq 101 timeout 20000",
                 // The check: seq 5, below 101.
                 "text --json tail=40",
-                "await idle 2000 timeout 20000",
+                "await idle 500 timeout 1500",
                 "text --json tail=40",
                 "await seq 6 timeout 20000",
             ],
@@ -7129,7 +7434,9 @@ mod tests {
     #[test]
     fn a_connection_that_never_comes_back_ends_when_the_window_lapses() {
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.down = Some((2, closed()));
+        // 0 the first wait, 1 the read, 2 the question's attention, 3 the
+        // wait past it.
+        m.down = Some((3, closed()));
         let window = Duration::from_millis(60);
         let started = Instant::now();
         let (lines, code) = watch_quick(&mut m, window);
@@ -7145,11 +7452,19 @@ mod tests {
             ]
         );
         assert_eq!(code, 1);
-        let probes = &m.requests[3..];
+        // After the meta, the wait, the read, the attention and the wait
+        // that failed: the probes, then the watcher's last act — its own
+        // keyed badge unset (unanswered: the session is out of reach).
+        let (last, probes) = m.requests[5..].split_last().expect("requests");
         assert!(!probes.is_empty(), "{:?}", m.requests);
         assert!(
             probes.iter().all(|r| r == "text --json tail=40"),
             "only reads, never the failed wait again: {:?}",
+            m.requests
+        );
+        assert_eq!(
+            last, "meta unset attention owner=supervisor",
+            "{:?}",
             m.requests
         );
     }
@@ -7164,7 +7479,8 @@ mod tests {
     #[test]
     fn an_outage_that_keeps_coming_back_is_one_window() {
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.drop_awaits_from = Some(2);
+        // Index 2 is the question's attention, not a wait.
+        m.drop_awaits_from = Some(3);
         let window = Duration::from_millis(200);
         let started = Instant::now();
         let (lines, code) = watch_quick(&mut m, window);
@@ -7181,7 +7497,7 @@ mod tests {
         reconnected_ms(&lines[2]);
         assert_eq!(
             lines[3],
-            format!("EXIT reconnect window lapsed: await idle 2000 failed: aterm-ctl: {CLOSED}")
+            format!("EXIT reconnect window lapsed: await idle 500 failed: aterm-ctl: {CLOSED}")
         );
         assert_eq!(code, 1);
         let relapses = m
@@ -7203,10 +7519,15 @@ mod tests {
     #[test]
     fn a_later_outage_is_a_new_one_with_its_own_window() {
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.by_index.insert(2, closed());
-        m.by_index.insert(6, timeout());
-        m.delay.insert(6, Duration::from_millis(400));
-        m.by_index.insert(8, closed());
+        // Index 2 is the question's attention, and the same question handed
+        // again after a fresh reconnect is asked again (index 7: an ask per
+        // review point, after work or an outage — main's fed20fadf rule, which
+        // the harness/integrate merge applies to lane B's question escalation
+        // too): the waits are 3, 8 and 10.
+        m.by_index.insert(3, closed());
+        m.by_index.insert(8, timeout());
+        m.delay.insert(8, Duration::from_millis(400));
+        m.by_index.insert(10, closed());
         m.vanish_after = Some(0);
         let (lines, code) = watch_quick(&mut m, Duration::from_millis(300));
         assert_eq!(lines.len(), 8, "{lines:?}");
@@ -7247,8 +7568,10 @@ mod tests {
     /// connection final too, as it was before.
     #[test]
     fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
+        // Index 2 is the question's attention (`meta set`, which the fabric
+        // would answer): the waits past the point are 3 on.
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.by_index.insert(2, err("no such session"));
+        m.by_index.insert(3, err("no such session"));
         let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
         assert_eq!(
             lines,
@@ -7258,12 +7581,12 @@ mod tests {
             ]
         );
         assert_eq!(code, 1);
-        assert_eq!(m.requests.len(), 3, "no retry: {:?}", m.requests);
+        assert_eq!(m.requests.len(), 5, "no retry: {:?}", m.requests);
 
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.by_index.insert(2, closed());
-        m.by_index.insert(3, err("no such session"));
+        m.by_index.insert(3, closed());
         m.by_index.insert(4, err("no such session"));
+        m.by_index.insert(5, err("no such session"));
         m.vanish_after = Some(0);
         let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
         assert_eq!(lines.len(), 5, "{lines:?}");
@@ -7282,8 +7605,8 @@ mod tests {
         assert_eq!(code, 1);
 
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.by_index.insert(2, closed());
-        m.down = Some((3, err("no such session")));
+        m.by_index.insert(3, closed());
+        m.down = Some((4, err("no such session")));
         let (lines, code) = watch_quick(&mut m, Duration::from_millis(60));
         assert_eq!(
             lines,
@@ -7298,7 +7621,7 @@ mod tests {
         assert_eq!(code, 1);
 
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.by_index.insert(2, closed());
+        m.by_index.insert(3, closed());
         let (lines, code) = watch_quick(&mut m, Duration::ZERO);
         assert_eq!(
             lines,
@@ -7308,7 +7631,13 @@ mod tests {
             ]
         );
         assert_eq!(code, 1);
-        assert_eq!(m.requests.len(), 3, "{:?}", m.requests);
+        // Nothing retried; the watcher's last act clears the badge it raised.
+        assert_eq!(
+            m.requests[5..],
+            ["meta unset attention owner=supervisor"],
+            "{:?}",
+            m.requests
+        );
     }
 
     /// The server turning a connection away before reading it — its
@@ -7351,7 +7680,8 @@ mod tests {
     #[test]
     fn a_budget_spent_in_an_outage_is_the_timeout() {
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.down = Some((2, closed()));
+        // 2 is the question's attention; 3 the wait past it.
+        m.down = Some((3, closed()));
         let started = Instant::now();
         let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto_ms(150, None));
         assert!(
@@ -7371,8 +7701,8 @@ mod tests {
 
         // The budget ran out while the request that was lost was in flight.
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.by_index.insert(2, closed());
-        m.delay.insert(2, Duration::from_millis(200));
+        m.by_index.insert(3, closed());
+        m.delay.insert(3, Duration::from_millis(200));
         let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto_ms(100, None));
         assert_eq!(
             lines,
@@ -7382,7 +7712,14 @@ mod tests {
             ]
         );
         assert_eq!(code, EXIT_TIMEOUT);
-        assert_eq!(m.requests.len(), 3, "nothing after: {:?}", m.requests);
+        // Nothing after the budget but the watcher's last act: the badge it
+        // raised for the question, read and cleared.
+        assert_eq!(
+            m.requests[5..],
+            ["meta unset attention owner=supervisor"],
+            "nothing after: {:?}",
+            m.requests
+        );
 
         let mut m = Mock::new(true, vec![busy_screen()]);
         m.down = Some((2, closed()));
@@ -7398,7 +7735,7 @@ mod tests {
         assert!(
             String::from_utf8(log)
                 .expect("utf-8")
-                .starts_with("RECONNECT await seq 101 failed: "),
+                .starts_with("RECONNECT await gone esc.to.interrupt failed: "),
         );
 
         let mut m = Mock::new(true, vec![busy_screen()]);
@@ -7425,7 +7762,7 @@ mod tests {
     fn a_press_in_flight_is_decided_again_from_a_fresh_read() {
         let (dir, notes) = notes_file("inflight");
         let mut m = Mock::new(true, vec![bash_one_row(), write_prompt()]);
-        m.by_index.insert(2, closed());
+        m.by_index.insert(4, closed());
         m.vanish_after = Some(0);
         let (lines, code) = watch_quick_with(
             &mut m,
@@ -7435,7 +7772,10 @@ mod tests {
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert_eq!(
             lines[0],
-            format!("RECONNECT key if=Do.you.want.to.proceed 1 failed: aterm-ctl: {CLOSED}")
+            format!(
+                "RECONNECT key if=^\\x20{{3}}git\\x20log\\x20--oneline\\x20-5\\s*$ 1 failed: \
+                 aterm-ctl: {CLOSED}"
+            )
         );
         reconnected_ms(&lines[1]);
         assert!(
@@ -7445,10 +7785,14 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)"
+            // The box handed over is waited on by its own row leaving.
+            "EXIT session gone (await gone ^\\x20{3}rm\\x20-rf\\x20target\\s*$ failed: aterm-ctl: ERR exited)"
         );
         assert_eq!(code, 1);
-        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1"]);
+        assert_eq!(
+            m.presses(),
+            ["key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1"]
+        );
         let noted = read_notes(&dir, &notes);
         assert_eq!(noted.len(), 2, "{noted:?}");
         assert!(
@@ -7459,7 +7803,9 @@ mod tests {
             "{noted:?}"
         );
         assert!(
-            noted[1].ends_with("handed to the manager (rm): rm -rf target"),
+            noted[1].ends_with(
+                "handed to the manager (not read-only (space reading): rm): rm -rf target"
+            ),
             "{noted:?}"
         );
 
@@ -7473,7 +7819,7 @@ mod tests {
                 idle_screen(),
             ],
         );
-        m.by_index.insert(2, closed());
+        m.by_index.insert(4, closed());
         m.vanish_after = Some(0);
         let (lines, _) = watch_quick(&mut m, Duration::from_secs(5));
         assert_eq!(
@@ -7485,16 +7831,22 @@ mod tests {
             ]
         );
         assert_eq!(
-            m.requests[..7],
+            m.requests[..12],
             [
+                "meta",
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                "key if=Do.you.want.to.proceed 1",
+                "status",
+                "help key",
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "text --json tail=40",
-                "await idle 2000 timeout 20000",
-                // The box read and classified again, then pressed.
+                "await idle 500 timeout 1500",
+                // The box read and decided again (the caps asked again of
+                // the instance that answers now), then pressed.
                 "text --json tail=40",
-                "key if=Do.you.want.to.proceed 1",
+                "status",
+                "help key",
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             ],
             "{:?}",
             m.requests
@@ -7525,7 +7877,7 @@ mod tests {
                 idle_screen(),
             ],
         );
-        m.by_index.insert(7, closed());
+        m.by_index.insert(9, closed());
         m.vanish_after = Some(0);
         let (lines, code) = watch_quick_with(
             &mut m,
@@ -7549,7 +7901,11 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(
             m.presses(),
-            ["key if=Do.you.want.to.proceed 1", "key 1", "key backspace"],
+            [
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
+                "key 1",
+                "key backspace"
+            ],
             "{:?}",
             m.requests
         );
@@ -7575,7 +7931,7 @@ mod tests {
             false,
             vec![bash_one_row(), bash_one_row(), busy_screen(), idle_screen()],
         );
-        m.by_index.insert(8, closed());
+        m.by_index.insert(10, closed());
         m.vanish_after = Some(0);
         let (lines, _) = watch_quick_with(
             &mut m,
@@ -7589,7 +7945,13 @@ mod tests {
             format!("RECONNECT text --json failed: aterm-ctl: {CLOSED}")
         );
         assert_eq!(lines[3], "EVENT idle seq=104 ⏺ Done.");
-        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1", "key 1"]);
+        assert_eq!(
+            m.presses(),
+            [
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
+                "key 1"
+            ]
+        );
         let noted = read_notes(&dir, &notes);
         assert_eq!(noted.len(), 1, "{noted:?}");
         assert!(
@@ -7610,7 +7972,7 @@ mod tests {
                 idle_screen(),
             ],
         );
-        m.by_index.insert(6, closed());
+        m.by_index.insert(8, closed());
         m.vanish_after = Some(0);
         let (lines, _) = watch_quick_with(
             &mut m,
@@ -7629,7 +7991,11 @@ mod tests {
         );
         assert_eq!(
             m.presses(),
-            ["key if=Do.you.want.to.proceed 1", "key 1", "key backspace"]
+            [
+                "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
+                "key 1",
+                "key backspace"
+            ]
         );
         let noted = read_notes(&dir, &notes);
         assert_eq!(noted.len(), 2, "{noted:?}");
@@ -7686,9 +8052,11 @@ mod tests {
                 "EXIT session gone (await seq 107 failed: aterm-ctl: ERR exited)",
             ]
         );
-        assert_eq!(code, 1);
-        assert_eq!(m.requests[9], "text --json tail=40");
-        assert_eq!(m.requests[10], "await seq 105 timeout 20000");
+        assert_eq!(code, 1, "{:?}", m.requests);
+        // `requests` holds the start-up `meta` the indexes do not count: the
+        // busy read is index 9, the footer wait after it index 10.
+        assert_eq!(m.requests[10], "text --json tail=40", "{:?}", m.requests);
+        assert_eq!(m.requests[11], "await gone esc.to.interrupt timeout 20000");
     }
 
     /// `await-turn` and `supervise` ride it out the same way; their lines go
@@ -7708,7 +8076,7 @@ mod tests {
         assert_eq!(log.len(), 2, "{log:?}");
         assert_eq!(
             log[0],
-            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+            format!("RECONNECT await gone esc.to.interrupt failed: aterm-ctl: {CLOSED}")
         );
         reconnected_ms(log[1]);
 
@@ -7727,7 +8095,8 @@ mod tests {
         let log = String::from_utf8(log).expect("utf-8");
         assert!(
             log.starts_with(&format!(
-                "RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}\nRECONNECTED after "
+                "RECONNECT await gone esc.to.interrupt failed: aterm-ctl: {CLOSED}\nRECONNECTED \
+                 after "
             )),
             "{log}"
         );
@@ -7744,7 +8113,8 @@ mod tests {
             "d".repeat(120)
         );
         let mut m = Mock::new(true, vec![question_screen()]);
-        m.by_index.insert(2, failed(1, &long));
+        // Index 2 is the question's attention; 3 the wait past it.
+        m.by_index.insert(3, failed(1, &long));
         m.vanish_after = Some(0);
         let (lines, _) = watch_quick(&mut m, Duration::from_secs(5));
         assert!(
@@ -7844,7 +8214,23 @@ mod tests {
             records[0].line, "an older run",
             "the file is appended to, never truncated"
         );
-        let mine = &records[1..];
+        // The journal-only lines — the question's escalation and its
+        // clearing — sit between the printed ones, in order.
+        let (quiet, mine): (
+            Vec<super::super::JournalRecord>,
+            Vec<super::super::JournalRecord>,
+        ) = records[1..]
+            .iter()
+            .cloned()
+            .partition(|r| r.kind == "escalated" || r.kind == "cleared");
+        assert_eq!(
+            quiet
+                .iter()
+                .map(|r| (r.kind.as_str(), r.seq))
+                .collect::<Vec<_>>(),
+            [("escalated", Some(104)), ("cleared", Some(106))]
+        );
+        let mine = &mine[..];
         assert_eq!(
             mine.iter().map(|r| r.line.clone()).collect::<Vec<_>>(),
             printed,
@@ -8163,9 +8549,9 @@ mod tests {
         let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
         m.vanish_after = Some(1);
         m.release = Some(release);
-        // Released as the idle screen is read (request 4): the report comes
-        // AFTER the point.
-        m.release_at.insert(4, vec![ok("OK inbox 6\n")]);
+        // Released as the idle screen is read (request 3, after the busy
+        // read's footer wait): the report comes AFTER the point.
+        m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
         let opts = SuperviseOpts {
             report: true,
             journal: Some(path.clone()),
@@ -8189,10 +8575,10 @@ mod tests {
         assert_eq!(
             m.requests,
             [
+                "@s-1 meta",
                 "@s-1 await gone esc.to.interrupt timeout 20000",
                 "@s-1 text --json tail=40",
-                "@s-1 await seq 101 timeout 20000",
-                "@s-1 await idle 2000 timeout 20000",
+                "@s-1 await gone esc.to.interrupt timeout 20000",
                 "@s-1 text --json tail=40",
                 "@s-1 await seq 102 timeout 20000",
                 "@s-1 text --json tail=40",
@@ -8232,8 +8618,8 @@ mod tests {
         let _ = std::fs::remove_dir(dir);
     }
 
-    /// A report that lands BEFORE the screen settles (the Stop hook fires
-    /// as the turn ends) folds into the idle point that follows within the
+    /// A report that lands BEFORE the screen settles (the worker posts as
+    /// the turn ends) folds into the idle point that follows within the
     /// window; outside the window it is another turn's, and the idle waits
     /// its grace and is said with no report.
     #[test]
@@ -8297,8 +8683,8 @@ mod tests {
     const LANDED_7: &str = "OK 1 hold=0 holder=- seen=3 bus_head=92 dropped=0 pending=0\n\
                             msg 7 off=92 t=2200 from=s-1@n-1 kind=report trust=agent len=18\n";
 
-    /// A worker ends a turn with a QUESTION; its Stop hook posts that turn's
-    /// report (the question's text). A question point is not held, so the
+    /// A worker ends a turn with a QUESTION and posts that turn's report
+    /// (the question's text). A question point is not held, so the
     /// report is not folded and stays pending. The manager answers, the
     /// worker works and goes idle with no report of its own: the NEXT idle
     /// must not name the question turn's report as this turn's — a report
@@ -8318,11 +8704,11 @@ mod tests {
         );
         m.vanish_after = Some(1);
         m.release = Some(release);
-        // The hook's report lands as the question settles (request 3 is the
-        // settle wait); the question is read 100 ms later (request 4), the
-        // MAIL line printed by then.
-        m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
-        m.delay.insert(4, Duration::from_millis(100));
+        // The report lands as the question settles (request 2 is the wait
+        // for the busy footer to leave); the question is read 100 ms later
+        // (request 3), the MAIL line printed by then.
+        m.release_at.insert(2, vec![ok("OK inbox 6\n")]);
+        m.delay.insert(3, Duration::from_millis(100));
         let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(200));
         let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
         assert_eq!(
@@ -8336,8 +8722,8 @@ mod tests {
         );
     }
 
-    /// Two reports in one turn — the hook's, then the worker's own. The
-    /// first folds into the idle; the second lands while the worker is STILL
+    /// Two reports in one turn, both the worker's. The first folds into the
+    /// idle; the second lands while the worker is STILL
     /// idle in that turn, after the point was handed over and before the
     /// worker was read busy again. It is that turn's late report, not the
     /// next turn's.
@@ -8356,13 +8742,14 @@ mod tests {
         );
         m.vanish_after = Some(1);
         m.release = Some(release);
-        // The hook's report as the idle is read (request 4): folds into it.
-        m.release_at.insert(4, vec![ok("OK inbox 6\n")]);
+        // The first report as the idle is read (request 3, after the busy
+        // read's footer wait): folds into it.
+        m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
         // The worker's own report after the fold, the worker still idle
-        // (request 5 is the wait past the point); the next turn's reads come
+        // (request 4 is the wait past the point); the next turn's reads come
         // 100 ms later, the MAIL line printed by then.
-        m.release_at.insert(5, vec![ok("OK inbox 7\n")]);
-        m.delay.insert(6, Duration::from_millis(100));
+        m.release_at.insert(4, vec![ok("OK inbox 7\n")]);
+        m.delay.insert(5, Duration::from_millis(100));
         let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(200));
         let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
         assert_eq!(
@@ -8388,7 +8775,7 @@ mod tests {
         let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
         m.vanish_after = Some(1);
         m.release = Some(release);
-        // Posted while busy (request 2 waits on the busy screen's seq) …
+        // Posted while busy (request 2 waits on the busy screen's footer) …
         m.release_at.insert(2, vec![ok("OK inbox 6\n")]);
         // … and the worker works on for 300 ms past the window.
         m.delay.insert(3, Duration::from_millis(300));
@@ -8452,7 +8839,7 @@ mod tests {
             [
                 "EVENT idle-no-report seq=102 ⏺ Done.",
                 "EVENT prompt seq=103 kind=bash classify=not-read-only:rm command=rm -rf target",
-                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+                "EXIT session gone (await gone ^\\x20{3}rm\\x20-rf\\x20target\\s*$ failed: aterm-ctl: ERR exited)",
             ]
         );
         let prompt = out
@@ -8668,7 +9055,9 @@ mod tests {
             MailMock::new(vec![ok(INBOX_AT_START), ok(INBOX_LANDED), ok(REPORT_BODY)]);
         let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
         m.release = Some(release);
-        m.release_at.insert(4, vec![ok("OK inbox 6\n")]);
+        // Released as the idle screen is read (request 3, after the busy
+        // read's footer wait).
+        m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
         let opts = SuperviseOpts {
             journal: Some(path.clone()),
             ..mail_opts(Duration::from_secs(120), Duration::from_secs(180))
@@ -8733,6 +9122,272 @@ mod tests {
     const WEEKLY_TEXT: &str =
         "You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)";
     const WEEKLY_RESET: &str = "Sep 19 at 11am (America/Los_Angeles)";
+    /// A BOX THE LOOP DOES NOT APPROVE IS THE MANAGER'S, ONCE PER BOX. For
+    /// the rm breaker box (outside a bypass session), a Read of a secret and
+    /// a trust prompt (`other`): the worker's `attention` is set to `claude
+    /// <kind>: <command, path or question> (<why no rule approved it>)` and
+    /// ONE `kind=ask` is posted to the manager (the fabric connected) — a
+    /// second look at the same box posts nothing — and when the box has left
+    /// the screen the badge is unset (read first, ours) and journaled
+    /// `CLEARED … box`.
+    #[test]
+    fn a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes() {
+        for (box_rows, label) in [
+            (
+                bash_multi_row_with_note(),
+                "claude rm-breaker: cd /work/trust-vc && S=/tmp/scratch && grep -h edition <(git sh… (",
+            ),
+            (
+                read_box(),
+                "claude read: ~/.ssh/config (a Read outside every allowed root",
+            ),
+            (trust_box(), "claude other: "),
+        ] {
+            let (dir, path) = journal_file("box-escalation");
+            let mut m = Mock::new(
+                true,
+                vec![
+                    busy_screen(),
+                    box_rows.clone(),
+                    box_rows,
+                    busy_screen(),
+                    idle_screen(),
+                ],
+            );
+            m.vanish_after = Some(4);
+            m.verb_replies
+                .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
+            let opts = SuperviseOpts {
+                journal: Some(path.clone()),
+                ..auto(30, None)
+            };
+            let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+                s.set_manager(Some("@s-9".to_string()));
+            });
+            assert!(
+                lines[0].starts_with("EVENT prompt "),
+                "the box is the first review point: {lines:?}"
+            );
+            let text = m
+                .requests
+                .iter()
+                .find_map(|r| r.strip_prefix("meta set attention owner=supervisor "))
+                .expect("an attention was set")
+                .to_string();
+            assert!(text.starts_with(label), "{text}");
+            assert!(
+                text.ends_with(')') && text.len() <= ATTENTION_BYTES,
+                "{text}"
+            );
+            let acts: Vec<&String> = m
+                .requests
+                .iter()
+                .filter(|r| {
+                    r.starts_with("meta set")
+                        || r.starts_with("meta unset")
+                        || r.starts_with("post")
+                })
+                .collect();
+            assert_eq!(
+                acts,
+                [
+                    &format!("meta set attention owner=supervisor {text}"),
+                    &format!("post to=@s-9 kind=ask --wait=0 {text}"),
+                    &"meta unset attention owner=supervisor".to_string(),
+                ],
+                "one set, one ask, one clear: {:?}",
+                m.requests
+            );
+            let (records, _) = journal_records(&path);
+            let kinds: Vec<&str> = records.iter().map(|r| r.kind.as_str()).collect();
+            let escalated = kinds.iter().filter(|k| **k == "escalated").count();
+            let cleared = kinds.iter().filter(|k| **k == "cleared").count();
+            assert_eq!((escalated, cleared), (1, 1), "{kinds:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The escalations `(set attention, post)` requests of a finished mock.
+    fn box_acts(m: &Mock) -> Vec<String> {
+        m.requests
+            .iter()
+            .filter(|r| r.starts_with("meta set attention") || r.starts_with("post"))
+            .cloned()
+            .collect()
+    }
+
+    /// Round-25 review, 2026-09-23: a HEADERLESS box's "first line" was read from
+    /// `prompt_box_span`'s 30-row window, so under a taller transcript the badge and
+    /// the ask named a transcript row (`claude needs approval: ⏺ transcript row 19
+    /// done`). They name the box's own first row.
+    #[test]
+    fn a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row() {
+        let transcript: Vec<String> = (0..40)
+            .map(|i| format!("⏺ transcript row {i} done"))
+            .collect();
+        let mut screen = rows(&transcript.iter().map(String::as_str).collect::<Vec<_>>());
+        screen.push(String::new());
+        screen.extend(trust_box());
+        let mut m = Mock::new(
+            true,
+            vec![busy_screen(), screen, busy_screen(), idle_screen()],
+        );
+        m.vanish_after = Some(4);
+        m.verb_replies
+            .insert("post", VecDeque::from([ok("OK 7 off=91\n")]));
+        let (_, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_manager(Some("@s-9".to_string()));
+        });
+        // Lane B's attention format (`<program> <kind>: <subject> (<reason>)`),
+        // merged over this test at harness/integrate: the subject of a
+        // headerless box is its question row, found from the box's OWN first
+        // row down — never a transcript row above it.
+        let text = "claude other: Do you trust the files in this folder? \
+                    (a other box: no rule approves this kind)";
+        assert!(!text.contains("transcript row"));
+        assert_eq!(
+            box_acts(&m),
+            [
+                format!("meta set attention owner=supervisor {text}"),
+                format!("post to=@s-9 kind=ask --wait=0 {text}"),
+            ],
+            "{:?}",
+            m.requests
+        );
+    }
+
+    /// Round-25 review: the same box back AFTER THE WORKER WORKED is a new review
+    /// point — the loop prints `EVENT prompt` again — and so a new ask: the badge is
+    /// set again and the manager asked again (it used to dedupe on the box alone, so a
+    /// badge cleared after the first ask never came back). One set and one post per
+    /// point, never per look.
+    #[test]
+    fn the_same_box_after_the_worker_worked_is_a_new_ask() {
+        let b = bash_multi_row_with_note();
+        let (dir, path) = journal_file("box-reask");
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                b.clone(),
+                b.clone(),
+                busy_screen(),
+                b.clone(),
+                b,
+                busy_screen(),
+                idle_screen(),
+            ],
+        );
+        m.vanish_after = Some(4);
+        m.verb_replies.insert(
+            "post",
+            VecDeque::from([ok("OK 7 off=91\n"), ok("OK 8 off=92\n")]),
+        );
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_manager(Some("@s-9".to_string()));
+        });
+        let prompts = lines
+            .iter()
+            .filter(|l| l.starts_with("EVENT prompt "))
+            .count();
+        let asks = m.requests.iter().filter(|r| r.starts_with("post ")).count();
+        let sets = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("meta set attention"))
+            .count();
+        assert_eq!(
+            (prompts, asks, sets),
+            (2, 2, 2),
+            "{lines:?}\n{:?}",
+            m.requests
+        );
+        let (records, _) = journal_records(&path);
+        let kinds: Vec<&str> = records.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "escalated").count(),
+            2,
+            "{kinds:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-25 review: the badge's line was cut by CHARS and carried control bytes.
+    /// It is cut by terminal cells (a wide character is two) and every character
+    /// that breaks a line is a space.
+    #[test]
+    fn the_approval_line_is_sanitized_and_cut_by_cells() {
+        let mut b = bash_one_row();
+        let header = b.iter().position(|r| r.trim() == "Bash command").unwrap();
+        b[header] = format!(" Bash command · 100% \u{7}{}\u{2028}x", "全".repeat(200));
+        let line = approval_line(&b);
+        assert!(
+            !line.chars().any(|c| c.is_control() || c == '\u{2028}'),
+            "{line:?}"
+        );
+        let cells: usize = line.chars().map(aterm_grapheme::char_width).sum();
+        assert!(cells <= APPROVAL_LINE_CELLS, "{cells} cells: {line:?}");
+        assert!(
+            cells >= APPROVAL_LINE_CELLS - 1,
+            "cut at the cap, not short of it: {cells}"
+        );
+        assert!(line.starts_with("Bash command · 100% "), "{line:?}");
+        // A plain line is untouched.
+        assert_eq!(approval_line(&bash_one_row()), "Bash command");
+    }
+
+    /// Round-25 review: the ask went out with the server's default landing wait (up to
+    /// 30 s, inside the single-threaded loop), and a queued post was journaled as the
+    /// error the server answered. The ask carries `--wait=0`, and a reply that means
+    /// queued is journaled `queued id=<n> (…)`; a real refusal keeps its words.
+    #[test]
+    fn a_box_ask_never_waits_and_a_queued_post_is_journaled_as_queued() {
+        for (reply, said) in [
+            (err("timeout id=7"), "mail=queued id=7 (not landed yet)"),
+            (
+                err("fabric absent id=7 no-bridge=1"),
+                "mail=queued id=7 (fabric absent, no-bridge=1)",
+            ),
+            (err("outbox full"), "mail=ERR outbox full"),
+            (ok("OK 7 off=91\n"), "mail=OK 7 off=91"),
+        ] {
+            let (dir, path) = journal_file("box-queued");
+            let mut m = Mock::new(
+                true,
+                vec![busy_screen(), read_box(), busy_screen(), idle_screen()],
+            );
+            m.vanish_after = Some(4);
+            m.verb_replies.insert("post", VecDeque::from([reply]));
+            let opts = SuperviseOpts {
+                journal: Some(path.clone()),
+                ..auto(30, None)
+            };
+            let (_, _) = watch_lines_with(&mut m, &opts, |s| {
+                s.set_manager(Some("@s-9".to_string()));
+            });
+            assert!(
+                m.requests
+                    .iter()
+                    .any(|r| r.starts_with("post to=@s-9 kind=ask --wait=0 ")),
+                "{:?}",
+                m.requests
+            );
+            let (records, _) = journal_records(&path);
+            let escalated: Vec<&String> = records
+                .iter()
+                .filter(|r| r.kind == "escalated")
+                .map(|r| &r.line)
+                .collect();
+            assert_eq!(escalated.len(), 1, "{records:?}");
+            assert!(escalated[0].contains(said), "{said}: {}", escalated[0]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     fn weekly_limited() -> Vec<String> {
         let mut r = rows(&[
             "⏺ Running the A/B on m7 now.",
@@ -8788,27 +9443,15 @@ mod tests {
         r.extend(composer("  ? for shortcuts"));
         r
     }
-    /// The worker's answer to the probe (measured: 23 s).
-    const ANSWER: &str = "⏺ Yes, I can work. Last completed: the A/B on m7, results in ab.md.";
-    fn answered() -> Vec<String> {
+    /// The worker's answer to the continuation typed at the reset.
+    const ANSWER: &str = "⏺ Back at it: the A/B on m7 is running again.";
+    fn answered(typed: &str) -> Vec<String> {
         let mut r = rows(&[
-            &format!("❯ {PROBE}"),
+            &format!("❯ {typed}"),
             "",
             ANSWER,
             "",
             "✻ Worked for 23s · done 11:01 AM",
-            "",
-        ]);
-        r.extend(composer("  ? for shortcuts"));
-        r
-    }
-    /// The probe typed and taken, nothing answered yet: no live status row.
-    fn probe_typed() -> Vec<String> {
-        let mut r = rows(&[
-            "⏺ Running the A/B on m7 now.",
-            WEEKLY,
-            "",
-            &format!("❯ {PROBE}"),
             "",
         ]);
         r.extend(composer("  ? for shortcuts"));
@@ -8840,11 +9483,24 @@ mod tests {
             .expect("write");
         (dir, path)
     }
-    const RULES_LINE: &str = "Manager's watcher, standing rules restated after a limit: Standing \
-                              rules: 1. run nothing heavy while ~/ay-machine-busy exists 2. report \
-                              counts";
-    fn probe_request() -> String {
-        format!("turn idle=600 timeout=2500 {PROBE}")
+    /// The continuation with the rules file's text.
+    const RULES_CONTINUATION: &str = "keep going (standing rules: Standing rules: 1. run nothing \
+                                      heavy while ~/ay-machine-busy exists 2. report counts)";
+    /// The guarded `turn` that types `text`.
+    fn continue_request(text: &str) -> String {
+        format!(
+            "turn submit=guarded:{} idle=600 timeout=2500 yield=0.2 {text}",
+            super::turn_end_loop::composer_guard(text)
+        )
+    }
+    /// The turn-end policy's timings with the waits shortened: no grace past
+    /// a reset, the backoff after a continuation that hit the wall `backoff`.
+    fn quick_turn_end(backoff: &[Duration]) -> TurnEndTiming {
+        TurnEndTiming {
+            reset_grace: Duration::ZERO,
+            limit_backoff: backoff.to_vec(),
+            ..TurnEndTiming::default()
+        }
     }
     fn count(m: &Mock, prefix: &str) -> usize {
         m.requests.iter().filter(|r| r.starts_with(prefix)).count()
@@ -8897,7 +9553,9 @@ mod tests {
                 .filter(|r| r.starts_with("meta") || r.starts_with("post"))
                 .collect::<Vec<_>>(),
             [
-                &format!("meta set attention {text}"),
+                // The start-up reconcile read.
+                &"meta".to_string(),
+                &format!("meta set attention owner=supervisor {text}"),
                 &format!("post to=@s-9 kind=control {text}"),
             ]
         );
@@ -8941,9 +9599,16 @@ mod tests {
         credits.extend(composer("  ? for shortcuts"));
         let mut m = Mock::new(true, vec![busy_screen(), credits]);
         m.vanish_after = Some(2);
+        // The start-up reconcile read answers first; then the refusal.
         m.verb_replies.insert(
             "meta",
-            VecDeque::from([err("attention too long (max 256 bytes)")]),
+            VecDeque::from([
+                ok(
+                    "OK title=- user_title=- description=- icon=- role=- attention=- cwd=- \
+                    state=alive\n",
+                ),
+                err("attention too long (max 256 bytes)"),
+            ]),
         );
         let opts = SuperviseOpts {
             journal: Some(path.clone()),
@@ -8961,6 +9626,61 @@ mod tests {
             records[1].summary,
             "attention=ERR attention too long (max 256 bytes) mail=skipped: no --inbox and no \
              $ATERM_PARENT_SESSION_ID"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal that names a TIGHTER cap than the text sent (`attention too
+    /// long (max <n> bytes)`) is answered once with the text cut to it — a
+    /// server whose keyed cap moved still gets a badge, never none (the live
+    /// E2E's D2). Negative control: the refusal above, naming a cap the text
+    /// already fits, is not retried.
+    #[test]
+    fn a_refusal_naming_a_tighter_cap_is_sent_again_cut_to_it() {
+        let (dir, path) = journal_file("limit-recut");
+        let mut credits = rows(&[
+            "⏺ Running the suite.",
+            "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch \
+             models with /model.",
+            "",
+            "✻ Worked for 12s · done 4:51 PM",
+            "",
+        ]);
+        credits.extend(composer("  ? for shortcuts"));
+        let mut m = Mock::new(true, vec![busy_screen(), credits]);
+        m.vanish_after = Some(2);
+        m.verb_replies.insert(
+            "meta",
+            VecDeque::from([
+                ok(
+                    "OK title=- user_title=- description=- icon=- role=- attention=- cwd=- \
+                    state=alive\n",
+                ),
+                err("attention too long (max 40 bytes)"),
+            ]),
+        );
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let _ = watch_lines(&mut m, &opts);
+        let sets: Vec<&String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("meta set attention owner=supervisor "))
+            .collect();
+        assert_eq!(sets.len(), 2, "{sets:#?}");
+        let second = sets[1].trim_start_matches("meta set attention owner=supervisor ");
+        assert!(second.len() <= 40, "{second}");
+        assert!(
+            sets[0].ends_with(second) || sets[0].contains(second),
+            "{sets:#?}"
+        );
+        let (records, _) = journal_records(&path);
+        assert!(
+            records[1].summary.starts_with("attention=OK"),
+            "{:?}",
+            records[1].summary
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8989,17 +9709,27 @@ mod tests {
         assert_eq!(count(&m, "turn"), 0);
     }
 
-    /// `--resume RULES`: the reset has passed, so the probe goes at once —
-    /// ONE `turn` with the fixed question — and the answer (a new done row,
-    /// within the window) prints `EVENT resumed seq=<n> <its line>`, clears
-    /// the attention, sends the rules file as ONE turn under its lead and
-    /// prints `EVENT rebriefed`; the answer is not reported again as idle.
-    /// Every step is in the journal.
+    /// `--resume RULES`: the reset has passed, so the continuation goes at
+    /// once — ONE guarded `turn` typing `keep going` with the rules file's
+    /// text, `CONTINUED` printed after the `EXTEND`, the session's program
+    /// read fresh first (`status`) — and a wall acted on at once raises no
+    /// badge and mails no one (`LIMITED … handled`); the worker answering
+    /// after a busy spell closes the episode, the answer printed as the idle
+    /// point it is. No probe question, no second turn for the rules. Every
+    /// step is in the journal.
     #[test]
-    fn at_the_reset_one_probe_goes_and_the_answer_is_resumed_and_rebriefed() {
+    fn at_the_reset_one_continuation_goes_with_the_rules_and_the_answer_closes_the_episode() {
         let (jdir, journal) = journal_file("limit-resume");
         let (rdir, rules) = rules_file("resume");
-        let mut m = Mock::new(true, vec![busy_screen(), weekly_limited(), answered()]);
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                weekly_limited(),
+                busy_screen(),
+                answered(RULES_CONTINUATION),
+            ],
+        );
         m.vanish_after = Some(3);
         m.turn_releases = Some(1);
         let opts = SuperviseOpts {
@@ -9012,6 +9742,7 @@ mod tests {
             s.set_resume(Some(Resume {
                 rules: Some(rules.clone()),
             }));
+            s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(600)]));
         });
         assert_eq!(
             lines,
@@ -9020,49 +9751,27 @@ mod tests {
                 // Half a minute past the reset, 10 min past it is still
                 // ahead of a 30 s budget.
                 format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
-                format!("EVENT resumed seq=103 {ANSWER}"),
-                "EVENT rebriefed seq=103".to_string(),
+                format!("CONTINUED seq=102 rule=usage-resume@v1 {RULES_CONTINUATION}"),
+                format!("EVENT idle seq=104 {ANSWER}"),
                 "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
             ]
         );
         assert_eq!(code, 1);
-        assert_eq!(
-            m.requests,
-            [
-                "await gone esc.to.interrupt timeout 20000",
-                "text --json tail=40",
-                "await seq 101 timeout 20000",
-                "await idle 2000 timeout 20000",
-                "text --json tail=40",
-                // EVENT limited: the escalation, then the probe at once (the
-                // reset passed half a minute ago: no wait).
-                &format!("meta set attention limited: {WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                &format!("post to=@s-9 kind=control limited: {WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                &probe_request(),
-                // The answer: the busy footer leaving, then the read.
-                "await gone esc.to.interrupt timeout 20000",
-                "text --json tail=40",
-                // EVENT resumed: the attention read, found still ours
-                // (`limited: …`) and cleared, the rules restated.
-                "meta",
-                "meta unset attention",
-                &format!("turn idle=600 timeout=2500 {RULES_LINE}"),
-                // The next look: the answer still showing is the point
-                // handed over — not reported again — and the screen never
-                // moves.
-                "await idle 2000 timeout 20000",
-                "text --json tail=40",
-                "await seq 104 timeout 20000",
-                "text --json tail=40",
-                "await seq 104 timeout 20000",
-                "text --json tail=40",
-                "await seq 104 timeout 20000",
-                "text --json tail=40",
-                "await seq 104 timeout 20000",
-            ],
-            "{:?}",
+        let at = |needle: &str| {
             m.requests
+                .iter()
+                .position(|r| r == needle)
+                .unwrap_or_else(|| panic!("no `{needle}`: {:#?}", m.requests))
+        };
+        let turn = at(&continue_request(RULES_CONTINUATION));
+        assert_eq!(
+            m.requests[turn - 1],
+            "status",
+            "the program read fresh first"
         );
+        assert_eq!(count(&m, "post"), 0, "handled at once: {:#?}", m.requests);
+        assert_eq!(count(&m, "meta set attention"), 0, "{:#?}", m.requests);
+        assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
         let (records, _) = journal_records(&journal);
         assert_eq!(
             records
@@ -9071,62 +9780,85 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("event", "limited", Some(102)),
-                ("escalated", "-", Some(102)),
+                ("limited", "-", Some(102)),
                 ("extend", "-", None),
-                ("probe", "sent", Some(102)),
-                ("event", "resumed", Some(103)),
-                ("cleared", "-", Some(103)),
-                ("event", "rebriefed", Some(103)),
+                ("continued", "usage-resume@v1", Some(102)),
+                ("cleared", "-", Some(104)),
+                ("event", "idle", Some(104)),
                 ("exit", "-", None),
             ]
         );
-        assert_eq!(records[5].summary, "attention=OK resumed");
+        assert_eq!(
+            records[4].summary,
+            "attention=none answered after a busy spell"
+        );
         let _ = std::fs::remove_dir_all(&jdir);
         let _ = std::fs::remove_dir_all(&rdir);
     }
 
     /// The screen leaving the notice before the reset — the owner's `/login`
-    /// in the worker's window — is the probe's moment: no `EVENT idle` for
-    /// that line, one probe, `EVENT resumed` on the answer; without a rules
-    /// file nothing is restated. The reset two days off, a long budget is
-    /// not extended.
+    /// in the worker's window — is the continuation's moment: the point is
+    /// reported, `keep going` goes at once (no rules file: the text alone),
+    /// and the answer after a busy spell closes the episode. The reset two
+    /// days off, a long budget is not extended.
     #[test]
-    fn the_screen_leaving_the_notice_probes_at_once() {
+    fn the_screen_leaving_the_notice_is_continued_at_once() {
         let mut m = Mock::new(
             true,
-            vec![busy_screen(), weekly_limited(), switched(), answered()],
+            vec![
+                busy_screen(),
+                weekly_limited(),
+                switched(),
+                busy_screen(),
+                answered("keep going"),
+            ],
         );
         m.vanish_after = Some(2);
+        m.turn_releases = Some(2);
         let (lines, _) = watch_lines_with(&mut m, &auto(3 * 86_400, None), |s| {
             s.set_resume(Some(Resume { rules: None }));
         });
+        assert_eq!(lines.len(), 5, "{lines:#?}");
         assert_eq!(
-            lines,
-            [
-                format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                format!("EVENT resumed seq=104 {ANSWER}"),
-                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)".to_string(),
-            ]
+            lines[0],
+            format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}")
         );
+        assert!(lines[1].starts_with("EVENT idle seq=103 "), "{lines:#?}");
+        assert_eq!(
+            lines[2],
+            "CONTINUED seq=103 rule=usage-resume@v1 keep going"
+        );
+        assert_eq!(lines[3], format!("EVENT idle seq=105 {ANSWER}"));
+        assert!(lines[4].starts_with("EXIT session gone"), "{lines:#?}");
         assert_eq!(count(&m, "turn"), 1);
-        assert_eq!(count(&m, "meta unset attention"), 1);
+        assert!(m.requests.contains(&continue_request("keep going")));
+        assert_eq!(count(&m, "meta unset attention owner=supervisor"), 1);
         assert!(!lines.iter().any(|l| l.starts_with("EXTEND")), "{lines:?}");
     }
 
-    /// The attention is SHARED, and the episode's close unsets only its own:
-    /// with the link Notification hook's `claude needs approval: …` raised
-    /// over the escalation's `limited: …` while the episode was open, the
-    /// close reads `meta`, finds another writer's text standing and leaves
-    /// it — the box that text names is still open. Journaled `attention=kept`.
+    /// The attention is KEYED (lane C), and the episode's close unsets only
+    /// its own entry: with a person's `claude needs approval: …` raised
+    /// (bare owner) over the escalation's `limited: …` while the episode was
+    /// open, the close unsets `owner=supervisor` alone and the person's
+    /// entry stands — the box that text names is still open. Nothing is
+    /// read first: the loop knows its own entry. Negative control: the
+    /// loop's own entry is gone.
     #[test]
     fn a_standing_approval_attention_survives_the_episode_close() {
         let (dir, path) = journal_file("limit-foreign-attention");
         let approval = "claude needs approval: Bash rm -rf build";
         let mut m = Mock::new(
             true,
-            vec![busy_screen(), weekly_limited(), switched(), answered()],
+            vec![
+                busy_screen(),
+                weekly_limited(),
+                switched(),
+                busy_screen(),
+                answered("keep going"),
+            ],
         );
         m.vanish_after = Some(2);
+        m.turn_releases = Some(2);
         m.foreign_attention = Some(approval.to_string());
         let opts = SuperviseOpts {
             journal: Some(path.clone()),
@@ -9136,125 +9868,196 @@ mod tests {
             s.set_resume(Some(Resume { rules: None }));
         });
         assert!(
-            lines.iter().any(|l| l.starts_with("EVENT resumed")),
-            "the episode closed: {lines:?}"
+            lines.iter().any(|l| l.starts_with("CONTINUED")),
+            "continued: {lines:?}"
         );
-        assert_eq!(count(&m, "meta set attention"), 1);
+        assert_eq!(count(&m, "meta set attention owner=supervisor"), 1);
+        assert_eq!(count(&m, "meta set attention"), 1, "never the bare form");
+        // The start-up reconcile read only.
         assert_eq!(
             m.requests.iter().filter(|r| *r == "meta").count(),
             1,
-            "the close read the standing attention first: {:?}",
+            "{:?}",
             m.requests
         );
-        assert_eq!(count(&m, "meta unset attention"), 0, "{:?}", m.requests);
-        assert_eq!(m.attention.as_deref(), Some(approval));
+        assert_eq!(
+            count(&m, "meta unset attention owner=supervisor"),
+            1,
+            "{:?}",
+            m.requests
+        );
+        assert_eq!(count(&m, "meta unset attention"), 1, "never the bare form");
+        assert_eq!(m.human_attention.as_deref(), Some(approval));
+        assert_eq!(m.attention, None);
         let (records, _) = journal_records(&path);
         let cleared = records
             .iter()
             .find(|r| r.kind == "cleared")
             .expect("a CLEARED row");
         assert!(
-            cleared.summary.starts_with("attention=kept "),
+            cleared.summary.starts_with("attention=OK "),
             "{}",
             cleared.summary
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The notice again after the probe (the limit had not reset after all)
-    /// is `EVENT still-limited`, never a second `EVENT limited` or a second
-    /// escalation; the next probe waits for the backoff.
+    /// The notice again after the continuation (the limit had not reset
+    /// after all) is the SAME episode — its point printed, escalated now
+    /// that the worker waits at the wall (the first notice, continued at
+    /// once, raised nothing) — and the next continuation waits the backoff
+    /// (60 s here, past the budget: none goes), journaled `WAITING` with its
+    /// deadline.
     #[test]
-    fn the_notice_again_after_a_probe_is_still_limited_not_a_new_episode() {
+    fn the_notice_again_after_a_continuation_is_the_same_episode_and_backs_off() {
+        let (dir, path) = journal_file("limit-again");
         let mut m = Mock::new(
             true,
-            vec![busy_screen(), weekly_limited(), weekly_retried()],
+            vec![
+                busy_screen(),
+                weekly_limited(),
+                busy_screen(),
+                weekly_retried(),
+            ],
         );
         m.vanish_after = Some(3);
         m.turn_releases = Some(1);
-        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             s.set_clock(AFTER_RESET, PDT);
             s.set_resume(Some(Resume { rules: None }));
+            s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(60)]));
         });
         assert_eq!(
             lines,
             [
                 format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
                 format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
-                format!("EVENT still-limited seq=103 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
+                "CONTINUED seq=102 rule=usage-resume@v1 keep going".to_string(),
+                format!("EVENT limited seq=104 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
                 "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
             ]
         );
-        assert_eq!(count(&m, "meta set attention"), 1);
-        assert_eq!(count(&m, "meta unset attention"), 0);
+        assert_eq!(
+            m.requests
+                .iter()
+                .filter(|r| r.starts_with("meta set attention"))
+                .collect::<Vec<_>>(),
+            [&format!(
+                "meta set attention owner=supervisor limited: {WEEKLY_TEXT} reset={WEEKLY_RESET}"
+            )]
+        );
+        assert_eq!(count(&m, "meta unset attention owner=supervisor"), 0);
         assert_eq!(count(&m, "turn"), 1, "{:?}", m.requests);
+        let (records, _) = journal_records(&path);
+        let waiting: Vec<(Option<u64>, &str)> = records
+            .iter()
+            .filter(|r| r.kind == "waiting")
+            .map(|r| (r.seq, r.summary.as_str()))
+            .collect();
+        // 18:00:30Z, the fixed clock, plus the 60 s backoff.
+        assert_eq!(
+            waiting,
+            [(Some(104), "until=2026-09-19T18:01:30Z usage-weekly resets")],
+            "{records:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// No answer within the window is `still-limited` too, and the probes
-    /// back off: the second 10 min (here ms) after the first, the third 30
-    /// after the second; a probe the server refuses is a failure like any.
+    /// A span (`resets in 1s` here, `in 3h` on the real screen) counts from
+    /// the notice's print, not from every read of it: the notice read again
+    /// after a continuation — the same text — names the same reset, so
+    /// `EXTEND` is said once and the next continuation waits the backoff
+    /// (10 then 30 ms here), never the span again. A model's own limit with
+    /// no model to switch to is waited out as a usage window's. The real
+    /// clock, as in production: a fixed one cannot show it (`now + span`
+    /// never moves).
     #[test]
-    fn no_answer_backs_off_ten_then_thirty() {
-        let (dir, path) = journal_file("limit-backoff");
-        let mut m = Mock::new(true, vec![busy_screen(), weekly_limited(), probe_typed()]);
-        m.turn_releases = Some(1);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        m.dead_after_turns = Some(2);
+    fn a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty() {
+        let (dir, path) = journal_file("limit-span-once");
+        let mut limited = rows(&[
+            "⏺ Running the suite.",
+            "",
+            "✻ Worked for 12s · done 4:51 PM",
+            "",
+        ]);
+        limited.extend(composer("  You've reached your Fable limit · resets in 1s"));
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                limited.clone(),
+                busy_screen(),
+                limited.clone(),
+                busy_screen(),
+                limited.clone(),
+                busy_screen(),
+                limited,
+            ],
+        );
+        m.turn_gates = vec![1, 3, 5, 7];
+        m.dead_after_turns = Some(3);
         let opts = SuperviseOpts {
             journal: Some(path.clone()),
             ..auto(30, None)
         };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_clock(AFTER_RESET, PDT);
-            s.set_resume(Some(Resume { rules: None }));
-            s.set_probe_timing(
-                &[Duration::from_millis(10), Duration::from_millis(30)],
-                Duration::from_millis(30),
-            );
-        });
-        let got = decisions(&lines);
-        assert_eq!(
-            &got[..5],
-            [
-                format!("EVENT limited message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
-                "EVENT still-limited no answer within 0.03 s".to_string(),
-                "EVENT still-limited no answer within 0.03 s".to_string(),
-                "EVENT still-limited the probe was not submitted: ERR exited".to_string(),
-            ],
-            "{lines:?}"
-        );
-        assert!(got[5].starts_with("EXIT session gone"), "{lines:?}");
-        assert_eq!(got.len(), 6, "{lines:?}");
-        assert_eq!(count(&m, "turn"), 3);
+        let mut out: Vec<u8> = Vec::new();
+        let mut s = Session::new(&mut m, None);
+        s.set_zone_lookup(test_zones);
+        s.set_resume(Some(Resume { rules: None }));
+        s.set_turn_end_timing(quick_turn_end(&[
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+        ]));
+        let _ = s.watch(&opts, &mut out);
+        let lines: Vec<String> = String::from_utf8(out)
+            .expect("utf-8")
+            .lines()
+            .map(str::to_string)
+            .collect();
         let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let limited = "EVENT limited message=You've reached your Fable limit · resets in 1s \
+                       reset=in 1s";
+        let got = decisions(&lines);
+        assert_eq!(got[0], limited, "{lines:#?}");
+        assert!(got[1].starts_with("EXTEND until="), "{lines:#?}");
+        let extends = got.iter().filter(|l| l.starts_with("EXTEND")).count();
+        assert_eq!(extends, 1, "the span read once: {lines:#?}");
         let sent: Vec<i64> = records
             .iter()
-            .filter(|r| r.kind == "probe" && r.phase == "sent")
+            .filter(|r| r.kind == "continued")
             .map(|r| r.t)
             .collect();
-        assert_eq!(sent.len(), 3, "{records:?}");
-        assert!(sent[1] - sent[0] >= 30 + 10, "{sent:?}");
-        assert!(sent[2] - sent[1] >= 30 + 30, "{sent:?}");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sent.len(), 3, "{lines:#?}");
+        assert!(sent[1] - sent[0] >= 10, "{sent:?}");
+        assert!(sent[2] - sent[1] >= 30, "{sent:?}");
+        assert!(
+            sent[2] - sent[1] < 500,
+            "the 30 ms backoff, not the second again: continuations at {sent:?}"
+        );
+        assert!(
+            got.last()
+                .is_some_and(|l| l.starts_with("EXIT session gone")),
+            "{lines:#?}"
+        );
     }
 
-    /// A draft typed in the composer holds the probe (a `turn` would land in
-    /// it): deferred a step, journaled, nothing typed.
+    /// A draft typed in the composer holds the continuation (a `turn` would
+    /// land in it): nothing is typed.
     #[test]
-    fn a_draft_in_the_composer_defers_the_probe() {
-        let (dir, path) = journal_file("limit-draft");
+    fn a_draft_in_the_composer_holds_the_continuation() {
         let mut m = Mock::new(true, vec![busy_screen(), weekly_drafted()]);
         m.vanish_after = Some(3);
         // The cursor at the end of the draft.
         m.cursor_col = Some(29);
-        let opts = SuperviseOpts {
-            journal: Some(path.clone()),
-            ..auto(30, None)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
             s.set_clock(AFTER_RESET, PDT);
             s.set_resume(Some(Resume { rules: None }));
+            s.set_turn_end_timing(quick_turn_end(&[Duration::from_millis(10)]));
         });
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("EVENT limited seq=102"), "{lines:?}");
@@ -9264,28 +10067,23 @@ mod tests {
         );
         assert!(lines[2].starts_with("EXIT session gone"), "{lines:?}");
         assert_eq!(count(&m, "turn"), 0, "{:?}", m.requests);
-        let (records, _) = journal_records(&path);
-        let deferred: Vec<&str> = records
-            .iter()
-            .filter(|r| r.kind == "probe")
-            .map(|r| r.summary.as_str())
-            .collect();
-        assert!(!deferred.is_empty(), "{records:?}");
-        assert!(
-            deferred
-                .iter()
-                .all(|s| *s == "text is typed in the composer"),
-            "{deferred:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        // Negative control: the same notice with nothing typed continues.
+        let mut m = Mock::new(true, vec![busy_screen(), weekly_limited()]);
+        m.vanish_after = Some(3);
+        let _ = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_clock(AFTER_RESET, PDT);
+            s.set_resume(Some(Resume { rules: None }));
+            s.set_turn_end_timing(quick_turn_end(&[Duration::from_millis(10)]));
+        });
+        assert_eq!(count(&m, "turn"), 1, "{:?}", m.requests);
     }
 
     /// The worker answering on someone else's turn (the manager's after the
-    /// reset, a human's) closes the episode without a probe: its point prints
-    /// as ever, the attention is cleared, and with a rules file the rules
-    /// follow at that idle point, `EVENT rebriefed` after it.
+    /// reset, a human's) closes the episode: its point prints as ever, the
+    /// attention is cleared, and nothing is typed — the rules ride with a
+    /// continuation, never as a turn of their own.
     #[test]
-    fn a_worked_point_closes_the_episode_and_restates_the_rules() {
+    fn a_worked_point_closes_the_episode_and_types_nothing() {
         let (rdir, rules) = rules_file("worked");
         let mut m = Mock::new(
             true,
@@ -9305,212 +10103,41 @@ mod tests {
                 // `in 3h` from the test clock, plus 10 min.
                 "EXTEND until=2026-09-17T19:05:00Z reset=in 3h",
                 "EVENT idle seq=104 ⏺ Done.",
-                "EVENT rebriefed seq=104",
                 "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
             ]
         );
-        assert_eq!(
-            count(&m, "turn"),
-            1,
-            "the rules, no probe: {:?}",
-            m.requests
-        );
-        assert_eq!(count(&m, "meta unset attention"), 1);
+        assert_eq!(count(&m, "turn"), 0, "{:?}", m.requests);
+        assert_eq!(count(&m, "meta unset attention owner=supervisor"), 1);
         let _ = std::fs::remove_dir_all(&rdir);
-    }
-    /// A span (`resets in 1s` here, `in 3h` on the real screen) counts from
-    /// the notice's print, not from every read of it: the notice read again
-    /// after a failed probe — the same text — names the same reset, so
-    /// `EXTEND` is said once and the next probe waits the backoff (10 then
-    /// 30 ms here), never the span again. The real clock, as in production:
-    /// a fixed one cannot show it (`now + span` never moves).
-    #[test]
-    fn a_span_is_read_once_and_the_backoff_holds_when_the_notice_is_read_again() {
-        let (dir, path) = journal_file("limit-span-once");
-        let mut limited = rows(&[
-            "⏺ Running the suite.",
-            "",
-            "✻ Worked for 12s · done 4:51 PM",
-            "",
-        ]);
-        limited.extend(composer("  You've reached your Fable limit · resets in 1s"));
-        let mut m = Mock::new(true, vec![busy_screen(), limited.clone(), limited]);
-        m.turn_releases = Some(1);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        m.dead_after_turns = Some(3);
-        let opts = SuperviseOpts {
-            journal: Some(path.clone()),
-            ..auto(30, None)
-        };
-        let mut out: Vec<u8> = Vec::new();
-        let mut s = Session::new(&mut m, None);
-        s.set_zone_lookup(test_zones);
-        s.set_resume(Some(Resume { rules: None }));
-        s.set_probe_timing(
-            &[Duration::from_millis(10), Duration::from_millis(30)],
-            Duration::from_millis(30),
-        );
-        let _ = s.watch(&opts, &mut out);
-        let lines: Vec<String> = String::from_utf8(out)
-            .expect("utf-8")
-            .lines()
-            .map(str::to_string)
-            .collect();
-        let (records, _) = journal_records(&path);
-        let _ = std::fs::remove_dir_all(&dir);
-        let got = decisions(&lines);
-        let again = "EVENT still-limited message=You've reached your Fable limit · resets in 1s \
-                     reset=in 1s";
-        assert_eq!(
-            got[0],
-            "EVENT limited message=You've reached your Fable limit · resets in 1s reset=in 1s"
-        );
-        assert!(got[1].starts_with("EXTEND until="), "{lines:#?}");
-        assert_eq!(&got[2..5], [again, again, again], "{lines:#?}");
-        assert_eq!(
-            got[5],
-            "EVENT still-limited the probe was not submitted: ERR exited"
-        );
-        assert!(got[6].starts_with("EXIT session gone"), "{lines:#?}");
-        assert_eq!(got.len(), 7, "{lines:#?}");
-        assert_eq!(count(&m, "turn"), 4);
-        let sent: Vec<i64> = records
-            .iter()
-            .filter(|r| r.kind == "probe" && r.phase == "sent")
-            .map(|r| r.t)
-            .collect();
-        assert_eq!(sent.len(), 4, "{records:?}");
-        assert!(
-            sent[2] - sent[1] < 500,
-            "the 30 ms backoff, not the second again: probes at {sent:?}"
-        );
     }
 
     /// The `/login` half-way — the code prompt, no composer on the screen
-    /// — reads as idle and leaves the notice, and is not the probe's moment:
-    /// nothing is typed where the code goes. The probe is deferred a step
-    /// and journaled so; the dialog's point prints as ever.
+    /// — reads as idle and leaves the notice, and is not the continuation's
+    /// moment: nothing is typed where the code goes; the dialog's point
+    /// prints as ever.
     #[test]
-    fn a_screen_without_a_composer_gets_no_probe() {
-        let (dir, path) = journal_file("limit-no-composer");
+    fn a_screen_without_a_composer_gets_no_continuation() {
         let mut m = Mock::new(
             true,
             vec![busy_screen(), weekly_limited(), login_code_prompt()],
         );
         m.vanish_after = Some(2);
-        let opts = SuperviseOpts {
-            journal: Some(path.clone()),
-            ..auto(3 * 86_400, None)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        let (lines, _) = watch_lines_with(&mut m, &auto(3 * 86_400, None), |s| {
             s.set_resume(Some(Resume { rules: None }));
         });
         assert_eq!(worker_phase(&login_code_prompt()), Phase::Idle);
         assert!(!has_composer_frame(&login_code_prompt()));
         assert_eq!(lines.len(), 3, "{lines:#?}");
         assert!(lines[0].starts_with("EVENT limited seq=102"), "{lines:#?}");
-        assert!(lines[1].starts_with("EVENT idle seq=103"), "{lines:#?}");
+        // A screen with no composer frame is settled by the full idle wait:
+        // the short settle's read, then the settled one.
+        assert!(
+            lines[1].starts_with("EVENT idle seq=104"),
+            "{lines:#?} {:#?}",
+            m.requests
+        );
         assert!(lines[2].starts_with("EXIT session gone"), "{lines:#?}");
         assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
-        let (records, _) = journal_records(&path);
-        let _ = std::fs::remove_dir_all(&dir);
-        let deferred: Vec<&str> = records
-            .iter()
-            .filter(|r| r.kind == "probe")
-            .map(|r| r.summary.as_str())
-            .collect();
-        assert!(!deferred.is_empty(), "{records:?}");
-        assert!(
-            deferred.iter().all(|s| *s == "no composer on the screen"),
-            "{deferred:?}"
-        );
-    }
-
-    /// The worker takes longer than the window to answer (50 ms here; in
-    /// production the question invites a look at the handoff, and 120 s is
-    /// not enough for one that runs a search): busy at the window's end, it
-    /// is answering, and the answer is waited for as any turn is — ONE
-    /// probe, `EVENT resumed` on the answer, never `still-limited` while it
-    /// visibly works and never a second probe once it has answered.
-    #[test]
-    fn a_slow_answer_is_waited_for_and_probed_once() {
-        let mut m = Mock::new(
-            true,
-            vec![
-                busy_screen(),
-                weekly_limited(),
-                busy_screen(),
-                busy_screen(),
-                answered(),
-            ],
-        );
-        m.turn_releases = Some(1);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        m.vanish_after = Some(2);
-        // The probe's second busy read (request 11: `await idle` at 10, then
-        // the read) lands past the 50 ms window.
-        m.delay.insert(10, Duration::from_millis(120));
-        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
-            s.set_clock(AFTER_RESET, PDT);
-            s.set_resume(Some(Resume { rules: None }));
-            s.set_probe_timing(
-                &[Duration::from_millis(10), Duration::from_millis(30)],
-                Duration::from_millis(50),
-            );
-        });
-        assert_eq!(
-            lines,
-            [
-                format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
-                format!("EVENT resumed seq=105 {ANSWER}"),
-                "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)".to_string(),
-            ],
-            "{:#?}",
-            m.requests
-        );
-        assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
-        assert_eq!(count(&m, "meta unset attention"), 1);
-    }
-
-    /// The notice printed again after a failed probe — the manager's retry
-    /// hit the limit too: a busy spell, then the notice, a new point printed
-    /// as ever — does not bring the next probe forward: the backoff (60 s
-    /// here) stands, and one probe goes in all.
-    #[test]
-    fn the_notice_again_after_a_failed_probe_keeps_the_backoff() {
-        let mut m = Mock::new(
-            true,
-            vec![
-                busy_screen(),
-                weekly_limited(),
-                weekly_retried(),
-                busy_screen(),
-                weekly_retried(),
-            ],
-        );
-        m.turn_releases = Some(1);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        m.vanish_after = Some(1);
-        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
-            s.set_clock(AFTER_RESET, PDT);
-            s.set_resume(Some(Resume { rules: None }));
-            s.set_probe_timing(&[Duration::from_secs(60)], Duration::from_millis(30));
-        });
-        assert_eq!(
-            lines,
-            [
-                format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
-                format!("EVENT still-limited seq=103 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                format!("EVENT limited seq=105 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
-                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)".to_string(),
-            ],
-            "{:#?}",
-            m.requests
-        );
-        assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
-        assert_eq!(count(&m, "meta set attention"), 1, "once an episode");
     }
 
     /// A reset read as further off than any limit names (`Feb 1` in
@@ -9586,10 +10213,10 @@ mod tests {
     /// and the FIRST busy read after it — the notice row still on the
     /// screen over the spinner — closes the episode there and then:
     /// `CLEARED` at that read's seq, the attention unset, before the point
-    /// the resumed turn ends on; with a rules file the rules follow at that
-    /// idle point, `EVENT rebriefed` after it, and no probe goes.
+    /// the resumed turn ends on. Claude Code goes on by itself: nothing is
+    /// typed, `--resume RULES` or not.
     #[test]
-    fn an_auto_continue_notice_closes_at_the_first_busy_read_and_the_rules_follow() {
+    fn an_auto_continue_notice_closes_at_the_first_busy_read_and_nothing_is_typed() {
         let (rdir, rules) = rules_file("auto-continue");
         let (jdir, path) = journal_file("auto-continue");
         let mut m = Mock::new(
@@ -9618,25 +10245,14 @@ mod tests {
                 // 1:50pm Pacific is 20:50Z; ten minutes past it.
                 "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
                 "EVENT idle seq=104 ⏺ All 8 runs are in.".to_string(),
-                "EVENT rebriefed seq=104".to_string(),
                 "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
             ],
             "{:#?}",
             m.requests
         );
         assert_eq!(count(&m, "meta set attention"), 1);
-        assert_eq!(count(&m, "meta unset attention"), 1);
-        assert_eq!(
-            count(&m, "turn"),
-            1,
-            "the rules, no probe: {:?}",
-            m.requests
-        );
-        assert!(
-            m.requests
-                .iter()
-                .any(|r| r == &format!("turn idle=600 timeout=2500 {RULES_LINE}"))
-        );
+        assert_eq!(count(&m, "meta unset attention owner=supervisor"), 1);
+        assert_eq!(count(&m, "turn"), 0, "{:?}", m.requests);
         let (records, _) = journal_records(&path);
         let cleared: Vec<(Option<u64>, &str)> = records
             .iter()
@@ -9662,7 +10278,6 @@ mod tests {
                 ("extend", "-"),
                 ("cleared", "-"),
                 ("event", "idle"),
-                ("event", "rebriefed"),
                 ("exit", "-"),
             ]
         );
@@ -9671,9 +10286,8 @@ mod tests {
     }
 
     /// `continuing shortly` is a reset a minute off: the line says
-    /// `reset=shortly`, the budget stretches to eleven minutes from now,
-    /// and the probe is armed a minute past the minute — not sent at the
-    /// point.
+    /// `reset=shortly`, the budget stretches to eleven minutes from now, and
+    /// nothing is typed — Claude Code goes on by itself.
     #[test]
     fn a_continuing_shortly_notice_is_a_reset_a_minute_off() {
         let mut m = Mock::new(true, vec![busy_screen(), auto_waiting(SHORTLY_TEXT)]);
@@ -9692,58 +10306,29 @@ mod tests {
             "{:#?}",
             m.requests
         );
-        assert_eq!(
-            count(&m, "turn"),
-            0,
-            "the probe waits for the minute and its grace"
-        );
+        assert_eq!(count(&m, "turn"), 0, "the vendor goes on by itself");
         assert_eq!(
             m.requests
                 .iter()
                 .find(|r| r.starts_with("meta set attention"))
                 .map(String::as_str),
-            Some(format!("meta set attention limited: {SHORTLY_TEXT} reset=shortly").as_str())
+            Some(
+                format!(
+                    "meta set attention owner=supervisor limited: {SHORTLY_TEXT} reset=shortly"
+                )
+                .as_str()
+            )
         );
     }
 
-    /// The probe after an auto-continue notice goes a minute PAST the time
-    /// it named, not at it — Claude Code's own continuation first: read at
-    /// 13:50:18, as the live notice was, no probe goes. Read at 13:51:30 it
-    /// goes at once, and its turn, read busy under the notice still up,
-    /// closes the episode at that read as any busy read does (the probe
-    /// cannot tell its own turn from Claude Code's continuation, and the
-    /// continuation may run for hours): `CLEARED … the worker works again`
-    /// at the busy read's seq, the attention unset once; the answer then
-    /// says `EVENT resumed` on the closed episode, and the rules follow.
+    /// Past the time an auto-continue notice named, and past a minute more,
+    /// still nothing is typed: the continuation is the vendor's own, and the
+    /// busy read of it closes the episode as any does. Negative control: a
+    /// notice that names a reset, at the same clock, is continued.
     #[test]
-    fn the_probe_after_an_auto_continue_notice_goes_a_minute_past_its_time() {
-        // 13:50:18 PDT: 1:50pm is 18 s gone, the probe is armed for 13:51.
-        let read_at = TEST_NOW + (4 * 60 + 55) * 60 + 18;
-        let mut m = Mock::new(true, vec![busy_screen(), auto_waiting(AUTO_TEXT)]);
-        m.vanish_after = Some(2);
-        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
-            s.set_clock(read_at, PDT);
-            s.set_resume(Some(Resume { rules: None }));
-        });
-        assert_eq!(
-            lines,
-            [
-                format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
-                "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
-                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)".to_string(),
-            ],
-            "{:#?}",
-            m.requests
-        );
-        assert_eq!(
-            count(&m, "turn"),
-            0,
-            "the probe is a minute past 1:50pm: {:?}",
-            m.requests
-        );
-        // 13:51:30 PDT: the minute is past, the probe goes at once.
-        let (rdir, rules) = rules_file("auto-probe");
-        let (jdir, path) = journal_file("auto-probe");
+    fn an_auto_continue_notice_is_never_continued_even_past_its_time() {
+        // 13:51:30 PDT: a minute and a half past 1:50pm.
+        let read_at = TEST_NOW + (4 * 60 + 55) * 60 + 90;
         let mut m = Mock::new(
             true,
             vec![
@@ -9754,61 +10339,32 @@ mod tests {
             ],
         );
         m.vanish_after = Some(2);
-        m.turn_releases = Some(1);
-        let opts = SuperviseOpts {
-            journal: Some(path.clone()),
-            ..auto(30, None)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_clock(read_at + 72, PDT);
-            s.set_resume(Some(Resume {
-                rules: Some(rules.clone()),
-            }));
+        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_clock(read_at, PDT);
+            s.set_resume(Some(Resume { rules: None }));
+            s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(600)]));
         });
         assert_eq!(
             lines,
             [
                 format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
                 "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
-                "EVENT resumed seq=104 ⏺ All 8 runs are in.".to_string(),
-                "EVENT rebriefed seq=104".to_string(),
-                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)".to_string(),
+                "EVENT idle seq=104 ⏺ All 8 runs are in.".to_string(),
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
             ],
             "{:#?}",
             m.requests
         );
-        assert_eq!(
-            count(&m, "turn"),
-            2,
-            "the probe, the rules: {:?}",
-            m.requests
-        );
-        assert!(m.requests.iter().any(|r| r == &probe_request()));
-        assert_eq!(count(&m, "meta unset attention"), 1);
-        let (records, _) = journal_records(&path);
-        assert_eq!(
-            records
-                .iter()
-                .map(|r| (r.kind.as_str(), r.phase.as_str(), r.seq))
-                .collect::<Vec<_>>(),
-            [
-                ("event", "limited", Some(102)),
-                ("escalated", "-", Some(102)),
-                ("extend", "-", None),
-                ("probe", "sent", Some(102)),
-                ("cleared", "-", Some(103)),
-                ("event", "resumed", Some(104)),
-                ("event", "rebriefed", Some(104)),
-                ("exit", "-", None),
-            ],
-            "the busy read under the probe closed the episode: {records:#?}"
-        );
-        assert_eq!(
-            records[4].summary,
-            "attention=OK the worker works again: the notice said it would continue by itself"
-        );
-        let _ = std::fs::remove_dir_all(&rdir);
-        let _ = std::fs::remove_dir_all(&jdir);
+        assert_eq!(count(&m, "turn"), 0, "{:?}", m.requests);
+        assert_eq!(count(&m, "meta unset attention owner=supervisor"), 1);
+        let mut m = Mock::new(true, vec![busy_screen(), weekly_limited()]);
+        m.vanish_after = Some(2);
+        let _ = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_clock(AFTER_RESET, PDT);
+            s.set_resume(Some(Resume { rules: None }));
+            s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(600)]));
+        });
+        assert_eq!(count(&m, "turn"), 1, "{:?}", m.requests);
     }
 
     /// Round 17's rule stands for a notice that names a reset: a busy spell
@@ -9848,7 +10404,7 @@ mod tests {
         );
         assert_eq!(count(&m, "meta set attention"), 1, "once an episode");
         assert_eq!(
-            count(&m, "meta unset attention"),
+            count(&m, "meta unset attention owner=supervisor"),
             0,
             "the episode is open still"
         );
@@ -9904,7 +10460,7 @@ mod tests {
         assert_eq!(
             (
                 count(&m, "meta set attention"),
-                count(&m, "meta unset attention"),
+                count(&m, "meta unset attention owner=supervisor"),
                 count(&m, "post to=@s-9 kind=control"),
             ),
             (3, 2, 1),
@@ -9986,7 +10542,7 @@ mod tests {
         assert_eq!(
             (
                 count(&m, "meta set attention"),
-                count(&m, "meta unset attention"),
+                count(&m, "meta unset attention owner=supervisor"),
                 count(&m, "post to=@s-9 kind=control"),
             ),
             (2, 1, 2),
@@ -9995,158 +10551,16 @@ mod tests {
         );
     }
 
-    /// The round-20 review: the probe typed on the notice a minute past its
-    /// time, and Claude Code's own continuation running for hours after it
-    /// (the live fourteen-hour turn, on the probe's path). The busy read
-    /// closes the episode as it does with no probe pending — `CLEARED` at
-    /// that read, the attention unset — instead of holding it open while
-    /// the answer window starts over at every busy read until the budget
-    /// (measured by the review: seven busy reads, no `CLEARED`, the badge
-    /// set to the end).
-    #[test]
-    fn a_pending_probe_does_not_hold_the_episode_open_while_the_continuation_runs() {
-        let (dir, path) = journal_file("auto-probe-long");
-        // 13:51:30 PDT: the minute past 1:50pm is gone, the probe goes at once.
-        let read_at = TEST_NOW + (4 * 60 + 55) * 60 + 90;
-        let mut m = Mock::new(
-            true,
-            vec![busy_screen(), auto_waiting(AUTO_TEXT), auto_resumed()],
-        );
-        m.turn_releases = Some(1);
-        m.vanish_after = Some(6);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        let opts = SuperviseOpts {
-            journal: Some(path.clone()),
-            ..auto(30, None)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_clock(read_at, PDT);
-            s.set_resume(Some(Resume { rules: None }));
-            s.set_probe_timing(&[Duration::from_secs(600)], Duration::from_millis(60));
-        });
-        assert!(
-            m.requests.iter().any(|r| r == &probe_request()),
-            "{:#?}",
-            m.requests
-        );
-        assert_eq!(
-            count(&m, "meta unset attention"),
-            1,
-            "the worker was read busy under the notice: the episode closes; lines {lines:#?}\n{:#?}",
-            m.requests
-        );
-        let (records, _) = journal_records(&path);
-        let cleared: Vec<(Option<u64>, &str)> = records
-            .iter()
-            .filter(|r| r.kind == "cleared")
-            .map(|r| (r.seq, r.summary.as_str()))
-            .collect();
-        assert_eq!(
-            cleared,
-            [(
-                Some(103),
-                "attention=OK the worker works again: the notice said it would continue by itself"
-            )],
-            "{records:#?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+    /// The engine's tests: the approval policy in the loop, the wake, the
+    /// lifecycle and the escalation (`run_engine_tests.rs`).
+    mod engine {
+        use super::*;
+        include!("run_engine_tests.rs");
     }
 
-    /// The probe's own turn hitting the wall: typed a minute past the time,
-    /// read busy under the notice (the episode closes at that read), then
-    /// the notice again — `EVENT still-limited`, and the SAME episode opened
-    /// again: the attention set again, no second mail, `EXTEND` for the
-    /// later reset it names (`shortly`, a minute past the probe's read: ten
-    /// minutes past that is past the first stretch), the backoff on, and
-    /// the notice re-read at the next look escalates nothing more.
-    #[test]
-    fn the_probe_hitting_the_wall_after_the_busy_read_opens_the_same_episode_again() {
-        let (dir, path) = journal_file("auto-probe-wall");
-        let read_at = TEST_NOW + (4 * 60 + 55) * 60 + 90;
-        let mut m = Mock::new(
-            true,
-            vec![
-                busy_screen(),
-                auto_waiting(AUTO_TEXT),
-                auto_resumed(),
-                auto_waiting(SHORTLY_TEXT),
-            ],
-        );
-        m.turn_releases = Some(1);
-        m.vanish_after = Some(3);
-        m.stall_sleep = Some(Duration::from_millis(5));
-        let opts = SuperviseOpts {
-            journal: Some(path.clone()),
-            ..auto(30, None)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_manager(Some("@s-9".to_string()));
-            s.set_clock(read_at, PDT);
-            s.set_resume(Some(Resume { rules: None }));
-            s.set_probe_timing(&[Duration::from_secs(600)], Duration::from_millis(60));
-        });
-        assert_eq!(
-            lines,
-            [
-                format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
-                "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
-                format!("EVENT still-limited seq=104 message={SHORTLY_TEXT} reset=shortly"),
-                "EXTEND until=2026-09-17T21:02:30Z reset=shortly".to_string(),
-                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)".to_string(),
-            ],
-            "{:#?}",
-            m.requests
-        );
-        assert_eq!(
-            (
-                count(&m, "meta set attention"),
-                count(&m, "meta unset attention"),
-                count(&m, "post to=@s-9 kind=control"),
-                count(&m, "turn"),
-            ),
-            (2, 1, 1, 1),
-            "{:#?}",
-            m.requests
-        );
-        let (records, _) = journal_records(&path);
-        assert_eq!(
-            records
-                .iter()
-                .map(|r| (r.kind.as_str(), r.seq, r.summary.as_str()))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    "event",
-                    Some(102),
-                    &*format!("message={AUTO_TEXT} reset=1:50pm")
-                ),
-                ("escalated", Some(102), "attention=OK mail=OK"),
-                ("extend", None, "until=2026-09-17T21:00:00Z reset=1:50pm"),
-                ("probe", Some(102), ""),
-                (
-                    "cleared",
-                    Some(103),
-                    "attention=OK the worker works again: the notice said it would continue by itself"
-                ),
-                (
-                    "event",
-                    Some(104),
-                    &*format!("message={SHORTLY_TEXT} reset=shortly")
-                ),
-                (
-                    "escalated",
-                    Some(104),
-                    "attention=OK mail=skipped: the retry hit the wall again, the episode of seq=102"
-                ),
-                ("extend", None, "until=2026-09-17T21:02:30Z reset=shortly"),
-                (
-                    "exit",
-                    None,
-                    "session gone (await seq 105 failed: aterm-ctl: ERR exited)"
-                ),
-            ],
-            "{records:#?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+    /// The turn-end policy in the loop (`turn_end_loop_tests.rs`).
+    mod turn_end {
+        use super::*;
+        include!("turn_end_loop_tests.rs");
     }
 }

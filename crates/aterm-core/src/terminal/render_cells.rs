@@ -1005,7 +1005,10 @@ impl Terminal {
     /// - dims + `cells.len()` match: resize-in-place preserved every row.
     /// - `display_offset == 0` on BOTH sides: tracker rows are LIVE-grid rows;
     ///   at offset 0 they coincide with viewport rows. A scrolled-back
-    ///   viewport (or a transition) re-maps rows and takes the full arm.
+    ///   viewport (or a transition) re-maps rows and takes the full arm —
+    ///   UNLESS the scratch is itself parked in history and the SCROLLED proof
+    ///   ([`scrolled_scoped_refill_delta`](Self::scrolled_scoped_refill_delta),
+    ///   SCR-2) holds, which reads no tracker bit at all.
     /// - `base_y` / `absolute_row_revision` match: no scroll or protected-
     ///   footer insertion shifted retained rows out from under their indices
     ///   (scroll damage marks only the EXPOSED strip — #6072 — so bits alone
@@ -1063,6 +1066,49 @@ impl Terminal {
             scratch.extract_gen = self.extract_gen;
             return crate::render::FrameRefill::Scoped { rows_refilled };
         };
+        // SCR-2: a viewport PARKED IN HISTORY has a continuity proof of its
+        // own. `EngineScrolled` used to refuse every scrolled-back frame — the
+        // ~120/s trackpad deltas of a 1:1 tracked scrub, every anchored glide
+        // tick, and every blink/pill/band frame parked between them, each a
+        // full `rows x cols` re-extraction — for exactly one reason: the
+        // tracker's row bits index LIVE rows, which at a non-zero offset are
+        // not viewport rows. The scrolled proof never reads those bits. Its
+        // strip comes from the OFFSET DELTA (two `scroll_display`s between
+        // fills mark `0..1` then `0..2` for a net 3-row exposure, so the bits
+        // would UNDERCOUNT), and "no other row changed" comes from the content
+        // generation the viewport-row memo (SCR-1) already trusts for the same
+        // rows. Consulted under that one cause only, AFTER the ordered check
+        // has spoken: every other clause's verdict and label are untouched,
+        // and entering history from the live bottom (a scratch at offset 0)
+        // still reports `EngineScrolled`, as the corpus pins.
+        if cause == crate::render::FullRefillCause::EngineScrolled
+            && let Some(delta) = self.scrolled_scoped_refill_delta(scratch, rows)
+        {
+            let mask = Self::rotate_scrolled_scratch(scratch, rows, delta);
+            self.cell_frame_fill(scratch, rows, cols, Some(&mask));
+            // SCR-2 DEBUG NET (the SCR-1 memo's pattern, viewport_row_cache.rs
+            // "The debug net"). The scrolled proof reads no tracker bit, so a
+            // future mutator that rewrites a cell and marks only partial damage
+            // — the one class the live arm's bits would catch and this arm
+            // cannot — is made loud where it is cheap: a debug build pays
+            // exactly what every scrolled frame cost before this arm, one full
+            // extraction. BEFORE `take_damage`, so the oracle reads the grid
+            // the masked fill just read.
+            #[cfg(debug_assertions)]
+            {
+                let mut oracle = crate::render::RenderInput::empty();
+                self.cell_frame_fill(&mut oracle, rows, cols, None);
+                debug_assert!(
+                    *scratch == oracle,
+                    "SCR-2: a rotated scratch diverged from a full extraction (delta {delta})"
+                );
+            }
+            self.take_damage();
+            scratch.extract_gen = self.extract_gen;
+            return crate::render::FrameRefill::Scoped {
+                rows_refilled: delta.unsigned_abs(),
+            };
+        }
         // Any continuity break lands here: always sound, costs exactly the
         // pre-carrier status quo, and re-establishes a valid baseline. The
         // refusing clause rides out with the arm so the caller can tally WHICH
@@ -1192,6 +1238,248 @@ impl Terminal {
         None
     }
 
+    /// SCR-2: the SCROLLED continuity proof — may a scratch that was filled
+    /// while parked in history be carried to the engine's CURRENT offset by
+    /// rotating its rows and re-resolving only the exposed strip?
+    ///
+    /// Consulted by [`cell_frame_damage_scoped_into`](Self::cell_frame_damage_scoped_into)
+    /// only after [`damage_scoped_refill_refusal`](Self::damage_scoped_refill_refusal)
+    /// refused under `EngineScrolled`, so every clause that PRECEDES that one
+    /// (identity, generation, host mutation, row shift, alt bit, dims) has
+    /// already held. Returns the signed offset delta (positive = the viewport
+    /// moved UP into older history) when the proof holds, `None` to keep the
+    /// full arm under the `EngineScrolled` label it already carries.
+    ///
+    /// Viewport row `r` shows absolute row `base_y - display_offset + r`. With
+    /// `base_y` pinned, an offset change of `delta` maps every retained row to
+    /// index `r + delta`, and only the `|delta|` rows that slid in from off
+    /// screen are new — that is the strip, derived from the two offsets and
+    /// NEVER from the tracker: the tracker's display-offset marks are the
+    /// per-call exposures (`TopRows`/`BottomRows`, #6072), whose union across
+    /// several `scroll_display`s between two fills undercounts the net move.
+    ///
+    /// The proof, clause by clause:
+    /// - the SCRATCH is parked in history (`display_offset > 0`). A scratch at
+    ///   offset 0 entering history keeps the full arm: it is the one frame
+    ///   per scrub, and the corpus pins its label.
+    /// - `content_seq` match: no content mutation since the fill. This is the
+    ///   grid's `content_gen`, the authority the SCR-1 viewport-row memo
+    ///   (`viewport_row_cache.rs`) keys its materialized history rows on, and
+    ///   it is bumped by every path that writes a cell, a line or the
+    ///   scrollback — including the direct `Damage::Full` assignments (reflow,
+    ///   offload) — and NOT by a pure viewport scroll. The partial marks that
+    ///   do not bump it are, by audit: the cursor cell (a scalar this fill
+    ///   restamps unconditionally), the display-offset strip (this proof's
+    ///   subject), image placement (the `images` channel is a whole-frame walk
+    ///   on every fill, and no `RenderCell` field reads `extra.image()`), and
+    ///   Kitty CSI +T unscroll, caught by the epoch below.
+    /// - `history_renumber_epoch` match: absolute keys did not shift wholesale
+    ///   under the retained rows (unscroll marks rows and moves no `base_y`).
+    /// - `base_y` match: the live grid did not scroll under the offset. The
+    ///   SCR-1 re-pin after an output batch moves `base_y` and the offset in
+    ///   lockstep — same ANCHOR, same rows on screen — but a batch is content
+    ///   and the tracker cannot say which VISIBLE live rows it touched (its
+    ///   bits mix the batch's live-row marks with the pin/re-pin's
+    ///   viewport-row marks), so that frame honestly stays full.
+    /// - `absolute_row_revision` match: no protected-footer insertion.
+    /// - `!Damage::Full`: palette / DECSCNM / reflow re-resolve every cell
+    ///   without necessarily moving `content_gen` (a recolor moves no cell).
+    /// - the two per-row companion channels are the scratch's own height
+    ///   (`cells.len()` was checked by the ordered proof; `clusters` and
+    ///   `combining` rotate with it and must be rotatable).
+    /// - `|delta| < rows`: a larger move exposes the whole viewport (a single
+    ///   `scroll_display` of that size marks `Damage::Full` already, but a
+    ///   COMPOUND move of small steps stays partial and would otherwise ask
+    ///   `rotate_right` for more than the length).
+    ///
+    /// The row-revision lane is NOT published by a scrolled fill (see
+    /// `cell_frame_fill`): `row_rev` is indexed by live rows and a scrolled
+    /// viewport's rows are not live rows.
+    fn scrolled_scoped_refill_delta(
+        &self,
+        scratch: &crate::render::RenderInput,
+        rows: usize,
+    ) -> Option<isize> {
+        let grid = self.grid();
+        if scratch.display_offset <= 0 {
+            return None;
+        }
+        if scratch.content_seq != self.content_seq() {
+            return None;
+        }
+        if scratch.history_renumber_epoch != grid.history_renumber_epoch() {
+            return None;
+        }
+        // Same conversion the fill stamps, so the comparison can never differ
+        // by conversion policy alone.
+        if scratch.base_y != i64::try_from(grid.base_y()).unwrap_or(i64::MAX) {
+            return None;
+        }
+        if scratch.absolute_row_revision != self.absolute_row_revision() {
+            return None;
+        }
+        if grid.damage().is_full() {
+            return None;
+        }
+        if scratch.clusters.len() != rows || scratch.combining.len() != rows {
+            return None;
+        }
+        let delta = i64::try_from(grid.display_offset()).ok()? - i64::from(scratch.display_offset);
+        if delta.unsigned_abs() >= u64::try_from(rows).ok()? {
+            return None;
+        }
+        isize::try_from(delta).ok()
+    }
+
+    /// SCR-2: carry a parked scratch to a new offset by rotating its three
+    /// per-row content channels (`cells`, `clusters`, `combining` — the three
+    /// a scoped refill retains, and the only per-row channels the fill does
+    /// not rebuild unconditionally: `line_sizes`, `images`, the pane span
+    /// lists and `row_rev` are rewritten whole on every fill) and return the
+    /// refill mask of the exposed strip.
+    ///
+    /// `delta > 0`: the viewport moved UP by `delta` rows, so what row `r`
+    /// showed is now at row `r + delta` (`rotate_right`) and rows `0..delta`
+    /// are newly exposed history. `delta < 0`: moved DOWN, `rotate_left`, and
+    /// the bottom `|delta|` rows are newly exposed. The rotated-out inner Vecs
+    /// land exactly on the exposed rows, where the masked fill `clear()`s and
+    /// refills them in place — allocation-free in steady state, like every
+    /// other row of the scratch.
+    ///
+    /// Caller guarantees `|delta| < rows` and all three channels have `rows`
+    /// entries (the proof above), so the rotations cannot panic.
+    fn rotate_scrolled_scratch(
+        scratch: &mut crate::render::RenderInput,
+        rows: usize,
+        delta: isize,
+    ) -> Vec<u64> {
+        let n = delta.unsigned_abs();
+        let exposed = match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => {
+                scratch.cells.rotate_right(n);
+                scratch.clusters.rotate_right(n);
+                scratch.combining.rotate_right(n);
+                0..n
+            }
+            std::cmp::Ordering::Less => {
+                scratch.cells.rotate_left(n);
+                scratch.clusters.rotate_left(n);
+                scratch.combining.rotate_left(n);
+                rows - n..rows
+            }
+            std::cmp::Ordering::Equal => 0..0,
+        };
+        let mut mask = vec![0u64; rows.div_ceil(64)];
+        for r in exposed {
+            mask[r / 64] |= 1u64 << (r % 64);
+        }
+        mask
+    }
+
+    /// M1b INCOMING-ROW APRON: fill `scratch.apron_row` with the row just below a
+    /// `rows`-tall viewport. THE LAW: the apron at offset `d` IS the bottom
+    /// viewport row at offset `d - 1` — the row a sub-row up-glide slides in at
+    /// the bottom. For `rows >= d` that row is the LIVE screen row `rows - d`,
+    /// read offset-INDEPENDENTLY (the same source `render_row_at_screen` reads,
+    /// so its colours / extras / wide flags pair with the live glyphs); deeper in
+    /// history it is the history row `visible_row_view` resolves for index
+    /// `rows` (rev index `d - 1 - rows`). At `d == 0` nothing lies below the live
+    /// bottom and the apron is absent. No images: an image on the incoming row
+    /// paints its bg only until the row lands (the renderer's image pass is
+    /// keyed to viewport rows).
+    fn apron_row_into(&self, scratch: &mut crate::render::RenderInput, rows: usize) {
+        let d = self.grid().display_offset();
+        // The caret is a present-time scalar, not row content: moving or hiding
+        // it does not bump `content_gen`. Refresh it even when the row memo
+        // hits, so a sub-row glide cannot paint yesterday's caret in its strip.
+        let cursor_col = (self.cursor_visible() && self.projected_cursor_row() == rows)
+            .then(|| self.cursor().col as usize);
+        // THE STAMP (the SCR-1 memo's discipline for one more row): the apron
+        // ROW CONTENT is a pure function of the offset, content generation,
+        // history renumbering and frame shape; the caret scalar above is not.
+        // Thus a stationary repaint —
+        // a blink, a pill tick, a sub-row band frame inside one engine row —
+        // re-reads nothing. Without it every scrolled frame materialized one
+        // history row (`scrolled_back_frame_materialize_count` caught it).
+        let stamp = (
+            d,
+            self.grid().content_gen(),
+            self.grid().history_renumber_epoch(),
+            rows,
+            scratch.cols,
+        );
+        if scratch.apron_stamp == Some(stamp) {
+            // An absent apron (live bottom or a BiDi row) must stay absent.
+            if scratch.apron_row.present {
+                scratch.apron_row.cursor_col = cursor_col;
+            }
+            return;
+        }
+        scratch.apron_stamp = Some(stamp);
+        let ap = &mut scratch.apron_row;
+        if d == 0 || rows == 0 {
+            ap.clear();
+            return;
+        }
+        if rows >= d {
+            let screen_row = rows - d;
+            self.render_row_into_impl(
+                screen_row,
+                &mut ap.cells,
+                Some((&mut ap.clusters, &mut ap.combining)),
+                true,
+            );
+            ap.line_size = u16::try_from(screen_row)
+                .ok()
+                .and_then(|sr| self.grid().row_at_screen(sr))
+                .map_or(
+                    crate::grid::LineSize::SingleWidth,
+                    crate::grid::Row::line_size,
+                );
+        } else {
+            // Deeper in history than the frame is tall: viewport index `rows` is
+            // itself a history row, which `visible_row_view` resolves directly.
+            self.render_row_into_impl(
+                rows,
+                &mut ap.cells,
+                Some((&mut ap.clusters, &mut ap.combining)),
+                false,
+            );
+            // The ring keeps a scrolled-off row's DEC line size, and `row(vr)`
+            // reports it for an in-viewport history index — so must the apron.
+            ap.line_size = u16::try_from(rows)
+                .ok()
+                .and_then(|vr| self.grid().row_past_viewport(vr))
+                .map_or(
+                    crate::grid::LineSize::SingleWidth,
+                    crate::grid::Row::line_size,
+                );
+        }
+        // The DEC cursor projects DOWN by the offset (`projected_cursor_row`);
+        // when its projected row is exactly the apron row, carry the caret so it
+        // rides in with the row instead of popping in once the row lands.
+        // The apron never passes `apply_bidi_reorder`, so a row whose VISUAL
+        // order is not its logical order (an RTL run) would ride in logical
+        // order and flip on landing; the placeholder is the lesser artefact for
+        // that row. Keyed on the ROW's order, never on `bidi_mode`: aterm-gui
+        // enables the `bidi` feature and the shipping mode is `Implicit`, so a
+        // mode veto would clear the apron on EVERY frame (the same mistake the
+        // damage-scoped refusal once made, see `damage_scoped_refill_refusal`).
+        // A pure-LTR row — the overwhelming majority — is the identity here.
+        #[cfg(feature = "bidi")]
+        if self
+            .bidi_visual_order_cells(&ap.cells)
+            .iter()
+            .enumerate()
+            .any(|(visual, &logical)| visual != logical)
+        {
+            ap.clear();
+            return;
+        }
+        ap.cursor_col = cursor_col;
+        ap.present = true;
+    }
+
     /// The one shared fill body behind [`cell_frame_into`](Self::cell_frame_into)
     /// (`refill_mask: None` — the historical unconditional walk, byte-identical)
     /// and the damage-scoped arm (`Some(mask)` — only marked rows re-resolve;
@@ -1252,6 +1540,12 @@ impl Terminal {
                 false,
             );
         }
+        // M1b INCOMING-ROW APRON: the ONE row just below the viewport, stamped on
+        // EVERY fill — the damage-scoped arm included, because the row sits at
+        // viewport index `rows`, outside any mask the tracker can mark, and it
+        // changes whenever output lands on the live row below a scrolled-back
+        // viewport. One row's resolve; the cell loop above is the price of `rows`.
+        self.apron_row_into(scratch, rows);
 
         // Images stay a SEPARATE pass: an image/placeholder cell carries only an
         // extra (no glyph), so the row may be unmaterialized and `render_row_into`
@@ -1464,7 +1758,18 @@ impl Terminal {
         // gate hit AND the change right. Full-damage frames repaint everything
         // anyway, so the compare they pay for is not a cost this lane was ever
         // going to save.
-        scratch.row_rev_lane = if self.grid().damage().is_full() {
+        //
+        // WHY A SCROLLED FILL IS EXCLUDED TOO (SCR-2): the lane is indexed by
+        // LIVE rows — `row_revisions` folds the tracker, whose bits are
+        // live-row bits — but this snapshot's rows are VIEWPORT rows, the
+        // first `display_offset` of which are history. The fold above still
+        // runs, so the clock keeps every mark for the next live fill; only the
+        // vouching is withheld. `aterm_render::compute_dirty_rows` already
+        // pins `display_offset == 0` on both snapshots before trusting a lane,
+        // so no consumer loses a hit — the snapshot merely stops claiming what
+        // its rows cannot mean, and a scrolled SCOPED fill (which retains
+        // rotated rows) cannot publish stamps under the wrong indices.
+        scratch.row_rev_lane = if self.grid().damage().is_full() || display_offset != 0 {
             0
         } else {
             self.extract_identity
@@ -2714,6 +3019,109 @@ mod tests {
         );
     }
 
+    /// M1b INCOMING-ROW APRON law: the apron at offset `d` IS the bottom viewport
+    /// row at offset `d - 1` — for a shallow scroll (the row is LIVE), at the
+    /// exact `d == rows` seam, and for a scroll deeper than the frame is tall
+    /// (the row is HISTORY) — and there is NO apron at the live bottom. The
+    /// caret rides on it exactly when the cursor's projected row is the apron.
+    /// FAILS against a `RenderInput` without the field (does not compile) and
+    /// against an extraction that leaves it absent.
+    #[test]
+    fn apron_row_is_the_bottom_row_one_offset_shallower() {
+        let (rows, cols) = (6usize, 10usize);
+        let seeded = || {
+            let mut t = Terminal::new(rows as u16, cols as u16);
+            for i in 0..30 {
+                t.process(format!("line {i:02}\r\n").as_bytes());
+            }
+            t
+        };
+        let mut live = seeded();
+        let at_live = live.cell_frame(rows, cols);
+        assert_eq!(at_live.display_offset, 0);
+        assert!(
+            !at_live.apron_row.present,
+            "no row lies below the live bottom"
+        );
+        assert!(at_live.apron_row.cells.is_empty());
+
+        for d in [1i32, 3, 5, 6, 7, 20] {
+            let mut t = seeded();
+            t.scroll_display(d);
+            let at_d = t.cell_frame(rows, cols);
+            assert_eq!(at_d.display_offset, d, "fixture reaches offset {d}");
+            assert!(
+                at_d.apron_row.present,
+                "d={d}: a row lies below the viewport"
+            );
+            t.scroll_display(-1);
+            let at_d1 = t.cell_frame(rows, cols);
+            assert_eq!(at_d1.display_offset, d - 1);
+            assert_eq!(
+                at_d.apron_row.cells,
+                at_d1.cells[rows - 1],
+                "d={d}: the apron is the bottom row one offset shallower"
+            );
+            assert_eq!(at_d.apron_row.clusters, at_d1.clusters[rows - 1], "d={d}");
+            assert_eq!(at_d.apron_row.combining, at_d1.combining[rows - 1], "d={d}");
+            assert_eq!(
+                at_d.apron_row.line_size,
+                at_d1.line_sizes[rows - 1],
+                "d={d}"
+            );
+            // The caret: after the last `\r\n` the cursor sits on live row 5 col 0,
+            // which projects onto viewport row `5 + d` — the apron row exactly at
+            // d == 1, off the frame past it.
+            assert_eq!(
+                at_d.apron_row.cursor_col,
+                (d == 1).then_some(0),
+                "d={d}: the caret rides the apron only when its projected row is it"
+            );
+        }
+        // Non-vacuity: a shallow apron carries real text (it is a written line).
+        let mut t = seeded();
+        t.scroll_display(2);
+        let text: String = t
+            .cell_frame(rows, cols)
+            .apron_row
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(text.starts_with("line "), "apron text: {text:?}");
+    }
+
+    /// Cursor-only updates do not bump the row-content generation. The apron
+    /// keeps its materialized row, but its caret must follow the current DEC
+    /// cursor so the incoming strip cannot show a stale position or visibility.
+    #[test]
+    fn apron_memo_refreshes_cursor_without_rematerializing_the_row() {
+        let (rows, cols) = (6usize, 10usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        for i in 0..30 {
+            term.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        term.scroll_display(1);
+        let mut scratch = crate::render::RenderInput::empty();
+        term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        assert_eq!(scratch.apron_row.cursor_col, Some(0));
+        let stamp = scratch.apron_stamp;
+        let content_gen = term.grid().content_gen();
+
+        for (escape, want) in [
+            (b"\x1b[6;4H".as_slice(), Some(3)),
+            (b"\x1b[?25l".as_slice(), None),
+            (b"\x1b[?25h".as_slice(), Some(3)),
+            (b"\x1b[5;4H".as_slice(), None),
+        ] {
+            term.process(escape);
+            assert_eq!(term.grid().content_gen(), content_gen);
+            term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+            assert_eq!(scratch.apron_stamp, stamp, "row memo stays reusable");
+            assert_eq!(scratch.apron_row.cursor_col, want, "escape {escape:?}");
+        }
+    }
+
     /// `render_row_at_screen` is the LIVE-frame twin of `render_row`: identical at
     /// `display_offset == 0`, but IGNORES a GUI scroll-back — so a socket `cell`/
     /// `screen`/`cells` read never pairs a scrolled-back row's colours/attrs with the
@@ -3704,5 +4112,456 @@ mod tests {
         for (i, c) in FullRefillCause::ALL.iter().enumerate() {
             assert_eq!(c.index(), i, "FullRefillCause::ALL must be in index order");
         }
+    }
+
+    /// SCR-2 fixture: a terminal with history and a scratch PARKED in it —
+    /// filled at a non-zero offset, so the very next scrolled refill is a
+    /// candidate for the scrolled proof. Entering history from the live
+    /// bottom is asserted to keep its corpus label on the way in: that frame
+    /// is one per scrub and its label is pinned, so the fixture would be
+    /// worthless if it drifted.
+    fn scr2_parked_in_history(
+        rows: usize,
+        cols: usize,
+        offset: i32,
+    ) -> (Terminal, crate::render::RenderInput) {
+        use crate::render::{FrameRefill, FullRefillCause};
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        // 24 lines on an 8-row grid leave 17 in scrollback: room to park,
+        // to overshoot, and to clamp at both ends.
+        for i in 0..24 {
+            term.process(format!("line {i}\r\n").as_bytes());
+        }
+        let mut scratch = crate::render::RenderInput::empty();
+        let _ = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        term.scroll_display(offset);
+        let r = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
+            "entering history from the live bottom keeps the full arm under the ENGINE's offset"
+        );
+        assert_eq!(
+            term.grid().display_offset(),
+            usize::try_from(offset).expect("a positive park offset"),
+            "precondition: the viewport is parked where the fixture put it"
+        );
+        (term, scratch)
+    }
+
+    /// One SCR-2 oracle step: fresh full extract first (allocation-per-call,
+    /// no continuity, no damage consume), then the scoped refill, then
+    /// content equality — the exact compare the CPU renderer's damage cache
+    /// uses — and the row-revision lane must be withheld from every frame
+    /// filled while scrolled.
+    fn scr2_step(
+        term: &mut Terminal,
+        scratch: &mut crate::render::RenderInput,
+        rows: usize,
+        cols: usize,
+        what: &str,
+    ) -> crate::render::FrameRefill {
+        let reference = term.cell_frame(rows, cols);
+        let refill = term.cell_frame_damage_scoped_into(scratch, rows, cols);
+        assert!(
+            *scratch == reference,
+            "scrolled scoped extraction diverged from the full extract after: {what} ({refill:?})"
+        );
+        if scratch.display_offset != 0 {
+            assert_eq!(
+                scratch.row_rev_lane, 0,
+                "a fill at a non-zero offset must not publish a row-revision lane ({what})"
+            );
+        }
+        refill
+    }
+
+    /// SCR-2 REACH. A 1:1 tracked trackpad scrub presents on every delta
+    /// (~120/s) and every anchored glide tick, and each of those frames used
+    /// to be a whole-viewport re-extraction under `EngineScrolled`. The strip
+    /// must be exactly the rows the OFFSET moved — one for a one-row step,
+    /// three for two steps of one and two between fills (whose tracker bits
+    /// say `0..2`), zero for a frame that moved nothing — and the three
+    /// corpus labels around the arm must keep meaning what they mean.
+    /// SCR-2: history evicted from UNDER a viewport parked at the top. The
+    /// grid re-clamps the offset (`clamp_display_offset`) and every survivor
+    /// keeps its absolute number, so the rotation stays right whether or not
+    /// the evictor bumped `content_gen` (the line-limit shrink does; the
+    /// byte-budget enforcer does not). Byte equality with the oracle is the
+    /// assertion; the arm taken is the evictor's business.
+    #[test]
+    fn scr2_eviction_under_a_parked_viewport_matches_the_full_extract() {
+        const ROWS: usize = 8;
+        const COLS: usize = 32;
+        let (mut term, mut scratch) = scr2_parked_in_history(ROWS, COLS, 2);
+        term.scroll_to_top();
+        let _ = scr2_step(&mut term, &mut scratch, ROWS, COLS, "to top");
+        let before = term.grid().scrollback_lines();
+        term.grid_mut().set_scrollback_line_limit(Some(10));
+        assert!(
+            term.grid().scrollback_lines() < before,
+            "precondition: lines were evicted"
+        );
+        assert_eq!(
+            term.grid().display_offset(),
+            term.grid().scrollback_lines(),
+            "the shrink re-clamped the parked offset to the new top"
+        );
+        let _ = scr2_step(
+            &mut term,
+            &mut scratch,
+            ROWS,
+            COLS,
+            "limit shrink while parked at top",
+        );
+        term.scroll_display(-1);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "step after eviction"),
+            crate::render::FrameRefill::Scoped { rows_refilled: 1 },
+            "the scrub is scoped again on the frame after the eviction"
+        );
+    }
+
+    #[test]
+    fn scr2_scrolled_wheel_step_refills_only_the_exposed_strip() {
+        use crate::render::{FrameRefill, FullRefillCause};
+        const ROWS: usize = 8;
+        const COLS: usize = 32;
+        let (mut term, mut scratch) = scr2_parked_in_history(ROWS, COLS, 3);
+
+        term.scroll_display(1);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "1-row step up"),
+            FrameRefill::Scoped { rows_refilled: 1 },
+            "a 1-row wheel step up re-resolves exactly the one exposed row"
+        );
+        term.scroll_display(-1);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "1-row step down"),
+            FrameRefill::Scoped { rows_refilled: 1 },
+            "a 1-row wheel step down re-resolves exactly the one exposed row"
+        );
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "parked, untouched"),
+            FrameRefill::Scoped { rows_refilled: 0 },
+            "a blink/pill frame parked in history refills nothing"
+        );
+        // A parser batch that moves only the cursor: the SCR-1 pin dance
+        // (offset -> 0 -> offset) marks a bottom strip and a top strip in the
+        // tracker, but no content moved and the offset is back where it was,
+        // so the strip is empty and only the cursor scalars restamp.
+        term.process(b"\x1b[2;2H");
+        assert_eq!(
+            scr2_step(
+                &mut term,
+                &mut scratch,
+                ROWS,
+                COLS,
+                "cursor-only batch while parked"
+            ),
+            FrameRefill::Scoped { rows_refilled: 0 },
+            "a cursor-only batch while parked re-pins to the same offset and refills nothing"
+        );
+        // COMPOUND MOTION: the tracker holds `0..1 | 0..2 == 0..2` for a net
+        // exposure of THREE rows. The strip must come from the offsets.
+        term.scroll_display(1);
+        term.scroll_display(2);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "compound 1+2"),
+            FrameRefill::Scoped { rows_refilled: 3 },
+            "two steps between fills expose their NET rows, not the tracker's union"
+        );
+        term.scroll_display(2);
+        term.scroll_display(-1);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "reversal 2-1"),
+            FrameRefill::Scoped { rows_refilled: 1 },
+            "a reversal within a frame exposes its net one row"
+        );
+        term.scroll_display(2);
+        term.scroll_display(-2);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "reversal 2-2"),
+            FrameRefill::Scoped { rows_refilled: 0 },
+            "a reversal that nets zero exposes nothing"
+        );
+
+        // The three corpus labels, pinned next to the arm that lives under them.
+        term.process(b"x");
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "write while scrolled"),
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
+            "content moved under the parked viewport: the full arm, under the engine's offset"
+        );
+        term.scroll_to_bottom();
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "back to bottom"),
+            FrameRefill::Full {
+                cause: FullRefillCause::ScratchScrolled
+            },
+            "returning to the bottom refuses on the SCRATCH's stale offset"
+        );
+        term.scroll_display(2);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "re-enter history"),
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
+            "entering history from the live bottom is the one full frame of a scrub"
+        );
+        term.scroll_display(1);
+        assert_eq!(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "scrub resumes"),
+            FrameRefill::Scoped { rows_refilled: 1 },
+            "and the scrub is scoped again from the next delta on"
+        );
+    }
+
+    /// SCR-2, the row-revision lane. `row_rev` is indexed by LIVE rows; a
+    /// frame filled at a non-zero offset holds VIEWPORT rows, so it may not
+    /// vouch for the lane — whether it was filled whole (this frame) or by
+    /// rotating a parked scratch (every frame after it).
+    #[test]
+    fn scr2_parked_fill_publishes_no_row_revision_lane() {
+        let (_term, scratch) = scr2_parked_in_history(8, 32, 3);
+        assert_ne!(
+            scratch.display_offset, 0,
+            "precondition: filled while parked"
+        );
+        assert_eq!(
+            scratch.row_rev_lane, 0,
+            "a fill at a non-zero offset must not publish a row-revision lane indexed by live rows"
+        );
+    }
+
+    /// SCR-2 ORACLE. Byte-for-byte equality with a fresh full extraction
+    /// across everything a scrub does: a compound move whose NET exceeds the
+    /// viewport while the tracker stays partial (a rotation would ask for more
+    /// rows than exist), the clamp at the top of history, one-row steps all
+    /// the way back down to the live bottom, re-entry in bites that clamp at
+    /// the top, and output arriving while parked — both the SCR-1 re-pin
+    /// (`base_y` and the offset move in lockstep) and a write into a visible
+    /// live row. Reach is counted at the bottom so a silent slide back to
+    /// `Full` on every frame cannot pass as correctness.
+    #[test]
+    fn scr2_scrolled_scoped_extraction_matches_full_extract_across_history_ends_and_output() {
+        use crate::render::{FrameRefill, FullRefillCause};
+        const ROWS: usize = 8;
+        const COLS: usize = 32;
+        let (mut term, mut scratch) = scr2_parked_in_history(ROWS, COLS, 2);
+        let mut n_scoped = 0usize;
+        let mut n_full = 0usize;
+        fn tally(r: FrameRefill, n_scoped: &mut usize, n_full: &mut usize) -> FrameRefill {
+            match r {
+                FrameRefill::Full { .. } => *n_full += 1,
+                FrameRefill::Scoped { .. } => *n_scoped += 1,
+            }
+            r
+        }
+
+        // Three steps of three: each marks `TopRows(3)` (partial), the net
+        // is 9 >= 8. The strip would be the whole viewport, so the full arm.
+        term.scroll_display(3);
+        term.scroll_display(3);
+        term.scroll_display(3);
+        let r = tally(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "compound 3+3+3"),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
+            "a compound move that exposes the whole viewport takes the full arm, and does not panic"
+        );
+
+        // Wrap at the TOP: 11 -> 17 is a 6-row strip; a further push clamps
+        // and moves nothing.
+        term.scroll_to_top();
+        let r = tally(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "scroll_to_top"),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(r, FrameRefill::Scoped { rows_refilled: 6 });
+        term.scroll_display(5);
+        let r = tally(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "clamped at top"),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(r, FrameRefill::Scoped { rows_refilled: 0 });
+
+        // One-row steps all the way down. The frame that lands on the live
+        // bottom refuses on the scratch's stale offset, as the corpus pins.
+        while term.grid().display_offset() > 0 {
+            term.scroll_display(-1);
+            let r = tally(
+                scr2_step(&mut term, &mut scratch, ROWS, COLS, "1-row step down"),
+                &mut n_scoped,
+                &mut n_full,
+            );
+            if term.grid().display_offset() == 0 {
+                assert_eq!(
+                    r,
+                    FrameRefill::Full {
+                        cause: FullRefillCause::ScratchScrolled
+                    }
+                );
+            } else {
+                assert_eq!(r, FrameRefill::Scoped { rows_refilled: 1 });
+            }
+        }
+        term.scroll_display(-1);
+        let r = tally(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "clamped at bottom"),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert!(
+            matches!(r, FrameRefill::Scoped { .. }),
+            "at the live bottom the LIVE scoped arm answers, got {r:?}"
+        );
+
+        // Back up in 3-row bites until the top clamps the last one short.
+        let mut entered = false;
+        loop {
+            let before = term.grid().display_offset();
+            term.scroll_display(3);
+            let after = term.grid().display_offset();
+            if after == before {
+                break;
+            }
+            let r = tally(
+                scr2_step(&mut term, &mut scratch, ROWS, COLS, "3-row bite up"),
+                &mut n_scoped,
+                &mut n_full,
+            );
+            if entered {
+                assert_eq!(
+                    r,
+                    FrameRefill::Scoped {
+                        rows_refilled: after - before
+                    },
+                    "a bite exposes exactly the rows the offset moved (clamped at the top)"
+                );
+            } else {
+                assert_eq!(
+                    r,
+                    FrameRefill::Full {
+                        cause: FullRefillCause::EngineScrolled
+                    }
+                );
+                entered = true;
+            }
+        }
+        assert_eq!(
+            term.grid().display_offset(),
+            17,
+            "the loop ran to the top of history"
+        );
+
+        // Output while parked with live rows on screen. The SCR-1 re-pin keeps
+        // the same rows in view (`base_y` and the offset move together) but a
+        // batch is content: the full arm, and the bytes must be the oracle's.
+        term.scroll_display(-12);
+        let r = tally(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "12-row jump down"),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            }
+        );
+        let base_y_before = scratch.base_y;
+        term.process(b"tail\r\n");
+        assert_eq!(
+            term.grid().display_offset(),
+            6,
+            "SCR-1 re-pinned the reading position"
+        );
+        let r = tally(
+            scr2_step(
+                &mut term,
+                &mut scratch,
+                ROWS,
+                COLS,
+                "output re-pinned the viewport",
+            ),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
+            "a re-pin is content: the full arm"
+        );
+        assert_eq!(
+            scratch.base_y,
+            base_y_before + 1,
+            "the live grid scrolled one line"
+        );
+        term.scroll_display(1);
+        let r = tally(
+            scr2_step(&mut term, &mut scratch, ROWS, COLS, "step after output"),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Scoped { rows_refilled: 1 },
+            "the scrub is scoped again on the frame after the output"
+        );
+        term.process(b"\x1b[1;1HX");
+        let r = tally(
+            scr2_step(
+                &mut term,
+                &mut scratch,
+                ROWS,
+                COLS,
+                "write into a visible live row",
+            ),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
+            "a write into a visible live row while parked is content: the full arm"
+        );
+        let r = tally(
+            scr2_step(
+                &mut term,
+                &mut scratch,
+                ROWS,
+                COLS,
+                "parked after the write",
+            ),
+            &mut n_scoped,
+            &mut n_full,
+        );
+        assert_eq!(r, FrameRefill::Scoped { rows_refilled: 0 });
+
+        assert!(
+            n_scoped >= 20,
+            "the scrolled scoped arm must carry the scrub: {n_scoped} scoped / {n_full} full"
+        );
+        assert!(
+            n_full >= 5,
+            "the full arm must still answer every content/identity break: {n_full} full"
+        );
     }
 }

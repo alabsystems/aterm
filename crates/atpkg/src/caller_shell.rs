@@ -143,6 +143,164 @@ fn linux_comm_name(pid: u32) -> Option<String> {
 /// string after the leading `argc`.
 #[cfg(target_os = "macos")]
 fn macos_exe_name(pid: u32) -> Option<String> {
+    exe_name_of_procargs2(&macos_procargs2(pid)?)
+}
+
+/// The basename of the exec path a `KERN_PROCARGS2` buffer leads with, read on its own
+/// ([`procargs2_exec_path`]) — never through the whole-layout [`parse_procargs2`]. The name
+/// needs one string, and routing it through the parser made every argv the parser refuses
+/// cost the caller's shell: a parent past 65 535 argv words went unnamed, and the remedy
+/// line was printed in `$SHELL`'s dialect instead (2026-09-23 audit; this reader never
+/// looked at argc before the parser existed).
+#[cfg(any(target_os = "macos", test))]
+fn exe_name_of_procargs2(buf: &[u8]) -> Option<String> {
+    std::path::Path::new(procargs2_exec_path(buf)?)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// The bytes of the native-endian `c_int` argc a `KERN_PROCARGS2` buffer leads with.
+const PROCARGS2_ARGC_BYTES: usize = 4;
+
+/// The exec path a `KERN_PROCARGS2` buffer leads with: the first NUL-terminated string
+/// after the argc, which this does not read. `None` when there is no NUL or the path is
+/// not UTF-8.
+fn procargs2_exec_path(buf: &[u8]) -> Option<&str> {
+    let rest = buf.get(PROCARGS2_ARGC_BYTES..)?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&rest[..end]).ok()
+}
+
+/// One process's exec path, argument vector and environment, as the kernel recorded
+/// them at `exec` (the environment is the INITIAL one: an `export` the process made
+/// later is not in it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcArgs {
+    /// The path the process was exec'd from, as passed to `exec` (not canonical).
+    pub exec_path: String,
+    /// `argv`, `argv[0]` first.
+    pub argv: Vec<String>,
+    /// `KEY=value` entries, in the order the kernel holds them.
+    pub env: Vec<String>,
+}
+
+impl ProcArgs {
+    /// The value of one environment variable at exec, where set.
+    #[must_use]
+    pub fn env_var(&self, key: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find_map(|kv| kv.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
+    }
+}
+
+/// `pid`'s exec path, argv and initial environment, when this process may read them —
+/// the process's own uid (or root). macOS: one `sysctl(KERN_PROCARGS2)`; Linux:
+/// `/proc/<pid>/{exe,cmdline,environ}`. `None` on any refusal, on another platform, or on
+/// a buffer this parser does not recognise — never a partial read passed off as whole.
+///
+/// Used by the agent live-upgrade driver (aterm-agent `harness::upgrade`), which must
+/// relaunch a Claude Code session with the flags it was started with and find the aterm
+/// tab it runs in; `ps -o command=` joins argv with spaces and loses a quoted word.
+#[must_use]
+pub fn process_args(pid: u32) -> Option<ProcArgs> {
+    #[cfg(target_os = "macos")]
+    {
+        parse_procargs2(&macos_procargs2(pid)?)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let exec_path = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        let argv = split_nul_list(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
+        // An empty `environ` entry names no variable; only there is dropping one right.
+        let mut env = split_nul_list(&std::fs::read(format!("/proc/{pid}/environ")).ok()?);
+        env.retain(|kv| !kv.is_empty());
+        Some(ProcArgs {
+            exec_path,
+            argv,
+            env,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `/proc/<pid>/cmdline` (or `environ`) as words. The kernel ends EVERY word with a NUL,
+/// so exactly one trailing NUL is a terminator and every other empty piece is an EMPTY
+/// WORD — kept, as [`parse_procargs2`] keeps one on macOS. Dropping empties handed a flag
+/// whose value was `""` the next word as its value: `--append-system-prompt ""
+/// --dangerously-skip-permissions` read back as the prompt swallowing the flag, and the
+/// live-upgrade relaunch typed that pairing (2026-09-23 audit). No trailing NUL (a process
+/// that rewrote its title) splits as it stands; no bytes at all are no words.
+#[cfg(any(test, target_os = "linux"))]
+fn split_nul_list(bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let body = bytes.strip_suffix(b"\0").unwrap_or(bytes);
+    body.split(|&b| b == 0)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// Parse a `KERN_PROCARGS2` buffer: a native-endian `c_int` argc, the exec path and its
+/// NUL, NUL padding, then `argc` NUL-terminated argv strings, then the environment's
+/// NUL-terminated `KEY=value` strings until an empty string or the end. Pure, so the
+/// layout is tested on built buffers as well as on a live read.
+#[must_use]
+pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
+    let argc = i32::from_ne_bytes(buf.get(..PROCARGS2_ARGC_BYTES)?.try_into().ok()?);
+    let exec_path = procargs2_exec_path(buf)?.to_string();
+    let rest = buf.get(PROCARGS2_ARGC_BYTES..)?;
+    // The bound is the one the layout sets: every argv word takes at least one byte of
+    // `rest` (its NUL, or its last byte at the very end), so a count past that is a buffer
+    // this parser does not recognise. A fixed cap is not such a bound — ARG_MAX admits
+    // more than 65 535 short words (a live `/bin/zsh` carrying 70 004 argv was measured,
+    // 2026-09-23), and refusing one refused a real process whole.
+    let argc = usize::try_from(argc).ok().filter(|&n| n <= rest.len())?;
+    let mut at = exec_path.len();
+    while rest.get(at) == Some(&0) {
+        at += 1;
+    }
+    let mut next = || -> Option<String> {
+        let tail = rest.get(at..)?;
+        if tail.is_empty() {
+            return None;
+        }
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        let s = String::from_utf8_lossy(&tail[..end]).into_owned();
+        at += end + 1;
+        Some(s)
+    };
+    // Grown, not reserved up front: `argc` is bounded by the buffer, not by what an ordinary
+    // process carries, and a reservation sized by it would be the largest allocation here.
+    let mut argv = Vec::with_capacity(argc.min(1024));
+    for _ in 0..argc {
+        argv.push(next()?);
+    }
+    let mut env = Vec::new();
+    while let Some(kv) = next() {
+        if kv.is_empty() {
+            break;
+        }
+        env.push(kv);
+    }
+    Some(ProcArgs {
+        exec_path,
+        argv,
+        env,
+    })
+}
+
+/// The raw `KERN_PROCARGS2` buffer for `pid`, sized by `KERN_ARGMAX`.
+#[cfg(target_os = "macos")]
+fn macos_procargs2(pid: u32) -> Option<Vec<u8>> {
     /// `KERN_PROCARGS2` (`sys/sysctl.h`): the process's `argc`, exec path, argv and env.
     const KERN_PROCARGS2: libc::c_int = 49;
     /// `KERN_ARGMAX`: the size that buffer must have.
@@ -182,13 +340,8 @@ fn macos_exe_name(pid: u32) -> Option<String> {
     if rc != 0 {
         return None;
     }
-    let filled = buf.get(..len.min(buf.len()))?;
-    let after_argc = filled.get(std::mem::size_of::<libc::c_int>()..)?;
-    let end = after_argc.iter().position(|&b| b == 0)?;
-    let path = std::str::from_utf8(&after_argc[..end]).ok()?;
-    std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+    buf.truncate(len.min(argmax));
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -234,6 +387,24 @@ mod tests {
             Some("weird")
         );
         assert_eq!(invoking_shell_from(None, None), None);
+    }
+
+    /// Whether `child` ends by SIGKILL within `patience` — the kernel's code-signing kill of
+    /// a process whose deleted executable it must page back in. Any other end, or none,
+    /// is `false`: only that one death is the fixture's, not the reader's.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn killed_within(child: &mut std::process::Child, patience: std::time::Duration) -> bool {
+        use std::os::unix::process::ExitStatusExt as _;
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                return status.signal() == Some(libc::SIGKILL);
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Poll until `pid` answers `want`, bounded. `Command::spawn` does not promise the
@@ -291,8 +462,8 @@ mod tests {
 
     /// A program whose file is deleted under it is still named: the state of every shell
     /// running across a package upgrade, and the one where Linux's exe link reads
-    /// `/…/sleep (deleted)`. macOS keeps answering the exec path it recorded, so both
-    /// platforms are asserted the same way.
+    /// `/…/sleep (deleted)`. macOS keeps answering the exec path it recorded for a live
+    /// process, so both platforms are asserted the same way.
     ///
     /// The fixture must be a copy of this test binary, not of a system one: macOS refuses
     /// to exec a copy of `/bin/sleep` (an AMFI launch constraint on `com.apple.sleep`), and
@@ -305,39 +476,108 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("atpkg-exe-name-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // A basename of our own choosing, which is what is asserted: the reader must answer
-        // the file's name, not the name of the binary it was copied from.
-        let exe = dir.join("outliver");
-        std::fs::copy(std::env::current_exe().unwrap(), &exe).expect("copy this test binary");
-        let mut perms = std::fs::metadata(&exe).unwrap().permissions();
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            perms.set_mode(0o755);
+        // THE KERNEL CAN END THE FIXTURE, AND THAT IS NOT THE READER FAILING. A deleted
+        // executable's code pages are backed by the unlinked file; under memory pressure
+        // macOS evicts clean code pages, and when the parked copy wakes and pages code back
+        // in from the unlinked file, code-signing validation fails and the kernel SIGKILLs
+        // it. Measured 2026-09-23 under 12-way parallel load: 6 of 480 attempts had the
+        // child already dead of signal 9 at the read (`try_wait` said so), and the reader
+        // correctly answered `None` for a process that no longer existed — which failed
+        // this case in two of four landing gates. So an attempt whose child DIED before the
+        // read measured the fixture, not the reader: it is rebuilt, a bounded number of
+        // times. A LIVE child whose name reads `None` still fails at once.
+        const ATTEMPTS: u32 = 5;
+        const KILL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+        for _ in 0..ATTEMPTS {
+            // A basename of our own choosing, which is what is asserted: the reader must
+            // answer the file's name, not the name of the binary it was copied from.
+            let exe = dir.join("outliver");
+            std::fs::copy(std::env::current_exe().unwrap(), &exe).expect("copy this test binary");
+            let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                perms.set_mode(0o755);
+            }
+            std::fs::set_permissions(&exe, perms).unwrap();
+            // The child announces when its test body has reached the park. An exec path
+            // alone does not establish that under a parallel workspace test.
+            let mut child = std::process::Command::new(&exe)
+                .args(["--exact", "--nocapture", "--quiet", OUTLIVER_PROBE])
+                .env(PROBE_ENV, "1")
+                .env(OUTLIVER_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the copy of this test binary");
+            let stdout = child.stdout.take().expect("probe stdout pipe");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                use std::io::BufRead as _;
+                let mut output = Vec::new();
+                let mut signalled = false;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(line) => {
+                            if !signalled && line.contains("atpkg-outliver-ready") {
+                                let _ = ready_tx.send(Ok(()));
+                                signalled = true;
+                            }
+                            output.push(line);
+                        }
+                        Err(error) => {
+                            if !signalled {
+                                let _ = ready_tx.send(Err(format!(
+                                    "reading probe readiness failed: {error}; output: {output:?}"
+                                )));
+                            }
+                            return;
+                        }
+                    }
+                }
+                if !signalled {
+                    let _ = ready_tx.send(Err(format!(
+                        "probe exited before readiness; output: {output:?}"
+                    )));
+                }
+            });
+            let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(30));
+            if !matches!(ready, Ok(Ok(()))) {
+                let _ = child.kill();
+                let status = child.wait();
+                reader.join().expect("probe stdout reader");
+                let _ = std::fs::remove_file(&exe);
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("copied test process was not ready: {ready:?}; status: {status:?}");
+            }
+            // Independently wait until the pid reader can name the exec before unlink.
+            await_exec(child.id(), "outliver");
+            std::fs::remove_file(&exe).expect("delete it under the running process");
+            let name = process_exe_name(child.id());
+            // Whether the kernel was ending the child when it was read. A process being
+            // torn down refuses its arguments BEFORE `waitpid` can report it (measured: the
+            // read failed while an immediate `try_wait` still said running), so a `None` gets
+            // a bounded moment to show a SIGKILL; a live child is still running after it.
+            let died = name.is_none() && killed_within(&mut child, KILL_PATIENCE);
+            let _ = child.kill();
+            let _ = child.wait();
+            reader.join().expect("probe stdout reader");
+            if name.is_none() && died {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(
+                name.as_deref(),
+                Some("outliver"),
+                "the reader must still name a process whose file was deleted under it"
+            );
+            return;
         }
-        std::fs::set_permissions(&exe, perms).unwrap();
-        // Run it as the probe: it prints one line and waits to be killed, so there is a live
-        // process whose file can be deleted under it.
-        let mut child = std::process::Command::new(&exe)
-            .args(["--exact", "--nocapture", "--quiet", OUTLIVER_PROBE])
-            .env(PROBE_ENV, "1")
-            .env(OUTLIVER_ENV, "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the copy of this test binary");
-        // The exec must have happened before the file goes, or the test measures a failed
-        // spawn instead of a program outliving its file (see `await_exec`).
-        await_exec(child.id(), "outliver");
-        std::fs::remove_file(&exe).expect("delete it under the running process");
-        let name = process_exe_name(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            name.as_deref(),
-            Some("outliver"),
-            "the reader must still name a process whose file was deleted under it"
+        panic!(
+            "the kernel ended the deleted-file child before it could be read in all {ATTEMPTS} \
+             attempts — the fixture could not stand up on this machine, which says nothing \
+             about the reader"
         );
     }
 
@@ -361,6 +601,11 @@ mod tests {
         // SAFETY: `getppid` takes no arguments, reads no memory we own and cannot
         // fail (POSIX gives it no error return).
         let spawner = unsafe { libc::getppid() };
+        println!("atpkg-outliver-ready");
+        {
+            use std::io::Write as _;
+            std::io::stdout().flush().expect("flush probe readiness");
+        }
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
             // SAFETY: as above.
@@ -438,5 +683,173 @@ mod tests {
             "invoking_shell={}",
             invoking_shell().unwrap_or_else(|| "-".into())
         );
+    }
+
+    /// The KERN_PROCARGS2 layout, built by hand: argc, the exec path, NUL padding, argv,
+    /// then the environment up to the first empty string. A quoted word keeps its space
+    /// (the reason `ps -o command=` is not used), and a short buffer is refused whole.
+    #[test]
+    fn procargs2_parses_argv_and_env_and_refuses_a_short_buffer() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/x/claude\0\0\0\0claude\0--add-dir\0/a b\0HOME=/h\0ATERM_PARENT_SESSION_ID=s-1\0\0junk");
+        let got = parse_procargs2(&buf).expect("a whole buffer");
+        assert_eq!(got.exec_path, "/x/claude");
+        assert_eq!(got.argv, vec!["claude", "--add-dir", "/a b"]);
+        assert_eq!(got.env, vec!["HOME=/h", "ATERM_PARENT_SESSION_ID=s-1"]);
+        assert_eq!(got.env_var("ATERM_PARENT_SESSION_ID"), Some("s-1"));
+        assert_eq!(got.env_var("ATERM_PARENT"), None, "a prefix is not a key");
+        let mut short = 5i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/x\0a\0b\0");
+        assert_eq!(parse_procargs2(&short), None, "fewer argv than argc");
+        assert_eq!(parse_procargs2(&[1, 0]), None);
+    }
+
+    /// An argc past 65 535 is a real process, not a malformed buffer: ARG_MAX admits more
+    /// short words than that (a live `/bin/zsh` carrying 70 004 argv read back whole), where
+    /// this parser used to answer `None` — and the exe-name reader lost the shell with it.
+    /// Such a buffer parses whole and names its executable; a count no buffer of its size
+    /// can hold is refused without reserving for it.
+    #[test]
+    fn procargs2_admits_an_argc_past_65535_and_bounds_it_by_the_buffer() {
+        let n = 70_000_usize;
+        let mut buf = i32::try_from(n).unwrap().to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/zsh\0\0\0\0");
+        for _ in 0..n {
+            buf.extend_from_slice(b"x\0");
+        }
+        buf.extend_from_slice(b"K=v\0\0");
+        let got = parse_procargs2(&buf).expect("70 000 argv is a whole buffer");
+        assert_eq!(got.exec_path, "/bin/zsh");
+        assert_eq!(got.argv.len(), n);
+        assert_eq!(got.env_var("K"), Some("v"));
+        assert_eq!(exe_name_of_procargs2(&buf).as_deref(), Some("zsh"));
+        let mut lie = i32::MAX.to_ne_bytes().to_vec();
+        lie.extend_from_slice(b"/x\0\0a\0");
+        assert_eq!(
+            parse_procargs2(&lie),
+            None,
+            "more argv than the buffer has bytes"
+        );
+    }
+
+    /// The exe name needs the exec path and nothing after it: a buffer the whole-layout
+    /// parser refuses still names its executable, as this reader did before the parser
+    /// existed. Only a buffer with no exec path names nothing.
+    #[test]
+    fn the_exe_name_reads_the_exec_path_alone() {
+        let mut short = 5i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/opt/homebrew/bin/fish\0\0a\0b\0");
+        assert_eq!(parse_procargs2(&short), None, "fewer argv than argc");
+        assert_eq!(exe_name_of_procargs2(&short).as_deref(), Some("fish"));
+        let mut negative = (-1i32).to_ne_bytes().to_vec();
+        negative.extend_from_slice(b"/bin/bash\0");
+        assert_eq!(exe_name_of_procargs2(&negative).as_deref(), Some("bash"));
+        assert_eq!(
+            exe_name_of_procargs2(&[1, 0, 0, 0]),
+            None,
+            "nothing after argc"
+        );
+        assert_eq!(
+            exe_name_of_procargs2(&[1, 0, 0, 0, b'/', b'x']),
+            None,
+            "no NUL"
+        );
+    }
+
+    /// Linux's `/proc/<pid>/cmdline` keeps an empty argument, as the macOS parser does: only
+    /// the one trailing NUL is a terminator. Pure, so it runs on every platform.
+    #[test]
+    fn a_nul_list_keeps_an_empty_word_and_drops_only_the_terminator() {
+        let cmdline = b"claude\0--append-system-prompt\0\0--dangerously-skip-permissions\0";
+        assert_eq!(
+            split_nul_list(cmdline),
+            vec![
+                "claude",
+                "--append-system-prompt",
+                "",
+                "--dangerously-skip-permissions"
+            ]
+        );
+        assert_eq!(
+            split_nul_list(b"claude\0--model\0\0"),
+            vec!["claude", "--model", ""],
+            "an empty LAST word, then the terminator"
+        );
+        assert_eq!(
+            split_nul_list(b"a\0b"),
+            vec!["a", "b"],
+            "a rewritten title, no final NUL"
+        );
+        assert_eq!(split_nul_list(b"\0"), vec![""], "one word, and it is empty");
+        assert_eq!(split_nul_list(b""), Vec::<String>::new(), "no words at all");
+        // The macOS reader reads the same argv the same way.
+        let mut buf = 4i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/x/claude\0\0");
+        buf.extend_from_slice(cmdline);
+        buf.extend_from_slice(b"K=v\0\0");
+        assert_eq!(
+            parse_procargs2(&buf).expect("whole").argv,
+            split_nul_list(cmdline)
+        );
+    }
+
+    /// A live process started with an EMPTY argument reads back with it, in place — on
+    /// Linux through the `/proc` arm (the one that used to drop it), on macOS through
+    /// `KERN_PROCARGS2`. `read` is a shell builtin, so the shell itself is what waits, and
+    /// closing its stdin ends it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn process_args_keeps_an_empty_argument_of_a_live_process() {
+        let tail = [
+            "--append-system-prompt",
+            "",
+            "--dangerously-skip-permissions",
+        ];
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read -r _", "sh"])
+            .args(tail)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("/bin/sh");
+        // The last word is the sign the exec happened (see `await_exec`); what is asserted
+        // is the word before it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let argv = loop {
+            let argv = process_args(child.id()).map(|a| a.argv);
+            if argv
+                .as_ref()
+                .and_then(|a| a.last())
+                .is_some_and(|w| w == tail[2])
+                || std::time::Instant::now() >= deadline
+            {
+                break argv;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        let argv = argv.unwrap_or_default();
+        assert!(
+            argv.last().is_some_and(|w| w == tail[2]),
+            "the shell never read back as exec'd within 30 s ({argv:?}) — the spawn failed, \
+             which is not what this case is about"
+        );
+        assert!(
+            argv.ends_with(&tail.map(String::from)),
+            "the empty argument must read back in place: {argv:?}"
+        );
+    }
+
+    /// A live read of this test process: its own argv[0] and a variable it certainly has.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn process_args_reads_this_process() {
+        let me = process_args(std::process::id()).expect("our own pid is readable");
+        assert!(!me.argv.is_empty());
+        assert!(me.exec_path.contains("atpkg"), "{}", me.exec_path);
+        assert!(me.env.iter().any(|kv| kv.contains('=')));
     }
 }

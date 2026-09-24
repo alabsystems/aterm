@@ -124,6 +124,9 @@ enum Flag {
     System(std::borrow::Cow<'static, str>),
     /// `requires=<a>+<b>` -> `requires = ["a", "b"]`: installed before it.
     Requires(std::borrow::Cow<'static, [&'static str]>),
+    /// `vendor-direct` -> the row is kept and `pin` carries nothing for it (design
+    /// 2026-09-22 §1.9); its BUILD column is `-`.
+    VendorDirect,
 }
 
 /// A bare program name, as atpkg-index.sh admits one in `requires=`/`system=`.
@@ -141,7 +144,8 @@ struct SpecRow {
     line_no: usize,
     name: String,
     policy: String,
-    build: u64,
+    /// `None` for a vendor-direct row, whose BUILD column is `-`: the index pins nothing.
+    build: Option<u64>,
     group: Option<String>,
     flags: Vec<Flag>,
 }
@@ -161,19 +165,24 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
          — fix the row (atpkg-index.sh reads exactly those columns)",
         fields.len()
     );
-    let build = fields[3].parse::<u64>().unwrap_or_else(|_| {
-        panic!(
-            "tools/atpkg-programs.spec:{line_no}: build column {:?} for {:?} \
-             is not a number — refresh it from the PACK-SPEC line the pack \
-             lane prints at publish time (spec BUILD COLUMN note)",
-            fields[3], fields[0]
-        )
+    let build = (fields[3] != "-").then(|| {
+        fields[3].parse::<u64>().unwrap_or_else(|_| {
+            panic!(
+                "tools/atpkg-programs.spec:{line_no}: build column {:?} for {:?} \
+                 is not a number — refresh it from the PACK-SPEC line the pack \
+                 lane prints at publish time (spec BUILD COLUMN note)",
+                fields[3], fields[0]
+            )
+        })
     });
     let group = match fields.get(4) {
         Some(&"-") | None => None,
         Some(g) => {
             assert!(
-                *g != "extra" && !g.starts_with("system=") && !g.starts_with("requires="),
+                *g != "extra"
+                    && *g != "vendor-direct"
+                    && !g.starts_with("system=")
+                    && !g.starts_with("requires="),
                 "tools/atpkg-programs.spec:{line_no}: {:?} has the flag {g:?} \
                  in the coherence_group column — the columns are positional; \
                  write `-` for the group first (atpkg-index.sh refuses this \
@@ -190,6 +199,8 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
         for f in col.split(',') {
             let flag = if f == "extra" {
                 Flag::Extra
+            } else if f == "vendor-direct" {
+                Flag::VendorDirect
             } else if let Some(bin) = f.strip_prefix("system=") {
                 assert!(
                     !bin.is_empty()
@@ -223,7 +234,7 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
                 panic!(
                     "tools/atpkg-programs.spec:{line_no}: {:?}: unknown spec \
                      flag {f:?} (known: extra, system=<bin>, \
-                     requires=<name>[+<name>]) — atpkg-index.sh refuses it; \
+                     requires=<name>[+<name>], vendor-direct) — atpkg-index.sh refuses it; \
                      nothing may silently drop a token from the column the \
                      index is signed from",
                     fields[0]
@@ -237,6 +248,22 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
             flags.push(flag);
         }
     }
+    // A vendor-direct row pins nothing: `-` is its build, and only its (atpkg-index.sh
+    // refuses the same shapes, but only at publish time).
+    let vendor_direct = flags.contains(&Flag::VendorDirect);
+    assert_eq!(
+        build.is_none(),
+        vendor_direct,
+        "tools/atpkg-programs.spec:{line_no}: {:?}: a `-` build and the `vendor-direct` flag \
+         go together — a vendor-direct row pins nothing, and every other row pins a build",
+        fields[0]
+    );
+    assert!(
+        !vendor_direct || group.is_none(),
+        "tools/atpkg-programs.spec:{line_no}: {:?}: a vendor-direct row joins no coherence \
+         group (a group moves pins together)",
+        fields[0]
+    );
     SpecRow {
         line_no,
         name: fields[0].to_string(),
@@ -474,7 +501,7 @@ fn active_rows_parse_with_published_build_numbers() {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for row in &rows {
         assert!(
-            row.build != 0,
+            row.build != Some(0),
             "tools/atpkg-programs.spec:{}: {:?} has placeholder build 0 — \
              publishing it would sign an index pinning build 0 for every \
              client; refresh the row from the PACK-SPEC line atpkg-pack.sh \
@@ -630,8 +657,8 @@ fn roadmap_names_cannot_vanish_from_the_spec_notes() {
 /// command and the public index account. `expose` is the PATH surface every
 /// install gets (one-binary collapse: everything else is an argv0 symlink);
 /// `account` is the compiled-in default index owner behind
-/// `crate::discovery::resolve_account` (env ATPKG_ACCOUNT > `[packages].account`
-/// config > this) — it must stay the PUBLIC alabsystems org or a tokenless
+/// `crate::discovery::resolve_account` (a development build's `[packages].account`
+/// config > this; a shipped binary reads this alone) — it must stay the PUBLIC alabsystems org or a tokenless
 /// fresh install can never reach an index (the `[workspace.package]`
 /// repository owner is the private staging repo, which 404s anonymously).
 #[test]
@@ -713,12 +740,11 @@ fn vendor_members_carry_the_owner_decisions_and_the_seed_exemption() {
     );
     for name in VENDOR_AGENTS {
         let row = find(name);
-        assert_eq!(
-            row.flags,
-            vec![],
-            "tools/atpkg-programs.spec:{}: {name:?} must carry NO flag (owner decision \
-             2026-09-10: a default-set member — aterm is its version manager — never \
-             `extra`)",
+        assert!(
+            row.flags.is_empty() || row.flags == [Flag::VendorDirect],
+            "tools/atpkg-programs.spec:{}: {name:?} must carry NO flag but `vendor-direct` \
+             (owner decision 2026-09-10: a default-set member — aterm is its version \
+             manager — never `extra`; since the 2026-09-22 cutover it may be kept unpinned)",
             row.line_no
         );
         // Owner direction 2026-09-08: the manifest-only releases of a vendor member
@@ -969,8 +995,8 @@ fn shim_env_rule_matches_the_client() {
     // earns is the self-update one — the whole point of the key.
     let env = atpkg::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
     assert_eq!(
-        env.fix_line().as_deref(),
-        Some("self-update off (DISABLE_AUTOUPDATER=1)")
+        env.fix_line("claude").as_deref(),
+        Some("Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)")
     );
     assert!(
         read(&root, "tools/atpkg-author-vendor.sh").contains("SHIM_ENV=\"DISABLE_AUTOUPDATER=1\""),
@@ -1068,6 +1094,89 @@ fn vendor_host_allow_list_matches_the_client() {
                     || b == b'.'
                     || b == b'-'),
             "VENDOR_HOSTS member {host:?} is not a bare lowercase host name"
+        );
+    }
+}
+
+/// THE LEGACY CEILING (design §1.3) is at or above every legacy build the committed spec
+/// pins for a vendor-direct program: an unread legacy build is replaced with no person
+/// asking only up to it, because every pin up to it carries a version at or below the
+/// floor. A row above it is a legacy pin published after the ceiling was compiled — raise
+/// the ceiling only once that build's signed version is known to be at or below the floor.
+#[test]
+fn every_legacy_vendor_pin_is_at_or_below_its_ceiling() {
+    let root = repo_root();
+    let rows = active_rows(&read(&root, "tools/atpkg-programs.spec"));
+    for vendor in atpkg::vendor_direct::VENDORS {
+        for row in rows.iter().filter(|r| r.name == vendor.program) {
+            let Some(build) = row.build else {
+                continue; // vendor-direct: no legacy pin at all
+            };
+            assert!(
+                build <= vendor.legacy_ceiling,
+                "tools/atpkg-programs.spec:{}: {} build {} is above its compiled legacy \
+                 ceiling {} (crates/atpkg/src/vendor_direct/table.rs)",
+                row.line_no,
+                row.name,
+                build,
+                vendor.legacy_ceiling
+            );
+        }
+    }
+}
+
+/// THE VENDOR-DIRECT MARKER (design 2026-09-22 §1.9) keeps a program's row and drops its
+/// pin, so it may name only a program the client follows on its vendor's own channel: on any
+/// other row the index would stop pinning a program nothing else updates. The shell's copy of
+/// that program set (atpkg-publish-lib.sh `ATPKG_VENDOR_DIRECT`, which atpkg-index.sh and
+/// every lane that carries such a row read) is the client's `vendor_direct::VENDORS`.
+#[test]
+fn vendor_direct_rows_name_only_the_programs_the_client_follows_directly() {
+    let root = repo_root();
+    let client: BTreeSet<String> = atpkg::vendor_direct::VENDORS
+        .iter()
+        .map(|v| v.program.to_string())
+        .collect();
+    let shell = shell_list(
+        &read(&root, "tools/atpkg-publish-lib.sh"),
+        "ATPKG_VENDOR_DIRECT",
+        "tools/atpkg-publish-lib.sh",
+    );
+    assert_eq!(
+        shell, client,
+        "tools/atpkg-publish-lib.sh ATPKG_VENDOR_DIRECT must equal the program set of \
+         crates/atpkg/src/vendor_direct/table.rs VENDORS"
+    );
+    let spec = read(&root, "tools/atpkg-programs.spec");
+    for row in active_rows(&spec) {
+        if row.flags.contains(&Flag::VendorDirect) {
+            assert!(
+                client.contains(&row.name),
+                "tools/atpkg-programs.spec:{}: {:?} is marked vendor-direct, but the client \
+                 follows only {client:?} on their vendors' channels — the index would stop \
+                 pinning a program nothing else updates",
+                row.line_no,
+                row.name
+            );
+            assert_eq!(
+                row.repo(&spec),
+                "aterm",
+                "tools/atpkg-programs.spec:{}: a vendor-direct row keeps the index repo \
+                 its legacy manifests ride",
+                row.line_no
+            );
+        }
+    }
+    // The indexer and the lanes read the lib's list; none keeps a private copy to drift.
+    for rel in [
+        "tools/atpkg-index.sh",
+        "tools/atpkg-auto-vendor.sh",
+        "tools/atpkg-auto-alab.sh",
+        "tools/linux-auto-atpkg.sh",
+    ] {
+        assert!(
+            !read(&root, rel).contains("ATPKG_VENDOR_DIRECT=\""),
+            "{rel} re-declares ATPKG_VENDOR_DIRECT — read tools/atpkg-publish-lib.sh's"
         );
     }
 }

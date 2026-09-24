@@ -503,50 +503,117 @@ pub(crate) struct GridFind {
 /// name change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChromeMessage {
-    /// The transient top-centre card ([`crate::notice`]): an update is ready, a gesture
-    /// failed, a connection was authorised. It is drawn as a floating raster card, so
-    /// unlike every band below, its words never reach the grid text at all.
-    Notice,
     /// The multi-line-paste CONFIRMATION band ([`crate::paste_banner`]) — the pastejacking
     /// guard's only prompt on the platforms with no native alert. A question the user is
     /// being asked; the loudest thing this tree ever says.
     PasteConfirm,
-    /// The config-load/reload warning band ([`crate::config_notice`]): which rules the
-    /// config dropped, and which edits wait for a restart.
-    ConfigWarning,
-    /// The ALab toolchain status band ([`crate::status_bars::Lane::Toolchain`]).
-    ToolchainStatus,
-    /// aterm's own self-update status band ([`crate::status_bars::Lane::Update`]).
-    UpdateStatus,
-    /// The PRESENCE band ([`crate::status_bars::Lane::Presence`], round 19): who is
-    /// driving this window's session, its phase, its mail, its link — one row under
-    /// the tab strip, spoken as one sentence ("driven by manager, turn 41").
+    /// The MESSAGE BAND's top row (`crate::message_band`, design §3.5): one fixed slot
+    /// per band ROW, not per message — AccessKit then emits "text changed" on a name
+    /// change instead of tearing a node down and building another.
+    BandRow0,
+    /// The band's second row.
+    BandRow1,
+    /// The band's third row.
+    BandRow2,
+    /// The band's overflow row (`N more messages`): one link to Settings ▸ Messages.
+    BandOverflow,
+    /// One capsule of one band row: a button child of that row's node, named by the
+    /// capsule's FULL label.
+    BandCapsule {
+        /// The band row, 0 = topmost.
+        row: u8,
+        /// The capsule: the authored intents by index, then [`CAPSULE_DETAILS`] for the
+        /// implicit `Details ›` ([`capsule_index`] / [`capsule_action`]).
+        index: u8,
+    },
+    /// The PRESENCE band (`crate::presence`, round 19): who is driving this window's
+    /// session, its phase, its mail, its link — one row under the tab strip, spoken as
+    /// one sentence ("driven by manager, turn 41").
     PresenceStatus,
 }
 
+/// The capsule index of the implicit `Details ›` in a [`ChromeMessage::BandCapsule`]
+/// slot: after the two authored intents a row may carry.
+pub(crate) const CAPSULE_DETAILS: u8 = 2;
+/// Capsule slots per band row (`16 + row·4 + index`): two authored, the Details, one
+/// spare.
+const CAPSULES_PER_ROW: u64 = 4;
+/// The first capsule slot.
+const CAPSULE_BASE: u64 = 16;
+
+/// The slot index of a capsule's action: an authored intent keeps its index; the
+/// implicit `Details ›` (`ActionIndex::DETAILS`) takes [`CAPSULE_DETAILS`].
+pub(crate) fn capsule_index(action: aterm_messages::ActionIndex) -> u8 {
+    if action.is_details() {
+        CAPSULE_DETAILS
+    } else {
+        action.0
+    }
+}
+
+/// The inverse of [`capsule_index`].
+pub(crate) fn capsule_action(index: u8) -> aterm_messages::ActionIndex {
+    if index == CAPSULE_DETAILS {
+        aterm_messages::ActionIndex::DETAILS
+    } else {
+        aterm_messages::ActionIndex(index)
+    }
+}
+
 impl ChromeMessage {
-    /// Every message, in the order they are published — the order they are painted down
-    /// the window. Exhaustive by construction: a new variant that is not listed here is
-    /// never published, and [`ChromeMessage::from_node`] would not round-trip it, which
-    /// is what the slot round-trip test checks.
+    /// Every ROW-level message, in the order they are published — the order they are
+    /// painted down the window. Exhaustive for the row slots by construction: a new
+    /// variant that is not listed here is never published, and
+    /// [`ChromeMessage::from_node`] would not round-trip it, which is what the slot
+    /// round-trip test checks. Capsules are children of their row and decode by
+    /// arithmetic, not by this list.
     pub(crate) const ORDER: [Self; 6] = [
         Self::PresenceStatus,
-        Self::ToolchainStatus,
-        Self::UpdateStatus,
+        Self::BandRow0,
+        Self::BandRow1,
+        Self::BandRow2,
+        Self::BandOverflow,
         Self::PasteConfirm,
-        Self::ConfigWarning,
-        Self::Notice,
     ];
 
-    /// This message's permanent id slot.
+    /// The band row's message for `row` (0 = topmost), or `None` past the band's three.
+    pub(crate) const fn band_row(row: usize) -> Option<Self> {
+        match row {
+            0 => Some(Self::BandRow0),
+            1 => Some(Self::BandRow1),
+            2 => Some(Self::BandRow2),
+            _ => None,
+        }
+    }
+
+    /// The band row this message names, for the three row slots; `None` otherwise.
+    pub(crate) const fn band_row_index(self) -> Option<usize> {
+        match self {
+            Self::BandRow0 => Some(0),
+            Self::BandRow1 => Some(1),
+            Self::BandRow2 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// This message's permanent id slot. The band rows keep the retired status bars'
+    /// slots 3 and 4 for their first two rows (the same rows, the same place). Slots 0
+    /// and 2 are RETIRED: 0 was the transient card's (`notice.rs`, 2026-09-23 — its
+    /// producers are band rows, and Robi's tip bubble that survived it is a decoration,
+    /// never announced) and 2 the config band's (its warnings are band rows too).
+    /// Nothing is published at either and [`ChromeMessage::from_node`] decodes nothing
+    /// there, so a reader's stale activate on one is a no-op, never a different row.
     const fn slot(self) -> u64 {
         match self {
-            Self::Notice => 0,
             Self::PasteConfirm => 1,
-            Self::ConfigWarning => 2,
-            Self::ToolchainStatus => 3,
-            Self::UpdateStatus => 4,
+            Self::BandRow0 => 3,
+            Self::BandRow1 => 4,
             Self::PresenceStatus => 5,
+            Self::BandRow2 => 6,
+            Self::BandOverflow => 7,
+            Self::BandCapsule { row, index } => {
+                CAPSULE_BASE + (row as u64) * CAPSULES_PER_ROW + index as u64
+            }
         }
     }
 
@@ -560,6 +627,16 @@ impl ChromeMessage {
     /// clamps: a stale request must be a no-op, never an answer to a different question.
     pub(crate) fn from_node(node: NodeId) -> Option<Self> {
         let slot = node.0.checked_sub(MESSAGE_BASE)?;
+        if let Some(offset) = slot.checked_sub(CAPSULE_BASE) {
+            let (row, index) = (offset / CAPSULES_PER_ROW, offset % CAPSULES_PER_ROW);
+            if row < 3 && index <= u64::from(CAPSULE_DETAILS) {
+                return Some(Self::BandCapsule {
+                    row: row as u8,
+                    index: index as u8,
+                });
+            }
+            return None;
+        }
         Self::ORDER.into_iter().find(|m| m.slot() == slot)
     }
 
@@ -570,33 +647,54 @@ impl ChromeMessage {
     const fn politeness(self) -> Live {
         match self {
             Self::PasteConfirm => Live::Assertive,
-            Self::Notice
-            | Self::ConfigWarning
-            | Self::ToolchainStatus
-            | Self::UpdateStatus
+            Self::BandRow0
+            | Self::BandRow1
+            | Self::BandRow2
+            | Self::BandOverflow
+            | Self::BandCapsule { .. }
             | Self::PresenceStatus => Live::Polite,
         }
     }
 
     /// The platform role. `Alert` reaches AT-SPI as `Notification` and `AlertDialog` as
     /// `Alert`, which is the distinction between "here is some news" and "you are being
-    /// asked something"; a metered band is a real `ProgressIndicator`, and one without a
-    /// meter is a `Status` (AT-SPI `StatusBar`).
-    const fn role(self, metered: bool) -> Role {
+    /// asked something"; a band row that warns OR ASKS (`alarm`) is an `Alert` — polite,
+    /// never assertive: only the paste confirmation stops anything — a metered one a
+    /// real `ProgressIndicator`, and one without a meter is a `Status` (AT-SPI
+    /// `StatusBar`).
+    const fn role(self, metered: bool, alarm: bool) -> Role {
         match self {
-            Self::Notice | Self::ConfigWarning => Role::Alert,
             Self::PasteConfirm => Role::AlertDialog,
-            Self::ToolchainStatus | Self::UpdateStatus => {
-                if metered {
+            Self::BandRow0 | Self::BandRow1 | Self::BandRow2 => {
+                if alarm {
+                    Role::Alert
+                } else if metered {
                     Role::ProgressIndicator
                 } else {
                     Role::Status
                 }
             }
+            // A link to the page, not news of its own.
+            Self::BandOverflow => Role::Link,
+            Self::BandCapsule { .. } => Role::Button,
             // The band never draws a meter: a status line, whatever the row says.
             Self::PresenceStatus => Role::Status,
         }
     }
+}
+
+/// One capsule of a band row as the frame paints it — the button child of the row's
+/// node ([`push_message`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BandCapsule {
+    /// The FULL label (the painted form may be the short one).
+    pub(crate) label: &'static str,
+    /// The first cell of the chip.
+    pub(crate) col: usize,
+    /// Its cells.
+    pub(crate) width: usize,
+    /// Its slot within the row ([`capsule_index`]).
+    pub(crate) index: u8,
 }
 
 /// One chrome message as the frame actually shows it.
@@ -616,9 +714,15 @@ pub(crate) struct GridMessage {
     pub(crate) detail: Option<String>,
     /// Determinate progress in `0..=1`, when the band draws a meter.
     pub(crate) progress: Option<f32>,
-    /// A screen reader may activate this message — the update pill's one-click apply, a
-    /// status band's deliberate settings page. `false` for a card that only informs, so
-    /// the tree never offers an action the pixels do not have.
+    /// Work in flight with no fraction (the comet): an INDETERMINATE
+    /// progress indicator — the role, with no numeric value (design §10.10).
+    pub(crate) busy: bool,
+    /// A warning, an error, or a question (an ask, a consequential capsule) — the row
+    /// is an `Alert`, not a `Status`.
+    pub(crate) alarm: bool,
+    /// A screen reader may activate this message — a band row's primary intent, a
+    /// capsule's. `false` for a card that only informs, so the tree never offers an
+    /// action the pixels do not have.
     pub(crate) activates: bool,
     /// Which STATUS BAR row (0 = topmost) this message occupies, for the messages that
     /// have one.
@@ -627,11 +731,12 @@ pub(crate) struct GridMessage {
     /// [`GridGeometry`] carries where that band starts and how tall a row is — so its
     /// rectangle is a real place on the glass and a screen reader can route a click, a
     /// magnifier can follow it, and a touch explorer can find it. `None` for every
-    /// message that has no rectangle worth publishing: the notice card floats and slides
-    /// through its whole life, and the paste/config bands overwrite rows that belong to
-    /// the grid document, so a rectangle there would put the announcement on top of text
-    /// that is not it.
+    /// message that has no rectangle worth publishing: the paste question overwrites
+    /// rows that belong to the grid document, so a rectangle there would put the
+    /// announcement on top of text that is not it.
     pub(crate) bar_row: Option<usize>,
+    /// The row's capsules, each published as a button child with its own rectangle.
+    pub(crate) capsules: Vec<BandCapsule>,
 }
 
 /// Everything a frame publishes BESIDES its plain visible grid: the tab strip, the split
@@ -931,25 +1036,57 @@ fn push_message(
     cols: usize,
 ) -> NodeId {
     let id = message.message.node_id();
-    let metered = message.progress.is_some();
-    let mut node = Node::new(message.message.role(metered));
+    let metered = message.progress.is_some() || message.busy;
+    let mut node = Node::new(message.message.role(metered, message.alarm));
     node.set_label(message.text.clone());
     node.set_value(message.text.clone());
     node.set_live(message.message.politeness());
     if let Some(detail) = &message.detail {
         node.set_description(detail.clone());
     }
-    if let Some(row) = message.bar_row
-        && let Some(g) = geom
-        && g.bar_h > 0.0
-    {
-        let y0 = g.bars_y + row as f64 * g.bar_h;
+    let row_rect = message.bar_row.and_then(|row| {
+        let g = geom?;
+        (g.bar_h > 0.0).then(|| {
+            let y0 = g.bars_y + row as f64 * g.bar_h;
+            (g, y0)
+        })
+    });
+    if let Some((g, y0)) = row_rect {
         node.set_bounds(Rect {
             x0: g.origin_x,
             y0,
             x1: g.origin_x + cols as f64 * g.cell_w,
             y1: y0 + g.bar_h,
         });
+    }
+    // Each capsule is a BUTTON of its own, named by the full label (the painted
+    // form may be the abbreviation), bounded by its cells within the row's rect,
+    // and clickable — so a reader can press `Apply now` without pressing the row.
+    if let Some(band_row) = message.message.band_row_index() {
+        let mut children = Vec::with_capacity(message.capsules.len());
+        for cap in &message.capsules {
+            let kind = ChromeMessage::BandCapsule {
+                row: band_row as u8,
+                index: cap.index,
+            };
+            let mut button = Node::new(Role::Button);
+            button.set_label(cap.label.to_string());
+            if let Some((g, y0)) = row_rect {
+                button.set_bounds(Rect {
+                    x0: g.origin_x + cap.col as f64 * g.cell_w,
+                    y0,
+                    x1: g.origin_x + (cap.col + cap.width) as f64 * g.cell_w,
+                    y1: y0 + g.bar_h,
+                });
+            }
+            button.add_action(Action::Click);
+            let child = kind.node_id();
+            nodes.push((child, button));
+            children.push(child);
+        }
+        if !children.is_empty() {
+            node.set_children(children);
+        }
     }
     // A determinate meter as the platform's own numeric value, so AT-SPI publishes a
     // `Value` interface on the progress bar and a reader can ask "how far along" instead
@@ -1162,29 +1299,36 @@ mod tests {
         bar_h: 18.0,
     };
 
-    /// THE STATUS BARS ARE NOT MUTE, AND THEY ARE SOMEWHERE. They reserve real terminal
+    /// THE BAND ROWS ARE NOT MUTE, AND THEY ARE SOMEWHERE. They reserve real terminal
     /// rows and are the only announcement of work the user did not start (a toolchain
     /// installing, an update downloading), so a tree that omitted them both described a
     /// window taller than the one on glass and said nothing about the work. Published in
     /// painted order between the strip and the grid, each carrying the band rectangle it
     /// was drawn into — which is what lets a magnifier follow it and a click reach it —
-    /// while the surfaces with no fixed place on the glass carry none.
+    /// while the surfaces with no fixed place on the glass carry none. Each capsule is a
+    /// button child bounded by its own cells.
     #[test]
     fn a_status_band_is_published_where_it_is_painted() {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));
         let bars = vec![
             GridMessage {
                 bar_row: Some(0),
+                capsules: vec![BandCapsule {
+                    label: "Packages",
+                    col: 10,
+                    width: 6,
+                    index: 0,
+                }],
                 ..message(
-                    ChromeMessage::ToolchainStatus,
-                    "Installing the ALab toolchain \u{00b7} extracting",
+                    ChromeMessage::BandRow0,
+                    "Installing ALab tools \u{00b7} extracting",
                 )
             },
             GridMessage {
                 bar_row: Some(1),
                 ..message(
-                    ChromeMessage::UpdateStatus,
-                    "aterm update v0.62.0 \u{00b7} downloading\u{2026}",
+                    ChromeMessage::BandRow1,
+                    "Updating to aterm v0.62.0 \u{00b7} downloading",
                 )
             },
         ];
@@ -1208,14 +1352,30 @@ mod tests {
             assert_eq!(bounds.x0, GEOM.origin_x);
             assert_eq!(bounds.x1, GEOM.origin_x + 20.0 * GEOM.cell_w);
         }
-        // A surface with no reserved row publishes NO rectangle rather than a wrong one.
+        // The capsule: a button child of its row, named in full, bounded by its cells.
+        let capsule = ChromeMessage::BandCapsule { row: 0, index: 0 };
+        let button = node(&update, capsule.node_id());
+        assert_eq!(button.role(), Role::Button);
+        assert_eq!(button.label(), Some("Packages"));
+        assert!(button.supports_action(Action::Click));
+        let b = button.bounds().expect("a capsule has its cells");
+        assert_eq!(b.x0, GEOM.origin_x + 10.0 * GEOM.cell_w);
+        assert_eq!(b.x1, GEOM.origin_x + 16.0 * GEOM.cell_w);
+        assert_eq!(b.y0, GEOM.bars_y);
+        assert_eq!(
+            node(&update, bars[0].message.node_id()).children(),
+            [capsule.node_id()]
+        );
+        assert_eq!(ChromeMessage::from_node(capsule.node_id()), Some(capsule));
+        // A surface with no reserved row publishes NO rectangle rather than a wrong one
+        // (the paste question overwrites the band's rows in place: `bar_row: None`).
         let floating = grid_tree(
             &snap,
             Some(GEOM),
-            &frame(&[message(ChromeMessage::Notice, "\u{2191} Update ready")]),
+            &frame(&[message(ChromeMessage::PasteConfirm, "Paste 3 lines?")]),
         );
         assert_eq!(
-            node(&floating, ChromeMessage::Notice.node_id()).bounds(),
+            node(&floating, ChromeMessage::PasteConfirm.node_id()).bounds(),
             None
         );
 
@@ -1226,12 +1386,12 @@ mod tests {
         assert_eq!(&children[..bars.len()], &bar_ids[..]);
         assert_eq!(children.last().copied(), Some(GRID));
 
-        // …and with no bar up the tree is byte-identical to the no-bar path.
+        // …and with no row up the tree is byte-identical to the no-band path.
         let without = grid_tree(&snap, Some(GEOM), &GridFrame::default());
         assert_eq!(
-            without.nodes.len() + bars.len(),
+            without.nodes.len() + bars.len() + 1,
             update.nodes.len(),
-            "a hidden bar publishes no node at all"
+            "a hidden row publishes no node at all (the capsule is the +1)"
         );
     }
 
@@ -1786,8 +1946,11 @@ mod tests {
             text: text.to_string(),
             detail: None,
             progress: None,
+            busy: false,
+            alarm: false,
             activates: false,
             bar_row: None,
+            capsules: Vec::new(),
         }
     }
 
@@ -1822,58 +1985,6 @@ mod tests {
         }
     }
 
-    /// The transient card is the ONE surface whose words never reach the grid text: it is
-    /// a floating raster, not terminal cells, so without this node an "Update ready" or a
-    /// "New tab failed: EMFILE" exists only as pixels. It is announced politely, above
-    /// the terminal, and it does NOT take focus — the keyboard is still in the shell.
-    #[test]
-    fn a_transient_notice_is_a_polite_alert_above_the_terminal() {
-        let snap = live_grid(2, 20, b"hi", Some((0, 2)));
-        let messages = vec![GridMessage {
-            activates: true,
-            ..message(
-                ChromeMessage::Notice,
-                "\u{2191} Update ready \u{2014} build 42",
-            )
-        }];
-        let update = grid_tree(
-            &snap,
-            None,
-            &GridFrame {
-                messages: &messages,
-                ..GridFrame::default()
-            },
-        );
-        let id = NodeId(MESSAGE_BASE + ChromeMessage::Notice.slot());
-        assert_eq!(
-            node(&update, ROOT).children(),
-            [id, GRID],
-            "the card is announced above the terminal, as it is painted"
-        );
-        let card = node(&update, id);
-        assert_eq!(card.role(), Role::Alert, "AT-SPI Notification");
-        assert_eq!(card.live(), Some(Live::Polite));
-        assert_eq!(
-            card.value(),
-            Some("\u{2191} Update ready \u{2014} build 42")
-        );
-        assert!(card.supports_action(Action::Click), "one-click apply");
-        assert_eq!(update.focus, GRID, "the keyboard is still in the terminal");
-
-        // A card that only informs offers no action, so the tree never promises one the
-        // pixels do not have.
-        let informational = vec![message(ChromeMessage::Notice, "\u{2717} New tab failed")];
-        let update = grid_tree(
-            &snap,
-            None,
-            &GridFrame {
-                messages: &informational,
-                ..GridFrame::default()
-            },
-        );
-        assert!(!node(&update, id).supports_action(Action::Click));
-    }
-
     /// FLOODING IS THE FAILURE MODE A LIVE REGION HAS. The announcement fires when the
     /// spoken sentence CHANGES, so a download whose byte counter lived in that sentence
     /// would say itself over and over on the way to 100%. The volatile figures belong in
@@ -1884,14 +1995,17 @@ mod tests {
     fn a_status_band_keeps_its_volatile_figures_out_of_the_announcement() {
         let snap = live_grid(2, 20, b"hi", None);
         let at = |done: &str, fill: f32| GridMessage {
-            message: ChromeMessage::UpdateStatus,
-            text: "aterm update v0.48.0 \u{00b7} downloading\u{2026}".to_string(),
+            message: ChromeMessage::BandRow0,
+            text: "Updating to aterm v0.48.0 \u{00b7} downloading".to_string(),
             detail: Some(format!("{done} / 1.2 GB")),
             progress: Some(fill),
+            busy: false,
+            alarm: false,
             activates: true,
             bar_row: Some(0),
+            capsules: Vec::new(),
         };
-        let id = NodeId(MESSAGE_BASE + ChromeMessage::UpdateStatus.slot());
+        let id = NodeId(MESSAGE_BASE + ChromeMessage::BandRow0.slot());
         let tree = |m: &[GridMessage]| {
             grid_tree(
                 &snap,
@@ -1919,18 +2033,59 @@ mod tests {
         assert_eq!(early.min_numeric_value(), Some(0.0));
         assert_eq!(early.max_numeric_value(), Some(1.0));
 
-        // No meter ⇒ a plain status band (AT-SPI StatusBar), left numerically unset,
-        // which is how AccessKit spells an indeterminate progress bar.
+        // No meter and no work in flight ⇒ a plain status band (AT-SPI StatusBar),
+        // left numerically unset. (A BUSY row is a value-less `ProgressIndicator`,
+        // ruling 142 — `an_indeterminate_row_is_a_busy_progress_indicator`; its
+        // spinner frame is paint, never part of what is announced.)
         let flat = tree(&[message(
-            ChromeMessage::ToolchainStatus,
-            "Installing the ALab toolchain \u{00b7} starting\u{2026}",
+            ChromeMessage::BandRow1,
+            "Installing ALab tools \u{00b7} starting\u{2026}",
         )]);
-        let flat = node(
-            &flat,
-            NodeId(MESSAGE_BASE + ChromeMessage::ToolchainStatus.slot()),
-        );
+        let flat = node(&flat, NodeId(MESSAGE_BASE + ChromeMessage::BandRow1.slot()));
         assert_eq!(flat.role(), Role::Status);
         assert_eq!(flat.numeric_value(), None);
+        // A warning row is an Alert, meter or not.
+        let warn = tree(&[GridMessage {
+            alarm: true,
+            ..message(ChromeMessage::BandRow2, "Couldn't install aterm v0.48.0")
+        }]);
+        assert_eq!(
+            node(&warn, NodeId(MESSAGE_BASE + ChromeMessage::BandRow2.slot())).role(),
+            Role::Alert
+        );
+    }
+
+    /// AN INDETERMINATE ROW IS A BUSY PROGRESS INDICATOR (design §10.10): work in
+    /// flight with no fraction — the comet — is a `ProgressIndicator` with no numeric
+    /// value, which is how AccessKit spells an indeterminate progress bar; a warning
+    /// is still an `Alert`, busy or not.
+    #[test]
+    fn an_indeterminate_row_is_a_busy_progress_indicator() {
+        let snap = live_grid(2, 20, b"hi", None);
+        let id = NodeId(MESSAGE_BASE + ChromeMessage::BandRow0.slot());
+        let tree = |m: &[GridMessage]| {
+            grid_tree(
+                &snap,
+                None,
+                &GridFrame {
+                    messages: m,
+                    ..GridFrame::default()
+                },
+            )
+        };
+        let busy = tree(&[GridMessage {
+            busy: true,
+            ..message(ChromeMessage::BandRow0, "Installing ALab toolchain")
+        }]);
+        let busy = node(&busy, id);
+        assert_eq!(busy.role(), Role::ProgressIndicator);
+        assert_eq!(busy.numeric_value(), None, "indeterminate: no value");
+        let alarm = tree(&[GridMessage {
+            busy: true,
+            alarm: true,
+            ..message(ChromeMessage::BandRow0, "Update did not apply")
+        }]);
+        assert_eq!(node(&alarm, id).role(), Role::Alert);
     }
 
     /// The multi-line-paste guard is a QUESTION, and on the platforms with no native
@@ -1982,13 +2137,56 @@ mod tests {
         assert_eq!(
             ChromeMessage::ORDER.len(),
             6,
-            "the presence band is the sixth message"
+            "the three band rows, the overflow link, the presence band and the paste \
+             question"
         );
         for kind in ChromeMessage::ORDER {
             let id = NodeId(MESSAGE_BASE + kind.slot());
             assert_eq!(ChromeMessage::from_node(id), Some(kind));
             assert_eq!(tab_index_for(id), None, "{kind:?} is not a tab");
         }
+        // The transient card's slot and the config band's are retired with them:
+        // tombstones no row is published at and no activate decodes to.
+        for (retired, what) in [
+            (0, "retired Notice slot"),
+            (2, "retired ConfigWarning slot"),
+        ] {
+            assert_eq!(
+                ChromeMessage::from_node(NodeId(MESSAGE_BASE + retired)),
+                None,
+                "{what}"
+            );
+            assert!(
+                ChromeMessage::ORDER.iter().all(|m| m.slot() != retired),
+                "no row is published at the {what}"
+            );
+        }
+        // The capsule slots decode by arithmetic: three per row, three rows; the
+        // spare slot in each group and anything past the band decode to nothing.
+        for row in 0..3u8 {
+            for index in 0..=CAPSULE_DETAILS {
+                let kind = ChromeMessage::BandCapsule { row, index };
+                assert_eq!(ChromeMessage::from_node(kind.node_id()), Some(kind));
+                assert_eq!(tab_index_for(kind.node_id()), None);
+            }
+            assert_eq!(
+                ChromeMessage::from_node(NodeId(
+                    MESSAGE_BASE + CAPSULE_BASE + u64::from(row) * CAPSULES_PER_ROW + 3
+                )),
+                None,
+                "the spare capsule slot is unassigned"
+            );
+        }
+        assert_eq!(
+            ChromeMessage::from_node(NodeId(MESSAGE_BASE + CAPSULE_BASE + 3 * CAPSULES_PER_ROW)),
+            None,
+            "no fourth band row"
+        );
+        assert_eq!(
+            capsule_action(CAPSULE_DETAILS),
+            aterm_messages::ActionIndex::DETAILS
+        );
+        assert_eq!(capsule_index(aterm_messages::ActionIndex(1)), 1);
         assert_eq!(
             ChromeMessage::from_node(NodeId(MESSAGE_BASE + ChromeMessage::PresenceStatus.slot())),
             Some(ChromeMessage::PresenceStatus),
@@ -2005,7 +2203,7 @@ mod tests {
             &snap,
             None,
             &GridFrame {
-                messages: &[message(ChromeMessage::Notice, "one")],
+                messages: &[message(ChromeMessage::BandRow0, "one")],
                 ..GridFrame::default()
             },
         );
@@ -2013,14 +2211,14 @@ mod tests {
             &snap,
             None,
             &GridFrame {
-                messages: &[message(ChromeMessage::Notice, "two")],
+                messages: &[message(ChromeMessage::BandRow0, "two")],
                 ..GridFrame::default()
             },
         );
         let id_of = |u: &TreeUpdate| {
             u.nodes
                 .iter()
-                .find(|(_, n)| n.role() == Role::Alert)
+                .find(|(_, n)| n.role() == Role::Status)
                 .map(|(id, _)| *id)
                 .unwrap()
         };

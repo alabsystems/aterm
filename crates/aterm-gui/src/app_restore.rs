@@ -825,9 +825,7 @@ impl App {
                 crate::logging::stderr_line!(
                     "aterm-gui: session restore: could not create a window; stopping here"
                 );
-                self.surface_gesture_failure(
-                    "✕ Restore stopped early — some saved tabs were not reopened",
-                );
+                self.post_message(crate::message_reporters::restore_stopped_early());
                 // OVERLAP HANDOFF: a carried window is now LOST (and possibly
                 // its adopted shell with it). Withhold the readiness byte —
                 // the parked parent's timeout + rollback recovers EVERY shell
@@ -967,8 +965,8 @@ impl App {
                     crate::logging::stderr_line!(
                         "aterm-gui: seamless: could not adopt an orphan shell: {e}"
                     );
-                    self.surface_gesture_failure(&format!(
-                        "✕ A live shell was lost across the update: {e}"
+                    self.post_message(crate::message_reporters::shell_lost_in_update(
+                        &e.to_string(),
                     ));
                 }
             }
@@ -2510,8 +2508,8 @@ impl App {
                 }
                 Err(e) => {
                     crate::logging::stderr_line!("aterm-gui: session restore: spawn failed: {e}");
-                    self.surface_gesture_failure(&format!(
-                        "✕ A restored tab could not start its shell: {e}"
+                    self.post_message(crate::message_reporters::restored_tab_failed(
+                        &e.to_string(),
                     ));
                     return None; // drops `fresh` → clean hang-up of the partial tab
                 }
@@ -4891,22 +4889,29 @@ mod tests {
         );
     }
 
-    /// THE ROW BUILT BEFORE THE ADOPTION NAMES THE FROZEN TAB (review,
+    /// THE ENTRY BUILT BEFORE THE ADOPTION NAMES THE FROZEN TAB (review,
     /// 2026-09-16). The atpkg launch pass starts from `main_entry` before the
     /// event loop, and on a warm machine prints `managed-current:` within tens
     /// of milliseconds — before the first park after first paint adopts the
     /// handed-off shells (`apply_pending_restore`). Counted from the registry
-    /// alone, that first row read "this one too" in exactly the tab the owner
-    /// had complained about, and the honest row came seconds later (a double
-    /// post) or six hours later. `App::frozen_path_tabs` counts the pending
-    /// adoptees, so the marker that arrives first is built right; the restore's
-    /// refresh (`StatusBars::refresh_managed_current`) then finds the registry
-    /// agreeing and posts nothing — one row, the true one.
+    /// alone, those words claimed every tab, the very one the owner had
+    /// complained about. `App::frozen_path_tabs` counts the pending adoptees, so
+    /// the marker that arrives first is worded right. Since 2026-09-22 the words
+    /// are a `Hold::LogOnly` record and never a row, and with a frozen tab the
+    /// record's detail is the remedy alone ("1 tab from before this update
+    /// picks them up with …"): the restore's refresh that re-posted the row
+    /// when the count moved (`refresh_managed_current`) is gone with it, and
+    /// the count simply reads the registry once the shells are adopted.
     #[test]
-    fn a_managed_row_built_before_the_adoption_counts_the_frozen_shell_and_reposts_nothing() {
-        use std::time::{Duration, Instant};
+    fn a_managed_entry_built_before_the_adoption_counts_the_frozen_shell_and_takes_no_row() {
         let wire = "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)";
-        let now = Instant::now();
+        let managed = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .rfind(|r| r.key.as_deref() == Some(crate::toolchain_words::KEY_MANAGED))
+                .map(|r| r.detail[0].clone())
+        };
         let mut new = App::headless_for_test();
         new.handoff_successor = true;
         let mut frozen = handed_off_shell(3);
@@ -4916,18 +4921,14 @@ mod tests {
         assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 0);
         assert_eq!(new.frozen_path_tabs(), 1, "the pending adoptee is counted");
         // The marker lands now — what `Wake::PkgManagedCurrent` does.
-        let frozen_tabs = new.frozen_path_tabs();
-        let hooked = new.this_tab_hooked();
-        new.status_bars
-            .toolchain_managed_current(wire, frozen_tabs, hooked, now);
-        let (_, bar) = new.status_bars.bars().next().expect("the row posts");
-        assert!(
-            bar.text.detail.ends_with(
-                "\u{00b7} 1 tab from before this update picks them up with \
-                 `. ~/.aterm/shell.d/00-atpkg.zsh`"
-            ) && !bar.text.detail.contains("this one too"),
-            "{}",
-            bar.text.detail
+        new.post_managed_current(wire);
+        assert_eq!(new.messages.live_rows().count(), 0, "no row");
+        let detail = managed(&new).expect("the record");
+        assert_eq!(
+            detail,
+            "1 tab from before this update picks them up with \
+             `. ~/.aterm/shell.d/00-atpkg.zsh`",
+            "the remedy, never a claim on every tab"
         );
         // The adoption: the leaf places shell 3, the net places shell 4.
         new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
@@ -4935,34 +4936,6 @@ mod tests {
         assert!(new.seamless_adopt.is_empty());
         assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
         assert_eq!(new.frozen_path_tabs(), 1, "registered now, counted once");
-        // The refresh the restore runs: the count agrees, nothing posts.
-        let frozen_tabs = new.frozen_path_tabs();
-        assert!(
-            !new.status_bars
-                .refresh_managed_current(frozen_tabs, hooked, now),
-            "the row built before the adoption was already the true one"
-        );
-        assert_eq!(
-            new.status_bars.rows(),
-            1,
-            "one row, not a false-then-true pair"
-        );
-        // The backstop: an adoptee counted but never registered (dropped by the
-        // net) is settled by the refresh — the count went down, the row reposts.
-        let mut new = App::headless_for_test();
-        new.handoff_successor = true;
-        let mut frozen = handed_off_shell(5);
-        frozen.frozen_path = true;
-        new.seamless_adopt = vec![frozen];
-        new.status_bars
-            .toolchain_managed_current(wire, new.frozen_path_tabs(), true, now);
-        new.seamless_adopt.clear();
-        assert_eq!(new.frozen_path_tabs(), 0);
-        assert!(new.status_bars.refresh_managed_current(
-            new.frozen_path_tabs(),
-            true,
-            now + Duration::from_secs(1)
-        ));
     }
 
     /// A shell the outgoing process handed across as `local_id`, the way

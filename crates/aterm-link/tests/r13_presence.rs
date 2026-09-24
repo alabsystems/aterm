@@ -6,17 +6,23 @@
 //! A real headless aterm, a real bridge, a real broker, and a session running
 //! a Claude-shaped fake TUI (a shell script that paints Claude Code's live
 //! zone — a spinner status row, the composer between its two rules, the
-//! footer — and moves through busy → idle-with-context → question on each
-//! Enter). What is asserted is what lands on the BUS:
+//! footer — and moves through busy → idle → question on each Enter), run
+//! under the argv0 `claude` so aterm identifies it as an agent. What is
+//! asserted is what lands on the BUS:
 //!
 //! * the session's presence row carries `role=` and `title=` from its `meta`,
-//!   `detail=` from aterm's own `status`, `phase=` and `context=` from the
-//!   screen — and flips busy → idle → question as the screen does, each flip
-//!   measured and printed;
+//!   `detail=` from aterm's own `status`, and `phase=` — the SERVER's agent
+//!   verdict (`status agent=`, pushed as `EVENT … agent`), relayed by a bridge
+//!   that reads no screen (2026-09-23) — flipping busy → idle → question as
+//!   the screen does, each flip measured and printed; a plain shell is
+//!   `phase=-`, and no row carries `context=`;
 //! * NEVER a word of the transcript: every screen the fake paints carries a
 //!   sentinel string, and no presence row on the bus ever does;
 //! * `aterm link ls` prints the new columns off the same rows;
-//! * a `--presence minimal` bridge writes today's row and nothing more.
+//! * a `--presence minimal` bridge writes today's row and nothing more;
+//! * a `meta` change made after the row's first read reaches the bus by the
+//!   `EVENT … meta` push alone — with that push held shut, a roster round
+//!   republishes the row without it.
 
 mod harness;
 
@@ -169,7 +175,14 @@ fn until_field(w: &World, sid: &str, key: &str, want: &str, budget: Duration) ->
 /// Enter. 120 columns (the harness's `ATERM_COLUMNS`), so the rules are
 /// full-width and the context indicator ends two columns short of them,
 /// where Claude Code parks it.
-fn write_fake_claude(dir: &std::path::Path) -> PathBuf {
+///
+/// It answers the path of a `claude` link to `/bin/bash`: the script runs
+/// under the argv0 `claude`, which is the foreground program aterm's server
+/// resolves (`status program=`) and applies its agent verdict to. The server
+/// never applies one to a plain shell, so without the name the row would
+/// carry no `phase=` at all — the measured negative control at the top of the
+/// test.
+fn write_fake_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let rule = "─".repeat(120);
     let indicator = format!("{}12% until auto-compact", " ".repeat(96));
     // THE SHELL-INTEGRATION MARKS FIRST, so aterm has an `Executing` block
@@ -197,18 +210,21 @@ fn write_fake_claude(dir: &std::path::Path) -> PathBuf {
     );
     let path = dir.join("fake-claude.sh");
     std::fs::write(&path, script).expect("write the fake");
-    path
+    let claude = dir.join("claude");
+    let _ = std::fs::remove_file(&claude);
+    std::os::unix::fs::symlink("/bin/bash", &claude).expect("link claude -> bash");
+    (claude, path)
 }
 
-/// **THE ROW MEANS SOMETHING, IT FLIPS WITH THE SCREEN, AND IT NEVER CARRIES
-/// THE SCREEN.**
+/// **THE ROW MEANS SOMETHING, IT FLIPS WITH THE SERVER'S VERDICT, AND IT
+/// NEVER CARRIES THE SCREEN.**
 #[test]
-fn a_sessions_presence_row_carries_role_detail_phase_context_and_title_and_never_text() {
+fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     let w = World::boot("r13-presence", &[]);
     w.wait_ready();
     let (_boot, sid) = w.two_sessions();
 
-    // `role=` AND `title=` FROM `meta`, on the next roster round.
+    // `role=` AND `title=` FROM `meta`, prompted by the pushed meta digest.
     let set = w.verb(&format!("@{sid} meta set role worker satcomp"));
     assert!(set.ok(), "meta set role: {}", set.header());
     let set = w.verb(&format!("@{sid} meta set title satcomp run"));
@@ -226,9 +242,10 @@ fn a_sessions_presence_row_carries_role_detail_phase_context_and_title_and_never
     );
     let body = presence(&w, &sid).expect("the row");
     assert_eq!(kv(&body, "title"), Some("satcomp%20run"), "{body}");
-    // A shell at its prompt is `idle` with nothing running: the phase reader
-    // has no composer frame and no busy signal, and `detail=` is `-`.
-    assert_eq!(kv(&body, "phase"), Some("idle"), "{body}");
+    // NEGATIVE CONTROL: a shell at its prompt is no agent, so the server
+    // publishes no verdict and the row carries `phase=-` — the bridge invents
+    // nothing (before 2026-09-23 it read `idle` off the screen itself).
+    assert_eq!(kv(&body, "phase"), Some("-"), "{body}");
     assert_eq!(kv(&body, "detail"), Some("-"), "{body}");
     assert!(
         kv(&body, "context").is_none(),
@@ -236,8 +253,12 @@ fn a_sessions_presence_row_carries_role_detail_phase_context_and_title_and_never
     );
 
     // THE FAKE CLAUDE, busy first.
-    let fake = write_fake_claude(&w.tmp);
-    let sent = w.verb(&format!("@{sid} send sh {}", fake.display()));
+    let (claude, fake) = write_fake_claude(&w.tmp);
+    let sent = w.verb(&format!(
+        "@{sid} send {} {}",
+        claude.display(),
+        fake.display()
+    ));
     assert!(sent.ok(), "send: {}", sent.header());
     let started = Instant::now();
     assert!(w.verb(&format!("@{sid} key enter")).ok());
@@ -254,7 +275,9 @@ fn a_sessions_presence_row_carries_role_detail_phase_context_and_title_and_never
     );
     assert!(kv(&body, "context").is_none(), "{body}");
 
-    // ENTER: the turn ends, the done row and the context indicator appear.
+    // ENTER: the turn ends, the done row and the context indicator appear —
+    // and the indicator stays on the screen: the server publishes no context
+    // figure, so no row carries `context=`.
     let flipped_at = Instant::now();
     assert!(w.verb(&format!("@{sid} key enter")).ok());
     until_field(&w, &sid, "phase", "idle", Duration::from_secs(20));
@@ -263,7 +286,7 @@ fn a_sessions_presence_row_carries_role_detail_phase_context_and_title_and_never
         flipped_at.elapsed().as_millis()
     );
     let body = presence(&w, &sid).expect("the row");
-    assert_eq!(kv(&body, "context"), Some("12%"), "{body}");
+    assert!(kv(&body, "context").is_none(), "{body}");
 
     // ENTER: a question.
     let asked_at = Instant::now();
@@ -274,10 +297,7 @@ fn a_sessions_presence_row_carries_role_detail_phase_context_and_title_and_never
         asked_at.elapsed().as_millis()
     );
     let body = presence(&w, &sid).expect("the row");
-    assert!(
-        kv(&body, "context").is_none(),
-        "the indicator is gone: {body}"
-    );
+    assert!(kv(&body, "context").is_none(), "{body}");
     assert!(!body.contains(SENTINEL), "{body}");
 
     // THE WHOLE ROSTER, not just this row: no presence body on the bus
@@ -356,4 +376,77 @@ fn a_minimal_bridge_writes_attention_alone() {
     }
     assert!(body.contains(" attention=needs-a-key"), "{body}");
     assert!(body.contains(" state=live "), "{body}");
+}
+
+/// A program that marks itself as the session's executing command `name`
+/// (the same OSC 133/633 marks the fake Claude writes, so `status detail=`
+/// becomes `name`) and then waits on stdin.
+fn write_marked_program(dir: &std::path::Path, name: &str) -> PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         nonce=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
+         printf '\\033]133;A%s\\007\\033]133;B%s\\007\\033]633;E;{name}%s\\007\\033]133;C%s\\007' \
+         \"$nonce\" \"$nonce\" \"$nonce\" \"$nonce\"\n\
+         read _x\n"
+    );
+    let path = dir.join(format!("{name}.sh"));
+    std::fs::write(&path, script).expect("write the marked program");
+    path
+}
+
+/// **A `meta` CHANGE AFTER THE FIRST READ REACHES THE BUS BY THE PUSH, AND
+/// ONLY BY THE PUSH.** Since 2026-09-23 the roster round reads `meta` only
+/// for a slot never read (or one a `GAP` marked unread); `attention=` — the
+/// field remote notifiers and `glance` read — `role=` and `title=` move on
+/// the `EVENT <local> meta` push. A `meta set` that lands after the row is on
+/// the bus is therefore the push's doing — which this test proves rather
+/// than assumes, by holding the push shut
+/// (the bridge's `Fault::DropMetaEventWhileMarked`) and showing that a roster round
+/// that republishes the row (a new `detail=`) does NOT carry the change.
+#[test]
+fn a_meta_change_after_the_first_read_rides_the_push_alone() {
+    let w = World::boot_with(
+        "r13-meta-push",
+        &[],
+        &[("ATERM_LINK_FAULT", "drop-meta-event-while-marked")],
+    );
+    w.wait_ready();
+    let (_boot, sid) = w.two_sessions();
+
+    // THE FIRST READ: the row is on the bus and its slot is sampled.
+    assert!(w.verb(&format!("@{sid} meta set role first-read")).ok());
+    until_field(&w, &sid, "role", "first-read", Duration::from_secs(15));
+
+    // THE PUSH CARRIES A LATER CHANGE.
+    let set_at = Instant::now();
+    assert!(w.verb(&format!("@{sid} meta set attention pushed-a")).ok());
+    until_field(&w, &sid, "attention", "pushed-a", Duration::from_secs(15));
+    eprintln!(
+        "MEASURED meta set attention (sampled slot) -> attention= on the bus: {} ms",
+        set_at.elapsed().as_millis()
+    );
+
+    // NEGATIVE CONTROL: with the push dropped, the change does not land —
+    // even though a roster round republishes the row after it was made.
+    let marker = w.state.join("drop-meta-event");
+    std::fs::write(&marker, b"1\n").expect("arm the dropped push");
+    assert!(w.verb(&format!("@{sid} meta set attention dropped-b")).ok());
+    let witness = write_marked_program(&w.tmp, "r13witness");
+    assert!(w
+        .verb(&format!("@{sid} send /bin/sh {}", witness.display()))
+        .ok());
+    assert!(w.verb(&format!("@{sid} key enter")).ok());
+    until_field(&w, &sid, "detail", "r13witness", Duration::from_secs(20));
+    let body = presence(&w, &sid).expect("the row");
+    assert_eq!(
+        kv(&body, "attention"),
+        Some("pushed-a"),
+        "a round republished the row after `meta set attention dropped-b` and must not have \
+         carried it — the push is the only path: {body}"
+    );
+
+    // THE PUSH RESTORED CARRIES THE NEXT CHANGE.
+    std::fs::remove_file(&marker).expect("disarm the dropped push");
+    assert!(w.verb(&format!("@{sid} meta set attention pushed-c")).ok());
+    until_field(&w, &sid, "attention", "pushed-c", Duration::from_secs(15));
 }

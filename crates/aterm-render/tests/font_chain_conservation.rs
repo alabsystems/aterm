@@ -236,7 +236,7 @@ fn dejavu() -> Vec<u8> {
 /// A Nerd Font PUA icon: covered by the bundled symbol face, absent from DejaVu.
 const NERD_PUA: char = '\u{E0A0}';
 /// A noncharacter no font covers — the honest `.notdef` control.
-const NONCHARACTER: char = '\u{FDD2}';
+const NONCHARACTER: char = '\u{FFFF}';
 
 fn renderer() -> Renderer {
     Renderer::from_bytes(&dejavu(), 18.0, Theme::default()).expect("fixture parses")

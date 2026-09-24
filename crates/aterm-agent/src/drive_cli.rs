@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use crate::supervise::approvals;
 use crate::supervise::limit::tz_offset_s;
 use crate::supervise::run::Resume;
+use crate::supervise::transport::{Endpoint, Transport};
 use crate::supervise::{
     self, ClockAnchor, EXIT_TIMEOUT, LedgerFormat, LedgerHost, LedgerOpts, MailOpts, Mark,
     ReportOpts, Session, SuperviseOpts, TaskOpts, View, classify_command_with, exit_reason,
@@ -27,15 +29,20 @@ fn resolve_ctl() -> PathBuf {
     if let Ok(p) = std::env::var("ATERM_CTL") {
         return PathBuf::from(p);
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let sib = dir.join("aterm-ctl");
-        if sib.is_file() {
-            return sib;
-        }
-    }
-    PathBuf::from("aterm-ctl")
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| sibling_ctl(&exe))
+        .unwrap_or_else(|| PathBuf::from("aterm-ctl"))
+}
+
+/// The `aterm-ctl` beside the binary at `exe`, looked up from its RESOLVED path. On
+/// macOS `current_exe()` is the path the process was started by, so an `aterm` run
+/// through `~/.local/bin/aterm` would otherwise take `~/.local/bin/aterm-ctl` — where
+/// a copy from an old install sits — over the bundle's own alias.
+pub(crate) fn sibling_ctl(exe: &std::path::Path) -> Option<PathBuf> {
+    let exe = exe.canonicalize().ok()?;
+    let sib = exe.parent()?.join("aterm-ctl");
+    sib.is_file().then_some(sib)
 }
 
 #[derive(Debug)]
@@ -322,10 +329,8 @@ struct SubArgs {
     deadline_s: Option<u64>,
     /// `task --wait`: park for the answer.
     wait: bool,
-    /// `task --no-nudge`: the mail alone (a worker with the wake hook).
-    no_nudge: bool,
-    /// `watch --resume [RULES]`: `Some(None)` probes the worker after a
-    /// limit's reset, `Some(Some(file))` restates that file's rules too.
+    /// `watch --resume [RULES]`: `Some(None)` continues the worker after a
+    /// limit's reset, `Some(Some(file))` types that file's rules with it.
     resume: Option<Option<PathBuf>>,
     /// Positional words (the command text for `classify`, the task's text
     /// for `task`).
@@ -530,7 +535,7 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 if verb != "watch" {
                     return Err(format!(
                         "{verb}: --resume is watch's (the loop that stays through a usage \
-                         limit's reset and probes the worker after it)"
+                         limit's reset and continues the worker after it)"
                     ));
                 }
                 // An optional RULES file: the next word, unless it is a flag
@@ -545,18 +550,13 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                     });
                 out.resume = Some(file);
             }
-            "--wait" | "--no-nudge" => {
+            "--wait" => {
                 if verb != "task" {
                     return Err(format!(
-                        "{verb}: {a} is task's (it sends the task by mail)",
-                        a = a.as_str()
+                        "{verb}: --wait is task's (it sends the task by mail)"
                     ));
                 }
-                if a == "--wait" {
-                    out.wait = true;
-                } else {
-                    out.no_nudge = true;
-                }
+                out.wait = true;
             }
             other if other.starts_with("--") => {
                 return Err(format!(
@@ -815,13 +815,20 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let sopts = supervise_opts(&sub);
             mail_needs_sid(verb, &sub)?;
             let reconnect = sub.reconnect_s;
-            // `--mail`'s lane is a client of its own: it parks on YOUR inbox
-            // while the loop's client watches the worker.
-            let mut lane = CtlClient::new(ctl.clone(), opts.socket.clone());
+            // The loop's client is one persistent connection where it can be
+            // opened (`aterm-ctl` per request otherwise); `--mail`'s lane is
+            // a client of its own: it parks on YOUR inbox while the loop's
+            // client watches the worker.
+            let mut client = supervise_transport(opts, &ctl);
+            let mut lane = sopts
+                .mail
+                .is_some()
+                .then(|| supervise_transport(opts, &ctl));
+            let ledger = approvals::default_path(sub.sid.as_deref());
             let mut session = Session::new(&mut client, sub.sid);
+            session.set_approval_ledger(ledger);
             set_reconnect(&mut session, reconnect);
-            let (text, code) =
-                session.supervise_mail(&sopts, sopts.mail.is_some().then_some(&mut lane))?;
+            let (text, code) = session.supervise_mail(&sopts, lane.as_mut())?;
             Ok(Reply { text, code })
         }
         // The same loop, one flushed stdout line per decision, for a harness
@@ -835,11 +842,17 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let resume = resume_opts(&sub)?;
             let manager = manager_sid(&sub);
             let reconnect = sub.reconnect_s;
-            let mut lane = CtlClient::new(ctl.clone(), opts.socket.clone());
+            let mut client = supervise_transport(opts, &ctl);
+            let mut lane = sopts
+                .mail
+                .is_some()
+                .then(|| supervise_transport(opts, &ctl));
             // The story lane: the worker's window is told each decision as
             // `aterm ctl @sid story …` (round 19), through a client of its own.
-            let mut teller = CtlClient::new(ctl.clone(), opts.socket.clone());
+            let mut teller = supervise_transport(opts, &ctl);
+            let ledger = approvals::default_path(sub.sid.as_deref());
             let mut session = Session::new(&mut client, sub.sid);
+            session.set_approval_ledger(ledger);
             set_reconnect(&mut session, reconnect);
             session.set_manager(manager);
             session.set_resume(resume);
@@ -847,7 +860,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             // through the same sink.
             let code = session.watch_telling(
                 &sopts,
-                sopts.mail.is_some().then_some(&mut lane),
+                lane.as_mut(),
                 Some(&mut teller),
                 &mut std::io::stdout(),
             );
@@ -1031,16 +1044,49 @@ const DEFAULT_CONTEXT_WARN: u8 = 10;
 /// `--reconnect-s`, when given: how long the loop rides out an outage (an
 /// aterm self-update's handoff, from its first unserved request) before it
 /// ends.
-fn set_reconnect(session: &mut Session<'_, CtlClient>, reconnect_s: Option<u64>) {
+fn set_reconnect<C: supervise::Ctl>(session: &mut Session<'_, C>, reconnect_s: Option<u64>) {
     if let Some(s) = reconnect_s {
         session.set_reconnect(Duration::from_secs(s));
+    }
+}
+
+/// The client `supervise` and `watch` run on: ONE persistent connection to
+/// the socket `--socket` names (else the one `aterm-ctl` would resolve for
+/// this terminal's session, re-resolved at every redial), authenticated with
+/// `$ATERM_CONTROL_TOKEN` or the token beside the socket; where that cannot
+/// be opened, `aterm-ctl` per request, with its own discovery and errors.
+fn supervise_transport(opts: &Opts, ctl: &std::path::Path) -> Transport {
+    let endpoint = match &opts.socket {
+        Some(sock) => Endpoint::Socket(sock.clone()),
+        None => Endpoint::Resolved {
+            self_sid: std::env::var("ATERM_PARENT_SESSION_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        },
+    };
+    let token = std::env::var("ATERM_CONTROL_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    Transport::open(
+        endpoint,
+        token,
+        CtlClient::new(ctl.to_path_buf(), opts.socket.clone()),
+    )
+}
+
+/// `--max-s`: seconds, `0` for no budget at all.
+fn max_budget(max_s: Option<u64>) -> Duration {
+    match max_s {
+        Some(0) => supervise::run::UNBOUNDED,
+        Some(s) => Duration::from_secs(s),
+        None => Duration::from_secs(DEFAULT_MAX_S),
     }
 }
 
 fn supervise_opts(sub: &SubArgs) -> SuperviseOpts {
     SuperviseOpts {
         auto_reads: sub.auto_reads,
-        max: Duration::from_secs(sub.max_s.unwrap_or(DEFAULT_MAX_S)),
+        max: max_budget(sub.max_s),
         python_allow: sub.allow_python.clone(),
         notes: sub.notes.clone(),
         report: sub.report,
@@ -1056,6 +1102,10 @@ fn supervise_opts(sub: &SubArgs) -> SuperviseOpts {
                 .idle_grace_s
                 .map_or(supervise::DEFAULT_IDLE_GRACE, Duration::from_secs),
         }),
+        policy: supervise::SupervisorConfig::cli(sub.resume.is_some()),
+        resume: None,
+        // `watch` behind another supervisor watches (`WATCHING …`).
+        yield_when_held: false,
     }
 }
 
@@ -1071,7 +1121,7 @@ fn resume_opts(sub: &SubArgs) -> Result<Option<Resume>, String> {
             .map_err(|e| format!("watch --resume: cannot read RULES {}: {e}", path.display()))?;
         if text.trim().is_empty() {
             return Err(format!(
-                "watch --resume: RULES {} is empty (the file the watcher restates after a limit)",
+                "watch --resume: RULES {} is empty (the file typed with every continuation)",
                 path.display()
             ));
         }
@@ -1105,7 +1155,7 @@ fn mail_needs_sid(verb: &str, sub: &SubArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// `task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text>`.
+/// `task @sid [--deadline S] [--wait] [--inbox @sid] <text>`.
 fn task_opts(opts: &Opts, sub: &SubArgs) -> Result<TaskOpts, String> {
     let worker = sub
         .sid
@@ -1127,7 +1177,6 @@ fn task_opts(opts: &Opts, sub: &SubArgs) -> Result<TaskOpts, String> {
             .unwrap_or_else(|| supervise::mail::SELF.to_string()),
         text,
         deadline,
-        nudge: !sub.no_nudge,
         wait: sub
             .wait
             .then(|| deadline.unwrap_or(Duration::from_millis(opts.timeout_ms))),
@@ -1145,6 +1194,36 @@ fn report_opts(sub: &SubArgs) -> ReportOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sibling is found beside the RESOLVED binary: a launch link in a directory
+    /// holding a stale `aterm-ctl` must still reach the bundle's own.
+    #[cfg(unix)]
+    #[test]
+    fn the_ctl_sibling_is_read_beside_the_resolved_binary() {
+        let dir = std::env::temp_dir().join(format!("aterm-drive-ctl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.canonicalize().unwrap();
+        let bundle = root.join("aterm.app/Contents/MacOS");
+        let links = root.join("bin");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        std::fs::write(bundle.join("aterm"), b"").unwrap();
+        std::fs::write(bundle.join("aterm-ctl"), b"").unwrap();
+        std::fs::write(links.join("aterm-ctl"), b"stale copy").unwrap();
+        std::os::unix::fs::symlink(bundle.join("aterm"), links.join("aterm")).unwrap();
+        assert_eq!(
+            sibling_ctl(&links.join("aterm")),
+            Some(bundle.join("aterm-ctl"))
+        );
+        std::fs::remove_file(bundle.join("aterm-ctl")).unwrap();
+        assert_eq!(
+            sibling_ctl(&links.join("aterm")),
+            None,
+            "never the stale copy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use crate::supervise::limit::parse_zone;
 
     fn args(v: &[&str]) -> Vec<String> {
@@ -1280,21 +1359,13 @@ mod tests {
                 idle_grace_s: None,
                 deadline_s: None,
                 wait: false,
-                no_nudge: false,
                 rest: vec![],
             }
         );
-        // Defaults: no auto-reads, no notes, the built-in python allowlist.
+        // Defaults: no auto-reads, no notes, and no python script is a read.
         let sub = parse_sub("supervise", &args(&[])).expect("parses");
         assert!(!sub.auto_reads && sub.notes.is_none() && sub.max_s.is_none());
-        assert_eq!(
-            python_allow(&sub),
-            args(&[
-                "scripts/*standing*.py",
-                "scripts/*report*.py",
-                "scripts/*score*.py"
-            ])
-        );
+        assert!(python_allow(&sub).is_empty());
         let err = parse_sub("supervise", &args(&["--max-s", "-1"])).expect_err("not a u64");
         assert!(err.contains("--max-s needs a seconds integer"), "{err}");
         let err = parse_sub("supervise", &args(&["--notes"])).expect_err("missing");
@@ -1332,8 +1403,19 @@ mod tests {
                 context_warn: 10,
                 journal: None,
                 mail: None,
+                policy: supervise::SupervisorConfig::cli(false),
+                resume: None,
+                yield_when_held: false,
             }
         );
+        // The CLI types no continuation, retries nothing and switches no
+        // model unless a flag asks: those switches are off in its policy.
+        let p = supervise_opts(&sub).policy;
+        assert!(!p.continue_policy && !p.retry_api_errors && p.model_fallback.is_none());
+        assert_eq!(p.approvals, supervise::ApprovalToggles::default());
+        // `--max-s 0` is no budget at all.
+        let sub = parse_sub("watch", &args(&["@s-1", "--max-s", "0"])).expect("parses");
+        assert_eq!(supervise_opts(&sub).max, supervise::UNBOUNDED);
         let sub = parse_sub("watch", &args(&["@s-1", "--report"])).expect("parses");
         assert!(supervise_opts(&sub).report, "watch --report");
         let sub = parse_sub("watch", &args(&[])).expect("parses");
@@ -1525,24 +1607,16 @@ mod tests {
         );
     }
 
-    /// `task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text>`:
-    /// the text is the positionals, the deadline rides on the post and
-    /// bounds `--wait` (else the global `--timeout` does), the nudge is on
-    /// unless refused; its flags are refused everywhere else.
+    /// `task @sid [--deadline S] [--wait] [--inbox @sid] <text>`: the text is
+    /// the positionals, the deadline rides on the post and bounds `--wait`
+    /// (else the global `--timeout` does); its flags are refused everywhere
+    /// else, and `--no-nudge` is no flag at all — the typed nudge is the verb.
     #[test]
     fn task_parses_the_worker_its_flags_and_the_text() {
         let opts = parse(vec!["task".into()]).expect("parses");
         let sub = parse_sub(
             "task",
-            &args(&[
-                "@s-1",
-                "--deadline",
-                "600",
-                "--wait",
-                "--no-nudge",
-                "run it",
-                "now",
-            ]),
+            &args(&["@s-1", "--deadline", "600", "--wait", "run it", "now"]),
         )
         .expect("parses");
         assert_eq!(
@@ -1552,7 +1626,6 @@ mod tests {
                 inbox: "@self".to_string(),
                 text: "run it now".to_string(),
                 deadline: Some(Duration::from_secs(600)),
-                nudge: false,
                 wait: Some(Duration::from_secs(600)),
             }
         );
@@ -1560,8 +1633,8 @@ mod tests {
             parse_sub("task", &args(&["@s-1", "--wait", "--inbox", "@s-9", "x"])).expect("parses");
         let t = task_opts(&opts, &sub).expect("a task");
         assert_eq!(
-            (t.inbox.as_str(), t.deadline, t.nudge, t.wait),
-            ("@s-9", None, true, Some(Duration::from_millis(180_000)))
+            (t.inbox.as_str(), t.deadline, t.wait),
+            ("@s-9", None, Some(Duration::from_millis(180_000)))
         );
         let sub = parse_sub("task", &args(&["@s-1", "x"])).expect("parses");
         assert_eq!(task_opts(&opts, &sub).expect("a task").wait, None);
@@ -1573,7 +1646,7 @@ mod tests {
         assert!(err.starts_with("task needs the text"), "{err}");
         for (verb, flag) in [
             ("watch", "--wait"),
-            ("supervise", "--no-nudge"),
+            ("supervise", "--wait"),
             ("report", "--deadline"),
         ] {
             let err = parse_sub(verb, &args(&[flag, "5"])).expect_err(verb);
@@ -1582,6 +1655,11 @@ mod tests {
                 "{err}"
             );
         }
+        let err = parse_sub("task", &args(&["@s-1", "--no-nudge", "x"])).expect_err("gone");
+        assert!(
+            err.starts_with("task: unknown option '--no-nudge'"),
+            "{err}"
+        );
     }
 
     /// `await-turn` prints its turn exactly like `phase` — the `survey 0`

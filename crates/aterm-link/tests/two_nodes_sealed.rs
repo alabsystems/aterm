@@ -37,7 +37,7 @@ mod harness;
 use std::time::Duration;
 
 use aterm_link::transport::Conn;
-use harness::{until, until_within, Fleet, DEADLINE, FLEET, PERIODIC_DEADLINE};
+use harness::{until, until_within, Fleet, DEADLINE, FLEET};
 
 /// Wait for a last-value row to carry `what`, ON ONE REUSED CONNECTION.
 ///

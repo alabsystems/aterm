@@ -93,7 +93,7 @@ pub const REQUEST_LINE_MAX: usize = 64 * 1024 - 1;
 /// bridge's own lane a latched `lost()` lane is exactly what the design wants
 /// instead. aterm's own client caps the same value for the same reason and says
 /// so (`aterm-ctl`'s `byte_count`/`MAX_BODY_BYTES`: "a hostile `OK <huge>`
-/// header"); this client, which `hook`, `mirror` and `notify` point at a
+/// header"); this client, which `notify` points at a
 /// `--sock` path an OPERATOR names on the command line — a stale path, a
 /// same-uid process that grabbed the name, a desynchronised stream — had no
 /// equivalent.
@@ -225,8 +225,7 @@ impl Ctl {
     /// [`Ctl::set_deadline`] would leave unbounded.
     ///
     /// For a short-lived caller that must not be held by a peer that accepted
-    /// and then said nothing: a hook, whose vendor reads a stall as a 60 s hang
-    /// per tool call. A request that runs past the deadline fails with
+    /// and then said nothing. A request that runs past the deadline fails with
     /// [`io::ErrorKind::TimedOut`] and LATCHES the connection lost, because a
     /// reply arriving after the caller gave up on it would be read as the
     /// header of the next.
@@ -582,7 +581,7 @@ mod tests {
     /// **A SERVER-DECLARED COUNT IS REFUSED ABOVE THE CEILING, IN BOTH UNITS.**
     ///
     /// `OK <n>` is written by whatever is on the other end of the socket — and
-    /// `hook`, `mirror` and `notify` point this client at a `--sock` path an
+    /// `notify` points this client at a `--sock` path an
     /// operator names, so "whatever" includes a stale path and a same-uid
     /// process that grabbed the name. Sized straight into `vec![0u8; n]` the
     /// bytes case ABORTS the process on allocation failure, which is not an

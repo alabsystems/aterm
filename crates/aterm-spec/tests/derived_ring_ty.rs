@@ -39,45 +39,45 @@ use aterm_spec::derive::{
     fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
     flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
     gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
-    harness_failure_recovery_model, harness_ledger_ring_model, harness_turn_observation_model,
-    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
-    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
-    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
-    kitty_collectibles_model, kitty_flush_worker_model, kitty_pin_merge_model,
-    kitty_sidecar_durability_model, kitty_sing_detector_model, layout_coordinate_reset_model,
-    ligature_gate_model, manual_config_completion_model, manual_config_diagnostics_lane_model,
-    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
-    motion_policy_model, native_async_delivery_model, native_capture_source_model,
-    native_close_plan_model, native_config_observation_handoff_model,
-    native_config_transaction_model, native_control_routing_model,
-    native_document_publication_model, native_document_queue_model, native_draft_journal_model,
-    native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
-    native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
-    native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
-    native_save_intent_latch_model, native_settings_draft_close_model,
-    native_settings_singleton_model, native_tab_identity_model, native_update_admission_model,
-    native_update_apply_ladder_model, native_update_attempt_identity_model,
-    native_update_auto_intent_model, native_update_channel_scan_model,
-    native_update_disk_transaction_model, native_update_failed_mark_suppression_model,
-    native_update_hidden_output_quiet_model, native_update_menu_activation_model,
-    native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
-    native_update_status_reconciliation_model, native_update_worker_queue_model,
-    native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
-    one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
-    operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
-    output_streak_attribution_model, output_streak_episode_delivery_model, pad_absorption_model,
-    pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
-    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
-    presented_frame_tap_model, press_custody_model, proxy_forward_model,
-    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
+    harness_failure_recovery_model, hdr_present_gate_model, hdr_reconfigure_retag_model,
+    hyperlink_scheme_cap_model, idle_deadline_model, ignition_reservation_lifecycle_model,
+    ignition_reservation_rekey_model, inject_floor_model, input_release_pairing_model,
+    kernel_model, key_injectivity_model, kitty_collectibles_model, kitty_flush_worker_model,
+    kitty_pin_merge_model, kitty_sidecar_durability_model, kitty_sing_detector_model,
+    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
+    manual_config_diagnostics_lane_model, manual_config_handoff_model,
+    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
+    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
+    native_config_observation_handoff_model, native_config_transaction_model,
+    native_control_routing_model, native_document_publication_model, native_document_queue_model,
+    native_draft_journal_model, native_editor_command_palette_model, native_editor_modal_model,
+    native_editor_viewport_model, native_file_watch_model, native_markdown_history_model,
+    native_markdown_viewport_model, native_packages_worker_model,
+    native_recovery_interaction_model, native_reopen_ledger_model, native_save_intent_latch_model,
+    native_settings_draft_close_model, native_settings_singleton_model, native_tab_identity_model,
+    native_update_admission_model, native_update_apply_ladder_model,
+    native_update_attempt_identity_model, native_update_auto_intent_model,
+    native_update_channel_scan_model, native_update_disk_transaction_model,
+    native_update_failed_mark_suppression_model, native_update_hidden_output_quiet_model,
+    native_update_menu_activation_model, native_update_overlap_handoff_model,
+    native_update_seamless_handoff_ownership_model, native_update_status_reconciliation_model,
+    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
+    net_dial_after_grant_model, nova_phase_model, one_shot_peek_model,
+    operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
+    operator_resync_cursor_model, operator_wal_actuator_model, output_streak_attribution_model,
+    output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
+    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
+    present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
+    proxy_forward_model, rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
-    rainbow_terminus_admission_model, read_image_seq_model, recording_model, recovery_redraw_model,
-    reduced_motion_companion_handoff_model, release_channel_floor_model,
-    release_channel_single_head_model, release_durable_post_intent_model,
-    release_historical_recovery_model, release_journal_prefix_model,
-    release_key_epoch_transition_model, release_published_identity_model,
-    release_publisher_fence_model, release_yank_successor_first_model,
-    restore_manifest_single_use_model, ring_model, roster_pair_redo_model, scroll_glide_model,
+    rainbow_terminus_admission_model, rainbow_typed_continuity_model, read_image_seq_model,
+    recording_model, recovery_redraw_model, reduced_motion_companion_handoff_model,
+    release_channel_floor_model, release_channel_single_head_model,
+    release_durable_post_intent_model, release_historical_recovery_model,
+    release_journal_prefix_model, release_key_epoch_transition_model,
+    release_published_identity_model, release_publisher_fence_model,
+    release_yank_successor_first_model, restore_manifest_single_use_model, ring_model,
+    roster_pair_redo_model, same_caret_typed_echo_model, scroll_glide_model,
     scrollback_maintenance_lane_model, seamless_nonce_model, selection_custody_model,
     self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
@@ -92,10 +92,10 @@ use aterm_spec::derive::{
     title_summary_model, title_summary_observation_scheduler_model, title_summary_runtime_model,
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
-    vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model,
-    video_batch_publication_durability_model, video_recording_lifecycle_model,
-    video_tap_slot_model, visible_pad_crop_model, watcher_failure_recovery_model,
-    watcher_latch_model, wide_center_model, window_routing_model,
+    unknown_insert_orphan_key_model, vf_axis_clamp_model, vf_nudge_gate_model,
+    vibrancy_contrast_model, video_batch_publication_durability_model,
+    video_recording_lifecycle_model, video_tap_slot_model, visible_pad_crop_model,
+    watcher_failure_recovery_model, watcher_latch_model, wide_center_model, window_routing_model,
 };
 use aterm_spec::verify;
 use std::process::Command;
@@ -414,14 +414,14 @@ fn derived_operator_fleet_fault_proves_and_catches_blocked_egress() {
     assert_proves_and_catches(&model);
 }
 
-/// The harness models (design §11 items 5 and 7) get the operator's shape
+/// The harness model (design §11 item 7) gets the operator's shape
 /// obligations — full committed-config action coverage, every action exercised
 /// at `Buggy = 1`, no wedge before a legitimate terminal — and the per-invariant
 /// non-vacuity sweep run HERE, by name.
 ///
 /// The one obligation `assert_operator_model_shape` carries that this cannot:
 /// enrolment in `xref::model_registry()`, which lives in `src/xref.rs` — a file
-/// this slice does not own. Until that line lands these two models are outside
+/// this slice does not own. Until that line lands the model is outside
 /// the workspace-wide ratchet (`non_vacuity_ratchet.rs`), so the sweep is
 /// spelled out at each call site rather than left to a registry that does not
 /// list them: a model swept by nothing is the silence that ratchet exists to
@@ -457,43 +457,11 @@ fn assert_harness_model_shape(model: &Model, bounds_guards: &[&str]) {
         aterm_spec::interp::find_deadlock(&aterm_spec::interp::with_buggy(model, 0), |_| false);
     assert!(
         deadlock.is_none(),
-        "{} must never wedge: the ring is always reopenable and the ladder always \
-         re-askable: {deadlock:?}",
+        "{} must never wedge: the ladder is always re-askable: {deadlock:?}",
         model.name
     );
 
     assert_every_invariant_carries_a_mutant(model, bounds_guards);
-}
-
-/// §11 item 5: the bounded, lossy ledger ring. `Buggy = 1` reproduces a reopen
-/// that hands the torn tail's slot out a second time, a rotation that forgets
-/// two segments, and a rotation that forgets none — one per design claim.
-#[test]
-fn derived_harness_ledger_ring_proves_and_catches_slot_reuse_and_wrong_rotation() {
-    let model = harness_ledger_ring_model();
-    assert_harness_model_shape(&model, &["FillBounded"]);
-
-    // The historical defect this ring was written against, stated as a trace:
-    // a writer dies mid-record, and the reopen that does not count the
-    // fragment's slot hands that id out again.
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let mut torn = buggy.init_state();
-    for action in ["Rotate", "Tear", "Reopen"] {
-        assert!(buggy.fire(action, &mut torn), "{action}: {torn:?}");
-    }
-    assert_eq!(torn["nextid"], 2, "the torn slot 2 is handed out again");
-    assert!(
-        !buggy.check_invariant("NoReuse", &torn),
-        "a reopen that forgets the fragment must be caught by NoReuse"
-    );
-    let mut healthy = model.init_state();
-    for action in ["Rotate", "Tear", "Reopen"] {
-        assert!(model.fire(action, &mut healthy));
-    }
-    assert_eq!(healthy["nextid"], 3, "the real ring burns the torn slot");
-    assert!(model.check_invariant("NoReuse", &healthy));
-
-    assert_proves_and_catches(&model);
 }
 
 /// §11 item 7: the limit-recovery ladder. `Buggy = 1` starts a second automatic
@@ -547,58 +515,6 @@ fn derived_harness_failure_recovery_proves_and_catches_a_second_action_in_flight
     assert_eq!(
         one_at_a_time["inflight"], 1,
         "the second is queued, not run"
-    );
-
-    assert_proves_and_catches(&model);
-}
-
-/// The grid spine's turn machine (design §4.2, §5.8.1). `Buggy = 1`
-/// reproduces the two defects the writer/reader asymmetry exists to prevent:
-/// `status` closing a turn the GRID opened — "did not look" read as "not
-/// busy" — and an exit that leaves the open turn behind.
-#[test]
-fn derived_harness_turn_observation_proves_and_catches_a_status_close_of_a_grid_turn() {
-    let model = harness_turn_observation_model();
-    assert_harness_model_shape(&model, &["Bounds"]);
-
-    // The defect, stated as a trace: the grid opens a turn, the next pass
-    // reads no grid (its `revision` did not move) and closes it anyway.
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let mut flapped = buggy.init_state();
-    for action in ["GridOpensTurn", "StatusWouldCloseAGridTurn"] {
-        assert!(buggy.fire(action, &mut flapped), "{action}: {flapped:?}");
-    }
-    assert_eq!(flapped["turn"], 0, "the grid-opened turn was closed");
-    assert!(
-        !buggy.check_invariant("AGridTurnIsNeverClosedByStatusAlone", &flapped),
-        "a status-sourced close of a grid turn must be caught"
-    );
-    // ... and the real observer falls through that arm, leaving it open.
-    let mut held = model.init_state();
-    for action in ["GridOpensTurn", "StatusWouldCloseAGridTurn"] {
-        assert!(model.fire(action, &mut held), "{action}: {held:?}");
-    }
-    assert_eq!(held["turn"], 1, "the shipped arm changes nothing");
-    assert!(model.check_invariant("AGridTurnIsNeverClosedByStatusAlone", &held));
-
-    // A status-OPENED turn is a different fact: the weaker source may close
-    // what it opened, and that is not the defect above.
-    let mut own = model.init_state();
-    for action in ["StatusOpensTurn", "StatusClosesItsOwnTurn"] {
-        assert!(model.fire(action, &mut own), "{action}: {own:?}");
-    }
-    assert_eq!(own["turn"], 0);
-    assert_eq!(own["statusclosed"], 0, "closing its own turn is no witness");
-
-    // The second defect: the exit emits and the turn outlives the program.
-    let mut leaked = buggy.init_state();
-    for action in ["GridOpensTurn", "SessionExited"] {
-        assert!(buggy.fire(action, &mut leaked), "{action}: {leaked:?}");
-    }
-    assert_eq!(leaked["turn"], 1, "the turn was left in flight");
-    assert!(
-        !buggy.check_invariant("NoTurnSurvivesTheExit", &leaked),
-        "an exit that does not close the open turn must be caught"
     );
 
     assert_proves_and_catches(&model);
@@ -5593,7 +5509,7 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     let restarted = buggy.successors("LapseRestartsTheLadder", &aged)[0].clone();
     assert_eq!(
         restarted["phase"], 0,
-        "the mutant: a 600 s latch bought fifteen more minutes"
+        "the mutant: a 600 s latch bought a fresh ladder"
     );
     assert!(!buggy.check_invariant("TheLadderNeverRestarts", &restarted));
 
@@ -5612,6 +5528,26 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     assert!(model.successors("ParkMissLatches", &keys_only).is_empty());
     let miss_latched = buggy.successors("ParkMissLatches", &keys_only)[0].clone();
     assert!(!buggy.check_invariant("ActivityNeverLatchesManualOnly", &miss_latched));
+
+    // THE CONSENT WARM-UP (2026-09-23): the one hold no phase relaxes. At the
+    // bound, a warm-up the user started blocks every admitted park; its end —
+    // always enabled while it holds — lets the landing through. The mutant's
+    // ruleless park lands on top of the dialog and is caught.
+    let mut at_bound = model.init_state();
+    for _ in 0..3 {
+        at_bound = model.successors("Advance", &at_bound)[0].clone();
+    }
+    let warming = model.successors("WarmupStarts", &at_bound)[0].clone();
+    for park in ["Park", "ParkMissed", "PhysicalFailure"] {
+        assert!(
+            model.successors(park, &warming).is_empty(),
+            "no {park} over the user's warm-up, even at Land"
+        );
+    }
+    let ended = model.successors("WarmupEnds", &warming)[0].clone();
+    assert_eq!(model.successors("Park", &ended)[0]["landed"], 1);
+    let over_dialog = buggy.successors("ParkWithoutTheRule", &warming)[0].clone();
+    assert!(!buggy.check_invariant("ParkedOnlyWhenTheLadderAdmits", &over_dialog));
 }
 
 /// A hidden tab may never present after its output wake. Its old latency sample
@@ -8496,12 +8432,185 @@ fn derived_cursor_cat_motion_pulse_routing_proves_and_catches_composed_strand() 
 /// mint light only if a human touched the keyboard within the freshness window,
 /// and an unlicensed move mints NOTHING and destroys NOTHING.
 ///
-/// This is the one invariant the redesign named, and the test is written the way
-/// the audit-method rule demands — the PREDICATE enumerated first, each of its
-/// terms given its own claim and its own mutant, rather than the implementation
-/// read back at itself. Tier-0 proves all thirteen laws over the whole bounded
-/// space and requires the `Buggy=1` family to falsify every one of the twelve
-/// design claims when isolated; `StateBounded` is the space, not a claim.
+/// The warm Codex take's retired `and ` run must rejoin only on an exact,
+/// adjacent typed continuation. Tier-0 checks the whole bounded state space;
+/// each named mutant is also caught on its particular witness path.
+#[test]
+fn derived_rainbow_typed_continuity_rejoins_only_exact_same_row_text() {
+    let model = rainbow_typed_continuity_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|candidate| candidate.name == "RainbowTypedContinuity"),
+        "RainbowTypedContinuity must participate in the global spec registry"
+    );
+    assert_proves_and_catches(&model);
+
+    let mut resumed = model.init_state();
+    for action in [
+        "TypeRun",
+        "RetireNaturally",
+        "ClearLicence",
+        "IdleTick",
+        "ResumeTyped",
+    ] {
+        assert!(model.fire(action, &mut resumed));
+    }
+    assert_eq!(resumed["revived"], 1);
+    assert_eq!(resumed["idle_work"], 0);
+
+    for refusal in [
+        "ChangeGlyph",
+        "MoveRow",
+        "LeaveAdjacentEnd",
+        "Navigation",
+        "AgePastChain",
+    ] {
+        let mut state = model.init_state();
+        for action in ["TypeRun", "RetireNaturally", refusal, "ResumeTyped"] {
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!(state["revived"], 0, "{refusal} revived old text");
+    }
+    let mut keyless = model.init_state();
+    for action in ["TypeRun", "RetireNaturally", "ProgramPaint"] {
+        assert!(model.fire(action, &mut keyless));
+    }
+    assert_eq!(keyless["revived"], 0);
+
+    let program_bug = aterm_spec::interp::with_buggy(&model, 2);
+    let mut stolen = program_bug.init_state();
+    for action in ["TypeRun", "RetireNaturally", "ProgramPaint"] {
+        assert!(program_bug.fire(action, &mut stolen));
+    }
+    assert!(!program_bug.check_invariant("RejoinNeedsTypedEcho", &stolen));
+
+    let idle_bug = aterm_spec::interp::with_buggy(&model, 3);
+    let mut idle = idle_bug.init_state();
+    for action in ["TypeRun", "RetireNaturally", "IdleTick"] {
+        assert!(idle_bug.fire(action, &mut idle));
+    }
+    assert!(!idle_bug.check_invariant("DormantCacheDoesNotWake", &idle));
+}
+
+#[test]
+fn derived_same_caret_typed_echo_requires_exact_oldest_key_and_fresh_probe() {
+    let model = same_caret_typed_echo_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|candidate| candidate.name == "SameCaretTypedEcho")
+    );
+    assert_proves_and_catches(&model);
+
+    let mut exact = model.init_state();
+    for action in ["BankA", "BankN", "ExactA", "Resolve"] {
+        assert!(model.fire(action, &mut exact));
+    }
+    assert_eq!(
+        exact["admitted"], 1,
+        "later typeahead `n` replaced oldest `a`"
+    );
+    assert_eq!(exact["spent"], 1);
+    let mut delayed = model.init_state();
+    for action in ["BankA", "DelayedExactA", "Resolve"] {
+        assert!(model.fire(action, &mut delayed));
+    }
+    assert_eq!(delayed["admitted"], 1, "a live delayed exact echo was dark");
+    assert_eq!(delayed["spent"], 1);
+    let mut expired = model.init_state();
+    for action in ["BankA", "ExpiredExactA", "Resolve"] {
+        assert!(model.fire(action, &mut expired));
+    }
+    assert_eq!(expired["admitted"], 0, "an expired key claimed a print");
+    for refusal in [
+        "AmbientOtherGlyph",
+        "DelayedAmbientOtherGlyph",
+        "EarlierMatchingPaint",
+        "NoRowProbe",
+        "NoHandOwner",
+    ] {
+        let mut state = model.init_state();
+        for action in ["BankA", refusal, "Resolve"] {
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!(state["admitted"], 0, "{refusal} claimed a key");
+    }
+    let mut batch = model.init_state();
+    for action in ["BankA", "BankN", "ExactBatch", "Resolve"] {
+        assert!(model.fire(action, &mut batch));
+    }
+    assert_eq!(
+        batch["admitted"], 1,
+        "the exact in-flight batch was refused"
+    );
+    for refusal in ["BatchOtherGlyph", "BatchNoPriorProbe", "BatchStaleTail"] {
+        let mut state = model.init_state();
+        for action in ["BankA", "BankN", refusal, "Resolve"] {
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!(state["admitted"], 0, "{refusal} claimed a key");
+    }
+    let mut keyless = model.init_state();
+    for action in ["KeylessPaint", "Resolve"] {
+        assert!(model.fire(action, &mut keyless));
+    }
+    assert_eq!(keyless["admitted"], 0);
+    let mut batch_keyless = model.init_state();
+    for action in ["BatchKeyless", "Resolve"] {
+        assert!(model.fire(action, &mut batch_keyless));
+    }
+    assert_eq!(batch_keyless["admitted"], 0);
+}
+
+#[test]
+fn derived_unknown_insert_orphan_key_is_exact_one_shot_and_invalidated() {
+    let model = unknown_insert_orphan_key_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|candidate| candidate.name == "UnknownInsertOrphanKey")
+    );
+    assert_proves_and_catches(&model);
+
+    let mut exact = model.init_state();
+    for action in [
+        "QueueOne",
+        "LayWithSite",
+        "Cleanup",
+        "ExactNewPrint",
+        "LaterProgramPrint",
+    ] {
+        assert!(model.fire(action, &mut exact));
+    }
+    assert_eq!(exact["lit"], 1, "the exact later key stayed dark");
+    assert_eq!(exact["generic"], 0, "escrow leaked into generic credits");
+    assert_eq!(exact["escrow"], 0, "the key spent more than once");
+
+    for refusal in [
+        "AmbientOtherGlyph",
+        "ExactOldPrint",
+        "Expire",
+        "Scroll",
+        "Rewrite",
+        "Reset",
+    ] {
+        let mut state = model.init_state();
+        for action in ["QueueOne", "LayWithSite", "Cleanup", refusal] {
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!(state["lit"], 0, "{refusal} claimed the key");
+        assert_eq!(state["escrow"], 0, "{refusal} retained the escrow");
+    }
+    for queue in ["QueueNone", "QueueTwo", "QueueBlank"] {
+        let mut state = model.init_state();
+        for action in [queue, "LayWithSite", "Cleanup", "ExactNewPrint"] {
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!(state["lit"], 0, "{queue} claimed a single exact key");
+    }
+}
+
 #[test]
 fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
@@ -8516,6 +8625,26 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     let model = cursor_hint_license_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_carries_a_mutant(&model, &["StateBounded"]);
+
+    // Delivery and all later keys can reach the renderer before either
+    // output frame. The first echo spends the insert, leaving the later
+    // press's credit and stamp for its own frame.
+    let mut delayed = model.init_state();
+    for action in [
+        "PasteEnqueues",
+        "PressBehindQueuedInsert",
+        "WriteCompletesArmsInsertLicence",
+        "DelayedInsertEchoPrecedesLaterKey",
+    ] {
+        assert!(model.fire(action, &mut delayed), "{action}");
+    }
+    assert_eq!(delayed["insert_hint"], 0);
+    assert_eq!(delayed["hint"], 1);
+    assert_eq!(delayed["later_key_credit"], 1);
+    assert_eq!(delayed["spent"], 0);
+    assert!(model.fire("LicensedTypedMoveMintsLight", &mut delayed));
+    assert_eq!(delayed["spent"], 1);
+    assert_eq!(delayed["births"], 2);
 
     // A PRESS ARMS A LICENCE, and the licensed echo spends it: one hint, one
     // echo. The ring scores the move as `licensed`, and light exists.
@@ -9348,6 +9477,28 @@ fn derived_cursor_companion_owner_lifecycle_proves_and_catches_stale_coordinates
 }
 
 #[test]
+fn derived_composed_witness_generation_preserves_captured_rows_and_fences_fresh_reads() {
+    let model = aterm_spec::derive::composed_witness_generation_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|candidate| candidate.name == "ComposedWitnessGeneration")
+    );
+    assert_proves_and_catches(&model);
+
+    let mut captured = model.init_state();
+    assert!(!model.action_enabled("ReadCaptured", &captured));
+    for action in ["Capture", "Mutate", "ReadCaptured"] {
+        assert!(model.fire(action, &mut captured));
+    }
+    assert_eq!(captured["admitted"], 2);
+
+    let mut fresh = model.init_state();
+    assert!(model.fire("Mutate", &mut fresh));
+    assert!(!model.action_enabled("ReadFresh", &fresh));
+}
+
+#[test]
 fn derived_composed_sync_hold_requires_every_pane_to_release() {
     let model = composed_sync_hold_model();
     assert_proves_and_catches(&model);
@@ -10052,4 +10203,34 @@ fn derived_console_resident_handoff_proves_and_catches_stranded_or_perpetual_wak
     let model = aterm_spec::derive::console_resident_handoff_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_carries_a_mutant(&model, &["StateBounded"]);
+}
+
+/// `aterm.log` rotation across writing processes: every line written stays in
+/// `aterm.log` or `aterm.log.1` until the older copy is replaced, and both files
+/// stay bounded. `Buggy=1` — no look while running and a truncating start, the
+/// code this replaced — must break both, each on its own. Tier-1:
+/// `aterm-gui/src/logging.rs` `rotation_conformance`.
+#[test]
+fn derived_log_rotation_proves_and_catches_lost_lines_and_unbounded_growth() {
+    let model = aterm_spec::derive::log_rotation_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &[]);
+
+    // A writer two rotations behind cannot write before it looks: the second
+    // rotation needs a tick after the first, and that tick makes A's look due.
+    let mut state = model.init_state();
+    for action in [
+        "WriteB", "CheckB", "WriteB", "CheckB", // B fills the file and rotates it
+        "WriteB", "CheckB", "Tick", "CheckB", "WriteB", "CheckB", // …and again
+    ] {
+        assert!(model.fire(action, &mut state), "{action} from {state:?}");
+    }
+    assert_eq!(state["ga"], 2, "A holds a deleted copy: {state:?}");
+    assert!(!model.action_enabled("WriteA", &state), "{state:?}");
+    assert!(model.fire("CheckA", &mut state));
+    assert_eq!(state["ga"], 0, "A's look reopens aterm.log: {state:?}");
+    assert_eq!(
+        state["live"] + state["old"] + state["aged"],
+        state["written"]
+    );
 }

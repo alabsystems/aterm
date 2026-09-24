@@ -1,8 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Machine settings the update/seed pass applies per the doctor's own findings (R5,
-//! owner decisions 2026-09-10): the POLICY half — what to do given what `defaults`
+//! Machine settings `aterm pkg machine apply` applies per the doctor's own findings (R5,
+//! owner decisions 2026-09-10; a pass applies them only after an edit to the `[machine]`
+//! table since Phase 3, [`changed_since_applied`]): the POLICY half — what to do given what `defaults`
 //! answered — kept pure and behind a port so no test ever touches the real
 //! `com.apple.universalcontrol` domain. The Spotlight half is [`crate::noindex::apply`].
 //!
@@ -15,8 +16,8 @@
 
 use crate::config::UniversalControlPolicy;
 
-/// The one-line revert every surface that mentions the change must print (pull-down
-/// row, doctor, this pass's log). The pass writes BOTH per-host keys
+/// The one-line revert every surface that mentions the change must print (the window's
+/// `appstatus` ledger entry, doctor, this pass's log). The pass writes BOTH per-host keys
 /// (`platform::universal_control_disable`), so the revert deletes both: `Disable` is
 /// the feature, `DisableMagicEdges` the screen-edge hand-off, and deleting one leaves
 /// the other set. Joined by `;`, not `&&`: `defaults delete` exits 1 on a key that is
@@ -99,9 +100,9 @@ impl UniversalControlState {
             return match policy {
                 UniversalControlPolicy::Off => "warn — Universal Control could not be read \
                      on this host (`defaults -currentHost read com.apple.universalcontrol` did \
-                     not answer), so whether it is on here is unknown; a pass writes both keys \
-                     anyway ([machine] universal_control = \"off\") — now: `aterm pkg machine \
-                     apply`"
+                     not answer), so whether it is on here is unknown; the next aterm window (or \
+                     the day's first terminal session) writes both keys anyway ([machine] universal_control = \"off\") — now: `aterm pkg \
+                     machine apply`"
                     .to_string(),
                 UniversalControlPolicy::Leave => {
                     "ok — Universal Control could not be read on this host, and [machine] \
@@ -111,15 +112,15 @@ impl UniversalControlState {
             };
         }
         if self.disabled() {
-            // THE REVERT ALONE DOES NOT HOLD. With the default policy every later pass
-            // disables it again first thing, so a line that offers only the two
-            // `defaults delete`s sends the reader to a change that lasts until the next
-            // launch. The command stays byte-identical ([`UNIVERSAL_CONTROL_REVERT`] is
+            // THE REVERT ALONE DOES NOT HOLD. With the default policy the next aterm window
+            // (or the day's first terminal session) disables it again, so a line that offers
+            // only the two `defaults delete`s sends the reader to a change that lasts until
+            // then. The command stays byte-identical ([`UNIVERSAL_CONTROL_REVERT`] is
             // a contract string); what follows it is the half that makes it stick.
             let keep = match policy {
                 UniversalControlPolicy::Off => {
-                    " — and set [machine] universal_control = \"leave\", or the next pass \
-                     disables it again"
+                    " — and set [machine] universal_control = \"leave\", or the next aterm \
+                     window (or the day's first terminal session) disables it again"
                 }
                 UniversalControlPolicy::Leave => "",
             };
@@ -140,9 +141,9 @@ impl UniversalControlState {
         };
         match policy {
             UniversalControlPolicy::Off => format!(
-                "warn — Universal Control is {posture}; every pass disables it first thing \
-                 ([machine] universal_control = \"off\") — now: `aterm pkg machine apply`; \
-                 keep it: universal_control = \"leave\""
+                "warn — Universal Control is {posture}; the next aterm window (or the day's \
+                 first terminal session) disables it ([machine] universal_control = \"off\") — now: \
+                 `aterm pkg machine apply`; keep it: universal_control = \"leave\""
             ),
             UniversalControlPolicy::Leave => format!(
                 "ok — Universal Control left {posture} ([machine] universal_control = \"leave\")"
@@ -534,10 +535,110 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     })
 }
 
+/// The `[machine]` table as one stable text — what [`record_applied`] keeps and
+/// [`changed_since_applied`] compares — spelled from the table as WRITTEN (the raw
+/// `Option`s), so an edit is a change even when it lands on a default.
+#[must_use]
+pub fn applied_fingerprint(cfg: &crate::config::MachineConfig) -> String {
+    format!(
+        "atpkg-machine-applied v1\nspotlight_noindex={:?}\nuniversal_control={:?}\n\
+         unreadable={}\n",
+        cfg.spotlight_noindex, cfg.universal_control, cfg.unreadable
+    )
+}
+
+/// `<prefix>/machine.applied` — the `[machine]` table the last apply acted on.
+#[must_use]
+pub fn applied_stamp_path(layout: &crate::store::Layout) -> std::path::PathBuf {
+    layout.prefix.join("machine.applied")
+}
+
+/// Whether `cfg` differs from the table the last apply recorded — an absent or unreadable
+/// stamp counts as changed, so a machine that never applied them does at its next pass.
+#[must_use]
+pub fn changed_since_applied(
+    layout: &crate::store::Layout,
+    cfg: &crate::config::MachineConfig,
+) -> bool {
+    crate::metadata_io::read_bounded_regular_utf8(&applied_stamp_path(layout), 4096)
+        .map_or(true, |had| had != applied_fingerprint(cfg))
+}
+
+/// Forget the applied table, so the next pass's edge applies it again — what an apply that
+/// did not FINISH leaves (a live build skipped, a rename or a `defaults` write that failed):
+/// the passes carry only a changed table, so without this nothing but the next window (or
+/// the day's first terminal session) would retry what it missed. Best-effort.
+pub fn forget_applied(layout: &crate::store::Layout) {
+    let _ = std::fs::remove_file(applied_stamp_path(layout));
+}
+
+/// Record `cfg` as the applied table: temp + rename, only when the bytes differ, and only
+/// where the prefix already exists (a pass creates it; a stamp never does). Best-effort —
+/// a stamp that did not land means the next pass applies once more.
+pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::MachineConfig) {
+    let path = applied_stamp_path(layout);
+    let text = applied_fingerprint(cfg);
+    if !layout.prefix.is_dir() || !changed_since_applied(layout, cfg) {
+        return;
+    }
+    let tmp = layout
+        .prefix
+        .join(format!("machine.applied.tmp-{}", std::process::id()));
+    if crate::call2(std::fs::write, &tmp, text).is_err() || std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// THE PASSES CARRY ONLY AN EDIT (Phase 3): a machine that never applied the `[machine]`
+    /// table reads "changed"; recording it makes the same table unchanged (and a second
+    /// record writes nothing); an edit — even one that lands on a default — reads changed
+    /// again. No prefix, no stamp: a stamp never creates the store.
+    #[test]
+    fn the_applied_table_is_recorded_and_an_edit_reads_as_changed() {
+        let p = std::env::temp_dir().join(format!("atpkg-machine-applied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        let layout = crate::store::Layout { prefix: p.clone() };
+        let default = crate::config::MachineConfig::default();
+        record_applied(&layout, &default);
+        assert!(!p.exists(), "no prefix: nothing is created");
+        std::fs::create_dir_all(&p).unwrap();
+        assert!(changed_since_applied(&layout, &default), "never applied");
+        record_applied(&layout, &default);
+        assert!(!changed_since_applied(&layout, &default));
+        let stamp = std::fs::metadata(applied_stamp_path(&layout))
+            .unwrap()
+            .modified()
+            .unwrap();
+        record_applied(&layout, &default);
+        assert_eq!(
+            std::fs::metadata(applied_stamp_path(&layout))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp,
+            "unchanged: not rewritten"
+        );
+        // An apply that did not finish forgets it: the next pass applies again.
+        forget_applied(&layout);
+        assert!(
+            changed_since_applied(&layout, &default),
+            "forgotten: retried"
+        );
+        record_applied(&layout, &default);
+        let leave = crate::config::parse_machine("[machine]\nuniversal_control = \"leave\"\n");
+        assert!(changed_since_applied(&layout, &leave), "an edit");
+        let spelled_default = crate::config::parse_machine("[machine]\nspotlight_noindex = true\n");
+        assert!(
+            changed_since_applied(&layout, &spelled_default),
+            "spelling out a default is an edit too"
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
 
     /// A fake domain: the two keys, and a count of writes.
     struct Fake {
@@ -668,14 +769,18 @@ mod tests {
         assert_eq!(default.posture(), UcPosture::Default);
         let line = default.doctor_line(UniversalControlPolicy::Off);
         assert!(line.starts_with("warn — "), "{line}");
-        // The promise, and the door: "first thing" is the 2026-09-14 fix (the apply used
-        // to sit inside `if failures == 0` at the END of the pass, so a machine whose
-        // toolchain pass never came clean was promised this on every run and never got
-        // it), and the verb is how a person gets it NOW rather than at the next pass.
+        // The promise, and the door: WHAT applies it — the next window, or the day's first
+        // terminal session, since the passes carry only an edit to the table (Phase 3;
+        // "every pass disables it first thing" was the 2026-09-14 promise, and stopped
+        // being true) and a session applies them once a day, not at every tab — and the
+        // verb is how a person gets it NOW rather than then.
         assert!(
-            line.contains("every pass disables it first thing"),
+            line.contains(
+                "the next aterm window (or the day's first terminal session) disables it"
+            ),
             "{line}"
         );
+        assert!(!line.contains("every pass"), "{line}");
         assert!(line.contains("now: `aterm pkg machine apply`"), "{line}");
         assert!(
             !line.contains("next update pass"),

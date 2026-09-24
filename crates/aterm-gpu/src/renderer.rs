@@ -1039,7 +1039,8 @@ struct Blit {
     overlay: u32,     // drop-target highlight enabled
     border_px: f32,   // inset border thickness, device px
     encode_srgb: f32, // !=0: re-encode linear->sRGB (downlevel WebGL2 blit)
-    accent: vec4<f32>,// overlay accent rgb (a unused), normalized 0..1
+    accent: vec3<f32>,// overlay accent rgb, normalized 0..1
+    chrome_y1: f32,   // source rows [0, chrome_y1) are host chrome: their bands continue the frame's edge pixels
     dims: vec2<f32>,  // OFFSCREEN frame width,height in px
     wash_a: f32,      // interior wash alpha 0..1
     border_a: f32,    // border alpha 0..1
@@ -1086,8 +1087,19 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
     // texel coords: `textureLoad` is a 1:1 texel fetch — zero scaling ever.
     // At exact fit (`content_off == 0`, dst dims == frame dims) every pixel is
     // in-bounds and this is byte-identical to the historical NEAREST blit.
-    let p = in.pos.xy - b.content_off;
+    var p = in.pos.xy - b.content_off;
     let visible_y1 = b.visible_y + b.visible_h;
+    // CHROME REACHES THE WINDOW EDGE: beside a host-chrome source row
+    // (`p.y < chrome_y1`, `aterm_render::Renderer::chrome_extent_px`) the
+    // horizontal remainder bands CONTINUE the frame's own edge pixel instead of
+    // the band colour — the CPU twin is `place_frame_bands`' `edge_rows`. The
+    // fetched texel is still a BAND pixel: never inverted, never washed.
+    // `chrome_y1 == 0` (every frame without chrome) never takes this arm.
+    var chrome_edge = false;
+    if ((p.x < 0.0 || p.x >= b.dims.x) && p.y >= b.visible_y && p.y < min(visible_y1, b.chrome_y1)) {
+        p.x = clamp(p.x, 0.0, b.dims.x - 1.0);
+        chrome_edge = true;
+    }
     if (p.x < 0.0 || p.y < b.visible_y || p.x >= b.dims.x || p.y >= visible_y1) {
         // M3: the bands are chrome in the SAME stream as the frame — on the EDR
         // swapchain they take the same linear decode (and the same <=1.0 clamp).
@@ -1115,13 +1127,13 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
     }
     let c = textureLoad(src_tex, vec2<i32>(p), 0);
     var rgb = c.rgb;
-    if (b.flag != 0u) {
+    if (b.flag != 0u && !chrome_edge) {
         rgb = vec3<f32>(1.0) - rgb;
     }
     // Drag-and-drop drop-target highlight: faint accent wash + inset accent
     // border, relative to the CONTENT frame (`p` is the frame-local device
     // pixel). Gated on `overlay` so a normal present is byte-identical.
-    if (b.overlay != 0u) {
+    if (b.overlay != 0u && !chrome_edge) {
         let visible_p = vec2<f32>(p.x, p.y - b.visible_y);
         let edge = min(
             min(visible_p.x, b.dims.x - visible_p.x),
@@ -1622,7 +1634,7 @@ impl_pod_zeroable!(ShimmerUniform {
 /// Blit uniform: the bell-flash invert flag plus the drag-and-drop drop-target
 /// highlight parameters plus the W1 band placement (frame offset + band colour).
 /// `#[repr(C)]` with a std140-compatible 96-byte layout matching the WGSL `Blit`
-/// struct exactly (vec4 at offsets 16 and 48, vec2 at 32 and 64).
+/// struct exactly (vec3 + f32 at 16/28, vec4 at 48, vec2 at 32 and 64).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct BlitUniform {
@@ -1636,8 +1648,15 @@ pub(crate) struct BlitUniform {
     /// (which auto-decodes to linear), so it must re-encode linear→sRGB before writing
     /// to the non-sRGB swapchain. Zero on native (the blit samples raw Unorm bytes).
     encode_srgb: f32,
-    /// Overlay accent, normalized 0..1 (rgb; a unused but kept for alignment).
-    accent: [f32; 4],
+    /// Overlay accent, normalized 0..1 (rgb).
+    accent: [f32; 3],
+    /// Source rows `[0, chrome_y1)` are host chrome
+    /// (`aterm_render::Renderer::chrome_extent_px`): beside them the horizontal
+    /// remainder bands continue the frame's own edge pixel, so a chrome band
+    /// reaches the true window edge. This slot WAS the accent's unused alpha
+    /// (always 0.0 outside the drop overlay, which never read it), so `0.0` —
+    /// every frame without chrome — keeps the pre-chrome bytes and behaviour.
+    chrome_y1: f32,
     /// OFFSCREEN frame size in pixels (the content the blit fetches), for the
     /// in-shader bounds check + overlay edge-distance calc. ALWAYS set by the
     /// present path (the bounds check runs on every pixel).
@@ -1693,7 +1712,8 @@ impl_pod_zeroable!(BlitUniform {
     overlay: u32,
     border_px: f32,
     encode_srgb: f32,
-    accent: [f32; 4],
+    accent: [f32; 3],
+    chrome_y1: f32,
     dims: [f32; 2],
     wash_a: f32,
     border_a: f32,
@@ -1717,7 +1737,8 @@ impl BlitUniform {
             overlay: 0,
             border_px: 0.0,
             encode_srgb: 0.0, // set by the caller from ctx.srgb_offscreen
-            accent: [0.0; 4],
+            accent: [0.0; 3],
+            chrome_y1: 0.0, // set by the present path from the chrome extent
             dims: [0.0, 0.0],
             wash_a: 0.0,
             border_a: 0.0,
@@ -2025,6 +2046,27 @@ fn note_offscreen_written(win: &mut WindowGpu, rect: Option<[u32; 4]>, dims: (u3
     win.offscreen_dirty_since_sync = union_rect_opt(win.offscreen_dirty_since_sync, rect, dims);
 }
 
+/// The compose copy's rect for THIS present — what of the resident present copy
+/// is no longer the clean offscreen: the rows the offscreen was repainted in
+/// since the last sync (`offscreen_dirty_since_sync`) PLUS the region the last
+/// sync's halo / haze / band shift / card wrote over the copy
+/// (`present_offscreen_fx`; dropping that term would leave the previous frame's
+/// halo baked into the copy — a smeared comet trail on glass). `None` on either
+/// side is "unknown" and forces the whole `(w, h)` frame.
+///
+/// ONE spelling for BOTH arms (`compose_present_offscreen` and
+/// `metal_encode_submit_b`). WHY: the Metal arm used to copy `[0, 0, fw, fh]`
+/// unconditionally — ~24 MB read + ~24 MB write at 3024x1964 — and once the 1:1
+/// trackpad band shift made EVERY glide delta a present-copy frame, that was the
+/// whole framebuffer per delta, to then translate one band of it.
+fn present_copy_rect(
+    dirty: Option<[u32; 4]>,
+    fx: Option<[u32; 4]>,
+    (w, h): (u32, u32),
+) -> [u32; 4] {
+    union_rect_opt(dirty, fx, (w, h)).unwrap_or([0, 0, w, h])
+}
+
 /// The offscreen frame's stream groups, in DRAW ORDER — the index space of
 /// [`coalesce_frame_passes`]'s `enabled`/`srgb` arrays, of [`GROUP_SRGB`] and of
 /// the `pass_of` map `encode_frame` walks. Module-level so the coalescing tests
@@ -2130,6 +2172,19 @@ pub(crate) struct BandShift {
     pub(crate) moved: u32,
 }
 
+/// M1b INCOMING-ROW APRON (GPU): the strip the apron paints, resolved ONCE per
+/// frame by `GpuRenderer::apron_strip_plan` and run by whichever arm presents.
+/// `dst_y`/`rows` are the CPU `incoming_strip` geometry (`[y1 - frac, y1)`,
+/// `rows` clamped to the apron's own rows); `w`/`cell_h` are the resident
+/// apron texture's dims (the frame width × one cell).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ApronStrip {
+    pub(crate) dst_y: u32,
+    pub(crate) rows: u32,
+    pub(crate) w: u32,
+    pub(crate) cell_h: u32,
+}
+
 /// The PURE arithmetic under `shift_offscreen_band_px`, extracted so the wgpu
 /// path and the Metal replay run the IDENTICAL copy plan (one spelling of the
 /// seam; a drift is a byte diff, not a shared assumption). `None` == nothing
@@ -2158,6 +2213,39 @@ pub(crate) fn band_shift_ops(y0: usize, y1: usize, delta: i64) -> Option<BandShi
         dst_y: dst_y as u32,
         moved: moved as u32,
     })
+}
+
+/// The two staged copies of a [`BandShift`] on the ARMED arm — band → scratch,
+/// scratch → band shifted — recorded onto `enc` (a blit encoder each, through
+/// the W1 copy verb that REFUSES the overlapping self-copy the scratch exists
+/// to avoid). ONE spelling for the oracle's own-buffer shift and the present
+/// path's Submit A ride, so the two cannot drift on a rect. Records only: the
+/// caller decides what command buffer this rides and whether it waits.
+#[cfg(target_os = "macos")]
+fn record_band_shift(
+    enc: &mut crate::device_layer::FrameEncoder<'_>,
+    off: &crate::metal::resources::SealedTexture,
+    scratch: &crate::metal::resources::SealedTexture,
+    shift: BandShift,
+    w: u32,
+) -> Result<(), String> {
+    use crate::device_layer::FrameCopyTexture;
+    enc.copy_texture_rect(
+        FrameCopyTexture::Metal(off),
+        (0, shift.src_y),
+        FrameCopyTexture::Metal(scratch),
+        (0, 0),
+        w,
+        shift.moved,
+    )?;
+    enc.copy_texture_rect(
+        FrameCopyTexture::Metal(scratch),
+        (0, 0),
+        FrameCopyTexture::Metal(off),
+        (0, shift.dst_y),
+        w,
+        shift.moved,
+    )
 }
 
 /// The pipeline a [`DrawItem`] binds — the hoisted twin of the `Pipe` enum
@@ -2851,6 +2939,27 @@ struct MetalArmLive {
     /// as `gpu_park`, so the ledger names the producer.
     frame_slot_wait_ns: u64,
     pending_ring_wait_ns: u64,
+    /// THE ENCODE PATH'S INLINE PARKS, COUNTED. How many times the armed
+    /// encode path parked the UI thread on a command buffer it had committed
+    /// in the SAME present — an UNPIPELINED `waitUntilCompleted`, distinct
+    /// from the two priced parks above (one frame back, or ring-bounded).
+    /// The E7 whole-row rescue was the one such site on the SCROLL path: its
+    /// two band copies were a submit of their own, waited to terminal before
+    /// Submit A, once per row crossed while scrolling. They now ride Submit A
+    /// itself, and the scroll-blit gate asserts this count POSITIVELY across
+    /// a rescued present, rather than by the absence of a wait nobody
+    /// measured. Every inline park on the OFFSCREEN-WRITING encode path (the
+    /// in-place bloom/shimmer/tray buffers, the oracle's post-encode
+    /// translate) books here through [`Self::wait_inline`]. NOT counted, on
+    /// purpose: the virtual-present and readback helpers
+    /// (`metal_present_virtual_with_crop`, `virtual_presented_snapshot_current`,
+    /// `metal_compose_present_readback`) wait their own Submit B / readback
+    /// copy — a synchronous readback's price, not a present's.
+    encode_inline_waits: std::cell::Cell<u64>,
+    /// How many E7 band shifts were RECORDED INTO an armed Submit A — the
+    /// positive twin of `encode_inline_waits`: a rescued frame whose copies
+    /// rode the encode, not a frame that merely skipped a wait.
+    encode_band_shifts: std::cell::Cell<u64>,
 }
 
 /// One armed present in flight: its committed Submit B and its ticket.
@@ -2890,6 +2999,8 @@ impl MetalArmLive {
             awaited_frames: 0,
             frame_slot_wait_ns: 0,
             pending_ring_wait_ns: 0,
+            encode_inline_waits: std::cell::Cell::new(0),
+            encode_band_shifts: std::cell::Cell::new(0),
         })
     }
 
@@ -2993,6 +3104,17 @@ impl MetalArmLive {
             std::mem::take(&mut self.frame_slot_wait_ns),
             std::mem::take(&mut self.pending_ring_wait_ns),
         )
+    }
+
+    /// ONE UNPIPELINED PARK: wait a command buffer THIS present committed to
+    /// terminal (the `Submitted` contract feeds the latch once), booked on
+    /// `encode_inline_waits` so the count is every such site, not the ones
+    /// someone remembered to tag. `&self` on purpose: the counter is a `Cell`
+    /// so a caller whose `CommandBuffer` still borrows `session` can book.
+    fn wait_inline(&self, sub: &crate::metal::encoder::Submitted) -> crate::metal::loss::CbOutcome {
+        self.encode_inline_waits
+            .set(self.encode_inline_waits.get().saturating_add(1));
+        sub.wait_outcome()
     }
 
     /// Demand-build the PSO for `row` (frame rows only — all in `cell.metal`,
@@ -3377,7 +3499,7 @@ fn present_blit_uniform(
                 .min(source_width / 2)
                 .min(visible_height / 2)
                 .max(1) as f32,
-                accent: [chan(16), chan(8), chan(0), 1.0],
+                accent: [chan(16), chan(8), chan(0)],
                 wash_a: f32::from(overlay.wash_a) / 255.0,
                 border_a: f32::from(overlay.border_a) / 255.0,
                 ..BlitUniform::bell(invert)
@@ -4147,6 +4269,15 @@ pub struct WindowGpu {
     // same transform DWM applies to SDR windows. `Default` 0.0 is clamped to 1.0 at
     // present (never set / macOS / SDR ⇒ no scaling, byte-identical).
     pub(crate) sdr_white_scale: f32,
+    // How many rows from the top of THIS window's offscreen are host chrome
+    // (`aterm_render::Renderer::chrome_extent_px`), stamped by `encode_frame`
+    // when the offscreen is drawn and read by every present into the blit's
+    // `chrome_y1`: beside those rows the remainder bands continue the frame's
+    // edge pixels, so the chrome band reaches the true window edge. Per window
+    // and stamped at encode, never read live off the shared inner renderer at
+    // present time — that holds whichever window composed LAST. `Default` 0 is
+    // the historical present (no chrome ⇒ byte-identical).
+    pub(crate) chrome_y1: u32,
     // Colour-space tag the platform compositor applies to this window's
     // presented texture. Unlike the texture format, this distinguishes an
     // 8-bit sRGB surface from macOS's legacy Display-P3 interpretation. Each
@@ -4164,6 +4295,28 @@ pub struct WindowGpu {
     // copies run through `FrameEncoder::copy_texture_rect` (the Metal arm of
     // which REFUSES the overlapping self-copy this scratch exists to avoid).
     pub(crate) shift_scratch: Option<crate::device_layer::LayerTexture>,
+    // M1b INCOMING-ROW APRON (both arms): the CPU raster of the row an up-glide
+    // slides in (`apron_scratch`, the CPU face's own `ApronScratch`), packed to
+    // the offscreen's RGBA8 bytes (`apron_rgba`), resident on the GPU as a
+    // `w × cell_h` copy-source texture that is re-uploaded ONLY when the bytes
+    // change (the `*_bytes` mirror — the tray card's unchanged-bytes skip). The
+    // present paths COPY its top `frac` rows onto the strip the band shift
+    // exposes (`shift_present_copy_band` / `ApronStripPass`), so the strip is
+    // the CPU's bytes on every backend. See `GpuRenderer::apron_strip_plan`.
+    pub(crate) apron_scratch: aterm_render::ApronScratch,
+    pub(crate) apron_rgba: Vec<u8>,
+    // The `ApronScratch::generation` the bytes in `apron_rgba` were packed from.
+    pub(crate) apron_rgba_gen: u64,
+    #[cfg(wgpu_arm)]
+    pub(crate) apron_tex: Option<crate::device_layer::LayerTexture>,
+    #[cfg(wgpu_arm)]
+    pub(crate) apron_tex_bytes: Vec<u8>,
+    // The ARMED arm's twin (fresh-on-change like `MetalTrayCard`: an un-waited
+    // Submit B may still be copying from the old texture).
+    #[cfg(target_os = "macos")]
+    pub(crate) metal_apron_tex: Option<crate::metal::resources::SealedTexture>,
+    #[cfg(target_os = "macos")]
+    pub(crate) metal_apron_bytes: Vec<u8>,
     // SDR-bloom PRESENT compositing target. The GPU comet bloom is a soft additive
     // HALO; compositing it into `offscreen` would force every scissored aurora tick
     // to REBUILD the whole halo band (the halo re-adds over any Load-preserved row),
@@ -4177,7 +4330,8 @@ pub struct WindowGpu {
     pub(crate) present_offscreen: Option<PresentOffscreen>,
     // The region of `offscreen` that has CHANGED since `present_offscreen` was
     // last synced to it, as `Some([x0, y0, x1, y1])` (half-open), or `None` for
-    // "unknown / everything". Lets `compose_present_offscreen` copy a RECT instead
+    // "unknown / everything". Lets the compose (`compose_present_offscreen` on
+    // wgpu, `metal_encode_submit_b`'s Submit B on the armed arm) copy a RECT instead
     // of the whole frame: at 3024x1964x4B the unconditional full copy was ~23 MB
     // read + ~23 MB write on every glow frame — i.e. on every keystroke echo while
     // the comet is alive — to refresh, typically, one dirty text row.
@@ -4187,7 +4341,8 @@ pub struct WindowGpu {
     // to `None`. Only `encode_frame` narrows it, and only to the exact scissor rect
     // it clipped its own draws to — so a writer that forgot to invalidate would
     // have to be a new one, and a full repaint (scissor `None`) already widens to
-    // the whole frame. See `note_offscreen_written` / `compose_present_offscreen`.
+    // the whole frame. See `note_offscreen_written` / `present_copy_rect` and the
+    // two composes that reset it.
     pub(crate) offscreen_dirty_since_sync: Option<[u32; 4]>,
     // The region of `present_offscreen` the LAST sync's effects (comet halo,
     // heat shimmer) wrote — i.e. where it diverges from `offscreen` and must be
@@ -4227,6 +4382,21 @@ pub struct WindowGpu {
     // the offscreen's dims, recreated on resize.
     #[cfg(target_os = "macos")]
     pub(crate) metal_present_off: Option<crate::metal::resources::SealedTexture>,
+    // TEST PROBE — the compose rect the last `metal_encode_submit_b` copied into
+    // `metal_present_off` (`None` when that Submit B ran no compose: the
+    // effect-free present blits the offscreen directly). Lets a test pin that an
+    // armed present-copy frame copies the STALE RECT, never the whole frame.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) metal_last_compose_rect: Option<[u32; 4]>,
+    // The last ARMED Submit B that composed `metal_present_off`, held until it
+    // resolves. WHY: Submit B is NOT waited, and the compose bookkeeping records
+    // the copy as synced when the ENCODE succeeds — a command buffer that then
+    // ends `Retryable` (loss.rs: no latch, no window reset) leaves the copy
+    // UNWRITTEN where the trackers say it is clean. The full copy used to
+    // self-heal that next frame; the tracked rect does not, so a non-Completed
+    // resolution degrades both trackers to "everything".
+    #[cfg(target_os = "macos")]
+    pub(crate) metal_present_off_pending: Option<crate::metal::encoder::CbProbe>,
     // The ARMED arm's resident band-shift scratch (the `shift_scratch` twin):
     // the Submit B sub-row translate and the E7 whole-row rescue both stage
     // through it. Reused at the offscreen's dims, recreated on resize. It used
@@ -5070,6 +5240,13 @@ pub struct GpuRenderer {
     // frame that degraded mid-tail. The readback/effect steps fork on it.
     #[cfg(target_os = "macos")]
     last_frame_arm_metal: bool,
+    // THE E7 RESCUE'S DEFERRED BAND SHIFT (armed arm): `shift_offscreen_rows`
+    // plans the whole-row move here instead of submitting it, and the armed
+    // tail of the very next `encode_frame` records it into Submit A AHEAD of
+    // the scissored pass. Set and taken within ONE `encode_present_frame`, so
+    // a plan can never outlive the present that made it.
+    #[cfg(target_os = "macos")]
+    metal_pending_band_shift: Option<BandShift>,
     // W6 flip-drill — the INJECTED-LOSS lever: `ATERM_METAL_INJECT_LOSS=<n>`
     // (parsed once at construct; meaningful only with the arm selected).
     // After the n-th SUCCESSFUL armed present, the exact classification a
@@ -7144,6 +7321,8 @@ impl GpuRenderer {
             metal_arm: None,
             #[cfg(target_os = "macos")]
             last_frame_arm_metal: false,
+            #[cfg(target_os = "macos")]
+            metal_pending_band_shift: None,
             // The drill lever rides the armed selection (unconditional on
             // macOS post-flip); non-mac builds never parse the variable.
             #[cfg(target_os = "macos")]
@@ -7916,6 +8095,33 @@ impl GpuRenderer {
         self.scroll_rescues
     }
 
+    /// TEST/DIAGNOSTIC: how many UNPIPELINED parks the armed encode path has
+    /// booked (`MetalArmLive::encode_inline_waits`) — a `waitUntilCompleted`
+    /// on a command buffer the same present committed. A rescued scroll
+    /// present books NONE (its band copies ride Submit A); the in-place
+    /// effect buffers and the capture oracle's translate still book one each.
+    #[doc(hidden)]
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub fn metal_encode_inline_waits(&self) -> u64 {
+        self.metal_arm
+            .as_ref()
+            .map_or(0, |c| c.live_ref().encode_inline_waits.get())
+    }
+
+    /// TEST/DIAGNOSTIC: how many E7 band shifts were recorded INTO an armed
+    /// Submit A (`MetalArmLive::encode_band_shifts`) — the positive half of
+    /// the rescue's no-wait contract: equal to the rescues an armed scroll
+    /// sweep took, or the copies went somewhere else.
+    #[doc(hidden)]
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    pub fn metal_encode_band_shifts(&self) -> u64 {
+        self.metal_arm
+            .as_ref()
+            .map_or(0, |c| c.live_ref().encode_band_shifts.get())
+    }
+
     /// TEST/DIAGNOSTIC: number of `present_input` frames that did a FULL repaint
     /// (Clear + all rows) — the first frame, a geometry/scrollback/selection
     /// change, a double-HEIGHT row, etc. (the conservative always-correct path).
@@ -8040,6 +8246,14 @@ impl GpuRenderer {
     #[must_use]
     pub fn chrome_bleed(&self) -> Option<aterm_render::ChromeBleed> {
         self.cpu.chrome_bleed()
+    }
+
+    /// The chrome rows' frame extent the inner CPU renderer answers
+    /// ([`aterm_render::Renderer::chrome_extent_px`]) — what `encode_frame`
+    /// stamps on a window for its present's blit to continue.
+    #[must_use]
+    pub fn chrome_extent_px(&self, frame_h: usize) -> usize {
+        self.cpu.chrome_extent_px(frame_h)
     }
 
     /// Padded pixel size of a `rows`×`cols` grid (`cols·cell_w + 2·pad`, etc.) —
@@ -9520,8 +9734,34 @@ impl GpuRenderer {
         // invalidates the scissored present sequence's prior-frame tracking: a
         // subsequent `present_input` must NOT diff against a frame it never drew.
         // Per-window: reset THIS window's prior-frame validity.
-        win.present_prev = None;
-        let (w, h) = self.encode_frame(win, input, &RepaintScope::Full);
+        // A SNAPSHOT IS FINAL (2026-09-22) — the CPU twin's rule
+        // (`aterm_render::Renderer::render_input`), kept on the atlas path: a
+        // glyph whose face is still parsing resolves (through the inner CPU
+        // renderer this backend plans with) to a PROVISIONAL `.notdef` for "a
+        // later frame" to repaint, and a snapshot has none. Encode, settle the
+        // parses the encode started, and encode again while the ROUTING EPOCH
+        // moved across the pass — the epoch, not a receiver still held: a
+        // parse that lands mid-encode is consumed by a later cell's probe
+        // (every probe polls), leaves nothing to settle, and still leaves the
+        // cells planned before it provisional (`⚠` on row 0 of
+        // `snapshot_is_final`, the symbol chain landing between the rows). A
+        // frame that started none pays nothing. The provisional key was never
+        // memoized, so the next encode re-resolves those cells and the atlas
+        // fills their real keys. Bounded as the CPU twin is
+        // (`SNAPSHOT_SETTLE_PASSES`).
+        let mut dims;
+        let mut pass = 1;
+        loop {
+            let epoch = self.cpu.font_epoch();
+            win.present_prev = None;
+            dims = self.encode_frame(win, input, &RepaintScope::Full);
+            let _ = self.cpu.settle_in_flight_fallback_parses();
+            if self.cpu.font_epoch() == epoch || pass == Renderer::SNAPSHOT_SETTLE_PASSES {
+                break;
+            }
+            pass += 1;
+        }
+        let (w, h) = dims;
         // GPU comet BLOOM: the additive halo is no longer composited inside
         // `encode_frame` (that would force every scissored present to rebuild the
         // whole halo band). Composite it into the offscreen HERE — before the tray /
@@ -9972,7 +10212,7 @@ impl GpuRenderer {
                 None
             }
         };
-        if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
+        if live.wait_inline(&cb.commit()) != crate::metal::loss::CbOutcome::Completed {
             return Err("in-place bloom command buffer did not complete".to_owned());
         }
         note_offscreen_written(win, halo, (fw, fh));
@@ -10081,7 +10321,7 @@ impl GpuRenderer {
             pass.set_fragment_buffer(&ub, binds.fragment_buffers[0] as usize);
             pass.draw_fullscreen_triangle()?;
         }
-        if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
+        if live.wait_inline(&cb.commit()) != crate::metal::loss::CbOutcome::Completed {
             return Err("in-place shimmer command buffer did not complete".to_owned());
         }
         note_offscreen_written(
@@ -10163,19 +10403,12 @@ impl GpuRenderer {
             pass.set_fragment_sampler(&linear, binds.fragment_samplers[0] as usize);
             pass.draw_strip_quad()?;
         }
-        if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
+        if live.wait_inline(&cb.commit()) != crate::metal::loss::CbOutcome::Completed {
             return Err("tray bake command buffer did not complete".to_owned());
         }
         Ok(())
     }
 
-    /// W6a — the armed arm of the M1b band shift: the SAME pure
-    /// [`band_shift_ops`] plan, staged through a scratch texture with the W1
-    /// copy verbs (whose Metal arm REFUSES the overlapping self-copy the
-    /// scratch exists to avoid), submitted and waited on the arm's session.
-    /// A failure takes one named note and leaves the band unshifted (the
-    /// frame is then the untranslated armed frame — visible, not corrupt).
-    #[cfg(target_os = "macos")]
     /// The ARMED arm's resident band-shift scratch at `(w, h)` — minted on the
     /// first shift at these dims, reused after. Returns an OWNED handle (same
     /// loss domain), so the caller keeps borrowing `win` freely.
@@ -10208,6 +10441,44 @@ impl GpuRenderer {
             .clone_handle())
     }
 
+    /// The ARMED arm's band-shift PLAN: the SAME pure [`band_shift_ops`] over
+    /// the metal offscreen's band, with the resident scratch ensured at the
+    /// offscreen's dims. `None` is the literal no-op (`band_shift_ops`' own
+    /// `None`), a missing offscreen, or a scratch mint failure (one named
+    /// note). Shared by the two armed shifters below so they cannot drift on
+    /// the arithmetic.
+    #[cfg(target_os = "macos")]
+    fn metal_band_shift_plan(
+        &mut self,
+        win: &mut WindowGpu,
+        y0: usize,
+        y1: usize,
+        delta: i64,
+    ) -> Option<BandShift> {
+        let shift = band_shift_ops(y0, y1, delta)?;
+        let (w, h) = win.metal_offscreen.as_ref().map(|o| (o.w, o.h))?;
+        // The resident scratch (was a per-call full-frame mint).
+        if let Err(e) = self.metal_ensure_shift_scratch(win, w, h) {
+            metal_arm_note(&format!(
+                "armed scroll shift: no scratch ({e}); band unshifted"
+            ));
+            return None;
+        }
+        Some(shift)
+    }
+
+    /// W6a — the ORACLE arm of the M1b band shift (`render_input_target`'s
+    /// post-encode translate, via `shift_offscreen_band`): the plan above,
+    /// staged through the scratch with the W1 copy verbs on a command buffer
+    /// of its own, submitted and WAITED — an inline park, booked on
+    /// `encode_inline_waits`. The capture path reads the offscreen back right
+    /// after, so this wait is the price of a synchronous readback, not of a
+    /// present. THE PRESENT PATH'S E7 RESCUE DOES NOT COME HERE: it defers
+    /// the same plan into Submit A (`shift_offscreen_rows`), because this
+    /// shape — a separate submit parked to terminal on the UI thread — ran
+    /// once per row crossed while scrolling. A failure takes one named note
+    /// and leaves the band unshifted (the untranslated oracle frame).
+    #[cfg(target_os = "macos")]
     fn metal_shift_offscreen_band_px(
         &mut self,
         win: &mut WindowGpu,
@@ -10215,26 +10486,26 @@ impl GpuRenderer {
         y1: usize,
         delta: i64,
     ) {
-        use crate::device_layer::{FrameCopyTexture, FrameEncoder, SubmittedFrame};
-        let Some(shift) = band_shift_ops(y0, y1, delta) else {
+        use crate::device_layer::{FrameEncoder, SubmittedFrame};
+        let Some(shift) = self.metal_band_shift_plan(win, y0, y1, delta) else {
             return;
         };
-        let Some((w, h)) = win.metal_offscreen.as_ref().map(|o| (o.w, o.h)) else {
+        let Some(scratch) = win.metal_shift_scratch.as_ref().map(|t| t.clone_handle()) else {
             return;
         };
-        // The resident scratch (was a per-call full-frame mint).
-        let scratch = match self.metal_ensure_shift_scratch(win, w, h) {
-            Ok(s) => s,
-            Err(e) => {
-                metal_arm_note(&format!(
-                    "armed scroll shift: no scratch ({e}); band unshifted"
-                ));
-                return;
-            }
-        };
+        // This MUTATES the offscreen outside any encode scissor, so the resident
+        // present copy can no longer be trusted anywhere: force a full re-copy on
+        // the next Submit B compose — the `shift_offscreen_band_px` twin's stamp,
+        // which this arm lacked (harmless while Submit B copied the whole frame
+        // unconditionally; stale rows on glass now that it copies the tracked
+        // rect). Recorded up front, so a failed staging still costs only a copy.
+        if let Some(dims) = win.metal_offscreen.as_ref().map(|o| (o.w, o.h)) {
+            note_offscreen_written(win, None, dims);
+        }
         let Some(off) = win.metal_offscreen.as_ref() else {
             return;
         };
+        let w = off.w;
         let Some(cell) = self.metal_arm.as_mut() else {
             return;
         };
@@ -10242,25 +10513,10 @@ impl GpuRenderer {
         let _pool = crate::metal::ffi::AutoreleasePool::new();
         let staged = (|| -> Result<(), String> {
             let mut enc = FrameEncoder::metal(&live.session)?;
-            enc.copy_texture_rect(
-                FrameCopyTexture::Metal(&off.tex),
-                (0, shift.src_y),
-                FrameCopyTexture::Metal(&scratch),
-                (0, 0),
-                w,
-                shift.moved,
-            )?;
-            enc.copy_texture_rect(
-                FrameCopyTexture::Metal(&scratch),
-                (0, 0),
-                FrameCopyTexture::Metal(&off.tex),
-                (0, shift.dst_y),
-                w,
-                shift.moved,
-            )?;
+            record_band_shift(&mut enc, &off.tex, &scratch, shift, w)?;
             match enc.submit() {
                 SubmittedFrame::Metal(sub) => {
-                    let outcome = sub.wait_outcome();
+                    let outcome = live.wait_inline(&sub);
                     if outcome != crate::metal::loss::CbOutcome::Completed {
                         return Err(format!("scroll-shift command buffer ended {outcome:?}"));
                     }
@@ -10944,8 +11200,8 @@ impl GpuRenderer {
             TEXTURE_USAGE_SHADER_READ,
         };
         use crate::metal::present::{
-            BandShiftPass, BloomPasses, CrownPass, PostPass, PresentSequence, ShimmerPass,
-            TrayPass, encode_present_sequence,
+            ApronStripPass, BandShiftPass, BloomPasses, CrownPass, PostPass, PresentSequence,
+            ShimmerPass, TrayPass, encode_present_sequence,
         };
 
         // ---- Phase A: derivations off `self`/`win` (no arm borrow) -------
@@ -10995,6 +11251,7 @@ impl GpuRenderer {
         };
         // The blit uniform — the production formula, spelling for spelling.
         let mut want = present_blit_uniform(invert, overlay, source_crop, fw, fh, dw, dh, live_bg);
+        want.chrome_y1 = win.chrome_y1 as f32;
         want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
         want.hdr = if plan.blit_linear_encode { 1.0 } else { 0.0 };
         want.sdr_white_scale = if plan.blit_linear_encode {
@@ -11024,21 +11281,44 @@ impl GpuRenderer {
         // dirty-row diff keeps its untranslated base through a whole glide
         // (the CPU `render_input_cached` → `present_view` precedent). SIGNED:
         // positive shifts the band up (glide), negative down (overscroll).
-        let band_shift = {
-            let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
-                self.cpu.grid_top(),
-                cell_h,
-                input.grid_top_row,
-                input.grid_bot_row,
-                fh as usize,
-            );
-            band_shift_ops(y0, y1, i64::from(input.scroll_frac_px))
-        };
+        let (band_y0, band_y1) = aterm_render::scroll_translate::grid_band_px(
+            self.cpu.grid_top(),
+            cell_h,
+            input.grid_top_row,
+            input.grid_bot_row,
+            fh as usize,
+        );
+        let band_shift = band_shift_ops(band_y0, band_y1, i64::from(input.scroll_frac_px));
+        // The band of the COPY the shift diverges from the offscreen — the
+        // `shift_present_copy_band` footprint, spelled the same (the whole band,
+        // not just the moved rows: the exposed strip keeps the copy's own pixels).
+        let band_fx: Option<[u32; 4]> = band_shift.map(|_| [0, band_y0 as u32, fw, band_y1 as u32]);
+        // The card's EXACT footprint over the copy, clamped to it — the
+        // `draw_tray_over_present_copy` spelling — resolved here because the
+        // pass build below consumes `tray`.
+        let tray_fx: Option<[u32; 4]> = tray.as_ref().map(|t| {
+            [
+                t.dx.min(fw),
+                t.dy.min(fh),
+                t.dx.saturating_add(t.pw).min(fw),
+                t.dy.saturating_add(t.ph).min(fh),
+            ]
+        });
         // The staged move's scratch, resident per window (an owned handle so
         // the arm borrow below is undisturbed). Ensured HERE, before Phase B
         // takes the arm.
         let shift_scratch = match band_shift {
             Some(_) => Some(self.metal_ensure_shift_scratch(win, fw, fh)?),
+            None => None,
+        };
+        // The incoming-row apron over the strip that shift exposes: the CPU
+        // raster + pack (`apron_strip_plan`) and the resident texture, ensured
+        // HERE, before Phase B takes the arm (an owned handle, like the scratch).
+        let apron_strip = match band_shift {
+            Some(_) => match self.apron_strip_plan(win, input, fh as usize) {
+                Some(strip) => Some((strip, self.metal_ensure_apron_tex(win, strip)?)),
+                None => None,
+            },
             None => None,
         };
 
@@ -11094,6 +11374,13 @@ impl GpuRenderer {
         let live = cell.live_mut();
         let usage = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
         if needs_off {
+            // A FRESH texture holds undefined texels, so the incremental compose
+            // below has nothing valid to build on: force this sync to be the
+            // full-frame copy (`ensure_present_offscreen`'s sibling reset —
+            // without it the first effect frame, and the first after every
+            // resize, would leak uninitialized tiles onto the glass).
+            win.offscreen_dirty_since_sync = None;
+            win.present_offscreen_fx = None;
             win.metal_present_off =
                 Some(
                     live.mint
@@ -11323,12 +11610,43 @@ impl GpuRenderer {
                 || band_shift.is_some(),
             "the present-copy gate and the passes that write it must agree"
         );
+        // The compose copy, narrowed to the STALE union — the wgpu
+        // `compose_present_offscreen` discipline through the one shared helper:
+        // the rows the scissored armed encode / in-place effects / E7 rescue
+        // wrote on the offscreen since the last sync, plus what the last Submit
+        // B's halo, haze, band shift and card wrote over the copy. Both trackers
+        // are `None` for the first sync into a fresh copy (the mint above), so
+        // that one — and only that one — is the full frame.
+        // Resolve the previous compose's fate BEFORE trusting the trackers.
+        // Still unfinished ⇒ keep it (queue order runs it before this one; it
+        // is re-polled next frame); Completed ⇒ forget it; anything else ⇒ the
+        // copy is unknown everywhere (see `metal_present_off_pending`).
+        if let Some(probe) = win.metal_present_off_pending.as_ref() {
+            match probe.try_terminal() {
+                None => {}
+                Some(crate::metal::loss::CbOutcome::Completed) => {
+                    win.metal_present_off_pending = None;
+                }
+                Some(_) => {
+                    win.metal_present_off_pending = None;
+                    win.offscreen_dirty_since_sync = None;
+                    win.present_offscreen_fx = None;
+                }
+            }
+        }
+        let copy_rect = present_copy_rect(
+            win.offscreen_dirty_since_sync,
+            win.present_offscreen_fx,
+            (fw, fh),
+        );
+        #[cfg(test)]
+        {
+            win.metal_last_compose_rect = use_present_off.then_some(copy_rect);
+        }
         let seq = PresentSequence {
             offscreen: &off_tex,
             present_off: present_off.as_ref(),
-            // Full-frame compose this wave (the armed present is always a
-            // full repaint, so the dirty-rect narrowing has no baseline).
-            copy_rect: [0, 0, fw, fh],
+            copy_rect,
             bloom: bloom_parts.as_ref().map(
                 |(
                     half,
@@ -11385,6 +11703,11 @@ impl GpuRenderer {
             band_shift: band_shift
                 .zip(shift_scratch.as_ref())
                 .map(|(shift, scratch)| BandShiftPass { shift, scratch }),
+            apron: apron_strip.as_ref().map(|(strip, tex)| ApronStripPass {
+                tex,
+                dst_y: strip.dst_y as usize,
+                rows: strip.rows as usize,
+            }),
             tray: tray_parts.as_ref().map(|(tu, pso, binds)| TrayPass {
                 pso,
                 card_tex: win
@@ -11440,6 +11763,29 @@ impl GpuRenderer {
         };
         let mut cb = live.session.begin()?;
         encode_present_sequence(&mut cb, target, (dw, dh), &seq)?;
+        // BOOKKEEPING, deliberately AFTER the encode (an early `?` above must
+        // leave the trackers conservative): the copy now matches the offscreen
+        // everywhere except the union of what this sequence wrote over it — the
+        // bloom composite's scissor (`None` = an unscissored composite = the
+        // whole frame, and `union_rect_opt`'s `None` is absorbing), the
+        // shimmer's refract region, the band and the card — so the next compose
+        // copies back exactly that plus whatever the offscreen changes meanwhile.
+        // An effect-free present (`use_present_off == false`) never touched the
+        // copy: its trackers keep accumulating, exactly as on the wgpu arm.
+        if use_present_off {
+            let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
+            if let Some((.., sc)) = bloom_parts.as_ref() {
+                fx = union_rect_opt(fx, *sc, (fw, fh));
+            }
+            if let Some((.., region)) = shimmer_parts.as_ref() {
+                fx = union_rect_opt(fx, Some(*region), (fw, fh));
+            }
+            for footprint in [band_fx, tray_fx].into_iter().flatten() {
+                fx = union_rect_opt(fx, Some(footprint), (fw, fh));
+            }
+            win.offscreen_dirty_since_sync = Some([0, 0, 0, 0]);
+            win.present_offscreen_fx = fx;
+        }
         // W6b — THE PRODUCTION TAP RING'S METAL ARMS (a W6a deferral,
         // closed): append the destination copies to the SAME command buffer
         // before commit — the wgpu `present_to_view` tail's ordering — then
@@ -11477,6 +11823,9 @@ impl GpuRenderer {
             }
         }
         let submitted = cb.commit();
+        if use_present_off {
+            win.metal_present_off_pending = Some(crate::metal::encoder::CbProbe::of(&submitted));
+        }
         if let Some(tap) = win.video.as_mut() {
             tap.metal_note_submitted(crate::metal::encoder::CbProbe::of(&submitted));
         }
@@ -11506,9 +11855,28 @@ impl GpuRenderer {
         (dw, dh): (u32, u32),
         translucent: bool,
     ) -> Result<Vec<u8>, String> {
+        self.metal_present_bytes_with_scope_for_test(win, input, (dw, dh), translucent, true)
+    }
+
+    /// [`Self::metal_present_bytes_for_test`] with the repaint scope as an
+    /// axis: `full_repaint == false` KEEPS `present_prev`, so the armed encode
+    /// takes the same scissored dirty-row path the on-glass present takes
+    /// between two frames of a glide — the only way a test can drive Submit
+    /// B's compose against a resident, partially-stale present copy.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_present_bytes_with_scope_for_test(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        (dw, dh): (u32, u32),
+        translucent: bool,
+        full_repaint: bool,
+    ) -> Result<Vec<u8>, String> {
         use crate::metal::ffi as mtl;
         let _pool = mtl::AutoreleasePool::new();
-        win.present_prev = None;
+        if full_repaint {
+            win.present_prev = None;
+        }
         let (fw, fh) = self.encode_present_frame(win, input);
         if !self.last_frame_arm_metal {
             return Err("the armed encode degraded to wgpu".to_owned());
@@ -11698,6 +12066,9 @@ impl GpuRenderer {
                 h as usize,
             );
             self.metal_shift_offscreen_band_px(win, y0, y1, frac);
+            // The incoming row over the strip the shift exposed — the CPU
+            // `paint_incoming_strip` order, on the armed offscreen.
+            self.apron_into_offscreen_metal(win, input);
         }
         #[cfg(wgpu_arm)]
         {
@@ -11715,6 +12086,9 @@ impl GpuRenderer {
                 h as usize,
             );
             self.shift_offscreen_band_px(win, y0, y1, frac);
+            // The incoming row over the strip the shift exposed — the CPU
+            // `paint_incoming_strip` order, on the offscreen the readback reads.
+            self.apron_into_offscreen_wgpu(win, input);
         }
     }
 
@@ -11743,7 +12117,24 @@ impl GpuRenderer {
             let grid_top = self.cpu.grid_top();
             let y0 = grid_top.min(h);
             let y1 = grid_top.saturating_add(rows.saturating_mul(cell_h)).min(h);
-            self.metal_shift_offscreen_band_px(win, y0, y1, i64::from(delta_rows) * cell_h as i64);
+            // THE RESCUE RIDES SUBMIT A. The plan is DEFERRED onto the
+            // renderer and recorded by the armed encode tail ahead of its
+            // scissored pass (`encode_frame`, step 6) — not a submit of its
+            // own waited here, which was an unbounded `waitUntilCompleted`
+            // the UI thread paid once per row crossed while scrolling.
+            self.metal_pending_band_shift =
+                self.metal_band_shift_plan(win, y0, y1, i64::from(delta_rows) * cell_h as i64);
+            // The plan will MUTATE the offscreen outside any encode scissor (in
+            // Submit A, ahead of the scissored pass), so the resident present
+            // copy can no longer be trusted anywhere: stamp the tracker to
+            // "everything" HERE, where the plan is made — the wgpu twin's
+            // `shift_offscreen_band_px` stamp, mirrored. `None` is absorbing, so
+            // the encode's own scissor union cannot narrow it back this frame.
+            if self.metal_pending_band_shift.is_some()
+                && let Some(dims) = win.metal_offscreen.as_ref().map(|o| (o.w, o.h))
+            {
+                note_offscreen_written(win, None, dims);
+            }
         }
         #[cfg(wgpu_arm)]
         {
@@ -13571,6 +13962,8 @@ impl GpuRenderer {
             dest.h,
             live_bg,
         );
+        // The chrome rows this window's offscreen holds (stamped at encode).
+        want.chrome_y1 = win.chrome_y1 as f32;
         // Downlevel (sRGB-typed offscreen): the blit samples a view that auto-decodes to
         // linear, so it must re-encode to sRGB for the non-sRGB swapchain.
         want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
@@ -13889,6 +14282,13 @@ impl GpuRenderer {
                 None,
             ));
         }
+        // The incoming-row apron for this frame (CPU raster + resident texture),
+        // ensured HERE — all `&mut win` work before the borrows below. `None` on
+        // a bounce, at the live bottom, or on a frame with no strip to fill.
+        let apron = self.apron_strip_plan(win, input, h as usize);
+        if let Some(strip) = apron {
+            self.ensure_apron_texture(win, strip);
+        }
         // The band of the copy diverges from the offscreen from here on.
         win.present_offscreen_fx = union_rect_opt(
             win.present_offscreen_fx,
@@ -13914,8 +14314,285 @@ impl GpuRenderer {
         //    overlap UB).
         enc.copy_texture_to_texture(rect(&po.tex, shift.src_y), rect(scratch, 0), extent);
         // 2. Lay them back shifted; the exposed strip keeps the copy's own
-        //    pixels — the documented-deferred placeholder, byte for byte.
+        //    pixels — the placeholder the down-bounce keeps, and the up-glide's
+        //    strip until step 3 lays the incoming row over it.
         enc.copy_texture_to_texture(rect(scratch, 0), rect(&po.tex, shift.dst_y), extent);
+        // 3. THE INCOMING ROW over the exposed strip: the CPU raster's top
+        //    `frac` rows, copied from the resident apron texture — AFTER the
+        //    shift, INSIDE the band, the same bytes the CPU `paint_incoming_strip`
+        //    lays (byte parity by construction).
+        if let Some(strip) = apron
+            && let Some(ap) = win.apron_tex.as_ref()
+        {
+            enc.copy_texture_to_texture(
+                rect(ap.wgpu(), 0),
+                rect(&po.tex, strip.dst_y),
+                wgpu::Extent3d {
+                    width: strip.w.min(w),
+                    height: strip.rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    /// M1b INCOMING-ROW APRON — the ONE plan both arms run: WHETHER this frame
+    /// owes the strip (the CPU's own `incoming_row_applies` + `incoming_strip`,
+    /// so the backends cannot disagree about its existence), then the CPU face
+    /// rasters the row into `win.apron_scratch` and this packs it into
+    /// `win.apron_rgba` — the offscreen's RGBA8 byte order with the top byte
+    /// `255 - transmittance`, the EXACT inverse of `frame_from_padded_rgba`, so
+    /// a readback of the strip is the CPU strip byte for byte. `h` is the target
+    /// (offscreen / present copy) height the band is clamped to.
+    ///
+    /// Cost: one row raster + one `w × cell_h × 4` pack per sub-row frame that
+    /// owes a strip; the upload behind it is skipped while the bytes are
+    /// unchanged (a glide inside one row re-presents the same apron).
+    fn apron_strip_plan(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        h: usize,
+    ) -> Option<ApronStrip> {
+        if !aterm_render::scroll_translate::incoming_row_applies(input) {
+            return None;
+        }
+        let cell_h = self.cell_size().1;
+        let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
+            self.cpu.grid_top(),
+            cell_h,
+            input.grid_top_row,
+            input.grid_bot_row,
+            h,
+        );
+        let (dst_y, rows) = aterm_render::scroll_translate::incoming_strip(
+            y0,
+            y1,
+            i64::from(input.scroll_frac_px),
+        )?;
+        if !self.cpu.rasterize_apron_row(input, &mut win.apron_scratch) {
+            return None;
+        }
+        let (w, band_rows) = (win.apron_scratch.width(), win.apron_scratch.rows());
+        if w == 0 || band_rows == 0 {
+            return None;
+        }
+        let rows = rows.min(band_rows);
+        // The pack (w × cell_h × 4 bytes, ~400 KB at 3024 px) runs only when the
+        // raster actually changed: the scratch keys its raster on its inputs, so
+        // a glide inside one engine row rasters nothing and packs nothing — the
+        // strip then costs the copy alone on ~119 of 120 trackpad frames.
+        let raster_gen = win.apron_scratch.generation();
+        if win.apron_rgba_gen != raster_gen || win.apron_rgba.len() != w * band_rows * 4 {
+            win.apron_rgba.clear();
+            win.apron_rgba.reserve(w * band_rows * 4);
+            for p in win.apron_scratch.band() {
+                win.apron_rgba.extend_from_slice(&[
+                    (p >> 16) as u8,
+                    (p >> 8) as u8,
+                    *p as u8,
+                    255 - (p >> 24) as u8,
+                ]);
+            }
+            win.apron_rgba_gen = raster_gen;
+        }
+        Some(ApronStrip {
+            dst_y: dst_y as u32,
+            rows: rows as u32,
+            w: w as u32,
+            cell_h: band_rows as u32,
+        })
+    }
+
+    /// Ensure `win.apron_tex` is a `w × cell_h` copy-source texture in the
+    /// offscreen's format holding exactly `win.apron_rgba` — resident reuse at
+    /// the same dims, recreate on a change, upload ONLY when the bytes differ
+    /// from the mirror (`ensure_tray_overlay`'s skip, spelling for spelling).
+    #[cfg(wgpu_arm)]
+    fn ensure_apron_texture(&mut self, win: &mut WindowGpu, strip: ApronStrip) {
+        let (w, h) = (strip.w, strip.cell_h);
+        let resident = win
+            .apron_tex
+            .as_ref()
+            .is_some_and(|t| t.width() == w && t.height() == h);
+        if !resident {
+            let format = crate::device_layer::TexelFormat::from_wgpu(self.ctx.offscreen_format())
+                .expect("the offscreen format is inside the map's closed set of six");
+            win.apron_tex = Some(self.ctx.device_layer().create_texture_2d(
+                "aterm-gpu m1b apron row",
+                format,
+                w,
+                h,
+                crate::device_layer::TexUsage {
+                    sampled: false,
+                    render: false,
+                    copy_src: true,
+                    copy_dst: true,
+                },
+                None,
+            ));
+            // Empty ⇒ can never equal a real raster ⇒ the fresh texture
+            // (undefined contents) is always uploaded into below.
+            win.apron_tex_bytes.clear();
+        }
+        if win.apron_tex_bytes.as_slice() == win.apron_rgba.as_slice() {
+            return;
+        }
+        let tex = win.apron_tex.as_ref().expect("ensured above");
+        self.ctx
+            .device_layer()
+            .upload_texture_full(tex, &win.apron_rgba, w * 4, w, h);
+        win.apron_tex_bytes.clear();
+        win.apron_tex_bytes.extend_from_slice(&win.apron_rgba);
+    }
+
+    /// THE ORACLE'S apron (the wgpu readback arm, after `shift_offscreen_band_px`
+    /// has translated the offscreen in place): copy the incoming row's top
+    /// `frac` rows onto the exposed strip of the offscreen itself, so the
+    /// readback and the on-glass present show the same strip. A separate
+    /// encoder + submit, like the tray bake; the shift already invalidated the
+    /// present copy for this frame.
+    #[cfg(wgpu_arm)]
+    fn apron_into_offscreen_wgpu(&mut self, win: &mut WindowGpu, input: &RenderInput) {
+        let Some(h) = win.offscreen.as_ref().map(|o| o.h as usize) else {
+            return;
+        };
+        let Some(strip) = self.apron_strip_plan(win, input, h) else {
+            return;
+        };
+        self.ensure_apron_texture(win, strip);
+        let (Some(off), Some(ap)) = (win.offscreen.as_ref(), win.apron_tex.as_ref()) else {
+            return;
+        };
+        fn at(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            }
+        }
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aterm-gpu m1b apron strip"),
+            });
+        enc.copy_texture_to_texture(
+            at(ap.wgpu(), 0),
+            at(&off.tex, strip.dst_y),
+            wgpu::Extent3d {
+                width: strip.w.min(off.w),
+                height: strip.rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.ctx.queue.submit([enc.finish()]);
+    }
+
+    /// The ARMED arm's resident apron texture holding exactly `win.apron_rgba`
+    /// at `strip`'s dims — reused while dims AND bytes match, REPLACED WHOLE on
+    /// any change (`MetalTrayCard`'s fresh-on-change: an un-waited Submit B may
+    /// still be copying from the old one). Returns an OWNED handle (same loss
+    /// domain) so the caller keeps borrowing `win` freely.
+    #[cfg(target_os = "macos")]
+    fn metal_ensure_apron_tex(
+        &mut self,
+        win: &mut WindowGpu,
+        strip: ApronStrip,
+    ) -> Result<crate::metal::resources::SealedTexture, String> {
+        let (w, h) = (strip.w as usize, strip.cell_h as usize);
+        let unchanged = win
+            .metal_apron_tex
+            .as_ref()
+            .is_some_and(|t| (t.width(), t.height()) == (w, h))
+            && win.metal_apron_bytes.as_slice() == win.apron_rgba.as_slice();
+        if !unchanged {
+            let _pool = crate::metal::ffi::AutoreleasePool::new();
+            let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
+            let live = cell.live_mut();
+            let tex = live
+                .mint
+                .texture_2d(crate::metal::ffi::PixelFormat::Rgba8Unorm, w, h, 0)
+                .map_err(|e| format!("apron row mint: {e}"))?;
+            // SAFETY: fresh managed texture of exactly `w` x `h`; the packed
+            // apron is `w*h*4` RGBA bytes at the tight stride (`apron_strip_plan`).
+            unsafe {
+                tex.upload(
+                    crate::metal::ffi::MtlRegion::full_2d(w, h),
+                    &win.apron_rgba,
+                    w * 4,
+                );
+            }
+            win.metal_apron_tex = Some(tex);
+            win.metal_apron_bytes.clear();
+            win.metal_apron_bytes.extend_from_slice(&win.apron_rgba);
+        }
+        Ok(win
+            .metal_apron_tex
+            .as_ref()
+            .expect("ensured above")
+            .clone_handle())
+    }
+
+    /// THE ORACLE'S apron on the ARMED arm (after `metal_shift_offscreen_band_px`):
+    /// the `apron_into_offscreen_wgpu` twin — one routed copy through the W1
+    /// verb, submitted and waited on the arm's session. A failure takes one
+    /// named note and leaves the strip as the placeholder (visible, not
+    /// corrupt), the `metal_shift_offscreen_band_px` stance.
+    #[cfg(target_os = "macos")]
+    fn apron_into_offscreen_metal(&mut self, win: &mut WindowGpu, input: &RenderInput) {
+        use crate::device_layer::{FrameCopyTexture, FrameEncoder, SubmittedFrame};
+        let Some(h) = win.metal_offscreen.as_ref().map(|o| o.h as usize) else {
+            return;
+        };
+        let Some(strip) = self.apron_strip_plan(win, input, h) else {
+            return;
+        };
+        let tex = match self.metal_ensure_apron_tex(win, strip) {
+            Ok(t) => t,
+            Err(e) => {
+                metal_arm_note(&format!(
+                    "armed apron strip: no texture ({e}); strip left as placeholder"
+                ));
+                return;
+            }
+        };
+        let Some(off) = win.metal_offscreen.as_ref() else {
+            return;
+        };
+        let Some(cell) = self.metal_arm.as_mut() else {
+            return;
+        };
+        let live = cell.live_mut();
+        let _pool = crate::metal::ffi::AutoreleasePool::new();
+        let copied = (|| -> Result<(), String> {
+            let mut enc = FrameEncoder::metal(&live.session)?;
+            enc.copy_texture_rect(
+                FrameCopyTexture::Metal(&tex),
+                (0, 0),
+                FrameCopyTexture::Metal(&off.tex),
+                (0, strip.dst_y),
+                strip.w.min(off.w),
+                strip.rows,
+            )?;
+            match enc.submit() {
+                SubmittedFrame::Metal(sub) => {
+                    let outcome = sub.wait_outcome();
+                    if outcome != crate::metal::loss::CbOutcome::Completed {
+                        return Err(format!("apron strip command buffer ended {outcome:?}"));
+                    }
+                    Ok(())
+                }
+                #[cfg(wgpu_arm)]
+                SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
+            }
+        })();
+        if let Err(e) = copied {
+            metal_arm_note(&format!(
+                "armed apron strip failed ({e}); strip left as placeholder"
+            ));
+        }
     }
 
     /// HEADLESS PRESENT-REAL: present `input` into this window's persistent
@@ -14524,7 +15201,9 @@ impl GpuRenderer {
         // is already correct everywhere it does not paint. It MUST precede
         // `encode_frame` — the encode's `LoadOp::Load` reads exactly these texels —
         // and it is the only offscreen writer here, so `present_prev` still describes
-        // the offscreen's contents once the encode has run.
+        // the offscreen's contents once the encode has run. (On the armed Metal arm
+        // "precede" is ENCODE order: the move is recorded into Submit A ahead of the
+        // pass, never a submit of its own — see `shift_offscreen_rows`.)
         if let Some(delta) = scroll_delta {
             self.scroll_rescues += 1;
             self.shift_offscreen_rows(win, delta, input.rows);
@@ -14978,7 +15657,7 @@ impl GpuRenderer {
         // sync's halo/haze wrote over the copy (dropping that term would leave the
         // previous frame's halo baked into the copy — a smeared comet trail on
         // glass). `None` on either side means "unknown" and forces the full copy.
-        let stale = union_rect_opt(
+        let copy_rect = present_copy_rect(
             win.offscreen_dirty_since_sync,
             win.present_offscreen_fx,
             (w, h),
@@ -14991,7 +15670,6 @@ impl GpuRenderer {
         // The clean base+aurora → present_offscreen (byte-exact same-format copy;
         // a sub-rect copy of the same format is byte-exact over its extent, and
         // every texel outside it already holds the identical clean pixel).
-        let copy_rect = stale.unwrap_or([0, 0, w, h]);
         if copy_rect[2] > copy_rect[0] && copy_rect[3] > copy_rect[1] {
             enc.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -15959,6 +16637,7 @@ impl GpuRenderer {
         // shared buffer and keep its memo coherent for the next present.
         let mut want =
             present_blit_uniform(invert, overlay, source_crop, fw, fh, w, h, self.theme.bg);
+        want.chrome_y1 = win.chrome_y1 as f32;
         if let Some(band_a) = fx.translucent {
             want = want.with_translucency(band_a);
             if fx.premult {
@@ -17876,6 +18555,13 @@ impl GpuRenderer {
         input: &RenderInput,
         scope: &RepaintScope,
     ) -> (u32, u32) {
+        // The E7 rescue's DEFERRED band shift, taken UNCONDITIONALLY so a plan
+        // can never outlive the present that made it: the armed tail records
+        // it into Submit A; any other tail drops it — a degrade re-encodes
+        // FULL (`encode_present_frame`'s coherence rule) and the wgpu oracle
+        // never sets one.
+        #[cfg(target_os = "macos")]
+        let pending_band_shift = self.metal_pending_band_shift.take();
         // Bound the shared shaping/glyph caches on the GPU path too. Glyph planning
         // below (row_glyph_plan / resolve_cell_key / glyph_image) inserts into the
         // inner CPU `Renderer`'s caches, but the GPU backend never routes through
@@ -17916,6 +18602,10 @@ impl GpuRenderer {
         let fb_h = (rows * ch + 2 * pad + head) as u32;
         let w = self.clamp_fb_dim(fb_w);
         let h = self.clamp_fb_dim(fb_h);
+        // The chrome rows this offscreen will hold, for the present's blit
+        // (`WindowGpu::chrome_y1`): stamped with the pixels, so a later present of
+        // this retained offscreen continues exactly the chrome it contains.
+        win.chrome_y1 = u32::try_from(self.cpu.chrome_extent_px(h as usize)).unwrap_or(h);
         // BOUND THE PER-FRAME INSTANCE STREAMS to the clamped framebuffer. The encode
         // loops below iterate the FULL `input.rows × input.cols`; a cell whose pixel
         // ORIGIN lies outside the clamped framebuffer emits no visible pixels (it is
@@ -18726,21 +19416,26 @@ impl GpuRenderer {
                 // (the CPU twin stays opaque: softbuffer has no alpha channel to
                 // present, so mirroring the byte there would be a lie). The SEAM
                 // hairline below stays opaque — it is ink, not surface.
-                let color = {
-                    let mut c = rgb4_u32(bleed.color);
+                let tone = |rgb: u32| {
+                    let mut c = rgb4_u32(rgb);
                     if backdrop_margins_on {
                         c[3] = margin_bg[3];
                     }
                     c
                 };
+                let color = tone(bleed.color);
+                // A metered band row continues its own edge cells into the
+                // gutters (`ChromeBleed::row_edges`) — the same lookup the CPU
+                // twin makes.
+                let (left_tone, right_tone) = bleed.gutter_tones(r);
                 let right = sat_pos_u16((w as usize).saturating_sub(pad));
                 bg_inst.push(BgInstance {
                     rect: [0, y0u, sat_pos_u16(pad), ch as u16],
-                    color,
+                    color: tone(left_tone),
                 });
                 bg_inst.push(BgInstance {
                     rect: [right, y0u, sat_pos_u16(pad), ch as u16],
-                    color,
+                    color: tone(right_tone),
                 });
                 if r == 0 && grid_top > 0 {
                     bg_inst.push(BgInstance {
@@ -20908,6 +21603,41 @@ impl GpuRenderer {
                         "encoder refused",
                         crate::device_layer::FrameEncoder::metal(&live.session)
                     );
+                    // THE E7 BAND COPIES RIDE SUBMIT A. Recorded on blit
+                    // encoders AHEAD of the scissored pass in THIS command
+                    // buffer, so the pass's `LoadOp::Load` reads the
+                    // translated band. THE ORDERING INVARIANT that keeps the
+                    // rescue sound without a wait: (1) encoders in one
+                    // command buffer execute in encode order, and the
+                    // offscreen and scratch are hazard-tracked textures;
+                    // (2) the offscreen's last writer — the previous frame's
+                    // Submit A — precedes on the session's ONE queue, whose
+                    // command buffers execute in commit order; (3) the
+                    // scratch's only readers and writers are command buffers
+                    // on that queue — this Submit A, and Submit B's sub-row
+                    // `BandShiftPass` — so its reuse is serialized by (2) too.
+                    // The old shape — a separate submit parked to terminal on
+                    // the UI thread — bought none of this; it paid an
+                    // unbounded `waitUntilCompleted` once per row crossed
+                    // while scrolling. A failure degrades the frame by name;
+                    // the copies are never half-applied (an uncommitted
+                    // buffer runs nothing), and the fall-through re-encodes
+                    // FULL under the Dirty scope.
+                    if let Some(shift) = pending_band_shift {
+                        let scratch = armed_try!(
+                            "band shift lacks its resident scratch",
+                            win.metal_shift_scratch
+                                .as_ref()
+                                .filter(|t| (t.width(), t.height()) == (w as usize, h as usize))
+                                .ok_or_else(|| format!("no {w}x{h} scratch resident"))
+                        );
+                        armed_try!(
+                            "band shift copies refused",
+                            record_band_shift(&mut enc, &rig.offscreen, scratch, shift, w)
+                        );
+                        live.encode_band_shifts
+                            .set(live.encode_band_shifts.get().saturating_add(1));
+                    }
                     let res = FrameRes::Metal(&rig);
                     let passes = armed_try!(
                         "frame-plan walk failed",
@@ -20953,12 +21683,17 @@ impl GpuRenderer {
 
         // THE FLIP's wgpu-free build has no tail to degrade to: the fall-
         // through is a LOST FRAME, already named on stderr, with the loss
-        // latch carrying anything terminal. `last_frame_arm_metal` stays
-        // false, so every caller refuses or blanks instead of reading a
-        // frame nothing drew — and the frontend's device-loss poll owns the
+        // latch carrying anything terminal. `last_frame_arm_metal` is RESET
+        // here (the wgpu tail resets it at its own entry; this build has no
+        // tail), so every caller refuses or blanks instead of reading a
+        // frame nothing drew, `encode_present_frame`'s coherence rule
+        // re-encodes a Dirty scope FULL, and the stamp it writes
+        // (`present_prev.on_metal`) cannot claim an offscreen this frame
+        // never reached — and the frontend's device-loss poll owns the
         // downgrade to the CPU present floor.
         #[cfg(not(wgpu_arm))]
         {
+            self.last_frame_arm_metal = false;
             (w, h)
         }
         #[cfg(wgpu_arm)]
@@ -21799,6 +22534,11 @@ impl GpuRenderer {
             "a recorded LOAD plan reads the prior frame's texels — the caller \
              must seed the Metal offscreen with the pre-encode offscreen bytes"
         );
+        // The incoming-row apron's twin is PLANNED here — the CPU raster + the
+        // RGBA pack into a throwaway window's scratch — so the copy after the
+        // scroll twin below borrows nothing of `self`; see that block.
+        let mut apron_win = WindowGpu::default();
+        let apron_plan = self.apron_strip_plan(&mut apron_win, input, h as usize);
 
         // --- the Metal arm's resolution set, minted on ONE loss domain -----
         let latch = Arc::new(LossLatch::new());
@@ -22085,6 +22825,54 @@ impl GpuRenderer {
                         let outcome = submitted.wait_outcome();
                         if outcome != CbOutcome::Completed {
                             return Err(format!("the Metal scroll twin failed: {outcome:?}"));
+                        }
+                    }
+                    #[cfg(wgpu_arm)]
+                    SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
+                }
+            }
+        }
+        // --- the incoming-row apron's Metal twin (after the scroll twin) ----
+        // The wgpu arm's oracle lays the CPU-rastered incoming row over the
+        // strip its shift exposed (`apron_into_offscreen_wgpu`); the replay must
+        // lay the same bytes or the differential diverges on every glide fixture
+        // whose input carries an apron (`apron_plan`, resolved up top).
+        {
+            if let Some(strip) = apron_plan {
+                let tex = handle.create_texture_2d(
+                    "aterm-gpu m1b apron row",
+                    TexelFormat::Rgba8Unorm,
+                    strip.w,
+                    strip.cell_h,
+                    TexUsage {
+                        sampled: false,
+                        render: false,
+                        copy_src: true,
+                        copy_dst: true,
+                    },
+                    None,
+                );
+                handle.upload_texture_full(
+                    &tex,
+                    &apron_win.apron_rgba,
+                    strip.w * 4,
+                    strip.w,
+                    strip.cell_h,
+                );
+                let mut enc = FrameEncoder::metal(&session)?;
+                enc.copy_texture_rect(
+                    FrameCopyTexture::Metal(tex.metal()),
+                    (0, 0),
+                    FrameCopyTexture::Metal(&rig.offscreen),
+                    (0, strip.dst_y),
+                    strip.w.min(w),
+                    strip.rows,
+                )?;
+                match enc.submit() {
+                    SubmittedFrame::Metal(submitted) => {
+                        let outcome = submitted.wait_outcome();
+                        if outcome != CbOutcome::Completed {
+                            return Err(format!("the Metal apron twin failed: {outcome:?}"));
                         }
                     }
                     #[cfg(wgpu_arm)]
@@ -22490,6 +23278,9 @@ impl GpuRenderer {
             input.default_bg
         };
         let mut want = present_blit_uniform(false, None, source_crop, fw, fh, dw, dh, live_bg);
+        // The production present reads the extent its window stamped at encode;
+        // the replay has no window, so it asks the inner renderer that encoded.
+        want.chrome_y1 = self.cpu.chrome_extent_px(fh as usize) as f32;
         want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
         let bu = mint.buffer(std::mem::size_of::<BlitUniform>())?;
         // SAFETY: Pod into an exactly-sized fresh shared buffer.
@@ -22506,6 +23297,7 @@ impl GpuRenderer {
             present_off: use_present_off.then_some(&present_off),
             copy_rect: [0, 0, fw, fh],
             band_shift: None,
+            apron: None,
             bloom: bloom_parts.as_ref().map(
                 |(half, extract_pso, cell, extract_binds, stream, count, pso, ubuf, binds, sc)| {
                     BloomPasses {
@@ -24350,6 +25142,31 @@ mod tests {
         assert_eq!(
             super::union_rect_opt(Some([1, 2, 3, 4]), Some([10, 0, 200, 80]), dims),
             Some([1, 0, 100, 50])
+        );
+    }
+
+    /// The compose rect both arms copy: `None` on either tracker is the whole
+    /// frame, two empty trackers copy nothing, and otherwise it is the union —
+    /// the wgpu spelling, now the Metal arm's too.
+    #[test]
+    fn present_copy_rect_is_the_stale_union_or_the_frame() {
+        let dims = (100, 80);
+        assert_eq!(super::present_copy_rect(None, None, dims), [0, 0, 100, 80]);
+        assert_eq!(
+            super::present_copy_rect(Some([0, 0, 0, 0]), None, dims),
+            [0, 0, 100, 80]
+        );
+        assert_eq!(
+            super::present_copy_rect(None, Some([1, 2, 3, 4]), dims),
+            [0, 0, 100, 80]
+        );
+        assert_eq!(
+            super::present_copy_rect(Some([0, 0, 0, 0]), Some([0, 0, 0, 0]), dims),
+            [0, 0, 0, 0]
+        );
+        assert_eq!(
+            super::present_copy_rect(Some([0, 40, 100, 60]), Some([0, 20, 100, 70]), dims),
+            [0, 20, 100, 70]
         );
     }
 
@@ -26602,6 +27419,136 @@ ab\r\n",
         assert_ne!(
             glided, flat,
             "a frac 3 present must move terminal pixels on glass"
+        );
+    }
+
+    /// THE ARMED COMPOSE COPIES THE STALE RECT, NOT THE FRAME — and stays
+    /// byte-exact. A scissored armed present-copy frame (one dirty row inside
+    /// the grid band, plus a sub-row band shift) must compose exactly the rows
+    /// that can differ between the resident copy and the clean offscreen: the
+    /// band the previous shift wrote over the copy, which already contains the
+    /// dirty row. The glass must then equal a full-copy oracle byte for byte,
+    /// and the E7 whole-row rescue (an offscreen writer outside any scissor)
+    /// must degrade the tracker to "everything".
+    ///
+    /// Against today's code `metal_encode_submit_b` composes `[0, 0, fw, fh]`
+    /// on every present-copy frame, so the stale-rect assertion FAILS there;
+    /// the last assertion fails there too, because the armed E7 shift never
+    /// stamped the tracker (its wgpu twin does).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn armed_present_composes_the_stale_rect_and_matches_a_full_copy() {
+        if crate::metal::ffi::Device::preferred().is_none() {
+            crate::stderr_line!("SKIP: no Metal device");
+            return;
+        }
+        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
+                return;
+            }
+        };
+        gpu.arm_metal_for_test();
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
+        // The chrome partition of the glide: rows [1, 5) are the band, row 0 and
+        // the last row are pinned chrome — so the band is smaller than the frame.
+        let glide_input = |term: &mut Terminal| {
+            let mut input = term.cell_frame(rows, cols);
+            input.grid_top_row = 1;
+            input.grid_bot_row = rows - 1;
+            input.scroll_frac_px = 3;
+            input
+        };
+        let mut input = glide_input(&mut term);
+        let mut win = WindowGpu::new();
+        input.scroll_frac_px = 0;
+        let first = gpu.render_input(&mut win, &input, None);
+        assert!(
+            gpu.metal_render_armed(),
+            "the first frame must mint the arm"
+        );
+        let (fw, fh) = (first.width as u32, first.height as u32);
+        let dest = (fw + 9, fh + 7);
+        input.scroll_frac_px = 3;
+
+        // Prime: the first glide present mints the copy, so its compose is the
+        // full frame by construction (a fresh texture has no valid baseline).
+        let primed = gpu
+            .metal_present_bytes_with_scope_for_test(&mut win, &input, dest, false, true)
+            .expect("armed present");
+        assert_eq!(
+            win.metal_last_compose_rect,
+            Some([0, 0, fw, fh]),
+            "the first sync into a fresh copy is the full frame"
+        );
+
+        // One cell changes INSIDE the band (row 2), same frac: a scissored armed
+        // encode (one dirty row) plus the band shift over the resident copy.
+        term.process(b"\x1b[3;1HX");
+        let changed = glide_input(&mut term);
+        let scissors_before = gpu.scissor_taken();
+        let incremental = gpu
+            .metal_present_bytes_with_scope_for_test(&mut win, &changed, dest, false, false)
+            .expect("armed present");
+        assert!(
+            gpu.scissor_taken() > scissors_before,
+            "non-vacuity: the second armed encode must take the scissor path"
+        );
+        let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
+            gpu.cpu.grid_top(),
+            gpu.cell_size().1,
+            1,
+            rows - 1,
+            fh as usize,
+        );
+        let band = [0, y0 as u32, fw, y1 as u32];
+        assert!(
+            band[3] - band[1] < fh,
+            "fixture: the band {band:?} must be smaller than the {fw}x{fh} frame"
+        );
+        assert_eq!(
+            win.metal_last_compose_rect,
+            Some(band),
+            "the compose must re-copy the stale union (the previous shift's band, \
+             which contains the dirty row), never the whole {fw}x{fh} frame"
+        );
+        assert_ne!(
+            incremental, primed,
+            "negative control: the changed cell must reach the glass"
+        );
+
+        // Byte-exact: the narrowed compose presents what a full-copy present of
+        // the same input does (a fresh window ⇒ Full encode ⇒ fresh copy ⇒ the
+        // full-frame compose).
+        let mut fresh = WindowGpu::new();
+        let oracle = gpu
+            .metal_present_bytes_with_scope_for_test(&mut fresh, &changed, dest, false, true)
+            .expect("armed present");
+        assert_eq!(
+            fresh.metal_last_compose_rect,
+            Some([0, 0, fw, fh]),
+            "fixture: the oracle is a full-frame compose"
+        );
+        assert_eq!(
+            incremental, oracle,
+            "the stale-rect compose must present the full-copy bytes"
+        );
+
+        // The E7 whole-row rescue mutates the offscreen outside any scissor:
+        // the tracker must degrade to "everything" so the next compose is a
+        // full copy (the `shift_offscreen_band_px` twin's stamp, mirrored).
+        assert_eq!(
+            win.offscreen_dirty_since_sync,
+            Some([0, 0, 0, 0]),
+            "fixture: the compose just synced the copy"
+        );
+        gpu.shift_offscreen_rows(&mut win, 1, rows);
+        assert_eq!(
+            win.offscreen_dirty_since_sync, None,
+            "the armed E7 shift must invalidate the incremental sync"
         );
     }
 

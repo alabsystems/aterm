@@ -3497,6 +3497,124 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
     );
 }
 
+/// M1b INCOMING-ROW APRON PARITY: on a positive-frac frame from a scrolled-back
+/// terminal, the exposed bottom strip on BOTH backends is the incoming row's
+/// top `frac` px. (1) The GPU strip is BYTE-EXACT with the CPU strip — it IS
+/// the CPU raster, uploaded and copied onto the shifted band, so the tolerance
+/// here is zero, not the glyph-AA 8; (2) each backend's strip matches that
+/// backend's own whole-row oracle at offset `d - 1` (the CPU exactly, the GPU
+/// within the standard tolerance — its landed row is a GPU raster); (3) the
+/// strip differs from the retired placeholder (teeth); (4) the existing chrome
+/// invariance still holds with the strip painted. Against today's code (1)
+/// holds vacuously and (2) FAILS on both backends.
+#[test]
+fn incoming_row_apron_gpu_matches_cpu() {
+    let theme = Theme::default();
+    let (rows, cols) = (8usize, 20usize);
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    let (_cw, ch) = cpu.cell_size();
+    let grid_top = cpu.grid_top();
+    let frac = (ch / 2).max(1) as i32;
+    let n = frac as usize;
+    let partitioned = |t: &mut Terminal, frac: i32| {
+        let mut input = t.cell_frame(rows, cols);
+        input.grid_top_row = 1;
+        input.grid_bot_row = rows;
+        input.scroll_frac_px = frac;
+        input
+    };
+    let mut win = aterm_gpu::WindowGpu::new();
+
+    // The glide frame at the fixture's offset (`scroll_seeded_term` scrolls 5).
+    let mut tg = scroll_seeded_term(rows, cols);
+    let glide_in = partitioned(&mut tg, frac);
+    assert!(
+        glide_in.apron_row.present,
+        "scrolled back: the apron is present"
+    );
+    let cpu_glide = cpu.render_input(&glide_in);
+    let gpu_glide = gpu.render_input(&mut win, &glide_in, None);
+    // The placeholder's source: the same offset, whole-row.
+    let flat_in = partitioned(&mut tg, 0);
+    let cpu_flat = cpu.render_input(&flat_in);
+    let gpu_flat = gpu.render_input(&mut win, &flat_in, None);
+    // The oracle: one offset shallower, whole-row — its bottom grid row IS the apron.
+    let mut to = scroll_seeded_term(rows, cols);
+    to.scroll_display(-1);
+    let oracle_in = partitioned(&mut to, 0);
+    assert_eq!(oracle_in.display_offset + 1, glide_in.display_offset);
+    let cpu_oracle = cpu.render_input(&oracle_in);
+    let gpu_oracle = gpu.render_input(&mut win, &oracle_in, None);
+
+    let w = cpu_glide.width;
+    assert_eq!((gpu_glide.width, gpu_glide.height), (w, cpu_glide.height));
+    let y1 = grid_top + rows * ch; // grid_bot_row == rows
+    let band = |f: &Frame, y0: usize, k: usize| f.pixels[y0 * w..(y0 + k) * w].to_vec();
+    let cpu_strip = band(&cpu_glide, y1 - n, n);
+    let gpu_strip = band(&gpu_glide, y1 - n, n);
+    // (1) Byte-exact across backends: the strip is the CPU's raster on both.
+    assert_eq!(
+        gpu_strip, cpu_strip,
+        "the apron strip is byte-identical CPU==GPU"
+    );
+    // (2) Each backend's strip is its own oracle's bottom-row top `n` px.
+    assert_eq!(
+        cpu_strip,
+        band(&cpu_oracle, y1 - ch, n),
+        "CPU strip == the incoming row's top {n} px"
+    );
+    let gpu_or = band(&gpu_oracle, y1 - ch, n);
+    let delta = gpu_strip
+        .iter()
+        .zip(&gpu_or)
+        .map(|(&a, &b)| {
+            (rr(a) - rr(b))
+                .abs()
+                .max((gg(a) - gg(b)).abs())
+                .max((bb(a) - bb(b)).abs())
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        delta <= 8,
+        "GPU strip vs the GPU's own landed row: max channel delta {delta} > 8"
+    );
+    // (3) Teeth: the strip is NOT the retired placeholder (the band's own bottom px).
+    assert_ne!(
+        cpu_strip,
+        band(&cpu_flat, y1 - n, n),
+        "CPU: placeholder gone"
+    );
+    assert_ne!(
+        gpu_strip,
+        band(&gpu_flat, y1 - n, n),
+        "GPU: placeholder gone"
+    );
+    assert!(
+        cpu_strip.iter().any(|&p| dist(p, BG) > 0),
+        "non-vacuity: the strip carries ink"
+    );
+    // (4) Chrome invariance with the strip painted: rows outside the band equal
+    //     the frac-0 frame on BOTH backends.
+    let y0 = grid_top + ch; // grid_top_row == 1
+    for y in (0..y0).chain(y1..cpu_glide.height) {
+        assert_eq!(
+            &cpu_glide.pixels[y * w..y * w + w],
+            &cpu_flat.pixels[y * w..y * w + w],
+            "CPU chrome row {y} pinned"
+        );
+        assert_eq!(
+            &gpu_glide.pixels[y * w..y * w + w],
+            &gpu_flat.pixels[y * w..y * w + w],
+            "GPU chrome row {y} pinned"
+        );
+    }
+}
+
 /// One cell's TOP pixel row — where `overline_rect` anchors its band.
 fn top_row(f: &Frame, cw: usize, col: usize) -> Vec<u32> {
     let x0 = col * cw;
@@ -3617,4 +3735,86 @@ fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
             "{label}: the channel must not reach any row but the overline's own"
         );
     }
+}
+
+/// THE CHROME BLEED ON BOTH BACKENDS, per-row tones included (the message
+/// band's full-width meter, ruling 55, 2026-09-23 — and the first GPU
+/// coverage the bleed has had at all). Two chrome rows over a padded frame,
+/// the second METERED (`row_edges`: its own fill on the left, its track on
+/// the right), with the seam: every padding pixel — the strip above row 0,
+/// both gutters of both chrome rows, the seam segments, the gutters below —
+/// is EXACTLY equal across the two arms (bg rects, no anti-aliasing), and the
+/// grid stays within the usual glyph tolerance.
+#[test]
+fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
+    let theme = Theme::default();
+    const P: usize = 10;
+    const BAND: u32 = 0x0030_3135;
+    const SEAM: u32 = 0x0060_6164;
+    const FILL: u32 = 0x0050_FA7B;
+    const TRACK: u32 = 0x0044_4750;
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    gpu.set_pad(P);
+    cpu.set_pad(P);
+    let bleed = aterm_render::ChromeBleed {
+        rows: 2,
+        color: BAND,
+        seam: Some(SEAM),
+        top_extends_cells: false,
+        row_edges: [
+            Some(aterm_render::ChromeRowEdges {
+                row: 1,
+                left: FILL,
+                right: TRACK,
+            }),
+            None,
+            None,
+        ],
+    };
+    cpu.set_chrome_bleed(Some(bleed));
+    gpu.set_chrome_bleed(Some(bleed));
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (mut term, rows, cols) = demo_term();
+    let (cw, ch) = cpu.cell_size();
+    let input = term.cell_frame(rows, cols);
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let (w, h) = (cpu_frame.width, cpu_frame.height);
+    assert_eq!((gpu_frame.width, gpu_frame.height), (w, h));
+    let grid =
+        |x: usize, y: usize| (P..P + cols * cw).contains(&x) && (P..P + rows * ch).contains(&y);
+    let (mut padding, mut tones) = (0usize, [false; 4]);
+    for y in 0..h {
+        for x in 0..w {
+            if grid(x, y) {
+                continue;
+            }
+            let (c, g) = (
+                cpu_frame.pixels[y * w + x] & 0x00ff_ffff,
+                gpu_frame.pixels[y * w + x] & 0x00ff_ffff,
+            );
+            assert_eq!(
+                c, g,
+                "padding pixel ({x},{y}) differs: cpu {c:06x} gpu {g:06x}"
+            );
+            for (i, tone) in [BAND, SEAM, FILL, TRACK].into_iter().enumerate() {
+                tones[i] |= c == tone;
+            }
+            padding += 1;
+        }
+    }
+    assert!(padding > 0);
+    assert_eq!(
+        tones, [true; 4],
+        "the band, seam, fill and track all painted"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "grid pixels diverge: max per-channel delta {delta} > 8"
+    );
 }

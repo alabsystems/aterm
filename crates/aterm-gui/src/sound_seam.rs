@@ -25,6 +25,59 @@
 
 use crate::trail_audio::HostState;
 
+/// Tier-1 conformance of the derived `TrailSoundSeam` machine
+/// (`aterm_spec::derive::trail_sound_seam_model`): the real host fold, the
+/// real engine tick, the real key seam and this table, bound to the model.
+#[cfg(test)]
+#[path = "sound_seam_conformance.rs"]
+mod conformance;
+
+/// Whether the person asked for any aurora at all: the RESOLVED brightness
+/// knob (`cursor_trail_intensity`, or a style pack that resolves to zero),
+/// read BEFORE any policy fold. Zero is their explicit off (binding decision
+/// C) — it silences the key seam, and it is what the verb must call
+/// `trail-off` rather than `engine-silent`.
+pub(crate) fn user_lit(resolved: &aterm_effects::cursor_glow::GlowConfig) -> bool {
+    resolved.intensity > 0.0
+}
+
+/// `SeamInputs::trail_on` for a resolved (pre-fold) config: the master knob
+/// and serious mode (`enabled`) AND a nonzero brightness knob.
+///
+/// Before this, the verb read `enabled` alone, so a person who dimmed the
+/// aurora to zero — silent, correctly, by decision C — got
+/// `closed:engine-silent`: the one reason reserved for a gate with NO name,
+/// raised as a false regression alarm. The `TrailSoundSeam` model's
+/// `EngineSilentIsUnreachable` and its conformance are what found it.
+pub(crate) fn trail_on(resolved: &aterm_effects::cursor_glow::GlowConfig) -> bool {
+    resolved.enabled && user_lit(resolved)
+}
+
+/// THE HOST'S SPLIT of one resolved config into its light half and its audio
+/// half, for one window's tick — the ONE place `tick_cursor_fx` decides both.
+///
+/// The light takes both motion policies (the accessibility stage's amplitude
+/// and the load-shed envelope); the key seam takes NEITHER: `audible` is
+/// whose window the key landed in and whether the person asked for any
+/// aurora at all. Before 2026-09-22 a shed frame or a `Reduce Motion`
+/// session zeroed `intensity`, the engine read that as "dark ⇒ silent", and
+/// every keystroke went quiet while `aterm ctl tone` still said `audio=live`.
+///
+/// A function rather than three inline lines so the `TrailSoundSeam`
+/// conformance drives THIS fold instead of a transcription of it.
+pub(crate) fn fold_window_audibility(
+    cfg: &mut aterm_effects::cursor_glow::GlowConfig,
+    motion_amplitude: f32,
+    shed_env: f32,
+    win_focused: bool,
+) {
+    // Read BEFORE the fold below: the one point at which the three meanings
+    // of a zero `intensity` are still separable.
+    let lit = user_lit(cfg);
+    cfg.intensity *= motion_amplitude * shed_env;
+    cfg.audible = win_focused && lit;
+}
+
 /// Everything that decides whether a keypress sounds, gathered once so the
 /// verb and the key path cannot drift.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -33,8 +86,9 @@ pub(crate) struct SeamInputs {
     pub(crate) sounds_on: bool,
     /// `trail_sound_volume`, already clamped to 0..1.
     pub(crate) volume: f32,
-    /// `GlowConfig::enabled` — the master knob AND serious mode AND a style
-    /// that resolves to something, which is the gate the ENGINE reads.
+    /// [`trail_on`] of the resolved config — the master knob AND serious
+    /// mode AND a style that resolves to something (`GlowConfig::enabled`,
+    /// the gate the ENGINE reads) AND a nonzero brightness knob.
     pub(crate) trail_on: bool,
     /// `SeriousEffect::TerminalSound`.
     pub(crate) serious_allows: bool,
@@ -48,6 +102,47 @@ pub(crate) struct SeamInputs {
     /// `CursorGlow::sound_seam_open()` — whether the last tick left the
     /// engine's key seam open.
     pub(crate) engine_sound_live: bool,
+}
+
+/// The host's own sound terms the verb reads beside the aurora config and
+/// the engine: every [`SeamInputs`] term that is neither derived from the
+/// resolved `GlowConfig` nor read off the `CursorGlow`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct HostSoundTerms {
+    pub(crate) sounds_on: bool,
+    pub(crate) volume: f32,
+    pub(crate) serious_allows: bool,
+    pub(crate) focused: bool,
+    pub(crate) resize_quiet: bool,
+    pub(crate) host: HostState,
+}
+
+/// THE VERB'S INPUTS. `App::tone_status` builds its [`SeamInputs`] here and
+/// nowhere else, and so does the `TrailSoundSeam` conformance's verb reader.
+/// A regression in how the verb reads the aurora config or the engine is
+/// therefore a regression the conformance runs.
+///
+/// `resolved` is the RESOLVED config (`App::glow_config`), never the one
+/// `tick_cursor_fx` folds: a dark trail under Reduce Motion or load shed is
+/// still `trail_on`, and only the person's own knobs may say otherwise.
+pub(crate) fn verb_seam_inputs(
+    resolved: &aterm_effects::cursor_glow::GlowConfig,
+    engine: &aterm_effects::cursor_glow::CursorGlow,
+    host: HostSoundTerms,
+) -> SeamInputs {
+    SeamInputs {
+        sounds_on: host.sounds_on,
+        volume: host.volume,
+        // NOT `resolved.enabled` alone: a person who dimmed the aurora to
+        // zero is silent by decision C, and must read `trail-off`, never
+        // `engine-silent` (the `TrailSoundSeam` model found this).
+        trail_on: trail_on(resolved),
+        serious_allows: host.serious_allows,
+        focused: host.focused,
+        resize_quiet: host.resize_quiet,
+        host: host.host,
+        engine_sound_live: engine.sound_seam_open(),
+    }
 }
 
 /// WHY a keypress would make no sound. One variant per gate, so the verb can

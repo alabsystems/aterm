@@ -136,7 +136,8 @@ const GENERIC: (&str, &str) = ("it did not finish applying", "didn\u{2019}t fini
 /// handoff admission rejected before Commit" and friends — fall through to whatever
 /// the fallback does. When that fallback was "show the reason verbatim", the Version
 /// menu read "⬆️ Update to v0.56.0 — tried twice, overlap handoff failed safely: a
-/// handed-off PTY session closed before Commit; retrying on its own".
+/// handed-off PTY session closed before Commit; retrying on its own" (the tail has
+/// since become "will try again").
 ///
 /// So the rows below are keyed on substrings taken from the producers themselves,
 /// each named in the comment above its group, and this module's tests replay every
@@ -423,15 +424,17 @@ impl ApplyTrouble {
         )
     }
 
-    /// The one-line tail for a MENU ROW: a Version-menu item and the palette row that
-    /// mirrors it are single lines with no room for a sentence, and both are also the
-    /// control that retries, so the tail ends on what pressing it does.
+    /// The one-line tail for a MENU ROW ("Install aterm vX — tried twice, didn't
+    /// start; will try again"): a Version-menu item and the palette row that mirrors
+    /// it are single lines with no room for a sentence, and both are also the control
+    /// that retries, so the tail ends on what happens next — in the update row's
+    /// words (2026-09-23), never "apply".
     #[must_use]
     pub(crate) fn row_tail(&self) -> String {
         let (_, short) = clauses(&self.reason);
         let next = match self.retry {
-            ApplyRetry::Scheduled => "retrying on its own",
-            ApplyRetry::ManualOnly => "apply now to retry",
+            ApplyRetry::Scheduled => "will try again",
+            ApplyRetry::ManualOnly => "try again now",
             ApplyRetry::NeedsPerson => "install the signed release",
         };
         format!("tried {}, {short}; {next}", times(self.attempts))
@@ -443,7 +446,7 @@ impl ApplyTrouble {
     pub(crate) fn compact(&self) -> String {
         let (_, short) = clauses(&self.reason);
         let next = match self.retry {
-            ApplyRetry::Scheduled => "retrying",
+            ApplyRetry::Scheduled => "will try again",
             ApplyRetry::ManualOnly => "ask to retry",
             ApplyRetry::NeedsPerson => "install the signed release",
         };
@@ -723,11 +726,11 @@ mod tests {
         );
         assert_eq!(
             trouble.row_tail(),
-            "tried twice, didn\u{2019}t start; retrying on its own"
+            "tried twice, didn\u{2019}t start; will try again"
         );
         assert_eq!(
             trouble.compact(),
-            "Tried twice, didn\u{2019}t start \u{b7} retrying."
+            "Tried twice, didn\u{2019}t start \u{b7} will try again."
         );
         // The count reaches even the tersest rung — it is the fact that separates
         // "waiting for you" from "tried twice and failed".
@@ -772,13 +775,19 @@ mod tests {
             manual.sentence()
         );
         assert!(
-            manual.row_tail().contains("apply now"),
+            manual.row_tail().ends_with("try again now"),
             "the manual-only row must name the action: {}",
             manual.row_tail()
         );
         assert!(
+            !manual.row_tail().contains("apply") && !auto.row_tail().contains("apply"),
+            "the Version menu's words are the update row's (install), never apply: {} / {}",
+            manual.row_tail(),
+            auto.row_tail()
+        );
+        assert!(
             !manual.row_tail().contains("restart") && !auto.row_tail().contains("restart"),
-            "the action is an in-place apply, never a restart: {} / {}",
+            "the action is an in-place install, never a restart: {} / {}",
             manual.row_tail(),
             auto.row_tail()
         );
@@ -934,7 +943,7 @@ mod tests {
                 match retry {
                     ApplyRetry::Scheduled => {
                         assert!(trouble.sentence().ends_with("It will try again by itself."));
-                        assert!(trouble.row_tail().ends_with("retrying on its own"));
+                        assert!(trouble.row_tail().ends_with("will try again"));
                     }
                     ApplyRetry::ManualOnly => assert!(
                         trouble

@@ -35,10 +35,6 @@ aterm-toml = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
-# Tier-1 conformance: the shipping census is driven through
-# `TccIdentityClaimExclusivity` (tests/conformance_claimants.rs). A ty-green
-# model with no such bind proves a property of its own description.
-aterm-spec = { workspace = true }
 aterm-log = { workspace = true }
 aterm-tempfile.workspace = true
 

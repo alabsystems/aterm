@@ -30,8 +30,9 @@
 //!
 //! * **Staging** happens on [`spawn_background_check`]'s thread, which runs its
 //!   FIRST check immediately at launch and then on the `cadence` schedule. So a
-//!   running app stages a new release within ~a minute of publish; an app that is
-//!   started stages within seconds of start.
+//!   running app stages a new release within one check interval of publish — about
+//!   a minute on the token lane, ten on the public channel's web lane; an app that
+//!   is started stages within seconds of start.
 //! * **Applying** happens in-session through the seamless overlap handoff
 //!   (default-on: automatically at the first quiet moment, forced within ~2 min,
 //!   or on one click); the top of the next `main()` is the fallback for a stage no
@@ -133,6 +134,10 @@ mod github;
 mod health;
 #[cfg(target_os = "macos")]
 mod install;
+mod install_posture;
+/// Signed single-executable Linux update transactions and explicit enrollment.
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(target_os = "macos")]
 mod manifest;
 #[cfg(target_os = "macos")]
@@ -140,9 +145,16 @@ mod no_token;
 #[cfg(target_os = "macos")]
 mod paths;
 mod progress;
+
+/// Machine-readable compiled identity; no installation or updater state access.
+pub fn binary_identity_json(
+    identity: &aterm_update_core::linux::BinaryIdentity,
+) -> Result<String, String> {
+    aterm_json::to_string(identity).map_err(|error| error.to_string())
+}
 // Not macOS-only: every platform relaunches aterm (see the module's own doc).
 mod relaunch;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod sig;
 #[cfg(target_os = "macos")]
 mod status;
@@ -200,9 +212,9 @@ fn read_ledger_text(path: &std::path::Path) -> Option<String> {
 /// wrappers: the GUI calls `aterm_update::Source::resolve(cfg_owner, cfg_repo)` and
 /// supplies the resulting `Source` through [`spawn_background_check_with_source`], so the type it
 /// passes must be the very same `aterm_update_core::Source` the inherent `resolve`
-/// (carrying aterm's compiled-in `alabsystems`/`aterm` channel defaults + the
-/// `ATERM_UPDATE_OWNER`/`_REPO`
-/// env keys) is defined on. A newtype here would break that call site.
+/// (carrying aterm's compiled-in `alabsystems`/`aterm` channel defaults, and the
+/// development-only `[update]` repoint) is defined on. A newtype here would break that
+/// call site.
 pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 
 /// Startup channel retained for callers of the legacy configured-source API.
@@ -216,7 +228,7 @@ pub fn set_configured_source(source: Source) {
     let _ = CONFIGURED_SOURCE.set(source);
 }
 
-/// The recorded startup source, or env-plus-default resolution when unset.
+/// The recorded startup source, or the compiled default when unset.
 /// This compatibility API does not query a running GUI's current config.
 #[must_use]
 pub fn configured_source() -> Source {
@@ -231,7 +243,7 @@ mod configured_source_tests {
     use super::{Source, configured_source, set_configured_source};
 
     /// The compatibility startup source remains first-wins: unset, the
-    /// env-plus-default rule; set, the caller's initial source. The GUI's live
+    /// compiled default; set, the caller's initial source. The GUI's live
     /// config provider is independent of this retained API.
     /// (The only test in this binary that touches the process-global.)
     #[test]
@@ -443,29 +455,43 @@ pub enum ApplyOutcome {
     ReExecFailed(String),
 }
 
-/// Whether the updater may run: macOS-only and not opted out via
-/// `ATERM_NO_AUTO_UPDATE`. It no longer requires a pinned anchor — the default Tier
-/// REPO works with none (see the crate-level trust model), so an internal build with no
-/// Apple Developer ID and no signing key still self-updates. Dev-build inertness comes
-/// from [`bundle::resolve`], not from a missing pin, and has two sources there: the
-/// LAYOUT (a `cargo run` / `target/` binary is not an installed `.app`) and the
-/// codesign-sealed [`bundle::DEV_BUILD_KEY`] mark (a local build installed in place,
-/// which layout alone cannot distinguish from a release). On non-macOS targets both
-/// entry points are unconditional no-ops, so this is false.
+/// Whether the updater runs on this platform at all: macOS or Linux. Every lane a PERSON starts
+/// reads this and nothing more — `aterm update check` / Settings ▸ Software Update's
+/// Check for Updates ([`check_now`]), Update Now and `aterm ctl update apply` (the
+/// window's apply lane), and the launch-time swap of a build already staged. It no
+/// longer requires a pinned anchor — the default Tier REPO works with none (see the
+/// crate-level trust model), so an internal build with no Apple Developer ID and no
+/// signing key still self-updates. Dev-build inertness comes from [`bundle::resolve`],
+/// not from a missing pin, and has two sources there: the LAYOUT (a `cargo run` /
+/// `target/` binary is not an installed `.app`) and the codesign-sealed
+/// [`bundle::DEV_BUILD_KEY`] mark (a local build installed in place, which layout alone
+/// cannot distinguish from a release). Linux instead requires explicit enrollment
+/// of its safe executable path and always authenticates signed native artifacts;
+/// merely running a checkout does not enroll it. Other platforms are unsupported.
+///
+/// NOT the setting. "Check for updates automatically" (`[update] enabled`) is
+/// [`automatic`]'s, and it switches off the BACKGROUND CHECKER alone (2026-09-23 review):
+/// the row says "automatically", so turning it off must leave the checks and the apply a
+/// person asks for working — the Sparkle convention every Mac user knows. Until then it
+/// fed this function and refused a typed `aterm update check` and a clicked Update Now
+/// as "disabled on this build", so the only way to get current with the switch off was
+/// to turn it on and relaunch.
 #[must_use]
 pub fn enabled() -> bool {
-    // Value semantics via the shared flag rule (`env_flag_engaged`): unset,
-    // EMPTY and "0" do NOT disable. The old `is_none()` read meant
-    // `ATERM_NO_AUTO_UPDATE=0` — the spelling that says "auto-update ON" under
-    // the documented "=1 disables" contract (README, SECURITY.md,
-    // docs/RELEASING.md) — silently killed the whole updater: no background
-    // checks, no launch-time apply, nothing logged (2026-09-01 audit).
-    cfg!(target_os = "macos")
-        && !aterm_types::control_socket::env_flag_engaged(
-            std::env::var_os("ATERM_NO_AUTO_UPDATE")
-                .map(|v| v.to_string_lossy().into_owned())
-                .as_deref(),
-        )
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
+/// "Check for updates automatically" — `[update] enabled`, Settings ▸ Terminal ▸ Updates,
+/// read once per process by [`aterm_update_core::settings::update_enabled`] — on a
+/// platform the updater runs on ([`enabled`]). It gates the one lane nobody asked for:
+/// the background checker ([`spawn_background_check_with_source`]) in the window and in
+/// every terminal session. It replaces `ATERM_NO_AUTO_UPDATE` (2026-09-23): an
+/// environment variable reached only what one shell launched, never the window a Dock
+/// click starts, and the owner's rule is Settings, not env. Applying a staged build is
+/// `[update] auto_apply`'s question, not this one's.
+#[must_use]
+pub fn automatic() -> bool {
+    enabled() && aterm_update_core::settings::update_enabled()
 }
 
 /// Apply a staged update if one is ready and strictly newer than `current_build`
@@ -816,7 +842,14 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     _handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     _handoff_target_is_this_build: bool,
 ) -> ApplyOutcome {
-    ApplyOutcome::NotApplicable
+    #[cfg(target_os = "linux")]
+    {
+        linux::boot(_current_build, _current_commit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ApplyOutcome::NotApplicable
+    }
 }
 
 /// Confirm the running build reached a healthy checkpoint (window up / first
@@ -832,11 +865,18 @@ pub fn confirm_boot_health_exact(current_build: u64, current_commit: &str) -> bo
     install::confirm_boot_health(current_build, Some(current_commit))
 }
 
-/// Non-macOS no-op: there is no self-swap to confirm.
+/// Linux confirms its exact inode trial; other platforms have nothing to confirm.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn confirm_boot_health_exact(_current_build: u64, _current_commit: &str) -> bool {
-    true
+    #[cfg(target_os = "linux")]
+    {
+        linux::confirm(_current_build, _current_commit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 /// Sealed installed-bundle identity plus the durable exact-artifact receipt written
@@ -972,30 +1012,6 @@ pub fn forgive_trial_launch(target_build: u64) {
 static UNCOMMITTED_CANDIDATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// A toolchain install is extracting FROM THIS BUNDLE'S sealed payload right now.
-///
-/// The batteries-included seal lives inside the app bundle, and `atpkg seed` reads
-/// it lazily by PATH over minutes and gigabytes. An automatic apply in that window
-/// `RENAME_SWAP`s the bundle out from under it — and the replacement came from the
-/// lean updater zip, which has the seal stripped. The installer's next read resolves
-/// into a bundle whose payload does not exist, mid-transaction, on exactly the
-/// machines the offline seal exists for (2026-08-20 round-8 audit).
-///
-/// An apply deferred here is not an apply lost: the lane retries on its own cadence,
-/// and the install it is waiting for is minutes, not hours.
-///
-/// The marker is written by the READER — atpkg claims it with its own pid at the
-/// seal-fetcher choke point (`aterm_update_core::seal_guard`), so every spawn lane
-/// (the GUI loop, the Settings worker, a user-run CLI) is guarded by construction.
-/// Five rounds of GUI-side choreography (8–12, each patching a race the split
-/// ownership created) were deleted with that move; this probe is the surviving
-/// half, and it self-heals a marker whose pid is gone rather than blocking
-/// updates forever.
-#[must_use]
-pub fn is_toolchain_install_active() -> bool {
-    aterm_update_core::seal_guard::seal_read_active()
-}
-
 /// Mark this process an uncommitted handoff candidate (`true` at boot when the
 /// launch carries a handoff; `false` once it is committed).
 pub fn set_uncommitted_handoff_candidate(uncommitted: bool) {
@@ -1111,9 +1127,9 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
 ///
 /// The hook also carries the RECOVERY: once this process has reported a persistent
 /// failure and a later check finds the ledger healed, it is called once more with
-/// [`HEALTH_RECOVERED_TITLE`] and an empty body, so a surface that STANDS while the
-/// failure stands (the pull-down's health row) knows when to leave. No notification
-/// is owed for it — the row leaving is the whole message.
+/// [`HEALTH_RECOVERED_TITLE`] and an empty body, so a surface still showing the
+/// failure (the update row, Settings' headline) knows to clear it. No notification
+/// is owed for it — the warning leaving is the whole message.
 pub type HealthNotify = Box<dyn Fn(String, String) + Send>;
 
 /// The `title` [`HealthNotify`] is called with when a persistent failure this
@@ -1166,14 +1182,43 @@ fn persistent_notice_is_owed(announced: Option<&str>, class: Option<&str>) -> bo
     class.is_some_and(|class| persistent_notice_is_new(announced, class))
 }
 
-/// The `title` [`HealthNotify`] is called with when a persistent failure is first
-/// announced: the loud one, owed an OS notification and a standing row.
-pub const HEALTH_FAILING_TITLE: &str = "aterm auto-update is failing";
+/// The `title` [`HealthNotify`] is called with when a persistent failure of
+/// `class` is first announced — the half of updating that is broken, in the
+/// words a person reads on the update row (2026-09-23: one "aterm auto-update is
+/// failing" for every class sent the reader after the wrong half). `apply`: a
+/// verified build will not start; `pipeline` / `stage`: downloads fail or will
+/// not verify; `manifest` (and any future class): the newest release cannot be
+/// read or trusted.
+#[must_use]
+pub fn health_failing_title(class: &str) -> &'static str {
+    match class {
+        "apply" => "aterm can't install updates",
+        "pipeline" | "stage" => "aterm can't download updates",
+        _ => "aterm can't check for updates",
+    }
+}
+
+/// The instant a persistent-failure notice's body dates its streak from — the
+/// RFC 3339 stamp after "since " that `persistent_failure_notice` writes — or
+/// `None` for a body that carries none. The reader of the writer below, beside
+/// it, so the row's "since <date>" can never drift from the sentence it is cut
+/// from.
+#[must_use]
+pub fn health_notice_since(body: &str) -> Option<&str> {
+    let (_, rest) = body.split_once(" since ")?;
+    let stamp = rest.split_whitespace().next()?.trim_end_matches(':');
+    let date = stamp.get(..10)?;
+    let well_formed = date.char_indices().all(|(i, c)| match i {
+        4 | 7 => c == '-',
+        _ => c.is_ascii_digit(),
+    });
+    well_formed.then_some(stamp)
+}
 
 /// The `title` [`HealthNotify`] is called with when the class this process ALREADY
-/// announced is still failing and its count has moved (2026-09-14): the standing row
-/// restates its number and no notification is owed — the person was told. The body
-/// is the same sentence the announcement carried, with the new count.
+/// announced is still failing and its count has moved (2026-09-14): the log and
+/// Settings restate its number and no notification or row is owed — the person was
+/// told. The body is the same sentence the announcement carried, with the new count.
 ///
 /// Before this the count a person read was frozen at the announcement for the life
 /// of the process: the bar said "3 consecutive checks since …" all day while
@@ -1265,8 +1310,10 @@ impl HealthAnnouncer {
     }
 }
 
-/// The loud notice for the class that escalated, as `(title, body)` — the words the
-/// pull-down row, the OS notification and the app log all carry.
+/// The loud notice for the class that escalated, as `(title, body)`: the title says
+/// which half of updating is broken ([`health_failing_title`]), the body the count,
+/// the date ([`health_notice_since`] reads it back), the cause and where the rest
+/// is — the log line and Settings carry it whole; the update row keeps the date.
 ///
 /// The COUNT and the sentence both come from the class that escalated. A single
 /// hardcoded pipeline story told an apply-stranded machine "0 consecutive checks …
@@ -1306,17 +1353,17 @@ fn persistent_failure_notice(
             .to_string(),
     };
     // The noun names the lane the count came from (2026-09-14): an apply streak
-    // is failed APPLIES of a build every check fetched fine — "3 consecutive
-    // checks" sent the owner after a download fault that did not exist.
+    // is failed attempts to install a build every check fetched fine — "3
+    // consecutive checks" sent the owner after a download fault that did not exist.
     let counted = if class == "apply" {
-        "failed applies"
+        "failed attempts to install"
     } else {
-        "checks"
+        "failed checks"
     };
     (
-        HEALTH_FAILING_TITLE.to_string(),
+        health_failing_title(class).to_string(),
         format!(
-            "{count} consecutive {counted} since {}: {cause}. Run `aterm-ctl update status` \
+            "{count} {counted} in a row since {}: {cause}. Run `aterm ctl update status` \
              for details.",
             h.class_since(class)
         ),
@@ -1348,15 +1395,15 @@ mod persistent_notice_tests {
             ..super::health::Health::default()
         };
         let (title, body) = super::persistent_failure_notice("apply", 3, &ledger, 1789276245);
-        assert_eq!(title, "aterm auto-update is failing");
+        assert_eq!(title, "aterm can't install updates");
         assert!(
-            !body.contains("consecutive checks"),
+            !body.contains("checks"),
             "an apply streak is not a run of failed checks — every check that day \
              succeeded: {body}"
         );
         assert!(
-            body.contains("3 consecutive") && body.contains("appl"),
-            "the count must name the lane it counts (applies/attempts to apply): {body}"
+            body.starts_with("3 failed attempts to install in a row"),
+            "the count must name the lane it counts: {body}"
         );
         assert!(
             body.contains("2026-09-14T05:42:50Z"),
@@ -1368,10 +1415,54 @@ mod persistent_notice_tests {
             pipeline_since: "2026-08-27T22:04:36Z".to_string(),
             ..super::health::Health::default()
         };
-        let (_, body) = super::persistent_failure_notice("pipeline", 20, &pipeline, 1);
+        let (title, body) = super::persistent_failure_notice("pipeline", 20, &pipeline, 1);
+        assert_eq!(title, "aterm can't download updates");
         assert!(
-            body.starts_with("20 consecutive checks since 2026-08-27T22:04:36Z"),
+            body.starts_with("20 failed checks in a row since 2026-08-27T22:04:36Z"),
             "{body}"
+        );
+        assert!(
+            body.contains("`aterm ctl update status`") && !body.contains("aterm-ctl"),
+            "the command is spelled the way the one binary takes it: {body}"
+        );
+    }
+
+    /// THE ROW'S DATE IS READ FROM THE SENTENCE IT IS CUT FROM (2026-09-23): the
+    /// update row says "since Sep 14", and the reader beside the writer finds the
+    /// stamp every class's body carries — and nothing in a body without one.
+    #[test]
+    fn the_notice_body_hands_back_the_date_it_was_written_with() {
+        for (class, count) in [
+            ("apply", 3),
+            ("pipeline", 20),
+            ("stage", 4),
+            ("manifest", 5),
+        ] {
+            let ledger = super::health::Health {
+                apply_since: "2026-09-14T05:42:50Z".to_string(),
+                pipeline_since: "2026-09-14T05:42:50Z".to_string(),
+                stage_since: "2026-09-14T05:42:50Z".to_string(),
+                manifest_since: "2026-09-14T05:42:50Z".to_string(),
+                last_error: "signature did not verify".to_string(),
+                last_apply_error: "the successor died".to_string(),
+                ..super::health::Health::default()
+            };
+            let (title, body) = super::persistent_failure_notice(class, count, &ledger, 7);
+            assert_eq!(title, super::health_failing_title(class));
+            assert_eq!(
+                super::health_notice_since(&body),
+                Some("2026-09-14T05:42:50Z"),
+                "{class}: {body}"
+            );
+        }
+        assert_eq!(super::health_notice_since("no date here"), None);
+        assert_eq!(
+            super::health_notice_since("broken since yesterday: it failed"),
+            None
+        );
+        assert_eq!(
+            super::health_failing_title("manifest"),
+            "aterm can't check for updates"
         );
     }
 
@@ -1437,8 +1528,11 @@ mod persistent_notice_tests {
                 7,
             )
             .expect("the first escalation is announced");
-        assert_eq!(title, super::HEALTH_FAILING_TITLE);
-        assert!(body.starts_with("3 consecutive failed applies"), "{body}");
+        assert_eq!(title, super::health_failing_title("apply"));
+        assert!(
+            body.starts_with("3 failed attempts to install in a row"),
+            "{body}"
+        );
         // Same class, same count: silence.
         assert!(
             announcer
@@ -1458,7 +1552,10 @@ mod persistent_notice_tests {
             )
             .expect("a moved count is restated");
         assert_eq!(title, super::HEALTH_RESTATED_TITLE);
-        assert!(body.starts_with("6 consecutive failed applies"), "{body}");
+        assert!(
+            body.starts_with("6 failed attempts to install in a row"),
+            "{body}"
+        );
         // A failure that predates this process is history: no restate for it.
         let mut fresh = super::HealthAnnouncer::new("2026-09-14T01:00:00Z".to_string());
         assert!(
@@ -1486,7 +1583,7 @@ mod persistent_notice_tests {
                 7,
             )
             .expect("a new episode is news");
-        assert_eq!(title, super::HEALTH_FAILING_TITLE);
+        assert_eq!(title, super::health_failing_title("apply"));
     }
 }
 
@@ -1520,6 +1617,71 @@ pub fn spawn_background_check(
 /// mode stops); a running check retains its source snapshot.
 pub type SourceProvider = std::sync::Arc<dyn Fn() -> Option<Source> + Send + Sync>;
 
+/// One request-local configuration observation. The provider is sampled again
+/// before Linux replacement, so a reload during download cannot bypass a veto.
+#[derive(Clone, Debug)]
+pub struct CheckSettings {
+    pub source: Source,
+    pub auto_apply: bool,
+}
+
+pub type CheckSettingsProvider = std::sync::Arc<dyn Fn() -> Option<CheckSettings> + Send + Sync>;
+
+pub fn check_now_with_settings(
+    current_build: u64,
+    provider: &CheckSettingsProvider,
+) -> UpdateStatus {
+    #[cfg(target_os = "linux")]
+    {
+        linux::check_with_settings(current_build, provider, true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match provider() {
+            Some(settings) => check_now(current_build, &settings.source),
+            None => UpdateStatus::empty(
+                enabled(),
+                current_build,
+                "current update settings could not be read".into(),
+            ),
+        }
+    }
+}
+
+pub fn spawn_background_check_with_settings(
+    current_build: u64,
+    provider: CheckSettingsProvider,
+    notify: Option<HealthNotify>,
+    on_staged: Option<StagedNotify>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = on_staged;
+        linux::spawn_background_check_with_settings(current_build, provider, notify);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        spawn_background_check_with_source(
+            current_build,
+            std::sync::Arc::new(move || provider().map(|settings| settings.source)),
+            notify,
+            on_staged,
+        );
+    }
+}
+
+/// Linux disk-stage/trial facts are not a macOS DMG or a live-session handoff.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LinuxUpdateStatus {
+    pub installed_build: u64,
+    pub staged_build: Option<u64>,
+    pub staged_version: Option<String>,
+    pub staged_commit: Option<String>,
+    pub trial_phase: Option<String>,
+    pub trial_starts: u32,
+    pub trial_healthy: bool,
+}
+
 /// The same single background checker, sampling its source before each cycle so
 /// configuration reloads take effect without restarting the process.
 #[cfg(target_os = "macos")]
@@ -1529,7 +1691,15 @@ pub fn spawn_background_check_with_source(
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
 ) {
-    if !enabled() {
+    if !automatic() {
+        // Said once per process, where the updater's lines go: the one record of why this
+        // machine is not checking by itself. A typed or clicked check still runs.
+        if enabled() {
+            log(
+                "automatic update checks are off — [update] enabled = false (Settings ▸ \
+                 Terminal ▸ Updates); Check for Updates still checks when asked",
+            );
+        }
         return;
     }
     // Not an installed `.app` (dev build / `cargo run` / `target/` binary) → nothing to
@@ -1557,17 +1727,13 @@ pub fn spawn_background_check_with_source(
             // only when that tag moved. There is no per-IP budget to share on the web
             // lane; its slower interval is a courtesy to the download host and a
             // bound on staleness — hence the per-lane interval below, adopted as soon
-            // as a check reveals which lane this machine is on.
-            // `ATERM_UPDATE_INTERVAL_SECS` overrides BOTH (and is then never
-            // second-guessed); 0 means check once and stop.
+            // as a check reveals which lane this machine is on. No knob overrides it
+            // (`ATERM_UPDATE_INTERVAL_SECS` is gone, 2026-09-23: one cadence).
             //
             // This is the BASE interval only. The wait actually taken is jittered and
             // backs off while checks fail, and returns early when the Mac turns out to
             // have been asleep — see `cadence`, which owns all three policies.
-            let configured = std::env::var("ATERM_UPDATE_INTERVAL_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok());
-            let interval = configured.unwrap_or(cadence::TOKEN_INTERVAL_SECS);
+            let interval = cadence::TOKEN_INTERVAL_SECS;
             let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
             let mut failures = cadence::FailureLog::default();
             // Once per process: a channel this machine cannot read is a configuration
@@ -1612,13 +1778,10 @@ pub fn spawn_background_check_with_source(
             // reject is a wasted request at best, and at worst the stage it
             // finds is read by two processes with two opinions of it.
             if wait_while_uncommitted_handoff_candidate(UNCOMMITTED_CANDIDATE_HOLD_BOUND) {
-                log("update checks waited for this handoff to be committed before the first");
+                log("update checks waited for this handoff to be committed before the first check");
             }
             loop {
                 let Some(source) = source_provider() else {
-                    if interval == 0 {
-                        break;
-                    }
                     // A failed bounded config query is not permission to use a
                     // stale channel. Retry the provider without holding any lane.
                     std::thread::sleep(std::time::Duration::from_secs(5));
@@ -1726,11 +1889,7 @@ pub fn spawn_background_check_with_source(
                         // yet, so it has no stamp of its own in the ledger to mistake
                         // for another checker's, and the first completed check both
                         // stamps the ledger and reveals the lane.
-                        let dedup_base = dedup_window_base(
-                            configured.is_some(),
-                            github::lane(),
-                            schedule.base(),
-                        );
+                        let dedup_base = dedup_window_base(github::lane(), schedule.base());
                         let now_unix = unix_now_secs();
                         if let Some((reason, timer)) = checker_staging.as_ref().and_then(|s| {
                             checker_skip_for(s, current_build, &source, dedup_base, now_unix)
@@ -1771,9 +1930,6 @@ pub fn spawn_background_check_with_source(
                                     schedule.woke();
                                 }
                             });
-                            if interval == 0 {
-                                break;
-                            }
                             continue;
                         }
                         // Stamped BEFORE the check so the ledger can be asked, after
@@ -1850,7 +2006,7 @@ pub fn spawn_background_check_with_source(
                                 // token) mid-session is noticed within one backoff
                                 // ceiling at worst — `max(MAX_BACKOFF,
                                 // MAX_BACKOFF_INTERVALS × base)`, i.e. ~15 min on the
-                                // token lane and ~1 h on the slow web one, which is
+                                // token lane and ~40 min on the web one, which is
                                 // the lane a missing token puts you on.
                                 schedule.failed();
                             }
@@ -1911,6 +2067,25 @@ pub fn spawn_background_check_with_source(
                                     schedule.succeeded();
                                 }
                             }
+                            // A network that could not be reached at all — the first
+                            // check after a cold boot, or on a Wi-Fi still joining —
+                            // is retried within seconds on the cadence's short rungs,
+                            // and said at INFO while those run: it is expected, and a
+                            // WARN there buried the warnings that matter (2026-09-23).
+                            Err(e)
+                                if paths::Staging::resolve().is_some_and(|s| {
+                                    unreachable_before_the_channel(
+                                        &e,
+                                        &health::Health::read(&s.health()),
+                                        &check_started,
+                                    )
+                                }) =>
+                            {
+                                schedule.failed_offline();
+                                emit(Some(
+                                    failures.failure_expected(&e, schedule.retrying_offline()),
+                                ));
+                            }
                             Err(e) => {
                                 emit(Some(failures.failure(&e)));
                                 schedule.failed();
@@ -1940,18 +2115,12 @@ pub fn spawn_background_check_with_source(
                     cb(title, body);
                 }
                 speak_health(&mut announcer);
-                if interval == 0 {
-                    break;
-                }
                 // Adopt the cadence the credential lane can actually afford, now that
-                // a completed check has revealed it. An explicitly configured interval
-                // is never overridden — an operator who set one owns the consequence.
-                if configured.is_none() {
-                    schedule.set_base(std::time::Duration::from_secs(match github::lane() {
-                        github::Lane::Web => cadence::WEB_INTERVAL_SECS,
-                        github::Lane::Token | github::Lane::Unknown => cadence::TOKEN_INTERVAL_SECS,
-                    }));
-                }
+                // a completed check has revealed it.
+                schedule.set_base(std::time::Duration::from_secs(match github::lane() {
+                    github::Lane::Web => cadence::WEB_INTERVAL_SECS,
+                    github::Lane::Token | github::Lane::Unknown => cadence::TOKEN_INTERVAL_SECS,
+                }));
                 // Jittered, backed-off, wake-aware wait. A detected wake returns early
                 // and clears the backoff — the outage the backoff was about belonged
                 // to a network this Mac is no longer on — then lets the network
@@ -1988,7 +2157,7 @@ fn emit(action: Option<cadence::LogAction>) {
     }
 }
 
-/// Non-macOS no-op.
+/// Linux runs its enrolled single-executable checker; other platforms are inert.
 #[cfg(not(target_os = "macos"))]
 pub fn spawn_background_check(
     _current_build: u64,
@@ -1996,6 +2165,12 @@ pub fn spawn_background_check(
     _notify: Option<HealthNotify>,
     _on_staged: Option<StagedNotify>,
 ) {
+    #[cfg(target_os = "linux")]
+    linux::spawn_background_check(
+        _current_build,
+        std::sync::Arc::new(move || Some(_source.clone())),
+        _notify,
+    );
 }
 
 /// Non-macOS no-op.
@@ -2006,6 +2181,8 @@ pub fn spawn_background_check_with_source(
     _notify: Option<HealthNotify>,
     _on_staged: Option<StagedNotify>,
 ) {
+    #[cfg(target_os = "linux")]
+    linux::spawn_background_check(_current_build, _source_provider, _notify);
 }
 
 /// Consecutive same-class failed checks at which the failure is called PERSISTENT
@@ -2027,6 +2204,7 @@ pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 /// the last background check + any staged build WITHOUT triggering network I/O.
 #[derive(Debug, Clone)]
 pub struct UpdateStatus {
+    pub linux: Option<LinuxUpdateStatus>,
     /// Whether the updater is configured to act on this build/machine.
     pub enabled: bool,
     /// Whether this launch has a bundle the updater could actually REPLACE.
@@ -2113,7 +2291,7 @@ impl UpdateStatus {
         } else {
             fallback = match (&self.staged_version, self.staged_build) {
                 (Some(v), Some(b)) => format!("update {v} (build {b}) staged"),
-                _ if !self.enabled => "auto-update is disabled on this build".to_string(),
+                _ if !self.enabled => "aterm updates itself on macOS only".to_string(),
                 _ => "no update check has run yet".to_string(),
             };
             &fallback
@@ -2147,6 +2325,7 @@ impl UpdateStatus {
     /// An empty (all-defaults) snapshot for the stub/fallback constructors.
     fn empty(enabled: bool, current_build: u64, outcome: String) -> Self {
         Self {
+            linux: None,
             enabled,
             // The fallback/stub path has no bundle to speak for; claiming one would
             // be the very over-claim `installable` exists to prevent.
@@ -2171,6 +2350,22 @@ impl UpdateStatus {
     }
 }
 
+/// "Check for updates automatically" is NOT whether the updater runs (2026-09-23
+/// review): [`enabled`] is the platform alone, so a typed `aterm update check`, a clicked
+/// Check for Updates and Update Now are never refused by the switch — only the background
+/// checker ([`automatic`]) is, and it can never be on where the updater cannot run.
+#[cfg(test)]
+mod switch_scope_tests {
+    #[test]
+    fn the_settings_switch_gates_the_background_checker_alone() {
+        assert_eq!(
+            super::enabled(),
+            cfg!(any(target_os = "macos", target_os = "linux"))
+        );
+        assert!(!super::automatic() || super::enabled());
+    }
+}
+
 #[cfg(test)]
 mod status_summary_tests {
     use super::UpdateStatus;
@@ -2184,7 +2379,7 @@ mod status_summary_tests {
 
     #[test]
     fn a_staged_summary_preserves_refusals_and_independent_failure_classes() {
-        let refusal = "staged 0.85.0 (build 85) — NOT applied: seamless handoff unavailable because $ATERM_NO_SEAMLESS_UPDATE is set. Unset it to restore the default.";
+        let refusal = "staged 0.85.0 (build 85) — NOT applied: seamless handoff unavailable because the successor could not be prepared.";
         let cases = [
             (refusal, 0, 0, ""),
             (
@@ -2233,7 +2428,7 @@ mod status_summary_tests {
         status.staged_version = None;
         assert_eq!(status.summary(), "no update check has run yet");
         status.enabled = false;
-        assert_eq!(status.summary(), "auto-update is disabled on this build");
+        assert_eq!(status.summary(), "aterm updates itself on macOS only");
     }
 
     #[test]
@@ -2456,22 +2651,36 @@ fn reconcile_status_outcome(
 /// defers a first check that a sibling has already made. It cannot starve the
 /// caller — a process with no completed check has no stamp of its own in the
 /// ledger to mistake for another checker's, and the first completed check both
-/// stamps the ledger and reveals the lane. An explicitly configured interval is
-/// never second-guessed: an operator who set one owns the consequence.
+/// stamps the ledger and reveals the lane.
 // `any(macos, test)` was reaching for the unit tests below, but its BODY reads
 // the macOS-only `github` and `cadence` modules — so on a Linux `cargo test` the
 // fn compiled without them and the crate failed to build. The tests that cover
 // it are macOS-gated for the same reason, so this rides the platform alone.
 #[cfg(target_os = "macos")]
-fn dedup_window_base(
-    configured: bool,
-    lane: github::Lane,
-    base: std::time::Duration,
-) -> std::time::Duration {
-    if configured || lane != github::Lane::Unknown {
+fn dedup_window_base(lane: github::Lane, base: std::time::Duration) -> std::time::Duration {
+    if lane != github::Lane::Unknown {
         return base;
     }
     std::time::Duration::from_secs(cadence::WEB_INTERVAL_SECS).max(base)
+}
+
+/// Whether a failed check takes the quick [`cadence::OFFLINE_RETRY`] rungs: its
+/// message says curl could not reach the network ([`cadence::is_network_unreachable`])
+/// AND the health ledger filed THIS check's failure (`last_failure_at` at or after
+/// `check_started`) as `network` — the channel itself was never reached. The same curl
+/// exit on the container download, after the channel answered, is a `pipeline`
+/// failure: the network is up, and four quick retries would download the container
+/// four more times in eight minutes and, three failures in, show "Updates are failing"
+/// in Settings about a slow link.
+#[cfg(target_os = "macos")]
+fn unreachable_before_the_channel(
+    error: &str,
+    health: &health::Health,
+    check_started: &str,
+) -> bool {
+    cadence::is_network_unreachable(error)
+        && health.kind == "network"
+        && health.last_failure_at.as_str() >= check_started
 }
 
 /// How much a RECORDED DEFERRAL widens the machine-wide freshness window, as a
@@ -2918,6 +3127,7 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
     // Self-healing ledger snapshot (per-class failure streaks).
     let h = health::Health::read(&staging.health());
     Some(UpdateStatus {
+        linux: None,
         enabled: enabled(),
         installable: bundle::resolve().is_some(),
         current_build,
@@ -2966,14 +3176,28 @@ pub fn last_check_at(current_build: u64, source: &Source) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn last_check_at(_current_build: u64, _source: &Source) -> Option<String> {
-    None
+    #[cfg(target_os = "linux")]
+    {
+        linux::last_check_at(_current_build, _source)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
-/// Non-macOS stub: no updater state to report.
+/// Linux reports its enrolled executable state; other platforms have no updater.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn status(_current_build: u64) -> Option<UpdateStatus> {
-    None
+    #[cfg(target_os = "linux")]
+    {
+        Some(linux::status(_current_build))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Whether `stamp` — an RFC3339 UTC timestamp as this crate writes them
@@ -3036,8 +3260,9 @@ pub fn rfc3339_to_unix(stamp: &str) -> Option<u64> {
 
 /// Run ONE update check + stage synchronously and return the resulting [`UpdateStatus`]
 /// (the "Check for Updates" action). BLOCKS on network + disk (download/verify/stage up
-/// to tens of seconds), so callers MUST run it off the UI/event-loop thread. A no-op
-/// that just reports current state when the updater is disabled or not an installed app.
+/// to tens of seconds), so callers MUST run it off the UI/event-loop thread. A person
+/// asked for it, so "Check for updates automatically" being off does not stop it
+/// ([`enabled`], not [`automatic`]); on an uninstalled copy it just reports state.
 #[cfg(target_os = "macos")]
 pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
     if enabled() {
@@ -3054,7 +3279,7 @@ pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
             if enabled() {
                 "update check could not run".into()
             } else {
-                "auto-update is disabled on this build".into()
+                "aterm updates itself on macOS only".into()
             },
         )
     })
@@ -3063,7 +3288,18 @@ pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
 /// Non-macOS stub.
 #[cfg(not(target_os = "macos"))]
 pub fn check_now(current_build: u64, _source: &Source) -> UpdateStatus {
-    UpdateStatus::empty(false, current_build, "auto-update is macOS-only".into())
+    #[cfg(target_os = "linux")]
+    {
+        linux::check_now(current_build, _source)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        UpdateStatus::empty(
+            false,
+            current_build,
+            "auto-update is unsupported on this platform".into(),
+        )
+    }
 }
 
 /// Emit an informational updater line to stderr (captured by the GUI's logger).
@@ -3076,6 +3312,50 @@ pub(crate) fn log(msg: &str) {
     #[cfg(test)]
     log_capture::record(aterm_log::Level::Info, msg);
     aterm_log::info!("aterm-update: {msg}");
+}
+
+/// Emit an updater line at DEBUG (see [`log`]): a routine fact kept out of the default
+/// log — the lane this process reads, the machine that signed a release it has already
+/// named once.
+#[cfg(target_os = "macos")]
+pub(crate) fn debug(msg: &str) {
+    #[cfg(test)]
+    log_capture::record(aterm_log::Level::Debug, msg);
+    aterm_log::debug!("aterm-update: {msg}");
+}
+
+/// Whether `key` is new to this process — for a line said once per process (or once
+/// per release per process) however many checks meet the same fact. Under `cfg(test)`
+/// the memory is per THREAD, like [`log_capture`], so a test's first sighting is not
+/// swallowed by a sibling test that met the same fixture first.
+#[cfg(target_os = "macos")]
+pub(crate) fn first_in_process(key: &str) -> bool {
+    #[cfg(not(test))]
+    {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.iter().any(|k| k == key) {
+            return false;
+        }
+        seen.push(key.to_string());
+        true
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static SEEN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SEEN.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            if seen.iter().any(|k| k == key) {
+                return false;
+            }
+            seen.push(key.to_string());
+            true
+        })
+    }
 }
 
 /// Emit a non-fatal updater warning to the app log (see [`log`]).
@@ -3121,12 +3401,65 @@ pub(crate) mod log_capture {
 mod checker_gate_tests {
     use std::time::Duration;
 
-    use super::dedup_window_base;
+    use super::{dedup_window_base, unreachable_before_the_channel};
     use crate::cadence;
     use crate::github::Lane;
 
     const AUTH: Duration = Duration::from_secs(cadence::TOKEN_INTERVAL_SECS);
     const ANON: Duration = Duration::from_secs(cadence::WEB_INTERVAL_SECS);
+
+    /// THE QUICK RUNGS ARE FOR A CHANNEL THAT WAS NEVER REACHED. The boot failure the
+    /// owner's log recorded — a DNS error on the HEAD, filed `network` by this check —
+    /// takes them. The same curl exit on the container download (filed `pipeline`: the
+    /// channel answered first), a `network` record an EARLIER check left, and a
+    /// `network` failure that is not a transport exit do not.
+    #[test]
+    fn only_this_checks_unreachable_channel_takes_the_quick_rungs() {
+        let dns = "curl HEAD https://github.com/alabsystems/aterm/releases/latest/download/\
+                   aterm-appcast.toml failed (exit status: 6): curl: (6) Could not resolve \
+                   host: github.com";
+        let stalled = "zip download failed: curl download failed (exit status: 28): curl: \
+                       (28) Operation too slow. Less than 4096 bytes/sec transferred the last \
+                       30 seconds";
+        let started = "2026-09-23T12:28:12Z";
+        let filed = |kind: &str, at: &str| crate::health::Health {
+            kind: kind.to_string(),
+            last_failure_at: at.to_string(),
+            ..Default::default()
+        };
+        assert!(unreachable_before_the_channel(
+            dns,
+            &filed("network", started),
+            started
+        ));
+        assert!(unreachable_before_the_channel(
+            dns,
+            &filed("network", "2026-09-23T12:28:15Z"),
+            started
+        ));
+        assert!(
+            !unreachable_before_the_channel(stalled, &filed("pipeline", started), started),
+            "a stalled container download is not a network that is down"
+        );
+        assert!(
+            !unreachable_before_the_channel(
+                dns,
+                &filed("network", "2026-09-23T12:18:12Z"),
+                started
+            ),
+            "an earlier check's record says nothing about this one"
+        );
+        assert!(!unreachable_before_the_channel(
+            "parse releases JSON: EOF while parsing",
+            &filed("network", started),
+            started
+        ));
+        assert!(!unreachable_before_the_channel(
+            dns,
+            &crate::health::Health::default(),
+            started
+        ));
+    }
 
     /// THE LAUNCH-COST OBLIGATION the steady-state cost test cannot express.
     /// A process that has not completed a check does not know its lane, and its
@@ -3135,13 +3468,13 @@ mod checker_gate_tests {
     #[test]
     fn an_unknown_lane_is_deduped_at_the_web_interval() {
         assert_eq!(
-            dedup_window_base(false, Lane::Unknown, AUTH),
+            dedup_window_base(Lane::Unknown, AUTH),
             ANON,
             "a freshly spawned process must not spend a check on a guess"
         );
         // Twelve launches in an hour: the freshness window (70% of the base) must
         // exceed the spacing, so at most one of them reaches the network.
-        let window = dedup_window_base(false, Lane::Unknown, AUTH).as_secs() * 7 / 10;
+        let window = dedup_window_base(Lane::Unknown, AUTH).as_secs() * 7 / 10;
         let spacing = 3600 / 12;
         assert!(
             window > spacing,
@@ -3150,19 +3483,13 @@ mod checker_gate_tests {
     }
 
     #[test]
-    fn a_known_lane_and_a_configured_interval_are_taken_at_face_value() {
-        assert_eq!(dedup_window_base(false, Lane::Token, AUTH), AUTH);
-        assert_eq!(dedup_window_base(false, Lane::Web, ANON), ANON);
-        // An operator interval owns its own consequence, fast or slow.
-        let configured = Duration::from_secs(10);
-        assert_eq!(
-            dedup_window_base(true, Lane::Unknown, configured),
-            configured
-        );
+    fn a_known_lane_is_taken_at_face_value() {
+        assert_eq!(dedup_window_base(Lane::Token, AUTH), AUTH);
+        assert_eq!(dedup_window_base(Lane::Web, ANON), ANON);
     }
 
     /// The window may only ever GROW relative to the schedule's own base, so this
-    /// gate can never shorten a cadence the lane or the operator already accepted.
+    /// gate can never shorten a cadence the lane already accepted.
     #[test]
     fn the_dedup_window_never_undercuts_the_schedules_own_base() {
         for lane in [Lane::Unknown, Lane::Token, Lane::Web] {
@@ -3172,12 +3499,7 @@ mod checker_gate_tests {
                 ANON,
                 Duration::from_secs(7200),
             ] {
-                for configured in [false, true] {
-                    assert!(
-                        dedup_window_base(configured, lane, base) >= base,
-                        "{lane:?} {base:?} configured={configured}"
-                    );
-                }
+                assert!(dedup_window_base(lane, base) >= base, "{lane:?} {base:?}");
             }
         }
     }

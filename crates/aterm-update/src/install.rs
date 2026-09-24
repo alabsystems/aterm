@@ -1011,7 +1011,7 @@ fn prepare_trial(
 
 /// Is the armed trial (if any) OWNED by the install at `app_root`? The sentinel and
 /// `trial.toml` are per user, but a build can be installed at several paths at once
-/// (a dev machine's `dist/aterm.app` beside `/Applications/aterm.app`, a duplicate
+/// (`~/Applications/aterm.app` beside `/Applications/aterm.app`, a duplicate
 /// copy of a release). A same-build process launched from a bundle the trial did
 /// not swap must neither count launches against it (three sibling launches used to
 /// revert and poison a build that never crashed), nor confirm it, nor disarm it as
@@ -1133,6 +1133,21 @@ fn disarm_dead_authority_trial(
     true
 }
 
+/// Whether THIS install may recover an abandoned pre-swap trial: the shape
+/// matches, the trial is this install's (`trial_owned_by` — the same law as the
+/// dead-authority branch; the staging root is shared by every copy on the
+/// machine), and the running build is the installed one.
+fn may_recover_abandoned_preswap(
+    staging: &Staging,
+    installed: &Path,
+    (process_build, installed_build, armed_build): (u64, u64, u64),
+    identity_matches: bool,
+) -> bool {
+    abandoned_preswap_trial(process_build, installed_build, armed_build)
+        && trial_owned_by(staging, installed)
+        && identity_matches
+}
+
 /// Recover the sole safe mismatched-sentinel crash cut under apply_lock: this
 /// process's OLD build is still canonically installed while the armed build is
 /// newer. Because apply_lock is held, a live concurrent swap must finish before
@@ -1180,28 +1195,16 @@ fn recover_abandoned_preswap_trial_if_exact(
             process_build,
         );
     }
-    if !abandoned_preswap_trial(process_build, installed_build, armed_build) {
-        return false;
-    }
-    // The SAME ownership law as the dead-authority branch above, which carried
-    // it and this one did not. The staging root is shared by every copy of
-    // aterm the machine runs — the owner's own has two, `/Applications/aterm.app`
-    // and the release cutter's `dist/aterm.app` (aterm_release::bundle) — so
-    // "armed for a build that is not mine" is a sentence a NON-OWNING sibling
-    // says just as truthfully as the install that armed it. Without this, a
-    // sibling confirms the sentinel and restores from a `rollback_path` computed
-    // beside ITSELF, which is how a trial ends up proving against a bundle that
-    // was never its own: "trial recovery proof failed 3x (fixed rollback
-    // missing); disarmed the boot sentinel to keep updates possible", measured
-    // on the owner's Mac 2026-09-21 at 20:34:26Z.
-    if !trial_owned_by(staging, installed) {
-        return false;
-    }
-    if !identity_matches_running(
-        installed_build,
-        &installed_commit,
-        process_build,
-        process_commit,
+    if !may_recover_abandoned_preswap(
+        staging,
+        installed,
+        (process_build, installed_build, armed_build),
+        identity_matches_running(
+            installed_build,
+            &installed_commit,
+            process_build,
+            process_commit,
+        ),
     ) {
         return false;
     }
@@ -1390,15 +1393,6 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
          {MAX_BOOT_ATTEMPTS} launches of build {current_build}; disarmed it rather than \
          blocking every future update"
     ));
-    // DELIBERATELY NOT collecting a rollback here. This escape retires a trial
-    // that belongs to a DIFFERENT install — that is the whole premise of
-    // `escape_wedged_foreign_trial`, and `trial_owned_by` is what tells the two
-    // apart. The rollback beside THIS install is not the retired trial's, and
-    // the retired trial's rollback is not ours to remove: automatically
-    // deleting another install's bundle is precisely the act this area forbids
-    // (see `recover_orphaned_prepared_candidate`, which leaves the fixed path
-    // alone for the same reason). The census on `aterm ctl privacy` NAMES such
-    // a bundle instead, and retiring it stays an owner's decision.
     true
 }
 
@@ -1528,46 +1522,6 @@ struct PreparedSwapCandidate {
     /// anything fails before RENAME_SWAP, the verified bundle must be moved back
     /// so `ready.toml` never advertises missing bytes.
     moved_from_stage: bool,
-}
-
-/// Collect a rollback bundle that nothing will ever revert to.
-///
-/// A retired trial has no further use for its predecessor, and leaving it is
-/// what makes it PERMANENT: `aterm.app.rollback` is a complete, signed bundle
-/// carrying the same `CFBundleIdentifier` as the install it was displaced from,
-/// so for as long as it sits there it is a second claimant on the app's one TCC
-/// row. macOS keeps ONE code requirement per identifier and resolves a mismatch
-/// by REPLACING the stored requirement — so a stale rollback whose signature
-/// differs from the live install (an ad-hoc predecessor beside a Developer-ID
-/// successor, which is how a dev machine's lineage looks) resets Full Disk
-/// Access for every copy the moment anything attributed to it asks. Measured on
-/// the owner's Mac 2026-09-21: two such fossils, three grants destroyed.
-///
-/// Only called where the rollback has ALREADY been proved unusable — the
-/// caller's `ensure_fixed_rollback` refused it — so this collects an orphan, not
-/// a recovery path. `aterm_spec`'s `NativeUpdateDiskTransaction` makes
-/// collection mandatory at a healthy boot; this is the same collection reached
-/// by the other terminal branch, and it removes state rather than adding any.
-fn collect_orphaned_rollback(installed: &Path, why: &str) {
-    let fixed = rollback_path(installed);
-    // Present now and unusable per the caller: `ensure_fixed_rollback` reports
-    // `inspect fixed rollback` only when this very call fails, so a readable
-    // entry here means the refusal came from validation.
-    if std::fs::symlink_metadata(&fixed).is_err() {
-        return;
-    }
-    match remove_path_no_follow(&fixed) {
-        Ok(()) => crate::warn(&format!(
-            "collected the unusable rollback at {} ({why}): nothing can revert to it, and a \
-             bundle left at that name keeps claiming this app's code identity",
-            fixed.display()
-        )),
-        Err(error) => crate::warn(&format!(
-            "could not collect the unusable rollback at {}: {error} — it will keep claiming \
-             this app's code identity until it is removed",
-            fixed.display()
-        )),
-    }
 }
 
 fn remove_path_no_follow(path: &Path) -> std::io::Result<()> {
@@ -3316,22 +3270,6 @@ fn apply_staged_if_ready_inner(
         ));
         return ApplyOutcome::NoUpdate;
     }
-    // NEVER SWAP THE BUNDLE OUT FROM UNDER A TOOLCHAIN INSTALL. `atpkg seed` reads
-    // the sealed payload inside this bundle by path, lazily, for minutes; the swap
-    // below would leave its next read resolving into the replacement, which came
-    // from the lean zip with the seal stripped. Deliberately AFTER the boot-health
-    // lane above, so a crash-looping build can still revert (2026-08-20 round-8
-    // audit) — and, since 2026-09-14, after startup authority is settled and the
-    // handoff target has answered: the deferral guards the SWAP, and firing it
-    // first booked "boot apply refused: a toolchain install is reading …" against
-    // a just-swapped re-exec (a Matched nonce) and against an authorized handoff
-    // successor — launches that ARE the successful apply — for as long as `atpkg
-    // seed` held the marker after a launch.
-    if crate::is_toolchain_install_active() {
-        return ApplyOutcome::Deferred(
-            "a toolchain install is reading this bundle's sealed payload".to_string(),
-        );
-    }
     // 2. Must be a real installed bundle.
     let Some(b) = bundle::resolve() else {
         return ApplyOutcome::NotApplicable;
@@ -4025,10 +3963,6 @@ fn check_boot_health_with_lock_wait(
                      ({error}); the running build boots, so the boot sentinel was disarmed \
                      rather than blocking every future update"
                 ));
-                // The trial is retired, so its predecessor is dead weight — and
-                // a bundle left at the fixed rollback name is a second claimant
-                // on this app's TCC row for as long as it sits there.
-                collect_orphaned_rollback(&b.app_root, "the trial it belonged to was retired");
                 if let Err(disarm_error) = disarm {
                     // Could not even clear the sentinel: report it rather than
                     // pretending the wedge is resolved.
@@ -5990,49 +5924,8 @@ staged_at = "2026-08-17T00:00:00Z"
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A retired trial's predecessor is COLLECTED, because leaving it is what
-    /// turns a transient artifact into a permanent co-claimant on the app's one
-    /// TCC row.
-    ///
-    /// `aterm.app.rollback` is a complete, signed bundle carrying the same
-    /// `CFBundleIdentifier` as the install it was displaced from. macOS keeps
-    /// ONE code requirement per identifier and resolves a mismatch by REPLACING
-    /// the stored requirement, so a stale rollback whose signature differs from
-    /// the live install resets Full Disk Access for every copy the moment
-    /// anything attributed to it asks. Measured on the owner's Mac 2026-09-21:
-    /// two such fossils, three grants destroyed in 55 seconds.
-    #[test]
-    fn an_unusable_rollback_is_collected_rather_than_left_to_claim_the_identity() {
-        let (_s, root) = temp_staging();
-        let installed = root.join("Applications").join("aterm.app");
-        make_app(&installed, "LIVE");
-        let fixed = rollback_path(&installed);
-        make_app(&fixed, "DEAD PREDECESSOR");
-        assert!(fixed.exists());
-
-        collect_orphaned_rollback(&installed, "a test");
-        assert!(
-            !fixed.exists(),
-            "the orphan is gone: nothing can revert to it, and while it sits there it \
-             claims this app's code identity"
-        );
-        assert_eq!(
-            read_id(&installed),
-            "LIVE",
-            "and the LIVE install is untouched — this collects a dead sibling, never the app"
-        );
-
-        // Idempotent, and silent when there is nothing to collect: the ordinary
-        // `fixed rollback missing` case must not become an error path.
-        collect_orphaned_rollback(&installed, "a second time");
-        assert!(read_id(&installed) == "LIVE");
-
-        // A rollback for an install that does not exist is not reached at all.
-        collect_orphaned_rollback(&root.join("nowhere").join("aterm.app"), "absent");
-    }
-
     /// A trial belongs to the install it swapped. A same-build process launched
-    /// from ANOTHER bundle (a dev machine's `dist/aterm.app` beside
+    /// from ANOTHER bundle (`~/Applications/aterm.app` beside
     /// `/Applications/aterm.app`, a duplicate copy) is not its owner: it must not
     /// count launches against it, confirm it, or disarm it as dead authority.
     /// Legacy markers without a recorded root stay owned by whoever asks.
@@ -6056,24 +5949,15 @@ staged_at = "2026-08-17T00:00:00Z"
         // …and a sibling that is NEWER than the armed build may not retire it as
         // dead authority either: the pure gate is the ownership test.
         assert!(dead_authority_trial(7, 7, 6) && !trial_owned_by(&s, &sibling));
-        // The ABANDONED-PRE-SWAP shape is no different, and until 2026-09-21
-        // `recover_abandoned_preswap_trial_if_exact` tested only
-        // `identity_matches_running` on that branch while its dead-authority
-        // sibling twenty lines above carried `trial_owned_by` — so a non-owner
-        // that happened to be the same build could confirm the sentinel and
-        // restore from a `rollback_path` computed beside ITSELF. The owner's
-        // Mac has exactly the two-install shape this fixture models
-        // (`/Applications/aterm.app` and the cutter's `dist/aterm.app`) and
-        // logged the consequence at 2026-09-21T20:34:26Z: "trial recovery proof
-        // failed 3x (fixed rollback missing)". NOTE: this pins the PREDICATE
-        // PAIR the branch now consults, not the branch end to end — reaching it
-        // needs `verified_bundle_identity`, which needs a codesigned fixture
-        // bundle this crate has no harness for.
-        assert!(abandoned_preswap_trial(6, 6, 7), "the armed build is newer");
-        assert!(
-            !trial_owned_by(&s, &sibling),
-            "and the sibling still does not own it"
-        );
+        // The abandoned-pre-swap gate: the owner may recover, a same-build
+        // sibling may not. Drop the ownership term and the second assert fails.
+        assert!(may_recover_abandoned_preswap(&s, &owner, (6, 6, 7), true));
+        assert!(!may_recover_abandoned_preswap(
+            &s,
+            &sibling,
+            (6, 6, 7),
+            true
+        ));
         // The owner install GONE (moved/deleted mid-trial): whoever runs the build
         // now inherits the trial, so it can still be counted, confirmed or escaped.
         std::fs::remove_dir_all(&owner).unwrap();

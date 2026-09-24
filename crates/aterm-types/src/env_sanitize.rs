@@ -136,34 +136,36 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // per-instance socket and never unlinks/steals the parent's explicit path.
     "ATERM_CONTROL_SOCK",
     "ATERM_NO_CONTROL_SOCK",
-    // Update-contract knobs: never inherit into child SHELLS, for the same
-    // one-hop reason as the socket selectors — an aterm launched from an aterm
-    // shell must make its own update decisions, not run under a veto (or a QA
-    // seam) the parent's environment happened to carry. The 2026-09-01 field
-    // bug was exactly this shape: an inherited-but-empty selector rerouted the
-    // updater of a daily driver for its whole process lifetime. The vars stay
-    // settable ON PURPOSE at launch; they just do not propagate through a
-    // shell hop.
-    "ATERM_NO_AUTO_UPDATE",
-    "ATERM_NO_AUTO_APPLY",
-    "ATERM_NO_SEAMLESS_UPDATE",
+    // The update DEVELOPMENT SEAMS (`dev_seam!`): never inherit into child SHELLS,
+    // for the same one-hop reason as the socket selectors — an aterm launched from an
+    // aterm shell makes its own update decisions, never under a QA seam the parent's
+    // environment happened to carry. The 2026-09-01 field bug was exactly this shape:
+    // an inherited-but-empty selector rerouted the updater of a daily driver for its
+    // whole process lifetime. A shipped binary reads none of these (they compile only
+    // in a dev build); a dev build still does, so they still stop at the hop.
+    //
+    // The update KNOBS that used to sit here — `ATERM_NO_AUTO_UPDATE`,
+    // `ATERM_NO_AUTO_APPLY`, `ATERM_NO_SEAMLESS_UPDATE`, `ATERM_UPDATE_INTERVAL_SECS`,
+    // `ATERM_UPDATE_OWNER`/`_REPO` — are gone (2026-09-23, R2: "NOT ENV VARS those are
+    // for development"). Nothing reads them, so there is no decision of a nested aterm
+    // to protect; `[update]` in aterm.toml is the one spelling.
     "ATERM_DEBUG_SEAMLESS_REEXEC",
     "ATERM_DEBUG_RELAUNCH_NUDGE",
+    "ATERM_DEBUG_STATUS_BARS",
     "ATERM_UPDATE_ROOT",
-    "ATERM_UPDATE_INTERVAL_SECS",
-    // The channel repoint, the credential and the handoff QA tunable too
-    // (2026-09-14, audit LT-7). A nested aterm run from an aterm shell used to
-    // inherit the parent's env repoint — the QA-seam recipe does exactly this —
-    // and a token set at GUI launch reached every child process of every shell.
-    // A repoint meant for the machine belongs in the config file (`[update]
-    // owner`/`repo`), which the window, the headless `aterm update check` and a
-    // nested instance all read identically; the env form is a per-launch
-    // override and stops at the launch. A token a shell should carry belongs in
-    // that shell's own rc, not in the launcher's secret environment.
-    "ATERM_UPDATE_OWNER",
-    "ATERM_UPDATE_REPO",
-    "ATERM_UPDATE_TOKEN",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
+    "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
+    // RETIRED CREDENTIALS STAY DENIED (2026-09-14 audit LT-7; kept 2026-09-23). Nothing
+    // reads `ATERM_UPDATE_TOKEN` or `ATPKG_TOKEN` any more, but that was never the only
+    // reason to stop them at the hop: the value is a SECRET. The old install.sh told
+    // people to export the first for the app (`launchctl setenv`), and a token set at
+    // GUI launch reached every child process of every shell — every agent and program
+    // run in a tab. Deleting a knob does not delete the export already sitting in a
+    // launchd environment or an rc file, so dropping these names from this list would
+    // have handed the secret to every shell of every machine that followed the old
+    // instructions. A token a shell should carry belongs in that shell's own rc.
+    "ATERM_UPDATE_TOKEN",
+    "ATPKG_TOKEN",
     // Network-drive selectors: never inherit, so a nested aterm cannot open a
     // second network control surface and the operator's key path is not fanned
     // into every descendant (only the explicitly-configured root binds).
@@ -277,19 +279,18 @@ mod tests {
         assert!(!is_ai_env_var("ATERM_SHELL_NONCE"));
     }
 
-    /// The reroute seam's three variables (`atpkg::reroute`, 2026-09-07) must reach
+    /// The reroute seam's two variables (`atpkg::reroute`, 2026-09-07) must reach
     /// EVERY child: `ATERM_REROUTE_DIR` is what the shell integration re-asserts
-    /// first on PATH after the rc files ran; `ATERM_NO_REROUTE` is the one escape
-    /// hatch (`aterm --no-reroute`) — an upstream `cargo` exec'd under it hands it
-    /// to its own `rustc`/`rustdoc` spawns, or they are refused; `ATERM_Z3_IS_ORACLE`
-    /// is the ORACLE row's key. A deny-list hit here would silently strip the escape
-    /// from a nested aterm's children — the `ATERM_NO_*` update knobs above ARE
-    /// denied by name, so this pin keeps the family from being deny-listed by prefix.
+    /// first on PATH after the rc files ran; `__ATERM_REROUTE_PASSTHROUGH` is the
+    /// internal marker `aterm --no-reroute` establishes for its session — an upstream
+    /// `cargo` exec'd under it hands it to its own `rustc`/`rustdoc` spawns, or they
+    /// are announced again. A deny-list hit here would silently strip the escape from
+    /// a `--no-reroute` session's children — the update seams above ARE denied by
+    /// name, so this pin keeps the family from being deny-listed by prefix.
     #[test]
     fn test_reroute_seam_vars_survive_sanitization() {
-        assert!(!is_ai_env_var("ATERM_NO_REROUTE"));
+        assert!(!is_ai_env_var("__ATERM_REROUTE_PASSTHROUGH"));
         assert!(!is_ai_env_var("ATERM_REROUTE_DIR"));
-        assert!(!is_ai_env_var("ATERM_Z3_IS_ORACLE"));
     }
 
     /// Item 4/5: the recursion-provisioning identity/edge vars and the
@@ -316,33 +317,48 @@ mod tests {
         assert!(!is_ai_env_var("ATERM_SHELL_INTEGRATION_DIR"));
     }
 
-    /// The update-contract knobs are denied by exact name (2026-09-01): a
-    /// nested aterm launched from an aterm shell makes its own update
-    /// decisions — no inherited veto, no inherited QA seam. Each name here has
-    /// a real reader: enabled()/spawn_background_check (ATERM_NO_AUTO_UPDATE),
-    /// update_auto_apply_setting (ATERM_NO_AUTO_APPLY),
-    /// seamless_handoff_opted_out (ATERM_NO_SEAMLESS_UPDATE),
-    /// debug_seamless_reexec_armed (ATERM_DEBUG_SEAMLESS_REEXEC),
-    /// relaunch_nudge_seam (ATERM_DEBUG_RELAUNCH_NUDGE), seal_guard's
-    /// updates_root (ATERM_UPDATE_ROOT), and the check cadence
-    /// (ATERM_UPDATE_INTERVAL_SECS).
+    /// The update development seams are denied by exact name (2026-09-01): a
+    /// nested aterm launched from an aterm shell makes its own update decisions —
+    /// no inherited QA seam. Each name here has a reader in a dev build (`dev_seam!`):
+    /// debug_seamless_reexec_armed (ATERM_DEBUG_SEAMLESS_REEXEC), relaunch_nudge_seam
+    /// (ATERM_DEBUG_RELAUNCH_NUDGE), the status-bar seeding (ATERM_DEBUG_STATUS_BARS),
+    /// seal_guard's updates_root (ATERM_UPDATE_ROOT) and the handoff deadlines
+    /// (ATERM_HANDOFF_READY_TIMEOUT_MS, ATERM_HANDOFF_PROOF_TIMEOUT_MS). The retired
+    /// update knobs are NOT listed: nothing reads them any more.
     #[test]
     fn test_update_contract_vars_are_denied_by_name() {
         for v in [
+            "ATERM_DEBUG_SEAMLESS_REEXEC",
+            "ATERM_DEBUG_RELAUNCH_NUDGE",
+            "ATERM_DEBUG_STATUS_BARS",
+            "ATERM_UPDATE_ROOT",
+            "ATERM_HANDOFF_READY_TIMEOUT_MS",
+            "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
+        ] {
+            assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
+        }
+        for retired in [
             "ATERM_NO_AUTO_UPDATE",
             "ATERM_NO_AUTO_APPLY",
             "ATERM_NO_SEAMLESS_UPDATE",
-            "ATERM_DEBUG_SEAMLESS_REEXEC",
-            "ATERM_DEBUG_RELAUNCH_NUDGE",
-            "ATERM_UPDATE_ROOT",
             "ATERM_UPDATE_INTERVAL_SECS",
-            // The repoint, the credential and the handoff tunable (2026-09-14).
             "ATERM_UPDATE_OWNER",
             "ATERM_UPDATE_REPO",
-            "ATERM_UPDATE_TOKEN",
-            "ATERM_HANDOFF_READY_TIMEOUT_MS",
         ] {
-            assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
+            assert!(
+                !ENV_DENY_VARS.contains(&retired),
+                "{retired} is read by nothing, so it has no inheritance to stop"
+            );
+        }
+        // …except a CREDENTIAL: read by nothing, and still a secret that an old
+        // `launchctl setenv` or rc export would otherwise hand to every tab's shell and
+        // every program run there (audit LT-7). Removing a name from this list is not a
+        // no-op when its value is a token.
+        for credential in ["ATERM_UPDATE_TOKEN", "ATPKG_TOKEN"] {
+            assert!(
+                is_ai_env_var(credential),
+                "{credential} is a retired CREDENTIAL and must stay deny-listed"
+            );
         }
     }
 

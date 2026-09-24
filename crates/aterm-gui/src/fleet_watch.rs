@@ -249,6 +249,10 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
             title: s.title.clone(),
             role: None,
             attention: None,
+            // A sibling's verdict is not read over this scan: its own menu
+            // and notifications carry it; this row only counts `⚠`s.
+            agent: None,
+            supervised: false,
         };
         if meta_alive && s.has_meta && lookups < MAX_META_LOOKUPS {
             lookups += 1;

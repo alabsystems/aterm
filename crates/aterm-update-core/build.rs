@@ -28,8 +28,9 @@
 //! root, and not `repository`, because that is the private staging repo a
 //! default-configured (tokenless) install cannot read at all.
 //!
-//! The runtime knobs (`ATERM_UPDATE_OWNER`/`_REPO`, `[update]` config) still
-//! override whatever is emitted here.
+//! What is emitted here is the channel of every shipped binary: only a development
+//! build honours a runtime repoint (`[update]` owner/repo in aterm.toml,
+//! `source::REPOINT_IS_A_DEV_SEAM`); the env overrides are gone (2026-09-23).
 //!
 //! Best-effort by construction: an unreadable manifest, an absent key, or a
 //! non-`OWNER/REPO` value degrades to the next rung rather than failing the build.

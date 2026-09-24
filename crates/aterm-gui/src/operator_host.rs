@@ -2586,10 +2586,30 @@ impl Classifier {
     }
 }
 
+/// Whether `screen` shows an approval box, FAIL-CLOSED: the operator's actuator
+/// refuses to type over one (`approval-shaped screens are human-only`), so a
+/// miss here is a keystroke into a box, and every reader that can see one is
+/// asked. It is a box when aterm-phase's parser finds one (`parse_prompt` —
+/// the Claude Code box grammar the supervisor decides on, the folder-trust
+/// dialog included), when the reader the screen identifies reads a prompt
+/// (`aterm_phase::read`: Codex's choice box), or when the generic shape holds
+/// (an approval phrase AND a choice affordance, [`generic_choice_box`]). Any
+/// one suffices; prose merely discussing approval is none of them.
+pub(crate) fn looks_like_approval(screen: &str) -> bool {
+    let rows: Vec<String> = screen.lines().map(str::to_string).collect();
+    if aterm_phase::parse_prompt(&rows).is_some() {
+        return true;
+    }
+    let reading = aterm_phase::read(None, &rows, None);
+    reading.prompt.is_some()
+        || reading.phase == aterm_phase::Phase::Prompt
+        || generic_choice_box(screen)
+}
+
 /// Conservative, deterministic presentation heuristic. Both an approval/request
 /// phrase and an actionable choice affordance must be present; prose merely discussing
 /// approval is not an event.
-pub(crate) fn looks_like_approval(screen: &str) -> bool {
+fn generic_choice_box(screen: &str) -> bool {
     let lower = screen.to_lowercase();
     let request = [
         "do you want to proceed",
@@ -3059,6 +3079,87 @@ mod tests {
             !accepted,
             "stale-snapshot negative control was accepted; binding is vacuous\n{diagnostics}"
         );
+    }
+
+    /// The fail-closed wrapper sees every box aterm-phase parses — measured
+    /// Claude Code 2.1.280 screens — including the folder-trust dialog the
+    /// phrase heuristic alone missed (no "do you want to proceed"): typing
+    /// over it would answer it. NEGATIVE CONTROLS: the same transcript with
+    /// the box gone, and an idle end of turn, are not approvals.
+    /// The cost of [`looks_like_approval`] (the phase parser, the reader,
+    /// then the phrase shape) beside the phrase shape alone, per screen, over
+    /// 400 calls: p50/p99/max in µs. It runs on every observed generation and
+    /// once under the terminal lock in the operator's actuation fence
+    /// (`control::operator_input_if_epoch`). A measurement, not a gate:
+    /// `targo --unverified test -p aterm-gui --lib measure_looks_like_approval
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, run by name"]
+    fn measure_looks_like_approval() {
+        use aterm_phase::prompt::fixtures;
+        let mut screens: Vec<(String, String)> = [
+            ("trust", fixtures::TRUST),
+            ("box-rm", fixtures::BOX_RM),
+            ("box-edit", fixtures::BOX_EDIT),
+            ("end-offer", fixtures::END_OFFER),
+        ]
+        .iter()
+        .map(|(name, f)| (name.to_string(), fixtures::screen(f).join("\n")))
+        .collect();
+        // A busy Claude screen at the evidence bound: rows of transcript.
+        let busy: Vec<String> = (0..EVIDENCE_ROWS)
+            .map(|i| {
+                format!(
+                    "  ⎿  line {i} of a long tool output with some words in it and a path /x/y/z"
+                )
+            })
+            .collect();
+        screens.push(("busy-evidence-bound".into(), busy.join("\n")));
+        for (name, text) in &screens {
+            let t = |f: &dyn Fn(&str) -> bool| {
+                let mut ns: Vec<u128> = (0..400)
+                    .map(|_| {
+                        let at = std::time::Instant::now();
+                        std::hint::black_box(f(std::hint::black_box(text)));
+                        at.elapsed().as_nanos()
+                    })
+                    .collect();
+                ns.sort_unstable();
+                (ns[200] / 1000, ns[396] / 1000, ns[399] / 1000)
+            };
+            let new = t(&looks_like_approval);
+            let old = t(&generic_choice_box);
+            eprintln!(
+                "{name} ({} B): looks_like_approval p50/p99/max {new:?} µs; generic_choice_box {old:?} µs",
+                text.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_approval_check_is_the_phase_parser_or_the_generic_shape() {
+        use aterm_phase::prompt::fixtures;
+        let text = |fixture: &str| fixtures::screen(fixture).join("\n");
+        let trust = text(fixtures::TRUST);
+        assert!(
+            !generic_choice_box(&trust),
+            "the phrase heuristic misses it"
+        );
+        assert!(looks_like_approval(&trust), "the parser does not");
+        for fixture in [
+            fixtures::BOX_RM,
+            fixtures::BOX_EDIT,
+            fixtures::BOX_BASH_TOUCH,
+        ] {
+            assert!(looks_like_approval(&text(fixture)), "{fixture}");
+        }
+        let transcript: String = fixtures::screen(fixtures::BOX_RM)
+            .into_iter()
+            .take_while(|l| !l.starts_with('─'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!looks_like_approval(&transcript), "{transcript}");
+        assert!(!looks_like_approval(&text(fixtures::END_OFFER)));
     }
 
     #[test]

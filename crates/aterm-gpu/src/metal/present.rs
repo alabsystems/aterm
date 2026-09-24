@@ -622,6 +622,22 @@ pub(crate) struct BandShiftPass<'a> {
     pub(crate) scratch: &'a SealedTexture,
 }
 
+/// The M1b INCOMING-ROW APRON (§2: ONE whole-width copy OVER THE PRESENT COPY,
+/// right after the band shift and before the tray): the CPU-rastered incoming
+/// row (`WindowGpu::metal_apron_tex`, `w × cell_h`, uploaded by
+/// `metal_ensure_apron_tex` only when its bytes changed), its top `rows` px
+/// copied onto the strip the shift exposed at `[dst_y, dst_y + rows)`. The
+/// SAME bytes the CPU `paint_incoming_strip` lays, so the strip is
+/// byte-identical across backends by construction. Refused without a present
+/// copy for the same reason as the shift.
+pub(crate) struct ApronStripPass<'a> {
+    pub(crate) tex: &'a SealedTexture,
+    /// First framebuffer row of the exposed strip (`y1 - frac`).
+    pub(crate) dst_y: usize,
+    /// Strip height (`frac`, clamped to the apron's rows).
+    pub(crate) rows: usize,
+}
+
 /// The tray pass (§2: row 17, 4-vertex strip, straight-alpha src-over).
 pub(crate) struct TrayPass<'a> {
     pub(crate) pso: &'a Obj,
@@ -660,14 +676,20 @@ pub(crate) struct PresentSequence<'a> {
     /// `offscreen` directly and the compose copy is skipped (the wgpu
     /// `use_present_off == false` arm).
     pub(crate) present_off: Option<&'a SealedTexture>,
-    /// The compose copy's rect (half-open); the first sync copies the full
-    /// frame. Ignored when `present_off` is `None`.
+    /// The compose copy's rect (half-open) — the caller's stale union
+    /// (`renderer::present_copy_rect`: the offscreen's dirt since the last sync
+    /// plus what the last sequence wrote over the copy); only the first sync
+    /// into a fresh copy is the full frame. Ignored when `present_off` is
+    /// `None`.
     pub(crate) copy_rect: [u32; 4],
     pub(crate) bloom: Option<BloomPasses<'a>>,
     pub(crate) shimmer: Option<ShimmerPass<'a>>,
     /// The sub-row scroll translate, over the copy (requires `present_off`;
     /// the sequence REFUSES it against the bare offscreen).
     pub(crate) band_shift: Option<BandShiftPass<'a>>,
+    /// The incoming row over the strip the translate exposed (requires
+    /// `band_shift`'s present copy; refused likewise).
+    pub(crate) apron: Option<ApronStripPass<'a>>,
     pub(crate) tray: Option<TrayPass<'a>>,
     /// The letterbox blit (row 16) onto the drawable: POST_FS binds; the
     /// clear is the live terminal background.
@@ -808,9 +830,30 @@ pub(crate) fn encode_present_sequence(
         cb.copy_texture_sub_rect(composed, (0, src_y), bs.scratch, (0, 0), w, moved)?;
         // 2. Lay them back at `[dst_y, dst_y+moved)`. The `|frac|`-px strip at
         //    the opposite edge keeps the copy's own (compose-copied) pixels —
-        //    the documented-deferred placeholder, byte for byte what the
-        //    in-place shift left.
+        //    the placeholder the down-bounce keeps, and the up-glide's strip
+        //    until 3c lays the incoming row over it.
         cb.copy_texture_sub_rect(bs.scratch, (0, 0), composed, (0, dst_y), w, moved)?;
+    }
+
+    // 3c. The INCOMING ROW over the exposed strip — AFTER the shift (the strip
+    //     is what it exposed), INSIDE the band (chrome stays pinned), the SAME
+    //     bytes the CPU `paint_incoming_strip` lays (`ApronStripPass`).
+    if let Some(ap) = &seq.apron {
+        if seq.present_off.is_none() {
+            return Err(
+                "the apron strip needs the present copy, never the offscreen (the \
+                 scissor base stays untranslated)"
+                    .to_owned(),
+            );
+        }
+        // The CPU / wgpu arms clamp to the apron's own width; a wider present
+        // copy (an oversized, device-clamped frame) must not turn the strip into
+        // a refused Submit B — the copy verb fails closed on the rect.
+        let w = composed.width().min(ap.tex.width());
+        let rows = ap.rows.min(ap.tex.height());
+        if w > 0 && rows > 0 {
+            cb.copy_texture_sub_rect(ap.tex, (0, 0), composed, (0, ap.dst_y), w, rows)?;
+        }
     }
 
     // 4. Tray: the card over the finished copy (straight-alpha src-over,
@@ -980,7 +1023,8 @@ mod tests {
         overlay: u32,
         border_px: f32,
         encode_srgb: f32,
-        accent: [f32; 4],
+        accent: [f32; 3],
+        chrome_y1: f32,
         dims: [f32; 2],
         wash_a: f32,
         border_a: f32,
@@ -1213,7 +1257,8 @@ mod tests {
             overlay: 0,
             border_px: 0.0,
             encode_srgb: 0.0,
-            accent: [0.0; 4],
+            accent: [0.0; 3],
+            chrome_y1: 0.0,
             dims: [CW as f32, CH as f32],
             wash_a: 0.0,
             border_a: 0.0,
@@ -1353,6 +1398,7 @@ mod tests {
                 bloom: None,
                 shimmer: None,
                 band_shift: None,
+                apron: None,
                 tray: None,
                 blit: PostPass {
                     pso: if is_hdr { &blit_edr } else { &blit_sdr },

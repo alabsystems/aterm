@@ -544,10 +544,12 @@ impl WarmupState {
     ///
     /// True while a warm-up worker is live AND the hold has not reached its
     /// cap. The automatic apply already backs off while the user is interacting
-    /// (`App::update_apply_hands_off_keys`); this is the same shape and the same
-    /// bound — an owner-initiated, seconds-long interaction, hard-capped, and
-    /// consulted ONLY on the automatic lanes. A manual `aterm ctl update apply`
-    /// is never held.
+    /// (`App::update_apply_hands_off_keys`); this is the same shape — an
+    /// owner-initiated, seconds-long interaction, hard-capped, and consulted
+    /// ONLY on the automatic lanes — read as its own ladder fact
+    /// (`App::update_apply_warmup_holds`) that no phase relaxes, so the
+    /// ladder's last phase cannot land on top of the dialog. A
+    /// manual `aterm ctl update apply` is never held.
     ///
     /// It is explicitly NOT "defer while agents are live", which §3.9 refuses:
     /// that trades a shipped invariant (shells survive an update) for a
@@ -1101,28 +1103,27 @@ mod tests {
             "an explicit `aterm ctl update apply` is the user asking for the freeze"
         );
         assert!(!ApplyMode::CleanQuit.is_automatic());
-        // The hold is consulted from exactly one place — the automatic-apply
-        // freeze gate — and that gate is reached only under `is_automatic()`.
+        // The hold is consulted through exactly one App method — the ladder's
+        // `consent_warmup` fact — and every call site sits under `is_automatic()`,
+        // like the keystroke gap beside it.
         let lib = include_str!("lib.rs");
         assert!(
             lib.contains("self.consent_warmup.holds_automatic_apply(now)"),
             "the hold must be wired into the automatic-apply freeze gate"
         );
         let apply_lane = include_str!("app_native.rs");
-        let call_sites: Vec<&str> = apply_lane
-            .lines()
-            .filter(|line| line.contains("update_apply_hands_off_keys"))
-            .collect();
-        assert!(
-            !call_sites.is_empty(),
-            "the freeze gate lost its only caller"
-        );
-        for line in call_sites {
-            assert!(
-                line.contains("is_automatic()"),
-                "the freeze gate (and so the warm-up hold) may only be consulted on an \
-                 automatic lane: {line}"
-            );
+        for gate in ["update_apply_hands_off_keys", "update_apply_warmup_holds"] {
+            let call_sites: Vec<&str> = apply_lane
+                .lines()
+                .filter(|line| line.contains(gate))
+                .collect();
+            assert!(!call_sites.is_empty(), "{gate} lost its callers");
+            for line in call_sites {
+                assert!(
+                    line.contains("is_automatic()"),
+                    "{gate} may only be consulted on an automatic lane: {line}"
+                );
+            }
         }
     }
 

@@ -23,8 +23,9 @@ expose = ["aterm"] # THE one command — window + session + every verb IN ONE BI
 # argv[0] — so nothing else lands in `bundle` as a separate binary.
 bundle = []
 # THE PACKAGE-INDEX ACCOUNT: the GitHub owner atpkg's signed index + program
-# releases are published under — the compiled-in default behind atpkg's account
-# resolution (env ATPKG_ACCOUNT > `[packages].account` config > this). Its OWN
+# releases are published under — the compiled-in account every shipped atpkg
+# reads (only a development build honours a `[packages].account` repoint; there is
+# no environment override since 2026-09-23). Its OWN
 # key on purpose: `[workspace.package] repository` is the PRIVATE staging repo
 # (a default-configured, tokenless install 404s there — no index is ever
 # reachable), and `update_channel` above is the APP-update knob the
@@ -50,9 +51,9 @@ account = "alabsystems"
 #
 # Two consumers read this one key, and a test proves they agree:
 #   * crates/aterm-update-core/build.rs stamps it into ATERM_DEFAULT_OWNER /
-#     ATERM_DEFAULT_REPO, the compiled-in default behind `Source::resolve`
-#     (still overridable per machine by ATERM_UPDATE_OWNER/_REPO env or the
-#     `[update] owner/repo` config — this is only the last-resort default);
+#     ATERM_DEFAULT_REPO, THE channel `Source::resolve` answers in every shipped
+#     binary (only a development build honours an `[update] owner/repo` repoint;
+#     the ATERM_UPDATE_OWNER/_REPO env override is gone since 2026-09-23);
 #   * crates/aterm-release (the `mirror` pipeline step) copies each finished,
 #     verified release here after `verify` and before `unlock`.
 #
@@ -68,7 +69,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.91.0"
+version = "0.92.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -203,6 +204,12 @@ aterm-effects = { path = "crates/aterm-effects" }
 # The mosh-style predictive-echo state machine (extracted from aterm-gui so the
 # web embedders drive the same speculative typing).
 aterm-predict = { path = "crates/aterm-predict" }
+# The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md §1):
+# the message model, glass policy, single-row width law, tagged log ring and
+# line codec behind the band, the Settings ▸ Messages page and the
+# `messages`/`notice` verbs — a clockless aterm-time-only leaf, so the native
+# host and a web host drive ONE implementation and the host only paints cells.
+aterm-messages = { path = "crates/aterm-messages" }
 aterm-suggest = { path = "crates/aterm-suggest" }
 aterm-core = { path = "crates/aterm-core" }
 # The headless half of the control protocol: verb bodies over a `SessionHost`

@@ -188,6 +188,7 @@ fn journal() -> Journal {
         commit: "aed5a06caed5a06caed5a06caed5a06caed5a06c".into(),
         min_build: None,
         arm64_only: false,
+        linux: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
@@ -544,13 +545,13 @@ fn a_journal_carrying_the_retired_lite_digest_key_still_loads() {
             .any(|n| n.contains("lite") || n.contains("offline") || n.contains("x86_64")),
         "{set:?}"
     );
-    mirror::validate_mirror_asset_set(&set, "0.61.0", false, false).unwrap();
+    mirror::validate_mirror_asset_set_with_linux(&set, "0.61.0", false, false, &[]).unwrap();
     // …and a channel head the old cutter already gave the lean twin to is
     // refused, naming the foreign object.
     let mut stale = set.clone();
     stale.push("aterm-0.61.0-lite.dmg".to_string());
     stale.push("aterm-offline.dmg".to_string());
-    let err = mirror::validate_mirror_asset_set(&stale, "0.61.0", false, false)
+    let err = mirror::validate_mirror_asset_set_with_linux(&stale, "0.61.0", false, false, &[])
         .expect_err("the retired twin on the channel head is a foreign object");
     assert!(err.to_string().contains("aterm-0.61.0-lite.dmg"), "{err}");
 }
@@ -3140,21 +3141,39 @@ fn a_resume_past_the_build_never_consults_the_provenance_gate() {
 
 /// The production gate a rebuilding resume runs IS the fresh cut's gate over the same
 /// toolchain: on this machine the two answer identically, pass or refusal, word for word.
+/// Both run READ-ONLY here ([`keep_the_installed_toolchain`]): this reads the machine's
+/// installed toolchain, and a test run must not rewrite it.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_resume_gate_is_the_fresh_cuts_gate_on_this_machine() {
     let fresh = gates::trust_stage2_bin()
-        .and_then(|bin| gates::provenance_gate(&bin.join("trustc")))
+        .and_then(|bin| {
+            gates::provenance_gate_with(&bin.join("trustc"), keep_the_installed_toolchain)
+        })
         .map_err(|e| e.to_string());
-    let resumed = publish::toolchain_provenance_gate().map_err(|e| e.to_string());
+    let resumed = publish::toolchain_provenance_gate_with(keep_the_installed_toolchain)
+        .map_err(|e| e.to_string());
     assert_eq!(resumed, fresh);
     let mut j = journal();
     j.done = vec!["lock".into()];
-    let through_the_rule = publish::resume_provenance_gate(&j, publish::toolchain_provenance_gate)
-        .map_err(|e| e.to_string());
+    let through_the_rule = publish::resume_provenance_gate(&j, || {
+        publish::toolchain_provenance_gate_with(keep_the_installed_toolchain)
+    })
+    .map_err(|e| e.to_string());
     match (&fresh, &through_the_rule) {
         (Ok(()), Ok(())) => {}
         (Err(f), Err(r)) => assert!(r.contains(f.as_str()), "{r}\n--- vs ---\n{f}"),
         other => panic!("the rule must agree with the gate: {other:?}"),
     }
+}
+
+/// A heal that changes nothing: the provenance gate's heal step, for a test that runs
+/// the gate over the machine's INSTALLED toolchain. The real heal is exercised on a
+/// scratch toolchain in the gates' own tests.
+#[cfg(target_os = "macos")]
+fn keep_the_installed_toolchain(
+    _roots: &[std::path::PathBuf],
+    _scratch: &std::path::Path,
+) -> atpkg::provenance::HealOutcome {
+    atpkg::provenance::HealOutcome::Clean
 }

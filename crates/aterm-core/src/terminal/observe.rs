@@ -284,6 +284,16 @@ struct ActivityClock {
     /// (`subscribe.rs`'s GAP-on-flip, `control_query`'s poll cache,
     /// `search_index`); the observation kernel was the one that did not.
     alt: bool,
+    /// The screen GENERATION `last_seq` was read in: the terminal's
+    /// [`invalidation_epoch`](super::ContentScrollState::invalidation_epoch),
+    /// advanced by every screen switch (and RIS, and every coordinate-moving
+    /// batch). `alt` alone cannot see a LEAVE-AND-RE-ENTER: the flag reads
+    /// `true` before and after, the fresh grid's counter can land on the very
+    /// value the old one showed (box A and box B both `seq=15`, measured), and
+    /// a kernel keyed on `(seq, alt)` read the new dialog as no change at all.
+    /// Within one epoch the grid is one grid and its seq only grows, so
+    /// `(epoch, seq)` never repeats — the same pair `status gen=` publishes.
+    epoch: u64,
 }
 
 /// One armed watcher — the single watcher type, distinguished only by `spec`.
@@ -311,6 +321,11 @@ struct Watcher {
     /// on 1049-exit the restored high-water counter fires it with no content
     /// change at all.
     armed_alt: bool,
+    /// Which screen GENERATION this watcher was armed in ([`ActivityClock::
+    /// epoch`]): a re-entered alternate screen is a different grid under the
+    /// same `armed_alt`, so `after` is not comparable across an epoch step
+    /// either, and crossing one latches.
+    armed_epoch: u64,
 }
 
 /// A bounded set of armed watchers plus the activity clock. Lives in
@@ -366,12 +381,22 @@ impl WatcherSet {
         self.clock.last_seq
     }
 
-    /// Which GRID [`seen_seq`](Self::seen_seq) was read from. The dirty-row gate
-    /// compares it so a 1049 swap counts as activity instead of being read as
-    /// "the counter went backwards, nothing happened".
+    /// Which screen GENERATION [`seen_seq`](Self::seen_seq) was read in
+    /// ([`ActivityClock::epoch`]). The dirty-row gate compares it too, so a
+    /// leave-and-re-enter that lands on the same seq and the same grid flag
+    /// still counts as activity.
     #[must_use]
-    pub fn seen_alt(&self) -> bool {
-        self.clock.alt
+    pub fn seen_epoch(&self) -> u64 {
+        self.clock.epoch
+    }
+
+    /// Whether `(seq, alt, epoch)` is a surface change from what the kernel
+    /// last saw: another grid, another generation, or a higher seq on the
+    /// same one. THE one change test — the Terminal glue's row-scan gate and
+    /// [`observe_screen`](Self::observe_screen) both ask it.
+    #[must_use]
+    pub fn is_advance(&self, seq: u64, alt: bool, epoch: u64) -> bool {
+        alt != self.clock.alt || epoch != self.clock.epoch || seq > self.clock.last_seq
     }
 
     /// Whether a row scan would do work this batch: some un-latched row watcher
@@ -415,8 +440,9 @@ impl WatcherSet {
             latched: None,
             fresh,
             // The clock's grid identity IS the arming grid: `Terminal::watch`
-            // seeds it (`seed_seq_in`) immediately before arming.
+            // seeds it (`seed_screen`) immediately before arming.
             armed_alt: self.clock.alt,
+            armed_epoch: self.clock.epoch,
         });
         Some(id)
     }
@@ -444,14 +470,16 @@ impl WatcherSet {
         }
     }
 
-    /// [`seed_seq`](Self::seed_seq) with the ACTIVE-GRID identity. On a grid
-    /// change the baseline is SET, not raised — the monotone rule is only sound
-    /// WITHIN one buffer, and applying it across a swap is what pins the clock
-    /// at the main grid's high-water mark and starves every predicate for the
+    /// [`seed_seq`](Self::seed_seq) with the ACTIVE-GRID identity and the
+    /// screen GENERATION: a new grid or a new generation SETS the baseline,
+    /// not raises it — the monotone rule is only sound WITHIN one generation
+    /// of one buffer, and applying it across a swap is what pins the clock at
+    /// the main grid's high-water mark and starves every predicate for the
     /// whole alt-screen lifetime.
-    pub fn seed_seq_in(&mut self, seq: u64, alt: bool) {
-        if alt != self.clock.alt {
+    pub fn seed_screen(&mut self, seq: u64, alt: bool, epoch: u64) {
+        if alt != self.clock.alt || epoch != self.clock.epoch {
             self.clock.alt = alt;
+            self.clock.epoch = epoch;
             self.clock.last_seq = seq;
             return;
         }
@@ -503,8 +531,9 @@ impl WatcherSet {
         self.observe_in(content_seq, false, newest_block_complete, now, rows)
     }
 
-    /// [`observe`](Self::observe) with the ACTIVE-GRID identity supplied — the
-    /// form the engine calls. A change of `alt` means the counter came from a
+    /// [`observe`](Self::observe) with the ACTIVE-GRID identity supplied (the
+    /// engine calls [`observe_screen`](Self::observe_screen), which adds the
+    /// generation; this form is the tests'). A change of `alt` means the counter came from a
     /// different grid, so it is a **resync**, never a comparison: activity is
     /// stamped and the baseline is SET (not monotonically raised, which is what
     /// would otherwise pin it at the main grid's high-water mark for the whole
@@ -517,11 +546,28 @@ impl WatcherSet {
         now: Instant,
         rows: &[Option<String>],
     ) -> bool {
-        let flipped = alt != self.clock.alt;
-        let advanced = flipped || content_seq > self.clock.last_seq;
+        let epoch = self.clock.epoch;
+        self.observe_screen(content_seq, alt, epoch, newest_block_complete, now, rows)
+    }
+
+    /// [`observe_in`](Self::observe_in) with the screen GENERATION supplied —
+    /// the form the engine calls. A new generation is a resync exactly as a new
+    /// grid is ([`ActivityClock::epoch`]): the counter may repeat across it, so
+    /// the step itself is the change.
+    pub fn observe_screen(
+        &mut self,
+        content_seq: u64,
+        alt: bool,
+        epoch: u64,
+        newest_block_complete: bool,
+        now: Instant,
+        rows: &[Option<String>],
+    ) -> bool {
+        let advanced = self.is_advance(content_seq, alt, epoch);
         if advanced {
             self.clock.last_seq = content_seq;
             self.clock.alt = alt;
+            self.clock.epoch = epoch;
             self.clock.last_at = Some(now);
         }
         let mut latched_any = false;
@@ -539,7 +585,7 @@ impl WatcherSet {
                     // reading from the SAME grid; crossing a buffer swap is a
                     // real surface change, so it latches on the identity change
                     // rather than on an incomparable number.
-                    if alt != w.armed_alt || content_seq > *after {
+                    if alt != w.armed_alt || epoch != w.armed_epoch || content_seq > *after {
                         new_latch = Some(Satisfaction {
                             seq: content_seq,
                             at: now,
@@ -655,7 +701,10 @@ impl super::Terminal {
         // The ACTIVE-GRID identity travels with the reading: `content_seq` is
         // per-grid, so a 1049 swap makes the raw counter incomparable.
         let alt = self.is_alternate_screen();
-        let advanced = alt != self.watchers.seen_alt() || seq > self.watchers.seen_seq();
+        // And the screen GENERATION: a leave-and-re-enter keeps `alt` and can
+        // repeat `seq`; only the epoch says the grid is another one.
+        let epoch = self.content_scroll_state.invalidation_epoch;
+        let advanced = self.watchers.is_advance(seq, alt, epoch);
         // Walk the command blocks ONLY when a BlockComplete watcher is armed.
         let newest_complete = self.watchers.has_block_complete()
             && self.all_blocks().last().is_some_and(|b| {
@@ -689,12 +738,12 @@ impl super::Terminal {
                 *slot = self.row_text_into(i, &mut s).then_some(s);
             }
             self.watchers
-                .observe_in(seq, alt, newest_complete, now, &scratch);
+                .observe_screen(seq, alt, epoch, newest_complete, now, &scratch);
             self.row_text_scratch = scratch;
         } else {
             // Gate closed: no row text needed this batch.
             self.watchers
-                .observe_in(seq, alt, newest_complete, now, &[]);
+                .observe_screen(seq, alt, epoch, newest_complete, now, &[]);
         }
     }
 
@@ -713,7 +762,9 @@ impl super::Terminal {
         // defaults to 0, which would otherwise look like a fresh content jump and
         // spuriously reset an `IdleFor` deadline).
         let seq = self.content_seq();
-        self.watchers.seed_seq_in(seq, self.is_alternate_screen());
+        let epoch = self.content_scroll_state.invalidation_epoch;
+        self.watchers
+            .seed_screen(seq, self.is_alternate_screen(), epoch);
         let id = self.watchers.arm(spec, now)?;
         if arm_eval {
             // Note the ordering: `seed_seq` above has already set the activity
@@ -1083,6 +1134,46 @@ mod tests {
         assert!(w.poll(id).is_none());
         w.observe(2, true, base + Duration::from_millis(2), NO_ROWS);
         assert_eq!(w.poll(id).unwrap().seq, 2);
+    }
+
+    /// The equal-seq re-entry, at the kernel's own level: a row watcher and a
+    /// `SeqAdvanced` armed at `(seq 15, alt, epoch 1)` must see `(seq 15, alt,
+    /// epoch 2)` as a change — the re-entered grid drew a new dialog at the
+    /// same count. NEGATIVE CONTROL: the same reading at the SAME epoch is no
+    /// change, scans nothing and latches nothing.
+    #[test]
+    fn a_new_screen_generation_at_an_equal_seq_is_an_advance() {
+        #[derive(Debug)]
+        struct Contains(&'static str);
+        impl RowMatch for Contains {
+            fn matches(&self, row: &str) -> bool {
+                row.contains(self.0)
+            }
+        }
+        let base = t0();
+        let box_b = [Some("rm -rf /tmp/work".to_string())];
+        for (epoch, moves) in [(1, false), (2, true)] {
+            let mut w = WatcherSet::default();
+            w.seed_screen(15, true, 1);
+            let rows = w
+                .arm(
+                    WatcherSpec::RowMatches {
+                        matcher: Arc::new(Contains("rm -rf")),
+                        rows: RowRange::All,
+                    },
+                    base,
+                )
+                .unwrap();
+            let seq = w.arm(WatcherSpec::SeqAdvanced { after: 15 }, base).unwrap();
+            // The arm-time scan (box A on screen).
+            w.observe_screen(15, true, 1, false, base, &[Some("ls".to_string())]);
+            assert!(w.poll(rows).is_none() && w.poll(seq).is_none());
+            assert_eq!(w.is_advance(15, true, epoch), moves, "epoch {epoch}");
+            w.observe_screen(15, true, epoch, false, base, &box_b);
+            assert_eq!(w.poll(rows).is_some(), moves, "row watcher, epoch {epoch}");
+            assert_eq!(w.poll(seq).is_some(), moves, "seq watcher, epoch {epoch}");
+            assert_eq!(w.seen_epoch(), epoch);
+        }
     }
 
     #[test]

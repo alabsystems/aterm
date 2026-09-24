@@ -140,6 +140,20 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Rainbow kitty typing wake",
         effect_label: "No effect",
     },
+    // THE ONE-PATH COLLAPSE (2026-09-23): atpkg reads the one `stable` channel and keeps
+    // the whole signed set minus `exclude`, so these two `[packages]` keys select
+    // nothing. atpkg names each once where it loads the table; this is Manual saying the
+    // same thing, instead of "unknown to this build".
+    RetiredConfigKeyMetadata {
+        key: "packages.channel",
+        feature: "Package release channel",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "packages.include",
+        feature: "Package include filter",
+        effect_label: "No effect",
+    },
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {
@@ -223,6 +237,16 @@ pub(crate) struct ConfigAnalysis {
     syntax: Vec<ConfigSyntaxSpan>,
     pub(crate) diagnostics: Vec<ConfigDiagnostic>,
     omitted_diagnostics: usize,
+    /// The warnings among [`Self::diagnostics`] that name a RETIRED or
+    /// DEPRECATED spelling (`[packages] auto_update` / `seed_install`,
+    /// `game_font`): a key this build or atpkg still reads, or one a newer key
+    /// now decides — never a key this build does not know. [`key_warnings`]
+    /// keeps them out of the ignored-key family, whose count says its members
+    /// "have no effect in this build" (review of the second origin/main merge,
+    /// 2026-09-23: a person told `auto_update = false` does nothing, who deletes
+    /// it, turns automatic updates back on). The editor paints them like any
+    /// other warning.
+    retired_spellings: Vec<ConfigDiagnostic>,
     /// Worker-built lexical state at every line boundary. Completion rendering
     /// and activation use this immutable index instead of rescanning every byte
     /// before the caret on the event-loop thread.
@@ -268,6 +292,7 @@ impl ConfigAnalysis {
                 message: message.into(),
             }],
             omitted_diagnostics: 0,
+            retired_spellings: Vec::new(),
             assist_index: ConfigAssistIndex::default(),
         }
     }
@@ -827,9 +852,42 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "update",
-        "Software update source",
+        "Software update",
         ConfigSchemaKind::Table,
         &["upgrade", "release", "github"],
+        false,
+    ),
+    // DEVELOPMENT settings (2026-09-23): only a development build honours a repointed
+    // channel or a fork's Team ID; a shipped build reads its compiled ones. Known here so
+    // a developer's config is not called unknown, and never a Settings row.
+    manual(
+        "update.owner",
+        "Update channel owner (development)",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["upgrade", "release", "github", "development"],
+        true,
+    ),
+    manual(
+        "update.repo",
+        "Update channel repository (development)",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["upgrade", "release", "github", "development"],
+        true,
+    ),
+    manual(
+        "update.require_team_id",
+        "Required Team ID (development)",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["upgrade", "signing", "team", "development"],
+        true,
+    ),
+    // The `[reroute]` table: its one Bool leaf rides the native registry
+    // (`prefs::NESTED_LEAVES`); this header is what lets Manual complete `[reroute]`.
+    manual(
+        "reroute",
+        "Toolchain reroute",
+        ConfigSchemaKind::Table,
+        &["cargo", "rustc", "trust", "toolchain"],
         false,
     ),
     // The `[harness]` table (design DESIGN-aterm-wrapper-2026-09-17 §4.6.2):
@@ -843,6 +901,126 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["harness", "wrapper", "claude", "agent"],
         false,
     ),
+    // The supervisor's policy (`aterm_agent::supervise::config::KEYS`, the
+    // in-GUI host's `harness_host`): every key but `enabled`, which is the
+    // Settings row above. Known here so the file's `[harness]` keys are
+    // completed and a misspelled one is reported, not silently dropped;
+    // `every_supervisor_key_is_known_to_the_config_language` pins the two lists.
+    manual(
+        "harness.headless",
+        "Supervise in a headless instance",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "headless", "test"],
+        true,
+    ),
+    manual(
+        "harness.auto_reads",
+        "Approve read-only commands",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "approve", "bash", "read"],
+        true,
+    ),
+    manual(
+        "harness.rm_breaker",
+        "Answer the rm circuit breaker for scratch paths",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "approve", "rm", "scratch"],
+        true,
+    ),
+    manual(
+        "harness.read_outside_cwd",
+        "Approve reads outside the project",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "approve", "read", "file"],
+        true,
+    ),
+    manual(
+        "harness.trust_dialog",
+        "Answer the folder-trust dialog",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "trust", "folder", "worktree"],
+        true,
+    ),
+    manual(
+        "harness.trust_roots",
+        "Folders trusted without asking",
+        ConfigSchemaKind::StringList,
+        &["supervisor", "trust", "folder", "worktree"],
+        true,
+    ),
+    manual(
+        "harness.dismiss_surveys",
+        "Dismiss the session survey",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "survey", "feedback"],
+        true,
+    ),
+    manual(
+        "harness.continue",
+        "Continue a turn that ended early",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "continue", "keep going"],
+        true,
+    ),
+    manual(
+        "harness.continue_per_hour",
+        "Continuations per session per hour",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["supervisor", "continue", "budget"],
+        true,
+    ),
+    manual(
+        "harness.continue_text",
+        "Continuation text",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["supervisor", "continue", "keep going"],
+        true,
+    ),
+    manual(
+        "harness.rules_file",
+        "Standing rules appended to a continuation",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["supervisor", "continue", "rules"],
+        true,
+    ),
+    manual(
+        "harness.retry_api_errors",
+        "Retry after an API error or an overload",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "529", "overloaded", "retry"],
+        true,
+    ),
+    manual(
+        "harness.resume_limits",
+        "Continue when a usage limit resets",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "limit", "usage", "reset"],
+        true,
+    ),
+    manual(
+        "harness.model_fallback",
+        "Model to switch to at a model limit",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["supervisor", "model", "limit", "opus"],
+        true,
+    ),
+    manual(
+        "harness.compact_on_context_wall",
+        "Compact when the context is full",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "context", "compact"],
+        true,
+    ),
+    // Not the supervisor's: the live agent upgrade's switch
+    // (`aterm harness upgrade`, the window's minute sweep), in this table so
+    // `[harness]` stays the one policy home.
+    manual(
+        "harness.upgrade",
+        "Restart live Claude Code sessions onto a newer build",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["upgrade", "update", "claude", "restart"],
+        true,
+    ),
     manual(
         "packages",
         "Toolchain packages",
@@ -852,30 +1030,16 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "packages.enabled",
-        "Package background service",
+        "Automatic updates",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["atpkg", "tools", "master"],
         true,
     ),
     manual(
         "packages.account",
-        "Package index account",
+        "Package index account (development)",
         ConfigSchemaKind::Scalar(EditKind::Text),
-        &["atpkg", "owner", "github"],
-        true,
-    ),
-    manual(
-        "packages.channel",
-        "Package release channel",
-        ConfigSchemaKind::Scalar(EditKind::Text),
-        &["atpkg", "stable", "release"],
-        true,
-    ),
-    manual(
-        "packages.include",
-        "Included packages",
-        ConfigSchemaKind::StringList,
-        &["atpkg", "filter", "allow"],
+        &["atpkg", "owner", "github", "development"],
         true,
     ),
     manual(
@@ -1534,7 +1698,10 @@ fn did_you_mean(suggestion: Option<&str>) -> String {
 }
 
 /// Every key in `source` this build will silently ignore: a misspelling, a key
-/// from a future aterm, or a retired spelling that no longer does anything.
+/// from a future aterm, or a retired spelling that no longer does anything —
+/// plus the retired and deprecated spellings that ARE still read, each in its
+/// own words, so `--validate-config` lists every key that needs an edit. The
+/// band splits the two ([`key_warnings`]).
 ///
 /// THE SEAM. `Config`'s serde derive accepts unknown keys BY DESIGN — forward
 /// compatibility, plus `[packages]` keys that only the co-located `atpkg` reads —
@@ -1546,28 +1713,75 @@ fn did_you_mean(suggestion: Option<&str>) -> String {
 /// A TOML syntax error yields nothing: the caller's own parse reports it with a
 /// line and column, and restating it here would double the message.
 pub(crate) fn ignored_key_warnings(source: &str) -> Vec<String> {
-    if source.len() > MAX_CONFIG_ANALYSIS_BYTES {
-        return Vec::new();
-    }
-    let Ok(document) = source.parse::<aterm_toml::edit::DocumentMut>() else {
+    let Some(analysis) = key_analysis(source) else {
         return Vec::new();
     };
+    let mut lines = analysis
+        .diagnostics
+        .iter()
+        .map(key_warning_line)
+        .collect::<Vec<_>>();
+    lines.extend(omitted_key_line(&analysis));
+    lines
+}
+
+/// [`ignored_key_warnings`] in two halves, from ONE walk: the band's view
+/// (`app_config::collect_key_notices`). `retired` holds the retired and
+/// deprecated spellings ([`ConfigAnalysis::retired_spellings`]); `ignored`
+/// holds every other line, the bounded validator's roll-up included. Each half
+/// keeps source order.
+pub(crate) fn key_warnings(source: &str) -> KeyWarnings {
+    let Some(analysis) = key_analysis(source) else {
+        return KeyWarnings::default();
+    };
+    let mut warnings = KeyWarnings::default();
+    for diagnostic in &analysis.diagnostics {
+        let half = if analysis.retired_spellings.contains(diagnostic) {
+            &mut warnings.retired
+        } else {
+            &mut warnings.ignored
+        };
+        half.push(key_warning_line(diagnostic));
+    }
+    warnings.ignored.extend(omitted_key_line(&analysis));
+    warnings
+}
+
+/// The two halves [`key_warnings`] returns.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeyWarnings {
+    /// Keys this build does nothing with, and the machine table's type errors.
+    pub(crate) ignored: Vec<String>,
+    /// Retired and deprecated spellings, each sentence saying whether the key
+    /// is still read and what to rename or remove.
+    pub(crate) retired: Vec<String>,
+}
+
+/// The key walk [`ignored_key_warnings`] and [`key_warnings`] share; `None`
+/// past the analysis bound or on a TOML syntax error.
+fn key_analysis(source: &str) -> Option<ConfigAnalysis> {
+    if source.len() > MAX_CONFIG_ANALYSIS_BYTES {
+        return None;
+    }
+    let document = source.parse::<aterm_toml::edit::DocumentMut>().ok()?;
     let mut analysis = ConfigAnalysis::default();
     validate_machine_types(source, &document, &mut analysis);
     warn_compatibility_only_values(source, &document, &mut analysis);
     warn_unknown_values(source, &document, &mut analysis);
-    let mut lines = analysis
-        .diagnostics
-        .iter()
-        .map(|diagnostic| format!("line {}: {}", diagnostic.line, diagnostic.message))
-        .collect::<Vec<_>>();
-    if analysis.omitted_diagnostics > 0 {
-        lines.push(format!(
+    Some(analysis)
+}
+
+fn key_warning_line(diagnostic: &ConfigDiagnostic) -> String {
+    format!("line {}: {}", diagnostic.line, diagnostic.message)
+}
+
+fn omitted_key_line(analysis: &ConfigAnalysis) -> Option<String> {
+    (analysis.omitted_diagnostics > 0).then(|| {
+        format!(
             "{} further ignored key(s) not listed by the bounded validator",
             analysis.omitted_diagnostics
-        ));
-    }
-    lines
+        )
+    })
 }
 
 /// A spelling the registry domain rejects that the RUNTIME nonetheless resolves.
@@ -1679,6 +1893,7 @@ pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
         syntax: lex_toml(source),
         diagnostics: Vec::new(),
         omitted_diagnostics: 0,
+        retired_spellings: Vec::new(),
         assist_index: build_assist_index(source),
     };
     if source.len() > MAX_CONFIG_ANALYSIS_BYTES {
@@ -2471,12 +2686,59 @@ fn warn_unknown_values(
 ) {
     for (key, item) in document.iter() {
         let path = crate::native_config_service::join_config_key_path("", key);
-        warn_unknown_item(source, item, &path, analysis);
+        warn_unknown_item(source, document, item, &path, analysis);
+    }
+}
+
+/// The item at `dotted` (`packages.enabled`) in `document`, if written.
+fn item_at<'a>(
+    document: &'a aterm_toml::edit::DocumentMut,
+    dotted: &str,
+) -> Option<&'a aterm_toml::edit::Item> {
+    let mut parts = dotted.split('.');
+    let mut item = document.get(parts.next()?)?;
+    for part in parts {
+        item = item.get(part)?;
+    }
+    Some(item)
+}
+
+/// What the editor says of a retired `[packages]` spelling — atpkg doctor's words
+/// (`atpkg::config::auto_update_note` for `auto_update`), so the two never give a person
+/// two recoveries. The rename is offered ONLY when the new key is not already written:
+/// with both present, a rename writes the key twice, the file stops parsing, and atpkg
+/// reads an unreadable table as automatic updates ON — the opt-out reversed by following
+/// the advice.
+fn retired_packages_message(
+    document: &aterm_toml::edit::DocumentMut,
+    path: &str,
+    current: &str,
+    value: Option<bool>,
+) -> String {
+    let written = item_at(document, current);
+    if path == "packages.auto_update"
+        && let Some(value) = value
+    {
+        let enabled = written.and_then(aterm_toml::edit::Item::as_bool);
+        if written.is_none() || enabled.is_some() {
+            return atpkg::config::auto_update_note(value, enabled);
+        }
+    }
+    // "Retired", the word atpkg doctor, Settings ▸ Packages and Settings ▸ Modified use for
+    // the same key (review of the Phase 4 merge, 2026-09-23: one key, one story).
+    if written.is_some() {
+        format!("`{path}` is retired and `{current}` decides; remove it")
+    } else {
+        format!(
+            "`{path}` is retired; rename it to `{current}` (the old key is still \
+             read — Settings writes the new one and drops the old)"
+        )
     }
 }
 
 fn warn_unknown_item(
     source: &str,
+    document: &aterm_toml::edit::DocumentMut,
     item: &aterm_toml::edit::Item,
     path: &str,
     analysis: &mut ConfigAnalysis,
@@ -2487,6 +2749,34 @@ fn warn_unknown_item(
         // Orca key two contradictory recovery stories.
         return;
     }
+    if let Some((_, current)) = crate::prefs::RETIRED_PACKAGES_SPELLINGS
+        .iter()
+        .find(|(retired, _)| *retired == path)
+    {
+        // RETIRED, not unknown (2026-09-23): atpkg still honours the retired
+        // `[packages]` spelling — `auto_update = false` reads as `enabled = false`,
+        // `seed_install` as `auto_install` while that is unset — so "unknown to this
+        // build" would be a lie. Name the rename, and the type the value needs.
+        let range = source_value_range(source, path)
+            .or_else(|| item.span())
+            .unwrap_or(0..source.len().min(1));
+        push_retired_spelling(
+            analysis,
+            source,
+            range.clone(),
+            retired_packages_message(document, path, current, item.as_bool()),
+        );
+        if item.as_bool().is_none() {
+            push_diagnostic(
+                analysis,
+                source,
+                range,
+                ConfigDiagnosticSeverity::Error,
+                format!("{path} must be true or false"),
+            );
+        }
+        return;
+    }
     if path == crate::prefs::LEGACY_EDIT_DISPLAY_FONT {
         // DEPRECATED, not unknown. The key still parses and still applies (a
         // serde alias on `Config::display_font`); "unknown to this build" would
@@ -2495,11 +2785,10 @@ fn warn_unknown_item(
         let range = source_value_range(source, path)
             .or_else(|| item.span())
             .unwrap_or(0..source.len().min(1));
-        push_diagnostic(
+        push_retired_spelling(
             analysis,
             source,
             range.clone(),
-            ConfigDiagnosticSeverity::Warning,
             format!(
                 "`{path}` is deprecated; rename it to `{current}` (the old key still \
                  applies — the faces are named for the letterform now, not a game)",
@@ -2549,7 +2838,7 @@ fn warn_unknown_item(
     if let Some(table) = item.as_table_like() {
         for (key, child) in table.iter() {
             let child_path = crate::native_config_service::join_config_key_path(path, key);
-            warn_unknown_item(source, child, &child_path, analysis);
+            warn_unknown_item(source, document, child, &child_path, analysis);
         }
         return;
     }
@@ -3319,6 +3608,29 @@ fn push_diagnostic(
     severity: ConfigDiagnosticSeverity,
     message: String,
 ) {
+    let _ = analysis.insert_diagnostic(located_diagnostic(source, bytes, severity, message));
+}
+
+/// A retired or deprecated spelling's warning: pushed like any other, and
+/// remembered in [`ConfigAnalysis::retired_spellings`] so the band can tell it
+/// from a key this build does not know ([`key_warnings`]).
+fn push_retired_spelling(
+    analysis: &mut ConfigAnalysis,
+    source: &str,
+    bytes: Range<usize>,
+    message: String,
+) {
+    let diagnostic = located_diagnostic(source, bytes, ConfigDiagnosticSeverity::Warning, message);
+    analysis.retired_spellings.push(diagnostic.clone());
+    let _ = analysis.insert_diagnostic(diagnostic);
+}
+
+fn located_diagnostic(
+    source: &str,
+    bytes: Range<usize>,
+    severity: ConfigDiagnosticSeverity,
+    message: String,
+) -> ConfigDiagnostic {
     let start = bytes.start.min(source.len());
     let end = bytes.end.min(source.len()).max(start);
     let start = floor_char_boundary(source, start);
@@ -3331,13 +3643,13 @@ fn push_diagnostic(
         .chars()
         .count()
         + 1;
-    let _ = analysis.insert_diagnostic(ConfigDiagnostic {
+    ConfigDiagnostic {
         bytes: start..end,
         line,
         column,
         severity,
         message,
-    });
+    }
 }
 
 #[cfg(test)]
@@ -3777,9 +4089,11 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "\"cat\" renders the cat graphic; \"paw\" is legacy ink-only and renders no paw graphic"
             .to_string()
     } else if setting.key == "packages.account" {
-        "GitHub owner slug (letters, digits, dot, underscore, or hyphen)".to_string()
+        "GitHub owner slug (letters, digits, dot, underscore, or hyphen); a development build only"
+            .to_string()
     } else if setting.key == "packages.links" {
-        "named absolute/~/ checkout paths or owner/repo slugs".to_string()
+        "named absolute/~/ checkout paths (dev links), or owner/repo slugs (a development build only)"
+            .to_string()
     } else {
         match setting.kind {
             ConfigSchemaKind::Scalar(EditKind::Float) => "number".to_string(),
@@ -3915,19 +4229,26 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · 0 searches only the live screen; a bounded index can report partial results for older retained history"
         }
         crate::prefs::EDIT_PACKAGES_ENABLED => {
-            " · gates only the background package service; explicit package commands remain available when the trust-root gate is open"
-        }
-        crate::prefs::EDIT_PACKAGES_AUTO_UPDATE => {
-            " · both packages.enabled and packages.auto_update must be true; the interval environment variable changes cadence only"
+            " · Automatic updates — the one switch for the background package service (the retired auto_update is read as it), read live by the window (off stands it down within seconds, on resumes it); a published public index is picked up within minutes, and a full signed check runs every six hours across every aterm on the machine; explicit package commands and Update Now remain available when the trust-root gate is open"
         }
         crate::prefs::EDIT_PACKAGES_AUTO_INSTALL => {
-            " · takes effect on an update/package operation and cannot bypass $ATPKG_DISABLE or the package trust-root gate"
+            " · the one install consent (the retired seed_install is read as it while this is unset): the first-run fill and new members of the signed set; uninstall, exclude and packages.enabled = false always win, and it cannot bypass the package trust-root gate"
         }
-        "packages.channel" => " · a blank value is treated as unset and resolves to stable",
+        crate::prefs::EDIT_UPDATE_ENABLED => {
+            " · off stops the background checks only — Check for Updates, `aterm update check` and installing a downloaded build still run; read at launch · the native updater runs on macOS and Linux"
+        }
+        crate::prefs::EDIT_REROUTE_ANNOUNCE => {
+            " · false silences the line a rerouted cargo/rustc/tlc prints before it runs upstream; the tool still runs, and a direct substitution still says what it ran"
+        }
         "update.owner" | "update.repo" => {
-            " · safe GitHub slug only; invalid/blank values fall through · in-app updates are macOS-only"
+            " · a development build only; a shipped build reads its compiled channel · safe GitHub slug only; invalid/blank values fall through · the native updater runs on macOS and Linux"
         }
-        "update.auto_apply" => " · in-app update application is macOS-only",
+        "update.require_team_id" => {
+            " · a development build only; a shipped build's compiled Team ID always wins"
+        }
+        "update.auto_apply" => {
+            " · off, a downloaded build installs only when you ask — Update Now on macOS, `aterm update apply` on Linux · the native updater runs on macOS and Linux"
+        }
         "sparkle_words.lexicon" => {
             " · loaded on the host; unreadable or rejected files are skipped while built-ins remain active"
         }
@@ -4683,6 +5004,39 @@ mod tests {
         assert_eq!(
             highlighted(source, &analysis, EditorSyntaxClass::Comment),
             ["# terminal colors"]
+        );
+    }
+
+    /// A RETIRED `[packages]` SPELLING NEVER GETS ADVICE THAT BREAKS THE FILE (2026-09-23
+    /// review). With `enabled` already written, "rename `auto_update` to `enabled`" wrote
+    /// the key twice — a file that no longer parses, which atpkg reads as automatic
+    /// updates ON. The editor says atpkg doctor's words: rename only when the new key is
+    /// absent; otherwise remove the old one, and keep an off switch off in `enabled`.
+    #[test]
+    fn a_retired_packages_key_is_never_told_to_rename_onto_a_written_key() {
+        let message = |source: &str| -> String {
+            analyze(source)
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .find(|m| m.contains("auto_update") || m.contains("seed_install"))
+                .unwrap_or_else(|| panic!("a retired-key diagnostic for {source:?}"))
+        };
+        let both = message("[packages]\nenabled = true\nauto_update = false\n");
+        assert!(!both.contains("rename"), "{both}");
+        assert!(
+            both.contains("remove it and set `enabled = false`"),
+            "{both}"
+        );
+        let alone = message("[packages]\nauto_update = false\n");
+        assert!(alone.contains("rename it to `enabled`"), "{alone}");
+        let seed_both = message("[packages]\nauto_install = true\nseed_install = false\n");
+        assert!(!seed_both.contains("rename"), "{seed_both}");
+        assert!(seed_both.contains("remove it"), "{seed_both}");
+        let seed_alone = message("[packages]\nseed_install = false\n");
+        assert!(
+            seed_alone.contains("rename it to `packages.auto_install`"),
+            "{seed_alone}"
         );
     }
 
@@ -5817,22 +6171,24 @@ home = "~/aterm"
         assert!(ignored_key_warnings(source).is_empty());
         assert!(unaccepted_value_warnings(source, &[]).is_empty());
         assert!(analyze(source).diagnostics.is_empty());
-        let notices = crate::app_config::ignored_key_notices(source);
-        assert!(
-            crate::config_notice::ConfigNotice::new(notices, std::time::Instant::now()).is_none(),
-            "valid machine opt-outs must not paint a banner over a real terminal"
+        let mut warns = crate::message_reporters::ConfigWarnings::default();
+        crate::app_config::collect_key_notices(&mut warns, source);
+        assert_eq!(
+            warns.into_messages().len(),
+            0,
+            "valid machine opt-outs must not post a row over a real terminal"
         );
 
-        // A real typo must still create the notice the historical omission
+        // A real typo must still create the message the historical omission
         // incorrectly created for both supported keys.
         let typo = source.replace("spotlight_noindex", "spotlight_noindx");
         let notices = crate::app_config::ignored_key_notices(&typo);
         assert!(notices.iter().any(|line| {
             line.contains("machine.spotlight_noindx") && line.contains("machine.spotlight_noindex")
         }));
-        assert!(
-            crate::config_notice::ConfigNotice::new(notices, std::time::Instant::now()).is_some()
-        );
+        let mut warns = crate::message_reporters::ConfigWarnings::default();
+        warns.extend(crate::message_reporters::ConfigFamily::IgnoredKeys, notices);
+        assert_eq!(warns.into_messages().len(), 1, "one row for the family");
     }
 
     #[test]
@@ -5943,8 +6299,6 @@ home = "~/aterm"
             r#"[packages]
 enabled = true
 account = "alabsystems"
-channel = "stable"
-include = ["ay"]
 exclude = ["trust"]
 [packages.links]
 ay = "~/ay"
@@ -6329,8 +6683,25 @@ expect_nonce = "pin"
                 .contains("desktop delivery is implemented on macOS and Windows")
         );
         assert!(help_for("option_as_meta").contains("ESC-prefixed Meta on every platform"));
-        assert!(help_for("update.owner").contains("in-app updates are macOS-only"));
-        assert!(help_for("update.auto_apply").contains("macOS-only"));
+        // The native updater runs on macOS AND Linux (`aterm_update::enabled`): the
+        // `[update]` help names both and each platform's own manual lane, never
+        // "macOS-only" (2026-09-24 review — the Settings card and the registry already
+        // said so, and this surface contradicted them on a Linux build).
+        for key in [
+            crate::prefs::EDIT_UPDATE_ENABLED,
+            "update.owner",
+            "update.repo",
+            "update.auto_apply",
+        ] {
+            let help = help_for(key);
+            assert!(
+                help.contains("the native updater runs on macOS and Linux"),
+                "{key}: {help}"
+            );
+            assert!(!help.contains("macOS-only"), "{key}: {help}");
+        }
+        assert!(help_for(crate::prefs::EDIT_UPDATE_ENABLED).contains("`aterm update check`"));
+        assert!(help_for("update.auto_apply").contains("`aterm update apply` on Linux"));
         assert!(help_for(crate::prefs::EDIT_MOTION).contains(crate::prefs::motion_auto_help()));
         // The query help is platform-split and states the WIDEST grant: the
         // system clipboard off-Linux (what the Query arm actually answers
@@ -6365,15 +6736,18 @@ expect_nonce = "pin"
             "{window_ops_help}"
         );
         assert!(help_for("matrix_rain.hue").contains("matrix / theme / #RRGGBB"));
-        assert!(help_for("packages.channel").contains("resolves to stable"));
-        let auto = help_for(crate::prefs::EDIT_PACKAGES_AUTO_UPDATE);
-        assert!(auto.contains("both packages.enabled and packages.auto_update"));
-        assert!(auto.contains("$ATPKG_UPDATE_INTERVAL_SECS"));
-        assert!(auto.contains("0 runs once"));
-        assert!(
-            help_for(crate::prefs::EDIT_PACKAGES_AUTO_INSTALL)
-                .contains("cannot bypass $ATPKG_DISABLE")
-        );
+        let auto = help_for(crate::prefs::EDIT_PACKAGES_ENABLED);
+        assert!(auto.contains("the one switch"), "{auto}");
+        // Phase 3 deleted the cadence knob and Phase 4 every environment alternative:
+        // no environment variable is taught here.
+        assert!(!auto.contains('$'), "{auto}");
+        assert!(!auto.contains("environment variable"), "{auto}");
+        assert!(auto.contains("within minutes"), "{auto}");
+        assert!(auto.contains("every six hours"), "{auto}");
+        let install = help_for(crate::prefs::EDIT_PACKAGES_AUTO_INSTALL);
+        assert!(install.contains("the one install consent"), "{install}");
+        assert!(install.contains("always win"), "{install}");
+        assert!(!install.contains("ATPKG_"), "{install}");
 
         let source = "trail_sounds = true\ntrail_sound_volume = 0.4\n\
 confirm_multiline_paste = true\nallow_notifications = true\n";
@@ -6768,10 +7142,10 @@ ink = { colorway = "twotone:#112233,#445566,#778899" }
 
     #[test]
     fn literal_dotted_keys_are_unknown_and_cannot_impersonate_nested_schema_paths() {
-        let source = r#""packages.include" = ["literal"]
+        let source = r#""packages.exclude" = ["literal"]
 
 [packages]
-include = ["nested"]
+exclude = ["nested"]
 "#;
         let analysis = analyze(source);
         assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
@@ -6783,26 +7157,26 @@ include = ["nested"]
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains(r#""packages.include" is unknown"#)),
+                .any(|message| message.contains(r#""packages.exclude" is unknown"#)),
             "the literal segment must retain an unknown, forward-compatible identity: {messages:?}"
         );
         assert!(
             messages
                 .iter()
-                .all(|message| !message.contains("packages.include is unknown")),
+                .all(|message| !message.contains("packages.exclude is unknown")),
             "the nested registered path must not be diagnosed as unknown: {messages:?}"
         );
-        assert!(config_schema_entry(r#""packages.include""#).is_none());
+        assert!(config_schema_entry(r#""packages.exclude""#).is_none());
         assert!(
-            config_schema_entry("packages.include").is_some_and(|entry| entry.manual_reset_safe)
+            config_schema_entry("packages.exclude").is_some_and(|entry| entry.manual_reset_safe)
         );
 
-        let literal_value = r#""packages.include" = "#;
+        let literal_value = r#""packages.exclude" = "#;
         let literal_assist = assist(literal_value, literal_value.len());
         assert!(literal_assist.completions.is_empty());
         assert!(literal_assist.help.is_none());
 
-        let quoted_nested_value = "[packages]\n\"include\" = ";
+        let quoted_nested_value = "[packages]\n\"exclude\" = ";
         let nested_assist = assist(quoted_nested_value, quoted_nested_value.len());
         assert!(nested_assist.completions.iter().any(|completion| {
             completion.insertion == "[]" && completion.help.contains("list of text values")
@@ -6895,7 +7269,7 @@ fps = 999
             );
         }
         for (key, kind, reset_safe) in [
-            ("packages.include", ConfigSchemaKind::StringList, true),
+            ("packages.exclude", ConfigSchemaKind::StringList, true),
             ("packages.links", ConfigSchemaKind::DynamicStringMap, true),
             ("keybindings", ConfigSchemaKind::DynamicStringMap, true),
             ("key_sequences", ConfigSchemaKind::DynamicStringMap, true),
@@ -6944,10 +7318,10 @@ fps = 999
                 && completion.help.contains("array of tables")
         }));
 
-        let package_source = "[packages]\ninc";
+        let package_source = "[packages]\nexc";
         let package_key = assist(package_source, package_source.len());
         assert!(package_key.completions.iter().any(|completion| {
-            completion.insertion == "include = []"
+            completion.insertion == "exclude = []"
                 && completion.help.contains("list of text values")
         }));
 
@@ -7281,7 +7655,7 @@ fps = 999
         let nested_candidate = nested_assist
             .completions
             .iter()
-            .find(|completion| completion.insertion == "include = []")
+            .find(|completion| completion.insertion == "exclude = []")
             .expect("another packages completion");
         let mut completed_nested = nested.to_string();
         completed_nested.replace_range(
@@ -7411,18 +7785,18 @@ words = ["two"]
 note = """
 [packages] # not a table
 # not a comment
-include =
+exclude =
 """
 sty"#,
             r#"[sparkle_words.profanity]
 note = '''
 [packages] # not a table
 # not a comment
-include =
+exclude =
 '''
 sty"#,
         ] {
-            for marker in ["[packages]", "# not a comment", "include ="] {
+            for marker in ["[packages]", "# not a comment", "exclude ="] {
                 let caret = source.find(marker).unwrap() + marker.len();
                 assert_eq!(
                     assist(source, caret),
@@ -7443,7 +7817,7 @@ sty"#,
                 after
                     .completions
                     .iter()
-                    .all(|completion| !completion.insertion.starts_with("include = "))
+                    .all(|completion| !completion.insertion.starts_with("exclude = "))
             );
         }
     }
@@ -7454,10 +7828,10 @@ sty"#,
 note = """
 escaped delimiter: \"""
 [packages]
-include =
+exclude =
 """
 sty"#;
-        let fake_include = source.find("include =").unwrap() + "include =".len();
+        let fake_include = source.find("exclude =").unwrap() + "exclude =".len();
         assert_eq!(
             assist(source, fake_include),
             ConfigAssist::default(),
@@ -7498,7 +7872,7 @@ sty"#;
         while source.len() < 400 * 1024 {
             source.push_str("# bounded filler\n");
         }
-        source.push_str("inc");
+        source.push_str("exc");
         let analysis = analyze(&source);
         assert_eq!(
             analysis.assist_index.lines.len(),
@@ -7509,7 +7883,7 @@ sty"#;
             indexed
                 .completions
                 .iter()
-                .any(|completion| completion.insertion == "include = []")
+                .any(|completion| completion.insertion == "exclude = []")
         );
     }
 
@@ -7585,9 +7959,6 @@ sty"#;
             "net.listen",
             "net.cert",
             "net.key",
-            "update.owner",
-            "update.repo",
-            "update.auto_apply",
             crate::prefs::EDIT_FALLBACK_FONTS,
             crate::prefs::EDIT_SYMBOL_FONT,
             crate::prefs::EDIT_EMOJI_FONT,
@@ -8210,6 +8581,44 @@ sty"#;
             .len(),
             1,
             "a platform note never said the value was wrong"
+        );
+    }
+
+    /// The supervisor's `[harness]` keys (`aterm_agent::supervise::config::
+    /// KEYS`) are the config language's: each is completed, and a misspelled
+    /// one is an ignored-key notice — never dropped in silence. `enabled` is
+    /// the Settings row (`prefs::EDIT_HARNESS_ENABLED`).
+    #[test]
+    fn every_supervisor_key_is_known_to_the_config_language() {
+        for key in aterm_agent::supervise::config::KEYS {
+            let dotted = format!("harness.{key}");
+            let known = *key == "enabled" && dotted == crate::prefs::EDIT_HARNESS_ENABLED
+                || MANUAL_SCHEMA.iter().any(|e| e.key == dotted);
+            assert!(known, "{dotted} is not in the config language");
+        }
+        let good = "[harness]\nenabled = true\ncontinue = false\ncontinue_per_hour = 3\n\
+                    trust_roots = [\"~/aterm*\", \"/private/tmp/claude-*\"]\n\
+                    model_fallback = \"opus\"\n";
+        let warned = key_warnings(good);
+        assert!(warned.ignored.is_empty(), "{:?}", warned.ignored);
+        // Every key the supervisor reads is applied: no label says otherwise.
+        for e in MANUAL_SCHEMA
+            .iter()
+            .filter(|e| e.key.starts_with("harness."))
+        {
+            assert!(
+                !e.label.ends_with(" (not yet applied)"),
+                "{}: {}",
+                e.key,
+                e.label
+            );
+        }
+        // NEGATIVE CONTROL: a typo inside the table is reported by name.
+        let typo = key_warnings("[harness]\ncontine = true\n");
+        assert!(
+            typo.ignored.iter().any(|l| l.contains("contine")),
+            "{:?}",
+            typo.ignored
         );
     }
 }

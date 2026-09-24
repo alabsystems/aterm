@@ -2,165 +2,67 @@
 // Copyright 2026 Andrew Yates
 
 //! The harness core: the PURE judgments behind the aterm wrapper
-//! (`docs/DESIGN-aterm-wrapper-2026-09-17.md`), kept free of every seam that
-//! needs an owner ruling (the design's D1, D1' and D6): nothing here talks to a
-//! control socket, answers a hook, types into a session or paints a status bar.
-//! A host inside `aterm-gui` (TARGET, design §4.1) will call these; until then
-//! they are libraries with tests.
+//! (`docs/DESIGN-aterm-wrapper-2026-09-17.md`), and the read verbs over them.
+//! Nothing here types into a session or answers a hook; the one engine that
+//! ACTS is [`crate::supervise`], which calls [`rm_policy`] through its
+//! approval policy.
 //!
-//! * [`accounts`] — THE ACCOUNT ROSTER (design §5.6): `accounts.toml`, the
-//!   two non-secret facts each config directory's own `.claude.json` already
-//!   carries, and §5.6's selection rule — lowest seven-day utilisation among
-//!   accounts whose five-hour window is not exhausted, ties by priority, and
-//!   never an account whose last observed state is `login-expired` (§5.8.10).
-//!   NO credential is read, stored or forwarded anywhere in it. It is what
-//!   fills [`watch::WatchConfig`]'s `accounts_enabled` and `account_dir`;
-//!   before it existed nothing did, so a rotation was refused
-//!   `refused:unresolved` while its table row read as live. The ROTATION
-//!   ITSELF is refused `refused:unsupported` as of 2026-09-22: no control
-//!   verb carries an environment into a new session, so §5.6's mechanism (a
-//!   `spawn` of the twin whose PRELUDE selects `CLAUDE_CONFIG_DIR`) waits on
-//!   the §4.1 host. The selection is real and printed; the act is not
-//!   available, and the ledger now says which.
-//! * [`align`] — THE PACKAGING CONTRACT AND THE ALIGNMENT VERDICT (design
-//!   §1.2, §3.1-§3.8): `harness.toml` admitted fail-closed and whole-file, the
-//!   probes of §3.2 run against the installed program, and the per-capability
-//!   verdict that comes out — degradation rather than all-or-nothing, and the
-//!   signed × local intersection that can only ever narrow. The row it keys is
-//!   spelled in `atpkg::harness`; this module owns the WIRE word.
-//! * [`observe`] — THE GRID SPINE: harness events read from aterm's own view
-//!   of a session (`status`, the parsed grid, `offscreen`, `search`) with NO
-//!   vendor hook in the path (design §0.2, §4.2, §5.8.1). It is the stage
-//!   every other capability stands on, and the answer to the owner's central
-//!   objection: `--bare` removes hooks, plugins and the statusLine in one
-//!   flag, and an ADOPTED session owns no shell-integration block, so a
-//!   capability that only works when a hook fires is the wrong shape.
-//! * [`ring`] — the bounded, append-only JSONL ledger every capability writes
-//!   (design §4.4, `LedgerRing` in §11).
 //! * [`rm_policy`] — is this Bash command an `rm` the owner's policy approves?
 //!   (design §5.1). Built ON [`crate::supervise::classify`]: the shell
 //!   segmentation, quote stripping and wrapper see-through there were each paid
 //!   for by a misclassification in a real session, and are not re-derived here.
 //! * [`source`] — WHERE DID THIS FACT COME FROM, once: the one [`source::Source`]
-//!   vocabulary every surface prints, and the [`source::SourceSet`] an event
-//!   carries when more than one read produced it. It replaced four separate
-//!   spellings of the same question (a window's authority, a read verb's
-//!   answer, an event's provenance, an evidence channel) in which the word
-//!   `grid` was four unrelated types and one surface printed `spine` where
-//!   another printed `grid` for the identical fact.
+//!   vocabulary [`usage`] and [`limits`] print.
 //! * [`usage`] — the statusLine JSON and the transcript's usage rows, read into
 //!   one view; the HUD line and the `harness usage --json` shape (design §5.2).
 //! * [`limits`] — the failure classifier and the ordered recovery table
 //!   (design §5.8, `FailureRecovery` in §11). Screen evidence comes from
 //!   `aterm_phase::phase::limit_notice` and [`crate::supervise::limit`], the
 //!   reset clock the supervisor already reads; neither is re-implemented.
-//!
-//! * [`mark`] — PRESENCE AND CONTROL (design §4.6): the four-state mark
-//!   (`armed`/`acting`/`degraded`/`bypassed`) that every surface renders the
-//!   same, the in-band attribution helper every actuation uses so a line
-//!   inside the vendor's transcript names the harness and its rule id, and
-//!   the per-capability off switches. The mark reports the HOST; the hook
-//!   channel is reported BESIDE it, never folded into it, because a harness
-//!   with zero hooks is alive.
-//! * [`watch`] — THE WATCH LOOP (design §5.3, §5.4, §5.6, §5.8, §5.8.10): the
-//!   actuator and the timing over that spine. Ingress is a PARKED subscribe
-//!   stream plus the `await` family for deadlines — there is no sleep and no
-//!   cadence in it. That sentence was true of the CODE and false of the
-//!   BEHAVIOUR until 2026-09-22, and both halves are worth keeping in mind:
-//!   nothing parked, because every arm's condition was `await seq 0` (the
-//!   stream is `events`, which carries no `DELTA`, so the one writer of
-//!   `last_seq` never fired) and because a deadline already in the past was
-//!   clamped to `timeout=1` rather than dropped. A loop with no sleep in it
-//!   can still be a poll; what stops it is a predicate that is not already
-//!   true and a floor that is not one millisecond.
-//!   Every act obeys §4.3's order: journal a row before,
-//!   take the lease, respect `hold`, the inject floor and the generation,
-//!   write the verdict after. It never types `y` at an approval and never
-//!   presses Enter bare.
+//!   `harness limits` runs [`limits::classify`] over one screen read. The
+//!   ladder ([`limits::step`]) lost its only production driver with `watch`
+//!   on 2026-09-23; it is tested and model-bound, and reached by nothing.
 //! * [`disk`] — DISK WATCH AND CLEANUP (design §5.5): the free-space figure
 //!   and the stale targets, each row carrying the WITNESS that makes it safe
-//!   to remove. Report-only is the shape of the function, not a flag: removal
-//!   needs a named safelist class, a second fence checks every path that
-//!   reaches the filesystem, a refusal is journalled as a denial row, and
-//!   nothing under the transcripts root is removable under any flag.
-//! * [`profile`] — PER-PROGRAM PROFILES (design §6.1-§6.3): the unit of
-//!   adaptation, and the proof that none of the above is a Claude Code
-//!   script. Three profiles ship — claude, codex and emacs — and they differ
-//!   as far as three programs can: a native hook channel, a trust-gated one,
-//!   and none at all. The serving table — per capability, whether a program
-//!   can serve it and WHY NOT — is AUTHORED AND REACHED ONLY BY
-//!   [`profile::identify`], which is the frame test that names the program on
-//!   the grid; `harness caps` renders from the alignment report and the
-//!   contract's own rows and consults no profile, so no per-program "why
-//!   not" is printed anywhere today. Corrected 2026-09-22: this paragraph
-//!   claimed the printing. The spine above IS unchanged by any of it, which
-//!   is the claim the tests discharge from real codex and emacs sessions.
-//! * [`config`] — THE HARNESS'S OWN `config.toml` (design §3.7, §5.8.7): a
-//!   CLOSED registry of keys, so an unknown one is refused by name rather
-//!   than ignored, and every write is validated against §5.8.7's per-class
-//!   allowed sets before it is committed. That is what makes §11's table
-//!   invariants hold by construction rather than by default.
-//! * [`wire`] — THE ADAPTER: [`observe::Introspect`] and [`watch::Wire`]
-//!   against a real aterm, over two control connections — one parked on
-//!   `subscribe … events`, one carrying requests — with every deadline armed
-//!   as an `await` on a third, cancellable connection. No sleep, no cadence.
-//! * [`cli`] — THE COMMAND: `aterm harness hook|statusline|install|uninstall|
-//!   status|mark|enable|disable|align|caps|usage|accounts|limits|liveness|
-//!   recover|nudge|switch|watch|config|disk|ledger` (design §4.5, §5.7),
-//!   which is `cli`'s own `USAGE` and is read from it rather than recalled —
-//!   this list said eight when the parser accepted seventeen. It is the hook
-//!   bridge, the read verbs and the two verbs that ACT, and it is where the
-//!   central law becomes checkable from the outside: every read verb answers
-//!   with ZERO hooks installed and carries a `source` field saying so.
+//!   to remove. Report-only is the shape of the function, not a flag.
+//! * [`align`] — the bounded child runner [`disk`] reads `df` through. It
+//!   was the packaging contract and the alignment verdict; that part is
+//!   deleted (the module doc says why) and the name stays for its caller.
+//! * [`cli`] — THE COMMAND: `aterm harness usage|limits|disk|ledger`, the
+//!   read views, plus the retired hook-bridge verbs answered as tombstones.
 //!
-//! STATUS (docs/README.md honesty ratchet): unit-tested; THREE bounded
-//! machines carry a derived model in `aterm-spec` and a Tier-1 bind in
-//! `aterm-agent/tests/conformance_harness.rs` that drives the real code —
-//! `harness_ledger_ring_model` ([`ring`]), `harness_failure_recovery_model`
-//! ([`limits`]) and `harness_turn_observation_model` ([`observe`]), each with
-//! a negative control. [`cli`] is routed at the front door (`aterm harness`);
-//! the control-socket verbs of design §5.7 (`aterm ctl … harness …`) do not
-//! exist yet. Nothing here has run against a REAL limit, exhausted window or
-//! expired login: the ladder is exercised against fixtures and a fake wire.
+//! # What was deleted, 2026-09-23
 //!
-//! TWO seams are still AUTHORED AND UNREACHED, and saying so is the honest
-//! reading of design §4.1's TARGET host rather than a scheduling detail.
+//! The SECOND harness stack: `watch` (the loop), `wire` (its control-socket
+//! adapter), `mark` (the four-state presence mark), `observe` (the grid
+//! spine), `ring` (the JSONL ledger ring), `profile` (the per-program serving
+//! table), `accounts` (the roster and rotation), `config` (the watcher's own
+//! `config.toml`), most of `align`, and the `status|mark|enable|disable|
+//! align|caps|accounts|liveness|recover|nudge|switch|watch|config` verbs. In
+//! its whole life none of its acts landed — its own turn lease blocked its
+//! `turn`, `appnotice` was denied before the badge went out, its escalation
+//! `post` was malformed, it woke on every repaint, and it labelled every
+//! finished turn `api-stalled` (measured by the 2026-09-23 harness audit) —
+//! and it duplicated the engine in [`crate::supervise`], which is the one
+//! supervisor now. Design §0.4 is the record.
 //!
-//! The FIRST is [`profile`]'s serving table above — `cap_rows`,
-//! `contract_toml`, `render_tree_text`, `serves` and `runnable` have no
-//! caller outside that module and its tests. The SECOND is the
-//! `atpkg` harness family — the §3.8 row words and the §1.3 paths — is written
-//! and rendered nowhere. It has ONE home as of 2026-09-22, `atpkg::harness`,
-//! and that module's own doc is where the decision is stated: which pass would
-//! write those rows, which ceremony would write those files, and the one
-//! function that IS reached (`clear_sidecar`, from `store::discard_build`).
-//! Nothing here restates it, so the two cannot drift.
-//!
-//! The other two are reached as of 2026-09-22. [`observe::Introspect`] and
-//! [`watch::Wire`] have a production implementor ([`wire::CtlWire`]), and
-//! [`watch::Watcher::pump`] has a verb (`aterm harness watch`); one hand-asked
-//! act runs through the same actuator by way of `aterm harness switch`, which
-//! calls [`watch::Watcher::execute`] — the second half of `pump` itself, split
-//! out rather than copied, so a manual act can reach nothing the loop could
-//! not. What remains TARGET on that path is the host inside `aterm-gui`: these
-//! verbs are a process an operator or an agent starts, not a supervisor the
-//! window runs on its own.
+//! STATUS (docs/README.md honesty ratchet): unit-tested; TWO bounded
+//! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
+//! real code — `harness_failure_recovery_model` ([`limits`], in
+//! `aterm-agent/tests/conformance_harness.rs`) and
+//! `harness_capture_worker_lifecycle_model` ([`align`]'s runner, in its
+//! tests). Nothing here has run against a REAL limit or exhausted window: the
+//! ladder is exercised against fixtures.
 
-pub mod accounts;
 pub mod align;
 pub mod cli;
-pub mod config;
 pub mod disk;
 pub mod limits;
-pub mod mark;
-pub mod observe;
-pub mod profile;
-pub mod ring;
 pub mod rm_policy;
 pub mod source;
+pub mod upgrade;
+pub mod upgrade_drive;
 pub mod usage;
-pub mod watch;
-pub mod wire;
 
 /// The longest prefix of `s` that is at most `max` BYTES and ends on a
 /// character boundary — never a split character, whatever the input.

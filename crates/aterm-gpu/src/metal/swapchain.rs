@@ -167,9 +167,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use super::ffi::{
-    AutoreleasePool, ClassPtr, Device, Id, Obj, ObjcBool, PixelFormat, Sel, class, msg, sel,
-};
+use aterm_objc::Bool as ObjcBool;
+
+use super::ffi::{AutoreleasePool, ClassPtr, Device, Id, Obj, PixelFormat, Sel, class, msg, sel};
 use super::{encoder, loss};
 
 // The QuartzCore linkage lives HERE, beside the only code that resolves
@@ -795,7 +795,7 @@ impl Swapchain {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            f(self.layer.id(), sel(c"framebufferOnly")).get()
+            f(self.layer.id(), sel(c"framebufferOnly")).as_bool()
         }
     }
 
@@ -803,7 +803,7 @@ impl Swapchain {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            f(self.layer.id(), sel(c"displaySyncEnabled")).get()
+            f(self.layer.id(), sel(c"displaySyncEnabled")).as_bool()
         }
     }
 
@@ -819,7 +819,7 @@ impl Swapchain {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            f(self.layer.id(), sel(c"wantsExtendedDynamicRangeContent")).get()
+            f(self.layer.id(), sel(c"wantsExtendedDynamicRangeContent")).as_bool()
         }
     }
 
@@ -827,7 +827,7 @@ impl Swapchain {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            f(self.layer.id(), sel(c"allowsNextDrawableTimeout")).get()
+            f(self.layer.id(), sel(c"allowsNextDrawableTimeout")).as_bool()
         }
     }
 
@@ -835,7 +835,7 @@ impl Swapchain {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            f(self.layer.id(), sel(c"isOpaque")).get()
+            f(self.layer.id(), sel(c"isOpaque")).as_bool()
         }
     }
 
@@ -1708,7 +1708,7 @@ mod tests {
         pad: f32,
     }
 
-    /// The 96-byte `Blit` uniform (`shaders/blit.metal:26-43`), restated
+    /// The 96-byte `Blit` uniform (`shaders/blit.metal`'s `struct Blit`), restated
     /// `repr(C)` — every member naturally aligned, so the MSL `constant`
     /// layout and this struct agree offset for offset; the size is asserted
     /// against [`crate::metal::blit::MetalBlit::UNIFORM_BYTES`] at the fill
@@ -1720,7 +1720,8 @@ mod tests {
         overlay: u32,
         border_px: f32,
         encode_srgb: f32,
-        accent: [f32; 4],
+        accent: [f32; 3],
+        chrome_y1: f32,
         dims: [f32; 2],
         wash_a: f32,
         border_a: f32,
@@ -1890,7 +1891,8 @@ mod tests {
             overlay: 0,
             border_px: 0.0,
             encode_srgb: 0.0,
-            accent: [0.0; 4],
+            accent: [0.0; 3],
+            chrome_y1: 0.0,
             dims: [W as f32, H as f32],
             wash_a: 0.0,
             border_a: 0.0,
@@ -2569,7 +2571,8 @@ mod tests {
             overlay: 0,
             border_px: 0.0,
             encode_srgb: 0.0,
-            accent: [0.0; 4],
+            accent: [0.0; 3],
+            chrome_y1: 0.0,
             dims: [W as f32, H as f32],
             wash_a: 0.0,
             border_a: 0.0,
@@ -3020,7 +3023,8 @@ mod tests {
             overlay: 0,
             border_px: 0.0,
             encode_srgb: 0.0,
-            accent: [0.0; 4],
+            accent: [0.0; 3],
+            chrome_y1: 0.0,
             dims: [W as f32, H as f32],
             wash_a: 0.0,
             border_a: 0.0,
@@ -3342,7 +3346,8 @@ mod tests {
             overlay: 0,
             border_px: 0.0,
             encode_srgb: 0.0,
-            accent: [0.0; 4],
+            accent: [0.0; 3],
+            chrome_y1: 0.0,
             dims: [W as f32, H as f32],
             wash_a: 0.0,
             border_a: 0.0,

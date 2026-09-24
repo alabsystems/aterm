@@ -784,9 +784,9 @@ pub fn shim_executable_to_env(
     ))
 }
 
-/// The `agents/` twin's shim: [`shim_executable_to_env`] with the landing `prelude`
-/// ([`super::sh_landing_prelude`]) ahead of its exports — the same route decision, the
-/// same writer. `prelude` empty is byte for byte the `bin/` shim.
+/// The `agents/` twin's shim: [`shim_executable_to_env`] with the twin's `prelude`
+/// ([`super::twin_prelude`], the self-update block) ahead of its exports — the same
+/// route decision, the same writer. `prelude` empty is byte for byte the `bin/` shim.
 pub fn twin_executable_to_env(
     shim: &Path,
     target: &Path,

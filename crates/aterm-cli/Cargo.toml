@@ -9,6 +9,12 @@ license.workspace = true
 repository.workspace = true
 description = "aterm — the transparent session: runs your shell unchanged, byte for byte, through the protected spawn seam. The live model an AI reads is WINDOW mode; a session's own VT model is demand-driven and off by default (U1)."
 
+[features]
+# Development seams in an optimized build (`aterm_types::dev_seam!`: ATERM_SESSION_MODEL).
+# Debug builds compile them anyway; the release cutter never enables this —
+# aterm-release's buildplan pins it.
+dev-seams = []
+
 [dependencies]
 aterm-core = { workspace = true }
 # P0: the daily-driver CLI runs the shell through the PROTECTED spawn seam

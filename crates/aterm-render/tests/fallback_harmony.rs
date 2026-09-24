@@ -713,7 +713,7 @@ fn ct_probe_is_total_and_sound() {
         // rejected for an uncovered one (cmap duty via ttf-parser).
         assert!(ct_face_can_render(&menlo, 0, 'M'), "Menlo must accept 'M'");
         assert!(
-            !ct_face_can_render(&menlo, 0, '\u{FDD0}'),
+            !ct_face_can_render(&menlo, 0, '\u{FFFF}'),
             "a permanent noncharacter has no glyph"
         );
     } else {

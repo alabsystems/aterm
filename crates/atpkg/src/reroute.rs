@@ -49,21 +49,28 @@
 //!   withholds is SILENT substitution, which is why it already let
 //!   `cargo +stable build` through with one loud line ([`passthrough_note`]);
 //!   a bare `cargo build` that announces and then runs is no more silent than
-//!   that one. [`QUIET_ENV`] is the flag the owner asked for, and
-//!   [`STRICT_ENV`] restores the refusal for anyone who wants the friction.
-//! * **ORACLE** (`z3`): `ay`'s differential oracle. Refuse; [`Z3_ORACLE_ENV`]
-//!   reaches the real z3. This row is NOT covered by the announce-and-run
-//!   ruling above: the owner's sentence is about "the vanilla rust toolchain",
-//!   and running the wrong oracle does not merely skip a proof claim — it
-//!   manufactures a false one, which is a different risk in kind.
+//!   that one. The suppression the owner asked for is a SETTING, `[reroute]
+//!   announce = false` in aterm.toml ([`crate::config::RerouteConfig`], Settings
+//!   ▸ Packages) — owner, 2026-09-22: settings, "NOT ENV VARS those are for
+//!   development". `ATERM_REROUTE_QUIET` is gone, and so is `ATERM_REROUTE_STRICT`,
+//!   the opposite knob that restored the refusal: a second policy lane nobody in the
+//!   tree set.
+//! * **ORACLE** (`z3`): `ay`'s differential oracle. Refuse, naming the upstream
+//!   copy's own path — running it by path reaches the real z3 (a path never meets a
+//!   stub). This row is NOT covered by the announce-and-run ruling above: the
+//!   owner's sentence is about "the vanilla rust toolchain", and running the wrong
+//!   oracle does not merely skip a proof claim — it manufactures a false one, which is
+//!   a different risk in kind. (`ATERM_Z3_IS_ORACLE`, the per-invocation consent, is
+//!   gone: the path is the consent.)
 //!
 //! # Escapes, all of them
 //!
-//! * [`NO_REROUTE_ENV`] engaged (`aterm --no-reroute` sets it for a session)
-//!   restores every upstream tool. The stub itself walks PATH past its own
-//!   directory and execs the first upstream copy — in `sh`, so the escape works
-//!   even when atpkg is unreachable. The Rust side sets the same variable on any
-//!   upstream child it execs, so cargo's own `rustc`/`rustdoc` spawns are never
+//! * `aterm --no-reroute` starts a session with every upstream tool: it stamps the
+//!   internal [`PASSTHROUGH_ENV`] marker on that session (the front door clears an
+//!   inherited one otherwise, so it is protocol, not a knob). The stub itself walks
+//!   PATH past its own directory and execs the first upstream copy — in `sh`, so the
+//!   escape works even when atpkg is unreachable. The Rust side stamps the same marker
+//!   on any upstream child it execs, so cargo's own `rustc`/`rustdoc` spawns are never
 //!   re-announced or refused.
 //! * `cargo +<toolchain>` naming a non-Trust toolchain is the user naming
 //!   upstream deliberately: it runs, with one loud line, because §4 withholds
@@ -99,37 +106,35 @@ pub const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
 /// absolute managed `<prefix>/agents/` ([`Layout::agents_dir`]), ensured to exist, on
 /// EVERY lane — engaged reroute or not (2026-09-18, closing the R3 residual of
 /// 2026-09-16: the session derived the directory as `$ATERM_REROUTE_DIR`'s sibling,
-/// so `--no-reroute` / [`NO_REROUTE_ENV`] — the escape hatch for the UPSTREAM RUST
-/// NAMES — also dropped the managed `claude`/`codex` front-insert). Absent or EMPTY
+/// so `--no-reroute` — the escape hatch for the UPSTREAM RUST NAMES — also dropped the
+/// managed `claude`/`codex` front-insert). Absent or EMPTY
 /// means none. Deliberately NOT `ATPKG_AGENTS`: that is the name the shell hook
 /// exports ([`crate::hooks`]) and the shell integration keys its hook-sourcing on it
 /// being unset, so a seam-exported `ATPKG_AGENTS` would stop a tab from ever sourcing
 /// the hook. The shell integration must never read THIS variable either — it is a
 /// launcher→session handoff, nothing more.
 pub const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
-/// The one escape hatch (philosophy §4): engaged ⇒ every upstream tool is
-/// restored. Also what an escaped upstream child inherits, so its own spawns
-/// pass silently.
-pub const NO_REROUTE_ENV: &str = "ATERM_NO_REROUTE";
-/// The ORACLE row's own key: engaged ⇒ the real z3 runs.
-pub const Z3_ORACLE_ENV: &str = "ATERM_Z3_IS_ORACLE";
-/// The flag the owner asked for on 2026-09-08: engaged ⇒ a SIGNPOST row runs
-/// upstream with NO announcement. It silences a line; it changes nothing else,
-/// and it is deliberately not honoured for a DIRECT row (whose announcement is
-/// the "never silently substituting" guarantee itself) nor when [`STRICT_ENV`]
-/// is engaged (a refusal with no reason given is not a refusal, it is a bug).
-pub const QUIET_ENV: &str = "ATERM_REROUTE_QUIET";
-/// The opposite knob: engaged ⇒ a SIGNPOST row REFUSES (exit [`REFUSAL_EXIT`])
-/// instead of running upstream, which is philosophy §4's original letter and
-/// what shipped between 2026-09-07 and this change. Kept because the friction
-/// reading is defensible and one variable is a cheap way to hold both.
-pub const STRICT_ENV: &str = "ATERM_REROUTE_STRICT";
+/// INTERNAL PROTOCOL, not a setting: the marker of a session with every upstream tool
+/// restored. `aterm --no-reroute` stamps it on its session (and the front door CLEARS
+/// an inherited one on every other launch, so exporting it by hand does not make a
+/// session), the stub and [`run`] read it, and [`exec_upstream`] stamps it on the
+/// upstream child it execs so that child's own spawns pass silently. It was the user
+/// knob `ATERM_NO_REROUTE` until 2026-09-23; the flag is the one spelling now (owner,
+/// 2026-09-22: "NOT ENV VARS those are for development").
+///
+/// SPELLED AS WHAT IT IS (2026-09-23 review): the stub and the shell integration are
+/// shell, and a shell reads the marker from its own environment, so an `export` in an
+/// rc file AFTER the front door cleared it still reaches them — a marker a shell reads is
+/// unavoidably settable. It is not SUPPORTED as a control: the double-underscore
+/// spelling says internal, no page documents it, and `aterm --no-reroute` is the escape.
+/// As `ATERM_REROUTE_PASSTHROUGH` it read like the deleted knob under a new name.
+pub const PASSTHROUGH_ENV: &str = "__ATERM_REROUTE_PASSTHROUGH";
 /// Line 2 of every stub — the ONLY thing that makes a file ours to rewrite or
 /// remove. Version-suffixed so a changed body can be told from an old one.
 pub const STUB_MARKER: &str = "# atpkg reroute stub v1";
 /// The hidden verb a stub execs: `atpkg __reroute <upstream> [args…]`.
 pub const HIDDEN_VERB: &str = "__reroute";
-/// An ORACLE refusal, a SIGNPOST refusal under [`STRICT_ENV`], and the
+/// An ORACLE refusal and the
 /// fail-closed answer when atpkg itself cannot be reached: a usage-shaped exit
 /// — the command did not run because the caller has to choose, not because
 /// anything broke.
@@ -195,12 +200,9 @@ pub enum Policy {
         branded: &'static str,
         lanes: &'static [Lane],
     },
-    /// Refuse; the upstream tool is `branded`'s differential oracle. `env`
-    /// engaged reaches the upstream tool.
-    Oracle {
-        branded: &'static str,
-        env: &'static str,
-    },
+    /// Refuse; the upstream tool is `branded`'s differential oracle. Its own path
+    /// reaches it (a path never meets a stub), and the refusal names that path.
+    Oracle { branded: &'static str },
 }
 
 /// One upstream name and what a session does with it.
@@ -307,10 +309,7 @@ pub const TABLE: &[Row] = &[
     Row {
         upstream: "z3",
         family: "SMT",
-        policy: Policy::Oracle {
-            branded: "ay",
-            env: Z3_ORACLE_ENV,
-        },
+        policy: Policy::Oracle { branded: "ay" },
     },
 ];
 
@@ -344,9 +343,9 @@ pub fn stub_path(layout: &Layout, upstream: &str) -> PathBuf {
     dir(layout).join(upstream)
 }
 
-/// THE ONE reading of a boolean escape variable — `aterm_types`'
-/// `env_flag_engaged` rule restated here so a present-but-empty `ATERM_NO_REROUTE=`
-/// (which travels) never counts as a veto: engaged iff non-empty and not `"0"`.
+/// THE ONE reading of the [`PASSTHROUGH_ENV`] marker — `aterm_types`'
+/// `env_flag_engaged` rule restated here so a present-but-empty value (which travels)
+/// never counts: engaged iff non-empty and not `"0"`.
 #[must_use]
 pub fn engaged(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
@@ -364,58 +363,26 @@ pub fn explicit_toolchain(args: &[String]) -> Option<&str> {
 // ── messages: byte-stable, stderr-only, one fix sentence ────────────────────
 
 fn escape_clause(upstream: &str) -> String {
-    let mut s = String::from("(");
-    s.push_str(NO_REROUTE_ENV);
-    s.push_str("=1 restores upstream '");
+    let mut s = String::from("(`aterm --no-reroute` restores upstream '");
     s.push_str(upstream);
     s.push_str("'.)");
     s
 }
 
-/// What a SIGNPOST row does once the two knobs are read: whether it speaks, and
-/// whether it refuses. One function so the 2026-09-08 ruling lives in exactly
-/// one place and can be pinned without a subprocess.
-///
-/// * neither knob — announce, then run upstream (the default, and the ruling);
-/// * [`QUIET_ENV`] — run upstream, say nothing (the flag the owner asked for);
-/// * [`STRICT_ENV`] — announce, then refuse (philosophy §4's original letter);
-/// * both — announce, then refuse. QUIET never silences a refusal, because an
-///   exit 2 with no reason printed is indistinguishable from a broken tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignpostAction {
-    /// Print [`signpost_message`] on stderr.
-    pub announce: bool,
-    /// Exit [`REFUSAL_EXIT`] instead of exec'ing upstream.
-    pub refuse: bool,
-}
+/// The setting that silences a SIGNPOST row's announcement, as the line spells it.
+pub const ANNOUNCE_SETTING: &str = "[reroute] announce = false";
 
-/// [`SignpostAction`] for the two knobs. Pure; `run` reads the environment and
-/// then does exactly what this says.
-#[must_use]
-pub fn signpost_action(strict: bool, quiet: bool) -> SignpostAction {
-    SignpostAction {
-        announce: strict || !quiet,
-        refuse: strict,
-    }
-}
-
-/// The last line (or two) of a SIGNPOST message.
-///
-/// Under [`STRICT_ENV`] it is the old refusal's "re-run" instruction and the
-/// escape. Otherwise it says what is about to happen — upstream runs, and what
-/// it produces carries no proof claim — and names both flags, because a line
-/// printed on every build must say how to stop printing it.
-fn signpost_closing(upstream: &str, strict: bool, rerun: &str) -> String {
-    if strict {
-        return format!("       {rerun}  {}", escape_clause(upstream));
-    }
+/// The last lines of a SIGNPOST message: what is about to happen — upstream runs, and
+/// what it produces carries no proof claim — and the setting that silences the line,
+/// because a line printed on every build must say how to stop printing it.
+fn signpost_closing(upstream: &str) -> String {
     // The measuring page is named on every signpost (owner, 2026-09-08: the
     // Trust default is to be "very strongly encouraged by the aterm system
     // itself"): a reader who is about to run stock cargo anyway is told, in
     // the same breath, the one command that answers which toolchain this
     // directory actually gets — instead of guessing from the two lines above.
     format!(
-        "       Running upstream '{upstream}' now — nothing it produces carries a proof claim.\n       `aterm help rust` measures which toolchain THIS directory gets; the default here is Trust.\n       ({QUIET_ENV}=1 silences this; {STRICT_ENV}=1 refuses instead of running.)"
+        "       Running upstream '{upstream}' now — nothing it produces carries a proof claim.\n       `aterm help rust` measures which toolchain THIS directory gets; the default here is Trust.\n       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
     )
 }
 
@@ -436,14 +403,11 @@ pub fn direct_announcement(upstream: &str, family: &str, branded: &str) -> Strin
 ///          targo trust build --release          VERIFIED   — emits a proof claim
 ///          targo --unverified build --release   UNVERIFIED — no proof claim
 ///        Running upstream 'cargo' now — nothing it produces carries a proof claim.
-///        (ATERM_REROUTE_QUIET=1 silences this; ATERM_REROUTE_STRICT=1 refuses instead of running.)
+///        `aterm help rust` measures which toolchain THIS directory gets; the default here is Trust.
+///        ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
 /// ```
-///
-/// `strict` ([`STRICT_ENV`]) swaps the last line back to the refusal's "re-run
-/// naming the lane" and the escape clause; the diagnosis above it is the same
-/// either way, because the diagnosis was never the part in dispute.
 #[must_use]
-pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String], strict: bool) -> String {
+pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
     let upstream = row.upstream;
     let branded = branded_of(row);
     let rest = args.join(" ");
@@ -460,7 +424,7 @@ pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String], strict: bool
             row.family
         ));
         out.push_str(&format!("         {}\n", join_command(reroute, &tail)));
-        out.push_str(&signpost_closing(upstream, strict, "Re-run as shown."));
+        out.push_str(&signpost_closing(upstream));
         return out;
     }
     if lanes.is_empty() {
@@ -470,11 +434,7 @@ pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String], strict: bool
         ));
         out.push_str("       drop-in equivalence is not yet proven, so nothing is substituted:\n");
         out.push_str(&format!("         {}\n", join_command(branded, &rest)));
-        out.push_str(&signpost_closing(
-            upstream,
-            strict,
-            "Re-run naming the tool.",
-        ));
+        out.push_str(&signpost_closing(upstream));
         return out;
     }
     out.push_str(&format!(
@@ -494,19 +454,20 @@ pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String], strict: bool
             lane.label, lane.note
         ));
     }
-    out.push_str(&signpost_closing(
-        upstream,
-        strict,
-        "Re-run naming the lane.",
-    ));
+    out.push_str(&signpost_closing(upstream));
     out
 }
 
-/// The ORACLE refusal.
+/// The ORACLE refusal, naming the upstream copy's own path when there is one: a path
+/// never meets a stub, so it is the consent to run the real tool.
 #[must_use]
-pub fn oracle_message(upstream: &str, branded: &str, env: &str) -> String {
+pub fn oracle_message(upstream: &str, branded: &str, upstream_path: Option<&Path>) -> String {
+    let reach = match upstream_path {
+        Some(path) => format!("run {} to reach the real {upstream}", path.display()),
+        None => format!("no upstream '{upstream}' is on PATH"),
+    };
     format!(
-        "aterm: '{upstream}' is the oracle '{branded}' is measured against, so a session never runs it silently: {env}=1 reaches the real {upstream} ({NO_REROUTE_ENV}=1 restores every upstream tool)."
+        "aterm: '{upstream}' is the oracle '{branded}' is measured against, so a session never runs it by name: {reach} (`aterm --no-reroute` starts a session with every upstream tool)."
     )
 }
 
@@ -529,7 +490,7 @@ pub fn explicit_lane_note(upstream: &str, branded: &str, lane: &str) -> String {
 #[must_use]
 pub fn passthrough_note(upstream: &str, toolchain: &str) -> String {
     format!(
-        "aterm: '{upstream} +{toolchain}' names an upstream toolchain explicitly — running upstream '{upstream}'; nothing it produces is verified. (The Trust lane is 'targo trust <verb>'; {NO_REROUTE_ENV}=1 silences this note.)"
+        "aterm: '{upstream} +{toolchain}' names an upstream toolchain explicitly — running upstream '{upstream}'; nothing it produces is verified. (The Trust lane is 'targo trust <verb>'; a session started with `aterm --no-reroute` prints no note.)"
     )
 }
 
@@ -538,7 +499,7 @@ pub fn passthrough_note(upstream: &str, toolchain: &str) -> String {
 #[must_use]
 pub fn unreachable_message(upstream: &str) -> String {
     format!(
-        "aterm: '{upstream}' is rerouted inside aterm sessions, but aterm's package manager is not reachable to say where; {NO_REROUTE_ENV}=1 restores upstream '{upstream}'"
+        "aterm: '{upstream}' is rerouted inside aterm sessions, but aterm's package manager is not reachable to say where; `aterm --no-reroute` restores upstream '{upstream}'"
     )
 }
 
@@ -589,8 +550,8 @@ pub fn policy_summary(row: &Row) -> String {
             s.push_str(&escape);
             s
         }
-        Policy::Oracle { branded, env } => format!(
-            "refused ('{branded}' is measured against it); {env}=1 reaches the real {upstream} {escape}"
+        Policy::Oracle { branded } => format!(
+            "refused ('{branded}' is measured against it); its own path reaches the real {upstream} {escape}"
         ),
     }
 }
@@ -623,9 +584,9 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String 
     s.push_str("\n__aterm_name=");
     s.push_str(&name);
     s.push_str("\nif [ -n \"${");
-    s.push_str(NO_REROUTE_ENV);
+    s.push_str(PASSTHROUGH_ENV);
     s.push_str(":-}\" ] && [ \"${");
-    s.push_str(NO_REROUTE_ENV);
+    s.push_str(PASSTHROUGH_ENV);
     s.push_str(":-}\" != \"0\" ]; then\n");
     // Pure shell, no subshell and no external command: this branch runs BEFORE
     // anything is resolved, on whatever PATH the caller has (a synthetic one in
@@ -669,6 +630,230 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String 
     s
 }
 
+/// THE AGENT PROGRAMS' STUB (2026-09-23): which copy of `claude`/`codex` runs is decided
+/// when the program RUNS, never when the shell started.
+///
+/// Measured that day on the owner's machine: the session shell he restarted `claude` in
+/// had started on 2026-09-10 and survived every seamless self-update since; a shell's PATH
+/// is fixed when it starts, and that one's was `pkg/reroute, ~/.local/bin, …,
+/// /opt/homebrew/bin, …, pkg/bin` with NO `pkg/agents` — so `claude` ran the vendor's own
+/// self-updating install and not the managed build the pass had just landed, while
+/// `aterm pkg doctor` said SHADOWED. The rc hook of 03513b5d7 fixes the PATH of NEW shells
+/// only. The one atpkg directory at the front of PATH in every generation of session shell
+/// is this one — so the decision lives here, in `sh`, read at exec time:
+///
+/// * INSIDE ATERM — any of [`crate::hooks::AGENTS_MARKERS`] non-empty, the SAME list the
+///   rc hook's gate is rendered from — with `<agents_dir>/<name>` executable: exec that
+///   twin, which carries the self-update interception and the managed store path.
+/// * Otherwise PASS THROUGH, [`stub_body_sh`]'s escape walk: the first `<name>` on PATH
+///   that is not in a reroute directory (by [`DIR_MARKER_FILE`] — any spelling, any
+///   prefix), not `<agents_dir>` itself (as spelled or by `-ef`, so a symlink or a
+///   trailing slash is skipped too) and not this stub under another name (`-ef "$0"`: a
+///   link to it in `~/bin` would exec it forever) — else exit 127 with one line. Outside
+///   aterm that is the user's own copy, never the `agents/` twin (owner law, 03513b5d7:
+///   *"claude managed via aterm should be in aterm only, NOT in all terminals like
+///   iTerm"*) — or, with none of the user's on PATH, `<prefix>/bin/<name>`, which the rc
+///   hook appends last in every shell: exactly what that shell ran with no stub.
+/// * The `aterm --no-reroute` marker ([`PASSTHROUGH_ENV`]) DOES NOT APPLY HERE (manager's
+///   ruling, 2026-09-23). It restores the upstream Rust names, and `aterm help pkg`
+///   promises it never swaps the managed `claude`/`codex` for a foreign one — a promise
+///   that must hold in EVERY generation of shell. A stub that let it through would run the
+///   foreign copy in an old shell and the managed one in a new shell under the same
+///   marker: the very class of bug this stub exists to close. The markers alone decide.
+///
+/// ONE THING IT CANNOT REACH: a shell's own command cache. zsh and bash remember where a
+/// command was found the first time it ran, so a shell that ran `claude` from
+/// `~/.local/bin` BEFORE this stub was laid keeps running that path until `rehash` (zsh)
+/// or `hash -r` (bash) — once; from then on the name resolves to this stub, which decides
+/// at every run. Measured by the 2026-09-23 review in `zsh -f -i` and bash against fakes.
+///
+/// Pure shell, no external command and no atpkg: it works on whatever PATH the caller has.
+/// It never recurses — the twin execs its store path by absolute path, and the walk skips
+/// every reroute directory and this stub under any other name. Line 2 is [`STUB_MARKER`], so every recognition, sweep and
+/// shim scan treats it as the other stubs; it execs only through variables, so
+/// [`crate::platform::parse_sh_shim_target`] sees no target.
+#[must_use]
+pub fn agents_stub_body_sh(name: &str, agents_dir: &Path) -> String {
+    let mut s = String::from("#!/bin/sh\n");
+    s.push_str(STUB_MARKER);
+    s.push_str(
+        "\n# Which copy of an agent program runs is decided HERE, when it runs (aterm help\n",
+    );
+    s.push_str(
+        "# reroute): inside an aterm session the managed twin, anywhere else the user's own.\n",
+    );
+    s.push_str("# Not a managed tool: this file resolves to no store target and is never proof of an install.\n");
+    s.push_str("__aterm_agents=");
+    s.push_str(&crate::stub::sh_single_quote(&agents_dir.to_string_lossy()));
+    s.push_str("\n__aterm_name=");
+    s.push_str(&crate::stub::sh_single_quote(name));
+    // The markers alone decide — never the --no-reroute marker (the doc above).
+    s.push_str("\nif [ -n \"");
+    s.push_str(&crate::hooks::agents_markers_sh());
+    s.push_str("\" ] && [ -x \"$__aterm_agents/$__aterm_name\" ] && [ ! -d \"$__aterm_agents/$__aterm_name\" ]; then\n");
+    s.push_str("  exec \"$__aterm_agents/$__aterm_name\" \"$@\"\n");
+    s.push_str("fi\n");
+    // The pass-through: [`stub_body_sh`]'s escape walk, plus the agents twin.
+    s.push_str("__aterm_ifs=$IFS; IFS=:; set -f\n");
+    s.push_str("for __d in $PATH; do\n");
+    s.push_str("  [ -z \"$__d\" ] && continue\n");
+    s.push_str("  [ \"${__d#/}\" = \"$__d\" ] && continue\n");
+    s.push_str("  [ -f \"$__d/");
+    s.push_str(DIR_MARKER_FILE);
+    s.push_str("\" ] && continue\n");
+    s.push_str("  [ \"$__d\" = \"$__aterm_agents\" ] && continue\n");
+    s.push_str("  [ \"$__d\" -ef \"$__aterm_agents\" ] && continue\n");
+    // Itself under another name: a symlink or hard link to this stub in an ordinary PATH
+    // directory would otherwise exec it again, forever.
+    s.push_str("  [ \"$__d/$__aterm_name\" -ef \"$0\" ] && continue\n");
+    s.push_str("  if [ -x \"$__d/$__aterm_name\" ] && [ ! -d \"$__d/$__aterm_name\" ]; then\n");
+    s.push_str("    IFS=$__aterm_ifs; set +f\n");
+    s.push_str("    exec \"$__d/$__aterm_name\" \"$@\"\n");
+    s.push_str("  fi\n");
+    s.push_str("done\n");
+    s.push_str("IFS=$__aterm_ifs; set +f\n");
+    s.push_str("printf '%s\\n' \"");
+    s.push_str(&agents_not_found_message("$__aterm_name"));
+    s.push_str("\" 1>&2\nexit 127\n");
+    s
+}
+
+/// The agents stub's one line when nothing is left to run: no copy on PATH outside aterm's
+/// own directories, and the managed twin not taken. `name` is spliced into a double-quoted
+/// `sh` string (the stub passes `$__aterm_name`), so the text holds no `"`, `$`, `` ` ``
+/// or `\` of its own.
+#[must_use]
+pub fn agents_not_found_message(name: &str) -> String {
+    format!(
+        "aterm: no '{name}' on PATH outside aterm's reroute and agents directories, and the managed copy is taken only inside an aterm session, when installed (aterm help reroute)"
+    )
+}
+
+/// The agent programs that get a reroute stub: every [`crate::stub::AGENT_PROGRAMS`] name
+/// whose `agents/` twin ([`Layout::agent_shim`], laid by
+/// [`crate::activate::reconcile_agents`] from that same roster) stands as an executable
+/// file now. A name with no twin gets none — a stub for a program that is not managed here
+/// would make `command -v claude` answer on a machine with no `claude` at all — and loses
+/// the one it had on the next [`lay`].
+#[must_use]
+pub fn agents_routes(layout: &Layout) -> Vec<&'static str> {
+    crate::stub::AGENT_PROGRAMS
+        .iter()
+        .copied()
+        .filter(|name| {
+            crate::store::ToolName::new(name).is_some_and(|tool| is_twin(&layout.agent_shim(&tool)))
+        })
+        .collect()
+}
+
+/// What an agents stub reads besides PATH — restated for the surfaces that say what
+/// `claude` typed in a shell does (`aterm pkg doctor`, which runs as a child of that shell
+/// and so sees what the stub would see). The markers, and nothing else: never
+/// [`PASSTHROUGH_ENV`] ([`agents_stub_body_sh`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StubEnv {
+    /// Any of [`crate::hooks::AGENTS_MARKERS`] set and non-empty — `-n` on the joined word.
+    pub in_aterm: bool,
+}
+
+impl StubEnv {
+    /// Read through `get` (a variable's raw value, `None` when unset).
+    #[must_use]
+    pub fn read(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        Self {
+            in_aterm: crate::hooks::AGENTS_MARKERS
+                .iter()
+                .any(|m| get(m).is_some_and(|v| !v.is_empty())),
+        }
+    }
+
+    /// This process's environment.
+    #[must_use]
+    pub fn of_process() -> Self {
+        Self::read(|name| std::env::var_os(name))
+    }
+}
+
+/// Whether the agents stub for `name` execs the managed twin under `env` —
+/// [`agents_stub_body_sh`]'s first arm: inside aterm, the twin executable.
+#[must_use]
+pub fn agents_stub_takes_twin(layout: &Layout, name: &str, env: StubEnv) -> bool {
+    env.in_aterm
+        && crate::store::ToolName::new(name).is_some_and(|tool| is_twin(&layout.agent_shim(&tool)))
+}
+
+/// OUR agents stub for `name` ([`stub_path`]) when it is the FIRST executable `name` on
+/// `path_var` — the copy a shell with that PATH runs. Absolute entries only, as every walk
+/// here; `None` when another copy comes first, or when nothing of ours stands there.
+#[must_use]
+pub fn agents_stub_first_on_path(
+    layout: &Layout,
+    name: &str,
+    path_var: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let ours = stub_path(layout, name);
+    let ours_real = std::fs::canonicalize(&ours).ok();
+    for dir in std::env::split_paths(path_var?) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if !is_twin(&candidate) {
+            continue;
+        }
+        let resolves_there =
+            ours_real.is_some() && std::fs::canonicalize(&candidate).ok() == ours_real;
+        let same = candidate == ours || resolves_there;
+        return (same && is_reroute_stub(&candidate)).then_some(candidate);
+    }
+    None
+}
+
+/// `path_var` with every reroute directory ([`is_reroute_dir`], any spelling) taken out —
+/// what a shell with that PATH resolves once the stubs are out of the way, for the
+/// surfaces that name the copy an agents stub out-ranks.
+#[must_use]
+pub fn without_reroute_dirs(path_var: Option<&OsStr>) -> Option<std::ffi::OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(path_var?)
+        .filter(|dir| dir.as_os_str().is_empty() || !is_reroute_dir(dir))
+        .collect();
+    std::env::join_paths(kept).ok()
+}
+
+/// `path_var` as an agents stub's pass-through walks it: without every reroute directory
+/// ([`without_reroute_dirs`]) and without `layout`'s `agents/` — as spelled or as it
+/// resolves ([`agents_stub_body_sh`]).
+#[must_use]
+pub fn pass_through_path(layout: &Layout, path_var: Option<&OsStr>) -> Option<std::ffi::OsString> {
+    let stripped = without_reroute_dirs(path_var)?;
+    let agents = layout.agents_dir();
+    let agents_real = std::fs::canonicalize(&agents).ok();
+    let kept: Vec<PathBuf> = std::env::split_paths(&stripped)
+        .filter(|dir| {
+            let resolves_there =
+                agents_real.is_some() && std::fs::canonicalize(dir).ok() == agents_real;
+            !(*dir == agents || resolves_there)
+        })
+        .collect();
+    std::env::join_paths(kept).ok()
+}
+
+/// Whether `path` is an agents twin the stub's `-x … && ! -d …` would take: an executable
+/// file (a link to one counts, as it does for `sh`).
+fn is_twin(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = true;
+    meta.is_file() && executable
+}
+
 /// Whether `path` is one of OUR stubs: a regular file (never a symlink), small,
 /// UTF-8, whose second line is [`STUB_MARKER`].
 #[must_use]
@@ -709,22 +894,56 @@ pub enum StubState {
 pub fn states(layout: &Layout) -> Vec<(&'static str, StubState)> {
     TABLE
         .iter()
-        .map(|row| {
-            let path = stub_path(layout, row.upstream);
-            let state = match std::fs::symlink_metadata(&path) {
-                Err(_) => StubState::Missing,
-                Ok(_) if is_reroute_stub(&path) => StubState::Laid,
-                Ok(_) => StubState::Foreign,
-            };
-            (row.upstream, state)
-        })
+        .map(|row| (row.upstream, stub_state(layout, row.upstream)))
         .collect()
 }
 
-/// Lay (or refresh) every row's stub — at seed, after each install pass, and on
-/// `repair`, so the embedded atpkg path survives relocation and self-update.
-/// Never over a foreign file; a stub whose row left the table is swept
-/// (marker-gated). Windows lays nothing.
+/// The state of the reroute stub named `name` — a [`TABLE`] row's or an agent program's.
+#[must_use]
+pub fn stub_state(layout: &Layout, name: &str) -> StubState {
+    let path = stub_path(layout, name);
+    match std::fs::symlink_metadata(&path) {
+        Err(_) => StubState::Missing,
+        Ok(_) if is_reroute_stub(&path) => StubState::Laid,
+        Ok(_) => StubState::Foreign,
+    }
+}
+
+/// Every stub [`lay`] wants in `dir(layout)` now, `(name, body)`: each [`TABLE`] row's, then
+/// each agent program's with a twin ([`agents_routes`]).
+fn wanted_stubs(layout: &Layout) -> Vec<(&'static str, String)> {
+    let dir = dir(layout);
+    let atpkg = crate::stub::embedded_atpkg_path();
+    let agents = layout.agents_dir();
+    TABLE
+        .iter()
+        .map(|row| (row.upstream, stub_body_sh(row.upstream, &atpkg, &dir)))
+        .chain(
+            agents_routes(layout)
+                .into_iter()
+                .map(|name| (name, agents_stub_body_sh(name, &agents))),
+        )
+        .collect()
+}
+
+/// Lay (or refresh) every row's stub — at seed, after each install pass, at every session
+/// spawn, and on `repair`, so the embedded atpkg path survives relocation and self-update.
+/// Never over a foreign file; a stub whose row left the table is swept (marker-gated).
+/// Windows lays nothing.
+///
+/// And every agent program's stub ([`agents_stub_body_sh`], 2026-09-23) whose `agents/`
+/// twin stands ([`agents_routes`]); one whose twin has gone is swept the same way. The
+/// stub names the twin's PATH, never its build, so an update of the program re-lays
+/// nothing here; a twin laid after a lay — the pass's alias reconcile, a hand-run
+/// `aterm pkg install` — gains its stub at the next one: every pass, every session
+/// spawn and `repair` call this.
+///
+/// A FILE IS WRITTEN ONLY WHEN ITS BYTES DIFFER (Phase 3, 2026-09-22). An identical stub
+/// that carries `com.apple.provenance` used to be re-laid through the untracked launchd
+/// lane on every pass, and when the lane's file came back tagged too the loop never
+/// converged: the marker was re-laid, and a note printed, on every pass from 2026-09-19 to
+/// 2026-09-22. Clearing the tag is `aterm pkg repair`'s job ([`relay_tagged`]), the fix
+/// `aterm pkg doctor` names; a pass or a spawn changes only what is wrong in content.
 pub fn lay(layout: &Layout) -> io::Result<()> {
     if cfg!(windows) {
         return Ok(());
@@ -738,53 +957,33 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
     }
     let dir = dir(layout);
     layout.ensure_dir(&dir)?;
-    // Every file of the pass rendered first and laid in ONE job
-    // ([`crate::lay::lay_executables`]: in-process, or through the untracked launchd
-    // job when this process is provenance-tracked — these stubs run every upstream
-    // `cargo`/`rustc` typed in a session, and a tagged one would track them all). The
-    // marker file first in the list, so a walk racing this `lay` already recognizes the
-    // directory before the first stub lands in it — the job writes in order.
-    let mut files = Vec::new();
+    // THE MARKER FIRST, and in-process: it is data the walks test with `-f`, never an
+    // executable, so its tag tracks nothing and it needs no lane — and a walk racing this
+    // `lay` recognizes the directory before the first stub lands in it.
     let marker = dir.join(DIR_MARKER_FILE);
-    if marker_needs_lay(
-        marker.is_file(),
-        || crate::provenance::carries_provenance(&marker),
-        crate::lay::lay_clears_provenance,
-    ) {
-        files.push(crate::lay::Executable::new(
-            &marker,
-            format!("{STUB_MARKER}\n"),
-        ));
+    if marker_needs_lay(std::fs::read(&marker).ok().as_deref()) {
+        crate::lay::write_in_process(&crate::lay::Executable::new(&marker, marker_body()))?;
     }
-    let atpkg = crate::stub::embedded_atpkg_path();
-    for row in TABLE {
-        let path = dir.join(row.upstream);
-        let body = stub_body_sh(row.upstream, &atpkg, &dir);
+    // Every stub whose bytes differ, rendered first and laid in ONE job
+    // ([`crate::lay::lay_executables`]: in-process, or through the untracked launchd job
+    // when this process is provenance-tracked — these stubs run every upstream
+    // `cargo`/`rustc` typed in a session, and a tagged one would track them all).
+    let mut files = Vec::new();
+    let wanted = wanted_stubs(layout);
+    for (name, body) in &wanted {
+        let path = dir.join(name);
         match std::fs::symlink_metadata(&path) {
             Err(_) => {} // absent: ours to claim
+            // Ours already, and byte-identical: nothing to lay. A body that differs — the
+            // embedded atpkg path moved with a relocation or a self-update — is rewritten.
             Ok(_) if is_reroute_stub(&path) => {
-                // Ours already. Byte-identical: nothing to lay — this runs at every
-                // session spawn and every pass end, and re-laying eight identical files
-                // meant a launchd job (and, from a tagged app, a whole-bundle copy) per
-                // GUI launch, plus the chance for a lane that could not run to replace a
-                // CLEAN stub with a tagged one under the in-process fallback (audit
-                // 2026-09-14). A body that differs — the embedded atpkg path moved with a
-                // relocation or a self-update — is rewritten as before, and so is a stub
-                // that carries the tag, but only when this pass could lay it clean: the
-                // same rule as the pending stubs' ([`crate::stub::identical_stub_needs_relay`]),
-                // because a rewrite that lands tagged again repairs nothing.
-                if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes())
-                    && !crate::stub::identical_stub_needs_relay(
-                        || crate::provenance::carries_provenance(&path),
-                        crate::lay::lay_clears_provenance,
-                    )
-                {
+                if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes()) {
                     continue;
                 }
             }
             Ok(_) => continue, // foreign: never touched
         }
-        files.push(crate::lay::Executable::new(&path, body));
+        files.push(crate::lay::Executable::new(&path, body.as_bytes()));
     }
     crate::lay::lay_executables(&files)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -800,7 +999,9 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
             if name.starts_with('.') {
                 continue;
             }
-            if row_for(name).is_none() && is_reroute_stub(&path) {
+            // Ours and no longer wanted: a row that left the table, or an agent program
+            // whose twin is gone (uninstalled, tombstoned) — its stub would only pass through.
+            if !wanted.iter().any(|(w, _)| *w == name) && is_reroute_stub(&path) {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -808,21 +1009,66 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether [`lay`] puts the marker file in this pass's list: when it is absent, and when it
-/// carries the tag and this pass can lay it clean — the stubs' rule
-/// ([`crate::stub::identical_stub_needs_relay`]) applied to the ninth file of the directory.
+/// The marker file's bytes.
+fn marker_body() -> String {
+    let mut body = String::from(STUB_MARKER);
+    body.push('\n');
+    body
+}
+
+/// Whether [`lay`] writes the marker file, given what stands there now (`None`: absent or
+/// unreadable): only when it is absent or its bytes differ — never for a tag, which on a
+/// file nothing executes tracks nothing (the reason it is written in-process at all).
+pub(crate) fn marker_needs_lay(have: Option<&[u8]>) -> bool {
+    have != Some(marker_body().as_bytes())
+}
+
+/// `aterm pkg repair`'s half of [`lay`]: re-lay every stub of ours that is current in
+/// content but carries `com.apple.provenance`, when a lay from this process would come
+/// back clean ([`crate::lay::lay_clears_provenance`]) — the one reason to rewrite
+/// identical bytes. Returns how many were re-laid.
 ///
-/// Doctor's scan takes every regular file in the directory, the marker included, so laying it
-/// only when absent left a tagged one tagged for ever, under a warn `aterm pkg repair`
-/// could not clear. The rewrite goes through the lane's temp-and-`rename(2)`, so a racing
-/// walk never sees the directory unmarked. Both closures are lazy: the xattr is read only
-/// when the marker exists, the tracking probe only when it is tagged.
-pub(crate) fn marker_needs_lay(
-    exists: bool,
-    tagged: impl FnOnce() -> bool,
-    lay_clears_tag: impl FnOnce() -> bool,
-) -> bool {
-    !exists || crate::stub::identical_stub_needs_relay(tagged, lay_clears_tag)
+/// # Errors
+/// The lay's own.
+pub fn relay_tagged(layout: &Layout) -> io::Result<usize> {
+    relay_tagged_where(layout, |_| crate::lay::lay_clears_provenance())
+}
+
+/// The passes' half: [`relay_tagged`] once per file — a stub the lane already re-laid and
+/// that came back tagged is not asked again ([`crate::lay::relay_worth_trying`]), so a pass
+/// clears a stub a fallback lay tagged without re-laying the same bytes for ever.
+///
+/// # Errors
+/// The lay's own.
+pub fn relay_tagged_once(layout: &Layout) -> io::Result<usize> {
+    relay_tagged_where(layout, |path| crate::lay::relay_worth_trying(layout, path))
+}
+
+/// Re-lay every tagged, current stub of ours `worth` admits, then remember which came back
+/// tagged ([`crate::lay::note_relayed`]).
+fn relay_tagged_where(layout: &Layout, worth: impl Fn(&Path) -> bool) -> io::Result<usize> {
+    if cfg!(windows) || layout.declined().is_file() {
+        return Ok(0);
+    }
+    let dir = dir(layout);
+    let tagged: Vec<crate::lay::Executable> = wanted_stubs(layout)
+        .into_iter()
+        .map(|(name, _)| dir.join(name))
+        .filter(|path| is_reroute_stub(path) && crate::provenance::carries_provenance(path))
+        .filter(|path| worth(path))
+        .filter_map(|path| {
+            std::fs::read(&path)
+                .ok()
+                .map(|body| crate::lay::Executable::new(&path, body))
+        })
+        .collect();
+    if tagged.is_empty() {
+        return Ok(0);
+    }
+    crate::lay::lay_executables(&tagged)?;
+    let paths: Vec<std::path::PathBuf> = tagged.iter().map(|e| e.path.clone()).collect();
+    crate::lay::note_relayed(layout, &paths);
+    Ok(tagged.len())
 }
 
 /// Remove every stub that is ours; the directory goes too once it is empty.
@@ -848,9 +1094,8 @@ pub fn remove_all(layout: &Layout) {
 /// escape hatch has NOT fired. Applies the row's policy; the exit code is the
 /// exec'd tool's, [`REFUSAL_EXIT`] for a refusal, 127 when a tool could not run.
 ///
-/// A SIGNPOST row announces and then execs UPSTREAM, so its exit code is the
-/// upstream tool's — it only refuses under [`STRICT_ENV`]. ORACLE still
-/// refuses.
+/// A SIGNPOST row announces (unless `[reroute] announce = false`) and then execs
+/// UPSTREAM, so its exit code is the upstream tool's. ORACLE refuses.
 pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
     let Some(row) = row_for(upstream) else {
         eprintln!("atpkg {HIDDEN_VERB}: '{upstream}' is not a rerouted name");
@@ -858,7 +1103,7 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
     };
     // Belt and braces: the stub decides this first, but `aterm <upstream>` and a
     // direct `atpkg __reroute` call arrive here without it.
-    if engaged(std::env::var(NO_REROUTE_ENV).ok().as_deref()) {
+    if engaged(std::env::var(PASSTHROUGH_ENV).ok().as_deref()) {
         return exec_upstream(layout, upstream, args);
     }
     match row.policy {
@@ -892,25 +1137,21 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
                 eprintln!("{}", explicit_lane_note(upstream, branded, lane));
                 return exec_branded(layout, upstream, branded, args);
             }
-            // ANNOUNCE, THEN RUN — the 2026-09-08 ruling. `strict` restores
-            // the refusal; `quiet` drops the line but never the run. A strict
-            // refusal is always spoken: an exit 2 with no reason is a bug.
-            let strict = engaged(std::env::var(STRICT_ENV).ok().as_deref());
-            let quiet = engaged(std::env::var(QUIET_ENV).ok().as_deref());
-            let action = signpost_action(strict, quiet);
-            if action.announce {
-                eprintln!("{}", signpost_message(row, lanes, args, strict));
-            }
-            if action.refuse {
-                return ExitCode::from(REFUSAL_EXIT);
+            // ANNOUNCE, THEN RUN — the 2026-09-08 ruling. `[reroute] announce =
+            // false` (the owner's "suppressed with a flag", a setting since
+            // 2026-09-23) drops the line but never the run.
+            if crate::config::cached_reroute().announce() {
+                eprintln!("{}", signpost_message(row, lanes, args));
             }
             exec_upstream(layout, upstream, args)
         }
-        Policy::Oracle { branded, env } => {
-            if engaged(std::env::var(env).ok().as_deref()) {
-                return exec_upstream(layout, upstream, args);
-            }
-            eprintln!("{}", oracle_message(upstream, branded, env));
+        Policy::Oracle { branded } => {
+            let path_var = std::env::var_os("PATH");
+            let upstream_path = upstream_on_path(layout, upstream, path_var.as_deref());
+            eprintln!(
+                "{}",
+                oracle_message(upstream, branded, upstream_path.as_deref())
+            );
             ExitCode::from(REFUSAL_EXIT)
         }
     }
@@ -956,7 +1197,7 @@ pub fn upstream_on_path(layout: &Layout, name: &str, path_var: Option<&OsStr>) -
 }
 
 /// The first upstream copy (see [`upstream_on_path`]), exec'd with
-/// [`NO_REROUTE_ENV`] set so its own spawns pass silently.
+/// [`PASSTHROUGH_ENV`] set so its own spawns pass silently.
 fn exec_upstream(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
     let path_var = std::env::var_os("PATH");
     let Some(target) = upstream_on_path(layout, upstream, path_var.as_deref()) else {
@@ -964,7 +1205,7 @@ fn exec_upstream(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         return ExitCode::from(127);
     };
     let mut command = std::process::Command::new(&target);
-    command.args(args).env(NO_REROUTE_ENV, "1");
+    command.args(args).env(PASSTHROUGH_ENV, "1");
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("aterm: failed to exec {}: {err}", target.display());
     ExitCode::from(127)
@@ -1001,7 +1242,7 @@ fn exec_branded(layout: &Layout, upstream: &str, branded: &str, args: &[String])
     // refuses the store's own `bin/rustc` copy lints only from there).
     let Some(target) = crate::ops::exec_path(layout, branded) else {
         eprintln!(
-            "aterm: '{upstream}' reroutes to '{branded}', which is not installed here — opening aterm provisions the toolset (`aterm pkg install <program>` for one program); {NO_REROUTE_ENV}=1 restores upstream '{upstream}'."
+            "aterm: '{upstream}' reroutes to '{branded}', which is not installed here — opening aterm provisions the toolset (`aterm pkg install <program>` for one program); `aterm --no-reroute` restores upstream '{upstream}'."
         );
         return ExitCode::from(127);
     };
@@ -1009,6 +1250,12 @@ fn exec_branded(layout: &Layout, upstream: &str, branded: &str, args: &[String])
         crate::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &layout.bin_dir());
     let mut command = std::process::Command::new(&target);
     command.args(args).env("PATH", child_path);
+    // …and what the shim would export before its `exec` (`ops::exec_env`, design S7) —
+    // `atpkg run`'s rule, so a branded program whose policy declares an environment gets
+    // it by either door.
+    for (name, value) in crate::ops::exec_env(layout, branded).entries() {
+        command.env(name, value);
+    }
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("aterm: failed to exec {}: {err}", target.display());
     ExitCode::from(127)
@@ -1135,7 +1382,7 @@ mod tests {
         let Policy::Signpost { lanes, .. } = row.policy else {
             panic!()
         };
-        let text = signpost_message(row, lanes, &args(&["build", "--release"]), false);
+        let text = signpost_message(row, lanes, &args(&["build", "--release"]));
         assert!(
             text.starts_with("aterm: 'cargo' is the Rust name; on Trust the tool is 'targo'."),
             "{text}"
@@ -1147,8 +1394,7 @@ mod tests {
         );
         assert!(text.contains("VERIFIED   — emits a proof claim"), "{text}");
         // Every announce-and-run signpost names the page that MEASURES the
-        // answer, and says the default (owner, 2026-09-08). The strict/refusal
-        // closing is a different sentence and is pinned separately below.
+        // answer, and says the default (owner, 2026-09-08).
         assert!(
             text.contains("`aterm help rust` measures which toolchain THIS directory gets"),
             "{text}"
@@ -1156,7 +1402,7 @@ mod tests {
         assert!(text.contains("the default here is Trust"), "{text}");
         assert!(text.contains("UNVERIFIED — no proof claim"), "{text}");
         // ANNOUNCE, NOT REFUSE: the default says upstream is about to run and
-        // names both flags. The refusal's wording survives only under strict.
+        // names the one setting that silences it — never an environment variable.
         assert!(
             text.contains(
                 "Running upstream 'cargo' now — nothing it produces carries a proof claim."
@@ -1164,19 +1410,17 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with("(ATERM_REROUTE_QUIET=1 silences this; ATERM_REROUTE_STRICT=1 refuses instead of running.)"),
+            text.ends_with(
+                "([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)"
+            ),
             "{text}"
         );
-        let strict = signpost_message(row, lanes, &args(&["build", "--release"]), true);
         assert!(
-            strict.ends_with("(ATERM_NO_REROUTE=1 restores upstream 'cargo'.)"),
-            "{strict}"
+            !text.contains("ATERM_"),
+            "no environment knob is taught: {text}"
         );
-        assert!(!strict.contains("Running upstream"), "{strict}");
-        // The diagnosis above the last line is the same either way.
-        assert!(strict.contains("targo trust build --release"), "{strict}");
         // No arguments: the bare commands, no trailing space.
-        let bare = signpost_message(row, lanes, &[], false);
+        let bare = signpost_message(row, lanes, &[]);
         assert!(bare.contains("targo trust   "), "{bare}");
         assert!(!bare.contains("targo trust  \n"), "{bare}");
     }
@@ -1185,47 +1429,34 @@ mod tests {
     ///
     /// The owner: *"We don't want to prevent agents from using the vanilla rust
     /// toolchain, but we do want … some kind of printed message when using
-    /// these tools that could be suppressed with a flag"*. So the default must
-    /// RUN, the quiet flag must silence WITHOUT refusing, and the strict knob —
-    /// kept for the friction reading this replaced — must refuse while still
-    /// saying why.
+    /// these tools that could be suppressed with a flag"* — and on 2026-09-22 that a
+    /// person's controls are settings, "NOT ENV VARS". So the default must RUN, and
+    /// `[reroute] announce = false` silences the line WITHOUT refusing: `run` reads the
+    /// setting in exactly one place, and no environment knob remains.
     #[test]
-    fn a_signpost_announces_and_runs_and_only_strict_refuses() {
-        assert_eq!(
-            signpost_action(false, false),
-            SignpostAction {
-                announce: true,
-                refuse: false
-            },
-            "the default announces and RUNS — refusing is what the owner ruled out"
+    fn a_signpost_announces_and_runs_and_a_setting_silences_it() {
+        let src = include_str!("reroute.rs");
+        let body = &src[src.find("pub fn run(").expect("run")..];
+        let body = &body[..body.find("\n}\n").expect("run's end")];
+        assert!(
+            body.contains("crate::config::cached_reroute().announce()"),
+            "the announcement is gated on the setting"
         );
-        assert_eq!(
-            signpost_action(false, true),
-            SignpostAction {
-                announce: false,
-                refuse: false
-            },
-            "the quiet flag silences the line; it must never withhold the run"
+        assert!(
+            !body.contains("REFUSAL_EXIT") || body.matches("REFUSAL_EXIT").count() == 2,
+            "only the unknown-name and ORACLE arms refuse: a signpost always runs"
         );
-        assert_eq!(
-            signpost_action(true, false),
-            SignpostAction {
-                announce: true,
-                refuse: true
-            },
+        for retired in [
+            "ATERM_REROUTE_QUIET",
+            "ATERM_REROUTE_STRICT",
+            "ATERM_Z3_IS_ORACLE",
+        ] {
+            assert!(!body.contains(retired), "{retired} is no longer read");
+        }
+        assert!(
+            crate::config::RerouteConfig::default().announce(),
+            "default: announce"
         );
-        assert_eq!(
-            signpost_action(true, true),
-            SignpostAction {
-                announce: true,
-                refuse: true
-            },
-            "a refusal is always spoken: exit 2 with no reason is a bug, not a policy"
-        );
-        // The two knobs are distinct names and neither is the escape hatch.
-        assert_ne!(QUIET_ENV, STRICT_ENV);
-        assert_ne!(QUIET_ENV, NO_REROUTE_ENV);
-        assert_ne!(STRICT_ENV, NO_REROUTE_ENV);
     }
 
     #[test]
@@ -1238,7 +1469,6 @@ mod tests {
             row,
             lanes,
             &args(&["clippy", "--workspace", "--", "-D", "warnings"]),
-            false,
         );
         assert!(
             text.contains("'cargo clippy' is the Rust name; on Trust the tool is 'targo tippy'"),
@@ -1249,7 +1479,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("targo trust"), "{text}");
-        let text = signpost_message(row, lanes, &args(&["fmt", "--check"]), false);
+        let text = signpost_message(row, lanes, &args(&["fmt", "--check"]));
         assert!(text.contains("targo fmt --check"), "{text}");
     }
 
@@ -1259,14 +1489,14 @@ mod tests {
         let Policy::Signpost { lanes, .. } = rustc.policy else {
             panic!()
         };
-        let text = signpost_message(rustc, lanes, &args(&["main.rs"]), false);
+        let text = signpost_message(rustc, lanes, &args(&["main.rs"]));
         assert!(text.contains("trustc main.rs"), "{text}");
         assert!(text.contains("trustc -Ztrust-verify=off main.rs"), "{text}");
         let tlc = row_for("tlc").unwrap();
         let Policy::Signpost { lanes, .. } = tlc.policy else {
             panic!()
         };
-        let text = signpost_message(tlc, lanes, &args(&["Spec.tla"]), false);
+        let text = signpost_message(tlc, lanes, &args(&["Spec.tla"]));
         assert!(
             text.contains("drop-in equivalence is not yet proven"),
             "{text}"
@@ -1278,14 +1508,24 @@ mod tests {
     fn direct_oracle_and_passthrough_are_one_line_each_and_name_the_escape() {
         for text in [
             direct_announcement("rustfmt", "Rust", "trustfmt"),
-            oracle_message("z3", "ay", Z3_ORACLE_ENV),
+            oracle_message("z3", "ay", Some(Path::new("/opt/homebrew/bin/z3"))),
+            oracle_message("z3", "ay", None),
             passthrough_note("cargo", "stable"),
             unreachable_message("cargo"),
         ] {
             assert_eq!(text.lines().count(), 1, "{text}");
             assert!(text.starts_with("aterm: "), "{text}");
-            assert!(text.contains(NO_REROUTE_ENV), "{text}");
+            assert!(text.contains("aterm --no-reroute"), "{text}");
+            assert!(
+                !text.contains("ATERM_"),
+                "no environment knob is taught: {text}"
+            );
         }
+        assert!(
+            oracle_message("z3", "ay", Some(Path::new("/opt/homebrew/bin/z3")))
+                .contains("run /opt/homebrew/bin/z3 to reach the real z3"),
+            "the ORACLE refusal names the path that is the consent"
+        );
     }
 
     /// A second `lay` may be in flight: its `.<name>.stub-<pid>` temp and the
@@ -1327,31 +1567,68 @@ mod tests {
             body.contains("__reroute \"$__aterm_name\" \"$@\""),
             "{body}"
         );
-        assert!(body.contains(NO_REROUTE_ENV), "{body}");
+        assert!(body.contains(PASSTHROUGH_ENV), "{body}");
         assert!(body.ends_with("exit 2\n"), "{body}");
     }
 
-    /// The marker follows the stubs' tag rule: laid when absent; re-laid when it carries
-    /// the tag and the lane can clear it; left alone when clean, and when a rewrite would
-    /// land tagged again. The probes stay lazy — never consulted for an absent marker, and
-    /// the tracking probe never for a clean one.
+    /// The marker is written only when absent or different in content — never for a tag
+    /// (Phase 3: the tag-driven re-lay through the launchd lane never converged, and the
+    /// marker is data nothing executes).
     #[test]
-    fn the_marker_is_relaid_when_tagged_only_if_the_lane_clears_it() {
-        assert!(marker_needs_lay(
-            false,
-            || unreachable!("absent: no xattr read"),
-            || { unreachable!("absent: no tracking probe") }
-        ));
-        assert!(!marker_needs_lay(
-            true,
-            || false,
-            || { unreachable!("clean: no tracking probe") }
-        ));
-        assert!(marker_needs_lay(true, || true, || true));
+    fn the_marker_is_written_only_when_its_bytes_differ() {
+        assert!(marker_needs_lay(None), "absent: laid");
         assert!(
-            !marker_needs_lay(true, || true, || false),
-            "a rewrite that lands tagged again clears nothing"
+            !marker_needs_lay(Some(marker_body().as_bytes())),
+            "identical: left"
         );
+        assert!(
+            marker_needs_lay(Some(b"# something else\n")),
+            "different: rewritten"
+        );
+    }
+
+    /// A second `lay` over a laid directory writes NOTHING: every stub and the marker keep
+    /// their inodes, whatever tag they carry — the steady-state pass and every session
+    /// spawn converge.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_lay_writes_nothing() {
+        use std::os::unix::fs::MetadataExt as _;
+        let l = layout("idempotent");
+        lay(&l).unwrap();
+        let d = dir(&l);
+        let inodes = |d: &Path| -> Vec<(String, u64)> {
+            let mut v: Vec<(String, u64)> = std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().unwrap().ino(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = inodes(&d);
+        assert!(
+            before.iter().any(|(n, _)| n == DIR_MARKER_FILE),
+            "{before:?}"
+        );
+        lay(&l).unwrap();
+        assert_eq!(inodes(&d), before, "nothing was rewritten");
+        // A stub whose body drifted is rewritten, and only it.
+        let cargo = d.join("cargo");
+        let body = std::fs::read_to_string(&cargo).unwrap();
+        std::fs::write(&cargo, body.replace("ATPKG=", "ATPKG_OLD=")).unwrap();
+        let drifted = inodes(&d);
+        lay(&l).unwrap();
+        let after = inodes(&d);
+        for ((name, was), (_, now)) in drifted.iter().zip(&after) {
+            assert_eq!(name == "cargo", was != now, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
     #[test]
@@ -1520,7 +1797,7 @@ mod tests {
             let mut cmd = std::process::Command::new(dir(&l).join("cargo"));
             cmd.args(["build"])
                 .env("PATH", &path_env)
-                .env(NO_REROUTE_ENV, "1");
+                .env(PASSTHROUGH_ENV, "1");
             // 60 s, not 5: the bound's only job is to tell "wedged" from
             // "slow", and an exec loop never finishes, so a longer wait costs
             // this test nothing when it is right and removes nearly all of the
@@ -1570,7 +1847,7 @@ mod tests {
         let note = explicit_lane_note("cargo", "targo", "trust");
         assert_eq!(note.lines().count(), 1, "{note}");
         assert!(note.contains("running targo trust"), "{note}");
-        assert!(note.contains(NO_REROUTE_ENV), "{note}");
+        assert!(note.contains("aterm --no-reroute"), "{note}");
     }
 
     /// The stub's own decisions, in a real `/bin/sh`: the escape hatch execs the
@@ -1603,9 +1880,9 @@ mod tests {
             let mut cmd = std::process::Command::new(&stub);
             cmd.args(["build", "--x"])
                 .env("PATH", &path_env)
-                .env_remove(NO_REROUTE_ENV);
+                .env_remove(PASSTHROUGH_ENV);
             if let Some(v) = no_reroute {
-                cmd.env(NO_REROUTE_ENV, v);
+                cmd.env(PASSTHROUGH_ENV, v);
             }
             cmd.output().unwrap()
         };
@@ -1641,12 +1918,413 @@ mod tests {
         assert_eq!(out.status.code(), Some(2));
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("not reachable") && err.contains(NO_REROUTE_ENV),
+            err.contains("not reachable") && err.contains("aterm --no-reroute"),
             "{err}"
         );
         assert!(
             String::from_utf8_lossy(&out.stdout).is_empty(),
             "stdout must stay clean"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A fake program at `dir/name` that prints `<who>: <args>` — never a real vendor
+    /// binary (a quarantined download raises a Gatekeeper dialog; owner, 2026-09-23).
+    #[cfg(unix)]
+    fn fake(dir: &Path, name: &str, who: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho \"{who}: $*\"\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// An agents twin shaped like the real one: it execs a (fake) store target by
+    /// absolute path.
+    #[cfg(unix)]
+    fn fake_twin(l: &Layout, name: &str) -> PathBuf {
+        let target = fake(
+            &l.prefix.join("store").join(name).join("1").join("bin"),
+            name,
+            &format!("managed {name}"),
+        );
+        let twin = l.agents_dir().join(name);
+        std::fs::create_dir_all(l.agents_dir()).unwrap();
+        std::fs::write(
+            &twin,
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", target.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        twin
+    }
+
+    /// `name` run through `stub` on `path`, with every marker and the escape CLEARED from
+    /// the inherited environment (this suite may itself run inside aterm) and `env` set.
+    #[cfg(unix)]
+    fn run_stub(stub: &Path, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::process::Output {
+        let mut cmd = std::process::Command::new(stub);
+        cmd.args(["--version", "x y"]).env("PATH", path);
+        for marker in crate::hooks::AGENTS_MARKERS {
+            cmd.env_remove(marker);
+        }
+        cmd.env_remove(PASSTHROUGH_ENV);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        output_within(cmd, 60)
+    }
+
+    /// THE OWNER'S CASE, 2026-09-23, IN A REAL `/bin/sh`: a session shell from 2026-09-10
+    /// whose PATH is `reroute, ~/.local/bin, /opt/homebrew/bin, pkg/bin` with NO
+    /// `pkg/agents` runs the managed copy the moment the stub decides — inside aterm, on
+    /// any one of the four markers. Outside aterm the same stub is a pure pass-through to
+    /// the user's own copy, even with `agents/` leaked onto PATH ahead of it (owner law,
+    /// 03513b5d7). `claude` and `codex` alike.
+    #[cfg(unix)]
+    #[test]
+    fn an_agents_stub_runs_the_twin_inside_aterm_and_the_users_own_copy_outside() {
+        for name in crate::stub::AGENT_PROGRAMS {
+            let l = layout(&format!("agents-stub-{name}"));
+            fake_twin(&l, name);
+            lay(&l).unwrap();
+            let d = dir(&l);
+            let stub = d.join(name);
+            assert!(is_reroute_stub(&stub), "{name}: a twin earns a stub");
+            let local = l.prefix.parent().unwrap().join(format!(
+                "atpkg-reroute-agents-local-{name}-{}",
+                std::process::id()
+            ));
+            let brew = local.with_file_name(format!(
+                "atpkg-reroute-agents-brew-{name}-{}",
+                std::process::id()
+            ));
+            fake(&local, name, &format!("local {name}"));
+            fake(&brew, name, &format!("brew {name}"));
+            fake(&l.bin_dir(), name, &format!("bin {name}"));
+            let stale = std::env::join_paths([d.clone(), local.clone(), brew.clone(), l.bin_dir()])
+                .unwrap();
+            let leaked = std::env::join_paths([
+                d.clone(),
+                l.agents_dir(),
+                local.clone(),
+                brew.clone(),
+                l.bin_dir(),
+            ])
+            .unwrap();
+            let stdout = |out: &std::process::Output| {
+                assert!(
+                    out.status.success(),
+                    "{name}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            let managed = format!("managed {name}: --version x y\n");
+            let own = format!("local {name}: --version x y\n");
+            // Inside aterm, on EACH marker alone: the twin, whatever PATH puts ahead.
+            for marker in crate::hooks::AGENTS_MARKERS {
+                for path in [&stale, &leaked] {
+                    let out = run_stub(&stub, path, &[(marker, "1")]);
+                    assert_eq!(stdout(&out), managed, "{name} under {marker}");
+                }
+            }
+            // A marker set but EMPTY is not set (`-n` on the joined word).
+            let out = run_stub(&stub, &stale, &[("ATERM_CHILD", "")]);
+            assert_eq!(stdout(&out), own, "{name}: an empty marker");
+            // Outside aterm: the user's own copy — never the managed one, even leaked.
+            for path in [&stale, &leaked] {
+                assert_eq!(stdout(&run_stub(&stub, path, &[])), own, "{name} outside");
+            }
+            // TERM_PROGRAM is not a marker (ATERM_TERM_PROGRAM makes it user-settable).
+            let out = run_stub(&stub, &stale, &[("TERM_PROGRAM", "aterm")]);
+            assert_eq!(stdout(&out), own, "{name}: TERM_PROGRAM decides nothing");
+            // The --no-reroute marker does not apply to these stubs (manager's ruling,
+            // 2026-09-23): it is the upstream Rust names' switch, and a foreign copy under it
+            // in an old shell but the managed one in a new shell is the bug this closes.
+            // Inside aterm the twin, outside the user's own — whatever its value, on any PATH.
+            for v in ["1", "", "0", "yes"] {
+                for path in [&stale, &leaked] {
+                    let out = run_stub(&stub, path, &[("ATERM_CHILD", "1"), (PASSTHROUGH_ENV, v)]);
+                    assert_eq!(stdout(&out), managed, "{name}: escape {v:?} inside aterm");
+                    let out = run_stub(&stub, path, &[(PASSTHROUGH_ENV, v)]);
+                    assert_eq!(stdout(&out), own, "{name}: escape {v:?} outside aterm");
+                }
+            }
+            // The twin gone: inside aterm too, a pass-through.
+            std::fs::remove_file(l.agents_dir().join(name)).unwrap();
+            let out = run_stub(&stub, &stale, &[("ATERM_CHILD", "1")]);
+            assert_eq!(stdout(&out), own, "{name}: no twin");
+            // Nothing of the user's on PATH: `bin/` answers, as it would with no stub.
+            let bin_only = std::env::join_paths([d.clone(), l.bin_dir()]).unwrap();
+            let out = run_stub(&stub, &bin_only, &[]);
+            assert_eq!(
+                stdout(&out),
+                format!("bin {name}: --version x y\n"),
+                "{name}"
+            );
+            // Nothing at all: exit 127, one line naming the help page, stdout clean.
+            let nothing = std::env::join_paths([d.clone()]).unwrap();
+            let out = run_stub(&stub, &nothing, &[("ATERM_CHILD", "1")]);
+            assert_eq!(out.status.code(), Some(127), "{name}");
+            assert!(out.stdout.is_empty(), "{name}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                err.trim_end(),
+                agents_not_found_message(name),
+                "{name}: one line"
+            );
+            let _ = std::fs::remove_dir_all(&local);
+            let _ = std::fs::remove_dir_all(&brew);
+            let _ = std::fs::remove_dir_all(&l.prefix);
+        }
+    }
+
+    /// NO RECURSION: a second reroute directory on PATH — another prefix's, holding its
+    /// own `claude` stub, a symlink to ours, ours with a trailing slash — `agents/` under
+    /// another spelling, and a symlink to the stub FILE in an ordinary directory are all
+    /// walked past, inside aterm and out, in bounded time.
+    #[cfg(unix)]
+    #[test]
+    fn an_agents_stub_never_runs_another_stub_or_itself() {
+        let l = layout("agents-no-recursion");
+        let other = layout("agents-no-recursion-other");
+        fake_twin(&l, "claude");
+        fake_twin(&other, "claude");
+        lay(&l).unwrap();
+        lay(&other).unwrap();
+        // The other prefix's twin gone: its stub passes through, and must not come back.
+        std::fs::remove_file(other.agents_dir().join("claude")).unwrap();
+        let local = l.prefix.parent().unwrap().join(format!(
+            "atpkg-reroute-agents-norec-local-{}",
+            std::process::id()
+        ));
+        fake(&local, "claude", "local claude");
+        let link = l.prefix.join("link-to-reroute");
+        std::os::unix::fs::symlink(dir(&l), &link).unwrap();
+        let agents_link = l.prefix.join("link-to-agents");
+        std::os::unix::fs::symlink(l.agents_dir(), &agents_link).unwrap();
+        let mut trailing = dir(&l).into_os_string();
+        trailing.push("/");
+        // The stub itself under another name, in an ordinary directory (`ln -s "$(command
+        // -v claude)" ~/bin/claude`): no marker there, so only `-ef "$0"` stops the loop.
+        let user_bin = l.prefix.join("user-bin");
+        std::fs::create_dir_all(&user_bin).unwrap();
+        std::os::unix::fs::symlink(dir(&l).join("claude"), user_bin.join("claude")).unwrap();
+        let path = std::env::join_paths([
+            dir(&other).into_os_string(),
+            link.clone().into_os_string(),
+            trailing,
+            agents_link.clone().into_os_string(),
+            user_bin.clone().into_os_string(),
+            local.clone().into_os_string(),
+        ])
+        .unwrap();
+        let stub = dir(&l).join("claude");
+        let out = run_stub(&stub, &path, &[]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "local claude: --version x y\n",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = run_stub(&stub, &path, &[("ATERM_SESSION_ID", "s-1")]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "managed claude: --version x y\n",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // …and the OTHER prefix's stub (its twin gone, so it passes through), entered
+        // first, walks past every reroute spelling of ours too. (It skips its OWN
+        // `agents/` only — our `agents/` is left off this PATH, the nested-prefix corner
+        // the pass-through does not claim to cover.)
+        let path = std::env::join_paths([
+            dir(&other).into_os_string(),
+            link.clone().into_os_string(),
+            dir(&l).into_os_string(),
+            local.clone().into_os_string(),
+        ])
+        .unwrap();
+        let out = run_stub(&dir(&other).join("claude"), &path, &[("ATERM_CHILD", "1")]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "local claude: --version x y\n",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&local);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&other.prefix);
+    }
+
+    /// `lay` lays an agent program's stub exactly while its twin stands: none without one
+    /// (a stub would make `command -v claude` answer on a machine with no claude), never
+    /// over a foreign file, swept when the twin goes, and a converged directory is left
+    /// alone byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn lay_follows_the_agents_twin_and_never_claims_a_foreign_name() {
+        use std::os::unix::fs::MetadataExt as _;
+        let l = layout("agents-lay");
+        lay(&l).unwrap();
+        let d = dir(&l);
+        for name in crate::stub::AGENT_PROGRAMS {
+            assert!(!d.join(name).exists(), "{name}: no twin, no stub");
+            assert_eq!(stub_state(&l, name), StubState::Missing);
+        }
+        fake_twin(&l, "claude");
+        lay(&l).unwrap();
+        assert!(is_reroute_stub(&d.join("claude")));
+        assert_eq!(
+            std::fs::read_to_string(d.join("claude")).unwrap(),
+            agents_stub_body_sh("claude", &l.agents_dir())
+        );
+        assert!(!d.join("codex").exists(), "codex has no twin");
+        assert_eq!(agents_routes(&l), vec!["claude"]);
+        // Converged: a second lay rewrites nothing.
+        let ino = std::fs::metadata(d.join("claude")).unwrap().ino();
+        lay(&l).unwrap();
+        assert_eq!(std::fs::metadata(d.join("claude")).unwrap().ino(), ino);
+        // A foreign `reroute/codex` is never claimed, even once codex has a twin.
+        std::fs::write(d.join("codex"), "#!/bin/sh\necho mine\n").unwrap();
+        fake_twin(&l, "codex");
+        lay(&l).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("codex")).unwrap(),
+            "#!/bin/sh\necho mine\n"
+        );
+        assert_eq!(stub_state(&l, "codex"), StubState::Foreign);
+        // The twin gone: its stub is swept at the next lay; the TABLE's stay.
+        std::fs::remove_file(l.agents_dir().join("claude")).unwrap();
+        lay(&l).unwrap();
+        assert!(!d.join("claude").exists(), "the stub followed the twin out");
+        assert!(d.join("cargo").exists() && d.join("codex").exists());
+        // `remove_all` takes an agents stub like any other of ours.
+        fake_twin(&l, "claude");
+        lay(&l).unwrap();
+        remove_all(&l);
+        assert!(!d.join("claude").exists());
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The stub's shape: marked on line 2 and recognized as ours, no store target for the
+    /// shim parser, the marker word rendered from THE list the rc hook's gate is (so the
+    /// shell-start and exec-time decisions read the same markers), neither `TERM_PROGRAM`
+    /// nor the `--no-reroute` marker read, and no marker ever SET — the stub reads the markers,
+    /// never writes one.
+    #[test]
+    fn the_agents_stub_reads_the_hooks_markers_and_is_never_a_managed_shim() {
+        let body = agents_stub_body_sh("claude", Path::new("/p/agents"));
+        assert_eq!(body.lines().nth(1), Some(STUB_MARKER));
+        assert!(
+            crate::platform::parse_sh_shim_target(&body).is_none(),
+            "{body}"
+        );
+        assert!(!body.contains("exec '"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "if [ -n \"{}\" ]",
+                crate::hooks::agents_markers_sh()
+            )),
+            "{body}"
+        );
+        assert_eq!(
+            crate::hooks::AGENTS_MARKERS,
+            &["ATERM_AGENTS_DIR", "ATERM_CHILD", "ATERM_SESSION_ID"]
+        );
+        for marker in crate::hooks::AGENTS_MARKERS {
+            assert!(
+                body.contains(&format!("${{{marker}-}}")),
+                "{marker}: {body}"
+            );
+            assert!(
+                !body.contains(&format!("{marker}=")),
+                "{marker} is never set: {body}"
+            );
+        }
+        let posix = crate::hooks::hook_files(Path::new("/p/bin"), Path::new("/p/agents"))
+            .into_iter()
+            .find(|(n, _)| n.ends_with(".zsh"))
+            .unwrap()
+            .1;
+        assert!(
+            posix.contains(&format!(
+                "case \"{}\" in",
+                crate::hooks::agents_markers_sh()
+            )),
+            "the rc hook's gate is the same word: {posix}"
+        );
+        assert!(!body.contains("TERM_PROGRAM"), "{body}");
+        assert!(
+            body.contains("'/p/agents'") && body.contains("'claude'"),
+            "{body}"
+        );
+        assert!(body.contains(DIR_MARKER_FILE), "{body}");
+        assert!(
+            !body.contains(PASSTHROUGH_ENV),
+            "the markers alone decide; the Rust names' escape is never read: {body}"
+        );
+        assert!(body.ends_with("exit 127\n"), "{body}");
+    }
+
+    /// The Rust restatement the doctor and `which` answer with agrees with the stub:
+    /// markers by `-n` (an empty one is unset), nothing else read, and the PATH a
+    /// pass-through walks.
+    #[cfg(unix)]
+    #[test]
+    fn the_stubs_decision_restated_matches_the_stub() {
+        let env = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            StubEnv::read(move |k| {
+                owned
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            })
+        };
+        assert_eq!(env(&[]), StubEnv::default());
+        assert!(!env(&[("ATERM_CHILD", "")]).in_aterm);
+        assert!(!env(&[("TERM_PROGRAM", "aterm")]).in_aterm);
+        for marker in crate::hooks::AGENTS_MARKERS {
+            assert!(env(&[(marker, "x")]).in_aterm, "{marker}");
+        }
+        assert!(
+            !env(&[(PASSTHROUGH_ENV, "1")]).in_aterm,
+            "the escape is not a marker, and the stub reads nothing else"
+        );
+
+        let l = layout("agents-restated");
+        fake_twin(&l, "claude");
+        lay(&l).unwrap();
+        let inside = StubEnv { in_aterm: true };
+        assert!(agents_stub_takes_twin(&l, "claude", inside));
+        assert!(!agents_stub_takes_twin(&l, "claude", StubEnv::default()));
+        assert!(!agents_stub_takes_twin(&l, "codex", inside), "no twin");
+        let local = l.prefix.join("local");
+        fake(&local, "claude", "local");
+        let stale = std::env::join_paths([dir(&l), local.clone(), l.bin_dir()]).unwrap();
+        assert_eq!(
+            agents_stub_first_on_path(&l, "claude", Some(&stale)),
+            Some(dir(&l).join("claude"))
+        );
+        let other_first = std::env::join_paths([local.clone(), dir(&l)]).unwrap();
+        assert_eq!(
+            agents_stub_first_on_path(&l, "claude", Some(&other_first)),
+            None
+        );
+        let leaked =
+            std::env::join_paths([dir(&l), l.agents_dir(), local.clone(), l.bin_dir()]).unwrap();
+        assert_eq!(
+            pass_through_path(&l, Some(&leaked)),
+            Some(std::env::join_paths([local.clone(), l.bin_dir()]).unwrap())
+        );
+        assert_eq!(
+            without_reroute_dirs(Some(&leaked)),
+            Some(std::env::join_paths([l.agents_dir(), local, l.bin_dir()]).unwrap())
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }

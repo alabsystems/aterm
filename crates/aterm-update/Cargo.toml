@@ -15,6 +15,10 @@ default = []
 # Tests always compile the same anchors through `cfg(test)`; the default updater
 # build keeps the specification machinery out of the shipped dependency graph.
 spec-anchors = ["dep:aterm-spec"]
+# Development seams in an optimized build — forwarded to the crate that reads them
+# (`aterm-update-core`: ATERM_UPDATE_ROOT, the `[update]` repoint). The release cutter
+# never enables this; aterm-release's buildplan pins that.
+dev-seams = ["aterm-update-core/dev-seams"]
 
 [dependencies]
 # Manifest (aterm-appcast.toml) + the on-disk `ready.toml` staging marker.

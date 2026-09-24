@@ -73,10 +73,21 @@ const CLAIMS_DIR: &str = "claims";
 /// must be parked ([`hold`]) for as long as the process answers to the id. It is
 /// deliberately not `Clone` — two holders is the bug.
 pub(crate) struct Claim {
-    /// The locked claim file. Never read; held open so the lock stays taken.
-    _file: std::fs::File,
+    /// The locked claim file, held open so the lock stays taken.
+    file: std::fs::File,
     /// The id this claim covers, for diagnostics.
     sid: String,
+}
+
+/// The drop releases the claim at once: `LOCK_UN`, not the close — a child another
+/// thread is spawning holds a copy of every descriptor until it execs, and a claim
+/// released only by the close stays taken for that long. (Windows: the handle's
+/// exclusive share mode is the claim, and its close the release.)
+impl Drop for Claim {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = self.file.unlock();
+    }
 }
 
 impl Claim {
@@ -195,7 +206,7 @@ pub(crate) fn claim_in(dir: &Path, sid: &SessionId) -> ClaimOutcome {
     // after a crash is a process that no longer exists.
     let _ = write_pid(&file);
     ClaimOutcome::Held(Claim {
-        _file: file,
+        file,
         sid: sid.as_str().to_string(),
     })
 }
@@ -518,6 +529,28 @@ mod tests {
             matches!(claim_in(d.path(), &sid), ClaimOutcome::Held(_)),
             "a relaunch after the holder exits must adopt its identity"
         );
+    }
+
+    /// A dropped claim is free at once, whatever else holds its descriptor: a child
+    /// another thread is spawning holds a copy of every descriptor until it execs, and
+    /// a claim released only by the close stayed taken for that long, so the relaunch
+    /// case above was refused under a loaded suite. A duplicate descriptor on the same
+    /// open file description (`try_clone`, which is `dup`) is what that child holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_claim_is_free_while_a_copy_of_its_descriptor_lives() {
+        let d = dir();
+        let sid = SessionId::generate();
+        let ClaimOutcome::Held(first) = claim_in(d.path(), &sid) else {
+            panic!("the first claimant must win");
+        };
+        let childs_copy = first.file.try_clone().expect("dup the claim's descriptor");
+        drop(first);
+        assert!(
+            matches!(claim_in(d.path(), &sid), ClaimOutcome::Held(_)),
+            "a dropped claim is free while a copy of its descriptor lives"
+        );
+        drop(childs_copy);
     }
 
     /// **TIER-1 BINDING FOR `SessionIdClaim`** — the REAL `claim_for_adoption`,

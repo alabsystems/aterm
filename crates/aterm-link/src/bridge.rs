@@ -29,11 +29,12 @@
 //!   answers and `stalled` while this process is alive but its link is not
 //!   ([`Bridge::observe`], [`ACK_DEADLINE`]; round 13);
 //! * WRITES PRESENCE WITH MEANING: every hosted session's row carries `role=
-//!   detail= phase= [context=] title=` beside `attention=` — the phase read by
-//!   the same reader `aterm drive phase` prints from, over the last 40 rows of
-//!   the screen, re-read ONLY when the session's `status revision=` moved, and
-//!   the row republished only when a field changed and at most once per 2 s.
-//!   Never a word of the transcript ([`crate::presence`]; round 13).
+//!   detail= phase= title=` beside `attention=` — `phase=` the SERVER'S agent
+//!   verdict (`status agent=`, and the `EVENT … agent` push on each move),
+//!   relayed as the word it is: this crate reads no screen and links no
+//!   vendor reader. The row is republished only when a field changed and at
+//!   most once per 2 s. Never a word of the transcript ([`crate::presence`];
+//!   round 13, re-grounded 2026-09-23).
 //!
 //! ## A NODE'S DISTINCT-SUBJECT BUDGET IS FINITE, AND NOTHING RECLAIMS IT
 //!
@@ -110,15 +111,10 @@ use astream_broker::Record as BrokerRecord;
 use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
 use crate::mailbox::{Item, Mailbox, Source};
-use crate::presence::{self, Fields, Mode, Slot};
+use crate::presence::{Fields, Mode, Slot};
 use crate::state::{Asked, Deadline, StateDir, TopicCursor, ASKED_KEEP, DEADLINES_KEEP};
 use crate::subject::{self, Reject};
 use crate::transport::{self, Closer, Conn, Transport};
-
-/// How long the loop parks with nothing to do before running its periodic
-/// duties (a reconnect attempt, a presence refresh). NOT a poll interval:
-/// nothing is discovered by waking up, and every real input wakes the mailbox.
-const IDLE_TICK: Duration = Duration::from_millis(250);
 
 /// The reconnect back-off floor and ceiling. §7: "a bridge therefore reconnects
 /// with jittered back-off and opens its publisher connection *before* its drain
@@ -168,8 +164,8 @@ const LINK_REFRESH: Duration = Duration::from_secs(2);
 /// The least gap between two reports made because the round trip MOVED by
 /// more than 2x. A local socket's ack jitters between 1 ms and 3 ms under
 /// `fsync` alone, so an unbounded 2x rule would put a control-lane round trip
-/// under every other publish of a burst; one per idle tick is the same rate
-/// the loop's other periodic duties run at.
+/// under every other publish of a burst; this floor caps those reports at four
+/// per second while the bridge is busy.
 const LINK_MOVE_GAP: Duration = Duration::from_millis(250);
 
 /// How far behind the log's head a refill starts when a session's `seen`
@@ -186,17 +182,20 @@ const REFILL_FLOOR_SPAN: u64 = 4096;
 ///
 /// FROM A DEADLINE, NOT FROM THE IDLE ARM. It used to be `ticks % 8` where
 /// `ticks` advanced only in the mailbox's `None` branch — reachable only after a
-/// full [`IDLE_TICK`] with every queue empty — so a bridge receiving one item
+/// full 250 ms with every queue empty — so a bridge receiving one item
 /// per 250 ms never ran it at all. The commit that made this argument for the
 /// other periodic duties left these behind, and what starves is not
 /// bookkeeping:
-/// [`Bridge::sample_local_control`] is the only place `attention=` is
-/// re-sampled — the field `notify --on attention` and `glance` read — and the
-/// only producer of the per-session `detail=` and `revision` the presence row
-/// carries. A peer posting four times a second is enough to hold a node in
-/// that state indefinitely. (It was also the only producer of §6.6's rows 4
-/// and 5, the conservative pause and the local-lease mirror; round 21 cut both
-/// with the drive face they decided for.)
+/// [`Bridge::sample_local_control`] is the only producer of the per-session
+/// `detail=` the presence row carries, re-reads `status agent=` behind the
+/// `EVENT … agent` push, and reads `meta` (`attention=` — the field `notify
+/// --on attention` and `glance` read — `role=`, `title=`) for a session no
+/// `EVENT … meta` push has covered: one never read, one a `GAP` marked
+/// unread, or one whose re-read on a push or an adoption failed
+/// ([`Bridge::refresh_meta`]). A peer posting four times a second is enough
+/// to hold a node in that state indefinitely. (It was also the only producer
+/// of §6.6's rows 4 and 5, the conservative pause and the local-lease mirror;
+/// round 21 cut both with the drive face they decided for.)
 ///
 /// The period is the one the tick gate used to produce (8 × 250 ms), so a quiet
 /// bridge pays exactly what it paid before and a busy one now pays it too.
@@ -220,6 +219,14 @@ const GHOST_SWEEP: Duration = Duration::from_secs(60);
 /// the cursor is persisted between them, so it also survives a restart
 /// mid-catch-up.
 const SAY_REPLAY_PAGES: usize = 4;
+
+/// Irrelevant broadcast records advance a topic's in-memory read position but
+/// need no per-record durable commit: replaying them after a crash delivers
+/// nothing. Checkpoint each moving session once per 256 such sweeps, with
+/// stable per-session slots so one busy broadcast does not fsync every topic
+/// subscriber at once. A record actually delivered to a topic still persists
+/// that session's entire cursor set immediately in [`Bridge::advance_topic`].
+const SAY_CURSOR_CHECKPOINT_SHARDS: u64 = 256;
 
 /// How long a `state=live` row under this node must have gone unhosted, AS
 /// OBSERVED BY THIS BRIDGE, before its presence is retired.
@@ -304,6 +311,43 @@ const WAITING_KINDS: [&str; 2] = ["ask", "task"];
 /// reason every other periodic duty moved there: a busy bridge never idles.
 const DEADLINE_TICK: Duration = Duration::from_millis(250);
 
+/// Park only until the first duty that actually has work. An empty deadline
+/// table needs no quarter-second wake, while a pending ask still gets its
+/// quarter-second expiry check. The roster's two-second read is also the
+/// backstop for an outbox event lost from the push lane.
+fn idle_wait(
+    now: Instant,
+    roster_due: Instant,
+    deadline_due: Option<Instant>,
+    ghost_due: Option<Instant>,
+) -> Duration {
+    let next = [Some(roster_due), deadline_due, ghost_due]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect("the roster always has a deadline");
+    next.saturating_duration_since(now)
+}
+
+/// Keep the reconnect delay even when the local push lane is busy. The mailbox
+/// wakes for every `EVENT`, so one `take(backoff)` can return immediately and
+/// turn a busy disconnected bridge into a rapid broker dial loop. Drain those
+/// stale prompts until the absolute retry deadline, while still exiting as soon
+/// as either inherited aterm lane closes. The deadline is not restarted by a
+/// new event: traffic cannot postpone recovery either.
+fn wait_for_retry_or_aterm_close(mailbox: &Mailbox, backoff: Duration) -> bool {
+    let deadline = Instant::now() + backoff;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match mailbox.take(remaining) {
+            Some(Item::Closed(Source::Aterm)) => return true,
+            None => return false,
+            Some(_) if Instant::now() >= deadline => return false,
+            Some(_) => {}
+        }
+    }
+}
+
 /// The most verdicts one sweep publishes. Each one is a bounded `Fetch` of the
 /// asker's lane plus a publish, so the sweep is bounded in work per tick and a
 /// burst of expiries drains over a few ticks rather than stalling delivery.
@@ -337,29 +381,109 @@ pub enum Attachment {
     Observer,
 }
 
-/// One sample of what the local instance says about a session: the `revision`
-/// the screen reader is gated on ([`crate::presence::Slot::needs_screen`]) and
-/// whether it has ever been read. It carried §6.6's last two rows until round
-/// 21 cut them with the drive face.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LocalSample {
-    /// Whether `revision` is a real observation yet. THE FIRST SAMPLE IS A
-    /// BASELINE, NOT A CHANGE: without this, every session whose classifier had
-    /// ever moved would read as an unaccounted change the first time it was
-    /// looked at, and the conservative pause would fire on a session nobody had
-    /// touched.
-    seen: bool,
-    /// The `status revision=` this bridge last observed.
-    revision: u64,
-}
-
-/// One `status` reply's three tokens the bridge reads: `revision=`, `hold=`
-/// and `detail=` (the running program, as `ls` prints it).
+/// One `status` reply's three tokens the bridge reads: `hold=`, `detail=`
+/// (the running program, as `ls` prints it) and `agent=` (the server's agent
+/// verdict, `phase=` on the presence row).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StatusSample {
-    revision: u64,
     hold: bool,
     detail: String,
+    agent: Option<String>,
+}
+
+/// One row of `sessions status`. `Stale` is a local id whose stable sid or
+/// launch nonce changed since this bridge's roster read: sampling it would
+/// project the new session's status onto the old one.
+enum BatchSample {
+    Ready(StatusSample),
+    Stale,
+}
+
+/// Parse the status fields the bridge consumes from one batched row.
+/// A malformed batch row is retried through the old per-session verb rather
+/// than silently becoming `hold=0 detail=- agent=-`.
+fn parse_batch_status<'a>(
+    local: u64,
+    tokens: impl Iterator<Item = &'a str>,
+) -> Option<StatusSample> {
+    let (mut sid, mut revision, mut hold, mut detail, mut agent) = (None, None, None, None, None);
+    for tok in tokens {
+        if let Some(v) = tok.strip_prefix("sid=") {
+            if sid.replace(v.parse::<u64>().ok()?).is_some() {
+                return None;
+            }
+        } else if let Some(v) = tok.strip_prefix("revision=") {
+            if revision.replace(v.parse::<u64>().ok()?).is_some() {
+                return None;
+            }
+        } else if let Some(v) = tok.strip_prefix("hold=") {
+            let value = match v {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            }?;
+            if hold.replace(value).is_some() {
+                return None;
+            }
+        } else if let Some(v) = tok.strip_prefix("agent=") {
+            if v.is_empty() || agent.replace(v.to_string()).is_some() {
+                return None;
+            }
+        } else {
+            // A literal space inside detail would create another token. The
+            // GUI percent-encodes it; never accept a truncated free-text row.
+            let v = tok.strip_prefix("detail=")?;
+            if detail.replace(v.to_string()).is_some() {
+                return None;
+            }
+        }
+    }
+    let _revision = revision?;
+    (sid == Some(local)).then_some(StatusSample {
+        hold: hold?,
+        detail: detail?,
+        agent: Some(agent?),
+    })
+}
+
+/// Project one batch onto the roster the bridge already read. A missing or
+/// malformed row remains absent (and gets an individual retry); a row naming
+/// a different incarnation is explicit `Stale` (never applied to the old sid).
+fn parse_batch_rows<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    locals: &BTreeMap<u64, String>,
+    epochs: &BTreeMap<String, String>,
+) -> BTreeMap<u64, BatchSample> {
+    let mut rows = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for line in lines {
+        let mut words = line.split_whitespace();
+        let Some(local) = words.next().and_then(|w| w.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(expected_sid) = locals.get(&local) else {
+            continue;
+        };
+        // A duplicate local-id row is inconsistent even if one copy looks
+        // valid. Fail closed for that sid; do not let the last row win.
+        if !seen.insert(local) {
+            rows.insert(local, BatchSample::Stale);
+            continue;
+        }
+        let (Some(sid), Some(nonce)) = (words.next(), words.next()) else {
+            continue;
+        };
+        if sid != expected_sid || epochs.get(expected_sid).map(String::as_str) != Some(nonce) {
+            rows.insert(local, BatchSample::Stale);
+            continue;
+        }
+        if let Some(sample) = parse_batch_status(local, words) {
+            rows.insert(local, BatchSample::Ready(sample));
+        }
+        // Missing or malformed row: the caller takes the old `@sid status`
+        // path for this session only, leaving the other rows useful.
+    }
+    rows
 }
 
 /// TEST-ONLY fault injection, armed by `$ATERM_LINK_FAULT` — and TEST-ONLY is
@@ -440,6 +564,15 @@ enum Fault {
     /// long as the assertion takes, and everything downstream of the drop is the
     /// shipped path.
     DropSessionExitedWhileMarked,
+    /// DROP the push lane's `post` line while `<state>/drop-post-event` exists,
+    /// and hold any concurrent drain until the test removes the marker. The
+    /// queued post then has no prompt event left; only the two-second roster
+    /// round can drain it. This avoids a test falsely passing when a roster
+    /// round races just ahead of the dropped event.
+    DropPostEventWhileMarked,
+    /// Test that a newly queued fetch is drained by its push event even while
+    /// the periodic roster is prevented from draining the outbox.
+    SkipRosterOutboxWhileMarked,
     /// PAD THE `deliver` REQUEST LINE past [`REQUEST_LINE_MAX`], once.
     ///
     /// Every variable-length field the line carries is now bounded — `via=` by
@@ -465,6 +598,17 @@ enum Fault {
     /// rows qualify, the `inc=` guard, the record published and the `ev` beside
     /// it are all the shipped path.
     SweepGhostsAtOnceWhileMarked,
+    /// DROP the push lane's `EVENT <local> meta` line for as long as a marker
+    /// file (`<state>/drop-meta-event`) exists.
+    ///
+    /// Since 2026-09-23 that push is the ONLY path by which a `meta set
+    /// attention|role|title` made after a session's first read reaches its
+    /// presence row: the roster round reads `meta` only for a slot never read
+    /// or one a `GAP` marked unread. A test that sets `meta` and sees the row
+    /// move cannot tell the push from that first read, so the marker holds the
+    /// push shut while the test proves the change does NOT land without it.
+    /// Everything downstream of the drop is the shipped path.
+    DropMetaEventWhileMarked,
 }
 
 impl Fault {
@@ -490,8 +634,11 @@ impl Fault {
             Ok("fail-status-while-marked") => Fault::FailStatusWhileMarked,
             Ok("fail-post-publish-while-marked") => Fault::FailPostPublishWhileMarked,
             Ok("drop-session-exited-while-marked") => Fault::DropSessionExitedWhileMarked,
+            Ok("drop-post-event-while-marked") => Fault::DropPostEventWhileMarked,
+            Ok("skip-roster-outbox-while-marked") => Fault::SkipRosterOutboxWhileMarked,
             Ok("oversize-deliver-line") => Fault::OversizeDeliverLine,
             Ok("sweep-ghosts-at-once-while-marked") => Fault::SweepGhostsAtOnceWhileMarked,
+            Ok("drop-meta-event-while-marked") => Fault::DropMetaEventWhileMarked,
             _ => Fault::None,
         }
     }
@@ -678,9 +825,8 @@ pub struct Config {
     /// The instance token, for observer mode only.
     pub token: Option<String>,
     /// `--presence meta|minimal` / `[fabric] presence`: whether a session's
-    /// presence row carries `role= detail= phase= context= title=` (the
-    /// default) or `attention=` alone with no screen ever read
-    /// ([`crate::presence::Mode`]).
+    /// presence row carries `role= detail= phase= title=` (the default) or
+    /// `attention=` alone ([`crate::presence::Mode`]).
     pub presence: Mode,
     /// `--receipts` / `[fabric] receipts`: whether an `inbox seen <id>
     /// handled|refused|deferred` on an `ask`/`task` row publishes `kind=ack
@@ -721,10 +867,6 @@ pub struct Bridge {
     locals: BTreeMap<u64, String>,
     /// `sid -> epoch` (the session's public launch nonce, verbatim).
     epochs: BTreeMap<String, String>,
-    /// `sid -> what the local instance last said about it`. Since round 21 its
-    /// whole job is gating the screen read on a moved `status revision=`; the
-    /// two §6.6 rows it was built for went with the drive face.
-    local: BTreeMap<String, LocalSample>,
     /// The sessions this bridge has NEWLY seen and not yet admitted to the
     /// fabric: presence published and, above all, §6.2's ring refill run.
     ///
@@ -767,15 +909,26 @@ pub struct Bridge {
     /// BROADCAST OPT-INS of every local session, with each one's cursor.
     ///
     /// The set is aterm's (`topic add`/`topic drop`); this is the bridge's copy
-    /// of it, sampled on the roster round, plus the one thing aterm cannot
-    /// know: where on the bus each topic resumes. A `since=head` entry is
-    /// resolved ONCE, against the head at the moment this bridge first learns
-    /// it; a `since=@<off>` entry starts at that offset. Every delivery moves
-    /// the cursor past the record, and the whole map is mirrored into
-    /// [`StateDir::set_topics`] so a restart resumes each topic where it was
-    /// instead of silently swallowing everything published while the bridge was
-    /// down.
+    /// of it — PUSHED as `EVENT <local> topic add|drop …` the moment it moves
+    /// ([`Bridge::topic_change`]), and read off `topic ls` once after each
+    /// attach for whatever moved while no bridge was listening
+    /// ([`Bridge::sample_topics`]) — plus the one thing aterm cannot know:
+    /// where on the bus each topic resumes. A `since=head` entry is resolved
+    /// ONCE, against the head at the moment this bridge learns it; a
+    /// `since=@<off>` entry starts at that offset. Every delivery moves the
+    /// cursor past the record and persists the whole map through
+    /// [`StateDir::set_topics`]. Irrelevant records move their cursors in memory
+    /// and checkpoint by shard; a restart may reread those irrelevant records
+    /// but cannot skip a delivered one or broadcasts published while down.
     topics: BTreeMap<String, BTreeMap<String, TopicCursor>>,
+    /// The sessions whose opt-ins have been read off `topic ls` since this
+    /// attach — the once-per-session backstop ([`Bridge::sample_topics`]). A
+    /// session is sampled when this bridge first learns of it, at attach or
+    /// on its `session-created`, and AGAIN when the push lane adopts it if
+    /// that read came first (the `sub` arm of [`Bridge::on_event`]); from then
+    /// on its changes arrive pushed. Reset by every attach, pruned to the
+    /// roster like every per-sid map.
+    topics_sampled: BTreeSet<String>,
     /// THE DRAIN POSITION of the broadcast face: the next offset the live
     /// subscription is expected to hand over.
     ///
@@ -785,17 +938,20 @@ pub struct Bridge {
     /// the lowest cursor any topic still owes, well below the bus head — and
     /// climbs as records arrive.
     say_drained_to: u64,
+    /// One tick per accounted live broadcast, used only to spread durable
+    /// checkpoints of irrelevant cursor movement across subscribers.
+    say_checkpoint_tick: u64,
     /// THE BUS HEAD of the broadcast face, as last known: the head read at
-    /// attach, then one past the highest say record taken.
+    /// attach or for a new `since=head` opt-in, then one past the highest say
+    /// record taken.
     ///
     /// Not the drain position: after a restart with a gap the two differ by
     /// the whole backlog, and `since=head` must mean the head of the bus.
     say_bus_head: u64,
     /// `sid -> the meaning fields of its presence row` — `attention=`, `role=`,
-    /// `detail=`, `phase=`, `context=`, `title=` — as last sampled, the
-    /// `status revision=` the screen was last read at, and what is on the bus
-    /// ([`Slot`]). A row is republished when a field moved and the row on the
-    /// bus is at least [`presence::REPUBLISH_MIN`] old, and only then: presence
+    /// `detail=`, `phase=`, `title=` — as last read or pushed, and what is on
+    /// the bus ([`Slot`]). A row is republished when a field moved and the row on the
+    /// bus is at least [`crate::presence::REPUBLISH_MIN`] old, and only then: presence
     /// is a last-value face on an append-forever log, so a periodic republish
     /// would be one record per session per period forever for no new
     /// information.
@@ -870,6 +1026,36 @@ pub struct Bridge {
     mailbox: Arc<Mailbox>,
 }
 
+/// Advance only cursors at the live drain frontier and name the sessions whose
+/// new position needs a durable checkpoint on this sweep. Matching deliveries
+/// have already persisted their cursor through `advance_topic`, so every move
+/// left here is past a record irrelevant to that particular topic. Replaying
+/// such a record after a crash cannot lose or duplicate a delivered message.
+///
+/// The slot is stable for a session across rounds; as the selected slot cycles,
+/// a continuously moving cursor is at most 255 broadcasts behind on disk.
+fn advance_frontier_cursors(
+    topics: &mut BTreeMap<String, BTreeMap<String, TopicCursor>>,
+    frontier: u64,
+    next: u64,
+    checkpoint_slot: u64,
+) -> Vec<String> {
+    let mut checkpoint = Vec::new();
+    for (sid, by_topic) in topics {
+        let mut changed = false;
+        for cursor in by_topic.values_mut() {
+            if cursor.next >= frontier && cursor.next < next {
+                cursor.next = next;
+                changed = true;
+            }
+        }
+        if changed && fnv1a_64(sid.as_bytes()) % SAY_CURSOR_CHECKPOINT_SHARDS == checkpoint_slot {
+            checkpoint.push(sid.clone());
+        }
+    }
+    checkpoint
+}
+
 impl Bridge {
     /// Build a bridge: state dir, node id, aterm connection, and the whoami that
     /// tells it whether it IS the bridge.
@@ -939,13 +1125,14 @@ impl Bridge {
             conn: None,
             locals: BTreeMap::new(),
             epochs: BTreeMap::new(),
-            local: BTreeMap::new(),
             pending_admit: BTreeSet::new(),
             roster_due: Instant::now() + ROSTER_REFRESH,
             ghost_due: Instant::now() + GHOST_SWEEP,
             ghosts: BTreeMap::new(),
             topics: BTreeMap::new(),
+            topics_sampled: BTreeSet::new(),
             say_drained_to: 0,
+            say_checkpoint_tick: 0,
             say_bus_head: 0,
             presence: BTreeMap::new(),
             halts: BTreeMap::new(),
@@ -1303,14 +1490,13 @@ impl Bridge {
     /// round, capped at [`crate::glance::ATTENTION_CAP`], and carried through
     /// pct-encoded exactly as it arrives.
     ///
-    /// ## AND SO DO `role=`, `detail=`, `phase=`, `context=` AND `title=` (round 13)
+    /// ## AND SO DO `role=`, `detail=`, `phase=` AND `title=` (round 13)
     ///
     /// §4.2 names `role=` and `detail=` too, and `ls` printed `-` for both
-    /// because nothing wrote them. They are written now, with the two a
+    /// because nothing wrote them. They are written now, with the one a
     /// manager actually needs — `phase=` (busy | idle | prompt | question |
-    /// limited | survey, from the same reader `aterm drive phase` prints) and
-    /// `context=<n>%` when Claude Code shows its indicator — from the fields
-    /// [`Bridge::sample_presence`] keeps per session ([`crate::presence`]).
+    /// limited | survey: the server's `agent=` verdict, relayed) — from the
+    /// fields this bridge keeps per session ([`crate::presence`]).
     /// `presence = "minimal"` writes `attention=` alone. NEVER TRANSCRIPT TEXT:
     /// every token is a word this bridge chose, a number, or a `meta` value.
     ///
@@ -1326,14 +1512,17 @@ impl Bridge {
     /// — "unknown" — which is the truth. The node's own row still carries it,
     /// where the will keeps it honest.
     fn publish_session_presence(&mut self, sid: &str, state: &str) {
-        // THE FIRST ROW ALREADY MEANS SOMETHING: a live row is sampled before
-        // it is first published, whichever path publishes it (admission, an
+        // THE FIRST ROW ALREADY MEANS SOMETHING: a live row is read before it
+        // is first published, whichever path publishes it (admission, an
         // observer's, a reconnect's), so a session is never on the bus as
-        // `phase=-` for a round only to be rewritten two seconds later. An
-        // `exited` row is not sampled: the session is gone, and the fields it
+        // `role=- phase=-` for a round only to be rewritten two seconds later.
+        // An `exited` row is not read: the session is gone, and the fields it
         // last had are the honest ones.
         if state == "live" && !self.presence.get(sid).is_some_and(|slot| slot.sampled) {
-            self.sample_presence(sid);
+            if let Some(sample) = self.status_sample(sid) {
+                self.status_into_presence(sid, &sample);
+            }
+            self.sample_meta(sid);
         }
         let subject = subject::session_face(&self.cfg.fleet, &self.node, sid, "presence");
         let epoch = self.epochs.get(sid).cloned().unwrap_or_else(|| "-".into());
@@ -1475,7 +1664,6 @@ impl Bridge {
             self.publish_session_presence(&sid, "exited");
         }
         self.epochs.retain(|sid, _| live.contains(sid));
-        self.local.retain(|sid, _| live.contains(sid));
         self.presence.retain(|sid, _| live.contains(sid));
         // AND THE BROADCAST CURSORS, in memory AND on disk: a session that has
         // exited will never take delivery of a topic again, and a cursor file
@@ -1487,6 +1675,7 @@ impl Bridge {
             }
         }
         self.topics.retain(|sid, _| live.contains(sid));
+        self.topics_sampled.retain(|sid| live.contains(sid));
         self.pending_admit.retain(|sid| live.contains(sid));
         // AND THE DEADLINES OF SESSIONS THAT ARE GONE. A verdict for an ask
         // whose asker has exited would land on a lane nobody drains; dropping
@@ -1727,20 +1916,9 @@ impl Bridge {
     /// backlog has not been walked yet, and moving it here would answer a
     /// `since=@<off>` with silence.
     fn advance_frontier(&mut self, frontier: u64, next: u64) {
-        let mut moved: Vec<String> = Vec::new();
-        for (sid, by_topic) in &mut self.topics {
-            let mut changed = false;
-            for cursor in by_topic.values_mut() {
-                if cursor.next >= frontier && cursor.next < next {
-                    cursor.next = next;
-                    changed = true;
-                }
-            }
-            if changed {
-                moved.push(sid.clone());
-            }
-        }
-        for sid in moved {
+        self.say_checkpoint_tick = self.say_checkpoint_tick.wrapping_add(1);
+        let slot = self.say_checkpoint_tick % SAY_CURSOR_CHECKPOINT_SHARDS;
+        for sid in advance_frontier_cursors(&mut self.topics, frontier, next, slot) {
             self.persist_topics(&sid);
         }
     }
@@ -2136,8 +2314,7 @@ impl Bridge {
     /// become a `task`, a `control` or an `answer`. The second is the allowlist
     /// itself: an unlisted principal's `task`/`control` is a `note` too.
     ///
-    /// ## EVERY HUMAN IS ACCEPTED, and that is the same rule `hook::accepted`
-    /// already implements
+    /// ## EVERY HUMAN IS ACCEPTED
     ///
     /// `--accept-from` is EMPTY by default, so with no carve-out a human's
     /// `task` or `control` arrived DEMOTED on every node whose operator had not
@@ -2155,11 +2332,6 @@ impl Bridge {
     /// on the narrower ground it always also had: a demoted `task` is a `note`,
     /// and a manager's human cannot hand a worker work on a node that has not
     /// heard of them.
-    ///
-    /// This crate's OTHER implementation of the same policy, `hook::accepted`,
-    /// has always read `owner.starts_with("h-") || listed.contains(owner)`, and
-    /// its help text says "beside every `h-*`". The two modules now agree, and
-    /// the one that governs the keyboard is no longer the narrower.
     ///
     /// It is not a widening of anyone's authority: `h-` is a CAP-FORCED `<src>`
     /// segment (§4.3), so a principal can only speak as a human if the broker's
@@ -2208,7 +2380,7 @@ impl Bridge {
 
     /// Whether `src` may speak a `task`/`control` AS ITSELF — every human, plus
     /// whatever `--accept-from` lists. The single source of truth for §8.4's
-    /// rule inside this module; `hook::accepted` is its twin on the wake path.
+    /// rule inside this module.
     fn accepted(&self, src: &str) -> bool {
         src.starts_with("h-") || self.cfg.accept_from.iter().any(|p| p == src)
     }
@@ -2226,9 +2398,8 @@ impl Bridge {
             // attribute a post to any of its OWN SESSIONS". `is_principal`
             // alone also accepts `h-`, `a-` and `n-`, so a node holding nothing
             // but its own §8.2 ring could render `h-andrew@n-rogue` and forge
-            // HUMAN provenance: `hook::accepted` reads the `h-` prefix of this
-            // string to decide whether a row may wake a parked `Stop` hook, and
-            // `InboxRow::is_human` reads it for the eviction order §6.2 promises
+            // HUMAN provenance: `InboxRow::is_human` reads the `h-` prefix of
+            // this string for the eviction order §6.2 promises
             // "never evicts an `h-*` row ahead of anyone else's". Claiming to be
             // a human is outside the residual, so it is refused at the door and
             // the record is attributed to the node itself.
@@ -2951,13 +3122,15 @@ impl Bridge {
         let on = body.unknown.get("state").is_some_and(|s| s == "on");
         // THE HUMAN'S OWN WORDS, carried through. A3 read `state=` and dropped
         // `reason=` on the floor, so every held agent was told `reason=fleet-halt`
-        // — true, and useless: §5.3's whole point is that the `PreToolUse` hook
-        // prints this string to the model, and "main broken, hold everything" is
-        // what stops an agent from re-trying its way around a halt it cannot see
-        // the cause of. It arrives pct-encoded (a body token has no spaces) and
-        // is passed on in that form, which is exactly what `hold … reason=<pct>`
-        // takes; [`halt_reason_token`] bounds and sanitizes it anyway, because a
-        // reason is a stranger's bytes.
+        // — true, and useless: §5.3's whole point is that the reason reaches the
+        // agent — every PTY-reaching verb on a held session answers `ERR halted
+        // reason=<r> origin=…`, and `inbox` carries it (round 25 cut the
+        // `PreToolUse` hook that also printed it to the model, 59c3bee59) — and
+        // "main broken, hold everything" is what stops an agent from re-trying its
+        // way around a halt it cannot see the cause of. It arrives pct-encoded (a
+        // body token has no spaces) and is passed on in that form, which is
+        // exactly what `hold … reason=<pct>` takes; [`halt_reason_token`] bounds
+        // and sanitizes it anyway, because a reason is a stranger's bytes.
         let reason = halt_reason_token(body.unknown.get("reason").map(String::as_str));
         self.halts.insert(human.to_string(), (on, reason));
         // IN FORCE IFF ANY human says on, and each human lifts their OWN (§4.2).
@@ -3268,6 +3441,25 @@ impl Bridge {
         Some((owed.map_or(head, |owed| owed.min(head)), head))
     }
 
+    /// Resolve a NEW `since=head` against the broker now, not the last say
+    /// record the lower-priority broadcast reader happened to drain. An aterm
+    /// `topic add` event outranks that reader, so a record already on the bus
+    /// may still be queued when the opt-in reaches us. Using `say_bus_head` in
+    /// that window replays a record the session explicitly asked to skip.
+    ///
+    /// If the head query fails, `observe` drops the connection and the next
+    /// attach samples the still-held opt-in. No cursor is persisted from a
+    /// guess. One query serves every new head topic in a `topic ls` sample.
+    fn fresh_broadcast_head(&mut self) -> Option<u64> {
+        let filter = subject::say_filter(&self.cfg.fleet);
+        let conn = self.conn.as_mut()?;
+        let started = Instant::now();
+        let answer = conn.fetch(0, &filter, 0).map(|(_, (_, head))| head);
+        let head = self.observe(started, answer, Some("read")).ok()?;
+        self.say_bus_head = self.say_bus_head.max(head);
+        Some(head)
+    }
+
     /// The second half of [`Bridge::read_fleet_halts`]: the standing halts
     /// REBUILT FROM THE BUS, not merged into what this process remembered —
     /// the retained rows ARE the standing state, and a human whose row is gone
@@ -3299,14 +3491,15 @@ impl Bridge {
     /// ONE SAMPLE OF WHAT THE INSTANCE SAYS ABOUT EVERY SESSION IT HOSTS, on
     /// the roster tick.
     ///
-    /// What it reads, per session: the `status` reply's `revision=` (which
-    /// gates the screen read that produces `phase=` and `context=`), its
-    /// `hold=` (reconciled against this bridge's own view, the one thing that
-    /// catches a drop guard landing after a reconcile), its `detail=`, and the
-    /// session's `meta attention=`. A10's notifier and A8's glance read
-    /// `attention=` off the presence row and nothing on the bus announces a
-    /// local `meta set attention`, so it is sampled here, on a round that is
-    /// already paying for a `status`.
+    /// What it reads, per session: ONE `status` — its `hold=` (reconciled
+    /// against this bridge's own view, the one thing that catches a drop guard
+    /// landing after a reconcile), and, off the same reply, the `detail=` and
+    /// `agent=` the presence row carries. `meta` (`attention=`, `role=`,
+    /// `title=`) is NOT read here any more: it arrives as `EVENT <local> meta
+    /// …` on the push lane and is re-read on that push ([`Bridge::on_event`]),
+    /// or on the first round after a `GAP` said a push may be lost. The
+    /// server's `agent=` verdict is pushed the same way (`EVENT <local> agent
+    /// <word> …`); the round's `status` is the backstop for a coalesced one.
     ///
     /// IT WAS THE LOCAL HALF OF §6.6. Two of that table's rows were local
     /// observations rather than bus events — row 4, the conservative pause that
@@ -3321,75 +3514,131 @@ impl Bridge {
         if self.attachment == Attachment::Observer {
             return;
         }
-        let sids: Vec<String> = self.locals.values().cloned().collect();
-        for sid in sids {
-            self.observe_local_control(&sid);
-            // AND THE BROADCAST OPT-INS. The set lives in aterm (`topic add`),
-            // nothing on the bus announces a change to it, and it is a LEVEL
-            // like `attention=` — still true when it is read late — so the
-            // roster round is where it is sampled, on a tick that is already
-            // paying for a round trip per session. The cost of the latency is
-            // stated where the verb is documented: a topic added between two
-            // rounds takes effect on the next one, within [`ROSTER_REFRESH`].
-            self.sample_topics(&sid);
+        let locals: Vec<(u64, String)> = self
+            .locals
+            .iter()
+            .map(|(local, sid)| (*local, sid.clone()))
+            .collect();
+        let mut batch = (!locals.is_empty())
+            .then(|| self.batch_status_samples())
+            .flatten();
+        // Apply the whole snapshot before a session's broadcast replay can
+        // consume several broker pages. That keeps a later tab's hold verdict
+        // close to the instant the main thread observed it.
+        for (local, sid) in &locals {
+            let sample = match batch.as_mut().and_then(|rows| rows.remove(local)) {
+                Some(BatchSample::Ready(sample)) => Some(sample),
+                Some(BatchSample::Stale) => None,
+                None => self.status_sample(sid),
+            };
+            self.observe_local_control(sid, sample);
+        }
+        for (_, sid) in locals {
+            // AND WHATEVER BROADCAST BACKLOG IS STILL OWED, one bounded walk per
+            // round ([`SAY_REPLAY_PAGES`]). The opt-ins themselves arrive
+            // pushed, not sampled: see [`Bridge::topic_change`].
+            self.catch_up_topics(&sid);
 
-            // THE ESCALATION IS A ROSTER OBSERVATION TOO — and so is the rest
-            // of the row's meaning. A10's notifier and A8's glance read
-            // `attention=` off the presence row, and a session sets it locally
-            // with `meta set attention …` — nothing on the bus announces that.
-            // It is sampled here, on the round that already pays for a
-            // `status`, together with `role=`, `title=` (the same `meta`),
-            // `detail=` (that `status`) and — only when the `status revision=`
-            // moved since the last read — `phase=` and `context=` off the
-            // screen's tail. The row is republished ONLY when a field moved
-            // and the row on the bus is a window old ([`Slot::due`]): a
-            // retained face rewritten on a timer is an unbounded write for no
-            // new information.
-            //
-            // The roster deadline is the right one for all of these: every
-            // one is a LEVEL. It is still true when it is read late, so a
-            // slower sampler sees it late rather than not at all.
+            // THE ROW'S MEANING RIDES PUSHES NOW, and this round is their
+            // backstop. `detail=` and `phase=` came off the `status` above
+            // (the read the hold reconciliation pays for anyway); `attention=`,
+            // `role=` and `title=` are re-read on the `EVENT … meta` push, so
+            // `meta` is read here only for a slot that has never been read or
+            // that a `GAP` marked unread. A change a push already published is
+            // not published again; one the window capped ([`Slot::due`]) goes
+            // out here. A retained face rewritten on a timer is an unbounded
+            // write for no new information.
             //
             // A SESSION STILL QUEUED FOR ADMISSION IS LEFT TO THE ADMISSION,
             // which runs right after this on the same round and publishes its
-            // first row (sampled) itself: sampling and publishing it here too
+            // first row (read) itself: reading and publishing it here too
             // put two identical `live` records on the log for every session
             // that existed when the bridge attached.
             if self.pending_admit.contains(&sid) {
                 continue;
             }
-            self.sample_presence(&sid);
-            let mode = self.cfg.presence;
-            if self
-                .presence
-                .get(&sid)
-                .is_some_and(|slot| slot.due(mode, Instant::now()).now())
-            {
-                self.publish_session_presence(&sid, "live");
+            if !self.presence.get(&sid).is_some_and(|slot| slot.sampled) {
+                self.sample_meta(&sid);
             }
+            self.publish_presence_if_due(&sid);
         }
     }
 
-    /// ONE session's BROADCAST OPT-INS, off one `topic ls` — and the cursor
-    /// each one resumes from.
+    /// A PUSHED CHANGE to one session's broadcast opt-ins — `EVENT <local>
+    /// topic add <t> since=<head|@<off>>` or `topic drop <t>` — acted on at
+    /// once.
     ///
-    /// THE RESOLUTION HAPPENS ONCE PER ADD, HERE. aterm answers an INTENT
+    /// THE RESOLUTION HAPPENS HERE, ONCE PER ADD. aterm answers an INTENT
     /// (`since=head` or `since=@<off>`); a cursor is a position, and only this
-    /// side knows where the bus is. An entry whose `serial=` this bridge already
-    /// holds keeps its cursor whatever the session still says, because by then
-    /// records have been delivered against it — re-reading `since=@0` off a
-    /// standing `ls` would replay the whole backlog on every roster round.
+    /// side knows where the bus is. Two events in order are two entries, so a
+    /// `drop` then an `add` under one name reads the second's `since=`; an add
+    /// for a name already held (the backstop sample raced the push) keeps the
+    /// cursor, because records have been delivered against it.
+    fn topic_change(&mut self, sid: &str, words: &mut std::str::SplitWhitespace<'_>) {
+        let op = words.next();
+        let Some(topic) = words.next().filter(|t| subject::is_topic(t)) else {
+            return;
+        };
+        match op {
+            Some("add") => {
+                let since = words
+                    .find_map(|w| w.strip_prefix("since="))
+                    .unwrap_or("head");
+                let held = self
+                    .topics
+                    .get(sid)
+                    .and_then(|by_topic| by_topic.get(topic))
+                    .map(|cursor| cursor.next);
+                let next = match held
+                    .or_else(|| since.strip_prefix('@').and_then(|n| n.parse::<u64>().ok()))
+                {
+                    Some(next) => next,
+                    None => match self.fresh_broadcast_head() {
+                        Some(head) => head,
+                        None => return,
+                    },
+                };
+                self.topics
+                    .entry(sid.to_string())
+                    .or_default()
+                    .entry(topic.to_string())
+                    .or_insert(TopicCursor { next });
+                self.persist_topics(sid);
+                self.catch_up_topics(sid);
+            }
+            Some("drop") => {
+                let Some(by_topic) = self.topics.get_mut(sid) else {
+                    return;
+                };
+                by_topic.remove(topic);
+                if by_topic.is_empty() {
+                    self.topics.remove(sid);
+                    self.state.forget_topics(sid);
+                } else {
+                    self.persist_topics(sid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// THE BACKSTOP: one session's whole opt-in set off `topic ls`, read once
+    /// after an attach.
     ///
-    /// PER ADD, NOT PER NAME: `serial=` is the endpoint's serial for the add, so
-    /// `drop` then `add` under one name inside one roster round is a different
-    /// entry here, and its `since=` is read.
+    /// A pushed change reaches this bridge only while it holds the event lane
+    /// AND a broker: the run loop drops every item but aterm's own closure
+    /// while the broker is unreachable, and a bridge that was not running
+    /// heard nothing at all. So each attach reconciles against the endpoint's
+    /// answer: a name it holds keeps its cursor (records were delivered against
+    /// it), a name it does not is resolved from the row's `since=`, a name the
+    /// endpoint no longer lists is dropped. What this cannot tell apart is a
+    /// `drop` and a re-`add` of the same name both made while no bridge was
+    /// listening — that entry resumes from the old cursor, which the verb's
+    /// help says.
     ///
     /// AN ENDPOINT THAT DOES NOT KNOW THE VERB ANSWERS `ERR`, and that is not a
-    /// reason to forget what this bridge is holding: a downgrade mid-flight
-    /// would otherwise drop every cursor and every opt-in with it. Only an `OK`
-    /// — the session's own answer — replaces the set. An endpoint too old to
-    /// print `serial=` reads as generation 0, which is stable, so it keeps the
-    /// pre-`serial` behaviour rather than re-resolving every round.
+    /// reason to forget what this bridge is holding: only an `OK` — the
+    /// session's own answer — replaces the set.
     fn sample_topics(&mut self, sid: &str) {
         let Ok(reply) = self.ctl_request(&format!("@{sid} topic ls")) else {
             return;
@@ -3398,8 +3647,8 @@ impl Bridge {
             return;
         }
         let have = self.topics.get(sid).cloned().unwrap_or_default();
-        let head = self.say_bus_head;
-        let mut wanted: BTreeMap<String, TopicCursor> = BTreeMap::new();
+        let mut parsed = Vec::new();
+        let mut needs_head = false;
         for row in reply.rows() {
             let mut words = row.split_whitespace();
             if words.next() != Some("topic") {
@@ -3408,28 +3657,27 @@ impl Bridge {
             let Some(topic) = words.next().filter(|t| subject::is_topic(t)) else {
                 continue;
             };
-            let mut since = "head";
-            let mut serial = 0u64;
-            for word in words {
-                if let Some(v) = word.strip_prefix("since=") {
-                    since = v;
-                } else if let Some(v) = word.strip_prefix("serial=") {
-                    serial = v.parse().unwrap_or(0);
-                }
+            let since = words
+                .find_map(|w| w.strip_prefix("since="))
+                .unwrap_or("head");
+            let offset = since.strip_prefix('@').and_then(|n| n.parse::<u64>().ok());
+            needs_head |= !have.contains_key(topic) && offset.is_none();
+            parsed.push((topic.to_string(), offset));
+        }
+        let head = if needs_head {
+            match self.fresh_broadcast_head() {
+                Some(head) => head,
+                None => return,
             }
+        } else {
+            self.say_bus_head
+        };
+        let mut wanted: BTreeMap<String, TopicCursor> = BTreeMap::new();
+        for (topic, offset) in parsed {
             let next = have
-                .get(topic)
-                .filter(|held| held.serial == serial)
-                .map_or_else(
-                    || {
-                        since
-                            .strip_prefix('@')
-                            .and_then(|n| n.parse::<u64>().ok())
-                            .unwrap_or(head)
-                    },
-                    |held| held.next,
-                );
-            wanted.insert(topic.to_string(), TopicCursor { next, serial });
+                .get(&topic)
+                .map_or(offset.unwrap_or(head), |held| held.next);
+            wanted.insert(topic, TopicCursor { next });
         }
         if wanted != have {
             if wanted.is_empty() {
@@ -3524,37 +3772,52 @@ impl Bridge {
         }
     }
 
-    /// ONE session's local observation, off one `status`: the `detail=` its
-    /// presence row carries, the `revision` the screen reader is gated on, and
-    /// the endpoint's own `hold=` reconciled against this bridge's view.
+    /// ONE session's local observation, off one `status`: the `detail=` and
+    /// `agent=` its presence row carries, and the endpoint's own `hold=`
+    /// reconciled against this bridge's view.
     ///
     /// A STATUS THAT CANNOT BE READ RECONCILES NOTHING — an unread state is not
     /// a disagreement, and the sample is taken FIRST so a `None` returns before
-    /// any state moves: `seen` and `revision` are left exactly as the last real
-    /// observation left them ([`Bridge::status_sample`]).
+    /// any state moves ([`Bridge::status_sample`]).
     ///
     /// Round 21 cut the rest. This used to be §6.6's rows 4 and 5 — the
     /// conservative pause that parked a driven row at `human?`, and the mirror
     /// of aterm's own local lease onto the bus — and both existed only to
     /// decide who was allowed to send a `term/in`. With the drive face gone
-    /// there is no such decision to make, and `moved_at`, `driven_at`,
-    /// `DRIVEN_KEEP`, `SETTLE_QUIET` and the whole `match holder` went with it.
-    fn observe_local_control(&mut self, sid: &str) {
-        let Some(sample) = self.status_sample(sid) else {
+    /// there is no such decision to make. The later `revision=` gate on this
+    /// bridge's own screen read also went; the batched row still validates the
+    /// field for compatibility with the ordinary status record.
+    fn observe_local_control(&mut self, sid: &str, sample: Option<StatusSample>) {
+        let Some(sample) = sample else {
             return;
         };
-        let (revision, held) = (sample.revision, sample.hold);
-        // `detail=` for the presence row, off the read already paid for.
-        self.presence
-            .entry(sid.to_string())
-            .or_default()
-            .fields
-            .set_detail(Some(&sample.detail));
-        self.converge_hold(sid, held);
-        let entry = self.local.entry(sid.to_string()).or_default();
-        entry.seen = true;
-        if revision > entry.revision {
-            entry.revision = revision;
+        self.status_into_presence(sid, &sample);
+        self.converge_hold(sid, sample.hold);
+    }
+
+    /// The presence fields one `status` reply carries: `detail=` and the
+    /// server's `agent=` verdict (`phase=`).
+    fn status_into_presence(&mut self, sid: &str, sample: &StatusSample) {
+        let fields = &mut self.presence.entry(sid.to_string()).or_default().fields;
+        fields.set_detail(Some(&sample.detail));
+        fields.set_agent(sample.agent.as_deref());
+    }
+
+    /// Publish `sid`'s presence row when a field moved and the row on the bus
+    /// is a window old ([`Slot::due`]) — and only for a session already
+    /// ADMITTED: one still queued is left to its admission, which publishes
+    /// its first row itself.
+    fn publish_presence_if_due(&mut self, sid: &str) {
+        if self.pending_admit.contains(sid) {
+            return;
+        }
+        let mode = self.cfg.presence;
+        if self
+            .presence
+            .get(sid)
+            .is_some_and(|slot| slot.sampled && slot.due(mode, Instant::now()).now())
+        {
+            self.publish_session_presence(sid, "live");
         }
     }
 
@@ -3676,6 +3939,80 @@ impl Bridge {
         }
     }
 
+    /// Retire ONE presence row on an operator's request — the row as it stands,
+    /// `state=` moved to `exited` and `t=` refreshed, every other field carried
+    /// (`fabric::retired_body`, the doctor's own rule) — published through this
+    /// bridge's sequence. Nothing for a sid ANY local instance hosts (the door
+    /// the request came through is one instance's; the ghost list is the
+    /// node's, read again here, at publish time), for a node that could not be
+    /// asked, for a row that is not `live`, or for a row that is not there;
+    /// each says why on stderr, a refusal is published as
+    /// `presence-retire-refused`, and a retirement's `ev` says
+    /// `reason=operator` so the sweep's `unhosted` retirements stay
+    /// distinguishable on the bus.
+    fn retire_on_request(&mut self, sid: &str) {
+        if self.locals.values().any(|s| s == sid) {
+            eprintln!("aterm-link: refusing to retire @{sid}: this instance hosts it");
+            return;
+        }
+        match crate::fabric::retire_refusal(sid, &crate::fabric::node_hosted()) {
+            Some(crate::fabric::RetireRefusal::Hosted(pid)) => {
+                eprintln!(
+                    "aterm-link: refusing to retire @{sid}: the instance at pid {pid} hosts it"
+                );
+                self.publish_ev(&format!(
+                    "presence-retire-refused sid={sid} reason=hosted pid={pid}"
+                ));
+                return;
+            }
+            Some(crate::fabric::RetireRefusal::Unaskable(why)) => {
+                eprintln!(
+                    "aterm-link: refusing to retire @{sid}: the node could not be asked: {why}"
+                );
+                self.publish_ev(&format!(
+                    "presence-retire-refused sid={sid} reason=unaskable"
+                ));
+                return;
+            }
+            None => {}
+        }
+        let subject = subject::session_face(&self.cfg.fleet, &self.node, sid, "presence");
+        let row = {
+            let Some(conn) = self.conn.as_mut() else {
+                return;
+            };
+            let started = Instant::now();
+            let answer = last_all(conn, &subject).map(|(rows, _)| rows);
+            match self.observe(started, answer, Some("read")) {
+                Ok(rows) => rows.into_iter().find(|(_, s, _)| *s == subject),
+                Err(e) => {
+                    eprintln!("aterm-link: could not read @{sid}'s presence row: {e}");
+                    return;
+                }
+            }
+        };
+        let Some((_, _, raw)) = row else {
+            eprintln!("aterm-link: @{sid} has no presence row on this node; nothing to retire");
+            return;
+        };
+        let body = String::from_utf8_lossy(&raw).into_owned();
+        if Body::decode(&raw)
+            .0
+            .unknown
+            .get("state")
+            .map(String::as_str)
+            != Some("live")
+        {
+            eprintln!("aterm-link: @{sid}'s presence row is not live; nothing to retire");
+            return;
+        }
+        let retired = crate::fabric::retired_body(&body);
+        match self.publish(&subject, retired.as_bytes()) {
+            Ok(_) => self.publish_ev(&format!("presence-retired sid={sid} reason=operator")),
+            Err(e) => eprintln!("aterm-link: could not retire @{sid}: {e}"),
+        }
+    }
+
     /// THE PERIODIC BACKSTOP: the local observations, the roster re-read, the
     /// halt reassert for anything new, and the outbox drain.
     ///
@@ -3717,16 +4054,40 @@ impl Bridge {
         // the same sentence for its 4 MiB drain budget (`cmd_outbox`: "a drain
         // stopped by the budget is resumed by the next call"). One call makes
         // all three true.
-        self.drain_outbox();
+        if self.fault != Fault::SkipRosterOutboxWhileMarked
+            || !self.state.root().join("skip-roster-outbox").exists()
+        {
+            self.drain_outbox();
+        }
     }
 
-    /// The session's `status revision=`, `hold=` and `detail=`, or `None`
+    /// Read all hosted sessions' status fields in one Lines-framed reply.
+    /// `None` means the batch was unavailable, so each session takes the old
+    /// single-status path. A malformed row is retried alone; a row that names a
+    /// different sid or nonce is never projected onto this roster's session.
+    fn batch_status_samples(&mut self) -> Option<BTreeMap<u64, BatchSample>> {
+        // Keep the fault's old meaning: while it is armed, EVERY status read
+        // fails and no batch response may accidentally bypass the test seam.
+        if self.fault == Fault::FailStatusWhileMarked
+            && self.state.root().join("fail-status").exists()
+        {
+            return None;
+        }
+        let reply = self.ctl_request("sessions status").ok()?;
+        if !reply.ok() {
+            return None;
+        }
+        Some(parse_batch_rows(
+            reply.rows().iter().map(String::as_str),
+            &self.locals,
+            &self.epochs,
+        ))
+    }
+
+    /// The session's `status hold=`, `detail=` and `agent=`, or `None`
     /// when the verb could not be read at all.
     ///
-    /// `None` IS NOT A ZERO, and no caller may turn it into one: `revision` is
-    /// compared against the last one seen, so a failed read folded into `0`
-    /// makes the next successful read an advance. See
-    /// [`Bridge::observe_local_control`].
+    /// `None` is an unread state, never a zero-valued hold or agent verdict.
     ///
     /// `detail=` rides the same reply — it is the sanitized running command
     /// `ls` prints (`control_session.rs`'s F5 column, one value for both
@@ -3744,8 +4105,8 @@ impl Bridge {
         }
         let mut sample = StatusSample::default();
         for tok in reply.header().split_whitespace() {
-            if let Some(v) = tok.strip_prefix("revision=") {
-                sample.revision = v.parse().unwrap_or(0);
+            if let Some(v) = tok.strip_prefix("agent=") {
+                sample.agent = Some(v.to_string());
             } else if let Some(v) = tok.strip_prefix("hold=") {
                 sample.hold = v == "1";
             } else if let Some(v) = tok.strip_prefix("detail=") {
@@ -3761,54 +4122,43 @@ impl Bridge {
         reply.ok().then(|| reply.header().to_string())
     }
 
-    /// The last [`presence::TAIL_ROWS`] rows of the session's screen, when it
-    /// answers — the rows the phase reader is shown, and NOTHING of them
-    /// leaves [`Fields::read_screen`] but a word and a number.
-    fn screen_tail(&mut self, sid: &str) -> Option<Vec<String>> {
-        let reply = self
-            .ctl_request(&format!("@{sid} text tail={}", presence::TAIL_ROWS))
-            .ok()?;
-        reply.ok().then(|| reply.rows().to_vec())
-    }
-
-    /// Sample the meaning fields of one session's presence row into its
-    /// [`Slot`]: `attention=`, `role=` and `title=` from `meta`; `detail=` is
-    /// already there from the round's `status` ([`Bridge::status_sample`]);
-    /// `phase=` and `context=` from the screen's tail — read ONLY when the
-    /// `status revision=` the last read was taken at has moved
-    /// ([`Slot::needs_screen`]), so an idle session costs no screen read, and
-    /// never in `minimal` mode. A read that fails leaves the field as it was.
-    ///
-    /// The revision is the one [`Bridge::observe_local_control`] recorded this
-    /// round: aterm's classifier bumps it on every phase or detail change it
-    /// publishes — output starting is `running` at once, output stopping is
-    /// `quiet` after its 5 s `quiet_after` — so a Claude Code turn that ends
-    /// moves it within 5 s, which is the edge that makes the next round
-    /// re-read (measured in `tests/r13_presence.rs`: `phase=idle` on the bus
-    /// 8 s after the screen showed it).
-    fn sample_presence(&mut self, sid: &str) {
-        let mode = self.cfg.presence;
-        let revision = self.local.get(sid).filter(|s| s.seen).map(|s| s.revision);
-        let meta = self.meta_header(sid);
-        let screen = if mode == Mode::Meta
-            && self
-                .presence
-                .get(sid)
-                .is_none_or(|slot| slot.needs_screen(revision))
-        {
-            self.screen_tail(sid)
-        } else {
-            None
+    /// Read one session's `meta` into its presence [`Slot`]: `attention=`,
+    /// `role=` and `title=`. Run on the first publish, on each `EVENT <local>
+    /// meta …` push, and on the round after a `GAP` — never on a timer. A
+    /// read that fails leaves the fields as they were and the slot unsampled,
+    /// so the next round tries again.
+    fn sample_meta(&mut self, sid: &str) {
+        let Some(header) = self.meta_header(sid) else {
+            return;
         };
         let slot = self.presence.entry(sid.to_string()).or_default();
+        slot.fields.read_meta(&header);
         slot.sampled = true;
-        if let Some(header) = meta {
-            slot.fields.read_meta(&header);
+    }
+
+    /// RE-READ one session's `meta` because something says the read on file
+    /// may be stale: an `EVENT <local> meta …` push, or an adoption whose watch
+    /// starts past a change made after that read. The slot is marked unread
+    /// FIRST, so a read that fails is retried by the next roster round rather
+    /// than leaving the stale fields standing as read; a session still queued
+    /// for admission (or not yet on this bridge's roster) is only marked, and
+    /// its admission's first publish reads it. The presence window still
+    /// bounds the writes ([`Bridge::publish_presence_if_due`]).
+    ///
+    /// ONE MECHANISM: this is the only invalidation of a `meta` read besides a
+    /// `GAP`'s, which marks every slot at once. It is the same idea upstream
+    /// shipped as a separate `meta_sampled` cache (d7f56e116, 2026-09-24),
+    /// kept here as the slot's own `sampled` flag so there is one cache bit,
+    /// not two that can disagree.
+    fn refresh_meta(&mut self, sid: &str) {
+        if let Some(slot) = self.presence.get_mut(sid) {
+            slot.sampled = false;
         }
-        if let Some(rows) = screen {
-            slot.fields.read_screen(&rows);
-            slot.text_rev = revision;
+        if self.pending_admit.contains(sid) || !self.epochs.contains_key(sid) {
+            return;
         }
+        self.sample_meta(sid);
+        self.publish_presence_if_due(sid);
     }
 
     /// The session's LIVE generation, `<content_seq>:<fp16>` (§6.6).
@@ -3855,6 +4205,11 @@ impl Bridge {
     /// back, and the whole point of the queue is to survive that.
     fn drain_outbox(&mut self) {
         if self.conn.is_none() {
+            return;
+        }
+        if self.fault == Fault::DropPostEventWhileMarked
+            && self.state.root().join("drop-post-event").exists()
+        {
             return;
         }
         let drained = match self.ctl_request("outbox") {
@@ -3913,8 +4268,8 @@ impl Bridge {
         // bounded local round trip it is already making three of. A roster that
         // cannot be read at all ends the drain rather than resolving against the
         // last one — the endpoint is unreachable, so the retirement this drain
-        // would have to write could not be taken either, and the next drain is
-        // 250 ms away. The receipts and posts it held stay owed and queued at
+        // would have to write could not be taken either, and the roster's next
+        // two-second drain will retry. The receipts and posts stay queued at
         // the endpoint, exactly as a publish the broker refused leaves them.
         if let Err(e) = self.refresh_sessions() {
             eprintln!("aterm-link: the roster could not be re-read before a drain: {e}");
@@ -4323,7 +4678,7 @@ impl Bridge {
     // aterm's events digest
     // -----------------------------------------------------------------------
 
-    /// One `EVENT …` line off the push lane.
+    /// One `EVENT …`, `GAP …` or adoption `sub …` line off the push lane.
     fn on_event(&mut self, line: &str) {
         let mut toks = line.split_whitespace();
         match toks.next() {
@@ -4344,8 +4699,41 @@ impl Bridge {
                 // reached on a schedule, while a session created inside the gap
                 // is ungoverned until then: no presence row, no refill, and no
                 // hold under a standing fleet halt.
+                // AND EVERY SESSION'S `meta`: a `meta` push may have been in
+                // the hole, and nothing but a push re-reads it now.
+                for slot in self.presence.values_mut() {
+                    slot.sampled = false;
+                }
                 self.roster_backstop();
+                // AND EVERY SESSION'S OPT-INS: a `topic add|drop` is one
+                // timeline record, and the hole may have held it.
+                self.topics_sampled.clear();
+                self.sample_unsampled_topics();
                 self.roster_due = Instant::now() + ROSTER_REFRESH;
+                return;
+            }
+            // `sub <local> <sid>`: the push lane has ADOPTED `<sid>`, and its
+            // watch starts at the session's timeline high as of now (see
+            // [`spawn_event_reader`]). A read of that session's topics taken
+            // BEFORE now — an attach's or a `GAP`'s, which read every session
+            // the store lists, or a `session-created` announced one wake ahead
+            // of its adoption — cannot have seen a `topic add` recorded after
+            // it, and the watch starts past that add, so it is read again. A
+            // session not yet read needs nothing here: its first read comes
+            // later, and so after the watch.
+            Some("sub") => {
+                let Some(sid) = toks.nth(1) else { return };
+                if self.topics_sampled.remove(sid) {
+                    self.sample_topics(sid);
+                    self.topics_sampled.insert(sid.to_string());
+                }
+                // AND ITS `meta`, by the same argument: a read taken before
+                // the watch's high-water mark cannot have seen a `meta set`
+                // recorded after it, and the push for that change is behind
+                // the watch. A slot not yet read is read later, after the watch.
+                if self.presence.get(sid).is_some_and(|slot| slot.sampled) {
+                    self.refresh_meta(sid);
+                }
                 return;
             }
             _ => return,
@@ -4353,7 +4741,21 @@ impl Bridge {
         let Some(target) = toks.next() else { return };
         let Some(kind) = toks.next() else { return };
         match kind {
-            "post" => self.drain_outbox(),
+            "post" => {
+                if self.fault == Fault::DropPostEventWhileMarked
+                    && self.state.root().join("drop-post-event").exists()
+                {
+                    self.fault.fired(&self.state);
+                    return;
+                }
+                self.drain_outbox();
+            }
+            "fetch" => {
+                if self.fault == Fault::SkipRosterOutboxWhileMarked {
+                    self.fault.fired(&self.state);
+                }
+                self.drain_outbox();
+            }
             "inbox-seen" => {
                 // `EVENT <local> inbox-seen <id> off=<n> [verdict=<v> kind=<k>
                 // from=<p>]` — the digest names the LOCAL id; `seen_off` is
@@ -4396,6 +4798,11 @@ impl Bridge {
                 // A halt already in force must reach a session that appeared
                 // after it.
                 self.reassert_halt();
+                // And its opt-ins: see [`Bridge::sample_unsampled_topics`]. This
+                // usually runs after the push lane has adopted the session, but
+                // not always — the endpoint announces and adopts in two store
+                // reads — and the adoption's `sub` line re-reads it if not.
+                self.sample_unsampled_topics();
             }
             // `EVENT <local> hold <0|1> reason=<pct> origin=<>` (§11.2). The
             // endpoint says its hold moved; if that disagrees with the standing
@@ -4410,6 +4817,65 @@ impl Bridge {
                 let sid = sid.clone();
                 let held = toks.next() == Some("1");
                 self.converge_hold(&sid, held);
+            }
+            // `EVENT <local> topic add <t> since=<s>` / `topic drop <t>`: the
+            // endpoint's broadcast opt-ins moved. Acted on now — the attach-time
+            // sample is the backstop for a change made while nobody listened.
+            "topic" => {
+                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                    return;
+                };
+                let sid = sid.clone();
+                self.topic_change(&sid, &mut toks);
+            }
+            // `EVENT <local> agent <word> rev=<n> gen=<e.s> fp=<hex16>`: the
+            // server's agent verdict moved. `phase=` is that word, relayed —
+            // the round's `status agent=` is only the backstop for a push a
+            // `GAP` coalesced away.
+            "agent" => {
+                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                    return;
+                };
+                let sid = sid.clone();
+                let word = toks.next();
+                self.presence
+                    .entry(sid.clone())
+                    .or_default()
+                    .fields
+                    .set_agent(word);
+                self.publish_presence_if_due(&sid);
+            }
+            // `EVENT <local> meta field=<f> value=<pct|->`: the session's own
+            // `meta` moved (a `meta set role|title|attention …`, a keyed
+            // attention owner). Re-read the whole header rather than trust one
+            // field's payload, so `title=` stays the USER title by the one rule
+            // [`crate::presence::Fields::read_meta`] keeps.
+            "meta" => {
+                // See [`Fault::DropMetaEventWhileMarked`].
+                if self.fault == Fault::DropMetaEventWhileMarked
+                    && self.state.root().join("drop-meta-event").exists()
+                {
+                    return;
+                }
+                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                    return;
+                };
+                let sid = sid.clone();
+                self.refresh_meta(&sid);
+            }
+            // `EVENT * fabric-retire <sid>`: an operator (`aterm fabric doctor
+            // --retire-ghosts`, through the instance's Owner-gated `fabric
+            // retire`) asks for a presence row nobody hosts to be retired. THE
+            // SEQUENCE IS THIS BRIDGE'S: the CLI never writes it, which is what
+            // makes a live bridge and the doctor safe together. Hosting is
+            // re-checked here against this bridge's own roster — the endpoint's
+            // check is the same fact a moment earlier, and a session admitted
+            // in between is a session, not a ghost.
+            "fabric-retire" => {
+                let Some(sid) = toks.next().filter(|s| subject::is_principal(s)) else {
+                    return;
+                };
+                self.retire_on_request(sid);
             }
             "session-exited" => {
                 // THE LINE THAT NEVER ARRIVES — see
@@ -4601,9 +5067,9 @@ impl Bridge {
         for sid in self.locals.values().cloned().collect::<Vec<_>>() {
             if self.topics.contains_key(&sid) {
                 // A RECONNECT, not a restart: what this process holds is at
-                // least as new as what is on disk (every step of a cursor is
-                // persisted as it is taken), and re-reading the file would
-                // rewind a cursor whose persist had failed.
+                // least as new as what is on disk (delivered records persist
+                // immediately; irrelevant movement checkpoints later), and
+                // re-reading the file would rewind in-memory progress.
                 continue;
             }
             let persisted = self.state.topics(&sid);
@@ -4648,7 +5114,36 @@ impl Bridge {
         // alternative is the minute timer this gating exists to remove.
         self.retire_ghost_presence();
         self.ghost_due = Instant::now() + GHOST_SWEEP;
+        // THE ONCE-PER-SESSION BACKSTOP for the opt-ins: whatever moved while
+        // no bridge was listening. From here on they arrive pushed.
+        self.topics_sampled.clear();
+        self.sample_unsampled_topics();
         true
+    }
+
+    /// Read the opt-ins of every local session this bridge has not yet sampled
+    /// since its attach — at attach, when a session appears, and (every
+    /// session, `topics_sampled` cleared) after a `GAP`: a `topic add` made
+    /// before the push lane's `@*` watch seeded that session's timeline, or
+    /// evicted from it while this reader was not draining, is one the watch
+    /// will never push.
+    ///
+    /// `locals` is the store's roster, which runs AHEAD of the push lane: a
+    /// session is listed from the moment it registers and watched only from
+    /// the push loop's next wake. So a read taken here can precede the watch,
+    /// and an add landing between the two would be in neither — which is why
+    /// the adoption's `sub` line re-reads a session sampled before it.
+    fn sample_unsampled_topics(&mut self) {
+        let fresh: Vec<String> = self
+            .locals
+            .values()
+            .filter(|sid| !self.topics_sampled.contains(*sid))
+            .cloned()
+            .collect();
+        for sid in fresh {
+            self.sample_topics(&sid);
+            self.topics_sampled.insert(sid);
+        }
     }
 
     /// Close every live subscription. Called before a reconnect and on the way
@@ -4684,14 +5179,10 @@ impl Bridge {
                     self.drain_outbox();
                 } else {
                     self.conn = None;
-                    // PARK ON THE MAILBOX for the back-off rather than sleeping
-                    // through it. Exactly one thing can still arrive while the
-                    // broker is unreachable and it is the one that matters:
-                    // aterm going away. A bridge that slept through that would
-                    // spin forever as an orphan, holding nothing and reachable
-                    // by nobody. Any other item is from the connection that just
-                    // died and is dropped with it.
-                    if let Some(Item::Closed(Source::Aterm)) = self.mailbox.take(backoff) {
+                    // Park until this retry's deadline even if other mailbox
+                    // items arrive. They cannot accelerate a failed dial, but
+                    // an inherited aterm-lane close must still end the bridge.
+                    if wait_for_retry_or_aterm_close(&self.mailbox, backoff) {
                         eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                         return Ok(());
                     }
@@ -4741,7 +5232,13 @@ impl Bridge {
             // them lives on the idle branch, because a busy bridge never idles
             // and every one of them is discovered by LOOKING rather than by
             // something arriving.
-            match self.mailbox.take(IDLE_TICK) {
+            let wait = idle_wait(
+                Instant::now(),
+                self.roster_due,
+                (!self.deadlines.is_empty()).then_some(self.deadline_due),
+                (!self.ghosts.is_empty()).then_some(self.ghost_due),
+            );
+            match self.mailbox.take(wait) {
                 Some(Item::Fleet(r)) => self.on_fleet_record(&r),
                 Some(Item::Event(line)) => self.on_event(&line),
                 Some(Item::Inbox(r)) => self.on_inbox_record(&r),
@@ -4762,23 +5259,12 @@ impl Bridge {
                     self.link_down("closed");
                     self.conn = None;
                 }
+                // The deadline at the top of the next loop owns every periodic
+                // duty. An idle timeout itself issues no control request: the
+                // pushed `post` event drains promptly, and the roster round
+                // drains an event that was lost or coalesced away within 2 s.
                 None => {
-                    // THE IDLE TICK, and it is now only ONE duty. Everything
-                    // periodic moved onto its own deadline in the loop body,
-                    // because "nothing is discovered by waking up" was never true
-                    // of the things that are discovered by LOOKING — a screen
-                    // revision advancing, a local `lease acquire`, an
-                    // `attention=` a session set with `meta set`, a
-                    // `session-created` line the push lane coalesced away. None
-                    // of those wakes the mailbox, and a bridge under load never
-                    // reaches this arm at all.
-                    //
-                    // What is left here is the one duty that is genuinely
-                    // "there is a moment to spare": draining the outbox, which
-                    // also has its prompt trigger on the push lane
-                    // (`EVENT <sid> post`) and its own backstop in
-                    // [`Bridge::roster_backstop`].
-                    self.drain_outbox();
+                    // The next loop iteration runs the duty whose deadline woke us.
                 }
             }
         }
@@ -5118,7 +5604,7 @@ pub fn gen_of_frame(frame: &str) -> Option<String> {
 /// 2^40 + 0x1b3. The doc above already claimed to be "the same HASH" as
 /// `turn_ledger`'s and was not, and because the multiply only carries low bits
 /// upward the two agreed in their bottom forty bits and diverged above them —
-/// which is exactly how it was found, by a `--report-to` that hashed a screen
+/// which is exactly how it was found, by a report that hashed a screen
 /// here and compared it with the `hash=` `status` stamps. Nothing persisted a
 /// value: [`gen_of_frame`]'s token is only ever compared with another token
 /// from this same function, so the repair changes no recorded state.
@@ -5530,6 +6016,10 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
             let _ = push.get_ref().flush();
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
+            // The `sub` lines still owed by the handshake: `OK subscribe <n>`
+            // is followed by one `sub <local> <sid>` per target it started
+            // with, and every `sub` after those is an ADOPTION.
+            let mut handshake_subs = 0usize;
             loop {
                 line.clear();
                 match reader.read_line(&mut line) {
@@ -5539,6 +6029,31 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
                     }
                     Ok(_) => {
                         let trimmed = line.trim_end().to_string();
+                        if let Some(n) = trimmed.strip_prefix("OK subscribe ") {
+                            handshake_subs = n
+                                .split_whitespace()
+                                .next()
+                                .and_then(|n| n.parse().ok())
+                                .unwrap_or(0);
+                            continue;
+                        }
+                        // AN ADOPTION'S `sub` IS FORWARDED, the handshake's are
+                        // not. The push loop writes an adoption's line only
+                        // after that session's watch has recorded where it
+                        // starts, so it is the one signal that says "from here
+                        // on, this session's changes are pushed" — the moment
+                        // [`Bridge::on_event`]'s `sub` arm re-reads what an
+                        // earlier read may have missed. The handshake's lines
+                        // are written BEFORE the loop seeds its first watches,
+                        // so they say nothing of the kind.
+                        if trimmed.starts_with("sub ") {
+                            if handshake_subs > 0 {
+                                handshake_subs -= 1;
+                            } else {
+                                mailbox.push_event(trimmed);
+                            }
+                            continue;
+                        }
                         // `EVENT` is the digest; `GAP` is the digest ADMITTING it
                         // dropped frames, which §4.2 says must be published as an
                         // `ev` record rather than dropped ("a `GAP` frame is
@@ -5556,10 +6071,159 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn status_batch_keeps_each_session_and_incarnation_separate() {
+        let locals = BTreeMap::from([
+            (1, "s-one".to_string()),
+            (2, "s-two".to_string()),
+            (3, "s-three".to_string()),
+        ]);
+        let epochs = BTreeMap::from([
+            ("s-one".to_string(), "a1".to_string()),
+            ("s-two".to_string(), "b2".to_string()),
+            ("s-three".to_string(), "c3".to_string()),
+        ]);
+        let rows = [
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude%20Code agent=prompt",
+            "2 s-two b2 sid=2 revision=4 hold=0 detail=- agent=-",
+            // This local id was reused after the bridge's roster read. Its
+            // new nonce cannot update the old session's hold or revision.
+            "3 s-three NEW sid=3 revision=99 hold=0 detail=new",
+        ];
+        let parsed = parse_batch_rows(rows.into_iter(), &locals, &epochs);
+        assert!(matches!(
+            parsed.get(&1),
+            Some(BatchSample::Ready(StatusSample {
+                hold: true,
+                detail,
+                agent: Some(agent),
+            })) if detail == "Claude%20Code" && agent == "prompt"
+        ));
+        assert!(matches!(
+            parsed.get(&2),
+            Some(BatchSample::Ready(StatusSample {
+                hold: false,
+                detail,
+                agent: Some(agent),
+            })) if detail == "-" && agent == "-"
+        ));
+        assert!(matches!(parsed.get(&3), Some(BatchSample::Stale)));
+
+        // A reused local id with a different stable sid is the other
+        // incarnation race. Matching the numeric id and nonce is insufficient.
+        let wrong_sid = ["2 s-other b2 sid=2 revision=88 hold=1 detail=other"];
+        let parsed = parse_batch_rows(wrong_sid.into_iter(), &locals, &epochs);
+        assert!(matches!(parsed.get(&2), Some(BatchSample::Stale)));
+    }
+
+    #[test]
+    fn malformed_batch_rows_retry_singly_and_duplicates_fail_closed() {
+        let locals = BTreeMap::from([(1, "s-one".to_string()), (2, "s-two".to_string())]);
+        let epochs = BTreeMap::from([
+            ("s-one".to_string(), "a1".to_string()),
+            ("s-two".to_string(), "b2".to_string()),
+        ]);
+        let malformed = [
+            // Raw spaces would truncate detail if accepted. The GUI always
+            // percent-encodes them, so this must take the old single-status path.
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude Code agent=prompt",
+            "2 s-two b2 sid=2 revision=4 hold=0 agent=idle",
+        ];
+        assert!(
+            parse_batch_rows(malformed.into_iter(), &locals, &epochs).is_empty(),
+            "missing or malformed rows are retried separately"
+        );
+        let duplicate = [
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=prompt",
+            "1 s-one a1 sid=1 revision=8 hold=0 detail=- agent=idle",
+        ];
+        let parsed = parse_batch_rows(duplicate.into_iter(), &locals, &epochs);
+        assert!(matches!(parsed.get(&1), Some(BatchSample::Stale)));
+
+        // A pre-verdict batch producer is retried through `@sid status` so a
+        // roster tick cannot erase the new server-published agent verdict.
+        let old = ["1 s-one a1 sid=1 revision=7 hold=1 detail=-"];
+        assert!(parse_batch_rows(old.into_iter(), &locals, &epochs).is_empty());
+    }
+
+    #[test]
+    fn busy_local_events_cannot_accelerate_a_failed_broker_retry() {
+        // Tier-1: drive the real mailbox and reconnect wait, then project the
+        // observed events/deadline/close onto the derived machine. Tier-0's
+        // Buggy=1 event reproduces the previous one-shot early retry.
+        let model = aterm_spec::derive::fabric_reconnect_backoff_model();
+        let mut retry = model.init_state();
+        let mailbox = Mailbox::default();
+        for i in 0..64 {
+            mailbox.push_event(format!("EVENT 1 title {i}"));
+            if i < 2 {
+                assert!(model.fire("Event", &mut retry));
+            }
+        }
+        assert_eq!(retry["result"], 0, "local events do not enable a retry");
+        let start = Instant::now();
+        assert!(!wait_for_retry_or_aterm_close(
+            &mailbox,
+            Duration::from_millis(100)
+        ));
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "queued local events must not turn the reconnect backoff into a rapid dial loop"
+        );
+        assert!(model.fire("Deadline", &mut retry));
+        assert_eq!(retry["result"], 1, "the real wait reached its deadline");
+
+        // The aterm closure is higher priority than the event backlog. A
+        // disconnected bridge still releases its instance promptly instead of
+        // sleeping through the whole retry delay.
+        let mut closed = model.init_state();
+        for i in 0..64 {
+            mailbox.push_event(format!("EVENT 1 bell {i}"));
+            if i < 2 {
+                assert!(model.fire("Event", &mut closed));
+            }
+        }
+        mailbox.push_aterm_closed();
+        let start = Instant::now();
+        assert!(wait_for_retry_or_aterm_close(
+            &mailbox,
+            Duration::from_secs(5)
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "a closed aterm lane must interrupt the backoff promptly"
+        );
+        assert!(model.fire("Closed", &mut closed));
+        assert_eq!(closed["result"], 2);
+        assert!(!model.action_enabled("Deadline", &closed));
+    }
+
+    #[test]
+    fn idle_bridge_waits_for_real_work_but_pending_asks_keep_the_expiry_bound() {
+        let now = Instant::now();
+        let roster = now + ROSTER_REFRESH;
+        assert_eq!(
+            idle_wait(now, roster, None, None),
+            ROSTER_REFRESH,
+            "no ask or ghost needs the old 250 ms wake"
+        );
+        assert_eq!(
+            idle_wait(now, roster, Some(now + DEADLINE_TICK), None),
+            DEADLINE_TICK,
+            "an outstanding ask keeps its quarter-second expiry check"
+        );
+        assert_eq!(
+            idle_wait(now, roster, None, Some(now + Duration::from_millis(100))),
+            Duration::from_millis(100),
+            "a ghost sweep due sooner than the roster still wakes on time"
+        );
+        assert_eq!(idle_wait(now, now, None, None), Duration::ZERO);
+    }
+
     /// **THE PRIME IS FNV'S OWN.** Pinned against the vectors FNV publishes,
     /// because the value this returns is compared with a hash another crate
     /// computes (`aterm-gui`'s `turn_ledger::fnv1a_64`, which `status` stamps a
-    /// screen with and `aterm-link hook --report-to` checks its rows against).
+    /// screen with and a stamped report's rows are held against).
     /// A multiplier of `0x1000_0000_01b3` — 2^44 + 0x1b3, which this was —
     /// agrees with the real thing in the bottom forty bits and nowhere above,
     /// so nothing but a cross-crate comparison or a published vector catches it.
@@ -5568,6 +6232,80 @@ mod tests {
         assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    /// One unrelated say row used to call `StateDir::set_topics` (and fsync)
+    /// once for EVERY topic subscriber. The returned set is exactly the set
+    /// `advance_frontier` persists; check the real files as well as that set.
+    #[test]
+    fn unrelated_broadcast_checkpoints_one_shard_and_replays_a_stale_cursor() {
+        let dir =
+            std::env::temp_dir().join(format!("atlink-say-checkpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = StateDir::open(&dir).expect("state dir");
+        let mut topics = BTreeMap::new();
+        for i in 0..64 {
+            let sid = format!("s-{i:03}");
+            let cursors = BTreeMap::from([("quiet".to_string(), TopicCursor { next: 10 })]);
+            state.set_topics(&sid, &cursors).expect("seed cursor");
+            topics.insert(sid, cursors);
+        }
+
+        let checkpoint = advance_frontier_cursors(&mut topics, 10, 11, 143);
+        assert_eq!(checkpoint.len(), 1, "one fsync instead of 64");
+        for sid in &checkpoint {
+            state
+                .set_topics(sid, topics.get(sid).expect("checkpointed session"))
+                .expect("checkpoint cursor");
+        }
+        let durable_moves = topics
+            .keys()
+            .filter(|sid| state.topics(sid)["quiet"].next == 11)
+            .count();
+        assert_eq!(durable_moves, 1, "only the selected state file changed");
+
+        // Simulate a crash by discarding the in-memory map. The stale durable
+        // cursor replays only the irrelevant record and catches up without a
+        // delivery; the other 63 cursors never required an fsync for it.
+        let laggard = topics
+            .keys()
+            .find(|sid| !checkpoint.contains(sid))
+            .expect("a cursor was left for replay")
+            .clone();
+        assert_eq!(topics[&laggard]["quiet"].next, 11);
+        let mut restarted = BTreeMap::from([(laggard.clone(), state.topics(&laggard))]);
+        assert_eq!(restarted[&laggard]["quiet"].next, 10);
+        let _ = advance_frontier_cursors(&mut restarted, 10, 11, 0);
+        assert_eq!(restarted[&laggard]["quiet"].next, 11);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_irrelevant_cursors_get_one_checkpoint_per_256_broadcasts() {
+        let mut topics = (0..64)
+            .map(|i| {
+                (
+                    format!("s-{i:03}"),
+                    BTreeMap::from([("quiet".to_string(), TopicCursor { next: 10 })]),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut counts = BTreeMap::<String, usize>::new();
+        for tick in 1..=SAY_CURSOR_CHECKPOINT_SHARDS {
+            for sid in advance_frontier_cursors(
+                &mut topics,
+                9 + tick,
+                10 + tick,
+                tick % SAY_CURSOR_CHECKPOINT_SHARDS,
+            ) {
+                *counts.entry(sid).or_default() += 1;
+            }
+        }
+        assert!(topics.values().all(|t| t["quiet"].next == 266));
+        assert!(
+            topics.keys().all(|sid| counts.get(sid) == Some(&1)),
+            "each continuously moving cursor was checkpointed exactly once: {counts:?}"
+        );
     }
 
     /// TRUST IS COMPUTED, and it is computed from the two things a sender cannot
@@ -5743,11 +6481,9 @@ mod tests {
             )),
             "the two hashes take the same algorithm over DIFFERENT bytes"
         );
-        // The run loop's idle arm claims the outbox has "its own backstop in
-        // [`Bridge::roster_backstop`]". There was no such call: the only two
-        // triggers were the push-lane `post` event and the idle arm itself, and
-        // both are starved by exactly the traffic that makes the idle arm
-        // unreachable.
+        // The roster round must drain a post whose push event was lost. The
+        // old idle arm did that every 250 ms, even when nothing was queued;
+        // the backstop now carries the recovery without idle control traffic.
         let backstop = src
             .split_once("fn roster_backstop(&mut self) {")
             .expect("the backstop exists")
@@ -5757,8 +6493,23 @@ mod tests {
             .0;
         assert!(
             backstop.contains("self.drain_outbox();"),
-            "the idle arm and `cmd_outbox`'s drain budget both name this function as \
-             the outbox's backstop; it must actually drain it"
+            "`cmd_outbox`'s drain budget names this function as the outbox's \
+             backstop; it must actually drain it"
+        );
+        let timeout_arm = src
+            .split_once("match self.mailbox.take(wait) {")
+            .expect("the bridge parks until its next real duty")
+            .1
+            .split_once("None => {")
+            .expect("an idle timeout has an explicit arm")
+            .1
+            .split_once("\n                }")
+            .expect("the idle timeout arm ends")
+            .0;
+        assert!(
+            !timeout_arm.contains("drain_outbox") && !timeout_arm.contains("ctl_request"),
+            "an idle timeout must not issue a control round trip; a pushed `post` \
+             and the roster backstop own outbox discovery"
         );
         // THE ROW-4/ROW-5 PIN WENT WITH ROWS 4 AND 5. It asserted the local
         // sweep's header did not describe a pre-`LOCAL_OBSERVE` shape, and named

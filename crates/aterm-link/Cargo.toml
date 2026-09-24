@@ -54,27 +54,18 @@ astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 # and the control-socket vocabulary. Neither pulls the engine.
 aterm-types = { workspace = true }
 aterm-uds = { workspace = true }
-# The control-socket CLIENT, for TWO callers. `hook run` (src/hook.rs) finds
-# aterm through `aterm-ctl`'s own flagless resolver (`resolve_sock_for`:
-# $ATERM_CONTROL_SOCK, then the rendezvous graph entry of
-# $ATERM_PARENT_SESSION_ID, then the `latest` alias) and reads the token the way
-# it does. A hook that found aterm by a rule of its own was inert inside every
-# aterm child on macOS (2026-09-14): the child has a session id and no socket
-# variable. And `aterm fabric` (src/fabric.rs), the operator's one-screen view
-# of the fabric, uses it for the local rendezvous walk and the Owner token read
-# — the SAME discovery `aterm ctl instances`/`ls` make, so the report cannot
-# find a different set of instances than the client does. It depends on nothing
-# but the two crates above; std-only, like this crate.
+# The control-socket CLIENT, for the local rendezvous walk and the Owner token
+# read — `aterm fabric` (src/fabric.rs), the operator's one-screen view of the
+# fabric, and the bridge's node-wide hosted set behind `fabric retire` — the
+# SAME discovery `aterm ctl instances`/`ls` make, so neither can find a
+# different set of instances than the client does. It depends on nothing but
+# the two crates above; std-only, like this crate.
 aterm-ctl = { path = "../aterm-ctl" }
 # `aterm fabric` reads `[fabric] command` with the parser the app itself loads
 # aterm.toml with, so the report and the instance cannot disagree about what the
 # file says. It brings `serde`, which is in the shipped binary's graph already;
 # the third-party CRYPTO surface above is unchanged.
 aterm-toml = { workspace = true }
-# The worker-phase reader, for the presence row's `phase=` and `context=`
-# (src/presence.rs) — the SAME functions `aterm drive phase` prints from, so the
-# bus and the drive CLI cannot disagree about a worker. Pure std, no deps.
-aterm-phase = { workspace = true }
 
 [dev-dependencies]
 # `aterm fabric status --json` is asserted as JSON, not as substrings.

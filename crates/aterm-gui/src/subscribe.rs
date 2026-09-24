@@ -1109,6 +1109,13 @@ fn drain_title_event(
 ///   `meta` verb, next to the title emitter (a fleet supervisor learns a sibling
 ///   was renamed/annotated without polling `meta`); the payload is the record's
 ///   own pre-pct-encoded `field=<f> value=<pct|->` tail.
+/// * `EVENT <sid> agent <word> rev=<n> gen=<e.s> fp=<hex16>` for an
+///   `agent-change` — the server's agent verdict moved (`status agent=`),
+///   with the screen generation and hash it was read from. A client can
+///   park on it instead of re-reading the screen; the in-GUI supervisor's
+///   loop does not yet — it reads `text --json` and classifies with
+///   aterm-phase itself, the verdict used only for one bounded `await agent
+///   prompt` (the laws review of 2026-09-24).
 /// * `EVENT <sid> closing <payload>` for the `closing` row the store writes as
 ///   it retires the session — the `reason=<token> by=<sid|human|->` the `exits`
 ///   ledger holds. This watch's own `Arc` is the ONLY wire path that can still
@@ -1122,7 +1129,11 @@ fn drain_title_event(
 /// says. [`timeline_wire_kind`] is the one table both the filter and the frame
 /// name come from. The returned watermark advances to the timeline HIGH (not
 /// just the last pushed record), so skipped records are scanned once, never
-/// re-walked every wake. Small payload strings are cloned OUT under the lock;
+/// re-walked every wake. A watermark below the retained low — the ring is
+/// drop-oldest at [`crate::session_timeline::TIMELINE_CAP`] — is a hole this
+/// watcher never saw, said first as `GAP <sid> events-dropped=<n>` (the mail
+/// lane's `mail-dropped=` twin), so a bridge can re-read what a lost `topic`
+/// row would have told it. Small payload strings are cloned OUT under the lock;
 /// the lock is never held across a write.
 fn drain_timeline_events(
     timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
@@ -1130,7 +1141,7 @@ fn drain_timeline_events(
     last_id: Option<u64>,
     out: &mut String,
 ) -> Option<u64> {
-    let (fresh, high) = {
+    let (missed, fresh, high) = {
         let tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
         // O(1) HIGH-WATER COMPARE BEFORE THE SCAN. `high_id()` is `back()`, so
         // this is one integer compare; the overwhelmingly common wake is a bare
@@ -1142,16 +1153,24 @@ fn drain_timeline_events(
             None => return last_id,
             Some(hi) if last_id.is_some_and(|a| hi <= a) => return Some(hi),
             Some(hi) => {
+                // Records between the watermark and the retained low are gone.
+                let missed = match (last_id, tl.low_id()) {
+                    (Some(a), Some(lo)) => lo.saturating_sub(a + 1),
+                    _ => 0,
+                };
                 // `since` now SEEKS (partition_point) instead of filtering the
                 // whole retained ring, so this costs O(log n + matched).
                 let fresh: Vec<(&'static str, String)> = tl
                     .since(last_id)
                     .filter_map(|e| timeline_wire_kind(e.kind).map(|k| (k, e.payload.clone())))
                     .collect();
-                (fresh, Some(hi))
+                (missed, fresh, Some(hi))
             }
         }
     };
+    if missed > 0 {
+        out.push_str(&format!("GAP {sid} events-dropped={missed}\n"));
+    }
     for (kind, payload) in fresh {
         out.push_str(&format!("EVENT {sid} {kind} {payload}\n"));
     }
@@ -1168,11 +1187,16 @@ fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "meta-change" => Some("meta"),
         "closing" => Some("closing"),
+        // The server's agent verdict moved (`SessionTimeline::publish_agent`):
+        // `EVENT <local> agent <word> rev=<n> gen=<e.s> fp=<hex16>`, the push
+        // face of `status agent=` — a client may park on it instead of
+        // re-reading screens (the in-GUI supervisor does not yet).
+        "agent-change" => Some("agent"),
         // The FABRIC digest (design §11.2): `inbox`, `inbox-seen`, `post`,
-        // `post-landed`, `hold`. Their wire name IS the record kind, and the list
+        // `fetch`, `post-landed`, `hold`, `topic`. Their wire name IS the record kind, and the list
         // lives beside the code that WRITES them
         // ([`crate::fabric::FABRIC_EVENT_KINDS`]) rather than being retyped here,
-        // so a sixth fabric event cannot ship recorded-but-never-pushed — the
+        // so a new fabric event cannot ship recorded-but-never-pushed — the
         // exact drift the `closing` row shipped with. NONE of them carries a body:
         // `inbox` is a count and an offset, `post` an address and a kind. The
         // digest tells an agent that mail EXISTS; reading it is a separate,
@@ -1213,8 +1237,8 @@ struct RosterCursor {
     known: std::collections::HashSet<String>,
 }
 
-/// Emit `EVENT * session-created <sid>` / `EVENT * session-exited <sid> reason=<…>` for
-/// every roster change since the cursor's watermark — the INSTANCE lifecycle
+/// Emit `EVENT * session-created <sid>` / `EVENT * session-exited <sid> reason=<…>` /
+/// `EVENT * fabric-retire <sid>` for every roster change since the cursor's watermark — the INSTANCE lifecycle
 /// stream (`*` = instance-level, not a per-channel event). Surfaces a SIBLING
 /// spawn/exit a fleet supervisor is not watching, so it need not poll `ls`.
 ///
@@ -1280,6 +1304,11 @@ fn drain_session_events(store: &Store, cursor: &mut RosterCursor) -> Vec<Frame> 
                                 rec.reason.as_str()
                             ));
                             cursor.known.remove(&rec.sid);
+                        }
+                        // An operator's request to the bridge, not a membership
+                        // change: `known` is untouched.
+                        crate::session_store::RosterChange::RetireRequested => {
+                            out.push_str(&format!("EVENT * fabric-retire {}\n", rec.sid));
                         }
                     }
                 }
@@ -2099,7 +2128,7 @@ fn pump<W: Write, P: FnMut() -> bool>(
         // demultiplexes an adopted channel exactly the way it does an original
         // one (the shipped bridge already reads `sub` lines anywhere in the
         // stream, because the ack was never guaranteed to arrive in one read).
-        if adopt.on() {
+        if adopt.on() && !push_held("adopt") {
             for f in adopt_new_targets(store, watches, sub, streams, opts, adopt_seq) {
                 egress.emit(f)?;
             }
@@ -2107,7 +2136,9 @@ fn pump<W: Write, P: FnMut() -> bool>(
 
         // INSTANCE lifecycle (connection-level, once per wake): a sibling spawn/exit
         // the subscriber is not watching, so a fleet supervisor need not poll `ls`.
-        if let Some(cursor) = roster.as_mut() {
+        if let Some(cursor) = roster.as_mut()
+            && !push_held("sessions")
+        {
             for f in drain_session_events(store, cursor) {
                 egress.emit(f)?;
             }
@@ -2140,6 +2171,40 @@ fn pump<W: Write, P: FnMut() -> bool>(
         }
         egress.end_wake()?;
     }
+}
+
+/// TEST-ONLY: whether one of [`pump`]'s two per-wake store reads is HELD —
+/// `adopt` ([`adopt_new_targets`]) or `sessions` ([`drain_session_events`]) —
+/// because a file of that name exists in the directory `$ATERM_TEST_PUSH_HOLD`
+/// names. A held step is skipped for that wake with its cursor untouched, so
+/// the journal replays it on the first wake after the file goes.
+///
+/// THE WINDOW IT OPENS IS REAL, and only its width is chosen. A session
+/// registered in the store is announced (`EVENT * session-created`) and adopted
+/// (`sub <local> <sid>`, its watch seeded at the timeline's high) on the push
+/// loop's next wake — up to the 250 ms tick later — and by two separate store
+/// reads, so a spawn landing between them is announced one wake BEFORE it is
+/// adopted. A reader that acts on the announcement, or that reads a session
+/// the store lists before the watch exists, is racing that window, and a test
+/// that raced it from outside would be the flake this codebase refuses. So the
+/// test holds each step open and closes it at the named point.
+///
+/// TEST-ONLY IS ENFORCED, not documented: the variable is read only in a build
+/// with `debug_assertions` — aterm-link's `Fault` rule — and only through
+/// `dev_seam!`, the one reader `env_reads` admits for a development seam, so a
+/// released binary has no hold to arm.
+#[cfg(debug_assertions)]
+fn push_held(step: &str) -> bool {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| aterm_types::dev_seam!("ATERM_TEST_PUSH_HOLD").map(std::path::PathBuf::from))
+        .as_ref()
+        .is_some_and(|dir| dir.join(step).exists())
+}
+
+/// A release build holds nothing: see the debug twin.
+#[cfg(not(debug_assertions))]
+const fn push_held(_step: &str) -> bool {
+    false
 }
 
 /// The block-id watermark to start a fresh `events` subscription at: the current
@@ -3995,6 +4060,71 @@ mod tests {
         let wm2 = drain_timeline_events(&timeline, "7", wm, &mut out);
         assert!(out.is_empty());
         assert_eq!(wm2, Some(4));
+    }
+
+    /// A WATERMARK BELOW THE RETAINED LOW IS A HOLE, AND IT IS SAID. The
+    /// timeline is drop-oldest at `TIMELINE_CAP`; a watcher that fell behind by
+    /// more than that comes back to records it never saw gone, and the drain
+    /// counts them before the retained rows — the mail lane's `mail-dropped=`
+    /// twin, so a bridge can re-read what a lost `topic` row would have said.
+    #[test]
+    fn an_evicted_timeline_record_is_reported_as_a_gap() {
+        use crate::session_timeline::TIMELINE_CAP;
+        let timeline = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::session_timeline::SessionTimeline::default(),
+        ));
+        timeline
+            .lock()
+            .unwrap()
+            .record("spawned", "state=alive".to_string());
+        let seeded = initial_timeline_watermark(
+            &timeline,
+            TargetStreams {
+                events: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seeded, Some(1));
+        // Within the ring: the record, no GAP.
+        timeline
+            .lock()
+            .unwrap()
+            .record("topic", "add t since=head".to_string());
+        let mut out = String::new();
+        let wm = drain_timeline_events(&timeline, "7", seeded, &mut out);
+        assert_eq!(out, "EVENT 7 topic add t since=head\n");
+        assert_eq!(wm, Some(2));
+        // Past the ring: the ring keeps the newest TIMELINE_CAP of these.
+        for i in 0..(TIMELINE_CAP + 5) {
+            timeline
+                .lock()
+                .unwrap()
+                .record("topic", format!("drop t{i}"));
+        }
+        let (low, high) = {
+            let tl = timeline.lock().unwrap();
+            (tl.since(None).next().unwrap().id, tl.high_id().unwrap())
+        };
+        assert_eq!(high, 2 + TIMELINE_CAP as u64 + 5);
+        assert_eq!(low, high - TIMELINE_CAP as u64 + 1);
+        let mut out = String::new();
+        let wm = drain_timeline_events(&timeline, "7", wm, &mut out);
+        let missed = low - 2 - 1; // ids 3 ..= low-1 are gone
+        assert!(
+            out.starts_with(&format!("GAP 7 events-dropped={missed}\n")),
+            "{}",
+            &out[..out.len().min(120)]
+        );
+        assert_eq!(
+            out.matches("EVENT 7 topic drop").count(),
+            TIMELINE_CAP,
+            "every retained row follows the GAP"
+        );
+        assert_eq!(wm, Some(high));
+        // Drained again: silence.
+        let mut out = String::new();
+        drain_timeline_events(&timeline, "7", wm, &mut out);
+        assert!(out.is_empty());
     }
 
     /// THE EXIT LEDGER ON THE WIRE — the deterministic half. A `subscribe … events`

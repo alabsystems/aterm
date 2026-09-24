@@ -112,7 +112,6 @@ const TCC_DB_RELATIVE: &str = "Library/Application Support/com.apple.TCC/TCC.db"
 
 /// Hard cap on an `Info.plist` read. A plist over the cap reads as absent —
 /// unbounded work on a path we do not control is not acceptable in a probe.
-#[cfg(target_os = "macos")]
 const INFO_PLIST_MAX_BYTES: u64 = 256 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -479,76 +478,40 @@ pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
 /// Whether the bundle macOS keys this process's consent decisions to can still
 /// be found on disk.
 ///
-/// # Why this exists
+/// A TCC grant is validated against the running code. If the bundle this process
+/// runs from is renamed or deleted under it, `tccd` cannot build a code object
+/// for it, and every consent decision for the process — and for every descendant
+/// attributed to it — falls back to asking. The updater's apply does exactly that:
+/// `RENAME_SWAP` moves the running bundle to `aterm.app.rollback`, and boot-health
+/// confirmation later deletes it.
 ///
-/// A TCC grant is stored with the client's designated requirement and validated
-/// against the running code on every request that is not already cached. If the
-/// bundle the process was launched from is renamed or deleted while it runs,
-/// `tccd` cannot build a static code object for it, the requirement cannot
-/// match, and **every** consent decision for that process — and for every
-/// descendant attributed to it — falls back to asking. Measured on the owner's
-/// machine 2026-09-19 at 13:42:41, verbatim:
-///
-/// ```text
-/// -[TCCDAccessIdentity staticCode]: SecStaticCodeCreateWithPath(
-///     file:///Applications/aterm.app.rollback) fails for bundle
-///     file:///Applications/aterm.app.rollback/: -67068
-/// ```
-///
-/// aterm's own updater produces exactly that shape: the apply is an atomic
-/// `RENAME_SWAP` that moves the bundle this process was exec'd from to
-/// `aterm.app.rollback`, and boot-health confirmation then deletes it.
-///
-/// # Which path can see it — and which one cannot
-///
-/// A process has TWO answers for "where is my executable", and they disagree
-/// for exactly this defect. **Read the kernel's, not the exec-time one.**
-///
-/// * `std::env::current_exe()` is `_NSGetExecutablePath` on macOS: the string
-///   captured at `execve`, frozen for the life of the process. It never
-///   follows a rename.
-/// * `proc_pidpath` asks the kernel for the vnode's CURRENT path. It follows a
-///   rename and answers nothing once the file is unlinked.
-///
-/// Measured 2026-09-21 with the updater's exact shape — `renamex_np` with
-/// `RENAME_SWAP`, then the boot-health delete:
+/// Classified from the KERNEL's path for the image (`proc_pidpath`), never from
+/// `std::env::current_exe()`: on macOS that is the `execve`-time string, frozen
+/// for the life of the process, and after the swap a new bundle occupies it, so
+/// it reads healthy in exactly the broken state. Measured with the updater's
+/// shape:
 ///
 /// ```text
 ///              current_exe()                 proc_pidpath
 /// before       …/A.app/Contents/MacOS/p      …/A.app/Contents/MacOS/p
 /// after swap   …/A.app/Contents/MacOS/p      …/A.app.rollback/Contents/MacOS/p
-/// after GC     …/A.app/Contents/MacOS/p      (empty, rc=0)
+/// after GC     …/A.app/Contents/MacOS/p      rc=0, errno ENOENT
 /// ```
 ///
-/// So `current_exe()` reports `Live` in all three states: after the swap a NEW
-/// bundle occupies the frozen path, so an `exists` check on it succeeds and the
-/// enclosing directory is still named `.app`. Classifying that path made
-/// [`Displaced`](ImageAnchor::Displaced) and [`Deleted`](ImageAnchor::Deleted)
-/// unreachable for the one case this enum exists for — the owner's live verb
-/// printed `anchor=live` while `tccd` logged
-/// `responsible_path=/Applications/aterm.app.rollback/…` for that same pid.
-/// (This doc said the opposite until 2026-09-21, and the code followed it.)
-///
-/// Both reads are cheap and prompt-free: `proc_pidpath` on self is one
-/// `__proc_info` syscall, and the fallback is an `exists` check on a path the
-/// process already knows. Neither reads a protected location or raises a
-/// dialog.
+/// One syscall; it reads no protected location and raises no dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageAnchor {
-    /// The running image is inside a `.app` that is still on disk under that
-    /// name. Grants keyed to it can be validated.
+    /// The image sits in a `.app` bundle. Grants keyed to it can be validated.
     Live,
-    /// The image is laid out as a bundle (`…/Contents/MacOS/…`) but the
-    /// directory enclosing it is no longer named `<something>.app` — it was
-    /// renamed out from under this process. `aterm.app.rollback` is this.
+    /// The image sits in a bundle layout (`…/Contents/MacOS/…`) whose directory
+    /// is no longer named `<something>.app` — `aterm.app.rollback` after an apply.
     Displaced,
-    /// The running image's own path no longer resolves. The bundle was deleted
-    /// while this process runs, so there is no code left for macOS to check.
+    /// The image no longer has a path: its bundle was deleted while this runs.
     Deleted,
-    /// Not a bundled layout at all: a test binary, `targo run`, a dev build
-    /// outside a `.app`. Not a fault, and never reported as one.
+    /// Not a bundle layout: a test binary, `targo run`, a dev build outside a
+    /// `.app`, or a host with no bundles. Not a fault, and never reported as one.
     NotBundled,
-    /// The executable path could not be read.
+    /// The kernel would not say (a sandbox denying process-info, say).
     Unknown,
 }
 
@@ -576,136 +539,74 @@ impl ImageAnchor {
     }
 }
 
-/// What the kernel currently says about this process's own executable.
-///
-/// Three-valued on purpose: "the image has no path any more" and "this platform
-/// cannot tell me" are different facts, and collapsing them would report a
-/// deleted bundle on every non-macOS build.
+/// What the kernel says about this process's own executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfImage {
-    /// The kernel's current path for the running image.
+    /// Its current path.
     At(PathBuf),
-    /// The kernel has no path for it: the file behind this process was
-    /// unlinked while it runs. `proc_pidpath` answers `rc=0` for that.
+    /// It has no path: `proc_pidpath` failed with `ENOENT`, which for this
+    /// process's own pid means the file was unlinked.
     NoPath,
-    /// No vnode-following source here — a non-macOS build. Never a fault.
-    Unsupported,
+    /// The lookup failed for another reason — `EPERM` under a sandbox that
+    /// denies process-info, or a host with no such call. Says nothing about the
+    /// bundle.
+    Unreadable,
 }
 
 /// [`SelfImage`] for this process.
-///
-/// Asking about ourselves makes the answer unambiguous: the process certainly
-/// exists, so a `proc_pidpath` that cannot name it means the image has no path,
-/// not that the lookup failed.
-#[must_use]
-pub fn self_image() -> SelfImage {
+fn self_image() -> SelfImage {
     #[cfg(target_os = "macos")]
     {
         imp::self_image()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        SelfImage::Unsupported
+        SelfImage::Unreadable
     }
-}
-
-/// Resolve symlinks, keeping the original when the path cannot be resolved.
-///
-/// The two sources spell the same file differently: `_NSGetExecutablePath`
-/// hands back the string `execve` was given, while `proc_pidpath` reports the
-/// kernel's resolved path — so on a machine where the bundle sits under `/tmp`
-/// or `/var` one says `/tmp/…` and the other `/private/tmp/…`, and comparing
-/// them raw reports `Displaced` for a bundle nobody touched. (Caught by
-/// `tests/image_anchor_live.rs`, which runs out of `std::env::temp_dir()`.)
-///
-/// `realpath` is metadata-only and is NOT one of the TCC-gated operations
-/// (design §1.5, the same reasoning `atpkg::hooks::command_links_dir` records),
-/// so normalising here raises no dialog. A path that cannot be resolved — the
-/// collected rollback — keeps its raw spelling and is compared as it stands.
-fn resolved(path: PathBuf) -> PathBuf {
-    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 /// [`ImageAnchor`] for this process.
-///
-/// Normalisation happens HERE rather than inside [`classify_image_anchor`] so
-/// the classifier stays pure over its inputs and its only filesystem reach
-/// remains the injected `exists` oracle.
 #[must_use]
 pub fn image_anchor() -> ImageAnchor {
-    let exe = std::env::current_exe().ok().map(resolved);
-    let live = match self_image() {
-        SelfImage::At(path) => SelfImage::At(resolved(path)),
-        absent => absent,
-    };
-    classify_image_anchor(exe.as_deref(), &live, Path::exists)
-}
-
-/// The classification, pure over the two paths and an existence oracle.
-///
-/// `exec` is the frozen exec-time path (`current_exe`), `live` is the kernel's
-/// current one (`proc_pidpath`). The whole detector is the disagreement between
-/// them — see the [`ImageAnchor`] header for the measurement. `exists` is
-/// injected so the table test drives every arm without creating or deleting
-/// anything.
-///
-/// Order, and why:
-///
-/// 1. **No exec path** ⇒ `Unknown`. Nothing to classify is not a fault.
-/// 2. **Not a bundled layout** ⇒ `NotBundled`, before anything else can call a
-///    `targo run` or a test binary broken. Judged on the exec path, which is
-///    the one that describes how this process was started.
-/// 3. **`live` is `NoPath`** ⇒ `Deleted`. Checked before displacement, because
-///    a deleted image is the less recoverable of the two.
-/// 4. **`live` is `At(p)`** ⇒ `Displaced` when `p`'s bundle root disagrees with
-///    the exec path's — either because `p` is no longer under a `.app` at all
-///    (`aterm.app.rollback`, the literal shape) or because it is under a
-///    DIFFERENT `.app` than the one this process was started from, which is
-///    what `RENAME_SWAP` produces and what a one-path classifier cannot see.
-/// 5. **`live` is `Unsupported`** ⇒ fall back to the exec path's existence.
-///    That cannot catch a swap, and says so.
-#[must_use]
-pub fn classify_image_anchor(
-    exec: Option<&Path>,
-    live: &SelfImage,
-    exists: impl Fn(&Path) -> bool,
-) -> ImageAnchor {
-    let Some(exec) = exec else {
-        return ImageAnchor::Unknown;
-    };
-    // A bundled LAYOUT is what makes `.app` the expected name. Without it there
-    // is nothing to be displaced from, and an ordinary dev run must never be
-    // reported as a broken grant.
-    let components: Vec<Component<'_>> = exec.components().collect();
-    let bundled_layout = components.len() >= 4
-        && components
-            .windows(2)
-            .any(|w| w[0].as_os_str() == "Contents" && w[1].as_os_str() == "MacOS");
-    if !bundled_layout {
+    if cfg!(not(target_os = "macos")) {
         return ImageAnchor::NotBundled;
     }
-    match live {
-        SelfImage::NoPath => ImageAnchor::Deleted,
-        SelfImage::At(path) => {
-            // `app_bundle_root` answers None for `…/aterm.app.rollback/…`
-            // because the enclosing directory's extension is `rollback`. A
-            // swap keeps a `.app` name but changes WHICH bundle, so compare
-            // the roots rather than merely testing for one.
-            match (app_bundle_root(path), app_bundle_root(exec)) {
-                (Some(live_root), Some(exec_root)) if live_root == exec_root => ImageAnchor::Live,
-                _ => ImageAnchor::Displaced,
-            }
-        }
-        // No vnode view: the exec-time path is all there is. This is the old,
-        // swap-blind behaviour, kept only where nothing better exists.
-        SelfImage::Unsupported => {
-            if exists(exec) {
-                ImageAnchor::Live
-            } else {
-                ImageAnchor::Deleted
-            }
-        }
+    classify_image_anchor(std::env::current_exe().ok().as_deref(), &self_image())
+}
+
+/// The classification, pure over the exec-time path and the kernel's answer.
+///
+/// The kernel's path decides whenever there is one. The exec path only tells a
+/// deleted bundle from a binary that was never in one, since a deleted image has
+/// no current path left to judge.
+#[must_use]
+pub fn classify_image_anchor(exec: Option<&Path>, image: &SelfImage) -> ImageAnchor {
+    match image {
+        SelfImage::At(path) if bundle_layout_root(path).is_none() => ImageAnchor::NotBundled,
+        SelfImage::At(path) if app_bundle_root(path).is_some() => ImageAnchor::Live,
+        SelfImage::At(_) => ImageAnchor::Displaced,
+        SelfImage::NoPath => match exec {
+            Some(exec) if bundle_layout_root(exec).is_some() => ImageAnchor::Deleted,
+            Some(_) => ImageAnchor::NotBundled,
+            None => ImageAnchor::Unknown,
+        },
+        SelfImage::Unreadable => ImageAnchor::Unknown,
     }
+}
+
+/// The directory enclosing `<dir>/Contents/MacOS/<exe>`, whatever `<dir>` is
+/// named — `aterm.app` and `aterm.app.rollback` alike. [`app_bundle_root`] is the
+/// narrower question, "is that directory still named `.app`".
+#[must_use]
+fn bundle_layout_root(exe: &Path) -> Option<PathBuf> {
+    let components: Vec<Component<'_>> = exe.components().collect();
+    let last_start = components.len().checked_sub(4)?;
+    (0..=last_start).rev().find_map(|index| {
+        (matches!(components[index], Component::Normal(_))
+            && components[index + 1].as_os_str() == "Contents"
+            && components[index + 2].as_os_str() == "MacOS")
+            .then(|| components[..=index].iter().collect())
+    })
 }
 
 /// `true` when the path cannot be handed to a C API because it contains an
@@ -905,7 +806,7 @@ pub fn is_under_protected_root(path: &Path, protected: &[PathBuf]) -> bool {
 pub fn display_name(exe: &Path, info_plist_text: Option<&str>) -> String {
     if let Some(text) = info_plist_text {
         for key in ["CFBundleDisplayName", "CFBundleName"] {
-            if let Some(value) = xml_plist_string(text, key) {
+            if let Some(value) = plist_string(text, key) {
                 return value.to_owned();
             }
         }
@@ -914,27 +815,6 @@ pub fn display_name(exe: &Path, info_plist_text: Option<&str>) -> String {
         || String::from("unknown"),
         |n| n.to_string_lossy().into_owned(),
     )
-}
-
-/// The string immediately following one exact XML plist key, non-empty and
-/// trimmed. The value element must follow the key modulo whitespace, so a
-/// malformed or intervening key's string can never be mis-bound.
-fn xml_plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let mut haystack = text;
-    loop {
-        let at = haystack.find("<key>")?;
-        let after = &haystack[at + "<key>".len()..];
-        let end = after.find("</key>")?;
-        let found = after[..end].trim();
-        let tail = &after[end + "</key>".len()..];
-        if found == key {
-            let value_tail = tail.trim_start().strip_prefix("<string>")?;
-            let string_end = value_tail.find("</string>")?;
-            let value = value_tail[..string_end].trim();
-            return (!value.is_empty()).then_some(value);
-        }
-        haystack = tail;
-    }
 }
 
 /// The responsible app for `pid`, using the default protected roots.
@@ -1045,67 +925,139 @@ pub fn classify_dr(requirement: &str) -> DrClass {
 // Code identity of a bundle on disk
 // ---------------------------------------------------------------------------
 //
-// These readers were private to `aterm_gui::control_privacy`, where they could
-// only ever describe the ONE bundle this process runs from. They moved here on
-// 2026-09-22 because the claimant census below has to ask the same questions of
-// bundles it does not run from, and two implementations of "what is this
-// bundle's designated requirement" is exactly how a census and a self-report
-// come to disagree. `control_privacy` now delegates to them; the behaviour is
-// unchanged.
+// Shared by the claimant census below and `aterm_gui::control_privacy`'s
+// self-report, so the two cannot disagree about a bundle's requirement.
+
+/// A bounded read of a text plist. A non-file, a file over
+/// [`INFO_PLIST_MAX_BYTES`], or unreadable or non-UTF-8 text reads as absent.
+#[must_use]
+pub fn read_plist_text(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > INFO_PLIST_MAX_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// The string immediately following one exact XML plist key, non-empty and
+/// trimmed. The value element must follow the key modulo whitespace, so a
+/// malformed or intervening key's string can never be mis-bound. Only XML
+/// plists are understood; a binary plist reads as absent.
+#[must_use]
+pub fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let mut haystack = text;
+    loop {
+        let at = haystack.find("<key>")?;
+        let after = &haystack[at + "<key>".len()..];
+        let end = after.find("</key>")?;
+        let found = after[..end].trim();
+        let tail = &after[end + "</key>".len()..];
+        if found == key {
+            let value_tail = tail.trim_start().strip_prefix("<string>")?;
+            let string_end = value_tail.find("</string>")?;
+            let value = value_tail[..string_end].trim();
+            return (!value.is_empty()).then_some(value);
+        }
+        haystack = tail;
+    }
+}
+
+/// A bundle's identity: its `CFBundleIdentifier` and its signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleIdentity {
+    /// `CFBundleIdentifier` from the bundle's `Info.plist`.
+    pub bundle_id: Option<String>,
+    /// The `designated => …` clause.
+    pub dr_text: String,
+    /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
+    pub signing: &'static str,
+    /// The Team ID, when there is a real one.
+    pub team: Option<String>,
+}
+
+/// Read one bundle's identity: `Info.plist`, then `codesign`. `None` for a
+/// bundle under a protected root, whose read could raise the very dialog this
+/// module exists to explain.
+#[must_use]
+pub fn bundle_identity(root: &Path, protected: &[PathBuf]) -> Option<BundleIdentity> {
+    if is_under_protected_root(root, protected) {
+        return None;
+    }
+    let text = read_plist_text(&root.join("Contents").join("Info.plist"));
+    let bundle_id = text
+        .as_deref()
+        .and_then(|t| plist_string(t, "CFBundleIdentifier"))
+        .map(str::to_owned);
+    Some(signed_identity(root, bundle_id))
+}
+
+fn signed_identity(root: &Path, bundle_id: Option<String>) -> BundleIdentity {
+    let report = codesign_report(root);
+    BundleIdentity {
+        bundle_id,
+        dr_text: report
+            .as_deref()
+            .and_then(designated_requirement)
+            .unwrap_or_default(),
+        signing: report.as_deref().map_or("unknown", classify_signing),
+        team: report.as_deref().and_then(team_identifier),
+    }
+}
 
 /// `codesign -d -r- --verbose=2` over a bundle, stdout and stderr joined
-/// (`codesign -d` writes its report to stderr). `None` when it cannot run.
+/// (`codesign -d` writes its report to stderr), within [`CODESIGN_CEILING`].
+/// `None` when it cannot run or does not finish.
 #[cfg(target_os = "macos")]
-#[must_use]
-pub fn codesign_report(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("/usr/bin/codesign")
-        .arg("-d")
-        .arg("-r-")
-        .arg("--verbose=2")
+fn codesign_report(root: &Path) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("/usr/bin/codesign")
+        .args(["-d", "-r-", "--verbose=2"])
         .arg(root)
-        .stdin(std::process::Stdio::null())
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .ok()?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // wasm-clock-guard: allow — `codesign_report` is `#[cfg(target_os = "macos")]`
+    // (it runs Apple's `codesign`), so neither clock read below reaches wasm.
+    let deadline = std::time::Instant::now() + CODESIGN_CEILING;
+    while child.try_wait().ok()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The child has exited: both pipes are closed and neither read can block.
+    let mut text = String::new();
+    let _ = child.stdout.take()?.read_to_string(&mut text);
     text.push('\n');
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let _ = child.stderr.take()?.read_to_string(&mut text);
     Some(text)
 }
 
 #[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn codesign_report(_root: &Path) -> Option<String> {
+fn codesign_report(_root: &Path) -> Option<String> {
     None
 }
 
+/// `codesign -d` on one bundle takes tens of milliseconds; a report that has
+/// not arrived in this long is not coming.
+#[cfg(target_os = "macos")]
+const CODESIGN_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The `designated => …` clause of a `codesign -d -r-` report.
 ///
-/// **`codesign` emits the clause TWO ways and only one of them is bare.** When
-/// the requirement was written into the signature it prints
-/// `designated => identifier "…" and anchor apple generic …`; when it is
-/// IMPLICIT — derived from the code rather than stored, which is what every
-/// ad-hoc signature has — it prints the same clause COMMENTED:
-///
-/// ```text
-/// # designated => cdhash H"4249c4f55957f293613399fb319b2e91cc7a3b26"
-/// ```
-///
-/// Matching only the bare form therefore returned `None` for exactly the
-/// bundles whose identity is unstable, so [`classify_dr`] saw an empty string
-/// and answered `Unknown` where the honest answer is [`DrClass::Cdhash`] —
-/// and, worse for [`classify_claimants`], two DIFFERENT ad-hoc bundles both
-/// read as the empty requirement and compared EQUAL. Measured 2026-09-22
-/// against two ad-hoc fixtures whose cdhashes differ; the census saw one
-/// conflict where there were two. The `#` is stripped here so the comparison
-/// is over the requirement itself.
-#[must_use]
-pub fn designated_requirement(report: &str) -> Option<String> {
+/// `codesign` prints an IMPLICIT requirement — every ad-hoc signature's — as a
+/// comment, `# designated => cdhash H"…"`. The `#` is stripped so it
+/// classifies as [`DrClass::Cdhash`], and two different ad-hoc bundles never
+/// both read as the empty requirement.
+fn designated_requirement(report: &str) -> Option<String> {
     report.lines().find_map(|line| {
         let line = line.trim();
-        let clause = line
-            .strip_prefix('#')
-            .map_or(line, str::trim_start)
-            .trim_start();
+        let clause = line.strip_prefix('#').map_or(line, str::trim_start);
         clause
             .starts_with("designated =>")
             .then(|| clause.to_owned())
@@ -1114,19 +1066,16 @@ pub fn designated_requirement(report: &str) -> Option<String> {
 
 /// The Team ID, when the signature carries a real one. Apple prints
 /// `TeamIdentifier=not set` for an ad-hoc signature, which is not an id.
-#[must_use]
-pub fn team_identifier(report: &str) -> Option<String> {
+fn team_identifier(report: &str) -> Option<String> {
     report.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("TeamIdentifier=")?;
-        let value = value.trim();
+        let value = line.trim().strip_prefix("TeamIdentifier=")?.trim();
         (!value.is_empty() && value != "not set").then(|| value.to_owned())
     })
 }
 
-/// How the running code is signed, from the same report. Fails toward the
-/// weaker claim: anything unrecognised is `unknown`, never `developer-id`.
-#[must_use]
-pub fn classify_signing(report: &str) -> &'static str {
+/// How the code is signed, from the same report. Fails toward the weaker
+/// claim: anything unrecognised is `unknown`, never `developer-id`.
+fn classify_signing(report: &str) -> &'static str {
     if report.contains("code object is not signed at all") {
         return "unsigned";
     }
@@ -1139,98 +1088,33 @@ pub fn classify_signing(report: &str) -> &'static str {
     "unknown"
 }
 
-/// One XML plist string value, by exact key. Only XML plists are understood —
-/// the same precedent `aterm_update::which_copy` sets, and lossless for the
-/// shapes that matter here.
-#[must_use]
-pub fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let mut rest = text;
-    loop {
-        let at = rest.find("<key>")?;
-        let after = &rest[at + "<key>".len()..];
-        let end = after.find("</key>")?;
-        let found = after[..end].trim();
-        let tail = &after[end + "</key>".len()..];
-        if found == key {
-            let value = tail.trim_start().strip_prefix("<string>")?;
-            let close = value.find("</string>")?;
-            let value = value[..close].trim();
-            return (!value.is_empty()).then_some(value);
-        }
-        rest = tail;
-    }
-}
-
-/// Whether an `Info.plist`'s text carries the `ATermDevBuild` mark — the same
-/// key and the same fail-open reading as `aterm_update`'s own predicate, which
-/// is not reachable from here (its module is private to that crate). Fails
-/// OPEN: anything unclear is "not a dev build", so a corrupt plist can never
-/// invent a dev identity for a release.
-#[must_use]
-pub fn plist_marks_dev_build(text: &str) -> bool {
-    plist_string(text, "ATermDevBuild").is_some_and(|v| v.eq_ignore_ascii_case("true"))
-}
-
-/// A bounded text read: an `Info.plist` over the cap is unreadable rather than
-/// unbounded work.
-#[must_use]
-pub fn read_bounded(path: &Path) -> Option<String> {
-    const MAX_PLIST_BYTES: u64 = 1 << 20;
-    let meta = std::fs::metadata(path).ok()?;
-    (meta.len() <= MAX_PLIST_BYTES)
-        .then(|| std::fs::read_to_string(path).ok())
-        .flatten()
-}
-
 // ---------------------------------------------------------------------------
 // The claimant census
 // ---------------------------------------------------------------------------
 //
-// # Why this exists
+// macOS keeps ONE code requirement per bundle identifier. A copy that does not
+// satisfy it is not merely denied when it asks: `tccd` answers `DB
+// Action:Update, UpdateVerifierData` and REPLACES the stored requirement with
+// the asker's, resetting the grant for every copy that shares the identifier.
+// That write escapes process scope, so no per-process self-report can see it.
 //
-// macOS keeps ONE TCC row per `(service, client, client_type)`, holding the
-// `csreq` — a code requirement — that `tccd` re-validates each requester
-// against. A requester that claims the client id but does NOT satisfy the
-// stored requirement is not merely denied: `tccd` answers
-// `ReqResult(... Denied (Service Policy), DB Action:Update, UpdateVerifierData)`
-// and publishes `TCCDEvent type=Create`, REPLACING the stored requirement with
-// the asker's own identity and resetting the grant. The last mismatching
-// claimant wins, and it wins for every copy that shares the identifier.
-//
-// That is a WRITE that escapes process scope, and it is why a per-process
-// self-report cannot see the failure. Measured on the owner's Mac 2026-09-21:
-// the owner granted Full Disk Access three times in 55 seconds; two grants were
-// destroyed by ad-hoc bundles in `~/aterm/dist` claiming the app's own
-// identifier, and every token the `privacy` verb printed (`dr=identity
-// grant_stable=yes anchor=live`) was true of the process reading it and said
-// nothing at all about the row.
-//
-// Every claimant in that incident was aterm's OWN output: `install.rs`'s
-// `rollback_path` renames the running bundle to `aterm.app.rollback` on every
-// in-place apply, and the release cutter keeps a second live install beside the
-// first. So the census does not need to search the disk — it needs to look
-// where aterm puts things, and to say plainly when it could not look
-// everywhere.
-//
-// # What it is NOT
-//
-// It does not read `TCC.db`. The stored requirement is not observable through
-// any supported API (Apple DTS), so the census reports what is ON DISK and
-// whether those bundles AGREE with each other — never what `tccd` currently
-// holds. Disagreement is the hazard; the census names it and stops.
+// The census reports what is ON DISK and whether those copies agree. It never
+// reads `TCC.db` — not a supported status API — so it says nothing about what
+// `tccd` currently holds.
 
-/// How much of the candidate space the census actually got to look at.
-///
-/// Three-valued because "nothing else claims this id" and "I could not finish
-/// looking" are different answers, and reporting the first for the second is
-/// the over-claim this whole surface exists to avoid.
+/// At most this many claimant lines on any surface. Every surface also carries
+/// the true totals, so truncation can never read as a smaller census.
+pub const MAX_CLAIMANT_ROWS: usize = 8;
+
+/// How much of the candidate space the census got to look at. "Nothing else
+/// claims this id" and "I could not finish looking" are different answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Enumeration {
-    /// Every candidate root was readable and every entry classified.
+    /// Every source was read and every candidate classified.
     Complete,
-    /// At least one root could not be read, so a claimant may be unseen.
+    /// Something could not be read, so a claimant may be unseen.
     Partial,
-    /// Nothing could be enumerated at all.
+    /// Nothing could be read at all.
     #[default]
     Unavailable,
 }
@@ -1247,14 +1131,14 @@ impl Enumeration {
     }
 }
 
-/// One bundle on disk that claims a given `CFBundleIdentifier`.
+/// One bundle on disk that claims the identifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claimant {
-    /// The `.app` root.
+    /// The bundle directory (`aterm.app`, `aterm.app.rollback`, …).
     pub path: PathBuf,
     /// How its designated requirement is shaped.
     pub dr: DrClass,
-    /// The `designated => …` clause verbatim, for a report that can be checked.
+    /// The `designated => …` clause verbatim.
     pub dr_text: String,
     /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
     pub signing: &'static str,
@@ -1265,22 +1149,11 @@ pub struct Claimant {
 }
 
 impl Claimant {
-    /// Whether this claimant's identity DIFFERS from `other`'s in a way `tccd`
-    /// would resolve destructively.
-    ///
-    /// The comparison is the designated requirement itself, because that is
-    /// what `tccd` stores and re-validates — not the signing class, and not the
-    /// team. Two Developer-ID bundles from the same team share a requirement
-    /// and are harmless; an ad-hoc sibling carries a bare `cdhash` and is not.
-    ///
-    /// **An unreadable requirement CONFLICTS.** Two bundles whose requirement
-    /// could not be read are not thereby the same bundle, and treating the
-    /// empty string as a value that can match is how a census under-reports:
-    /// it is the failure this very method was written with (see
-    /// [`designated_requirement`]). Unknown fails toward naming the claimant,
-    /// which costs a line of report; the other direction costs the grant.
-    #[must_use]
-    pub fn conflicts_with(&self, other: &Self) -> bool {
+    /// Whether `tccd` would treat the two as different code. The comparison is
+    /// the designated requirement itself, which is what it stores. An
+    /// unreadable (empty) requirement conflicts: two unknowns are not one
+    /// identity.
+    fn conflicts_with(&self, other: &Self) -> bool {
         let (mine, theirs) = (self.dr_text.trim(), other.dr_text.trim());
         mine.is_empty() || theirs.is_empty() || mine != theirs
     }
@@ -1289,22 +1162,16 @@ impl Claimant {
 /// Every bundle found claiming one identifier, and how complete the look was.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Claimants {
-    /// The identifier asked about.
-    pub bundle_id: String,
-    /// Every claimant found, running copy included.
+    /// Every claimant found, running copy first.
     pub found: Vec<Claimant>,
-    /// How much of the candidate space was readable.
+    /// How much of the candidate space was read.
     pub enumeration: Enumeration,
 }
 
 impl Claimants {
-    /// The claimants whose designated requirement disagrees with the running
-    /// copy's — the ones that can destroy a grant.
-    ///
-    /// Empty when the running copy is unknown: without a reference identity
-    /// there is nothing to disagree WITH, and guessing one would invent a
-    /// conflict. That case is visible as `enumeration` plus a `found` list the
-    /// reader can still see.
+    /// The claimants whose requirement differs from the running copy's — the
+    /// ones that can reset a grant. Empty when the running copy is unknown:
+    /// with no reference there is nothing to differ from.
     #[must_use]
     pub fn conflicting(&self) -> Vec<&Claimant> {
         let Some(running) = self.found.iter().find(|c| c.running) else {
@@ -1316,218 +1183,332 @@ impl Claimants {
             .collect()
     }
 
-    /// Whether the census is entitled to say "nothing else claims this id".
-    ///
-    /// Only a COMPLETE enumeration may say so. A partial one that happened to
-    /// find nothing has not established absence.
+    /// The conflicting copies the Security panel offers to move to the Trash:
+    /// ad-hoc (cdhash) or unsigned ones, beside a running copy whose grant
+    /// survives updates. Anything else is listed and left alone — beside an
+    /// unstable running copy the conflicting one may well be the real release,
+    /// and a copy whose signature could not be read is not known to be either.
+    #[must_use]
+    pub fn retirable(&self) -> Vec<&Claimant> {
+        let stable_running = self.found.iter().any(|c| c.running && c.dr.grant_stable());
+        if !stable_running {
+            return Vec::new();
+        }
+        self.conflicting()
+            .into_iter()
+            .filter(|c| matches!(c.dr, DrClass::Cdhash | DrClass::Unsigned))
+            .collect()
+    }
+
+    /// Whether the census may say nothing else claims the id: only after a
+    /// COMPLETE look. A partial look that found nothing has not established
+    /// absence.
     #[must_use]
     pub fn sole_claimant(&self) -> bool {
-        self.enumeration == Enumeration::Complete
-            && self.found.iter().filter(|c| !c.running).count() == 0
+        self.enumeration == Enumeration::Complete && self.found.iter().all(|c| c.running)
     }
 }
 
-/// The identity of one bundle, as the census reads it.
-///
-/// Separated from [`Claimant`] so the classification can be driven by a test
-/// over fixtures without running `codesign` at all.
+/// One listed directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BundleIdentity {
-    /// `CFBundleIdentifier` from the bundle's `Info.plist`.
-    pub bundle_id: Option<String>,
-    /// The `designated => …` clause.
-    pub dr_text: String,
-    /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
-    pub signing: &'static str,
-    /// The Team ID, when there is a real one.
-    pub team: Option<String>,
+pub enum Listing {
+    /// Its entries.
+    Entries(Vec<PathBuf>),
+    /// It does not exist.
+    Missing,
+    /// It exists and could not be read.
+    Unreadable,
 }
 
-/// Read one bundle's identity from disk: its `Info.plist` and its signature.
-///
-/// Refuses a bundle under a protected root for the same reason
-/// [`readable_info_plist`] does — the census must never be the thing that
-/// raises the dialog it exists to explain.
+/// What one candidate turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Candidate {
+    /// Not a bundle, gone, or another program's.
+    NotOurs,
+    /// A bundle that could not be read: a hole in the census, not an absence.
+    Hole,
+    /// A bundle claiming the identifier.
+    Ours(BundleIdentity),
+}
+
+/// List one census root.
 #[must_use]
-pub fn bundle_identity(root: &Path, protected: &[PathBuf]) -> Option<BundleIdentity> {
-    if is_under_protected_root(root, protected) {
-        return None;
+pub fn list_root(dir: &Path) -> Listing {
+    match std::fs::read_dir(dir) {
+        Ok(read) => Listing::Entries(read.flatten().map(|e| e.path()).collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Listing::Missing,
+        Err(_) => Listing::Unreadable,
     }
-    let text = read_bounded(&root.join("Contents").join("Info.plist"));
-    let bundle_id = text
-        .as_deref()
-        .and_then(|t| plist_string(t, "CFBundleIdentifier"))
-        .map(str::to_owned);
-    let report = codesign_report(root);
-    Some(BundleIdentity {
-        bundle_id,
-        dr_text: report
-            .as_deref()
-            .and_then(designated_requirement)
-            .unwrap_or_default(),
-        signing: report.as_deref().map_or("unknown", classify_signing),
-        team: report.as_deref().and_then(team_identifier),
-    })
 }
 
-/// The directories the census looks in, most specific first.
-///
-/// Deliberately NOT a disk walk. aterm's co-claimants are its own outputs, and
-/// they are always SIBLINGS of an install: `rollback_path` puts the displaced
-/// bundle beside the live one (`install.rs`), the release cutter places a
-/// finished bundle beside its scratch (`aterm_release::bundle`), and a hand
-/// backup lands in the same folder. So the candidate roots are the directories
-/// that hold an aterm install — the running one first, then the conventional
-/// ones — and a `~/aterm/dist` that no roster knows about is covered because
-/// the process running from it contributes its own parent.
+/// Classify one candidate for `bundle_id`. The `Info.plist` is read first, and
+/// `codesign` runs only for a bundle that claims the identifier.
 #[must_use]
-pub fn claimant_search_roots(running: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let mut push = |dir: PathBuf| {
-        if !roots.contains(&dir) {
-            roots.push(dir);
-        }
+pub fn read_candidate(root: &Path, bundle_id: &str, protected: &[PathBuf]) -> Candidate {
+    if !std::fs::metadata(root).is_ok_and(|m| m.is_dir()) {
+        return Candidate::NotOurs;
+    }
+    if !census_may_read(root, protected) {
+        return Candidate::Hole;
+    }
+    let plist = root.join("Contents").join("Info.plist");
+    match std::fs::symlink_metadata(&plist) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Candidate::NotOurs,
+        Err(_) => return Candidate::Hole,
+        Ok(meta) if !meta.is_file() => return Candidate::NotOurs,
+        Ok(_) => {}
+    }
+    let Some(text) = read_plist_text(&plist) else {
+        return Candidate::Hole;
     };
-    if let Some(bundle) = running.and_then(app_bundle_root)
-        && let Some(parent) = bundle.parent()
-    {
-        push(parent.to_path_buf());
+    match plist_string(&text, "CFBundleIdentifier") {
+        Some(id) if id == bundle_id => Candidate::Ours(signed_identity(root, Some(id.to_owned()))),
+        _ => Candidate::NotOurs,
     }
-    push(PathBuf::from("/Applications"));
-    if let Some(home) = home {
-        push(home.join("Applications"));
+}
+
+/// Whether the bundle at `claimant.path` is still the copy the census
+/// classified: it still claims `bundle_id`, with the same requirement. Runs
+/// `codesign`, so it belongs on a worker.
+#[must_use]
+pub fn still_claims(claimant: &Claimant, bundle_id: &str) -> bool {
+    matches!(
+        read_candidate(&claimant.path, bundle_id, &protected_roots(&[])),
+        Candidate::Ours(id) if id.dr_text == claimant.dr_text
+    )
+}
+
+/// Whether the census may look inside `path`: not under a protected root as
+/// spelled, nor once resolved — a link from `/Applications` into `~/Documents`
+/// must not be followed into it. `canonicalize` is metadata-only and raises no
+/// dialog; listing or reading under a protected root would.
+fn census_may_read(path: &Path, protected: &[PathBuf]) -> bool {
+    !is_under_protected_root(path, protected)
+        && !std::fs::canonicalize(path)
+            .is_ok_and(|resolved| is_under_protected_root(&resolved, protected))
+}
+
+/// The directories the census lists, with whether each must be readable.
+///
+/// aterm's co-claimants are its own outputs, siblings of an install: the
+/// updater's `rollback_path` puts the displaced bundle beside the live one. So
+/// the running bundle's parent is listed and REQUIRED — this process runs from
+/// there, so an unreadable parent is a hole. The conventional app folders are
+/// listed too, and a missing one is simply empty. `LaunchServices` supplies
+/// every other registered copy.
+fn claimant_search_roots(running: Option<&Path>, home: Option<&Path>) -> Vec<(PathBuf, bool)> {
+    let mut roots: Vec<(PathBuf, bool)> = Vec::new();
+    if let Some(parent) = running.and_then(Path::parent) {
+        roots.push((parent.to_path_buf(), true));
+    }
+    let conventional = [
+        Some(PathBuf::from("/Applications")),
+        home.map(|h| h.join("Applications")),
+    ];
+    for dir in conventional.into_iter().flatten() {
+        if !roots.iter().any(|(d, _)| *d == dir) {
+            roots.push((dir, false));
+        }
     }
     roots
 }
 
-/// Whether a directory entry is shaped like a bundle the census should read.
-///
-/// `foo.app` is the obvious one. `foo.app.rollback` is the one that matters:
-/// it is a complete, signed bundle carrying the same `CFBundleIdentifier` as
-/// the install it was displaced from, and it is what `tccd` attributed the
-/// owner's process to at 13:33:46 on 2026-09-21. A plain `.app` extension test
-/// would have missed exactly the bundle that destroyed the grant.
-#[must_use]
-pub fn looks_like_bundle(name: &str) -> bool {
-    let name = name.trim_end_matches('/');
-    if name.starts_with('.') {
+/// Whether a directory entry is named like a bundle: `foo.app`, or
+/// `foo.app.<suffix>` — `aterm.app.rollback` is a complete bundle carrying the
+/// install's identifier. Hidden names are skipped.
+fn looks_like_bundle(path: &Path) -> bool {
+    let Some(name) = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+    else {
         return false;
-    }
-    name.to_ascii_lowercase().ends_with(".app")
-        || name
-            .to_ascii_lowercase()
-            .rsplit_once(".app.")
-            .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty())
+    };
+    let is_app = Path::new(&name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
+    !name.starts_with('.')
+        && (is_app
+            || name
+                .rsplit_once(".app.")
+                .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty()))
 }
 
-/// The census, pure over its inputs.
+/// The census, pure over its sources.
 ///
-/// `entries` lists a directory (`None` when it could not be read, which is what
-/// downgrades the enumeration), and `identity` reads one bundle. Both are
-/// injected so the table test drives every arm without a filesystem or a
-/// `codesign`, and so the ORDERING is testable: a root that cannot be listed
-/// must downgrade the verdict rather than shrink the answer.
+/// `running` is the bundle this process runs from, `roots` the directories to
+/// list (with whether each is required), `registered` the copies `LaunchServices`
+/// knows (`None` when it could not be asked), `list` and `read` the two
+/// filesystem reads. Each injected so a table test drives every arm with no
+/// filesystem and no `codesign`.
 #[must_use]
 pub fn classify_claimants(
-    bundle_id: &str,
     running: Option<&Path>,
-    roots: &[PathBuf],
-    entries: impl Fn(&Path) -> Option<Vec<PathBuf>>,
-    identity: impl Fn(&Path) -> Option<BundleIdentity>,
+    roots: &[(PathBuf, bool)],
+    registered: Option<&[PathBuf]>,
+    list: impl Fn(&Path) -> Listing,
+    read: impl Fn(&Path) -> Candidate,
 ) -> Claimants {
-    let running_root = running.and_then(app_bundle_root);
-    let mut found: Vec<Claimant> = Vec::new();
-    let mut unreadable = 0usize;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut holes = 0usize;
     let mut looked = 0usize;
-    for root in roots {
-        let Some(listing) = entries(root) else {
-            unreadable += 1;
+    for (dir, required) in roots {
+        match list(dir) {
+            Listing::Entries(entries) => {
+                looked += 1;
+                candidates.extend(entries.into_iter().filter(|p| looks_like_bundle(p)));
+            }
+            Listing::Missing if !required => looked += 1,
+            Listing::Missing | Listing::Unreadable => holes += 1,
+        }
+    }
+    match registered {
+        Some(paths) => {
+            looked += 1;
+            candidates.extend(paths.iter().filter(|p| !in_trash(p)).cloned());
+        }
+        None => holes += 1,
+    }
+    candidates.extend(running.map(Path::to_path_buf));
+
+    let mut found: Vec<Claimant> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if seen.contains(&candidate) {
             continue;
-        };
-        looked += 1;
-        for candidate in listing {
-            let name = candidate
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !looks_like_bundle(&name) {
-                continue;
-            }
-            if found.iter().any(|c| c.path == candidate) {
-                continue;
-            }
-            let Some(id) = identity(&candidate) else {
-                // A bundle we were not allowed to read is NOT evidence of
-                // absence; it is a hole in the census.
-                unreadable += 1;
-                continue;
-            };
-            if id.bundle_id.as_deref() != Some(bundle_id) {
-                continue;
-            }
-            found.push(Claimant {
-                running: running_root.as_deref() == Some(candidate.as_path()),
+        }
+        seen.push(candidate.clone());
+        match read(&candidate) {
+            Candidate::NotOurs => {}
+            Candidate::Hole => holes += 1,
+            Candidate::Ours(id) => found.push(Claimant {
+                running: running == Some(candidate.as_path()),
                 path: candidate,
                 dr: classify_dr(&id.dr_text),
                 dr_text: id.dr_text,
                 signing: id.signing,
                 team: id.team,
-            });
+            }),
         }
     }
-    // The running copy is a claimant even when its directory could not be
-    // listed: this process is the proof that it exists.
-    if let Some(root) = running_root
-        && !found.iter().any(|c| c.path == root)
-        && let Some(id) = identity(&root)
-        && id.bundle_id.as_deref() == Some(bundle_id)
-    {
-        found.push(Claimant {
-            path: root,
-            dr: classify_dr(&id.dr_text),
-            dr_text: id.dr_text,
-            signing: id.signing,
-            team: id.team,
-            running: true,
-        });
-    }
     found.sort_by(|a, b| b.running.cmp(&a.running).then_with(|| a.path.cmp(&b.path)));
-    // A census that established the RUNNING copy has observed something, even
-    // if no directory would open: this process is the evidence. `Unavailable`
-    // is reserved for a look that produced nothing at all.
     let enumeration = if looked == 0 && found.is_empty() {
         Enumeration::Unavailable
-    } else if unreadable > 0 || looked == 0 {
+    } else if holes > 0 || looked == 0 {
         Enumeration::Partial
     } else {
         Enumeration::Complete
     };
-    Claimants {
-        bundle_id: bundle_id.to_string(),
-        found,
-        enumeration,
+    Claimants { found, enumeration }
+}
+
+/// The census for one identifier, against this machine. Runs `codesign` on
+/// each bundle that claims the identifier, so it belongs on a worker, never on
+/// a draw path.
+#[must_use]
+pub fn claimants_for(bundle_id: &str) -> Claimants {
+    let running = running_bundle();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let roots = claimant_search_roots(running.as_deref(), home.as_deref());
+    let registered = registered_bundles(bundle_id);
+    let protected = protected_roots(&[]);
+    // A folder under a protected root is never listed — an app run from
+    // `~/Desktop` must not list the Desktop — so it is a hole in the look.
+    classify_claimants(
+        running.as_deref(),
+        &roots,
+        registered.as_deref(),
+        |dir| {
+            if census_may_read(dir, &protected) {
+                list_root(dir)
+            } else {
+                Listing::Unreadable
+            }
+        },
+        |root| read_candidate(root, bundle_id, &protected),
+    )
+}
+
+/// The bundle this process runs from, by the kernel's path — so after an
+/// update's swap it is the `aterm.app.rollback` actually executing, not the
+/// new bundle that took the name. Falls back to the exec path only when the
+/// kernel will not say.
+fn running_bundle() -> Option<PathBuf> {
+    match self_image() {
+        SelfImage::At(path) => bundle_layout_root(&path),
+        SelfImage::NoPath => None,
+        SelfImage::Unreadable => std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::canonicalize(exe).ok())
+            .and_then(|exe| bundle_layout_root(&exe)),
     }
 }
 
-/// The census for one identifier, against the real filesystem.
-///
-/// Runs `codesign` once per candidate bundle, so it belongs off the event loop
-/// and behind a cache — never on a draw path.
-#[must_use]
-pub fn claimants_for(bundle_id: &str, running: Option<&Path>) -> Claimants {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let roots = claimant_search_roots(running, home.as_deref());
-    let protected = protected_roots(&[]);
-    classify_claimants(
-        bundle_id,
-        running,
-        &roots,
-        |dir| {
-            let read = std::fs::read_dir(dir).ok()?;
-            Some(read.flatten().map(|e| e.path()).collect())
-        },
-        |root| bundle_identity(root, &protected),
-    )
+/// Every bundle `LaunchServices` has registered for `bundle_id` — every copy
+/// that has launched, wherever it sits. `None` when it cannot be asked.
+fn registered_bundles(bundle_id: &str) -> Option<Vec<PathBuf>> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::registered_bundles(bundle_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = bundle_id;
+        None
+    }
+}
+
+/// Whether `path` sits in a Trash (`~/.Trash`, a volume's `.Trashes`).
+/// `LaunchServices` keeps a copy's registration after it is moved there, the
+/// Finder will not open an item in the Trash, and moving a copy there is how
+/// the Security panel retires one — so the census does not count it.
+fn in_trash(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(c, std::path::Component::Normal(name) if name == ".Trash" || name == ".Trashes")
+    })
+}
+
+/// What the Security panel's *Move to Trash* did with one copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retired {
+    /// Moved to the Trash.
+    Moved,
+    /// Left in place: a fresh check no longer offers it — it moved, it was
+    /// re-signed, its signature could not be read, or the copy running here
+    /// changed.
+    NotOffered,
+    /// Left in place: a process runs from it, or that could not be ruled out.
+    InUse,
+    /// The move was refused, in the system's words.
+    Failed(String),
+}
+
+/// Move to the Trash each copy in `plan` — the copies the owner was shown —
+/// that a FRESH census still offers ([`Claimants::retirable`]), that is still
+/// the same bundle right before the move (`unchanged`, see [`still_claims`]),
+/// and that no process runs from. Nothing outside `plan` is touched, whatever
+/// the fresh census finds. The three checks are injected so a table test
+/// drives every arm.
+pub fn retire_claimants(
+    plan: &[PathBuf],
+    fresh: &Claimants,
+    unchanged: impl Fn(&Claimant) -> bool,
+    in_use: impl Fn(&Path) -> Option<bool>,
+    trash: impl Fn(&Path) -> Result<(), String>,
+) -> Vec<(PathBuf, Retired)> {
+    let offered = fresh.retirable();
+    plan.iter()
+        .map(|path| {
+            let copy = offered.iter().find(|c| c.path == *path);
+            let outcome = if !copy.is_some_and(|c| unchanged(c)) {
+                Retired::NotOffered
+            } else if in_use(path) != Some(false) {
+                Retired::InUse
+            } else {
+                trash(path).map_or_else(Retired::Failed, |()| Retired::Moved)
+            };
+            (path.clone(), outcome)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2660,8 +2641,8 @@ impl ConsentCache {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        INFO_PLIST_MAX_BYTES, ProbeOutcome, ResponsibleApp, ResponsibleError, SelfImage,
-        display_name, readable_info_plist, responsible_answer,
+        ProbeOutcome, ResponsibleApp, ResponsibleError, SelfImage, display_name, read_plist_text,
+        readable_info_plist, responsible_answer,
     };
     use std::ffi::{CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
@@ -2760,8 +2741,8 @@ mod imp {
         protected: &[PathBuf],
     ) -> Option<ResponsibleApp> {
         let responsible = super::responsible_pid(pid)?;
-        let path = pid_path(responsible)?;
-        let plist = readable_info_plist(&path, protected).and_then(|p| read_info_plist(&p));
+        let path = pid_path(responsible).ok()?;
+        let plist = readable_info_plist(&path, protected).and_then(|p| read_plist_text(&p));
         let name = display_name(&path, plist.as_deref());
         Some(ResponsibleApp {
             pid: responsible,
@@ -2770,22 +2751,27 @@ mod imp {
         })
     }
 
-    /// [`SelfImage`] from `proc_pidpath` on our own pid.
-    ///
-    /// For SELF the two failure modes collapse into one useful fact: the
-    /// process demonstrably exists, so `rc=0` means the kernel has no path for
-    /// its image — it was unlinked — rather than a lookup that went wrong.
-    /// Measured 2026-09-21: `rc=0` is exactly what follows the boot-health
-    /// delete of `aterm.app.rollback`.
+    /// [`SelfImage`] from `proc_pidpath` on our own pid. `ENOENT` is the unlink
+    /// signal; any other failure is [`SelfImage::Unreadable`].
     pub(super) fn self_image() -> SelfImage {
-        // SAFETY: `getpid` takes no arguments and cannot fail.
-        let me = unsafe { libc::getpid() };
-        pid_path(me).map_or(SelfImage::NoPath, SelfImage::At)
+        let Ok(me) = i32::try_from(std::process::id()) else {
+            return SelfImage::Unreadable;
+        };
+        match pid_path(me) {
+            Ok(path) => SelfImage::At(path),
+            Err(libc::ENOENT) => SelfImage::NoPath,
+            Err(_) => SelfImage::Unreadable,
+        }
     }
 
-    /// `proc_pidpath` for one pid.
-    fn pid_path(pid: i32) -> Option<PathBuf> {
+    /// `proc_pidpath` for one pid, or the errno it failed with.
+    fn pid_path(pid: i32) -> Result<PathBuf, i32> {
         let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+        // SAFETY: `__error()` returns a valid pointer to this thread's errno;
+        // cleared so a stale value cannot be read back as this call's.
+        unsafe {
+            *libc::__error() = 0;
+        }
         // SAFETY: `buf` is a live allocation of exactly the length passed, and
         // `proc_pidpath` writes at most that many bytes.
         let written = unsafe {
@@ -2795,21 +2781,86 @@ mod imp {
                 u32::try_from(buf.len()).unwrap_or(u32::MAX),
             )
         };
-        let written = usize::try_from(written).ok()?;
-        if written == 0 || written > buf.len() {
-            return None;
+        match usize::try_from(written) {
+            Ok(n) if n > 0 && n <= buf.len() => Ok(PathBuf::from(OsStr::from_bytes(&buf[..n]))),
+            _ => Err(errno()),
         }
-        Some(PathBuf::from(OsStr::from_bytes(&buf[..written])))
     }
 
-    /// A bounded read of an `Info.plist` the guard already cleared. Anything
-    /// over the cap, unreadable, or not UTF-8 reads as absent.
-    fn read_info_plist(path: &Path) -> Option<String> {
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.is_file() || meta.len() > INFO_PLIST_MAX_BYTES {
+    /// Every bundle `LaunchServices` has registered for `bundle_id`, through the
+    /// public `LSCopyApplicationURLsForBundleIdentifier`: a read of the
+    /// `LaunchServices` database, which touches no protected path, raises no
+    /// dialog and does not reach `WindowServer`. `kLSApplicationNotFoundErr` is
+    /// an empty answer; any other failure is `None`. Registrations outlive
+    /// their bundles, so callers must treat a path as a candidate, not a fact.
+    pub(super) fn registered_bundles(bundle_id: &str) -> Option<Vec<PathBuf>> {
+        type CfRef = *const libc::c_void;
+        #[link(name = "CoreServices", kind = "framework")]
+        unsafe extern "C" {
+            fn LSCopyApplicationURLsForBundleIdentifier(id: CfRef, error: *mut CfRef) -> CfRef;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFStringCreateWithBytes(
+                alloc: CfRef,
+                bytes: *const u8,
+                num_bytes: isize,
+                encoding: u32,
+                is_external: u8,
+            ) -> CfRef;
+            fn CFArrayGetCount(array: CfRef) -> isize;
+            fn CFArrayGetValueAtIndex(array: CfRef, index: isize) -> CfRef;
+            fn CFURLGetFileSystemRepresentation(
+                url: CfRef,
+                resolve_against_base: u8,
+                buffer: *mut u8,
+                max_len: isize,
+            ) -> u8;
+            fn CFErrorGetCode(error: CfRef) -> isize;
+            fn CFRelease(cf: CfRef);
+        }
+        const UTF8: u32 = 0x0800_0100;
+        const APPLICATION_NOT_FOUND: isize = -10814;
+        let len = isize::try_from(bundle_id.len()).ok()?;
+        // SAFETY: `bundle_id` is a live UTF-8 buffer of exactly `len` bytes; a
+        // null allocator is the documented default.
+        let id =
+            unsafe { CFStringCreateWithBytes(std::ptr::null(), bundle_id.as_ptr(), len, UTF8, 0) };
+        if id.is_null() {
             return None;
         }
-        std::fs::read_to_string(path).ok()
+        let mut error: CfRef = std::ptr::null();
+        // SAFETY: `id` is a valid CFString we own; `error` is a valid out slot.
+        let urls = unsafe { LSCopyApplicationURLsForBundleIdentifier(id, &raw mut error) };
+        // SAFETY: `id` was created above and is released exactly once.
+        unsafe { CFRelease(id) };
+        if urls.is_null() {
+            if error.is_null() {
+                return None;
+            }
+            // SAFETY: a non-null `error` is a CFError we own (Copy rule).
+            let code = unsafe { CFErrorGetCode(error) };
+            // SAFETY: released exactly once.
+            unsafe { CFRelease(error) };
+            return (code == APPLICATION_NOT_FOUND).then(Vec::new);
+        }
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        let max = isize::try_from(buf.len()).unwrap_or(isize::MAX);
+        // SAFETY: `urls` is a valid CFArray of CFURLs we own; every index is in
+        // range; `buf` holds `max` bytes and the call NUL-terminates within it.
+        unsafe {
+            for index in 0..CFArrayGetCount(urls) {
+                let url = CFArrayGetValueAtIndex(urls, index);
+                if CFURLGetFileSystemRepresentation(url, 1, buf.as_mut_ptr(), max) != 0
+                    && let Some(end) = buf.iter().position(|&b| b == 0)
+                {
+                    out.push(PathBuf::from(OsStr::from_bytes(&buf[..end])));
+                }
+            }
+            CFRelease(urls);
+        }
+        Some(out)
     }
 }
 
@@ -2859,53 +2910,76 @@ mod tests {
     // The claimant census
     // -----------------------------------------------------------------
 
-    fn id(bundle: &str, dr: &str, signing: &'static str) -> BundleIdentity {
-        BundleIdentity {
-            bundle_id: Some(bundle.to_string()),
+    const DEV_ID: &str = "designated => identifier \"x\" and anchor apple generic and \
+                          certificate leaf[subject.OU] = A66A9P66Z7";
+
+    fn ours(dr: &str) -> Candidate {
+        Candidate::Ours(BundleIdentity {
+            bundle_id: Some("x".to_string()),
             dr_text: dr.to_string(),
-            signing,
+            signing: if dr.contains("cdhash") {
+                "adhoc"
+            } else {
+                "developer-id"
+            },
             team: None,
-        }
+        })
     }
 
-    const DEV_ID: &str = "designated => identifier \"com.aterm.aterm\" and anchor apple \
-                          generic and certificate leaf[subject.OU] = A66A9P66Z7";
-
-    /// `codesign` prints an IMPLICIT requirement as a COMMENT, and every
-    /// ad-hoc signature has one. Matching only the bare form returned `None`
-    /// for exactly the bundles whose identity is unstable — so `dr=` read
-    /// `unknown` instead of `cdhash`, the "a rebuild invalidated your grant"
-    /// remediation (`aterm_cli`'s `churns`) never fired for a dev build, and
-    /// two DIFFERENT ad-hoc bundles both carried the empty requirement and
-    /// compared equal. Measured against real fixtures 2026-09-22.
+    /// The signing readers, over recorded `codesign -d -r- --verbose=2`
+    /// output. They fail toward the WEAKER claim: anything unrecognised is
+    /// `unknown`, never `developer-id`.
     #[test]
-    fn a_commented_designated_clause_is_still_a_designated_clause() {
-        let adhoc = "Executable=/x/aterm.app/Contents/MacOS/aterm\n\
-                     # designated => cdhash H\"4249c4f55957f293613399fb319b2e91cc7a3b26\"\n";
-        let clause = designated_requirement(adhoc).expect("the commented form is read");
-        assert!(clause.starts_with("designated => cdhash"), "{clause}");
-        assert!(
-            !clause.contains('#'),
-            "the comment marker is stripped: {clause}"
+    fn the_signing_readers_fail_toward_the_weaker_claim() {
+        let devid = "Executable=/Applications/aterm.app/Contents/MacOS/aterm\n\
+                     TeamIdentifier=A66A9P66Z7\n\
+                     designated => identifier \"com.aterm.aterm\" and anchor apple generic\n";
+        assert_eq!(classify_signing(devid), "developer-id");
+        assert_eq!(team_identifier(devid).as_deref(), Some("A66A9P66Z7"));
+        assert_eq!(
+            classify_dr(&designated_requirement(devid).unwrap()),
+            DrClass::Identity
         );
+
+        // An ad-hoc signature's requirement is IMPLICIT, and codesign prints it
+        // commented. It must still read, as cdhash, with the `#` stripped.
+        let adhoc = "Signature=adhoc\n\
+                     TeamIdentifier=not set\n\
+                     # designated => cdhash H\"4249c4f5\"\n";
+        assert_eq!(classify_signing(adhoc), "adhoc");
+        assert_eq!(team_identifier(adhoc), None, "`not set` is not a team id");
+        let clause = designated_requirement(adhoc).expect("the commented form reads");
+        assert_eq!(clause, "designated => cdhash H\"4249c4f5\"");
         assert_eq!(classify_dr(&clause), DrClass::Cdhash);
 
-        // The bare form is unchanged.
-        let signed = format!("Executable=/x\n{DEV_ID}\n");
-        let clause = designated_requirement(&signed).expect("the bare form still reads");
-        assert_eq!(classify_dr(&clause), DrClass::Identity);
-
-        // A report with no clause at all is still None, not an empty string
-        // pretending to be a requirement.
-        assert_eq!(
-            designated_requirement("Executable=/x\nIdentifier=y\n"),
-            None
-        );
+        let unsigned = "/x: code object is not signed at all\n";
+        assert_eq!(classify_signing(unsigned), "unsigned");
+        assert_eq!(designated_requirement(unsigned), None);
+        assert_eq!(classify_signing("something else entirely\n"), "unknown");
     }
 
-    /// TWO ad-hoc bundles are not the same bundle. An unreadable requirement
-    /// must fail toward naming the claimant: the cost of a spurious line is a
-    /// line, the cost of a missed one is the grant.
+    /// The one plist reader: XML only, exact key, and a key whose value is not
+    /// the next element never binds a later string.
+    #[test]
+    fn the_plist_reader_is_exact_and_xml_only() {
+        let xml = "<plist><dict>\
+                   <key>CFBundleIdentifier</key><string>com.aterm.aterm.dev</string>\
+                   <key>CFBundleName</key><string>aterm (dev)</string>\
+                   </dict></plist>";
+        assert_eq!(
+            plist_string(xml, "CFBundleIdentifier"),
+            Some("com.aterm.aterm.dev")
+        );
+        assert_eq!(plist_string(xml, "CFBundleName"), Some("aterm (dev)"));
+        assert_eq!(plist_string(xml, "CFBundleDisplayName"), None);
+        assert_eq!(
+            plist_string("<key>A</key><key>B</key><string>v</string>", "A"),
+            None
+        );
+        assert_eq!(plist_string("bplist00\u{0}\u{1}", "A"), None);
+    }
+
+    /// Two unknowns are not one identity: an unreadable requirement conflicts.
     #[test]
     fn an_unreadable_requirement_conflicts_rather_than_matching() {
         let mk = |dr: &str| Claimant {
@@ -2916,187 +2990,317 @@ mod tests {
             team: None,
             running: false,
         };
-        assert!(
-            !mk(DEV_ID).conflicts_with(&mk(DEV_ID)),
-            "identical requirements agree"
-        );
+        assert!(!mk(DEV_ID).conflicts_with(&mk(DEV_ID)));
         assert!(
             mk("designated => cdhash H\"aa\"").conflicts_with(&mk("designated => cdhash H\"bb\""))
         );
-        assert!(
-            mk("").conflicts_with(&mk("")),
-            "two unknowns are not one identity"
-        );
+        assert!(mk("").conflicts_with(&mk("")));
         assert!(mk("").conflicts_with(&mk(DEV_ID)));
     }
 
-    /// THE CENSUS, as a table — the shape that actually happened.
-    ///
-    /// On 2026-09-21 the owner's disk held a Developer-ID `/Applications/aterm.app`
-    /// and two AD-HOC `com.aterm.aterm` bundles in `~/aterm/dist`, one of them
-    /// named `aterm.app.rollback`. Any process attributed to one of those made
-    /// `tccd` overwrite the stored requirement and reset Full Disk Access. The
-    /// census has to find all three, name the running one, and call the other
-    /// two conflicts.
+    /// THE CENSUS, as a table: a Developer-ID install running from `/Apps`,
+    /// its `.rollback` sibling and a backup (both ad-hoc), a copy whose
+    /// signature cannot be read, another program, and a copy only
+    /// LaunchServices knows about. All five copies of `x` are found, the running
+    /// one is the reference, and the four that differ conflict — of which only
+    /// the two ad-hoc ones are retirable.
     #[test]
-    fn the_census_finds_every_claimant_including_a_rollback_sibling() {
-        let dist = PathBuf::from("/Users//a/aterm/dist");
-        let apps = PathBuf::from("/Applications");
-        let running_exe = PathBuf::from("/Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm");
-        let entries = |dir: &Path| -> Option<Vec<PathBuf>> {
-            if dir == dist {
-                Some(vec![
-                    dist.join("aterm.app"),
-                    dist.join("aterm.app.rollback"),
-                    dist.join("aterm-b826-backup.app"),
-                    dist.join("notes.txt"),
+    fn the_census_finds_every_claimant_including_rollback_and_registered_copies() {
+        let apps = PathBuf::from("/Apps");
+        let running = apps.join("x.app");
+        let far = PathBuf::from("/far/away/x.app");
+        let roots = vec![
+            (apps.clone(), true),
+            (PathBuf::from("/Applications"), false),
+        ];
+        let list = |dir: &Path| {
+            if dir == apps {
+                Listing::Entries(vec![
+                    apps.join("x.app"),
+                    apps.join("x.app.rollback"),
+                    apps.join("x-backup.app"),
+                    apps.join("x-unread.app"),
+                    apps.join("Other.app"),
+                    apps.join("notes.txt"),
                 ])
-            } else if dir == apps {
-                Some(vec![apps.join("aterm.app"), apps.join("Safari.app")])
             } else {
-                Some(Vec::new())
+                Listing::Missing
             }
         };
-        let identity = |root: &Path| -> Option<BundleIdentity> {
-            let name = root.file_name()?.to_string_lossy().into_owned();
-            Some(match (root.starts_with(&dist), name.as_str()) {
-                (_, "Safari.app") => {
-                    id("com.apple.Safari", "designated => anchor apple", "unknown")
-                }
-                (true, "aterm.app") => {
-                    id("com.aterm.aterm", "designated => cdhash H\"aa\"", "adhoc")
-                }
-                (true, "aterm.app.rollback") => {
-                    id("com.aterm.aterm", "designated => cdhash H\"bb\"", "adhoc")
-                }
-                (true, _) => id("com.aterm.aterm", "designated => cdhash H\"cc\"", "adhoc"),
-                (false, _) => id("com.aterm.aterm", DEV_ID, "developer-id"),
-            })
+        let read = |root: &Path| match root.file_name().and_then(|n| n.to_str()) {
+            Some("x.app") if root.starts_with("/Apps") => ours(DEV_ID),
+            Some("x.app.rollback") => ours("designated => cdhash H\"aa\""),
+            Some("x-backup.app") => ours("designated => cdhash H\"bb\""),
+            Some("x-unread.app") => ours(""),
+            Some("x.app") => ours("designated => identifier \"x\" and anchor apple generic"),
+            _ => Candidate::NotOurs,
         };
-        let roots = vec![dist.clone(), apps.clone()];
-        let c = classify_claimants(
-            "com.aterm.aterm",
-            Some(&running_exe),
-            &roots,
-            entries,
-            identity,
+        let trashed = PathBuf::from("/Users//u/.Trash/x.app");
+        let registered = [far.clone(), apps.join("x.app"), trashed.clone()];
+        let c = classify_claimants(Some(&running), &roots, Some(&registered), list, read);
+        assert!(
+            !c.found.iter().any(|x| x.path == trashed),
+            "a copy in the Trash is not a claimant, though LaunchServices still lists it"
         );
 
-        assert_eq!(c.enumeration, Enumeration::Complete);
         assert_eq!(
-            c.found.len(),
-            4,
-            "three dist bundles and the release: {:?}",
-            c.found
+            c.enumeration,
+            Enumeration::Complete,
+            "a missing /Applications is empty"
         );
-        assert!(c.found[0].running, "the running copy sorts first");
-        assert_eq!(c.found[0].path, dist.join("aterm.app"));
+        assert_eq!(c.found.len(), 5, "{:?}", c.found);
+        assert!(c.found[0].running && c.found[0].path == running);
         assert!(
             c.found
                 .iter()
-                .any(|x| x.path == dist.join("aterm.app.rollback")),
-            "the .rollback sibling is the one that destroyed the grant"
+                .any(|x| x.path == apps.join("x.app.rollback"))
         );
         assert!(
-            !c.found.iter().any(|x| x.path == apps.join("Safari.app")),
-            "another program's bundle is not a claimant"
+            c.found.iter().any(|x| x.path == far),
+            "LaunchServices' copy is found"
         );
+        assert_eq!(c.conflicting().len(), 4);
+        let retirable: Vec<_> = c.retirable().iter().map(|x| x.path.clone()).collect();
         assert_eq!(
-            c.conflicting().len(),
-            3,
-            "everything that is not the running copy"
+            retirable,
+            vec![apps.join("x-backup.app"), apps.join("x.app.rollback")],
+            "an unreadable signature is listed as conflicting and never offered"
         );
         assert!(!c.sole_claimant());
     }
 
-    /// The lone-install case, and the rule that only a COMPLETE look may say
-    /// "nothing else claims this". A root that cannot be listed downgrades the
-    /// verdict instead of shrinking the answer — the difference between "I
-    /// looked and there is nothing" and "I could not look".
+    /// Only a COMPLETE look may claim absence. An unreadable required root, an
+    /// unreadable bundle, and LaunchServices not answering each downgrade the
+    /// verdict rather than shrink the answer.
     #[test]
-    fn a_partial_census_never_claims_to_be_the_sole_claimant() {
-        let apps = PathBuf::from("/Applications");
-        let exe = apps.join("aterm.app/Contents/MacOS/aterm");
-        let only = |root: &Path| -> Option<BundleIdentity> {
-            root.ends_with("aterm.app")
-                .then(|| id("com.aterm.aterm", DEV_ID, "developer-id"))
+    fn every_hole_downgrades_the_census_and_a_complete_lone_install_is_sole() {
+        let apps = PathBuf::from("/Apps");
+        let running = apps.join("x.app");
+        let lone = |dir: &Path| {
+            if dir == apps {
+                Listing::Entries(vec![apps.join("x.app")])
+            } else {
+                Listing::Missing
+            }
+        };
+        let roots = vec![
+            (apps.clone(), true),
+            (PathBuf::from("/Applications"), false),
+        ];
+        let only = |root: &Path| {
+            if root == running.as_path() {
+                ours(DEV_ID)
+            } else {
+                Candidate::NotOurs
+            }
         };
 
-        let complete = classify_claimants(
-            "com.aterm.aterm",
-            Some(&exe),
-            &[apps.clone()],
-            |_| Some(vec![apps.join("aterm.app")]),
+        let complete = classify_claimants(Some(&running), &roots, Some(&[]), lone, only);
+        assert!(complete.sole_claimant() && complete.conflicting().is_empty());
+
+        let no_ls = classify_claimants(Some(&running), &roots, None, lone, only);
+        assert_eq!(
+            no_ls.enumeration,
+            Enumeration::Partial,
+            "LaunchServices unasked"
+        );
+        assert!(!no_ls.sole_claimant());
+
+        let required_missing = classify_claimants(
+            Some(&running),
+            &roots,
+            Some(&[]),
+            |_| Listing::Missing,
             only,
         );
-        assert!(complete.sole_claimant(), "one readable root, one claimant");
-        assert!(complete.conflicting().is_empty());
-
-        // The same disk, one root unreadable.
-        let partial = classify_claimants(
-            "com.aterm.aterm",
-            Some(&exe),
-            &[apps.clone(), PathBuf::from("/nope")],
-            |dir| (dir == apps).then(|| vec![apps.join("aterm.app")]),
-            only,
+        assert_eq!(
+            required_missing.enumeration,
+            Enumeration::Partial,
+            "the running bundle's own parent is required"
         );
-        assert_eq!(partial.enumeration, Enumeration::Partial);
-        assert_eq!(partial.found.len(), 1, "it still found what it could");
-        assert!(
-            !partial.sole_claimant(),
-            "a hole in the census is not evidence of absence"
+        assert_eq!(
+            required_missing.found.len(),
+            1,
+            "the running copy is still counted"
         );
 
-        // Nothing readable at all.
-        let blind = classify_claimants(
-            "com.aterm.aterm",
-            None,
-            &[PathBuf::from("/nope")],
-            |_| None,
-            |_| None,
+        let unreadable_bundle = classify_claimants(
+            Some(&running),
+            &roots,
+            Some(&[apps.join("y.app")]),
+            lone,
+            |root: &Path| {
+                if root == running.as_path() {
+                    ours(DEV_ID)
+                } else {
+                    Candidate::Hole
+                }
+            },
         );
+        assert_eq!(unreadable_bundle.enumeration, Enumeration::Partial);
+
+        let blind = classify_claimants(None, &[], None, lone, |_| Candidate::NotOurs);
         assert_eq!(blind.enumeration, Enumeration::Unavailable);
-        assert!(!blind.sole_claimant());
         assert!(
             blind.conflicting().is_empty(),
             "no reference identity, no claim"
         );
     }
 
-    /// The running copy is a claimant even when its own directory could not be
-    /// listed: this process is the proof that it exists. Without this the
-    /// census could report conflicts with no reference to compare against.
+    /// Beside an UNSTABLE running copy, a conflicting Developer-ID copy may
+    /// well be the real release, so nothing is retirable.
     #[test]
-    fn the_running_copy_is_always_counted() {
-        let exe = PathBuf::from("/opt/weird/aterm.app/Contents/MacOS/aterm");
+    fn nothing_is_retirable_beside_an_unstable_running_copy() {
+        let running = PathBuf::from("/A/x.app.rollback");
+        let release = PathBuf::from("/A/x.app");
         let c = classify_claimants(
-            "com.aterm.aterm",
-            Some(&exe),
-            &[PathBuf::from("/nope")],
-            |_| None,
-            |root| {
-                root.ends_with("aterm.app")
-                    .then(|| id("com.aterm.aterm", DEV_ID, "developer-id"))
+            Some(&running),
+            &[(PathBuf::from("/A"), true)],
+            Some(&[]),
+            |_| Listing::Entries(vec![running.clone(), release.clone()]),
+            |root: &Path| {
+                if root == release.as_path() {
+                    ours(DEV_ID)
+                } else {
+                    ours("designated => cdhash H\"aa\"")
+                }
             },
         );
-        assert_eq!(c.found.len(), 1);
-        assert!(c.found[0].running);
-        assert_eq!(c.enumeration, Enumeration::Partial, "a root was unreadable");
+        assert_eq!(c.conflicting().len(), 1);
+        assert!(c.retirable().is_empty());
     }
 
-    /// `foo.app.rollback` is a bundle. A plain `.app` extension test would
-    /// have missed the exact directory `tccd` attributed the owner's process to
-    /// at 13:33:46 on 2026-09-21.
+    /// THE TRASH GESTURE'S CORE: a copy is moved only if the owner was shown
+    /// it, a fresh census still offers it, it is still the same bundle right
+    /// before the move, and nothing runs from it. Every other
+    /// copy stays where it is, with its reason, and nothing outside the plan is
+    /// touched.
     #[test]
-    fn a_rollback_sibling_looks_like_a_bundle() {
+    fn only_a_shown_still_offered_idle_copy_is_moved_to_the_trash() {
+        let dir = PathBuf::from("/A");
+        let running = dir.join("x.app");
+        let [rollback, busy, unsure, refused, unshown, resigned] = [
+            "x.app.rollback",
+            "x-busy.app",
+            "x-unsure.app",
+            "x-refused.app",
+            "x-unshown.app",
+            "x-resigned.app",
+        ]
+        .map(|name| dir.join(name));
+        let gone = dir.join("x-gone.app");
+        let entries = vec![
+            running.clone(),
+            rollback.clone(),
+            busy.clone(),
+            unsure.clone(),
+            refused.clone(),
+            unshown.clone(),
+            resigned.clone(),
+        ];
+        let fresh = classify_claimants(
+            Some(&running),
+            &[(dir.clone(), true)],
+            Some(&[]),
+            |_| Listing::Entries(entries.clone()),
+            |root: &Path| {
+                if root == running.as_path() {
+                    ours(DEV_ID)
+                } else {
+                    ours("designated => cdhash H\"aa\"")
+                }
+            },
+        );
+        let trashed = std::cell::RefCell::new(Vec::new());
+        let plan = [
+            &rollback, &busy, &unsure, &refused, &resigned, &gone, &running,
+        ]
+        .map(|p| (*p).clone());
+        let out = retire_claimants(
+            &plan,
+            &fresh,
+            |c| c.path != resigned,
+            |p| {
+                if p == busy {
+                    Some(true)
+                } else if p == unsure {
+                    None
+                } else {
+                    Some(false)
+                }
+            },
+            |p| {
+                trashed.borrow_mut().push(p.to_path_buf());
+                if p == refused {
+                    Err("denied".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            out,
+            vec![
+                (rollback.clone(), Retired::Moved),
+                (busy, Retired::InUse),
+                (unsure, Retired::InUse),
+                (refused.clone(), Retired::Failed("denied".to_string())),
+                (resigned, Retired::NotOffered),
+                (gone, Retired::NotOffered),
+                (running, Retired::NotOffered),
+            ]
+        );
+        assert_eq!(*trashed.borrow(), vec![rollback, refused]);
+        assert!(
+            !trashed.borrow().contains(&unshown),
+            "never outside the plan"
+        );
+    }
+
+    /// The census never looks inside a protected root, as spelled or reached
+    /// through a link: the bundle behind the link is a hole, never read.
+    #[cfg(unix)]
+    #[test]
+    fn the_census_does_not_follow_a_link_into_a_protected_root() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-census-protected-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let documents = dir.join("Documents");
+        let hidden = documents.join("x.app");
+        std::fs::create_dir_all(hidden.join("Contents")).unwrap();
+        std::fs::write(
+            hidden.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>",
+        )
+        .unwrap();
+        let apps = dir.join("Applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let link = apps.join("x.app");
+        std::os::unix::fs::symlink(&hidden, &link).unwrap();
+        let protected = vec![documents.canonicalize().unwrap()];
+
+        assert!(census_may_read(&apps, &protected));
+        assert!(
+            !census_may_read(&link, &protected),
+            "resolved under Documents"
+        );
+        assert!(
+            !census_may_read(&documents, &protected),
+            "spelled under Documents"
+        );
+        assert_eq!(read_candidate(&link, "x", &protected), Candidate::Hole);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundle_names_include_the_rollback_suffix() {
         for yes in [
             "aterm.app",
             "aterm.app.rollback",
             "aterm.APP",
-            "aterm-b826-backup.app",
             "Some Name.app.previous",
         ] {
-            assert!(looks_like_bundle(yes), "{yes}");
+            assert!(looks_like_bundle(Path::new(yes)), "{yes}");
         }
         for no in [
             "notes.txt",
@@ -3106,115 +3310,141 @@ mod tests {
             "apple.appointments",
             "",
         ] {
-            assert!(!looks_like_bundle(no), "{no}");
+            assert!(!looks_like_bundle(Path::new(no)), "{no}");
         }
     }
 
-    /// The search roots are the directories that hold an aterm install, most
-    /// specific first, de-duplicated. The running bundle's PARENT is what
-    /// covers a `~/aterm/dist` no roster knows about.
+    /// The running bundle's parent is listed first and REQUIRED; the
+    /// conventional folders follow, optional and de-duplicated.
     #[test]
     fn the_search_roots_start_where_this_process_runs_from() {
-        let exe = PathBuf::from("/Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm");
         let home = PathBuf::from("/Users//a");
-        let roots = claimant_search_roots(Some(&exe), Some(&home));
-        assert_eq!(roots[0], PathBuf::from("/Users//a/aterm/dist"), "{roots:?}");
-        assert!(roots.contains(&PathBuf::from("/Applications")));
-        assert!(roots.contains(&home.join("Applications")));
-
-        // Running FROM /Applications must not list it twice.
-        let apps_exe = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
-        let roots = claimant_search_roots(Some(&apps_exe), Some(&home));
-        assert_eq!(
-            roots
-                .iter()
-                .filter(|r| *r == Path::new("/Applications"))
-                .count(),
-            1,
-            "{roots:?}"
+        let roots = claimant_search_roots(
+            Some(Path::new("/Users//a/aterm/dist/aterm.app")),
+            Some(&home),
         );
-
-        // An unbundled dev run contributes no root of its own.
-        let dev = PathBuf::from("/Users//a/aterm/target/debug/aterm");
-        let roots = claimant_search_roots(Some(&dev), Some(&home));
-        assert_eq!(roots[0], PathBuf::from("/Applications"), "{roots:?}");
+        assert_eq!(
+            roots,
+            vec![
+                (PathBuf::from("/Users//a/aterm/dist"), true),
+                (PathBuf::from("/Applications"), false),
+                (home.join("Applications"), false),
+            ]
+        );
+        let roots = claimant_search_roots(Some(Path::new("/Applications/aterm.app")), Some(&home));
+        assert_eq!(roots[0], (PathBuf::from("/Applications"), true));
+        assert_eq!(roots.len(), 2, "{roots:?}");
+        assert_eq!(
+            claimant_search_roots(None, None),
+            vec![(PathBuf::from("/Applications"), false)]
+        );
     }
 
-    /// THE IMAGE ANCHOR, as a table. Every arm, and the ordering that
-    /// distinguishes the two failing ones.
-    ///
-    /// This is the detector for the defect that silently cost the owner four
-    /// and a half hours on 2026-09-19: the bundle a live aterm was exec'd from
-    /// is renamed to `aterm.app.rollback` by the apply and then deleted by
-    /// boot-health confirmation, after which `tccd` cannot build a code
-    /// identity and every grant stops matching. Nothing in the posture could
-    /// see it, because the existing probe reads a path that follows the vnode.
+    /// The candidate reader on a real directory tree: a bundle claiming the id
+    /// is ours, another program's is not, a directory with no Info.plist is not
+    /// a bundle, a plain file named `.app.zip` is not a bundle, and an
+    /// unreadable Info.plist is a hole.
+    #[test]
+    fn the_candidate_reader_tells_ours_from_not_a_bundle_from_a_hole() {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let lay = |name: &str, id: &str| {
+            let contents = tmp.path().join(name).join("Contents");
+            std::fs::create_dir_all(&contents).unwrap();
+            std::fs::write(
+                contents.join("Info.plist"),
+                format!(
+                    "<plist><dict><key>CFBundleIdentifier</key><string>{id}</string></dict></plist>"
+                ),
+            )
+            .unwrap();
+        };
+        lay("mine.app", "x");
+        lay("theirs.app", "y");
+        std::fs::create_dir_all(tmp.path().join("empty.app")).unwrap();
+        std::fs::write(tmp.path().join("archive.app.zip"), b"zip").unwrap();
+
+        assert!(matches!(
+            read_candidate(&tmp.path().join("mine.app"), "x", &[]),
+            Candidate::Ours(_)
+        ));
+        assert_eq!(
+            read_candidate(&tmp.path().join("theirs.app"), "x", &[]),
+            Candidate::NotOurs
+        );
+        assert_eq!(
+            read_candidate(&tmp.path().join("empty.app"), "x", &[]),
+            Candidate::NotOurs
+        );
+        assert_eq!(
+            read_candidate(&tmp.path().join("archive.app.zip"), "x", &[]),
+            Candidate::NotOurs
+        );
+        assert_eq!(
+            read_candidate(&tmp.path().join("gone.app"), "x", &[]),
+            Candidate::NotOurs
+        );
+        assert_eq!(
+            read_candidate(
+                &tmp.path().join("mine.app"),
+                "x",
+                &[tmp.path().to_path_buf()]
+            ),
+            Candidate::Hole,
+            "a bundle under a protected root is not read"
+        );
+        assert_eq!(list_root(&tmp.path().join("nowhere")), Listing::Missing);
+    }
+
+    /// THE IMAGE ANCHOR, as a table: every arm, classified from the kernel's
+    /// path, with the exec path consulted only once the image has none.
     #[test]
     fn the_image_anchor_names_every_way_the_code_can_go_missing() {
         let exec = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
         let rolled = Path::new("/Applications/aterm.app.rollback/Contents/MacOS/aterm");
-        let other = Path::new("/Applications/aterm-new.app/Contents/MacOS/aterm");
         let unbundled = Path::new("/Users//a/aterm/target/debug/deps/aterm_gui-abc");
         let at = |p: &Path| SelfImage::At(p.to_path_buf());
-        // The oracle must not be consulted on any arm the kernel answers.
-        let boom = |_: &Path| panic!("the live path answered; nothing may stat");
 
-        // Agreement is the ONLY way to read Live.
         assert_eq!(
-            classify_image_anchor(Some(exec), &at(exec), boom),
+            classify_image_anchor(Some(exec), &at(exec)),
             ImageAnchor::Live
         );
-
-        // The measured RENAME_SWAP shape, in both forms. `current_exe()` is
-        // frozen at `exec` in each of them, which is precisely why the live
-        // path has to be the one classified.
-        for live in [rolled, other] {
-            assert_eq!(
-                classify_image_anchor(Some(exec), &at(live), boom),
-                ImageAnchor::Displaced,
-                "{live:?}"
-            );
-        }
-
-        // Boot-health deleted the displaced bundle: the kernel has no path.
+        // The updater's swap: the frozen exec path still names a `.app`, the
+        // kernel's path does not.
         assert_eq!(
-            classify_image_anchor(Some(exec), &SelfImage::NoPath, boom),
-            ImageAnchor::Deleted
+            classify_image_anchor(Some(exec), &at(rolled)),
+            ImageAnchor::Displaced
         );
-
-        // A dev run is not a fault, whatever the kernel says — judged on the
-        // exec path's layout, before anything can call it broken.
-        for live in [
-            SelfImage::At(unbundled.to_path_buf()),
-            SelfImage::NoPath,
-            SelfImage::Unsupported,
-        ] {
-            assert_eq!(
-                classify_image_anchor(Some(unbundled), &live, boom),
-                ImageAnchor::NotBundled,
-                "{live:?}"
-            );
-        }
-
-        // No vnode view (non-macOS): fall back to the exec path's existence.
-        // This arm cannot see a swap, and the doc says so.
+        // A kernel path under ANOTHER valid `.app` is still a bundle macOS can
+        // build an identity for — a retargeted launch symlink, not a fault.
+        let other = Path::new("/Applications/aterm-new.app/Contents/MacOS/aterm");
         assert_eq!(
-            classify_image_anchor(Some(exec), &SelfImage::Unsupported, |_: &Path| true),
+            classify_image_anchor(Some(exec), &at(other)),
             ImageAnchor::Live
         );
         assert_eq!(
-            classify_image_anchor(Some(exec), &SelfImage::Unsupported, |_: &Path| false),
-            ImageAnchor::Deleted
+            classify_image_anchor(Some(unbundled), &at(unbundled)),
+            ImageAnchor::NotBundled
         );
 
-        // No path to classify is not a fault.
+        // No path left: deleted only if this was ever a bundled image.
         assert_eq!(
-            classify_image_anchor(None, &SelfImage::Unsupported, boom),
+            classify_image_anchor(Some(exec), &SelfImage::NoPath),
+            ImageAnchor::Deleted
+        );
+        assert_eq!(
+            classify_image_anchor(Some(unbundled), &SelfImage::NoPath),
+            ImageAnchor::NotBundled
+        );
+        assert_eq!(
+            classify_image_anchor(None, &SelfImage::NoPath),
+            ImageAnchor::Unknown
+        );
+        // A failed lookup (EPERM under a sandbox) says nothing about the bundle.
+        assert_eq!(
+            classify_image_anchor(Some(exec), &SelfImage::Unreadable),
             ImageAnchor::Unknown
         );
 
-        // Only the two real failures claim the grant cannot be validated. A dev
-        // run and a failed read must never be reported as a broken grant.
         assert!(ImageAnchor::Displaced.grant_unverifiable());
         assert!(ImageAnchor::Deleted.grant_unverifiable());
         for ok in [
@@ -3233,16 +3463,18 @@ mod tests {
         assert_eq!(ImageAnchor::Unknown.as_str(), "unknown");
     }
 
-    /// The classifier performs NO syscall of its own: the existence oracle is
-    /// the only thing that may touch the filesystem, and a panicking one proves
-    /// the early arms never reach it.
     #[test]
-    fn the_image_anchor_touches_the_filesystem_only_through_its_oracle() {
-        let boom = |_: &Path| panic!("the classifier must not stat anything itself");
+    fn the_bundle_layout_root_ignores_the_directory_name() {
         assert_eq!(
-            classify_image_anchor(None, &SelfImage::Unsupported, boom),
-            ImageAnchor::Unknown
+            bundle_layout_root(Path::new("/A/aterm.app.rollback/Contents/MacOS/aterm")),
+            Some(PathBuf::from("/A/aterm.app.rollback"))
         );
+        assert_eq!(
+            bundle_layout_root(Path::new("/A/aterm.app/Contents/MacOS/aterm")),
+            Some(PathBuf::from("/A/aterm.app"))
+        );
+        assert_eq!(bundle_layout_root(Path::new("/usr/local/bin/aterm")), None);
+        assert_eq!(bundle_layout_root(Path::new("/Contents/MacOS/x")), None);
     }
 
     #[test]

@@ -68,7 +68,7 @@ use std::path::Path;
 ///
 /// This 3 was chosen against a 6h check interval, where it meant "≈18h — long
 /// enough to skip a flaky day". **That interval is retired.** The cadence is now
-/// 75s (`ATERM_UPDATE_INTERVAL_SECS`, `spawn_background_check`), so 3 consecutive
+/// 75s (`cadence::TOKEN_INTERVAL_SECS`, `spawn_background_check`), so 3 consecutive
 /// failures is ≈4 minutes: the threshold now means "three checks in a row", and it
 /// escalates far sooner than the original rationale intended. It has not been
 /// re-tuned for the new cadence — revisit it against 75s rather than trusting the

@@ -611,6 +611,71 @@ fn the_real_producer_emits_a_quad_the_real_client_accepts() {
     );
 }
 
+/// THE VENDOR-DIRECT CUTOVER (design 2026-09-22 §1.9), producer to client. A spec row
+/// marked `vendor-direct` makes the real producer emit the program's row and no pin, and
+/// the real client authorizes that quad, keeps the row (a newer client reads the version of
+/// the legacy build it runs through `Index::program`) and decides `NotPinned` for an
+/// installed legacy build — the decision that leaves it alone on a client older than the
+/// vendor lane. A version yank rides the channel as written and yanks no build.
+#[test]
+fn a_vendor_direct_row_is_kept_unpinned_and_the_real_client_leaves_it_alone() {
+    let prefix = Prefix::provision("vendor-direct");
+    std::fs::write(
+        &prefix.spec,
+        "ay ay prebuilt-only 6255\nclaude aterm prebuilt-only - - vendor-direct\n",
+    )
+    .expect("program spec");
+    let out = prefix.run_indexer(&tracked_indexer(), &[("YANKED", "claude@2.1.281")]);
+    assert!(
+        out.status.success(),
+        "a vendor-direct spec must publish:\n{}",
+        text(&out)
+    );
+    let verified = prefix.client_verify();
+    assert!(
+        verified.status.success(),
+        "the shipping client verifier must accept the cutover quad:\n{}",
+        text(&verified)
+    );
+
+    let read = |name: &str| std::fs::read(prefix.out.join(name)).expect(name);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+    let roster = atpkg::admit_roster(
+        &atpkg::Anchor::of(vec![prefix.master_pub.clone()], 0),
+        read("aterm-machines.toml"),
+        &read("aterm-machines.toml.sig"),
+        i64::try_from(now).expect("seconds fit an i64"),
+    )
+    .expect("the client admits the roster");
+    let (index, _) = roster
+        .authorize_index(read("index.toml"), &read("index.toml.sig"))
+        .expect("the client authorizes the cutover index");
+    assert_eq!(
+        index.program("claude").map(|p| p.repo.as_str()),
+        Some("aterm"),
+        "claude's row is kept, on the index repo"
+    );
+    let channel = index
+        .channel_for("stable", "aarch64-apple-darwin")
+        .expect("the stable channel");
+    assert_eq!(channel.pin.get("ay"), Some(&6255));
+    assert_eq!(
+        channel.pin.get("claude"),
+        None,
+        "a vendor-direct row pins nothing"
+    );
+    assert_eq!(
+        atpkg::decide(&channel, "claude", Some(2_026_092_201)),
+        atpkg::ApplyDecision::NotPinned,
+        "an installed legacy claude is no longer part of the channel: left alone"
+    );
+    assert_eq!(channel.yanked, vec!["claude@2.1.281".to_string()]);
+    assert!(!atpkg::is_yanked(&channel, "claude", 2_026_092_201));
+}
+
 // ===========================================================================
 // MUTATIONS. Each is a plausible edit; each must be caught by the producer.
 // ===========================================================================

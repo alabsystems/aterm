@@ -15,7 +15,11 @@
 //!   increments, and 48 identical log lines. [`Cadence::delay`] doubles the interval
 //!   per consecutive failure up to a ceiling of [`MAX_BACKOFF_INTERVALS`] base
 //!   intervals (never below [`MAX_BACKOFF`]), and snaps back to the base interval the
-//!   moment a check succeeds.
+//!   moment a check succeeds. A check that could not reach its release channel at all
+//!   (DNS, connect, timeout — [`is_network_unreachable`], on a failure the health
+//!   ledger filed as `network`) is retried sooner first, on [`OFFLINE_RETRY`], because
+//!   that is what a Mac that has just booted or joined a network looks like for its
+//!   first few seconds.
 //! * **No jitter.** Every aterm on every machine woke on the same 75 s grid relative
 //!   to its own launch; a fleet restarted together stays in lockstep and hits the API
 //!   in a thundering herd. [`Cadence::delay`] spreads each wait by ±[`JITTER_PCT`]%.
@@ -52,7 +56,7 @@ pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 /// was the one lane with no backoff at all, and the same silent no-op applied to any
 /// operator interval at or above the cap.
 /// A ceiling expressed in INTERVALS is inert for no base: four of them is a real
-/// retreat (30 min → 60 → 120 on today's web lane) while bounding the worst
+/// retreat (10 min → 20 → 40 on today's web lane) while bounding the worst
 /// case at 4× a cadence the lane or the operator has already accepted — and a wake,
 /// or one healthy check, still snaps all the way back to the base, so recovery is
 /// never rate-limited by the cap.
@@ -89,11 +93,60 @@ pub(crate) const TOKEN_INTERVAL_SECS: u64 = 75;
 /// `github.com/…/releases/latest/download/aterm-appcast.toml` (a 302 with no
 /// `x-ratelimit-*` header at all — measured 2026-09-03), and a moved pointer adds only
 /// tag-specific GETs on the same unmetered host. There is no per-IP budget to share,
-/// so the interval is a courtesy to the web host and a bound on how stale a
-/// terminal-only machine can be, not an arithmetic constraint: two checks an hour picks
-/// a release up well inside the "one launch behind" bound the crate docs promise, and
-/// a resolved token on a repointed source restores the 75 s cadence automatically.
-pub(crate) const WEB_INTERVAL_SECS: u64 = 30 * 60;
+/// so the interval is a courtesy to the web host and a bound on how long a new release
+/// waits to be found, not an arithmetic constraint. Ten minutes (2026-09-23; it was
+/// thirty) because a verified update now installs by itself within a minute of being
+/// staged, so the check is what decides how soon a release lands — and the owner wants
+/// it to land promptly. It stays one HEAD per machine per interval however many aterm
+/// processes run: `checker.lock` and the 70 % freshness window in the check loop
+/// dedupe every sibling. A resolved token on a repointed source restores the 75 s
+/// cadence automatically.
+pub(crate) const WEB_INTERVAL_SECS: u64 = 10 * 60;
+
+/// The waits after a check that could not reach the network at all
+/// ([`is_network_unreachable`]): the first retry comes after 20 s, then 60 s, 2 min
+/// and 5 min, and after those the ordinary ladder takes over from the base interval.
+/// A Mac that has just booted, woken or joined a network cannot resolve a name for a
+/// few seconds — the first check after a cold boot on 2026-09-23 failed on DNS three
+/// seconds in — and a whole interval after that is a whole interval in which a new
+/// release goes unnoticed. Four quick tries cost four tiny requests; an outage longer
+/// than they cover falls back to the backoff it always had. Never longer than the
+/// ordinary ladder's own wait at that point ([`Cadence::nominal_at`]).
+pub(crate) const OFFLINE_RETRY: [Duration; 4] = [
+    Duration::from_secs(20),
+    Duration::from_secs(60),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(5 * 60),
+];
+
+/// Whether a failed check's message says the network could not be reached at all:
+/// curl exit 6 (could not resolve the host), 7 (could not connect) or 28 (timed out),
+/// in either spelling the transport writes — `curl: (6) …` from curl's own stderr, or
+/// `(exit status: 6)` from the exit status the transport quotes. Only a message that
+/// names curl counts: another tool's exit 7 (a `ditto` that failed to extract) is not
+/// a network that is down. Anything else — an HTTP status, a signature, a refused
+/// redirect — is a failure the network carried, and waits on the ordinary ladder. The
+/// check loop also asks the health ledger: the same exit on the container download,
+/// after the channel answered, is not a network that is down either
+/// (`unreachable_before_the_channel` in the crate root).
+pub(crate) fn is_network_unreachable(message: &str) -> bool {
+    const UNREACHABLE: [u32; 3] = [6, 7, 28];
+    if !message.contains("curl") {
+        return false;
+    }
+    let code_after = |marker: &str| {
+        message.match_indices(marker).any(|(at, _)| {
+            let digits: String = message[at + marker.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits
+                .parse::<u32>()
+                .is_ok_and(|code| UNREACHABLE.contains(&code))
+        })
+    };
+    code_after("curl: (") || code_after("exit status: ") || code_after("(exit ")
+}
 
 /// The floor on a HELD wait that is still in force. A hold a few seconds out (the
 /// server's reset was nearly here when the check ran) must not become a near-zero
@@ -110,6 +163,11 @@ pub(crate) const HOLD_FLOOR: Duration = Duration::from_secs(60);
 pub(crate) struct Cadence {
     base: Duration,
     failures: u32,
+    /// Consecutive checks, ending with the latest, that could not reach the network
+    /// ([`Self::failed_offline`]). While it is within [`OFFLINE_RETRY`] the next wait
+    /// is that rung and `failures` has not moved; past it, each one counts as an
+    /// ordinary failure.
+    offline: u32,
     /// When set and still in the future, the next wait ends HERE (bounded by
     /// [`Self::cap`], floored by [`HOLD_FLOOR`], un-jittered — the epoch already
     /// carries the loop's 0–60 s scatter) instead of on the doubling ladder. The
@@ -123,6 +181,7 @@ impl Cadence {
         Self {
             base,
             failures: 0,
+            offline: 0,
             hold: None,
         }
     }
@@ -151,13 +210,33 @@ impl Cadence {
     /// supersedes a hold of known length.
     pub(crate) fn failed(&mut self) {
         self.failures = self.failures.saturating_add(1);
+        self.offline = 0;
         self.hold = None;
+    }
+
+    /// Note a check that could not reach the network at all
+    /// ([`is_network_unreachable`]). The next wait is the next [`OFFLINE_RETRY`] rung;
+    /// once those are spent, this counts as an ordinary [`Self::failed`] and the
+    /// doubling ladder goes on from the base interval.
+    pub(crate) fn failed_offline(&mut self) {
+        self.offline = self.offline.saturating_add(1);
+        if self.offline as usize > OFFLINE_RETRY.len() {
+            self.failures = self.failures.saturating_add(1);
+        }
+        self.hold = None;
+    }
+
+    /// Whether the next wait is one of the quick [`OFFLINE_RETRY`] rungs — a network
+    /// that is not up YET, which the check loop logs as news rather than a warning.
+    pub(crate) fn retrying_offline(&self) -> bool {
+        self.offline > 0 && self.offline as usize <= OFFLINE_RETRY.len()
     }
 
     /// Note a successful check — the next wait returns to the base interval
     /// immediately. Recovery must not be rate-limited by how long the outage was.
     pub(crate) fn succeeded(&mut self) {
         self.failures = 0;
+        self.offline = 0;
         self.hold = None;
     }
 
@@ -166,6 +245,7 @@ impl Cadence {
     /// budget the hold was about.
     pub(crate) fn woke(&mut self) {
         self.failures = 0;
+        self.offline = 0;
         self.hold = None;
     }
 
@@ -200,8 +280,9 @@ impl Cadence {
     }
 
     /// The nominal (pre-jitter) wait: `base` doubled once per consecutive failure,
-    /// clamped to [`Self::cap`]. Exposed for tests; [`Self::delay`] is what the
-    /// loop uses.
+    /// clamped to [`Self::cap`] — or, while a run of unreachable-network failures is
+    /// within [`OFFLINE_RETRY`], that rung. Exposed for tests; [`Self::delay`] is what
+    /// the loop uses.
     #[cfg(test)]
     pub(crate) fn nominal(&self) -> Duration {
         self.nominal_at(Instant::now())
@@ -216,7 +297,11 @@ impl Cadence {
         // `1 << 20` already exceeds any sane base × ceiling ratio; the shift is
         // clamped so a long outage can never overflow the multiply.
         let doublings = self.failures.saturating_sub(1).min(20);
-        self.base.saturating_mul(1u32 << doublings).min(self.cap())
+        let ladder = self.base.saturating_mul(1u32 << doublings).min(self.cap());
+        match self.offline.checked_sub(1) {
+            Some(rung) if self.retrying_offline() => OFFLINE_RETRY[rung as usize].min(ladder),
+            _ => ladder,
+        }
     }
 
     /// The actual wait: [`Self::nominal`] spread by ±[`JITTER_PCT`]%. `entropy` is a
@@ -329,7 +414,8 @@ pub(crate) enum LogAction {
 /// the handoff diagnostics this whole effort is about. Policy:
 ///
 /// * a message DIFFERENT from the last one is always warned (a changed failure is
-///   news: DNS → auth, say);
+///   news: DNS → auth, say) — or said at INFO while the network is expected to be
+///   down, on the quick [`OFFLINE_RETRY`] rungs ([`Self::failure_expected`]);
 /// * an identical repeat is suppressed until [`STILL_FAILING_AFTER`], then warned
 ///   once with the suppressed count, so the log always shows an ongoing outage
 ///   without showing it 48 times an hour;
@@ -338,6 +424,9 @@ pub(crate) enum LogAction {
 #[derive(Debug, Default)]
 pub(crate) struct FailureLog {
     last: Option<String>,
+    /// Whether the last emitted line was a warning — a failure first said at INFO is
+    /// said again, as a warning, the moment it stops being expected.
+    last_warned: bool,
     /// Failures observed since the last emitted line (the first one included).
     since_emit: u32,
     /// Total consecutive failures in the current outage.
@@ -348,20 +437,30 @@ pub(crate) struct FailureLog {
 impl FailureLog {
     /// Record a failed check and decide what to say about it.
     pub(crate) fn failure(&mut self, message: &str) -> LogAction {
+        self.failure_expected(message, false)
+    }
+
+    /// [`Self::failure`], said at INFO instead of as a warning when `expected`: a
+    /// network that is not up yet while the quick [`OFFLINE_RETRY`] rungs still run
+    /// (the boot and wake case) is news, not a fault. The same failure, still there
+    /// once `expected` is false, is warned at once rather than suppressed as a repeat.
+    pub(crate) fn failure_expected(&mut self, message: &str, expected: bool) -> LogAction {
         self.streak = self.streak.saturating_add(1);
         self.since_emit = self.since_emit.saturating_add(1);
         let changed = self.last.as_deref() != Some(message);
         let stale = self
             .emitted_at
             .is_none_or(|t| t.elapsed() >= STILL_FAILING_AFTER);
-        if !changed && !stale {
+        let escalated = !expected && !self.last_warned;
+        if !changed && !stale && !escalated {
             return LogAction::Suppress;
         }
         let suppressed = self.since_emit.saturating_sub(1);
         self.last = Some(message.to_string());
+        self.last_warned = !expected;
         self.since_emit = 0;
         self.emitted_at = Some(Instant::now());
-        LogAction::Warn(if suppressed == 0 {
+        let line = if suppressed == 0 {
             format!("update check failed: {message}")
         } else {
             format!(
@@ -369,13 +468,19 @@ impl FailureLog {
                  messages suppressed): {message}",
                 self.streak
             )
-        })
+        };
+        if expected {
+            LogAction::Log(line)
+        } else {
+            LogAction::Warn(line)
+        }
     }
 
     /// Record a successful check. Emits the recovery line iff there was an outage.
     pub(crate) fn success(&mut self) -> Option<LogAction> {
         let streak = std::mem::take(&mut self.streak);
         self.last = None;
+        self.last_warned = false;
         self.since_emit = 0;
         self.emitted_at = None;
         (streak > 0).then(|| {
@@ -414,6 +519,108 @@ mod tests {
             c.failed();
         }
         assert_eq!(c.nominal(), MAX_BACKOFF, "backoff is capped, not unbounded");
+    }
+
+    /// A network that is not up yet — the boot and wake case — is retried after 20 s,
+    /// 60 s, 2 min and 5 min, and only then does the ordinary ladder take over, from
+    /// the base interval and doubling as before.
+    #[test]
+    fn an_unreachable_network_is_retried_on_the_short_ladder_then_the_base() {
+        let web = Duration::from_secs(WEB_INTERVAL_SECS);
+        let mut c = Cadence::new(web);
+        let mut waits = Vec::new();
+        for _ in 0..OFFLINE_RETRY.len() {
+            c.failed_offline();
+            assert!(c.retrying_offline());
+            waits.push(c.nominal());
+        }
+        assert_eq!(
+            waits,
+            [20, 60, 120, 300].map(Duration::from_secs),
+            "20 s, 60 s, 2 min, 5 min"
+        );
+        assert_eq!(
+            c.failures(),
+            0,
+            "the quick rungs are not the doubling ladder's"
+        );
+        c.failed_offline();
+        assert!(!c.retrying_offline());
+        assert_eq!(c.nominal(), web, "then the base interval");
+        c.failed_offline();
+        assert_eq!(c.nominal(), web * 2, "and the ordinary doubling from there");
+        c.succeeded();
+        assert!(!c.retrying_offline());
+        assert_eq!(c.nominal(), web, "a success ends it");
+        c.failed_offline();
+        assert_eq!(
+            c.nominal(),
+            OFFLINE_RETRY[0],
+            "and the next outage starts over"
+        );
+        c.woke();
+        assert!(!c.retrying_offline());
+        assert_eq!(c.nominal(), web, "a wake ends it too");
+    }
+
+    /// The quick rungs never wait LONGER than the ordinary ladder would: on the 75 s
+    /// token lane the 2- and 5-minute rungs are the base interval.
+    #[test]
+    fn the_short_ladder_never_outwaits_the_ordinary_one() {
+        let token = Duration::from_secs(TOKEN_INTERVAL_SECS);
+        let mut c = Cadence::new(token);
+        let mut waits = Vec::new();
+        for _ in 0..OFFLINE_RETRY.len() {
+            c.failed_offline();
+            waits.push(c.nominal());
+        }
+        assert_eq!(waits, [20, 60, 75, 75].map(Duration::from_secs));
+        c.failed_offline();
+        assert_eq!(c.nominal(), token);
+    }
+
+    /// A failure the network carried (an HTTP status, a signature) is not a network
+    /// that is down: it ends the quick rungs and waits on the ordinary ladder.
+    #[test]
+    fn an_ordinary_failure_ends_the_short_ladder() {
+        let web = Duration::from_secs(WEB_INTERVAL_SECS);
+        let mut c = Cadence::new(web);
+        c.failed_offline();
+        c.failed_offline();
+        assert_eq!(c.nominal(), OFFLINE_RETRY[1]);
+        c.failed();
+        assert!(!c.retrying_offline());
+        assert_eq!(c.nominal(), web, "the ordinary ladder's first rung");
+    }
+
+    /// Exits 6, 7 and 28 — could not resolve, could not connect, timed out — in both
+    /// spellings the transport writes are an unreachable network; every other curl
+    /// failure, and another tool's exit 7, is not.
+    #[test]
+    fn only_dns_connect_and_timeout_failures_count_as_an_unreachable_network() {
+        for unreachable in [
+            "curl HEAD https://github.com/alabsystems/aterm/releases/latest/download/\
+             aterm-appcast.toml failed (exit status: 6): curl: (6) Could not resolve host: \
+             github.com",
+            "curl GET https://api.github.com/x failed (exit status: 7): curl: (7) Failed to \
+             connect to api.github.com port 443",
+            "curl: (28) Operation timed out after 30001 milliseconds",
+            "curl GET x failed (exit 6): dns",
+            "fetch appcast: curl download failed (exit status: 28): ",
+        ] {
+            assert!(is_network_unreachable(unreachable), "{unreachable}");
+        }
+        for reached in [
+            "curl: (22) The requested URL returned error: 404",
+            "curl: (60) SSL certificate problem: unable to get local issuer certificate",
+            "curl: (67) Login denied",
+            "curl GET x failed (exit status: 35): curl: (35) TLS handshake",
+            "ditto zip extract failed (exit status: 7)",
+            "HTTP 404 for https://github.com/x: the channel has no published release",
+            "no usable release this check — run `aterm-ctl update status` for the reason",
+        ] {
+            assert!(!is_network_unreachable(reached), "{reached}");
+        }
     }
 
     #[test]
@@ -477,9 +684,8 @@ mod tests {
 
     #[test]
     fn a_base_longer_than_the_cap_is_respected_and_still_backs_off() {
-        // `ATERM_UPDATE_INTERVAL_SECS=3600` must not be silently shortened to 15 min
-        // by the cap; the cap bounds BACKOFF, it is not a ceiling on the operator's
-        // configured interval. It must not silently DELETE the backoff either, which
+        // A one-hour base must not be silently shortened to 15 min by the cap; the
+        // cap bounds BACKOFF, it is not a ceiling on the base interval. It must not silently DELETE the backoff either, which
         // is what `min(MAX_BACKOFF.max(base))` did for every base at or above the cap:
         // the wait stayed at exactly the base no matter how many checks in a row
         // failed.
@@ -684,6 +890,32 @@ mod tests {
             text.contains("1 identical messages suppressed"),
             "the suppressed count is carried forward, not lost: {text}"
         );
+    }
+
+    /// A network that is not up yet is said at INFO while the quick rungs run, and the
+    /// same failure is WARNED — not suppressed as a repeat — the moment it outlasts
+    /// them. Once warned, repeats collapse as before.
+    #[test]
+    fn an_expected_failure_is_info_until_it_outlasts_the_short_ladder() {
+        let mut log = FailureLog::default();
+        let msg = "curl: (6) Could not resolve host: github.com";
+        let LogAction::Log(first) = log.failure_expected(msg, true) else {
+            panic!("a network that is not up yet is news, not a warning");
+        };
+        assert!(first.contains("Could not resolve host"), "{first}");
+        assert_eq!(log.failure_expected(msg, true), LogAction::Suppress);
+        let LogAction::Warn(escalated) = log.failure_expected(msg, false) else {
+            panic!("past the quick rungs the same failure must be warned");
+        };
+        assert!(
+            escalated.contains("3 consecutive") && escalated.contains("1 identical"),
+            "{escalated}"
+        );
+        assert_eq!(log.failure_expected(msg, false), LogAction::Suppress);
+        let Some(LogAction::Log(recovered)) = log.success() else {
+            panic!("the recovery is logged");
+        };
+        assert!(recovered.contains("after 4 consecutive"), "{recovered}");
     }
 
     #[test]

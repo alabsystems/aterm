@@ -36,6 +36,88 @@
 
 use std::time::{Duration, Instant};
 
+#[path = "session_program.rs"]
+pub(crate) mod program;
+
+/// At most this often is one session's screen re-read for its agent verdict,
+/// whatever `tab_status`'s observation interval: 4 Hz per session.
+pub(crate) const AGENT_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often a foreground group whose screen keeps moving is re-named. A
+/// group's program is resolved when the group CHANGES; this catches the one
+/// change that keeps the group — an `exec` in place (`cd ~/ay && exec
+/// claude` replaces the shell without a new process group).
+pub(crate) const PROGRAM_RECHECK: Duration = Duration::from_secs(5);
+
+/// FNV-1a 64 over the classified rows, `\n`-joined: the live-zone hash the
+/// agent verdict is re-derived on (a changed content seq over an unchanged
+/// zone — a ticking clock elsewhere — costs a hash, not a classification).
+fn zone_hash(rows: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for row in rows {
+        for b in row.bytes().chain(std::iter::once(b'\n')) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// One session's agent-verdict watch: what the sweep last looked at, and the
+/// reading it published.
+#[derive(Debug, Default)]
+struct AgentWatch {
+    /// The screen generation the live zone was last read at. A generation, not
+    /// the bare content seq: a screen switch can land the new grid on the old
+    /// grid's seq, and that screen must still be read.
+    seq_seen: Option<crate::control::ScreenGen>,
+    /// [`zone_hash`] of the rows last classified.
+    zone_hash: Option<u64>,
+    /// When the classifier last ran — the [`AGENT_MIN_INTERVAL`] floor.
+    classified_at: Option<Instant>,
+    /// The program the last classification ran under; a different one forces
+    /// a re-read even over an unchanged zone.
+    program_seen: Option<Option<String>>,
+    /// Look once more at the next due observation: the content moved at this
+    /// one (or the rate floor deferred a read), so its FINAL frame — a box
+    /// drawn just after a look, with nothing printed after it — is read
+    /// within one interval rather than at the status FSM's next deadline.
+    followup: bool,
+    /// The foreground group last seen (`-1` when unknowable).
+    pgid: i32,
+    /// When a program resolution was last requested for this session.
+    resolved_at: Option<Instant>,
+    /// The foreground group in which Claude's composer frame identified the
+    /// session: it stays an agent until that group leaves the foreground (an
+    /// approval box hides the frame, and must not un-identify it).
+    frame_pgid: Option<i32>,
+    /// The published reading (`None` = not an identified agent).
+    reading: Option<crate::presence::AgentReading>,
+    /// [`StatusObserver::agent_seq`] when `reading` last changed.
+    reading_seq: u64,
+}
+
+/// A verdict to publish: its `word`, raw `detail`, a prompt's host-side
+/// subject, and the program its reader read (by name or by screen).
+pub(crate) type AgentPublish = (
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<aterm_phase::Program>,
+);
+
+/// What one observation's agent step decided.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentStep {
+    /// The published reading changed (presence must re-fold it).
+    pub(crate) reading_changed: bool,
+    /// The verdict to publish on the session's timeline (`word`, raw
+    /// `detail`, a prompt's host-side subject, and the agent its reader
+    /// read — by name or by screen), when the zone was classified this
+    /// observation.
+    pub(crate) publish: Option<AgentPublish>,
+}
+
 /// Current activity of a session. This is deliberately NOT where success or
 /// failure lives — see [`Outcome`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1399,6 +1481,18 @@ pub(crate) struct StatusObserver {
     /// brand-new session may be waiting for its first classification and the
     /// gate must open regardless of the deadlines. See `SessionPool::insert_epoch`.
     swept_pool_epoch: u64,
+    /// THE SERVER'S AGENT VERDICT, per session ([`AgentWatch`]).
+    agents: std::collections::HashMap<u64, AgentWatch>,
+    /// Monotonic across every session and every [`Self::clear`]: the sequence
+    /// number a changed reading is stamped with, so presence folds only a
+    /// NEWER reading than the one it holds.
+    agent_seq: u64,
+    /// [`Self::agent_seq`] at the last [`Self::clear`]: the sequence an
+    /// unwatched session answers with, so a reading from before the clear is
+    /// retired rather than kept.
+    agent_cleared_at: u64,
+    /// Names a foreground group's program off the event loop.
+    programs: program::ProgramResolver,
 }
 
 #[derive(Debug)]
@@ -1429,6 +1523,10 @@ impl StatusObserver {
             // No slots yet: the gate is open until the first sweep records one.
             next_due_any: None,
             swept_pool_epoch: 0,
+            agents: std::collections::HashMap::new(),
+            agent_seq: 0,
+            agent_cleared_at: 0,
+            programs: program::ProgramResolver::default(),
         }
     }
 
@@ -1595,7 +1693,18 @@ impl StatusObserver {
     }
 
     pub(crate) fn next_wake(&self) -> Option<Instant> {
-        self.sessions
+        // THE AGENT FOLLOW-UP: a session whose content moved at its last look
+        // is looked at once more at its next due instant, so the frame an
+        // agent drew last (an approval box, then silence) is read within one
+        // interval. It re-arms only while the content keeps moving.
+        let followup = self
+            .agents
+            .iter()
+            .filter(|(_, w)| w.followup)
+            .filter_map(|(id, _)| self.sessions.get(id).map(|slot| slot.next_due))
+            .min();
+        let owed = self
+            .sessions
             .values()
             .filter_map(|slot| {
                 // STRUCTURAL CLAMP (busy-rearm audit, item 2): an armed wake
@@ -1609,11 +1718,169 @@ impl StatusObserver {
                 // past while the gate still had up to `min_interval` to run).
                 slot.fsm.owed_wake().map(|owed| owed.max(slot.next_due))
             })
-            .min()
+            .min();
+        match (owed, followup) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub(crate) fn status(&self, session: u64) -> Option<&Status> {
         self.sessions.get(&session).map(|slot| slot.fsm.status())
+    }
+
+    /// The published agent reading presence folds: its sequence number and
+    /// the reading (`None` = not an identified agent). A session never
+    /// classified answers the sequence of the last [`Self::clear`] (`0` before
+    /// any), which retires a reading from before it and applies nothing else.
+    pub(crate) fn agent_reading(
+        &self,
+        session: u64,
+    ) -> (u64, Option<crate::presence::AgentReading>) {
+        match self.agents.get(&session) {
+            Some(w) if w.reading_seq > 0 => (w.reading_seq, w.reading.clone()),
+            _ => (self.agent_cleared_at, None),
+        }
+    }
+
+    /// Whether this observation should read the live zone (the caller holds
+    /// the terminal guard): the screen generation moved since the last read, or the
+    /// published program is not the one the zone was last judged under — and
+    /// the [`AGENT_MIN_INTERVAL`] floor allows it. A read the floor defers
+    /// arms a follow-up instead.
+    pub(crate) fn agent_zone_wanted(
+        &mut self,
+        session: u64,
+        generation: crate::control::ScreenGen,
+        program: &Option<String>,
+        now: Instant,
+    ) -> bool {
+        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
+            pgid: -1,
+            ..AgentWatch::default()
+        });
+        let moved = w.seq_seen != Some(generation) || w.program_seen.as_ref() != Some(program);
+        if !moved {
+            return false;
+        }
+        let floor = w
+            .classified_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
+        if !floor {
+            w.followup = true;
+        }
+        floor
+    }
+
+    /// One observation's agent step, after the terminal guard is released:
+    /// `rows` is the live zone when [`Self::agent_zone_wanted`] asked for it
+    /// (under the same `program`), `pgid` the foreground group, `resolving`
+    /// whether a program resolution was just requested for it. Classifies
+    /// through [`crate::presence::agent_verdict`] only when the zone's hash
+    /// or the program changed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one observation's facts, each read under a different lock or \
+                  syscall by the sweep; a struct would only rename the list"
+    )]
+    pub(crate) fn agent_observe(
+        &mut self,
+        session: u64,
+        generation: crate::control::ScreenGen,
+        rows: Option<Vec<String>>,
+        program: Option<String>,
+        pgid: i32,
+        resolving: bool,
+        now: Instant,
+    ) -> AgentStep {
+        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
+            pgid: -1,
+            ..AgentWatch::default()
+        });
+        if w.pgid != pgid {
+            w.pgid = pgid;
+            if w.frame_pgid != Some(pgid) {
+                w.frame_pgid = None;
+            }
+        }
+        let program_moved = w.program_seen.as_ref() != Some(&program);
+        let Some(rows) = rows else {
+            // Not read this time (unchanged, or deferred by the floor): look
+            // again next interval if anything is still owed — a moved seq or
+            // program, or a resolution in flight whose answer is not yet read.
+            w.followup = resolving || program_moved || w.seq_seen != Some(generation);
+            return AgentStep::default();
+        };
+        let moved = w.seq_seen != Some(generation);
+        w.seq_seen = Some(generation);
+        w.followup = moved || resolving;
+        let hash = zone_hash(&rows);
+        if w.zone_hash == Some(hash) && !program_moved {
+            return AgentStep::default();
+        }
+        w.zone_hash = Some(hash);
+        w.program_seen = Some(program.clone());
+        w.classified_at = Some(now);
+        let known = w.frame_pgid == Some(pgid);
+        // A foreground group with no name yet: the resolver is naming it.
+        let pending = program.is_none() && pgid > 0;
+        let verdict =
+            crate::presence::agent_verdict(program.as_deref(), pending, known, &rows, now);
+        if matches!(
+            verdict,
+            crate::presence::AgentVerdict::Agent { by_frame: true, .. }
+        ) {
+            w.frame_pgid = Some(pgid);
+        }
+        let reading = verdict.reading().cloned();
+        let reading_changed = reading != w.reading;
+        if reading_changed {
+            self.agent_seq += 1;
+            w.reading = reading;
+            w.reading_seq = self.agent_seq;
+        }
+        // The box's command or path, for the menu row and the notification
+        // only: read by the same reader, from the same zone, as the verdict.
+        let subject = verdict.subject().map(str::to_string);
+        AgentStep {
+            reading_changed,
+            publish: Some((verdict.word(), verdict.detail(), subject, verdict.program())),
+        }
+    }
+
+    /// Whether `session`'s foreground program should be (re-)named now: its
+    /// group just changed (`group_changed`), or the screen moved and the last
+    /// naming is older than [`PROGRAM_RECHECK`] (an `exec` in place). Call
+    /// before [`Self::agent_observe`], which records the generation.
+    pub(crate) fn program_due(
+        &self,
+        session: u64,
+        group_changed: bool,
+        generation: crate::control::ScreenGen,
+        now: Instant,
+    ) -> bool {
+        if group_changed {
+            return true;
+        }
+        self.agents.get(&session).is_some_and(|w| {
+            w.seq_seen != Some(generation)
+                && w.resolved_at
+                    .is_some_and(|at| now.saturating_duration_since(at) >= PROGRAM_RECHECK)
+        })
+    }
+
+    /// Ask the resolver to name `pgid`'s leader into `timeline`, off-thread.
+    pub(crate) fn request_program(
+        &mut self,
+        session: u64,
+        timeline: &std::sync::Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
+        pgid: i32,
+        now: Instant,
+    ) {
+        if let Some(w) = self.agents.get_mut(&session) {
+            w.resolved_at = Some(now);
+        }
+        self.programs.request(timeline, pgid);
     }
 
     pub(crate) fn revision(&self, session: u64) -> u64 {
@@ -1642,6 +1909,7 @@ impl StatusObserver {
     /// Drop a retired session's state. Without this the map would grow for the
     /// process lifetime as tabs open and close.
     pub(crate) fn retire(&mut self, session: u64) {
+        self.agents.remove(&session);
         if self.sessions.remove(&session).is_some() {
             // The removed slot may have BEEN the minimum, and a stale-early
             // bound would only cost a scan — but the exact value is one cheap
@@ -1691,6 +1959,11 @@ impl StatusObserver {
     pub(crate) fn clear(&mut self) -> bool {
         let had = !self.sessions.is_empty();
         self.sessions.clear();
+        // The agent readings describe the same stopped subsystem: retire them
+        // (presence folds the post-clear sequence as "no reading").
+        self.agents.clear();
+        self.agent_seq += 1;
+        self.agent_cleared_at = self.agent_seq;
         // No slots ⇒ no known deadline ⇒ the gate is open again, which is what
         // a re-enabled subsystem needs (every session is unclassified).
         self.next_due_any = None;
@@ -1700,7 +1973,9 @@ impl StatusObserver {
 
 impl crate::App {
     /// Classify every live session that is due, gathering evidence under
-    /// `try_lock` only. Returns the sessions whose published status changed.
+    /// `try_lock` only. Returns the sessions whose published status — or
+    /// published agent reading — changed; the caller refreshes each one's
+    /// chrome and presence.
     ///
     /// This runs on the output path, so its cost per session is: one map
     /// lookup, and — only when due — one uncontended try-lock holding the
@@ -1778,8 +2053,46 @@ impl crate::App {
             let shell = shell_evidence(&guard);
             let alt_screen = guard.is_alternate_screen();
             let content_seq = guard.content_seq();
+            let generation = crate::control::screen_gen(&guard);
             let detail = executing_detail(&guard);
+            // THE AGENT VERDICT's one read of the screen, under this SAME
+            // guard: the live zone's rows, only when the content moved since
+            // the last read (and at most 4 Hz). Classified after the guard is
+            // released — the PTY reader never waits on `aterm_phase`.
+            // The published program is read here, under the guard (the
+            // timeline is a strict leaf: nothing holding it takes a terminal),
+            // so the zone is judged under the program it was read with.
+            let program = session
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent()
+                .program
+                .clone();
+            // The read is the WHOLE screen, once, through the one construction
+            // `status hash=` hashes ([`crate::control::screen_text`]): its hash
+            // and generation are the verdict's stamp (`agent_gen=`/`agent_fp=`),
+            // and its last rows are the zone classified.
+            let read = self
+                .session_status
+                .agent_zone_wanted(id, generation, &program, now)
+                .then(|| {
+                    let text = crate::control::screen_text(&guard);
+                    let stamp = crate::session_timeline::AgentStamp {
+                        generation,
+                        fp: crate::turn_ledger::fnv1a_64(text.as_bytes()),
+                    };
+                    let rows: Vec<&str> = text.split_terminator('\n').collect();
+                    let from = rows.len().saturating_sub(crate::presence::CLASSIFY_ROWS);
+                    let zone: Vec<String> = rows[from..].iter().map(|r| (*r).to_string()).collect();
+                    (zone, stamp)
+                });
             drop(guard);
+            let (zone, stamp) = match read {
+                Some((zone, stamp)) => (Some(zone), Some(stamp)),
+                None => (None, None),
+            };
             let last_output = match latest_output_ns {
                 0 => None,
                 ns => self
@@ -1846,7 +2159,63 @@ impl crate::App {
             // (`running targo test` -> `running claude`) still repaints.
             let status_changed = self.session_status.observe(id, &evidence, now);
             let detail_changed = self.session_status.set_detail(id, detail);
-            if status_changed || detail_changed {
+            // PROGRAM IDENTITY + AGENT VERDICT. The foreground group is one
+            // `tcgetpgrp` (the job probe above asked the same question); only
+            // a CHANGED group costs a resolution, and that runs off this
+            // thread. The verdict is published on the session's timeline —
+            // the store `status`, `sessions`, `await agent` and the events
+            // digest all read — and a move wakes this session's subscribers
+            // now rather than on their next 250 ms tick.
+            let pgid = if master >= 0 {
+                crate::quit_safety::foreground_pgrp(master)
+            } else {
+                -1
+            };
+            let group_changed = pgid > 0
+                && session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_foreground_group(pgid);
+            let resolve = pgid > 0
+                && self
+                    .session_status
+                    .program_due(id, group_changed, generation, now);
+            if resolve {
+                self.session_status
+                    .request_program(id, &session.ctx.timeline, pgid, now);
+            }
+            let step = self
+                .session_status
+                .agent_observe(id, generation, zone, program, pgid, resolve, now);
+            let moved = match (step.publish, stamp) {
+                (Some((word, detail, subject, reader)), Some(stamp)) => session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .publish_agent(word, detail, subject, reader, stamp),
+                // Read, and the zone was unchanged: the verdict stands on this
+                // newer screen.
+                (None, Some(stamp)) => {
+                    session
+                        .ctx
+                        .timeline
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .note_agent_stamp(stamp);
+                    false
+                }
+                _ => false,
+            };
+            if moved && self.subscribers.any() {
+                self.subscribers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notify(id);
+            }
+            if status_changed || detail_changed || step.reading_changed {
                 changed.push(id);
             }
         }
@@ -2052,6 +2421,89 @@ impl crate::App {
         self.job_probe.forget(session);
     }
 
+    /// The bridge's roster-round status read. Each row carries the registry's
+    /// stable sid and launch nonce beside `status`'s revision, hold, detail and
+    /// agent fields, so a
+    /// local id reused between two roster reads cannot be mistaken for the
+    /// session the bridge sampled earlier. A vanished session contributes no
+    /// row; the bridge then retries its old `@sid status` path for that one sid.
+    ///
+    /// This is a pure read. There is no cursor or batch-owned state: the point
+    /// is one event-loop wake for the roster. It deliberately avoids `status`'s
+    /// subject, full-screen hash and consent projection: doing those N times
+    /// in one event-loop turn would trade N wakes for a long typing stall.
+    pub(crate) fn session_statuses_record(&self) -> String {
+        let snapshot = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot();
+        let mut rows = Vec::with_capacity(snapshot.len());
+        for h in snapshot {
+            let Some(record) = self.fabric_status_fields(h.local_id) else {
+                continue;
+            };
+            // The registry may change on another thread while the status is
+            // read. Never stamp a new local-id occupant with the old key.
+            let same_generation = self
+                .store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_local(h.local_id)
+                .is_some_and(|live| live.sid == h.sid && live.nonce == h.nonce);
+            if same_generation {
+                rows.push(format!(
+                    "{} {} {} {record}",
+                    h.local_id,
+                    h.sid.as_str(),
+                    h.nonce.to_hex()
+                ));
+            }
+        }
+        let mut out = format!("OK {}\n", rows.len());
+        for row in rows {
+            out.push_str(&row);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The fields the bridge extracts from `@sid status`. Keep
+    /// their producers and fallback exactly aligned with that record: `hold`
+    /// from the session fabric leaf, `detail` from one non-blocking terminal
+    /// read or the last observed status, and `revision=0` until classified.
+    fn fabric_status_fields(&self, session: u64) -> Option<String> {
+        let pooled = self.pool.get(session)?;
+        let hold = u8::from(pooled.ctx.fabric.hold().is_some());
+        let detail = {
+            let term = match pooled.term.try_lock() {
+                Ok(t) => Some(t),
+                Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            term.as_deref().and_then(executing_detail)
+        };
+        let status = self.session_status.status(session);
+        let (revision, detail) = match status {
+            None => (0, detail.as_deref()),
+            Some(status) => (
+                self.session_status.revision(session),
+                detail.as_deref().or(status.detail.as_deref()),
+            ),
+        };
+        let detail = detail.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
+        let agent = pooled
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent()
+            .word;
+        Some(format!(
+            "sid={session} revision={revision} hold={hold} detail={detail} agent={agent}"
+        ))
+    }
+
     /// Project one session's SUBJECT + STATUS onto the `status` verb's reply
     /// body (RFC §8). The caller adds the `OK ` prefix and the newline.
     ///
@@ -2153,7 +2605,7 @@ impl crate::App {
         // `content_seq` and `hash=` is FNV-1a-64 of the UNTRIMMED visible screen
         // — byte for byte the pair `turn` returns and `history` keeps for a turn
         // id, so a report built from this screen can be matched against the
-        // ledger rather than believed (`aterm-link hook --report-to`). A session
+        // ledger rather than believed (a manager's fold of a report). A session
         // whose terminal could not be locked answers `-`/`-`: the poll never
         // waits on the guard for a field it can say it does not have.
         let stamp = term.as_deref().map(crate::control::screen_stamp);
@@ -2161,7 +2613,43 @@ impl crate::App {
             || ("-".to_string(), "-".to_string()),
             |(seq, hash)| (seq.to_string(), format!("{hash:016x}")),
         );
+        // `gen=<epoch>.<seq>`, from the same guard: the screen generation a
+        // fenced press names (`key if-gen=`). `seq=` alone repeats after an
+        // alternate-screen re-entry; see [`crate::control::ScreenGen`].
+        let generation = term.as_deref().map_or_else(
+            || "-".to_string(),
+            |t| crate::control::screen_gen(t).to_string(),
+        );
+        // `integration=<on|off|degraded>`, from the same guard: whether this
+        // session's OSC 133/633 marks can reach the engine. `degraded` = a
+        // nonce is required and none is authorized (an adopted shell whose
+        // handoff did not carry it), so `detail=` and blocks are dark — and
+        // `program=` below is how its program is still named.
+        let integration = term
+            .as_deref()
+            .map_or("-", |t| t.shell_integration_posture().as_str());
         drop(term);
+        // `supervisor=<holder|->`: the live supervisor claim (`meta set
+        // supervisor`), so a poll shows that something is answering this
+        // session's prompts. A leaf lock, taken after the terminal guard.
+        let supervisor = pooled
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_supervisor(crate::metrics::now_us())
+            .map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
+        // THE PROGRAM AND THE AGENT VERDICT (`program= agent= agent_detail=
+        // agent_rev= agent_since_ms=`): the sweep's publication, read from the
+        // session timeline — the same store the `sessions` row, `await agent`
+        // and `EVENT agent` read, so no two surfaces disagree.
+        let agent = pooled
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent()
+            .wire_fields();
         // THE TWO ADDITIVE FIELDS (design §5.2). Additive: `schema=1` does not
         // move. Computed after the terminal guard is released, from the cwd
         // that guard already produced.
@@ -2174,6 +2662,26 @@ impl crate::App {
         // — plain field reads, no lock, no classifier — so the poll pays nothing
         // it did not already pay.
         let presence = self.presence_status_tail(session);
+        // `path=<frozen|live>` (2026-09-22), after `story=` and BEFORE the
+        // `seq=`/`hash=` stamp, which stays last by contract: whether this
+        // session's shell fronts aterm's managed `agents/` on PATH. `frozen` is
+        // the registry's adoption mark ([`crate::session_store::SessionStore::
+        // has_frozen_path`]): a shell spawned by a build before the self-healing
+        // sessions (2026-09-16) and carried across the update(s) since, so
+        // `claude`/`codex` typed in it run the foreign copies until the hook is
+        // sourced there. An UPPER BOUND — sourcing the hook is not reported back
+        // — the same one the managed-current row's tab count is. One registry
+        // read, no lock the poll did not already take elsewhere.
+        let path = if self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .has_frozen_path(session)
+        {
+            "frozen"
+        } else {
+            "live"
+        };
         let Some(status) = self.session_status.status(session) else {
             // Never classified. Distinct from `phase=unknown`, which IS a
             // classification ("evidence was looked for and none was usable").
@@ -2185,7 +2693,8 @@ impl crate::App {
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
-                 identity={identity} {presence} seq={seq} hash={hash}",
+                 identity={identity} {presence} path={path} {agent} integration={integration} \
+                 supervisor={supervisor} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -2223,7 +2732,8 @@ impl crate::App {
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
-             identity={identity} {presence} seq={seq} hash={hash}",
+             identity={identity} {presence} path={path} {agent} integration={integration} \
+             supervisor={supervisor} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -2361,7 +2871,7 @@ mod idle_cost_tests {
 mod tests {
 
     /// `seq=<n|-> hash=<hex16|->`, last on the record and in that order — the
-    /// pair `aterm-link hook --report-to` reads to stamp a report, and the one
+    /// pair a stamped report opens with, and the one
     /// `history` can be held against.
     fn assert_stamp_rides_last(record: &str) {
         let stamp = record
@@ -3191,7 +3701,7 @@ mod tests {
         // Round 22 appended the SCREEN'S STAMP after the round-19 tail, the same
         // additive way, so the tail is no longer the end of the record.
         assert!(
-            record.contains(" hand=- level=quiet story=0 seq="),
+            record.contains(" hand=- level=quiet story=0 why=- path=live program="),
             "{record}"
         );
         assert_stamp_rides_last(&record);
@@ -3217,6 +3727,79 @@ mod tests {
         assert!(record.contains(" observed=true "), "{record}");
         assert!(record.contains(" hold=1 "), "{record}");
         assert!(!record.contains('\n'), "one line, always");
+    }
+
+    #[test]
+    fn fabric_batch_matches_single_status_fields_for_each_session() {
+        let mut app = crate::App::headless_for_test();
+        let second = crate::stub_session(1);
+        crate::App::register_session(&app.store, &second, None);
+        app.pool.insert(second);
+
+        let assert_same = |app: &crate::App| {
+            let batch = app.session_statuses_record();
+            let mut lines = batch.lines();
+            assert_eq!(lines.next(), Some("OK 2"), "{batch}");
+            for local in [0, 1] {
+                let h = app
+                    .store
+                    .read()
+                    .unwrap()
+                    .by_local(local)
+                    .expect("registered session")
+                    .clone();
+                let row = lines.next().expect("one row per live session");
+                let prefix = format!("{local} {} {} ", h.sid.as_str(), h.nonce.to_hex());
+                let fields = row.strip_prefix(&prefix).expect("stable sid and nonce");
+                let single = app.session_status_record(local).expect("live session");
+                for key in ["sid=", "revision=", "hold=", "detail=", "agent="] {
+                    let batch_value = fields
+                        .split_whitespace()
+                        .find(|part| part.starts_with(key))
+                        .expect("batch field present");
+                    let single_value = single
+                        .split_whitespace()
+                        .find(|part| part.starts_with(key))
+                        .expect("single field present");
+                    assert_eq!(batch_value, single_value, "{key}: {row}");
+                }
+            }
+            assert!(lines.next().is_none(), "framed count is exact: {batch}");
+        };
+
+        // Both sessions start unclassified. An unavailable terminal must not
+        // invent an observed detail or revision for either one.
+        let locked_term = app.pool.get(0).unwrap().term.clone();
+        let guard = locked_term.lock().unwrap();
+        assert_same(&app);
+        drop(guard);
+
+        // One session becomes classified and held; its cached detail supplies
+        // the same percent-encoded fallback when its terminal is contended.
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        assert!(
+            app.session_status
+                .set_detail(0, Some("Claude Code".to_string()))
+        );
+        let ctx = app.pool.get(0).unwrap().ctx.clone();
+        crate::fabric::apply_hold_for_test(
+            &ctx,
+            Some(crate::fabric::Hold {
+                reason: "test".to_string(),
+                origin: "fleet".to_string(),
+            }),
+        );
+        let guard = locked_term.lock().unwrap();
+        assert_same(&app);
+        assert!(
+            app.fabric_status_fields(0)
+                .unwrap()
+                .contains("detail=Claude%20Code")
+        );
+        drop(guard);
     }
 
     /// IDENTITY (session identities, phase 1): the record carries the agent
@@ -3330,9 +3913,13 @@ mod tests {
         );
         // Round 19 appended three more (`hand=`, `level=`, `story=`), the same way.
         // Round 22 appended the SCREEN'S STAMP after the round-19 tail, the same
-        // additive way, so the tail is no longer the end of the record.
+        // additive way, so the tail is no longer the end of the record. `path=`
+        // (2026-09-22) went in between, the same way again — the stamp keeps
+        // its contract (last), the tail keeps its order. 2026-09-23: `why=`
+        // closes the round-19 tail, and the published `program= agent= …
+        // integration=` columns sit between `path=` and the stamp.
         assert!(
-            record.contains(" hand=- level=quiet story=0 seq="),
+            record.contains(" hand=- level=quiet story=0 why=- path=live program="),
             "{record}"
         );
         assert_stamp_rides_last(&record);
@@ -4277,5 +4864,589 @@ mod tests {
             None,
             "a completed block clears the chrome detail"
         );
+    }
+}
+
+/// THE SERVER-PUBLISHED AGENT VERDICT and PROGRAM IDENTITY, driven through the
+/// real sweep (`App::observe_session_statuses`) on a headless App.
+#[cfg(test)]
+mod agent_verdict_tests {
+    use std::time::{Duration, Instant};
+
+    use crate::{App, WindowId};
+
+    /// Claude Code 2.1.280's rm circuit-breaker box, measured 2026-09-23 in a
+    /// private headless aterm (120 columns; rows 1-24 of the capture).
+    const RM_BOX: &[&str] = &[
+        "",
+        "  Get to finished work sooner with Opus 5.5. Switch anytime with /model.",
+        "  1 more notice hidden",
+        "",
+        "\u{276f} Use the Bash tool to run exactly this one line, verbatim, as one call: S=$PWD/tmp; for p in a b; do set -- $p; rm -rf",
+        "  $S/$1; done",
+        "",
+        "  Removing directories tmp/a and tmp/b",
+        "  \u{23bf}  $ S=$PWD/tmp; for p in a b; do set -- $p; rm -rf $S/$1; done",
+        "",
+        "\u{2500}",
+        " Bash command",
+        "",
+        "   S=$PWD/tmp; for p in a b; do set -- $p; rm -rf $S/$1; done",
+        "   Remove directories tmp/a and tmp/b",
+        "",
+        " \u{2502} Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1` (bind $1 and rewrite its $S as",
+        " \u{2502} \"${S:?}\" or use a literal path)",
+        "",
+        " Do you want to proceed?",
+        " \u{276f} 1. Yes",
+        "   2. No",
+        "",
+        " Esc to cancel \u{00b7} Tab to amend",
+    ];
+
+    /// A busy Claude screen: a transcript row, the spinner, the composer
+    /// between its two rules, the footer (the shape `aterm_phase` reads).
+    fn busy_screen(secs: u32) -> Vec<String> {
+        let rule = "\u{2500}".repeat(120);
+        let mut rows = vec![String::new(); 24];
+        rows[0] = "\u{23fa} Working on it.".into();
+        rows[19] = format!("\u{2736} Deliberating\u{2026} ({secs}s \u{00b7} thinking)");
+        rows[20] = rule.clone();
+        rows[21] = "\u{276f} ".into();
+        rows[22] = rule;
+        rows[23] = "  \u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt".into();
+        rows
+    }
+
+    /// The rm box with its top rule at full width, and a transcript row above
+    /// it that keeps TICKING (a live monitor line) — the audit's INT-1 shape.
+    fn box_screen(tick: u32) -> Vec<String> {
+        let mut rows: Vec<String> = RM_BOX.iter().map(|r| (*r).to_string()).collect();
+        rows[10] = "\u{2500}".repeat(120);
+        rows[0] = format!("\u{23fa} Monitor tick {tick}");
+        rows
+    }
+
+    fn paint(app: &App, sid: u64, rows: &[String]) {
+        let pooled = app.pool.get(sid).expect("pooled");
+        let mut t = crate::term_lock(&pooled.term);
+        if t.cols() != 120 {
+            t.resize(24, 120);
+        }
+        let mut bytes = String::from("\x1b[H\x1b[2J");
+        for (i, row) in rows.iter().enumerate() {
+            bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
+        }
+        t.process(bytes.as_bytes());
+    }
+
+    fn published(app: &App, sid: u64) -> crate::session_timeline::AgentPublication {
+        app.pool
+            .get(sid)
+            .expect("pooled")
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .agent()
+            .clone()
+    }
+
+    fn app_with_stub() -> (App, u64) {
+        let mut app = App::headless_for_test();
+        let sid = app.next_session_id;
+        app.push_stub_tab(WindowId(0), crate::stub_session(sid));
+        (app, sid)
+    }
+
+    /// INT-1: a box raised while a row keeps ticking must reach `agent=` at
+    /// the next sweep, although the shell status FSM's revision — the old
+    /// classifier gate — never moves. The negative control is the revision
+    /// itself: it stays put across the busy→prompt move, so a verdict gated on
+    /// it (today's `level=quiet` with a box up) would never have been read.
+    #[test]
+    fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves() {
+        let (mut app, sid) = app_with_stub();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(300);
+        let mut t = t0;
+        for secs in 0..3 {
+            paint(&app, sid, &busy_screen(secs));
+            let _ = app.observe_session_statuses(t);
+            t += step;
+        }
+        let busy = published(&app, sid);
+        assert_eq!(busy.word, "busy", "the composer frame identified Claude");
+        let revision = app.session_status.revision(sid);
+
+        paint(&app, sid, &box_screen(1));
+        let changed = app.observe_session_statuses(t);
+        for id in &changed {
+            app.refresh_presence_session(*id, false);
+        }
+        t += step;
+        let prompt = published(&app, sid);
+        assert_eq!(prompt.word, "prompt", "the box is read at the next sweep");
+        assert_eq!(
+            prompt.detail.as_deref(),
+            Some("bash:not-read-only"),
+            "the box's kind and the read-only verdict, never the command"
+        );
+        assert_eq!(prompt.rev, busy.rev + 1);
+        assert!(changed.contains(&sid), "the caller refreshes presence");
+        assert_eq!(
+            app.session_status.revision(sid),
+            revision,
+            "NEGATIVE CONTROL: the status revision did not move, so the old \
+             revision-gated classifier would still read busy"
+        );
+        let record = app.session_status_record(sid).expect("live");
+        assert!(
+            record.contains(" agent=prompt agent_detail=bash:not-read-only agent_rev="),
+            "{record}"
+        );
+        assert!(record.contains(" level=attention story="), "{record}");
+        assert!(record.contains(" why=prompt "), "{record}");
+        // The move is on the timeline, so the events digest pushes it.
+        let events: Vec<String> = app
+            .pool
+            .get(sid)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == "agent-change")
+            .map(|e| e.payload.clone())
+            .collect();
+        let stamp = prompt.stamp.expect("a published verdict carries its read");
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some(
+                format!(
+                    "prompt rev={} gen={} fp={:016x}",
+                    prompt.rev, stamp.generation, stamp.fp
+                )
+                .as_str()
+            )
+        );
+
+        // The row keeps ticking: the zone changed, so it is re-read — and the
+        // verdict holds, so nothing is re-published.
+        let calls = crate::presence::classifier_calls();
+        paint(&app, sid, &box_screen(2));
+        let _ = app.observe_session_statuses(t);
+        t += step;
+        assert_eq!(crate::presence::classifier_calls() - calls, 1);
+        assert_eq!(
+            published(&app, sid).rev,
+            prompt.rev,
+            "same verdict, same rev"
+        );
+        // An unchanged screen costs no classification at all.
+        let _ = app.observe_session_statuses(t);
+        t += step;
+        let _ = app.observe_session_statuses(t);
+        assert_eq!(
+            crate::presence::classifier_calls() - calls,
+            1,
+            "no content move, no read"
+        );
+    }
+
+    /// THE VERDICT'S STAMP (review major): `agent_gen=`/`agent_fp=` name the
+    /// screen the verdict was read from, byte-equal to what `status gen=`/
+    /// `hash=` printed for that screen. A screen that changes after the sweep
+    /// moves `status gen=` but NOT `agent_gen=` — the NEGATIVE CONTROL, and the
+    /// reason a press decided from the verdict fences on `agent_gen`: a fence
+    /// on the fresh `status gen=` would hold over a box nothing classified.
+    /// A re-read whose zone is unchanged re-confirms the verdict: the stamp
+    /// moves, the rev does not.
+    #[test]
+    fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
+        let field = |record: &str, key: &str| {
+            record
+                .split(' ')
+                .find_map(|kv| kv.strip_prefix(key))
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("{key} in {record}"))
+        };
+        let (mut app, sid) = app_with_stub();
+        let mut t = Instant::now();
+        let step = Duration::from_millis(300);
+        paint(&app, sid, &busy_screen(0));
+        let _ = app.observe_session_statuses(t);
+        t += step;
+        paint(&app, sid, &box_screen(1));
+        let _ = app.observe_session_statuses(t);
+        t += step;
+        let record = app.session_status_record(sid).expect("live");
+        assert!(record.contains(" agent=prompt "), "{record}");
+        assert_eq!(
+            field(&record, "agent_gen="),
+            field(&record, "gen="),
+            "{record}"
+        );
+        assert_eq!(
+            field(&record, "agent_fp="),
+            field(&record, "hash="),
+            "{record}"
+        );
+        let rev = published(&app, sid).rev;
+
+        // The screen moves with no sweep in between: `status` reads the new
+        // screen, the verdict still names the one it was read from.
+        paint(&app, sid, &box_screen(2));
+        let record = app.session_status_record(sid).expect("live");
+        assert_ne!(
+            field(&record, "agent_gen="),
+            field(&record, "gen="),
+            "{record}"
+        );
+        assert_ne!(
+            field(&record, "agent_fp="),
+            field(&record, "hash="),
+            "{record}"
+        );
+
+        // The sweep re-reads it (the ticking row, same verdict): the stamp
+        // catches up, the rev stays.
+        let _ = app.observe_session_statuses(t);
+        let record = app.session_status_record(sid).expect("live");
+        assert_eq!(
+            field(&record, "agent_gen="),
+            field(&record, "gen="),
+            "{record}"
+        );
+        assert_eq!(
+            field(&record, "agent_fp="),
+            field(&record, "hash="),
+            "{record}"
+        );
+        assert_eq!(published(&app, sid).rev, rev, "same verdict, same rev");
+    }
+
+    /// A zone re-read inside [`super::AGENT_MIN_INTERVAL`] is deferred, and
+    /// the deferral arms a follow-up wake instead of being lost.
+    #[test]
+    fn the_rate_floor_defers_a_read_and_arms_a_followup() {
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let mut obs =
+            super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
+        let t0 = Instant::now();
+        assert!(obs.agent_zone_wanted(1, g(1), &None, t0));
+        let rows = vec!["$ ls".to_string()];
+        let _ = obs.agent_observe(1, g(1), Some(rows), None, -1, false, t0);
+        assert!(!obs.agent_zone_wanted(1, g(1), &None, t0), "nothing moved");
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(
+            !obs.agent_zone_wanted(1, g(2), &None, t1),
+            "a read 100 ms after the last is deferred"
+        );
+        let _ = obs.agent_observe(1, g(2), None, None, -1, false, t1);
+        assert!(obs.agents[&1].followup, "and a follow-up is armed");
+        assert!(obs.agent_zone_wanted(1, g(2), &None, t0 + super::AGENT_MIN_INTERVAL));
+        // A resolution in flight keeps the follow-up armed over an unmoved
+        // screen, so its answer is read one interval later.
+        let t2 = t0 + super::AGENT_MIN_INTERVAL;
+        let _ = obs.agent_observe(1, g(2), Some(vec!["$ ls".into()]), None, 7, true, t2);
+        assert!(obs.agents[&1].followup);
+        assert!(
+            obs.agent_zone_wanted(
+                1,
+                g(2),
+                &Some("sleep".into()),
+                t2 + super::AGENT_MIN_INTERVAL
+            ),
+            "the resolved program re-reads an unchanged zone"
+        );
+    }
+
+    /// INT-4: a shell whose last line ends in `?` is not an agent — `agent=-`
+    /// and no attention — while the SAME screen under `program=claude` is read
+    /// as the question it is. Identity, not screen text, decides.
+    #[test]
+    fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
+        let (mut app, sid) = app_with_stub();
+        let screen: Vec<String> = vec![
+            "$ echo \"Checking whether the disk is full?\"; sleep 30".into(),
+            "Checking whether the disk is full?".into(),
+        ];
+        paint(&app, sid, &screen);
+        let t0 = Instant::now();
+        let changed = app.observe_session_statuses(t0);
+        for id in changed {
+            app.refresh_presence_session(id, false);
+        }
+        assert_eq!(published(&app, sid).word, "-");
+        let record = app.session_status_record(sid).expect("live");
+        assert!(
+            record.contains(" agent=- agent_detail=- agent_rev=0 "),
+            "{record}"
+        );
+        assert!(!record.contains("level=attention"), "{record}");
+        assert!(record.contains(" why=- "), "{record}");
+
+        // The same screen, the foreground program named `claude`: an agent,
+        // asking. (The stub has no PTY, so the program is published by hand
+        // exactly as the resolver would.)
+        {
+            let pooled = app.pool.get(sid).unwrap();
+            let mut tl = pooled.ctx.timeline.lock().unwrap();
+            assert!(tl.note_foreground_group(4242));
+            tl.set_program(4242, Some("claude".into()));
+        }
+        let changed = app.observe_session_statuses(t0 + Duration::from_millis(300));
+        for id in changed {
+            app.refresh_presence_session(id, false);
+        }
+        let p = published(&app, sid);
+        assert_eq!(p.program.as_deref(), Some("claude"));
+        assert_eq!(
+            p.word, "question",
+            "a program change re-reads an unchanged zone"
+        );
+        let record = app.session_status_record(sid).expect("live");
+        assert!(
+            record.contains(" program=claude agent=question "),
+            "{record}"
+        );
+        assert!(record.contains(" why=question "), "{record}");
+    }
+
+    /// ACT-4: an adopted, checkpointed session whose handoff CARRIED its
+    /// shell-integration nonce still takes its shell's marks — fed `633;E;claude
+    /// --resume` then `133;C`, it reads `detail=claude` — and one whose
+    /// handoff did not stays `integration=degraded` with its marks dropped
+    /// (the requirement is never cleared as a fallback).
+    #[test]
+    fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
+        use aterm_core::terminal::{ShellIntegrationPosture, Terminal};
+        let nonce = [0x3Cu8; 32];
+        let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let mut outgoing = Terminal::new(24, 80);
+        outgoing.authorize_shell_integration(nonce);
+        outgoing.set_require_shell_integration_nonce(true);
+        outgoing.process(format!("\x1b]133;A;id={hex}\x07$ ").as_bytes());
+        let carried = outgoing.checkpoint_carry(0).expect("Ground");
+
+        let feed = format!(
+            "\x1b]133;D;0;id={hex}\x07\x1b]133;A;id={hex}\x07$ \x1b]633;E;claude --resume;id={hex}\x07\
+             \x1b]133;B;id={hex}\x07claude --resume\n\x1b]133;C;id={hex}\x07"
+        );
+        let mut adopted = Terminal::new(24, 80);
+        adopted.restore_checkpoint(&carried);
+        crate::spawn::authorize_adopted_shell_nonce(&mut adopted, &carried, 1);
+        assert_eq!(
+            adopted.shell_integration_posture(),
+            ShellIntegrationPosture::On
+        );
+        adopted.process(feed.as_bytes());
+        assert_eq!(super::executing_detail(&adopted).as_deref(), Some("claude"));
+
+        // NEGATIVE CONTROL: the same adopt without the carried nonce (a parent
+        // that predates the carry) drops every mark and says so.
+        let mut uncarried = carried.clone();
+        uncarried.shell_integration_nonce = None;
+        let mut blind = Terminal::new(24, 80);
+        blind.restore_checkpoint(&uncarried);
+        crate::spawn::authorize_adopted_shell_nonce(&mut blind, &uncarried, 2);
+        assert_eq!(
+            blind.shell_integration_posture(),
+            ShellIntegrationPosture::Degraded
+        );
+        assert!(blind.is_require_shell_integration_nonce(), "never cleared");
+        blind.process(feed.as_bytes());
+        assert_eq!(super::executing_detail(&blind), None);
+    }
+
+    /// The herald's posts on this thread since the last call, drained.
+    fn take_posts() -> Vec<crate::status_item::HeraldNotice> {
+        crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
+    }
+
+    /// One sweep plus the presence fan-out the event loop runs after it.
+    fn sweep(app: &mut App, t: Instant) {
+        for id in app.observe_session_statuses(t) {
+            app.refresh_presence_session(id, false);
+        }
+    }
+
+    fn looking_at(app: &App, sessions: &[u64]) {
+        let mut set = app.notify_suppress.lock().unwrap();
+        set.clear();
+        set.extend(sessions.iter().copied());
+    }
+
+    /// ONE PLACE FOR ANDREW, end to end on the measured rm box: the sweep
+    /// publishes `agent=prompt`, and the presence fan-out raises exactly one
+    /// menu row naming the tab, the kind and the command, and exactly one
+    /// notification. Re-classifying the same box (its ticking row moves the
+    /// zone hash) posts nothing more; a new box while the human is looking
+    /// at the tab posts nothing but still lists the row; a headless instance
+    /// posts nothing at all.
+    #[test]
+    fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
+        let (mut app, sid) = app_with_stub();
+        app.headless = false;
+        {
+            use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
+            let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
+            write_session_meta(&ctx, MetaField::Title, MetaEdit::Set("build")).expect("title");
+        }
+        let _ = take_posts();
+        looking_at(&app, &[]);
+        let step = Duration::from_millis(300);
+        let mut t = Instant::now();
+        for secs in 0..2 {
+            paint(&app, sid, &busy_screen(secs));
+            sweep(&mut app, t);
+            t += step;
+        }
+        assert!(take_posts().is_empty(), "a busy agent needs nobody");
+        assert!(app.operator_fleet_glance().warnings.is_empty());
+
+        paint(&app, sid, &box_screen(1));
+        sweep(&mut app, t);
+        t += step;
+        let posts = take_posts();
+        assert_eq!(posts.len(), 1, "exactly one notification: {posts:?}");
+        assert_eq!(posts[0].session, sid);
+        assert_eq!(posts[0].title, "aterm \u{b7} approval waiting");
+        assert!(
+            posts[0]
+                .body
+                .contains("bash S=$PWD/tmp; for p in a b; do set -- $p; rm -rf"),
+            "the body names the command: {}",
+            posts[0].body
+        );
+        let glance = app.operator_fleet_glance();
+        assert_eq!(glance.warnings.len(), 1, "{:?}", glance.warnings);
+        let (row_sid, label) = &glance.warnings[0];
+        assert_eq!(*row_sid, sid, "a click on the row focuses this tab");
+        assert!(
+            label.starts_with("\u{26a0} build: bash S=$PWD/tmp;"),
+            "`<tab title>: <kind> <command>`: {label}"
+        );
+        assert!(
+            posts[0].body.starts_with("build: bash "),
+            "{}",
+            posts[0].body
+        );
+        let rev = published(&app, sid).rev;
+
+        // The same box re-read: the ticking row moves the zone hash, so the
+        // sweep classifies it again — the same verdict, the same rev.
+        paint(&app, sid, &box_screen(2));
+        sweep(&mut app, t);
+        t += step;
+        assert_eq!(
+            published(&app, sid).rev,
+            rev,
+            "the same box is the same rev"
+        );
+        app.refresh_presence_session(sid, false);
+        assert!(take_posts().is_empty(), "no second notification");
+        assert_eq!(
+            app.presence.herald.last_quiet(),
+            Some(crate::status_item::HeraldQuiet::Same)
+        );
+        assert_eq!(app.operator_fleet_glance().warnings.len(), 1);
+
+        // The box is answered, and a NEW one comes up while the human is
+        // looking at this tab in the active app: listed, not announced.
+        paint(&app, sid, &busy_screen(9));
+        sweep(&mut app, t);
+        t += step;
+        assert!(app.operator_fleet_glance().warnings.is_empty(), "row gone");
+        looking_at(&app, &[sid]);
+        paint(&app, sid, &box_screen(3));
+        sweep(&mut app, t);
+        assert!(published(&app, sid).rev > rev, "a new transition");
+        assert!(take_posts().is_empty(), "the human is looking at it");
+        assert_eq!(
+            app.presence.herald.last_quiet(),
+            Some(crate::status_item::HeraldQuiet::Looking)
+        );
+        assert_eq!(app.operator_fleet_glance().warnings.len(), 1);
+
+        // NEGATIVE CONTROL: the same first transition in a headless instance
+        // reaches the published verdict and posts nothing.
+        let (mut headless, hsid) = app_with_stub();
+        assert!(headless.headless);
+        looking_at(&headless, &[]);
+        let mut t = Instant::now();
+        paint(&headless, hsid, &busy_screen(0));
+        sweep(&mut headless, t);
+        t += step;
+        paint(&headless, hsid, &box_screen(1));
+        sweep(&mut headless, t);
+        assert_eq!(published(&headless, hsid).word, "prompt");
+        assert!(take_posts().is_empty(), "headless never notifies");
+    }
+
+    /// A SUPERVISOR THAT DIES (review major): its `ttl=` claim lapses with a
+    /// box up and nothing writes — yet the human must hear. The presence
+    /// timer wakes at the expiry, removes the claim with a `meta-change
+    /// field=supervisor value=-` record (the `EVENT meta` push), and the box
+    /// posts exactly one notice. NEGATIVE CONTROL: while the claim is live the
+    /// same box posts nothing, and a tick before the expiry changes nothing.
+    #[test]
+    fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
+        let (mut app, sid) = app_with_stub();
+        app.headless = false;
+        let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
+        let _ = take_posts();
+        looking_at(&app, &[]);
+        let ttl = Duration::from_millis(120);
+        let now_us = crate::metrics::now_us();
+        assert_eq!(
+            crate::session_timeline::claim_supervisor(
+                &ctx,
+                "sup",
+                None,
+                Some(now_us + ttl.as_micros() as u64),
+                now_us
+            ),
+            Ok(true)
+        );
+        // The `meta set` arm's `Wake::MetaChanged` refresh.
+        app.refresh_presence_session(sid, false);
+        let step = Duration::from_millis(300);
+        let mut t = Instant::now();
+        paint(&app, sid, &busy_screen(0));
+        sweep(&mut app, t);
+        t += step;
+        paint(&app, sid, &box_screen(1));
+        sweep(&mut app, t);
+        assert_eq!(published(&app, sid).word, "prompt");
+        assert!(take_posts().is_empty(), "NEGATIVE CONTROL: supervised");
+        let deadline = app.presence_deadline(Instant::now()).expect("armed");
+        assert!(deadline <= Instant::now() + ttl + Duration::from_millis(5));
+        let _ = app.presence_tick(Instant::now());
+        assert!(take_posts().is_empty(), "NEGATIVE CONTROL: not lapsed yet");
+
+        std::thread::sleep(ttl + Duration::from_millis(10));
+        let _ = app.presence_tick(Instant::now());
+        let posts = take_posts();
+        assert_eq!(posts.len(), 1, "exactly one notice: {posts:?}");
+        assert_eq!(posts[0].session, sid);
+        let meta_events: Vec<String> = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == "meta-change")
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(
+            meta_events.last().map(String::as_str),
+            Some("field=supervisor value=-"),
+            "{meta_events:?}"
+        );
+        assert!(ctx.meta.lock().unwrap().supervisor_expiry().is_none());
+        let _ = app.presence_tick(Instant::now());
+        assert!(take_posts().is_empty(), "announced once");
     }
 }

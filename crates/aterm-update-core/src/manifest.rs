@@ -112,6 +112,22 @@ pub struct Manifest {
     /// downloaded bytes against, so the client falls back to the DMG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zip_sha256: Option<String>,
+    /// Native Linux raw ELF assets. Each target's name/digest/size is an atomic
+    /// declaration: partial declarations are refused, not treated as absent.
+    /// Names are bound to this manifest's version; URLs are derived from the
+    /// authenticated release source/tag, never supplied by this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_x86_64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_x86_64_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_x86_64_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_aarch64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_aarch64_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_aarch64_size: Option<u64>,
     /// The INTEL batteries-included DMG's asset name within the same release,
     /// e.g. `"aterm-0.47.0-x86_64.dmg"` — the same signed, notarized universal
     /// app with the toolchain seed filtered to `x86_64-apple-darwin` artifacts.
@@ -194,6 +210,27 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Select a native target only when all its signed identity fields agree.
+    /// `None` means this release does NOT ship that target, not "up to date".
+    pub fn linux_artifact(
+        &self,
+        target: crate::linux::LinuxTarget,
+    ) -> Result<Option<crate::linux::LinuxArtifact<'_>>, String> {
+        let (name, digest, size) = match target {
+            crate::linux::LinuxTarget::X86_64 => (
+                self.linux_x86_64.as_deref(),
+                self.linux_x86_64_sha256.as_deref(),
+                self.linux_x86_64_size,
+            ),
+            crate::linux::LinuxTarget::Aarch64 => (
+                self.linux_aarch64.as_deref(),
+                self.linux_aarch64_sha256.as_deref(),
+                self.linux_aarch64_size,
+            ),
+        };
+        crate::linux::artifact(target, &self.version, name, digest, size)
+    }
+
     /// Parse a manifest from TOML text, rejecting a schema this build is too old
     /// to understand.
     // Skip: the serde derive dispatches into pinned `toml 0.8`'s
@@ -229,6 +266,8 @@ impl Manifest {
                 self.build_number
             ));
         }
+        self.linux_artifact(crate::linux::LinuxTarget::X86_64)?;
+        self.linux_artifact(crate::linux::LinuxTarget::Aarch64)?;
         Ok(())
     }
 
@@ -308,6 +347,12 @@ mod tests {
             ),
             dmg_x86_64: None,
             dmg_x86_64_sha256: None,
+            linux_x86_64: None,
+            linux_x86_64_sha256: None,
+            linux_x86_64_size: None,
+            linux_aarch64: None,
+            linux_aarch64_sha256: None,
+            linux_aarch64_size: None,
             min_os: Some("11.0".into()),
             team_id: Some(String::new()),
             pub_date: Some("2026-07-06T21:29:44Z".into()),
@@ -317,6 +362,89 @@ mod tests {
             changelog: Some(
                 "### Added\n- a `thing` with \"quotes\", # hashes and a \\ backslash\n".into(),
             ),
+        }
+    }
+
+    fn linux_manifest() -> Manifest {
+        let mut m = full();
+        m.version = "0.86.0".into();
+        m.dmg = "aterm-0.86.0.dmg".into();
+        m.linux_aarch64 = Some("aterm-0.86.0-linux-aarch64".into());
+        m.linux_aarch64_sha256 = Some("ab".repeat(32));
+        m.linux_aarch64_size = Some(33_000_000);
+        m
+    }
+
+    #[test]
+    fn linux_entries_round_trip_and_select_only_the_declared_target() {
+        use crate::linux::LinuxTarget;
+        let mut m = linux_manifest();
+        let aarch64 = m.linux_artifact(LinuxTarget::Aarch64).unwrap().unwrap();
+        assert_eq!(aarch64.name, "aterm-0.86.0-linux-aarch64");
+        assert_eq!(aarch64.size, 33_000_000);
+        assert_eq!(aarch64.sha256, "ab".repeat(32));
+        assert_eq!(m.linux_artifact(LinuxTarget::X86_64).unwrap(), None);
+        assert_eq!(Manifest::parse(&m.to_toml().unwrap()).unwrap(), m);
+        m.linux_x86_64 = Some("aterm-0.86.0-linux-x86_64".into());
+        m.linux_x86_64_sha256 = Some("cd".repeat(32));
+        m.linux_x86_64_size = Some(34_000_000);
+        let text = m.to_toml().unwrap();
+        assert_eq!(Manifest::parse(&text).unwrap(), m);
+        assert_eq!(
+            m.linux_artifact(LinuxTarget::X86_64).unwrap().unwrap().size,
+            34_000_000
+        );
+        assert!(text.contains("changelog = '''\n"));
+    }
+
+    #[test]
+    fn every_partial_linux_entry_fails_closed_on_parse_and_emit() {
+        for fields in 1_u8..7 {
+            let mut m = linux_manifest();
+            if fields & 1 == 0 {
+                m.linux_aarch64 = None;
+            }
+            if fields & 2 == 0 {
+                m.linux_aarch64_sha256 = None;
+            }
+            if fields & 4 == 0 {
+                m.linux_aarch64_size = None;
+            }
+            assert!(m.to_toml().is_err(), "partial mask {fields}");
+            // Bypass the validating emitter only to exercise an invalid wire input.
+            let wire = aterm_toml::to_string(&m).unwrap();
+            assert!(Manifest::parse(&wire).is_err(), "partial mask {fields}");
+        }
+    }
+
+    #[test]
+    fn linux_identity_digest_size_and_legacy_version_mutants_are_rejected() {
+        for name in [
+            "aterm-0.85.0-linux-aarch64",
+            "aterm-0.86.0-linux-x86_64",
+            "aterm-0.86.0-linux-aarch64.tar.gz",
+            "../aterm-0.86.0-linux-aarch64",
+            "https://example.invalid/aterm",
+        ] {
+            let mut m = linux_manifest();
+            m.linux_aarch64 = Some(name.into());
+            assert!(m.to_toml().is_err(), "{name}");
+        }
+        for digest in ["".into(), "AB".repeat(32), "xy".repeat(32), "ab".repeat(31)] {
+            let mut m = linux_manifest();
+            m.linux_aarch64_sha256 = Some(digest);
+            assert!(m.to_toml().is_err());
+        }
+        for size in [0, 63, crate::linux::LINUX_BINARY_MAX_BYTES + 1, u64::MAX] {
+            let mut m = linux_manifest();
+            m.linux_aarch64_size = Some(size);
+            assert!(m.to_toml().is_err(), "size {size}");
+        }
+        for version in ["0.86", "0.086.0", "0.86.0+gabc", "0.86.0/../1"] {
+            let mut m = linux_manifest();
+            m.version = version.into();
+            m.linux_aarch64 = Some(crate::linux::LinuxTarget::Aarch64.asset_name(version));
+            assert!(m.to_toml().is_err(), "version {version}");
         }
     }
 
@@ -403,6 +531,12 @@ mod tests {
             zip_sha256: None,
             dmg_x86_64: None,
             dmg_x86_64_sha256: None,
+            linux_x86_64: None,
+            linux_x86_64_sha256: None,
+            linux_x86_64_size: None,
+            linux_aarch64: None,
+            linux_aarch64_sha256: None,
+            linux_aarch64_size: None,
             min_os: None,
             team_id: None,
             pub_date: None,
@@ -418,6 +552,8 @@ mod tests {
             "url",
             "zip",
             "zip_sha256",
+            "linux_x86_64",
+            "linux_aarch64",
             "dmg_x86_64",
             "dmg_x86_64_sha256",
             "min_os",

@@ -628,35 +628,25 @@ pub(crate) fn config_semantic_warnings(
                 warnings.push(ConfigSemanticWarning {
                     key,
                     message: format!(
-                        "{key} value {value:?} is not a safe GitHub slug and is ignored; a valid environment value or the compiled default is used"
+                        "{key} value {value:?} is not a safe GitHub slug and is ignored; the compiled default is used"
                     ),
                 });
             }
         }
     }
 
-    if let Some(packages) = config.packages.as_ref() {
-        if let Some(account) = packages.account.as_deref()
-            && !aterm_update_core::is_valid_slug(account.trim())
-        {
-            warnings.push(ConfigSemanticWarning {
-                key: "packages.account",
-                message: format!(
-                    "packages.account value {account:?} is not a safe GitHub owner slug and is ignored; atpkg uses its next valid precedence fallback"
-                ),
-            });
-        }
-        if packages
-            .channel
-            .as_deref()
-            .is_some_and(|channel| channel.trim().is_empty())
-        {
-            warnings.push(ConfigSemanticWarning {
-                key: "packages.channel",
-                message: "packages.channel is blank and is treated as unset; atpkg uses the stable channel"
-                    .to_string(),
-            });
-        }
+    if let Some(account) = config
+        .packages
+        .as_ref()
+        .and_then(|packages| packages.account.as_deref())
+        && !aterm_update_core::is_valid_slug(account.trim())
+    {
+        warnings.push(ConfigSemanticWarning {
+            key: "packages.account",
+            message: format!(
+                "packages.account value {account:?} is not a safe GitHub owner slug and is ignored; atpkg uses the compiled index account"
+            ),
+        });
     }
     if let Some(privacy) = config.privacy.as_ref() {
         // RESERVED AND UNIMPLEMENTED, said out loud. aterm has no supported way
@@ -1175,10 +1165,6 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
         "net.listen",
         "net.cert",
         "net.key",
-        "update.owner",
-        "update.repo",
-        "update.auto_apply",
-        "packages.account",
     ] {
         if config_key_is_authored(config, key)
             && let Some(active) = crate::app_config::active_environment_override(key)
@@ -1402,16 +1388,13 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
         }
     }
 
-    let package_disabled = std::env::var_os("ATPKG_DISABLE").is_some();
-    // The compiled anchor is the ONLY anchor. `ATPKG_ROOTKEY_OVERRIDE` used to be
-    // consulted here and could enable an unpinned build; it is gone, because an
-    // environment variable must never decide what is trusted.
+    // The compiled anchor is the ONLY anchor, and the only input. `ATPKG_ROOTKEY_OVERRIDE`
+    // used to be consulted here and could enable an unpinned build; it is gone, because
+    // an environment variable must never decide what is trusted — and the
+    // `ATPKG_DISABLE` kill switch went too (2026-09-23): `[packages] enabled` is the
+    // machine's switch, a setting.
     let package_root_available = !atpkg::PINNED_PKG_ROOTKEY.is_empty();
-    warnings.extend(package_capability_warnings(
-        config,
-        package_disabled,
-        package_root_available,
-    ));
+    warnings.extend(package_capability_warnings(config, package_root_available));
     warnings.extend(config_backend_capability_warnings(
         config,
         backend_gpu,
@@ -1710,12 +1693,10 @@ fn first_authored_package_key(config: &crate::app_config::Config) -> Option<&'st
         Some("packages.auto_update")
     } else if packages.auto_install.is_some() {
         Some("packages.auto_install")
+    } else if packages.seed_install.is_some() {
+        Some("packages.seed_install")
     } else if packages.account.is_some() {
         Some("packages.account")
-    } else if packages.channel.is_some() {
-        Some("packages.channel")
-    } else if packages.include.is_some() {
-        Some("packages.include")
     } else if packages.exclude.is_some() {
         Some("packages.exclude")
     } else {
@@ -1723,24 +1704,17 @@ fn first_authored_package_key(config: &crate::app_config::Config) -> Option<&'st
     }
 }
 
-/// Pure atpkg admission projection. The package preferences remain parseable
-/// while disabled, but no package operation may act without both operator
-/// opt-in and a verification root.
+/// Pure atpkg admission projection. The package preferences remain parseable in an
+/// unpinned build, but no package operation may act without a verification root.
 fn package_capability_warnings(
     config: &crate::app_config::Config,
-    disabled: bool,
     root_available: bool,
 ) -> Vec<ConfigSemanticWarning> {
     let Some(key) = first_authored_package_key(config) else {
         return Vec::new();
     };
-    let reason = if disabled {
-        Some("$ATPKG_DISABLE is set")
-    } else if !root_available {
-        Some("no package verification root is pinned in this build")
-    } else {
-        None
-    };
+    let reason =
+        (!root_available).then_some("no package verification root is pinned in this build");
     reason.map_or_else(Vec::new, |reason| {
         vec![ConfigSemanticWarning {
             key,
@@ -1760,6 +1734,11 @@ fn package_capability_warnings(
 pub(crate) enum ConfigCapabilityPlatform {
     MacOs,
     Windows,
+    /// Linux: [`Self::Unsupported`] for every desktop capability below but one — it
+    /// has a native updater (`aterm_update::enabled`), which reads the `[update]` keys
+    /// (`enabled` gates its background checker once per process, `auto_apply` each
+    /// replacement on disk), so they earn no "no effect here" warning there.
+    Linux,
     Unsupported,
 }
 
@@ -1768,8 +1747,16 @@ impl ConfigCapabilityPlatform {
     const CURRENT: Self = Self::MacOs;
     #[cfg(windows)]
     const CURRENT: Self = Self::Windows;
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    #[cfg(target_os = "linux")]
+    const CURRENT: Self = Self::Linux;
+    #[cfg(all(not(target_os = "macos"), not(windows), not(target_os = "linux")))]
     const CURRENT: Self = Self::Unsupported;
+
+    /// Whether a native updater reads `[update]` here: macOS and Linux
+    /// (`aterm_update::enabled`).
+    const fn has_native_updater(self) -> bool {
+        matches!(self, Self::MacOs | Self::Linux)
+    }
 }
 
 /// Deterministic capability half of host validation. `platform` is an explicit
@@ -1811,7 +1798,7 @@ pub(crate) fn config_backend_capability_warnings(
         .unwrap_or(BackgroundMaterial::None);
     if material != BackgroundMaterial::None {
         let issue = match platform {
-            ConfigCapabilityPlatform::Unsupported => Some((
+            ConfigCapabilityPlatform::Unsupported | ConfigCapabilityPlatform::Linux => Some((
                 "this platform has no native window-material consumer",
                 "it is supported only by the macOS and Windows GPU renderers",
             )),
@@ -1943,7 +1930,10 @@ pub(crate) fn config_backend_capability_warnings(
             }
         }
     }
-    if platform == ConfigCapabilityPlatform::Unsupported {
+    if matches!(
+        platform,
+        ConfigCapabilityPlatform::Unsupported | ConfigCapabilityPlatform::Linux
+    ) {
         // `confirm_multiline_paste` has NO warning here any more: it is live on
         // every platform — the macOS sheet, the Windows MessageBoxW, and the
         // Linux in-window `paste_banner` (the clipboard sweep closed the
@@ -1967,10 +1957,11 @@ pub(crate) fn config_backend_capability_warnings(
             });
         }
     }
-    if platform != ConfigCapabilityPlatform::MacOs
+    if !platform.has_native_updater()
         && let Some(update) = config.update.as_ref()
     {
         for (key, authored) in [
+            ("update.enabled", update.enabled.is_some()),
             ("update.owner", update.owner.is_some()),
             ("update.repo", update.repo.is_some()),
             ("update.auto_apply", update.auto_apply.is_some()),
@@ -1979,7 +1970,7 @@ pub(crate) fn config_backend_capability_warnings(
                 warnings.push(ConfigSemanticWarning {
                     key,
                     message: format!(
-                        "{key} is parsed and preserved but has no effect on this platform because the in-app updater is macOS-only"
+                        "{key} is parsed and preserved but has no effect on this platform because the native updater runs only on macOS and Linux"
                     ),
                 });
             }
@@ -2100,22 +2091,6 @@ fn config_key_is_authored(config: &crate::app_config::Config, key: &str) -> bool
         "net.listen" => config.net.as_ref().is_some_and(|net| net.listen.is_some()),
         "net.cert" => config.net.as_ref().is_some_and(|net| net.cert.is_some()),
         "net.key" => config.net.as_ref().is_some_and(|net| net.key.is_some()),
-        "update.owner" => config
-            .update
-            .as_ref()
-            .is_some_and(|update| update.owner.is_some()),
-        "update.repo" => config
-            .update
-            .as_ref()
-            .is_some_and(|update| update.repo.is_some()),
-        "update.auto_apply" => config
-            .update
-            .as_ref()
-            .is_some_and(|update| update.auto_apply.is_some()),
-        "packages.account" => config
-            .packages
-            .as_ref()
-            .is_some_and(|packages| packages.account.is_some()),
         _ => false,
     }
 }
@@ -2626,14 +2601,20 @@ mod tests {
                 "window_colorspace",
             ])
         );
-        assert_eq!(
-            keys(true, ConfigCapabilityPlatform::Unsupported),
-            std::collections::BTreeSet::from([
-                "background_material",
-                "background_opacity",
-                "window_colorspace",
-            ])
-        );
+        for platform in [
+            ConfigCapabilityPlatform::Linux,
+            ConfigCapabilityPlatform::Unsupported,
+        ] {
+            assert_eq!(
+                keys(true, platform),
+                std::collections::BTreeSet::from([
+                    "background_material",
+                    "background_opacity",
+                    "window_colorspace",
+                ]),
+                "{platform:?}"
+            );
+        }
 
         let opaque = parsed("background_material = \"sidebar\"\n");
         assert_eq!(
@@ -2647,15 +2628,23 @@ mod tests {
         );
 
         let platform_only = parsed(
-            "font_thicken = true\nsecure_keyboard_entry = true\n[update]\nowner = \"safe-owner\"\nrepo = \"aterm\"\nauto_apply = true\n",
+            "font_thicken = true\nsecure_keyboard_entry = true\n[update]\nenabled = false\nowner = \"safe-owner\"\nrepo = \"aterm\"\nauto_apply = true\n",
         );
-        let non_macos = config_backend_capability_warnings(
+        let platform_keys = |platform| {
+            config_backend_capability_warnings(&platform_only, true, platform)
+                .into_iter()
+                .map(|warning| warning.key)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        // Where no native updater runs, every authored `[update]` key is inert, and the
+        // warning does not call the updater macOS-only (Linux has one too).
+        let non_updater = config_backend_capability_warnings(
             &platform_only,
             true,
             ConfigCapabilityPlatform::Unsupported,
         );
         assert_eq!(
-            non_macos
+            non_updater
                 .iter()
                 .map(|warning| warning.key)
                 .collect::<std::collections::BTreeSet<_>>(),
@@ -2663,9 +2652,24 @@ mod tests {
                 "font_thicken",
                 "secure_keyboard_entry",
                 "update.auto_apply",
+                "update.enabled",
                 "update.owner",
                 "update.repo",
             ])
+        );
+        assert!(
+            non_updater
+                .iter()
+                .filter(|warning| warning.key.starts_with("update."))
+                .all(|warning| warning.message.contains("only on macOS and Linux")),
+            "{non_updater:?}"
+        );
+        // Linux's native updater reads `[update]` (`enabled` gates its background
+        // checker once per process, `auto_apply` each replacement), so no `[update]`
+        // key is called inert there; the macOS-only desktop keys still are.
+        assert_eq!(
+            platform_keys(ConfigCapabilityPlatform::Linux),
+            std::collections::BTreeSet::from(["font_thicken", "secure_keyboard_entry"])
         );
         assert!(
             config_backend_capability_warnings(
@@ -2697,14 +2701,20 @@ mod tests {
         // `confirm_multiline_paste` is deliberately absent: the confirm is
         // live on every platform (Linux's in-window paste_banner included),
         // so warning that it "has no protective effect" would be the lie.
-        assert_eq!(
-            keys(ConfigCapabilityPlatform::Unsupported),
-            std::collections::BTreeSet::from([
-                "allow_notifications",
-                "trail_sound_volume",
-                "trail_sounds",
-            ])
-        );
+        for platform in [
+            ConfigCapabilityPlatform::Linux,
+            ConfigCapabilityPlatform::Unsupported,
+        ] {
+            assert_eq!(
+                keys(platform),
+                std::collections::BTreeSet::from([
+                    "allow_notifications",
+                    "trail_sound_volume",
+                    "trail_sounds",
+                ]),
+                "{platform:?}"
+            );
+        }
     }
 
     #[test]
@@ -2720,7 +2730,6 @@ repo = "bad/repo"
 
 [packages]
 account = "bad/account"
-channel = "   "
 
 [matrix_rain]
 hue = "blue"
@@ -2742,7 +2751,6 @@ palette = ["#112233", "not-a-color"]
             "update.owner",
             "update.repo",
             "packages.account",
-            "packages.channel is blank",
             "matrix_rain.hue",
             "sparkle_words.profanity.palette[1]",
         ] {
@@ -2758,7 +2766,6 @@ owner = "safe-owner"
 repo = "safe.repo"
 [packages]
 account = "safe_owner"
-channel = "stable"
 [matrix_rain]
 hue = "#12ABef"
 [sparkle_words.profanity]
@@ -2914,14 +2921,15 @@ expect_nonce = "launch-pin"
         assert_eq!(nested.len(), 1);
         assert!(nested[0].message.contains("never binds in an aterm child"));
 
-        let packages = parsed("[packages]\nauto_update = true\n");
-        let disabled = package_capability_warnings(&packages, true, true);
-        assert_eq!(disabled.len(), 1);
-        assert!(disabled[0].message.contains("$ATPKG_DISABLE"));
-        let rootless = package_capability_warnings(&packages, false, false);
+        let packages = parsed("[packages]\nenabled = true\n");
+        let rootless = package_capability_warnings(&packages, false);
         assert_eq!(rootless.len(), 1);
         assert!(rootless[0].message.contains("verification root"));
-        assert!(package_capability_warnings(&packages, false, true).is_empty());
+        assert!(
+            !rootless[0].message.contains("ATPKG_"),
+            "no environment switch is named"
+        );
+        assert!(package_capability_warnings(&packages, true).is_empty());
     }
 
     /// Every `[privacy]` key this build refuses or ignores says so, once, in the

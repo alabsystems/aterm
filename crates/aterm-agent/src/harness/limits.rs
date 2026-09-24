@@ -89,11 +89,12 @@
 //! (`harness_failure_recovery_model`, Tier-0 by the in-process interpreter and
 //! by `ty` where installed) and a Tier-1 bind in
 //! `aterm-agent/tests/conformance_harness.rs` that drives this engine and
-//! checks each transition against it. This module is REACHED from the front
-//! door as of 2026-09-22 — `aterm harness limits` prints [`classify`]'s
-//! verdict, `harness recover` runs one class's table or one step through the
-//! guarded path, and [`super::watch`] drives [`step`] on the loop — which
-//! corrects the line that stood here saying nothing was wired into a verb.
+//! checks each transition against it. `aterm harness limits` prints
+//! [`classify`]'s verdict over a session's screen. Since 2026-09-23 NOTHING
+//! drives [`step`] in production: `harness recover` and the `harness watch`
+//! loop that ran the ladder were deleted with the second harness stack
+//! (design §0.4), and the one engine's turn-end policy
+//! (`crate::supervise::policy::turn_end`) decides walls instead.
 //! What is NOT reached: no control-socket verb answers any of it (design
 //! §5.7), and nothing here has ever run against a REAL limit — the ladder is
 //! exercised against fixtures and a fake wire only (design §10.1, the P2
@@ -500,13 +501,37 @@ fn stop_failure_class(
 ///
 /// EVERY NEEDLE IS A PHRASE, not a word. Tightened 2026-09-22: the table held
 /// `weekly`, `billing`, `on hold`, `verification` and `authentication` as
-/// bare substrings, and a class minted here short-circuits
-/// [`super::watch::classify_liveness`] — so one ordinary English word on the
-/// screen turned the stall ladder off for the class's lifetime. A phrase is
-/// the smallest change that keeps the design's literal column readable while
-/// making an accidental match improbable; the row-placement fence in
-/// [`super::observe`] is the other half, and neither alone is enough.
+/// bare substrings, and a class minted here short-circuited the deleted
+/// `harness watch` loop's liveness classifier — so one ordinary English word
+/// on the screen turned the stall ladder off for the class's lifetime. A
+/// phrase is the smallest change that keeps the design's literal column
+/// readable while making an accidental match improbable; the row-placement
+/// fence in the deleted observer was the other half.
 pub fn banner_class(text: &str) -> Option<Class> {
+    // aterm-phase's wall table decides every notice it places: this module
+    // maps its kind and keeps needles only for what that table does not
+    // read (a network failure, a storm marker, the older spellings). Two
+    // tables answered `Out of usage credits` and `You've hit your limit ·
+    // resets 3pm` differently — `harness limits` and `status agent=` read
+    // the same screen two ways (the laws review of 2026-09-24).
+    if let Some(kind) = aterm_phase::classify_wall(text) {
+        use aterm_phase::WallKind;
+        return match kind {
+            WallKind::UsageSession => Some(Class::Session5hLimit),
+            WallKind::UsageWeekly => Some(Class::Weekly7dLimit),
+            WallKind::ModelBucket { .. } => Some(Class::ModelBucketLimit),
+            WallKind::Spend => Some(Class::SpendBilling),
+            WallKind::Auth => Some(Class::Auth),
+            WallKind::Overloaded
+            | WallKind::ApiError {
+                retryable: true, ..
+            } => Some(Class::TransientCapacity),
+            // A full context is no limit; a non-retryable API error is the
+            // fail-closed class.
+            WallKind::Context => None,
+            WallKind::ApiError { .. } => Some(Class::Unknown),
+        };
+    }
     let t = text.to_ascii_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
     if has(&[

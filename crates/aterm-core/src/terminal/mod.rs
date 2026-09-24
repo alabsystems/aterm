@@ -127,7 +127,10 @@ pub use callbacks::{
 };
 #[cfg(feature = "serde")]
 pub use checkpoint::CheckpointMeta;
-pub use checkpoint::{GridCursorRepr, HostBindings, StyleRepr, TerminalCheckpoint};
+pub use checkpoint::{
+    GridCursorRepr, HostBindings, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr,
+    TerminalCheckpoint,
+};
 pub use custody::CustodyTransition;
 pub use mode_mirror::ModeMirror;
 // The injected-clock seam, re-exported so an out-of-crate replay/lash harness

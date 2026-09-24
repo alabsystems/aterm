@@ -13,14 +13,18 @@
 //! noticed.
 //!
 //! This is the one vocabulary. [`Source`] names every input the harness reads
-//! a fact from; [`SourceSet`] is a set of them, for a fact that came from more
-//! than one read at once. Each POSITION admits a subset — a window figure is
-//! never a `StopFailure`, an event's reads are never a `Cache` — and the
-//! producer for that position is what enforces it; nothing here pretends
-//! every variant is admissible everywhere. What IS shared is the spelling:
-//! one [`Source::as_str`], so `harness status`, `harness usage --json`,
-//! `harness limits --json` and an observe event all print the same word for
-//! the same input.
+//! a fact from. Each POSITION admits a subset — a window figure is never a
+//! `StopFailure` — and the producer for that position is what enforces it;
+//! nothing here pretends every variant is admissible everywhere. What IS
+//! shared is the spelling: one [`Source::as_str`], so `harness usage --json`
+//! and `harness limits --json` print the same word for the same input.
+//!
+//! `SourceSet` (a bit-set of these, for an observe event read from more than
+//! one place) went with `harness::observe` on 2026-09-23: the grid spine it
+//! served was the second harness stack, deleted in favour of the one engine
+//! in `supervise`. The vendor HOOK variants stay because
+//! [`super::limits`]' pair rule still names them; since decision "B" nothing
+//! produces one.
 //!
 //! Two orderings live here and they point opposite ways, which is why both
 //! are named rather than folded:
@@ -32,11 +36,6 @@
 //!   aterm drew the frame, so the grid survives `--bare`, a user statusLine,
 //!   a hook rename and a program with no hooks at all, and it is rank 1.
 //!
-//! What is NOT here, deliberately: `align::Attestation`. That answers a
-//! different question — who ATTESTS a capability verdict, a signed row or a
-//! local run — and it was the fifth "source" only because it had been given
-//! the same name. Renaming it was the fix; merging it would have been a
-//! category error.
 
 use std::fmt;
 
@@ -197,97 +196,6 @@ impl fmt::Display for Source {
     }
 }
 
-/// A SET of sources: what one fact was read from, when it was read from more
-/// than one place at once.
-///
-/// An observe event is the case this exists for — a turn boundary can be
-/// carried by aterm's `status` and confirmed on the parsed grid, and the
-/// event says both rather than picking. It is a bit-set so an event is
-/// `Copy` and cheap; [`SourceSet::names`] is how it prints, in the fixed
-/// order of [`Source::ALL`], with the one vocabulary's words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SourceSet(u16);
-
-impl SourceSet {
-    /// The empty set: nothing was read.
-    pub const EMPTY: SourceSet = SourceSet(0);
-
-    /// The bit for one source. [`Source::None`] is the ABSENCE and has no
-    /// bit, so `SourceSet::just(Source::None)` is empty — which is what it
-    /// means.
-    const fn bit(s: Source) -> u16 {
-        match s {
-            Source::None => 0,
-            Source::Status => 1 << 0,
-            Source::Grid => 1 << 1,
-            Source::Offscreen => 1 << 2,
-            Source::Search => 1 << 3,
-            Source::Hook => 1 << 4,
-            Source::StopFailure => 1 << 5,
-            Source::Notification => 1 << 6,
-            Source::PostModelSwitch => 1 << 7,
-            Source::StatusLine => 1 << 8,
-            Source::Cache => 1 << 9,
-            Source::Transcript => 1 << 10,
-            Source::TranscriptNewest => 1 << 11,
-        }
-    }
-
-    /// The set holding exactly one source.
-    #[must_use]
-    pub const fn just(s: Source) -> SourceSet {
-        SourceSet(SourceSet::bit(s))
-    }
-
-    /// This set with `s` added.
-    #[must_use]
-    pub const fn with(self, s: Source) -> SourceSet {
-        SourceSet(self.0 | SourceSet::bit(s))
-    }
-
-    /// This set with every member of `other` added.
-    #[must_use]
-    pub const fn union(self, other: SourceSet) -> SourceSet {
-        SourceSet(self.0 | other.0)
-    }
-
-    /// Whether `s` is in this set. [`Source::None`] is in no set.
-    #[must_use]
-    pub const fn has(self, s: Source) -> bool {
-        let bit = SourceSet::bit(s);
-        bit != 0 && self.0 & bit == bit
-    }
-
-    /// Whether every member of `other` is in this set. The empty set is in
-    /// no set, so `has_all(EMPTY)` is `false` — "nothing" is never a fact
-    /// this set carries.
-    #[must_use]
-    pub const fn has_all(self, other: SourceSet) -> bool {
-        other.0 != 0 && self.0 & other.0 == other.0
-    }
-
-    /// Whether the set is empty.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    /// The members, in the fixed order of [`Source::ALL`].
-    #[must_use]
-    pub fn members(self) -> Vec<Source> {
-        Source::ALL
-            .into_iter()
-            .filter(|s| self.has(*s))
-            .collect::<Vec<_>>()
-    }
-
-    /// The source words, in the fixed order of [`Source::ALL`].
-    #[must_use]
-    pub fn names(self) -> Vec<&'static str> {
-        self.members().into_iter().map(Source::as_str).collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,33 +263,5 @@ mod tests {
             Source::StopFailure.channel(),
             Source::Notification.channel()
         );
-    }
-
-    #[test]
-    fn the_set_is_a_set_and_the_absence_is_in_none_of_them() {
-        let both = SourceSet::just(Source::Status).with(Source::Grid);
-        assert_eq!(both.names(), vec!["status", "grid"]);
-        assert!(both.has(Source::Status) && both.has(Source::Grid));
-        assert!(!both.has(Source::Search));
-        assert!(both.has_all(SourceSet::just(Source::Grid)));
-        assert!(!both.has_all(both.with(Source::Search)));
-        // Idempotent, and order does not matter.
-        assert_eq!(both.with(Source::Grid), both);
-        assert_eq!(
-            SourceSet::just(Source::Grid).with(Source::Status),
-            both,
-            "the names are ordered by ALL, not by insertion"
-        );
-        // NEGATIVE CONTROLS: the absence is not a member, and the empty set
-        // is in no set.
-        assert!(SourceSet::just(Source::None).is_empty());
-        assert!(!both.has(Source::None));
-        assert!(!both.has_all(SourceSet::EMPTY));
-        assert!(SourceSet::EMPTY.names().is_empty());
-        // Every source that can be a member has its own bit.
-        let all = Source::ALL
-            .into_iter()
-            .fold(SourceSet::EMPTY, SourceSet::with);
-        assert_eq!(all.members().len(), Source::ALL.len() - 1, "all but None");
     }
 }

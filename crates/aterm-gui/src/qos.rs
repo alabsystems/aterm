@@ -386,6 +386,10 @@ mod tests {
             "unclassified: lists the bundles claiming this app's identifier",
         ),
         (
+            "aterm-claimant-retire",
+            "unclassified: moves conflicting copies of the app to the Trash on the owner's press",
+        ),
+        (
             "aterm-consent-probe",
             "unclassified: probes macOS full-disk-access consent",
         ),

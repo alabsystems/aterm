@@ -92,8 +92,8 @@
 //!    (`$XDG_RUNTIME_DIR/aterm`, else `~/Library/Application Support/aterm`),
 //!    0600: fleet, broker, node, cap file, state dir and the bridge command.
 //!    `aterm link ls` defaults its `--fleet --broker --cap-file
-//!    --state` from it, `aterm link mirror` its `--sock`, and `aterm fabric`
-//!    reads its command when aterm.toml has none.
+//!    --state` from it, and `aterm fabric` reads its command when aterm.toml
+//!    has none.
 //! 9. Every running instance `aterm ctl instances` lists is armed with
 //!    `fabric attach <argv>` — the argv, because `[fabric] command` is recorded
 //!    once, at launch, and a bare attach on an instance launched before step 7
@@ -1039,7 +1039,7 @@ impl Rendezvous {
         }
         format!(
             "# Written by `aterm fabric on` — where this machine's fabric is. `aterm link\n\
-             # ls|mirror` and `aterm fabric` read it when their flags are omitted;\n\
+             # ls` and `aterm fabric` read it when their flags are omitted;\n\
              # `aterm fabric off` removes it. Not the source of truth: aterm launches its\n\
              # bridge from `[fabric] command` in aterm.toml, which `command` below mirrors.\n\
              fleet = {}\n\
@@ -1189,25 +1189,6 @@ pub fn fill_defaults(args: &[String], r: &Rendezvous) -> Vec<String> {
             out.push(key.clone());
         }
     }
-    out.extend_from_slice(args);
-    out
-}
-
-/// `args` with `--sock <dir>/aterm.sock` filled in for `mirror` when the
-/// rendezvous file exists and that socket does — the `latest` alias every
-/// flagless `aterm ctl` call dials.
-#[must_use]
-pub fn with_default_sock(args: &[String]) -> Vec<String> {
-    if args.iter().any(|a| a == "--sock") || !matches!(Rendezvous::read(), Ok(Some(_))) {
-        return args.to_vec();
-    }
-    let Some(sock) = aterm_uds::control_socket_dir().map(|d| d.join("aterm.sock")) else {
-        return args.to_vec();
-    };
-    if !sock.exists() {
-        return args.to_vec();
-    }
-    let mut out = vec!["--sock".to_string(), sock.to_string_lossy().into_owned()];
     out.extend_from_slice(args);
     out
 }
@@ -3592,29 +3573,21 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
     for (sid, node) in &ghosts {
         println!("  @{} on {}", safe(sid, 64), safe(node, 64));
     }
-    // A RUNNING BRIDGE REFUSES THE PUBLISH, NOT THE LISTING. The listing is
-    // the whole value of a dry run and costs nothing; it is the write that
-    // would race the bridge for this node's publish sequence.
+    // A RUNNING BRIDGE OWNS THE PUBLISH, SO IT IS ASKED TO DO IT. The listing
+    // is the whole value of a dry run and costs nothing either way.
     let bridge = running_bridge(&report.instances);
     if !yes && !confirmed() {
         if let Some(pid) = bridge {
             println!(
-                "  note: publishing is refused while the instance at pid {pid} hosts a \
-                 running bridge — see the fix below"
+                "  note: the instance at pid {pid} hosts a running bridge; `--yes` (or y) \
+                 asks that bridge to retire them through its own publish sequence"
             );
-            print_bridge_remedy(pid);
         }
         println!("  nothing published (dry). Re-run with --yes, or answer y.");
         return ExitCode::SUCCESS;
     }
     if let Some(pid) = bridge {
-        println!(
-            "  refused: the instance at pid {pid} hosts a running bridge. It owns this \
-             node's publish sequence, and a CLI that raced it for one would be deduped by \
-             the broker — a retire that says OK and appends nothing."
-        );
-        print_bridge_remedy(pid);
-        return ExitCode::from(2);
+        return retire_through_bridge(&report, pid, &ghosts);
     }
     match fabric::publish_exited(&report, &ghosts) {
         Ok(n) => {
@@ -3628,20 +3601,90 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
     }
 }
 
-/// The remedy that actually works.
+/// THE BRIDGE-UP PATH: ask the instance at `pid` — over its Owner token, on a
+/// connection of its own — to retire the rows through its bridge (`fabric
+/// retire <sid>…`), then read the bus back until every row says `exited` or
+/// [`RETIRE_WAIT`] is up. The CLI writes no sequence: the bridge publishes
+/// under its own, which is what makes the two safe together. A row still live
+/// at the deadline is REPORTED, not concluded: the request is queued at the
+/// bridge and may still land, or the bridge refused it (a sibling instance
+/// hosts the session; the node could not be asked) and said so on the bus.
 ///
-/// NOT `aterm fabric off`: that boots the broker out, removes `[fabric]` and
-/// the rendezvous file, and leaves the running instance's bridge up until it
-/// is relaunched — so a re-run is refused again, and once the instance IS
-/// relaunched `gather()` finds no command and exits 2. The bridge belongs to
-/// an instance; quitting that instance is what releases the sequence, and the
-/// broker is a separate process that keeps running and keeps the log.
-fn print_bridge_remedy(pid: u32) {
-    println!("  fix: quit the aterm instance at pid {pid} (the broker keeps running and");
-    println!("       keeps the log), re-run this command, then relaunch the instance.");
-    println!("       Do NOT use `aterm fabric off`: it removes the fabric config and the");
-    println!("       rendezvous file, and the bridge stays up until the instance exits.");
+/// An instance from 0.91.0 or earlier answers `ERR usage` to the verb; that is
+/// reported with the one remedy that works, and nothing is published.
+fn retire_through_bridge(
+    report: &fabric::Report,
+    pid: u32,
+    ghosts: &[(String, String)],
+) -> ExitCode {
+    let Some(instance) = report.instances.iter().find(|i| i.pid == pid) else {
+        println!("  could not find the instance at pid {pid} in the report");
+        return ExitCode::from(2);
+    };
+    let sids: Vec<&str> = ghosts.iter().map(|(sid, _)| sid.as_str()).collect();
+    let reply = (|| -> Result<String, String> {
+        let token = aterm_ctl::instance_token(&instance.sock).map_err(|e| e.to_string())?;
+        let mut ctl =
+            crate::ctl::Ctl::connect(&instance.sock, &token).map_err(|e| e.to_string())?;
+        let reply = ctl
+            .request(&format!("fabric retire {}", sids.join(" ")))
+            .map_err(|e| e.to_string())?;
+        Ok(reply.header().to_string())
+    })();
+    let header = match reply {
+        Ok(h) => h,
+        Err(e) => {
+            println!("  could not ask the instance at pid {pid}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if !header.starts_with("OK") {
+        println!(
+            "  the instance at pid {pid} answered: {}",
+            safe(&header, 160)
+        );
+        if header.starts_with("ERR usage") {
+            println!("  its bridge predates `fabric retire` (0.91.0 or earlier): quit that instance, re-run");
+            println!("  this command (it then publishes itself), and relaunch the instance.");
+        }
+        return ExitCode::from(2);
+    }
+    println!("  asked the bridge at pid {pid}: {}", safe(&header, 80));
+    let mut done = 0;
+    let deadline = std::time::Instant::now() + RETIRE_WAIT;
+    let mut pending: Vec<&str> = sids.clone();
+    while !pending.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let Ok(rows) = fabric::presence_states(report, &pending) else {
+            continue;
+        };
+        pending.retain(|sid| {
+            let retired = rows.get(*sid).is_some_and(|s| s == "exited");
+            if retired {
+                done += 1;
+            }
+            !retired
+        });
+    }
+    for sid in &pending {
+        println!(
+            "  @{} still reads live after {:?}: the request is queued at the bridge and may \
+             still land, or the bridge refused it — `aterm fabric tail` shows \
+             `presence-retired` or `presence-retire-refused` for it",
+            safe(sid, 64),
+            RETIRE_WAIT
+        );
+    }
+    println!("  published `exited` for {done} row(s) through the bridge");
+    if pending.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    }
 }
+
+/// How long the bridge-up path waits for the bus to show the retirements.
+const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The pid of a local instance whose bridge is up, if one is.
 fn running_bridge(instances: &[fabric::InstanceView]) -> Option<u32> {

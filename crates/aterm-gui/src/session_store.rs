@@ -177,7 +177,7 @@ pub struct SessionRecord {
 /// A session handed off by a build that wrote no [`SessionHandoff::outgoing_build`]
 /// at all — the old→new handoff that introduced the field, by definition — is
 /// FROZEN: the row must not claim "this one too" for it, and names the in-place
-/// remedy (sourcing the atpkg hook in that tab; `status_bars::HookDialect`).
+/// remedy (sourcing the atpkg hook in that tab; `toolchain_words::HookDialect`).
 ///
 /// PRESENCE, NOT A NUMBER (review, 2026-09-16). The first cut compared
 /// `outgoing_build` against a hand-picked epoch of that day (1789585000, 11:56
@@ -248,28 +248,252 @@ pub struct WindowCarry {
     pub outer_x: Option<i32>,
     #[serde(default)]
     pub outer_y: Option<i32>,
-    /// STATUS-BAR ROWS the outgoing window had committed above its grid at
-    /// handoff time (`App::status_bar_rows`), with the words each row carried
-    /// (`bars`, top to bottom). The successor reserves the same rows BEFORE it
-    /// sizes its first window — the grid rows above are the same either way,
-    /// but the WINDOW is one row taller per bar, and without this the swap
-    /// showed a frame one row shorter than the one it replaced — and paints
-    /// the carried words in them until Commit, when its own lanes take over.
-    /// Additive: absent in pre-carry manifests, which reads as no bars.
+    /// THE MESSAGE BAND'S ROWS the outgoing window had committed above its
+    /// grid at handoff time (`App::message_band_rows`), with the messages
+    /// each row carried (`messages`). The successor reserves the same rows
+    /// BEFORE it sizes its first window — the grid rows above are the same
+    /// either way, but the WINDOW is one row taller per row, and without this
+    /// the swap showed a frame one row shorter than the one it replaced — and
+    /// paints the carried words in them until Commit, when its own reporters
+    /// take over. The serde NAME is the status bars' (2026-09-07): an older
+    /// outgoing build writes it, and it means "committed chrome rows above
+    /// the grid" for both. Additive: absent in pre-carry manifests, which
+    /// reads as no rows.
     #[serde(default)]
     pub status_bar_rows: u16,
+    /// The status bars' rows as an OLDER outgoing build writes them — read
+    /// only ([`WindowCarry::message_carry`] maps each to a message); this
+    /// build writes `messages` and leaves this empty. Dies in Phase 6 of the
+    /// unified message system, one release after the band shipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bars: Vec<CarriedBar>,
+    /// The center's live rows at handoff time, glass rows first
+    /// (`aterm_messages::MessageCenter::carried`, design §3.8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<CarriedMessage>,
+    /// The parent's next message id, so the successor's ids continue past
+    /// every carried one. No `messages.log` lines cross: the parent's
+    /// record is its own to the end (it flushes its writer before it
+    /// execs) and the successor's begins at Commit (design §3.7).
+    #[serde(default)]
+    pub next_message_id: u64,
+    /// When the outgoing process finished downloading the build this handoff
+    /// installs and it passed its checks, on the wall clock (Unix ms;
+    /// `update_words::verified_unix_ms`), so the successor's record of the
+    /// landing can say how long the update took. Additive: absent in older
+    /// manifests, and when the outgoing process did not download that build
+    /// itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_verified_unix_ms: Option<u64>,
 }
 
-/// One status-bar row's words at handoff time — the plain-data projection of
-/// `status_bars::Bar` that the successor re-seeds (design: the reveal shows
-/// carried content and nothing invented). No deadlines cross the boundary:
-/// the successor gives every carried bar the handoff's own staleness cap and
-/// replaces the update lane's words with its own phase.
+/// The two message fields of a [`WindowCarry`] as one value — what
+/// `App::carried_messages` hands the two construction sites.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct MessagesCarry {
+    pub messages: Vec<CarriedMessage>,
+    pub next_message_id: u64,
+}
+
+impl From<&aterm_messages::Carry> for MessagesCarry {
+    fn from(carry: &aterm_messages::Carry) -> Self {
+        Self {
+            messages: carry.live.iter().map(CarriedMessage::from).collect(),
+            next_message_id: carry.next_id,
+        }
+    }
+}
+
+impl WindowCarry {
+    /// The carried messages in the center's own shape, for
+    /// `MessageCenter::seed_carried`. A manifest from THIS build carries
+    /// `messages`; one from an older parent carries `bars`, and each of
+    /// those becomes a message with its lane as the tag, its tone as the
+    /// severity, the lane's own supersede key (so the successor's first
+    /// report replaces it), the severity's default hold, and an id minted
+    /// from `next_id_floor` (the successor's next id) stamped `now_unix_ms`
+    /// — nothing invented beyond what the bar said.
+    pub fn message_carry(&self, next_id_floor: u64, now_unix_ms: u64) -> aterm_messages::Carry {
+        if !self.messages.is_empty() || self.next_message_id > 0 {
+            return aterm_messages::Carry {
+                next_id: self.next_message_id,
+                live: self
+                    .messages
+                    .iter()
+                    .map(aterm_messages::CarriedMessage::from)
+                    .collect(),
+            };
+        }
+        let live: Vec<aterm_messages::CarriedMessage> = self
+            .bars
+            .iter()
+            .enumerate()
+            .filter_map(|(i, bar)| {
+                let severity = match bar.tone.as_str() {
+                    "info" => "info",
+                    "success" => "success",
+                    "warn" => "warn",
+                    _ => return None,
+                };
+                let key = match bar.lane.as_str() {
+                    "toolchain" => "toolchain.pass",
+                    "update" => "update.progress",
+                    _ => return None,
+                };
+                Some(aterm_messages::CarriedMessage {
+                    id: next_id_floor.saturating_add(i as u64),
+                    unix_ms: now_unix_ms,
+                    tag: bar.lane.clone(),
+                    severity: severity.to_string(),
+                    glyph: bar.glyph,
+                    title: bar.title.clone(),
+                    detail: if bar.detail.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![bar.detail.clone()]
+                    },
+                    actions: Vec::new(),
+                    hold: "default".to_string(),
+                    key: Some(key.to_string()),
+                    fill_permille: bar.fill_permille,
+                    stats: bar.stats.clone(),
+                    // An older parent's bar carries no busy flag: a still row.
+                    busy: false,
+                    on_glass: true,
+                    excerpt: true,
+                    finished: None,
+                })
+            })
+            .collect();
+        aterm_messages::Carry {
+            next_id: next_id_floor.saturating_add(live.len() as u64),
+            live,
+        }
+    }
+}
+
+/// One live message at handoff time — the serialisable twin of
+/// [`aterm_messages::CarriedMessage`] (the engine knows no format): every
+/// field a string or a number, every intent in its codec form, the hold as
+/// its word. No deadlines cross the boundary: the successor gives every
+/// carried row the handoff's own staleness cap until Commit.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CarriedMessage {
+    /// The parent's id — the successor keeps it.
+    pub id: u64,
+    /// The wall clock at ingress, from the parent.
+    pub unix_ms: u64,
+    /// The tag word.
+    pub tag: String,
+    /// The severity word.
+    pub severity: String,
+    /// The glyph.
+    pub glyph: char,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detail: Vec<String>,
+    /// Encoded intents (`Intent::encode`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
+    /// `default` | `for:<secs>` | `live:<secs>` | `standing` | `ask:<secs>`.
+    pub hold: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_permille: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stats: String,
+    /// The meter was BUSY (`aterm_messages::Meter::busy`): work with no known
+    /// fraction, animated. Absent from an older build's carry, which reads as
+    /// not busy — a still row, never an invented animation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub busy: bool,
+    /// Whether the row was on glass when the parent froze.
+    #[serde(default)]
+    pub on_glass: bool,
+    /// Whether the band paints `detail[0]` beside the title
+    /// (`Message::excerpt`, design §10.4.2 E1). Absent — an older parent's row,
+    /// or a row that paints its excerpt — reads `true`, so rows from an older
+    /// parent paint as before and a default row's manifest is byte-identical.
+    #[serde(
+        default = "carried_excerpt",
+        skip_serializing_if = "is_carried_excerpt"
+    )]
+    pub excerpt: bool,
+    /// The words the row finishes with (`Message::finished`, design ruling
+    /// 154). Absent — an older parent's row, or one that declared none —
+    /// derives them from the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished: Option<String>,
+}
+
+/// [`CarriedMessage::excerpt`]'s default: the excerpt is painted.
+fn carried_excerpt() -> bool {
+    true
+}
+
+/// The default is not written.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the field by reference"
+)]
+fn is_carried_excerpt(excerpt: &bool) -> bool {
+    *excerpt
+}
+
+impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
+    fn from(m: &aterm_messages::CarriedMessage) -> Self {
+        Self {
+            id: m.id,
+            unix_ms: m.unix_ms,
+            tag: m.tag.clone(),
+            severity: m.severity.clone(),
+            glyph: m.glyph,
+            title: m.title.clone(),
+            detail: m.detail.clone(),
+            actions: m.actions.clone(),
+            hold: m.hold.clone(),
+            key: m.key.clone(),
+            fill_permille: m.fill_permille,
+            stats: m.stats.clone(),
+            busy: m.busy,
+            on_glass: m.on_glass,
+            excerpt: m.excerpt,
+            finished: m.finished.clone(),
+        }
+    }
+}
+
+impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
+    fn from(m: &CarriedMessage) -> Self {
+        Self {
+            id: m.id,
+            unix_ms: m.unix_ms,
+            tag: m.tag.clone(),
+            severity: m.severity.clone(),
+            glyph: m.glyph,
+            title: m.title.clone(),
+            detail: m.detail.clone(),
+            actions: m.actions.clone(),
+            hold: m.hold.clone(),
+            key: m.key.clone(),
+            fill_permille: m.fill_permille,
+            stats: m.stats.clone(),
+            busy: m.busy,
+            on_glass: m.on_glass,
+            excerpt: m.excerpt,
+            finished: m.finished.clone(),
+        }
+    }
+}
+
+/// One status-bar row's words at handoff time, as an OLDER outgoing build
+/// writes them (the plain-data projection of the retired `status_bars::Bar`).
+/// Decoded, never written: [`WindowCarry::message_carry`] maps each to a
+/// message. Dies in Phase 6 of the unified message system.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CarriedBar {
-    /// `toolchain` | `update` (`status_bars::Lane::as_str`).
+    /// `toolchain` | `update` (the retired `status_bars::Lane::as_str`).
     pub lane: String,
     pub glyph: char,
     pub title: String,
@@ -582,6 +806,12 @@ pub enum RosterChange {
     Created,
     /// The sid left the registry (`deregister_local`).
     Exited,
+    /// NOT a membership change: an operator asked this instance's bridge to
+    /// retire a presence row nobody hosts (`fabric retire <sid>`). It rides
+    /// this journal because the journal is the one instance-level stream the
+    /// bridge holds (`EVENT * …`); every other reader filters on the two
+    /// membership variants and never sees it.
+    RetireRequested,
 }
 
 /// WHY a session left the registry — the `reason=` token of an `exits` row, a
@@ -821,6 +1051,29 @@ impl SessionStore {
             exit_code,
             actor,
         });
+        // The in-GUI supervisor host decides from membership: a session that
+        // closed loses its worker at once (`harness_host`, which parks on this).
+        crate::harness_host::ring();
+    }
+
+    /// Ask this instance's bridge to retire the presence row of `sid` — a sid
+    /// NO session here carries (the registry is checked; a hosted sid is
+    /// refused, `false`). The request is a journal row the events lane pushes
+    /// as `EVENT * fabric-retire <sid>`; the bridge re-checks hosting itself
+    /// and publishes `exited` through its own producer sequence.
+    pub fn request_retire(&mut self, sid: &str) -> bool {
+        if self.by_sid(&SessionId::new(sid.to_string())).is_some() {
+            return false;
+        }
+        self.record_roster(
+            sid.to_string(),
+            0,
+            RosterChange::RetireRequested,
+            ExitReason::Unknown,
+            None,
+            ExitActor::Unknown,
+        );
+        true
     }
 
     /// Mark the session with local id `local_id` as having a FROZEN PATH (see the
@@ -1792,6 +2045,7 @@ title = \"zsh\"
                     RosterChange::Exited => {
                         set.remove(&r.sid);
                     }
+                    RosterChange::RetireRequested => {}
                 }
             }
             set

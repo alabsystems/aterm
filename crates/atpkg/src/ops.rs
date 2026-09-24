@@ -62,10 +62,11 @@ pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
 /// root when [`crate::compat::route_for_shim`] finds one standing for this shim.
 ///
 /// Those two verbs exec the store path directly, so the guard line a routed shim carries
-/// never runs for them, and on a trust build whose `bin/rustc` is a separate copy of
-/// `trustc` (bundles 8571/8589/8590/8595) `aterm tippy` and the `clippy` reroute stopped
-/// at tippy's "rustc-compatible sibling … is not the selected Trust compiler" while the
-/// shim beside them linted. The answer is the one the shim's guard gives, decided by the
+/// never runs for them (nor its exports — they export [`exec_env`] instead), and on a
+/// trust build whose `bin/rustc` is a separate copy of `trustc` (bundles
+/// 8571/8589/8590/8595) `aterm tippy` and the `clippy` reroute stopped at tippy's
+/// "rustc-compatible sibling … is not the selected Trust compiler" while the shim beside
+/// them linted. The answer is the one the shim's guard gives, decided by the
 /// same `stat`s. [`which`] itself is unchanged — every reader that asks where a tool
 /// LIVES (gc, doctor, `atpkg which`) keeps reading the store.
 #[must_use]
@@ -73,6 +74,38 @@ pub fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
     let shim = layout.shim(&ToolName::new(tool)?);
     let target = crate::platform::resolve_shim(&shim)?;
     Some(crate::compat::route_for_shim(&shim, &target).unwrap_or(target))
+}
+
+/// The environment to EXPORT for `tool` on those same verbs — [`exec_path`]'s other half,
+/// because the shim they skip does two things before its `exec`, and `exec_path` took over
+/// only the first (design S7): what the build `bin/<tool>` resolves into DECLARES (its
+/// `<build>.shim-env` sidecar, [`crate::shim_env::read_sidecar`] — the environment a shim
+/// laid now would carry, and the one the pass re-asserts on a shim that lost it,
+/// [`crate::activate::reassert_shim_env`]), or, for a build that declares none, what the
+/// shim as laid exports (the add-only rule: an absent sidecar is no evidence the shim's
+/// exports should go). [`crate::shim_env::ShimEnv::NONE`] for a name with no shim.
+///
+/// Until 2026-09-23 these verbs exported nothing, so `aterm claude` — the way to the
+/// managed copy from any terminal — ran Claude Code with its own updater on while
+/// `bin/claude` beside it ran with it off (audit 2026-09-23). The declaration comes
+/// first, not the shim as laid, because a shim a pre-2026-09-23 `repair` laid plain has
+/// nothing to copy. Every value passed [`crate::shim_env::ShimEnv::admit`] on the way in,
+/// so no entry here can name `PATH`, the loader's variables or a runtime's.
+#[must_use]
+pub fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
+    let Some(name) = ToolName::new(tool) else {
+        return crate::shim_env::ShimEnv::NONE;
+    };
+    let shim = layout.shim(&name);
+    let declared = crate::platform::resolve_shim(&shim)
+        .and_then(|target| store_build_of(&layout.prefix, &target))
+        .map(|(program, build)| crate::shim_env::read_sidecar(&layout.build_dir(&program, build)))
+        .unwrap_or_default();
+    if declared.is_empty() {
+        crate::platform::shim_env_of(&shim)
+    } else {
+        declared
+    }
 }
 
 /// One listing of `bin/`, resolved once: per entry, the logical [`ToolName`] its file name
@@ -862,19 +895,19 @@ mod tests {
         let l = layout("uninstall-traversal");
 
         // A sibling directory *outside* the managed prefix that a `..` escape would reach.
-        // `store/../../<victim>` resolves to `prefix.parent().parent()/<victim>`.
-        let victim = l
-            .prefix
-            .parent()
-            .unwrap()
-            .join("atpkg-victim-do-not-delete");
+        // `store/../../<victim>` resolves to `prefix.parent().parent()/<victim>`. Named for
+        // this process: the temp dir is shared, and a second run of this suite beside this
+        // one (a crate suite and a workspace suite at once) used to delete this victim
+        // while this run was asserting it survived.
+        let name = format!("atpkg-victim-do-not-delete-{}", std::process::id());
+        let victim = l.prefix.parent().unwrap().join(&name);
         let _ = std::fs::remove_dir_all(&victim);
         std::fs::create_dir_all(victim.join("keep")).unwrap();
 
-        // Lexically, `prefix/store/../../atpkg-victim-do-not-delete` starts_with(prefix),
-        // so the old guard would have let `remove_dir_all` escape the prefix.
-        let traversal = "../../atpkg-victim-do-not-delete";
-        let err = uninstall(&l, traversal).unwrap_err();
+        // Lexically, `prefix/store/../../<victim>` starts_with(prefix), so the old guard
+        // would have let `remove_dir_all` escape the prefix.
+        let traversal = format!("../../{name}");
+        let err = uninstall(&l, &traversal).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(
             victim.join("keep").exists(),
@@ -899,5 +932,95 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&victim);
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// [`exec_env`] — what `atpkg run` and a DIRECT reroute export in place of the shim
+    /// they skip (audit 2026-09-23): the build's declaration when it has one, whatever the
+    /// shim as laid says (a pre-2026-09-23 `repair` laid `claude` plain over a build that
+    /// declares `DISABLE_AUTOUPDATER=1`); the shim's own exports for a build that declares
+    /// none (add-only); nothing for a plain shim over such a build, a name with no shim or
+    /// a name no shim could have.
+    #[cfg(unix)]
+    #[test]
+    fn exec_env_is_what_the_build_declares_else_what_the_shim_exports() {
+        let l = layout("exec-env");
+        let dir = install(&l, "ay", 17);
+        let none = crate::shim_env::ShimEnv::NONE;
+        let laid = crate::shim_env::ShimEnv::admit(&["AY_QUIET=1".to_string()]).unwrap();
+        let declared =
+            crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        assert_eq!(
+            exec_env(&l, "ay"),
+            none,
+            "a plain shim over a build declaring nothing"
+        );
+
+        crate::activate::install_tools_env(
+            &l,
+            &dir,
+            &[tool("ay")],
+            crate::activate::Aliases::Off,
+            &laid,
+        )
+        .unwrap();
+        assert_eq!(
+            exec_env(&l, "ay"),
+            laid,
+            "no declaration: the shim's own exports stand"
+        );
+
+        crate::shim_env::write_sidecar(&dir, &declared).unwrap();
+        assert_eq!(
+            exec_env(&l, "ay"),
+            declared,
+            "a declaration wins over the shim as laid"
+        );
+        crate::activate::install_tools(&l, &dir, &[tool("ay")], crate::activate::Aliases::Off)
+            .unwrap();
+        assert_eq!(
+            crate::platform::shim_env_of(&l.shim(&tool("ay"))),
+            none,
+            "fixture: the drifted shape — the shim laid plain"
+        );
+        assert_eq!(exec_env(&l, "ay"), declared, "…and over a shim laid plain");
+
+        assert_eq!(exec_env(&l, "absent"), none);
+        assert_eq!(exec_env(&l, "../ay"), none);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// EVERY DOOR PAST THE SHIM EXPORTS WHAT THE SHIM WOULD. The production functions that
+    /// exec [`exec_path`] — `atpkg run` (hence `aterm <tool>`) and the reroute's DIRECT
+    /// rows — each export [`exec_env`] too: `run` alone was the defect (audit 2026-09-23),
+    /// and the reroute is the same shape one file away, latent only while no program it
+    /// brands declares an environment. Source-level, because a door is an `exec` that
+    /// replaces the test process.
+    #[test]
+    fn every_door_that_execs_past_the_shim_exports_its_environment() {
+        let mut doors = 0;
+        for (file, source) in [
+            ("cli.rs", include_str!("cli.rs")),
+            ("reroute.rs", include_str!("reroute.rs")),
+        ] {
+            let production = source.split("\nmod tests {").next().unwrap_or_default();
+            let mut from = 0;
+            while let Some(at) = production[from..].find("crate::ops::exec_path(") {
+                let at = from + at;
+                let start = production[..at].rfind("\nfn ").expect("inside a fn");
+                let end = production[at..]
+                    .find("\n}\n")
+                    .map_or(production.len(), |e| at + e);
+                let body = &production[start..end];
+                let name = body[4..].split('(').next().unwrap_or_default();
+                assert!(
+                    body.contains("crate::ops::exec_env("),
+                    "{file}: {name} execs `ops::exec_path` without exporting `ops::exec_env` \
+                     — the shim it skips exports that before its exec"
+                );
+                doors += 1;
+                from = end;
+            }
+        }
+        assert_eq!(doors, 2, "run and the reroute's DIRECT rows");
     }
 }

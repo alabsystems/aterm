@@ -41,7 +41,11 @@
 // The positional arguments are the worker counts to sweep (default: 2 4 6 8 and
 // the shipping ceiling); 120 is the unbounded shape, one worker per job. Every
 // count runs `ROUNDS` = 5 times, interleaved with the others, and the medians
-// are printed. Optional knobs:
+// are printed. Any other argument but the `--bench` cargo appends is taken for
+// a criterion filter or flag aimed at the package's other benches (`cargo bench
+// -p aterm-gui --features bench-support -- <args>` hands every bench target the
+// same arguments): the probe prints one line and exits 0 without running.
+// Optional knobs:
 //
 //   PROBE_UI_COMPUTE=0   the main thread only sleeps — no compute quantum. With
 //                        the class capped at 31 (a shell launch), the wake tail
@@ -389,7 +393,32 @@ mod probe {
         }
     }
 
+    /// The worker counts on the command line, or the first argument that is
+    /// not one. `cargo bench` hands every bench target of the package the same
+    /// arguments and appends `--bench`, and the package's other benches are
+    /// criterion: `cargo bench -p aterm-gui --features bench-support --
+    /// resize_settle` hands this probe `resize_settle --bench`, and `--
+    /// --save-baseline eight` hands it `--save-baseline eight --bench`. A count
+    /// is a bare integer and `--bench` is cargo's; anything else belongs to
+    /// another bench, and the caller steps aside rather than guess which of a
+    /// flag's values are counts.
+    fn worker_counts(args: impl Iterator<Item = String>) -> Result<Vec<usize>, String> {
+        args.filter(|arg| arg != "--bench")
+            .map(|arg| arg.parse::<usize>().map_err(|_| arg))
+            .collect()
+    }
+
     pub(super) fn main() {
+        let mut counts = match worker_counts(std::env::args().skip(1)) {
+            Ok(counts) => counts,
+            Err(arg) => {
+                eprintln!(
+                    "reflow_smt_probe: not run — `{arg}` is not a worker count, so these arguments \
+                     are another bench's; `--bench reflow_smt_probe -- 2 4 6 8 120` runs the probe"
+                );
+                return;
+            }
+        };
         if std::env::var("PROBE_MAIN_QOS").as_deref() == Ok("ui") {
             assert_eq!(
                 set_qos_self(QOS_CLASS_USER_INTERACTIVE),
@@ -475,12 +504,6 @@ mod probe {
             }
         );
 
-        // `cargo bench` appends `--bench`; every other argument is a count.
-        let mut counts: Vec<usize> = std::env::args()
-            .skip(1)
-            .filter(|a| !a.starts_with('-'))
-            .map(|a| a.parse().expect("worker counts are positive integers"))
-            .collect();
         if counts.is_empty() {
             counts = vec![2, 4, 6, 8];
             if !counts.contains(&shipping) {

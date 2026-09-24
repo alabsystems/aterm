@@ -122,8 +122,9 @@ fn check_channel_audit_an_apply_lane_deferral_does_not_widen_the_check_window() 
         "deferred: staged bundle failed re-verification (discarded)",
         "deferred: staged bundle build-number rebind mismatch (discarded)",
     ] {
-        // 25 min: past the 21-min base window, inside the 42-min widened one.
-        write_stamped(&s, now - 25 * 60, outcome);
+        // 80 % of an interval: past the base window (70 %), inside the widened one
+        // (70 % of two intervals).
+        write_stamped(&s, now - WEB_BASE.as_secs() * 8 / 10, outcome);
         assert_eq!(
             checker_skip_at(&s, WEB_BASE, now),
             None,
@@ -134,7 +135,7 @@ fn check_channel_audit_an_apply_lane_deferral_does_not_widen_the_check_window() 
     // The check lane's own deferral still widens, exactly as before.
     write_stamped(
         &s,
-        now - 25 * 60,
+        now - WEB_BASE.as_secs() * 8 / 10,
         "update check deferred: the release host answered HTTP 429 to HEAD x; transient — \
          backing off, will retry on the next check",
     );

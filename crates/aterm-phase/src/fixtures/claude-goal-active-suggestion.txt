@@ -1,0 +1,15 @@
+# claude-code (version unrecorded) · MEASURED 2026-09-21, `aterm ctl @self text --json tail=14` of a live session (copied from aterm-agent harness/observe_tests.rs REAL_GRID) · `◎ /goal active (3h)` over the frame, the dim suggestion `❯ keep going` with the cursor at column 2
+  with zero hooks installed. Each stage now also runs its own format, lint and test checks before committing, plus the
+  help-surfaces check when it touches a doc comment, because that is what caught me out.
+
+  I will gate and push again once stages land.
+
+✻ Waiting for 1 dynamic workflow to finish
+                                                                                                            ◎ /goal active (3h)
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────── workspace ─
+❯ keep going
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage
+
+  ◯ harness-all-stages  Build stages 1-7 of the aterm harness end to end              0/1 agents done · 4m 0s · ↓ 131.1k tokens
+  ⧉  aterm Wrapper Brief · canvas

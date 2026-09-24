@@ -1,0 +1,41 @@
+# claude-code 2.1.280 · MEASURED 2026-09-23, `aterm ctl text` of a private headless aterm (the harness audit live probe) · the folder-trust dialog under three earlier `Resume this session with:` exits · user, host and scratch-path UUID redacted at equal length
+user@a-mac-host-name-redactedxxxxxx work1 % which claude; claude --version; echo $TERM_PROGRAM; env | grep -c -E "^(CLAU
+DE|ANTHROPIC)"
+/Users//_user0/Library/Application Support/aterm/pkg/agents/claude
+2.1.280 (Claude Code)
+aterm
+0
+user@a-mac-host-name-redactedxxxxxx work1 % claude --model haiku
+
+Resume this session with:
+claude --resume 00425c3f-cdba-4910-b8df-45e43fb3a12b
+user@a-mac-host-name-redactedxxxxxx work1 % claude --model haiku --dangerously-skip-permissions
+
+Resume this session with:
+claude --resume 331917df-004c-45b3-b41f-4ee00c3a47a4
+user@a-mac-host-name-redactedxxxxxx work1 % claude --model haiku --setting-sources project
+
+Resume this session with:
+claude --resume f7496a37-f0c0-4fdf-83e5-f1d7712d5bf6
+user@a-mac-host-name-redactedxxxxxx work1 % cd /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-00000
+0000000/scratchpad/lv/work2 && claude --model haiku --setting-sources project
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/lv/work2
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+

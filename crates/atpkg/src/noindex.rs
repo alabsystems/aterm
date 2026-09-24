@@ -908,6 +908,13 @@ impl Applied {
         matches!(self, Applied::Migrated { .. })
     }
 
+    /// Whether a running build held this directory, so it was left for a later apply —
+    /// one the caller must not record as finished, or no pass retries it.
+    #[must_use]
+    pub fn held_by_build(&self) -> bool {
+        matches!(self, Applied::Skipped { reason, .. } if reason.starts_with(HELD_BY_BUILD))
+    }
+
     /// The reason this attempt FAILED, if it did — what a caller turns into the
     /// `machine settings failed —` line.
     #[must_use]
@@ -918,6 +925,9 @@ impl Applied {
         }
     }
 }
+
+/// How a live build's skip reason starts ([`Applied::held_by_build`]).
+pub(crate) const HELD_BY_BUILD: &str = "a build holds ";
 
 /// How many subdirectories [`build_in_progress`] looks into per level. Cargo's layout
 /// has a handful (`debug`, `release`, one dir per `--target` triple, and under each of
@@ -1676,7 +1686,7 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
     if let Some(lock) = build_in_progress(dir) {
         return Applied::Skipped {
             path: dir.to_path_buf(),
-            reason: format!("a build holds {} — retried next pass", lock.display()),
+            reason: format!("{HELD_BY_BUILD}{} — retried next pass", lock.display()),
         };
     }
     let pointer = pointer_for(repo.as_deref());
@@ -2742,9 +2752,8 @@ mod tests {
     }
 
     // `apply_one` over a synthetic repo: the rename, the config write (with the
-    // relative name), idempotence on the second run, and the build-output sentinel
-    // (`.metadata_never_index`, which cli.rs reads four levels above a seed dir)
-    // travelling with the tree so the reader and the writers keep agreeing.
+    // relative name), idempotence on the second run, and the tree's contents
+    // travelling with it.
     #[test]
     fn apply_one_migrates_points_cargo_and_is_idempotent() {
         if !SUPPORTED {
@@ -2761,12 +2770,9 @@ mod tests {
         std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         let target = repo.join("target");
         tagged_target(&target);
-        // `aterm-release` writes the sentinel into the directory it produces the
-        // bundle IN (`target/release/`), and cli.rs reads it four levels above the
-        // seed dir: seed → Resources → Contents → aterm.app → release.
-        let seed = target.join("release/aterm.app/Contents/Resources/seed");
-        std::fs::create_dir_all(&seed).unwrap();
-        std::fs::write(target.join("release/.metadata_never_index"), "").unwrap();
+        let bundle = target.join("release/aterm.app/Contents/MacOS");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("aterm"), "build output").unwrap();
         // Dry run first: nothing moves, the plan names the config.
         match apply_one(&target, true, true) {
             Applied::Planned { from, to, pointer } => {
@@ -2789,14 +2795,11 @@ mod tests {
             std::fs::read_to_string(repo.join(".cargo/config.toml")).unwrap(),
             "[build]\ntarget-dir = \"target.noindex\"\n"
         );
-        // The sentinel moved with the tree, four levels above the seed dir.
-        let moved_seed = to.join("release/aterm.app/Contents/Resources/seed");
-        assert!(
-            moved_seed
-                .ancestors()
-                .nth(4)
-                .is_some_and(|d| d.join(".metadata_never_index").exists()),
-            "the build-output sentinel travels with the renamed tree"
+        // The contents moved with the tree: a rename, never a copy that drops a file.
+        assert_eq!(
+            std::fs::read_to_string(to.join("release/aterm.app/Contents/MacOS/aterm")).unwrap(),
+            "build output",
+            "the tree's contents travel with the rename"
         );
         // Idempotent: the new name is already excluded; the config is not rewritten.
         assert_eq!(
@@ -5025,7 +5028,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn every_entry_point_is_an_honest_no_op() {
-        assert!(!SUPPORTED);
+        const { assert!(!SUPPORTED) };
         let root = scratch("noop");
         let target = root.join("target");
         tagged_target(&target);

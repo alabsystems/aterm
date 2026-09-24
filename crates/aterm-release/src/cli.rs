@@ -20,10 +20,17 @@ use crate::{publish, verify};
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
+  targo --unverified ship linux-build --version X.Y.Z --build-number N
+                 --commit FULL-CLAIM-SHA --out EXISTING-PRIVATE-DIRECTORY
+      Local native Linux worker: sealed Trust build + provenance handoff.
+      No signing or publication. Run on both x86_64 and aarch64 Linux,
+      then give the complete handoff directory to the canonical cutter.
+
   targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z] [--set-version X.Y.Z]
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
                  [--arm64-only] [--no-paint-smoke] [--release-credentials <profile.toml>]
-                 [--strand-pre-roster-clients]
+                 [--strand-pre-roster-clients] [--linux-artifacts DIRECTORY]
+                 [--linux-target aarch64|x86_64]...
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
       → draft-first publish → late tag → flip → verify.
         --dry-run          gates + provisional number + full local build into
@@ -49,6 +56,11 @@ USAGE
         --rehearse O/R     full real cut published to the scratch repo O/R
                            (provisional number, no ledger push, no tag)
         --arm64-only       ship a single-arch build (explicit opt-out)
+        --linux-artifacts DIRECTORY
+                           require declared Linux handoffs before signing;
+                           missing workers pause the journaled cut for resume
+        --linux-target ARCH
+                           explicit native subset (repeatable); defaults to both
         --no-paint-smoke   EMERGENCY ONLY: skip the self-check's paint smoke
                            (the 29-keystroke pixel proof that the just-built
                            bundle actually paints its flagship effect — the
@@ -131,6 +143,12 @@ USAGE
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     Help,
+    LinuxBuild {
+        version: String,
+        build: u64,
+        commit: String,
+        out: std::path::PathBuf,
+    },
     Cut {
         opts: publish::CutOptions,
         abandon: Option<String>,
@@ -215,6 +233,43 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
     match cmd {
         "help" | "--help" | "-h" => Ok(Cmd::Help),
         "cut" => parse_cut(&mut it),
+        "linux-build" => {
+            let mut values = std::collections::BTreeMap::new();
+            while let Some(flag) = it.next() {
+                if !["--version", "--build-number", "--commit", "--out"].contains(&flag) {
+                    return Err(format!("unknown linux-build flag {flag:?}"));
+                }
+                let value = it
+                    .next()
+                    .ok_or_else(|| format!("{flag} requires a value"))?;
+                if value.is_empty() || values.insert(flag, value).is_some() {
+                    return Err(format!("empty or duplicated linux-build {flag}"));
+                }
+            }
+            let version = normalize_version(
+                values
+                    .get("--version")
+                    .ok_or("linux-build needs --version")?,
+            )?;
+            let build = values
+                .get("--build-number")
+                .ok_or("linux-build needs --build-number")?
+                .parse::<u64>()
+                .map_err(|_| "linux-build requires a positive u64 build number")?;
+            let commit = values
+                .get("--commit")
+                .ok_or("linux-build needs --commit")?
+                .to_string();
+            crate::buildplan::linux::check_identity(&version, build, &commit)?;
+            let out =
+                std::path::PathBuf::from(values.get("--out").ok_or("linux-build needs --out")?);
+            Ok(Cmd::LinuxBuild {
+                version,
+                build,
+                commit,
+                out,
+            })
+        }
         "provision" => {
             let mut id: Option<String> = None;
             let mut check = false;
@@ -388,6 +443,27 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             "--resume" => opts.resume = true,
             "--gate" => opts.gate = true,
             "--arm64-only" => opts.arm64_only = true,
+            "--linux-artifacts" => {
+                if opts.linux_artifacts.is_some() {
+                    return Err("--linux-artifacts given twice".into());
+                }
+                opts.linux_artifacts = Some(std::path::PathBuf::from(
+                    it.next().ok_or("--linux-artifacts needs a directory")?,
+                ));
+            }
+            "--linux-target" => {
+                let triple = match it.next().ok_or("--linux-target needs aarch64 or x86_64")? {
+                    "aarch64" => "aarch64-unknown-linux-gnu",
+                    "x86_64" => "x86_64-unknown-linux-gnu",
+                    other => {
+                        return Err(format!("unsupported Linux release architecture {other:?}"));
+                    }
+                };
+                if opts.linux_targets.iter().any(|t| t == triple) {
+                    return Err("duplicate --linux-target".into());
+                }
+                opts.linux_targets.push(triple.into());
+            }
             // An EMERGENCY ESCAPE, not a setting — publish::paint_smoke_policy
             // owns the refusal on notarized real cuts and the ack it demands.
             publish::NO_PAINT_SMOKE_FLAG => opts.no_paint_smoke = true,
@@ -431,6 +507,9 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             other => return Err(format!("unknown cut flag {other:?}")),
         }
     }
+    if !opts.linux_targets.is_empty() && opts.linux_artifacts.is_none() {
+        return Err("--linux-target requires --linux-artifacts".into());
+    }
     // Mode exclusivity: each of abandon/resume is a whole flow of its own —
     // silently ignoring a second flag would do something the operator did not
     // ask for, on the one command where that costs a burned ledger number.
@@ -439,6 +518,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.resume
             || opts.gate
             || opts.arm64_only
+            || opts.linux_artifacts.is_some()
             || opts.no_paint_smoke
             || opts.strand_pre_roster_clients
             || opts.set_version.is_some()
@@ -456,6 +536,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
         && (opts.dry_run
             || opts.gate
             || opts.arm64_only
+            || opts.linux_artifacts.is_some()
             || opts.no_paint_smoke
             || opts.strand_pre_roster_clients
             || opts.set_version.is_some()
@@ -492,6 +573,13 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             print!("{USAGE}");
             Ok(())
         }
+        Cmd::LinuxBuild {
+            version,
+            build,
+            commit,
+            out,
+        } => crate::buildplan::linux::run_worker(&repo_root()?, &out, &version, build, &commit)
+            .map_err(Error::new),
         Cmd::Cut {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),

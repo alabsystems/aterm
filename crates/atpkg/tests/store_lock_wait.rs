@@ -11,7 +11,8 @@
 //! `flock`) and drives the dev `atpkg` binary against it: a `--wait-lock` child
 //! announces the wait and proceeds once the holder lets go, times out with exit 75
 //! (`EX_TEMPFAIL`) and says it stood aside (`seed-busy:`) when it does not, a typed
-//! verb stays fail-fast with the same code and prints no marker at all,
+//! verb with no terminal to wait on (stdin not one; a person's waits behind a spinner,
+//! `typed_lock_wait_tty.rs`) stays fail-fast with the same code and prints no marker,
 //! an unwritable prefix is never waited on (exit 1), an uncontended child prints
 //! no marker at all, a waiter whose spawner has gone stands down silently, and a
 //! waiter whose parent is init from the start is no orphan and waits like any other.
@@ -111,7 +112,6 @@ impl Fixture {
         cmd.env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("ATPKG_REGISTRY", format!("dir:{}", self.registry.display()))
-            .env_remove("ATPKG_DISABLE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -320,8 +320,8 @@ fn no_progress_marker(stdout: &[String]) {
     }
     for marker in [
         atpkg::cli::LOCK_WAITING_MARKER,
-        atpkg::cli::SEED_STARTING_MARKER,
-        atpkg::cli::SEED_INSTALLED_MARKER,
+        atpkg::cli::NET_STARTING_MARKER,
+        atpkg::cli::NET_INSTALLED_MARKER,
         atpkg::cli::SEED_FAILED_MARKER,
     ] {
         assert!(
@@ -451,9 +451,10 @@ fn a_waiting_seed_times_out_with_exit_75() {
     );
 }
 
-/// A typed verb (no flag) is unchanged in everything but the code: instant, loud on
-/// stderr, silent on stdout — a person at a terminal is told at once and never
-/// waits invisibly.
+/// A typed verb (no flag) with no person at a terminal behind it — stdin here is not
+/// one — is unchanged in everything but the code: instant, loud on stderr, silent on
+/// stdout; a script is told at once and never waits invisibly. (A person at a terminal
+/// waits, visibly: `typed_lock_wait_tty.rs`.)
 #[test]
 fn a_typed_seed_stays_fail_fast_with_exit_75() {
     let fx = Fixture::new("typed");
@@ -809,4 +810,82 @@ fn a_declined_seed_without_contention_is_unchanged() {
         stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),
         "the verb ran: {stdout:?}"
     );
+}
+
+/// The sentence a full `update` prints when nothing is installed and the set is not owed.
+const NOTHING_TO_UPDATE: &str = "nothing installed to update";
+
+/// A FULL PASS THAT QUEUED BEHIND ANOTHER STANDS DOWN BEHIND ITS END, WHATEVER IT WAS
+/// (2026-09-24). The holder records a FAILED full pass — rate-limited, with a reset — while
+/// the child waits; once it lets go, the child does not run the pass again back to back (a
+/// metered listing inside the reset just recorded): it says the holder's failure on stderr,
+/// in the holder's own sentence, exits 1 so its window's ladder retries it, and records
+/// nothing of its own. Until then only a success stood it down.
+#[test]
+fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited() {
+    use aterm_update_core::pkg_check::PassOutcome;
+    let fx = Fixture::new("behind-failed");
+    let guard = fx.hold();
+    let mut child = stream(fx.spawn(&["update", "--wait-lock", "60"]));
+    child.wait_for_line(&waiting_line(), ANNOUNCE_WITHIN);
+    // A second past now: strictly after the child's first contended poll.
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ended = aterm_types::rfc3339::format_rfc3339(unix + 1);
+    let layout = fx.layout();
+    let mut record = atpkg::status::read(&layout).unwrap_or_default();
+    record.outcome = "update failed: the index listing was refused (rate limited)".into();
+    atpkg::status::write(&layout, &record).unwrap();
+    atpkg::status::stamp_pass_end(
+        &layout,
+        &ended,
+        PassOutcome::Failed,
+        atpkg::status::MeteredHold::Until(i64::try_from(unix + 1800).unwrap()),
+    )
+    .unwrap();
+    drop(guard);
+    let (status, _, stdout, stderr) = child.finish(Duration::from_secs(20));
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "stdout: {stdout:?}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed")
+            && stderr.contains("while this one waited")
+            && stderr.contains("(rate limited)"),
+        "the holder's failure, in its own sentence: {stderr}"
+    );
+    assert!(
+        !stdout.iter().any(|l| l.contains(NOTHING_TO_UPDATE)),
+        "the verb did not run: {stdout:?}"
+    );
+    let after = atpkg::status::read(&layout).expect("the holder's record");
+    assert_eq!(
+        (after.last_pass.as_str(), after.last_pass_at.as_str()),
+        ("failed", ended.as_str()),
+        "the record is the holder's"
+    );
+}
+
+/// A FULL PASS WITH NOTHING TO CHECK STILL RECORDS ITS END (2026-09-24): with nothing
+/// installed and the set not owed, `update` says so, exits 0 and records `last_pass = ok`
+/// — the end the schedulers count their walk from — and no success, since nothing was
+/// checked. Unrecorded, every terminal tab owed it again five minutes on.
+#[test]
+fn an_update_with_nothing_to_check_records_its_end() {
+    let fx = Fixture::new("nothing-to-check");
+    fx.decline();
+    let (status, _, stdout, stderr) = stream(fx.spawn(&["update"])).finish(Duration::from_secs(20));
+    assert!(status.success(), "{status}; stderr: {stderr}");
+    assert!(
+        stdout.iter().any(|l| l.contains(NOTHING_TO_UPDATE)),
+        "{stdout:?}"
+    );
+    let record = atpkg::status::read(&fx.layout()).expect("the pass's record");
+    assert_eq!(record.last_pass, "ok");
+    assert!(!record.last_pass_at.is_empty());
+    assert!(record.last_success_at.is_empty(), "nothing was checked");
 }

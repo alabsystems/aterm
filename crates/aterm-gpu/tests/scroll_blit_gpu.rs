@@ -204,3 +204,70 @@ fn a_visible_cursor_rides_the_rescue_and_stays_byte_identical() {
     );
     eprintln!("gpu scroll-blit (cursor shown): {rescued} notches rescued");
 }
+
+/// THE RESCUE RIDES SUBMIT A (the armed Metal arm). Since the trackpad glide
+/// tracks 1:1 with a sub-row present on every delta, the whole-row rescue fires
+/// on EVERY row-step frame — once per row crossed while scrolling. It used to
+/// stage its two band copies on a command buffer of its own and park the UI
+/// thread on `waitUntilCompleted` before Submit A: an unbounded, per-row stall
+/// that no timer booked (`last_present_work_ns` charged it to compose). The
+/// copies now ride the armed encode's own command buffer ahead of the scissored
+/// pass, ordered by encode order and the one queue's commit order, so a rescued
+/// present parks on NOTHING it committed itself.
+///
+/// Both halves are asserted so silence cannot read as success: the inline-park
+/// count stays flat across the sweep (the negative), AND every rescue's copies
+/// were recorded into a Submit A (the positive — `encode_band_shifts` grows by
+/// exactly the rescues taken). The byte-identity oracle rides along: a copy
+/// that landed AFTER the pass, or on the wrong frame, is a pixel diff here.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_rescued_scroll_present_parks_on_no_command_buffer_of_its_own() {
+    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut term = scrollback_term(true);
+    let mut win = WindowGpu::new();
+    // Warm at the bottom (a full repaint), then take the baselines AFTER it —
+    // the warm frame is not a rescue and must not be charged to the sweep.
+    let input = term.cell_frame(ROWS, COLS);
+    let warm = gpu.present_input_readback(&mut win, &input);
+    assert_eq!(
+        warm.pixels,
+        fresh_render(&input),
+        "warm frame != full repaint"
+    );
+    let waits_before = gpu.metal_encode_inline_waits();
+    let shifts_before = gpu.metal_encode_band_shifts();
+    let rescues_before = gpu.scroll_rescues();
+
+    for (notches, step) in [(6, 3i32), (6, -2i32)] {
+        for n in 0..notches {
+            term.scroll_display(step);
+            let input = term.cell_frame(ROWS, COLS);
+            let got = gpu.present_input_readback(&mut win, &input);
+            assert_eq!(
+                got.pixels,
+                fresh_render(&input),
+                "scrolled frame (step {step}, notch {n}) != a full repaint"
+            );
+        }
+    }
+
+    let rescued = gpu.scroll_rescues() - rescues_before;
+    assert!(
+        rescued >= 8,
+        "the rescue barely fired ({rescued} notches) — the no-wait contract \
+         below is not being tested"
+    );
+    assert_eq!(
+        gpu.metal_encode_band_shifts() - shifts_before,
+        rescued,
+        "every rescued present must record its band copies INTO Submit A"
+    );
+    assert_eq!(
+        gpu.metal_encode_inline_waits(),
+        waits_before,
+        "a rescued scroll present parked the UI thread on a command buffer of \
+         its own ({} inline waits across {rescued} rescues)",
+        gpu.metal_encode_inline_waits() - waits_before
+    );
+}

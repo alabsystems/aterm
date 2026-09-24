@@ -30,7 +30,7 @@
 //! `since=` heard nothing for the rest of the run.
 //!
 //! `task` ([`task`]) posts `kind=task` from the manager's session — the body
-//! travels by mail, never through the PTY — then, unless `--no-nudge`, types
+//! travels by mail, never through the PTY — then types
 //! the one-line nudge `Inbox: task @<off>` as a `turn` ONLY when the worker
 //! is idle, and with `--wait` parks `await inbox` for the `answer|report|ack`
 //! that carries `re=<off>` — re-armed while time is left, since the host
@@ -179,8 +179,8 @@ pub fn newest_id(body: &str) -> u64 {
 /// How many rows a mail body holds (a trailing newline ends the last row, it
 /// does not start another).
 ///
-/// THE STAMP LINE IS NOT A ROW. Round 22 put `seq=<n> hash=<hex16>[ busy=1]`
-/// on the first line of every `--report-to` body, and counting it made
+/// THE STAMP LINE IS NOT A ROW. A stamped report opens with `seq=<n>
+/// hash=<hex16>[ busy=1]` on its first line, and counting it made
 /// `EVENT <sid> turn … rows=<n>` one more than the body's rows — against
 /// `lib.rs`'s promise that the field IS the body's row count. It is stripped
 /// here rather than at the one call site so nothing else can read the count
@@ -189,8 +189,8 @@ pub fn body_rows(body: &str) -> usize {
     body.lines().filter(|l| !is_report_stamp(l)).count()
 }
 
-/// `seq=<digits> hash=<16 hex>[ busy=1]` and nothing else — the stamp line an
-/// `aterm-link hook --report-to` body opens with.
+/// `seq=<digits> hash=<16 hex>[ busy=1]` and nothing else — the stamp line a
+/// stamped report body opens with.
 fn is_report_stamp(line: &str) -> bool {
     let mut toks = line.split(' ');
     let (Some(seq), Some(hash)) = (toks.next(), toks.next()) else {
@@ -522,8 +522,6 @@ pub struct TaskOpts {
     pub text: String,
     /// `--deadline`: the advisory `dl=` the post carries.
     pub deadline: Option<Duration>,
-    /// Type the nudge when the worker is idle (off with `--no-nudge`).
-    pub nudge: bool,
     /// `--wait`: how long to park for the answer.
     pub wait: Option<Duration>,
 }
@@ -573,21 +571,21 @@ pub fn task<C: Ctl>(ctl: &mut C, opts: &TaskOpts, out: &mut dyn Write) -> Result
     // The post LANDED: whatever the nudge comes to, the offset is printed —
     // it is the one thing the manager cannot recover (a worker that cannot
     // be read, a turn the server refused, are the error AFTER it).
+    // NOTHING WAKES A WORKER FOR MAIL: it is typed to, as a human would type to
+    // it — the one-line nudge, only over an idle screen.
     let mut nudged = false;
     let mut refused = None;
-    if opts.nudge {
-        match Session::new(ctl, Some(opts.worker.clone())).read_screen() {
-            Err(why) => refused = Some(format!("cannot read the worker for the nudge: {why}")),
-            Ok(screen) if worker_phase(&screen.rows) == Phase::Idle => {
-                let nudge = format!("{NUDGE}{off}");
-                let r = ctl.call(&[&opts.worker, "turn", NUDGE_IDLE, NUDGE_TIMEOUT, &nudge])?;
-                nudged = r.stdout.contains("submitted=1");
-                if !nudged && !r.timed_out() {
-                    refused = Some(format!("nudge refused: {}", r.err_text()));
-                }
+    match Session::new(ctl, Some(opts.worker.clone())).read_screen() {
+        Err(why) => refused = Some(format!("cannot read the worker for the nudge: {why}")),
+        Ok(screen) if worker_phase(&screen.rows) == Phase::Idle => {
+            let nudge = format!("{NUDGE}{off}");
+            let r = ctl.call(&[&opts.worker, "turn", NUDGE_IDLE, NUDGE_TIMEOUT, &nudge])?;
+            nudged = r.submitted();
+            if !nudged && !r.timed_out() {
+                refused = Some(format!("nudge refused: {}", r.err_text()));
             }
-            Ok(_) => {}
         }
+        Ok(_) => {}
     }
     emit(out, &format!("task @{off} nudged={}", u8::from(nudged)))?;
     if let Some(why) = refused {
@@ -692,7 +690,7 @@ mod tests {
 
     /// **THE STAMP LINE IS NOT A ROW.** Round 22 put
     /// `seq=<n> hash=<hex16>[ busy=1]` on the first line of every
-    /// `--report-to` body; counting it made `EVENT <sid> turn … rows=<n>` one
+    /// stamped report body; counting it made `EVENT <sid> turn … rows=<n>` one
     /// more than the body's rows, against the promise that the field IS the
     /// body's row count. Only a real stamp is skipped — prose that merely
     /// starts with `seq=` is a row like any other.
@@ -802,13 +800,12 @@ mod tests {
     }
     const INBOX_1: &str = "OK 1 hold=0 holder=- seen=3 bus_head=90 dropped=0 pending=0\n\
                            msg 4 off=80 t=1000 from=h-owner kind=note trust=human len=3\n";
-    fn task_opts(nudge: bool, wait: Option<Duration>) -> TaskOpts {
+    fn task_opts(wait: Option<Duration>) -> TaskOpts {
         TaskOpts {
             worker: "@s-1".to_string(),
             inbox: "@self".to_string(),
             text: "run the suite and report".to_string(),
             deadline: Some(Duration::from_secs(600)),
-            nudge,
             wait,
         }
     }
@@ -869,7 +866,7 @@ mod tests {
             screen(&idle_screen()),
             ok("turn 5 submitted=1 status=timeout seq=9 dur_ms=2500 hash=0000000000000000\n"),
         ]);
-        let (code, lines) = run_task(&mut s, &task_opts(true, None));
+        let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(code, Ok(0));
         assert_eq!(lines, ["task @91 nudged=1"]);
         assert_eq!(
@@ -887,35 +884,25 @@ mod tests {
     #[test]
     fn a_busy_worker_is_not_nudged() {
         let mut s = Script::new(vec![ok("OK 3 off=91\n"), screen(&busy_screen())]);
-        let (code, lines) = run_task(&mut s, &task_opts(true, None));
+        let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(code, Ok(0));
         assert_eq!(lines, ["task @91 nudged=0"]);
         assert_eq!(s.requests.len(), 2, "{:?}", s.requests);
         assert!(!s.requests.iter().any(|r| r.contains("turn")));
     }
 
-    /// `--no-nudge` (a worker with the wake hook installed): the post alone,
-    /// not even a read of the worker's screen.
+    /// No deadline: no `dl=` on the post (a busy worker, so no nudge either).
     #[test]
-    fn no_nudge_posts_and_reads_nothing() {
-        let mut s = Script::new(vec![ok("OK 3 off=91\n")]);
-        let (code, lines) = run_task(&mut s, &task_opts(false, None));
-        assert_eq!(code, Ok(0));
-        assert_eq!(lines, ["task @91 nudged=0"]);
-        assert_eq!(
-            s.requests,
-            ["@self post to=@s-1 kind=task dl=600000 run the suite and report"]
-        );
-        // No deadline: no `dl=`.
-        let mut s = Script::new(vec![ok("OK 3 off=91\n")]);
+    fn a_task_without_a_deadline_carries_no_dl() {
+        let mut s = Script::new(vec![ok("OK 3 off=91\n"), screen(&busy_screen())]);
         let opts = TaskOpts {
             deadline: None,
-            ..task_opts(false, None)
+            ..task_opts(None)
         };
         assert_eq!(run_task(&mut s, &opts).0, Ok(0));
         assert_eq!(
-            s.requests,
-            ["@self post to=@s-1 kind=task run the suite and report"]
+            s.requests[0],
+            "@self post to=@s-1 kind=task run the suite and report"
         );
     }
 
@@ -942,7 +929,7 @@ mod tests {
             ),
             ok("done\n"),
         ]);
-        let (code, lines) = run_task(&mut s, &task_opts(true, Some(Duration::from_secs(30))));
+        let (code, lines) = run_task(&mut s, &task_opts(Some(Duration::from_secs(30))));
         assert_eq!(code, Ok(0));
         assert_eq!(
             lines,
@@ -986,6 +973,7 @@ mod tests {
         let mut s = Script::new(vec![
             ok(INBOX_1),
             ok("OK 3 off=91\n"),
+            screen(&busy_screen()),
             timeout(),
             timeout(),
             timeout(),
@@ -993,7 +981,7 @@ mod tests {
         ]);
         let bound = Duration::from_millis(60);
         let started = Instant::now();
-        let (code, lines) = run_task(&mut s, &task_opts(false, Some(bound)));
+        let (code, lines) = run_task(&mut s, &task_opts(Some(bound)));
         // THE BOUND IS SPENT BY WAITING, measured against a clock that rounds.
         // A sleep of `bound` can return a hair early — 59.714 ms against 60 ms in
         // this release's gate — because the sleep's own timer and `Instant` are
@@ -1038,6 +1026,7 @@ mod tests {
         let mut s = Script::new(vec![
             ok(INBOX_1),
             ok("OK 3 off=91\n"),
+            screen(&busy_screen()),
             timeout(),
             ok("OK inbox 6\n"),
             ok(
@@ -1046,7 +1035,7 @@ mod tests {
             ),
             ok("done\n"),
         ]);
-        let (code, lines) = run_task(&mut s, &task_opts(false, Some(Duration::from_secs(30))));
+        let (code, lines) = run_task(&mut s, &task_opts(Some(Duration::from_secs(30))));
         assert_eq!(
             lines,
             [
@@ -1187,7 +1176,7 @@ mod tests {
     #[test]
     fn a_post_that_did_not_land_is_the_servers_words() {
         let mut s = Script::new(vec![err("fabric absent id=3 queued=1 no-bridge=1")]);
-        let (code, lines) = run_task(&mut s, &task_opts(true, None));
+        let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(
             code,
             Err("task not posted: ERR fabric absent id=3 queued=1 no-bridge=1".to_string())
@@ -1201,13 +1190,13 @@ mod tests {
             screen(&idle_screen()),
             err("halted"),
         ]);
-        let (code, lines) = run_task(&mut s, &task_opts(true, None));
+        let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(code, Err("nudge refused: ERR halted".to_string()));
         assert_eq!(lines, ["task @91 nudged=0"]);
         // A worker that cannot be read for the nudge: the offset is still
         // printed — the post landed — and the read is the error.
         let mut s = Script::new(vec![ok("OK 3 off=91\n"), err("no such session")]);
-        let (code, lines) = run_task(&mut s, &task_opts(true, None));
+        let (code, lines) = run_task(&mut s, &task_opts(None));
         assert_eq!(lines, ["task @91 nudged=0"]);
         let why = code.expect_err("the worker could not be read");
         assert!(

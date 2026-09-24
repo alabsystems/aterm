@@ -64,6 +64,7 @@ fn journal() -> Journal {
         commit: "a".repeat(40),
         min_build: None,
         arm64_only: false,
+        linux: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
@@ -101,6 +102,7 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         min_build: None,
         arm64_only: false,
         manifest_signed: false,
+        linux: None,
         signature_required: false,
         signature_pubkey: None,
         // Unattributed, as a FORK's cut is: with no master pinned no roster authorizes

@@ -1015,10 +1015,45 @@ pub fn model_registry() -> Vec<Model> {
         ring_model(),
         cursor_model(),
         subscribe_model(),
+        fabric_outbox_wake_model(),
+        fabric_reconnect_backoff_model(),
+        broadcast_cursor_checkpoint_model(),
+        broadcast_head_subscription_model(),
+        // The observation kernel's change test across an equal-seq
+        // alternate-screen re-entry; Tier-1 in aterm-core's conformance_observe.
+        observation_screen_generation_model(),
+        // The in-GUI supervisor host's per-session worker lifecycle (one
+        // supervisor per session, the restart budget, the held claim); Tier-1
+        // in aterm-gui's harness_host conformance.
+        harness_worker_lifecycle_model(),
         transact_model(),
         kernel_model(),
         snapshot_model(),
         read_image_seq_model(),
+        // Cross-process package hints, their wake decisions, and bounded harness
+        // capture lifecycles are Tier-1 bound to the real lock/stamp, GUI decision,
+        // or child/worker path; none claims per-method `#[refines]` anchors.
+        atpkg_index_probe_cooldown_model(),
+        atpkg_index_successor_selection_model(),
+        atpkg_index_wake_highwater_model(),
+        atpkg_index_pending_park_model(),
+        atpkg_vendor_pending_check_model(),
+        // The machine-wide full-pass rule: atpkg's pass writing `status.toml`'s
+        // stamps, the window's gate and the session lane reading them. Tier-1 bound
+        // in atpkg (`status`) and aterm-gui (the gate); no `#[refines]` anchors.
+        atpkg_full_pass_rule_model(),
+        atpkg_published_spacing_model(),
+        harness_capture_worker_lifecycle_model(),
+        harness_upgrade_startup_cadence_model(),
+        harness_upgrade_notice_owner_model(),
+        // The store's tag record against the tag it explains: written only when an
+        // install's heal failed, cleared by the store heal, never read by doctor.
+        // Tier-1 bound to the real writer, heal and doctor in `atpkg::install`'s tests.
+        atpkg_tag_record_model(),
+        // A pending stub waiting for its program against the pass installing it: it reads
+        // whether the pass runs before whether the shim resolves. Tier-1 bound to the real
+        // decision (`pending_wait_step`) in `atpkg::cli`'s tests.
+        atpkg_pending_wait_model(),
         // Resident operator safety: durable event claims, guarded mutation WAL +
         // attempted-input epoch, GAP/resnapshot cursors, single-leader epoch
         // fencing, and the durable fleet-fault gate. Tier-1 binds these scalar
@@ -1030,11 +1065,6 @@ pub fn model_registry() -> Vec<Model> {
         operator_fleet_fault_model(),
         // A7 (WS-G): the PTY-master fd-lifecycle ownership discipline — drift-free
         // twin of FdLifecycle.tla, anchored to aterm-session/src/sink.rs.
-        // The app's TCC identity is EXCLUSIVE: a second bundle claiming it can
-        // destroy the grant for every copy, so a conflict must never be silent
-        // and nothing may be retired unnamed. Tier-1 drives the real
-        // `aterm_containment::consent::classify_claimants`.
-        tcc_identity_claim_exclusivity_model(),
         fd_lifecycle_model(),
         // WS-G: spawn-time locale guarantee — the child always runs under a UTF-8
         // LC_CTYPE. Abstract twin of aterm_pty::resolve_spawn_locale (real-code
@@ -1161,6 +1191,13 @@ pub fn model_registry() -> Vec<Model> {
         // live in aterm-update::manifest.
         native_update_failed_mark_suppression_model(),
         trail_audio_lifecycle_model(),
+        // The D5 reopen ladder between a device fault and exhaustion, and the
+        // typing-sound seam (D1/D2) with its two readers. Tier-1 for both
+        // lives in aterm-gui (`trail_audio_reopen_conformance.rs`,
+        // `sound_seam_conformance.rs`); neither carries `#[refines]` anchors,
+        // so both report here rather than gate the closure.
+        trail_audio_reopen_ladder_model(),
+        trail_sound_seam_model(),
         trail_audio_start_latency_model(),
         asymmetric_pad_layout_model(),
         visible_pad_crop_model(),
@@ -1178,6 +1215,9 @@ pub fn model_registry() -> Vec<Model> {
         reduced_motion_companion_handoff_model(),
         cursor_cat_motion_pulse_routing_model(),
         cursor_hint_license_model(),
+        rainbow_typed_continuity_model(),
+        same_caret_typed_echo_model(),
+        unknown_insert_orphan_key_model(),
         // The rainbow-kitty echo ledger: a licensed typed move pays the hole
         // the seam refused out of the presses older than its licensing key,
         // exactly, and a refusal forgets them. Tier-1 drives the real
@@ -1190,6 +1230,7 @@ pub fn model_registry() -> Vec<Model> {
         // typed-wake focus pins are modeled as explicit preservation controls.
         // Tier-1 drives the real sync_window/on_focus decisions in aterm-gui.
         cursor_companion_owner_lifecycle_model(),
+        composed_witness_generation_model(),
         composed_sync_hold_model(),
         sync_reopen_visibility_model(),
         cursor_effect_scroll_model(),
@@ -1272,6 +1313,14 @@ pub fn model_registry() -> Vec<Model> {
         // publishes/samples its timestamp tuple coherently; Tier-1 drives the
         // real sink receipts and tracker in aterm-gui/src/app_input.rs.
         output_echo_receipt_publication_model(),
+        // Ordered GUI input admission is per sink: a paste in one session
+        // cannot defer another session's keys. Tier-1 drives the real sink
+        // counters and key-path decision in aterm-gui/src/app_input.rs.
+        paste_order_sink_isolation_model(),
+        // A queued key's fast-present wake requires a direct kernel receipt;
+        // Tier-1 drives the GUI decision over real direct, spill and failed
+        // sink receipts in aterm-gui/src/app_input.rs.
+        queued_key_kernel_delivery_model(),
         // Streaming-search lifecycle: drift-free twin of aterm-search's
         // StreamingSearch engine (supersedes the never-committed hand
         // StreamingSearch.tla). Registering it enrolls every action in the

@@ -93,19 +93,14 @@ pub(crate) type Sel = *const c_void;
 /// are the same shape; the alias exists to make the message target obvious.
 pub(crate) type ClassPtr = *mut c_void;
 
-/// The C type `BOOL` widens to on this target: C99 `_Bool` on arm64, `signed
-/// char` everywhere else Apple ships.
-#[cfg(target_arch = "aarch64")]
-type BoolRepr = bool;
-/// See the `aarch64` arm.
-#[cfg(not(target_arch = "aarch64"))]
-type BoolRepr = i8;
-
 /// The Objective-C `BOOL`, at the width and value set THIS target uses — the
 /// type every `BOOL` argument and return in a [`msg`] prototype is spelled
-/// with. It is `aterm-objc`'s `encode::Bool` reached by the same reasoning;
-/// this module keeps its own because `aterm-gpu` does not depend on that
-/// crate, and [`msg`] carries no `Encode` bound that could enforce the rule.
+/// with, since [`msg`] carries no `Encode` bound that could enforce the rule.
+/// It is `aterm-objc`'s [`aterm_objc::Bool`]: `#[repr(transparent)]` over
+/// `bool` on aarch64 and over `i8` (C's `signed char`) everywhere else Apple
+/// ships, `From<bool>` in and `.as_bool()` out, which reads `!= 0` on the
+/// `i8` targets. `ObjcBool` is only its name here, so that no prototype reads
+/// as Rust's `bool`.
 ///
 /// # Why Rust's `bool` is not this type
 ///
@@ -130,58 +125,7 @@ type BoolRepr = i8;
 /// a property of the callers, not of the IMPs. This type makes the
 /// prototypes right at zero cost: on aarch64 it IS `bool`, so codegen there
 /// is unchanged.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct ObjcBool(BoolRepr);
-
-#[cfg(target_arch = "aarch64")]
-impl ObjcBool {
-    /// A `BOOL` from a Rust `bool`. Exact: they are the same type here.
-    #[inline]
-    pub(crate) const fn new(value: bool) -> Self {
-        Self(value)
-    }
-
-    /// The Rust `bool` this `BOOL` means.
-    #[inline]
-    pub(crate) const fn get(self) -> bool {
-        self.0
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-impl ObjcBool {
-    /// A `BOOL` from a Rust `bool`. Exact: `bool` is a subset of `signed char`.
-    #[inline]
-    pub(crate) const fn new(value: bool) -> Self {
-        Self(value as BoolRepr)
-    }
-
-    /// The Rust `bool` this `BOOL` means — `!= 0`, C's own rule, which is why
-    /// the byte is never transmuted.
-    #[inline]
-    pub(crate) const fn get(self) -> bool {
-        self.0 != 0
-    }
-}
-
-impl ObjcBool {
-    /// The raw byte a method could hand back — so a test can put a `2` in
-    /// the slot and read YES, which is the value set a `bool` cannot hold.
-    /// Gated like its only caller: on aarch64 the slot IS `bool`, and there
-    /// is no such byte to put.
-    #[cfg(all(test, not(target_arch = "aarch64")))]
-    pub(crate) const fn from_raw(raw: BoolRepr) -> Self {
-        Self(raw)
-    }
-}
-
-impl From<bool> for ObjcBool {
-    #[inline]
-    fn from(value: bool) -> Self {
-        Self::new(value)
-    }
-}
+use aterm_objc::Bool as ObjcBool;
 
 #[link(name = "objc")]
 unsafe extern "C" {
@@ -755,7 +699,7 @@ impl CompileOptions {
         // SAFETY: `-preserveInvariance` is a `BOOL` getter on a live object.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            f(self.0.id(), sel(c"preserveInvariance")).get()
+            f(self.0.id(), sel(c"preserveInvariance")).as_bool()
         }
     }
 
@@ -779,9 +723,9 @@ impl Device {
     /// A terminal needs no discrete GPU, and on a dual-GPU MacBook Pro the
     /// system default IS the discrete one: `MTLCreateSystemDefaultDevice`
     /// answered "AMD Radeon Pro 560" on a 2017 15" with an Intel HD Graphics
-    /// 630 beside it (macOS 13.7, measured 2026-09-06), so every window kept
-    /// the discrete chip powered — fan and battery — for nothing the
-    /// integrated GPU could not draw. The wgpu arm always asked for
+    /// 630 beside it (macOS 13.7, measured 2026-09-06), and the renderer
+    /// logged that chip; that every window thereby kept it powered (fan,
+    /// battery) is inferred, not observed. The wgpu arm always asked for
     /// `PowerPreference::LowPower` (`power_preference_from_env`) and honoured
     /// `ATERM_GPU_POWER=low|high`; this is the same policy on the first-party
     /// arm: the first low-power, non-headless device `MTLCopyAllDevices`
@@ -790,16 +734,16 @@ impl Device {
     /// Mac) has one device either way, so the choice is invisible there.
     ///
     /// The system default is deliberately NOT created when a low-power device
-    /// exists. Apple documents that on a Mac with automatic graphics switching
-    /// `MTLCreateSystemDefaultDevice` switches the machine to the discrete GPU
-    /// and `MTLCopyAllDevices` does not, although the array it answers holds
-    /// the discrete device too; so the pick lists devices rather than creating
-    /// the default one. The app bundle's `NSSupportsAutomaticGraphicsSwitching`
-    /// is the other half: per Apple's documentation, an app without it keeps a
-    /// switching Mac on the discrete GPU for its whole life, whichever device
-    /// the renderer picked. Both halves are DOCUMENTED, not measured here:
-    /// nothing observed the mux, and no bundle was built and run with or
-    /// without the key. What was measured is which device each call answers.
+    /// exists. The macOS 13.3 SDK's `MTLDevice.h` doc comments say why: on a
+    /// Mac with automatic graphics switching, `MTLCreateSystemDefaultDevice`
+    /// "will cause the system to switch to the high power GPU", and
+    /// `MTLCopyAllDevices`, whose array holds that GPU too, "will not cause the
+    /// system to switch devices". Apple's web pages for the two calls omit
+    /// this, and nothing here observed the mux. The other half, the bundle's
+    /// `NSSupportsAutomaticGraphicsSwitching`, rests on an unmeasured
+    /// expectation that no SDK header or Apple page read here states: without
+    /// it a switching Mac stays on the discrete GPU for the app's life,
+    /// whichever device it picked. Measured: which device each call answers.
     pub(crate) fn preferred() -> Option<Self> {
         let want_high = matches!(
             std::env::var("ATERM_GPU_POWER").as_deref(),
@@ -834,7 +778,7 @@ impl Device {
                 if d.is_null() {
                     continue;
                 }
-                if flag(d, sel(c"isLowPower")).get() && !flag(d, sel(c"isHeadless")).get() {
+                if flag(d, sel(c"isLowPower")).as_bool() && !flag(d, sel(c"isHeadless")).as_bool() {
                     let dev = Obj::retain(d).map(Self)?;
                     if n > 1 {
                         SAID.call_once(|| {
@@ -2172,7 +2116,7 @@ mod tests {
         // reads it.
         let is_low = unsafe {
             let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
-            flag(dev.0.id(), sel(c"isLowPower")).get()
+            flag(dev.0.id(), sel(c"isLowPower")).as_bool()
         };
         let low = Device::low_power().map(|d| d.name());
         crate::stderr_line!(
@@ -2199,18 +2143,26 @@ mod tests {
     /// The ObjC `BOOL` slot at this target's width: one byte, `bool` in and
     /// out, and — on the `signed char` targets — ANY non-zero byte reads YES,
     /// which is the value set a Rust `bool` cannot hold and the whole reason
-    /// [`ObjcBool`] exists. No GPU needed.
+    /// every `BOOL` in a [`msg`] prototype is an [`ObjcBool`]. No GPU needed.
+    /// `aterm-objc`'s own tests of the type read only YES and NO, so the
+    /// non-0/1 bytes are checked here.
     #[test]
     fn objc_bool_is_one_byte_and_reads_c_style() {
         assert_eq!(std::mem::size_of::<ObjcBool>(), 1, "BOOL is one byte");
-        assert!(ObjcBool::from(true).get());
-        assert!(!ObjcBool::from(false).get());
-        assert!(!ObjcBool::default().get(), "the default is NO");
+        assert!(ObjcBool::from(true).as_bool());
+        assert!(!ObjcBool::from(false).as_bool());
+        assert!(!ObjcBool::default().as_bool(), "the default is NO");
         #[cfg(not(target_arch = "aarch64"))]
         {
-            assert!(ObjcBool::from_raw(2).get(), "a BOOL of 2 is YES");
-            assert!(ObjcBool::from_raw(-1).get(), "a BOOL of -1 is YES");
-            assert!(!ObjcBool::from_raw(0).get());
+            // SAFETY: on this arm `aterm_objc::Bool` is `#[repr(transparent)]`
+            // over `i8` (its `BoolRepr` in aterm-objc's encode.rs), so every
+            // `i8` is a valid value of it — all 256 bytes a `signed char`
+            // `BOOL` can hold, which is what this block reads. `transmute`
+            // refuses to compile if the two sizes ever differ.
+            let raw = |byte: i8| unsafe { std::mem::transmute::<i8, aterm_objc::Bool>(byte) };
+            assert!(raw(2).as_bool(), "a BOOL of 2 is YES");
+            assert!(raw(-1).as_bool(), "a BOOL of -1 is YES");
+            assert!(!raw(0).as_bool());
         }
     }
 

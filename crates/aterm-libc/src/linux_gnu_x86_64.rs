@@ -1156,7 +1156,7 @@ pub const RLIMIT_NOFILE: __rlimit_resource_t = 7;
 pub const RLIMIT_NPROC: __rlimit_resource_t = 6;
 pub const RLIMIT_STACK: __rlimit_resource_t = 3;
 pub const RLIM_INFINITY: rlim_t = 18446744073709551615;
-pub const RTLD_DEFAULT: *mut c_void = 0x0 as *mut c_void;
+pub const RTLD_DEFAULT: *mut c_void = core::ptr::null_mut();
 pub const RTLD_LAZY: c_int = 1;
 pub const R_OK: c_int = 4;
 pub const SA_NOCLDSTOP: c_int = 0x00000001;
@@ -1805,7 +1805,7 @@ const fn cmsg_align(len: usize) -> usize {
 #[inline]
 pub unsafe extern "C" fn CMSG_FIRSTHDR(mhdr: *const msghdr) -> *mut cmsghdr {
     unsafe {
-        if (*mhdr).msg_controllen as usize >= ::core::mem::size_of::<cmsghdr>() {
+        if (*mhdr).msg_controllen >= ::core::mem::size_of::<cmsghdr>() {
             (*mhdr).msg_control.cast::<cmsghdr>()
         } else {
             ::core::ptr::null_mut::<cmsghdr>()
@@ -1911,7 +1911,7 @@ pub const extern "C" fn makedev(major: c_uint, minor: c_uint) -> dev_t {
     let mut dev = 0;
     dev |= (major & 0x0000_0fff) << 8;
     dev |= (major & 0xffff_f000) << 32;
-    dev |= (minor & 0x0000_00ff) << 0;
+    dev |= minor & 0x0000_00ff;
     dev |= (minor & 0xffff_ff00) << 12;
     dev
 }
@@ -1919,7 +1919,7 @@ pub const extern "C" fn makedev(major: c_uint, minor: c_uint) -> dev_t {
 #[inline]
 pub const extern "C" fn minor(dev: dev_t) -> c_uint {
     let mut minor = 0;
-    minor |= (dev & 0x0000_0000_0000_00ff) >> 0;
+    minor |= dev & 0x0000_0000_0000_00ff;
     minor |= (dev & 0x0000_0fff_fff0_0000) >> 12;
     minor as c_uint
 }

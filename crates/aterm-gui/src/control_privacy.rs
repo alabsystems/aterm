@@ -51,35 +51,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aterm_containment::consent::{
-    self,
-    Attribution,
-    Claimants,
-    ConsentKey,
-    ConsentPosture,
-    DrClass,
-    FdaProbe,
-    FdaState,
-    Folder,
-    FsConsent,
-    PostureInputs,
-    ProbeGate,
-    ProbeLabel,
-    Responsible,
-    ResponsibleError,
-    SpikeEvidence,
-    // The bundle-identity readers used to be private to this module, where they
-    // could only ever describe the ONE bundle this process runs from. They live
-    // in `aterm_containment` since 2026-09-22 so the claimant census can ask the
-    // same questions of bundles it does NOT run from — one implementation of
-    // "what is this bundle's designated requirement", so a census and a
-    // self-report cannot come to disagree.
-    classify_signing,
-    codesign_report,
-    designated_requirement,
-    plist_marks_dev_build,
-    plist_string,
-    read_bounded,
-    team_identifier,
+    self, Attribution, Claimants, ConsentKey, ConsentPosture, DrClass, FdaProbe, FdaState, Folder,
+    FsConsent, PostureInputs, ProbeGate, ProbeLabel, Responsible, ResponsibleError, SpikeEvidence,
+    plist_string, read_plist_text,
 };
 use aterm_control::wire::{json_ok, json_str_field, pct_encode};
 use winit::event_loop::EventLoopProxy;
@@ -189,7 +163,7 @@ pub(crate) struct ConsentProbes {
     /// `CFBundleIdentifier`, with each one's designated requirement. Runs
     /// `codesign` per candidate, so it takes the same fence as the others and
     /// its inert arm reads nothing at all.
-    census: fn(&str, Option<&Path>) -> Claimants,
+    census: fn(&str) -> Claimants,
     /// Whether these are the live arms. Read only by the `Debug` impl and the
     /// tests: the `observer` row never carries it, because the inert arms
     /// answer with labels the row already renders as `off` (`RefusedDisabled`,
@@ -198,9 +172,9 @@ pub(crate) struct ConsentProbes {
     live: bool,
 }
 
-/// The inert census: it does not list a directory or run `codesign`, and it
-/// answers `Unavailable` — "I did not look", never "there is nothing".
-fn inert_census(_bundle_id: &str, _running: Option<&Path>) -> Claimants {
+/// The inert census reads nothing and answers `Unavailable`: "I did not look",
+/// never "there is nothing".
+fn inert_census(_bundle_id: &str) -> Claimants {
     Claimants::default()
 }
 
@@ -309,30 +283,32 @@ struct ProbeSlot {
     retry_after: Option<Instant>,
 }
 
-/// The claimant census's own slot, with the SAME admission discipline as
-/// [`ProbeSlot`]: at most one worker, an expired answer is never served while
-/// refreshing, and a failed spawn cannot loop.
+/// The claimant census's slot: at most one worker, a failed spawn cannot loop,
+/// and a completed answer is kept and served while a refresh runs.
 ///
-/// It needs its own slot rather than riding the FDA probe's because it answers
-/// a different question on a different cadence — the probe asks "can THIS
-/// process open a protected file", the census asks "what else on this disk
-/// claims my identifier" — and because it is the more expensive of the two: one
-/// `codesign` per candidate bundle, which is exactly the work that must not
-/// happen on a GUI-thread read.
+/// It is NOT retired by [`ConsentState::invalidate`], which focus and config
+/// changes call: neither changes which bundles are on disk. It refreshes on
+/// [`CENSUS_TTL`].
 #[derive(Debug, Default)]
 struct CensusSlot {
     in_flight: bool,
-    request_epoch: u64,
+    /// Bumped by [`ConsentState::invalidate_census`]; a worker dispatched
+    /// under an older one publishes nothing.
+    generation: u64,
     entry: Option<CensusEntry>,
     retry_after: Option<Instant>,
 }
 
 #[derive(Debug)]
 struct CensusEntry {
-    epoch: u64,
     claimants: Claimants,
     completed_at: Instant,
 }
+
+/// How long a census answer is served before a read refreshes it. The census
+/// is about bundles on disk, which rarely change, and each refresh runs
+/// `codesign` once per copy of the app.
+const CENSUS_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct SharedProbe {
@@ -346,15 +322,14 @@ struct SharedProbe {
 }
 
 impl SharedProbe {
-    /// The census's publication seam. Same rule as [`Self::complete`]: the
-    /// worker runs `codesign` with no lock held and only then takes the mutex.
-    fn complete_census(&self, epoch: u64, claimants: Claimants, now: Instant) {
+    /// The census's publication seam. The worker runs `codesign` with no lock
+    /// held and only then takes the mutex.
+    fn complete_census(&self, generation: u64, claimants: Claimants, now: Instant) {
         {
             let mut slot = self.census.lock().unwrap_or_else(|p| p.into_inner());
             slot.in_flight = false;
-            if epoch == self.epoch.load(Ordering::Acquire) {
+            if slot.generation == generation {
                 slot.entry = Some(CensusEntry {
-                    epoch,
                     claimants,
                     completed_at: now,
                 });
@@ -430,73 +405,66 @@ impl ConsentState {
         if let Ok(mut slot) = self.shared.slot.try_lock() {
             slot.entry = None;
         }
-        // The census expires with everything else: a bundle can appear beside
-        // the install at any moment (an apply renames one into place), so an
-        // answer from before an activation is exactly as stale as a grant from
-        // before one.
-        if let Ok(mut census) = self.shared.census.try_lock() {
-            census.entry = None;
-        }
     }
 
-    /// The claimant census, read the same way the FDA probe is: never on this
-    /// thread, never blocking, and `None` until a current answer exists.
-    ///
-    /// Returns `(answer, pending)`. `pending` is true when a worker is or has
-    /// just been dispatched, so the caller can say `census=pending` rather than
-    /// printing a count it has not established.
-    fn claimants(
+    /// Forget the census answer after the bundles on disk changed under it (a
+    /// *Move to Trash*). A worker already out publishes nothing, and the next
+    /// read dispatches a fresh one without waiting out the retry floor.
+    pub(crate) fn invalidate_census(&self) {
+        let mut slot = self.shared.census.lock().unwrap_or_else(|p| p.into_inner());
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.entry = None;
+        slot.retry_after = None;
+    }
+
+    /// The claimant census, never computed on this thread. Returns the last
+    /// answer with its age (served even while a refresh runs), and whether no
+    /// answer exists yet. `(None, false)` — `census=off` — when the privacy
+    /// posture is disabled, the instance is inert, or there is no bundle id to
+    /// ask about.
+    pub(crate) fn claimants(
         &self,
         bundle_id: Option<&str>,
-        running: Option<&Path>,
-        interval: Duration,
-    ) -> (Option<Claimants>, bool) {
-        let Some(bundle_id) = bundle_id else {
-            // No identifier to ask about: there is nothing a census could mean.
+        enabled: bool,
+    ) -> (Option<(Claimants, Duration)>, bool) {
+        let Some(bundle_id) = bundle_id.filter(|_| enabled && self.probes.live) else {
             return (None, false);
         };
-        if !self.probes.live {
-            return (None, false);
-        }
-        let interval = interval.max(PROBE_RETRY_FLOOR);
         let now = Instant::now();
-        let epoch = self.shared.epoch.load(Ordering::Acquire);
-        let dispatch = {
+        let (answer, dispatch, generation) = {
             let mut slot = self.shared.census.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(entry) = &slot.entry
-                && entry.epoch == epoch
-                && now.saturating_duration_since(entry.completed_at) < interval
-            {
-                return (Some(entry.claimants.clone()), false);
+            let answer = slot.entry.as_ref().map(|e| {
+                (
+                    e.claimants.clone(),
+                    now.saturating_duration_since(e.completed_at),
+                )
+            });
+            let stale = answer.as_ref().is_none_or(|(_, age)| *age >= CENSUS_TTL);
+            let dispatch = stale && !slot.in_flight && !slot.retry_after.is_some_and(|at| now < at);
+            if dispatch {
+                slot.in_flight = true;
+                slot.retry_after = Some(now + PROBE_RETRY_FLOOR);
             }
-            slot.entry = None;
-            if slot.in_flight || slot.retry_after.is_some_and(|at| now < at) {
-                return (None, true);
-            }
-            slot.in_flight = true;
-            slot.request_epoch = epoch;
-            slot.retry_after = Some(now + PROBE_RETRY_FLOOR);
-            true
+            (answer, dispatch, slot.generation)
         };
         if dispatch {
             let shared = Arc::clone(&self.shared);
             let census = self.probes.census;
             let id = bundle_id.to_owned();
-            let running = running.map(Path::to_path_buf);
             let spawned = std::thread::Builder::new()
                 .name("aterm-claimant-census".to_owned())
                 .spawn(move || {
-                    let answer = census(&id, running.as_deref());
-                    shared.complete_census(epoch, answer, Instant::now());
+                    let answer = census(&id);
+                    shared.complete_census(generation, answer, Instant::now());
                 });
             if spawned.is_err() {
-                // No worker owns the slot; release it so a later read can try
-                // again after the floor, rather than staying pending forever.
+                // No worker owns the slot: release it so a later read retries.
                 let mut slot = self.shared.census.lock().unwrap_or_else(|p| p.into_inner());
                 slot.in_flight = false;
             }
         }
-        (None, true)
+        let pending = answer.is_none();
+        (answer, pending)
     }
 
     /// A future-only deadline for an active observer. Completion normally
@@ -732,6 +700,12 @@ fn signing_identity_if_warm() -> &'static SigningIdentity {
         .unwrap_or_else(SigningIdentity::unknown)
 }
 
+/// [`running_bundle_id`] for the event loop: `None` until the identity has
+/// been read off it.
+pub(crate) fn running_bundle_id_if_warm() -> Option<&'static str> {
+    signing_identity_if_warm().bundle_id.as_deref()
+}
+
 fn identity_cell() -> &'static OnceLock<SigningIdentity> {
     static IDENTITY: OnceLock<SigningIdentity> = OnceLock::new();
     &IDENTITY
@@ -752,34 +726,36 @@ fn read_signing_identity() -> SigningIdentity {
     let Some(root) = consent::app_bundle_root(exe) else {
         return SigningIdentity::unknown().clone();
     };
-    // The guard: an `Info.plist` under a protected root is exactly the read
-    // this design exists to avoid, so the resolver refuses it and everything
-    // below degrades to `unknown`.
-    let plist = consent::readable_info_plist(exe, &consent::protected_roots(&[]));
-    let text = plist.as_deref().and_then(read_bounded);
-    let bundle_id = text
+    // An `Info.plist` under a protected root is exactly the read this design
+    // exists to avoid, so both reads refuse it and the identity is `unknown`.
+    let protected = consent::protected_roots(&[]);
+    let Some(identity) = consent::bundle_identity(&root, &protected) else {
+        return SigningIdentity::unknown().clone();
+    };
+    let text = consent::readable_info_plist(exe, &protected)
         .as_deref()
-        .and_then(|t| plist_string(t, "CFBundleIdentifier"))
-        .map(str::to_owned);
+        .and_then(read_plist_text);
     let display_name = text
         .as_deref()
         .and_then(|t| plist_string(t, "CFBundleDisplayName").or(plist_string(t, "CFBundleName")))
         .map(str::to_owned);
-    let dev_build = text.as_deref().map(plist_marks_dev_build);
-    let codesign = codesign_report(&root);
-    let dr_text = codesign
-        .as_deref()
-        .and_then(designated_requirement)
-        .unwrap_or_default();
     SigningIdentity {
-        bundle_id,
+        bundle_id: identity.bundle_id,
         display_name,
-        signing: codesign.as_deref().map_or("unknown", classify_signing),
-        team: codesign.as_deref().and_then(team_identifier),
-        dr: consent::classify_dr(&dr_text),
-        dr_text,
-        dev_build,
+        signing: identity.signing,
+        team: identity.team,
+        dr: consent::classify_dr(&identity.dr_text),
+        dr_text: identity.dr_text,
+        dev_build: text.as_deref().map(plist_marks_dev_build),
     }
+}
+
+/// Whether an `Info.plist`'s text carries the `ATermDevBuild` mark — the same
+/// key and the same fail-open reading as `aterm_update`'s own predicate, which
+/// is not reachable from here. Fails OPEN: anything unclear is "not a dev
+/// build", so a corrupt plist can never invent a dev identity for a release.
+fn plist_marks_dev_build(text: &str) -> bool {
+    plist_string(text, "ATermDevBuild").is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 /// The host OS version (`ProductVersion`), read once from the public system
@@ -792,7 +768,7 @@ fn os_version() -> Option<&'static str> {
             if !cfg!(target_os = "macos") {
                 return None;
             }
-            let text = read_bounded(Path::new(
+            let text = read_plist_text(Path::new(
                 "/System/Library/CoreServices/SystemVersion.plist",
             ))?;
             plist_string(&text, "ProductVersion").map(str::to_owned)
@@ -825,17 +801,16 @@ pub(crate) struct PrivacySnapshot {
     platform: &'static str,
     os: Option<String>,
     identity: SigningIdentity,
-    /// The install posture the first-open doctor classifies
-    /// (`aterm_update::which_copy::posture_from`), as a token.
+    /// The macOS install posture the first-open doctor classifies
+    /// (`aterm_update::which_copy::posture_from`), as a token. Other platforms
+    /// run a bare executable and report `not-a-bundle`.
     install: &'static str,
     /// The canonical path this process runs from, when it can be read.
     running: Option<String>,
     /// Whether macOS can still FIND the code this process's grants are keyed
-    /// to. `running=` above follows the vnode, so it reports the current name
-    /// of the image and looks healthy in precisely the state where the bundle
-    /// was renamed or deleted out from under a live process — which is what an
-    /// in-place apply does, and what cost the owner four and a half silent
-    /// hours on 2026-09-19.
+    /// to. `running=` above is the exec-time path, frozen for the life of the
+    /// process, so it reads healthy in exactly the state where the bundle was
+    /// renamed or deleted under a live process — which an in-place apply does.
     anchor: aterm_containment::ImageAnchor,
     fda: FdaState,
     probe: ProbeLabel,
@@ -860,20 +835,11 @@ pub(crate) struct PrivacySnapshot {
     observer_fda: &'static str,
     observer_responsible: &'static str,
     reset_command: Option<String>,
-    /// Every bundle on disk claiming this process's `CFBundleIdentifier`, and
-    /// how complete the look was. `None` while the census worker is out, or on
-    /// a host with no identifier to ask about.
-    ///
-    /// This is the ONLY row on this report that is about the TCC ROW rather
-    /// than about this process. Every other token — `dr=`, `grant_stable=`,
-    /// `anchor=`, `full_disk_access=` — was true of the process reading it on
-    /// 2026-09-21 while an ad-hoc sibling destroyed the owner's grant twice in
-    /// 55 seconds, because macOS resolves a requirement mismatch by REPLACING
-    /// the stored requirement, not by denying one caller.
-    claimants: Option<Claimants>,
-    /// Whether a census worker is out. Distinguishes "I looked and found one"
-    /// from "I have not looked yet" — the same three-valued honesty the probe
-    /// row keeps.
+    /// Every bundle on disk claiming this process's `CFBundleIdentifier`
+    /// (`aterm_containment::consent`, "The claimant census") and the answer's
+    /// age. The only row about the TCC record rather than this process.
+    claimants: Option<(Claimants, Duration)>,
+    /// No census answer exists yet — `census=pending`, as opposed to `off`.
     census_pending: bool,
 }
 
@@ -1043,42 +1009,29 @@ const NOTE: &str = "per-folder state is unknown by construction: reading a folde
                     so prompt_possible may remain yes";
 
 impl PrivacySnapshot {
-    /// `prompt_possible` — the module's own rule, not a second copy of it.
-    /// At most this many claimant rows. A disk with more copies than this has
-    /// a bigger problem than the report, and an unbounded row count on a
-    /// control verb is a denial of service against its own reader. The summary
-    /// row always carries the true totals, so truncation can never read as a
-    /// smaller census.
-    const MAX_CLAIMANT_ROWS: usize = 8;
-
-    /// The census rows: one summary, then one line per CONFLICTING claimant.
-    ///
-    /// Only conflicting ones get a line. A second copy that shares the running
-    /// copy's designated requirement — two Developer-ID installs from the same
-    /// team, which is an ordinary thing to have — cannot cause the destructive
-    /// resolution, and listing it would bury the one that can.
+    /// The census rows: a summary, then one line per CONFLICTING copy (at most
+    /// `MAX_CLAIMANT_ROWS`, the summary keeping the true totals). A copy that
+    /// shares the running requirement cannot reset a grant, so it is counted
+    /// and not listed.
     fn claimant_lines(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let Some(census) = &self.claimants else {
-            out.push(format!(
-                "claimants=- conflicting=- census={}",
-                if self.census_pending {
-                    "pending"
-                } else {
-                    "off"
-                }
-            ));
-            return out;
+        let Some((census, age)) = &self.claimants else {
+            let state = if self.census_pending {
+                "pending"
+            } else {
+                "off"
+            };
+            return vec![format!("claimants=- conflicting=- census={state}")];
         };
         let conflicting = census.conflicting();
-        out.push(format!(
-            "claimants={} conflicting={} census={} sole={}",
+        let mut out = vec![format!(
+            "claimants={} conflicting={} census={} sole={} age_ms={}",
             census.found.len(),
             conflicting.len(),
             census.enumeration.as_str(),
             yes_no(census.sole_claimant()),
-        ));
-        for claimant in conflicting.iter().take(Self::MAX_CLAIMANT_ROWS) {
+            age.as_millis(),
+        )];
+        for claimant in conflicting.iter().take(consent::MAX_CLAIMANT_ROWS) {
             out.push(format!(
                 "claimant path={} signing={} dr={} team={} conflicts=yes",
                 pct_encode(&claimant.path.to_string_lossy()),
@@ -1087,28 +1040,29 @@ impl PrivacySnapshot {
                 opt(claimant.team.as_deref()),
             ));
         }
-        if conflicting.len() > Self::MAX_CLAIMANT_ROWS {
+        if conflicting.len() > consent::MAX_CLAIMANT_ROWS {
             out.push(format!(
                 "claimant truncated={} of={}",
-                conflicting.len() - Self::MAX_CLAIMANT_ROWS,
+                conflicting.len() - consent::MAX_CLAIMANT_ROWS,
                 conflicting.len()
             ));
         }
         if !conflicting.is_empty() {
-            // Stated as the mechanism, with no instruction attached: the fix is
-            // the owner's to choose, and the Security panel is where a gesture
-            // that MOVES a bundle belongs (design §3.7's fence).
-            out.push(
-                "note another copy of this app on this disk carries a different code \
-                 requirement under the same bundle id; macOS keeps ONE requirement per \
-                 identifier and REPLACES it with whichever copy asks last, which resets the \
-                 grant for all of them"
-                    .to_string(),
-            );
+            out.push(format!(
+                "note {}",
+                pct_encode(
+                    "another copy of this app on this disk has a different code requirement \
+                     under the same bundle id; macOS keeps ONE requirement per bundle id and \
+                     REPLACES it with whichever copy asks last, which resets the grant for \
+                     every copy; Settings > Security lists it and can move an ad-hoc or \
+                     unsigned copy to the Trash"
+                )
+            ));
         }
         out
     }
 
+    /// `prompt_possible` — the module's own rule, not a second copy of it.
     fn prompt_possible(&self) -> bool {
         ConsentPosture::join(PostureInputs {
             adoption: Attribution::Live,
@@ -1236,11 +1190,10 @@ impl PrivacySnapshot {
             pct_encode("settings:Privacy_FilesAndFolders"),
             opt(self.reset_command.as_deref()),
         ));
-        // A grant that cannot be VALIDATED is not a grant, and this is the one
-        // condition the rest of the report cannot show: `full_disk_access=` is
-        // the probe's answer, and the probe reads a path that follows the
-        // vnode. Say it in words, on its own row, rather than leaving a reader
-        // to notice one token on the install line.
+        // A grant that cannot be VALIDATED is not a grant, and the rest of the
+        // report cannot show it: `full_disk_access=` is the probe's answer, and
+        // the probe gates on the exec-time path, which a swap leaves pointing
+        // at a healthy new bundle. Say it in words, on its own row.
         if self.anchor.grant_unverifiable() {
             out.push(format!(
                 "note {}",
@@ -1431,48 +1384,51 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         let _ = write!(body, ",{}", json_str_field(name, state));
     }
     let _ = write!(body, "}},");
-    // THE CENSUS. `census` is three-valued and `claimants`/`conflicting` are
-    // null until it answers, for the same reason the text form prints `-`: a
-    // count that was never taken must not render as zero.
-    match &snapshot.claimants {
-        None => {
-            let _ = write!(
-                body,
-                "\"census\":{{{},\"claimants\":null,\"conflicting\":null,\"sole\":null}},",
-                json_str_field(
-                    "state",
-                    if snapshot.census_pending {
-                        "pending"
-                    } else {
-                        "off"
-                    }
-                )
-            );
-        }
-        Some(census) => {
+    // THE CENSUS, with the same keys in every state: counts are null until it
+    // answers, as the text form prints `-`.
+    let _ = match &snapshot.claimants {
+        None => write!(
+            body,
+            "\"census\":{{{},\"claimants\":null,\"conflicting\":null,\"sole\":null,\
+             \"age_ms\":null,\"conflicts\":null,\"truncated\":0}},",
+            json_str_field(
+                "state",
+                if snapshot.census_pending {
+                    "pending"
+                } else {
+                    "off"
+                }
+            )
+        ),
+        Some((census, age)) => {
             let conflicting = census.conflicting();
-            let _ = write!(
+            let conflicts: Vec<String> = conflicting
+                .iter()
+                .take(consent::MAX_CLAIMANT_ROWS)
+                .map(|claimant| {
+                    format!(
+                        "{{{},{},{},\"team\":{}}}",
+                        json_str_field("path", &claimant.path.to_string_lossy()),
+                        json_str_field("signing", claimant.signing),
+                        json_str_field("dr", claimant.dr.as_str()),
+                        json_opt(claimant.team.as_deref()),
+                    )
+                })
+                .collect();
+            write!(
                 body,
-                "\"census\":{{{},\"claimants\":{},\"conflicting\":{},\"sole\":{},\"conflicts\":[",
+                "\"census\":{{{},\"claimants\":{},\"conflicting\":{},\"sole\":{},\
+                 \"age_ms\":{},\"conflicts\":[{}],\"truncated\":{}}},",
                 json_str_field("state", census.enumeration.as_str()),
                 census.found.len(),
                 conflicting.len(),
                 census.sole_claimant(),
-            );
-            for (index, claimant) in conflicting.iter().enumerate() {
-                let _ = write!(
-                    body,
-                    "{}{{{},{},{},{}}}",
-                    if index == 0 { "" } else { "," },
-                    json_str_field("path", &claimant.path.to_string_lossy()),
-                    json_str_field("signing", claimant.signing),
-                    json_str_field("dr", claimant.dr.as_str()),
-                    format_args!("\"team\":{}", json_opt(claimant.team.as_deref())),
-                );
-            }
-            let _ = write!(body, "]}},");
+                age.as_millis(),
+                conflicts.join(","),
+                conflicting.len().saturating_sub(consent::MAX_CLAIMANT_ROWS),
+            )
         }
-    }
+    };
     let _ = write!(body, "\"prompt_possible\":{},", snapshot.prompt_possible());
     let _ = write!(
         body,
@@ -1650,14 +1606,10 @@ impl App {
         let mode = aterm_containment::mode_or_containment();
         let (install, running) = install_posture_once().clone();
         // The census asks about the RUNNING bundle's identifier — never a
-        // literal. A build whose `Info.plist` cannot be read has no identifier
-        // to ask about and gets no census rather than a guessed one, which is
-        // the same rule `running_bundle_id` exists to enforce.
-        let (claimants, census_pending) = self.consent.claimants(
-            identity.bundle_id.as_deref(),
-            running.as_deref().map(Path::new),
-            policy.interval,
-        );
+        // literal; a build with no readable one gets no census.
+        let (claimants, census_pending) = self
+            .consent
+            .claimants(identity.bundle_id.as_deref(), policy.enabled);
         // The folder row's real state. `rows()` is `&self` and does NOT drain —
         // same discipline as `last_pass_ms()` below, because `read_privacy` may
         // not consume a pass the Security panel has not folded yet. `covers` is
@@ -1677,10 +1629,9 @@ impl App {
             identity: identity.clone(),
             install,
             running,
-            // Read FRESH on every report, never memoized: the whole point is
-            // that it changes under a running process. One `current_exe` plus
-            // one `exists` on a path this process already knows — no protected
-            // location, no dialog.
+            // Read FRESH on every report, never memoized: it changes under a
+            // running process. One `proc_pidpath` — no protected location, no
+            // dialog.
             anchor: aterm_containment::image_anchor(),
             fda: probe.state,
             probe: probe.label,
@@ -1726,7 +1677,9 @@ impl App {
         };
         PrivacyRead {
             lines,
-            pending: probe.label == ProbeLabel::Pending,
+            // A first census (no answer yet) takes the same bounded wait as a
+            // cold probe, so a one-shot read gets the row rather than `pending`.
+            pending: probe.label == ProbeLabel::Pending || census_pending,
         }
     }
 
@@ -2491,9 +2444,7 @@ mod tests {
         PrivacySnapshot {
             folders,
             folder_source,
-            // The default fixture is a machine whose census has not answered
-            // yet; `with_claimants` below is how a test states otherwise, so a
-            // census row can never appear in a test that did not ask for one.
+            // No census answer unless a test sets `claimants` itself.
             claimants: None,
             census_pending: false,
             platform: "macos",
@@ -2648,211 +2599,216 @@ mod tests {
         assert_eq!(format!("OK {}", lines.len()), "OK 21");
     }
 
-    /// The census takes the SAME admission discipline as the FDA probe: the
-    /// calling thread never runs `codesign`, the first read dispatches and
-    /// answers `pending`, a completed answer is cached, and an invalidation
-    /// retires it.
-    ///
-    /// The fixture counts its own invocations, so "cached" is proved by the
-    /// census NOT running again rather than by the answer merely looking the
-    /// same.
-    #[test]
-    fn the_census_never_runs_on_the_reading_thread_and_is_cached_until_invalidated() {
-        use aterm_containment::consent::Enumeration;
-        use std::sync::atomic::AtomicUsize;
+    fn census_answer(found: Vec<aterm_containment::consent::Claimant>) -> Claimants {
+        Claimants {
+            found,
+            enumeration: aterm_containment::consent::Enumeration::Complete,
+        }
+    }
 
+    fn claimant(
+        path: &str,
+        dr: DrClass,
+        signing: &'static str,
+        running: bool,
+    ) -> aterm_containment::consent::Claimant {
+        aterm_containment::consent::Claimant {
+            path: std::path::PathBuf::from(path),
+            dr,
+            dr_text: format!("designated => {} {path}", dr.as_str()),
+            signing,
+            team: None,
+            running,
+        }
+    }
+
+    /// The census never runs on the reading thread, a completed answer is
+    /// served until [`CENSUS_TTL`], and focus/config `invalidate()` leaves it
+    /// alone (neither changes the disk). The
+    /// fixture counts its own runs, so "served from the slot" is proved by the
+    /// census NOT running again. The wait is the completion wake, not a spin.
+    #[test]
+    fn the_census_runs_on_a_worker_and_survives_focus_and_config_invalidation() {
+        use std::sync::atomic::AtomicUsize;
         static RUNS: AtomicUsize = AtomicUsize::new(0);
-        fn counting_census(_id: &str, _running: Option<&Path>) -> Claimants {
+        fn counting_census(_id: &str) -> Claimants {
             RUNS.fetch_add(1, Ordering::AcqRel);
-            Claimants {
-                bundle_id: "x".to_string(),
-                found: Vec::new(),
-                enumeration: Enumeration::Complete,
-            }
+            census_answer(Vec::new())
         }
         RUNS.store(0, Ordering::Release);
-
         let mut state = ConsentState::inert();
         state.probes.live = true;
         state.probes.census = counting_census;
-        let interval = Duration::from_secs(3600);
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_completion_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wait = || {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("the worker publishes")
+        };
 
-        // First read dispatches and does NOT block for the answer.
-        let (answer, pending) = state.claimants(Some("x"), None, interval);
+        let (answer, pending) = state.claimants(Some("x"), true);
         assert!(
             answer.is_none() && pending,
             "the reading thread never waits"
         );
+        wait();
+        let (answer, pending) = state.claimants(Some("x"), true);
+        assert!(answer.is_some() && !pending);
+        assert_eq!(RUNS.load(Ordering::Acquire), 1);
 
-        // The worker lands. Poll the published slot rather than sleeping on a
-        // guess: a bounded spin keeps this test honest on a loaded machine.
-        let mut settled = None;
-        for _ in 0..2000 {
-            match state.claimants(Some("x"), None, interval) {
-                (Some(answer), _) => {
-                    settled = Some(answer);
-                    break;
-                }
-                _ => std::thread::yield_now(),
-            }
-        }
-        let settled = settled.expect("the census worker publishes");
-        assert_eq!(settled.enumeration, Enumeration::Complete);
-        assert_eq!(RUNS.load(Ordering::Acquire), 1, "exactly one worker ran");
-
-        // Cached: a second read inside the interval does not run it again.
-        let (again, pending) = state.claimants(Some("x"), None, interval);
-        assert!(again.is_some() && !pending);
-        assert_eq!(RUNS.load(Ordering::Acquire), 1, "the cache is a cache");
-
-        // Invalidation retires it — a bundle can appear beside the install at
-        // any moment, so an answer from before an activation is stale.
         state.invalidate();
-        let (after, pending) = state.claimants(Some("x"), None, interval);
+        let (answer, _) = state.claimants(Some("x"), true);
         assert!(
-            after.is_none() && pending,
-            "invalidation retires the census"
+            answer.is_some(),
+            "focus and config changes do not change the disk"
         );
+        assert_eq!(RUNS.load(Ordering::Acquire), 1, "served, not rerun");
+
+        // A move to the Trash changes the disk: the answer is dropped and the
+        // next read dispatches at once, retry floor or not.
+        state.invalidate_census();
+        let (answer, pending) = state.claimants(Some("x"), true);
+        assert!(answer.is_none() && pending);
+        wait();
+        assert!(state.claimants(Some("x"), true).0.is_some());
+        assert_eq!(RUNS.load(Ordering::Acquire), 2);
     }
 
-    /// No identifier, no census. The verb must never ask about a literal — the
-    /// same rule `running_bundle_id` enforces, and the reason the shipping half
-    /// of `aterm_containment::consent` carries no bundle-id literal at all.
+    /// A census already out when the disk changes publishes nothing: it
+    /// describes bundles that may just have moved.
     #[test]
-    fn a_host_with_no_bundle_id_is_never_given_a_guessed_one() {
+    fn a_census_out_when_the_disk_changes_publishes_nothing() {
+        use std::sync::atomic::AtomicBool;
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        fn held(_id: &str) -> Claimants {
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            census_answer(Vec::new())
+        }
+        let mut state = ConsentState::inert();
+        state.probes.live = true;
+        state.probes.census = held;
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_completion_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let wait = || {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("the worker publishes")
+        };
+        assert_eq!(state.claimants(Some("x"), true), (None, true));
+        state.invalidate_census();
+        RELEASE.store(true, Ordering::Release);
+        wait();
+        let (answer, pending) = state.claimants(Some("x"), true);
+        assert!(answer.is_none() && pending, "the stale answer is dropped");
+        wait();
+        assert!(state.claimants(Some("x"), true).0.is_some());
+    }
+
+    /// No census without a bundle id, with the privacy posture disabled, or on
+    /// an inert instance — and never a guessed id.
+    #[test]
+    fn the_census_is_off_without_an_id_a_live_instance_or_the_master_switch() {
         static RAN: AtomicU64 = AtomicU64::new(0);
-        fn never(_id: &str, _running: Option<&Path>) -> Claimants {
+        fn never(_id: &str) -> Claimants {
             RAN.fetch_add(1, Ordering::AcqRel);
             Claimants::default()
         }
         let mut state = ConsentState::inert();
         state.probes.live = true;
         state.probes.census = never;
-        let (answer, pending) = state.claimants(None, None, Duration::from_secs(1));
-        assert!(answer.is_none() && !pending, "not pending — never asked");
-        assert_eq!(RAN.load(Ordering::Acquire), 0);
-
-        // And an inert (headless / non-macOS) instance reads nothing either.
+        assert_eq!(state.claimants(None, true), (None, false));
+        assert_eq!(state.claimants(Some("x"), false), (None, false));
         let mut inert = ConsentState::inert();
         inert.probes.census = never;
-        let (answer, pending) = inert.claimants(Some("x"), None, Duration::from_secs(1));
-        assert!(answer.is_none() && !pending);
+        assert_eq!(inert.claimants(Some("x"), true), (None, false));
         assert_eq!(RAN.load(Ordering::Acquire), 0);
     }
 
-    /// THE CENSUS ROWS, in the state that actually destroyed a grant.
-    ///
-    /// On 2026-09-21 the owner's disk held a Developer-ID `/Applications`
-    /// install and two AD-HOC bundles in `~/aterm/dist` claiming the same
-    /// identifier. Every other row on this report was TRUE of the process
-    /// reading it — `dr=identity grant_stable=yes anchor=live` — and none of
-    /// them was about the row that `tccd` was rewriting. These rows are the
-    /// ones that would have said so.
+    /// The census rows in the state that destroys a grant: a Developer-ID
+    /// install with two ad-hoc copies beside it. The summary carries the true
+    /// totals, each differing copy gets a line, the running copy is the
+    /// reference and not a finding, and the mechanism is stated once.
     #[test]
     fn the_census_rows_name_every_conflicting_copy_and_say_why_it_matters() {
-        use aterm_containment::consent::{Claimant, Enumeration};
-
-        let claimant = |path: &str, dr_text: &str, dr, signing, running| Claimant {
-            path: std::path::PathBuf::from(path),
-            dr,
-            dr_text: dr_text.to_string(),
-            signing,
-            team: None,
-            running,
-        };
         let mut snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
-        snap.claimants = Some(Claimants {
-            bundle_id: "com.aterm.aterm".to_string(),
-            found: vec![
+        snap.claimants = Some((
+            census_answer(vec![
                 claimant(
                     "/Applications/aterm.app",
-                    "designated => identifier \"x\" and anchor apple generic",
                     DrClass::Identity,
                     "developer-id",
                     true,
                 ),
                 claimant(
-                    "/Users//a/aterm/dist/aterm.app.rollback",
-                    "designated => cdhash H\"4249c4f5\"",
+                    "/Applications/aterm.app.rollback",
                     DrClass::Cdhash,
                     "adhoc",
                     false,
                 ),
-                claimant(
-                    "/Users//a/aterm/dist/aterm-b826-backup.app",
-                    "designated => cdhash H\"20d41c8d\"",
-                    DrClass::Cdhash,
-                    "adhoc",
-                    false,
-                ),
-            ],
-            enumeration: Enumeration::Complete,
-        });
+                claimant("/Users//a/aterm-backup.app", DrClass::Cdhash, "adhoc", false),
+            ]),
+            Duration::from_millis(1200),
+        ));
         let lines = snap.lines();
-
         assert!(
-            lines.contains(&"claimants=3 conflicting=2 census=complete sole=no".to_string()),
-            "the summary carries the true totals: {lines:?}"
-        );
-        // One row per CONFLICTING copy, path percent-encoded like every other
-        // free-text field on this wire.
-        assert!(
-            lines.iter().any(|l| l
-                == "claimant path=/Users//a/aterm/dist/aterm.app.rollback signing=adhoc \
-                    dr=cdhash team=- conflicts=yes"),
+            lines.contains(
+                &"claimants=3 conflicting=2 census=complete sole=no age_ms=1200".to_string()
+            ),
             "{lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("aterm-b826-backup.app") && l.contains("conflicts=yes")),
+            lines.contains(
+                &"claimant path=/Applications/aterm.app.rollback signing=adhoc dr=cdhash \
+                  team=- conflicts=yes"
+                    .to_string()
+            ),
             "{lines:?}"
         );
-        // The RUNNING copy is counted but never listed as a conflict with
-        // itself — it is the reference the others are compared against.
         assert!(
             !lines
                 .iter()
-                .any(|l| l.starts_with("claimant path=/Applications/")),
-            "the running copy is the reference, not a finding: {lines:?}"
+                .any(|l| l.starts_with("claimant path=/Applications/aterm.app ")),
+            "the running copy is the reference: {lines:?}"
         );
-        // And the mechanism is stated, because a list of paths with no reason
-        // attached reads as trivia rather than as the thing eating the grant.
         let note = lines
             .iter()
-            .find(|l| l.starts_with("note another copy"))
+            .find(|l| l.starts_with("note another%20copy"))
             .expect("the conflicting census explains itself");
-        assert!(note.contains("ONE requirement per identifier"), "{note}");
         assert!(note.contains("REPLACES"), "{note}");
     }
 
-    /// A census that found only itself says so positively, and adds no rows
-    /// beyond the summary: the ordinary machine must not grow a wall of text.
+    /// A lone install says `sole=yes` and adds nothing beyond the summary.
     #[test]
     fn a_lone_install_reports_sole_and_nothing_more() {
-        use aterm_containment::consent::{Claimant, Enumeration};
         let mut snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
-        snap.claimants = Some(Claimants {
-            bundle_id: "com.aterm.aterm".to_string(),
-            found: vec![Claimant {
-                path: std::path::PathBuf::from("/Applications/aterm.app"),
-                dr: DrClass::Identity,
-                dr_text: "designated => identifier \"x\" and anchor apple generic".to_string(),
-                signing: "developer-id",
-                team: Some("A66A9P66Z7".to_string()),
-                running: true,
-            }],
-            enumeration: Enumeration::Complete,
-        });
+        snap.claimants = Some((
+            census_answer(vec![claimant(
+                "/Applications/aterm.app",
+                DrClass::Identity,
+                "developer-id",
+                true,
+            )]),
+            Duration::ZERO,
+        ));
         let lines = snap.lines();
-        assert!(lines.contains(&"claimants=1 conflicting=0 census=complete sole=yes".to_string()));
-        assert!(!lines.iter().any(|l| l.starts_with("claimant ")));
-        assert!(!lines.iter().any(|l| l.starts_with("note another copy")));
+        assert!(
+            lines.contains(
+                &"claimants=1 conflicting=0 census=complete sole=yes age_ms=0".to_string()
+            )
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("claimant ") || l.starts_with("note another"))
+        );
     }
 
-    /// `pending` and `off` are different answers and neither is a count. A
-    /// census that has not run must never render `claimants=0`, which is the
-    /// same over-claim `sole_claimant` refuses inside the census itself.
+    /// `pending` and `off` are different answers and neither is a count.
     #[test]
     fn an_unanswered_census_never_renders_a_count() {
         let mut snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
@@ -2866,9 +2822,64 @@ mod tests {
             snap.lines()
                 .contains(&"claimants=- conflicting=- census=off".to_string())
         );
-        for line in snap.lines() {
-            assert!(!line.starts_with("claimants=0"), "{line}");
+    }
+
+    /// The JSON census object has the same keys in every state, and caps its
+    /// list like the text form does.
+    #[test]
+    fn the_json_census_parses_in_both_states_and_is_capped() {
+        let keys = [
+            "state",
+            "claimants",
+            "conflicting",
+            "sole",
+            "age_ms",
+            "conflicts",
+            "truncated",
+        ];
+        let snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
+        let json: aterm_json::Value =
+            aterm_json::from_str(cmd_privacy_json(&snap).lines().nth(1).expect("JSON body"))
+                .expect("pending json parses");
+        for key in keys {
+            assert!(
+                json["census"].get(key).is_some(),
+                "{key} in the unanswered form"
+            );
         }
+        assert_eq!(json["census"]["state"].as_str(), Some("off"));
+
+        let mut snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
+        let mut found = vec![claimant(
+            "/A/aterm.app",
+            DrClass::Identity,
+            "developer-id",
+            true,
+        )];
+        for n in 0..(aterm_containment::consent::MAX_CLAIMANT_ROWS + 3) {
+            found.push(claimant(
+                &format!("/A/copy-{n}.app"),
+                DrClass::Cdhash,
+                "adhoc",
+                false,
+            ));
+        }
+        snap.claimants = Some((census_answer(found), Duration::from_millis(7)));
+        let json: aterm_json::Value =
+            aterm_json::from_str(cmd_privacy_json(&snap).lines().nth(1).expect("JSON body"))
+                .expect("answered json parses");
+        for key in keys {
+            assert!(
+                json["census"].get(key).is_some(),
+                "{key} in the answered form"
+            );
+        }
+        assert_eq!(
+            json["census"]["conflicts"].as_array().map(Vec::len),
+            Some(aterm_containment::consent::MAX_CLAIMANT_ROWS)
+        );
+        assert_eq!(json["census"]["truncated"].as_u64(), Some(3));
+        assert_eq!(json["census"]["conflicting"].as_u64(), Some(11));
     }
 
     /// A big instance is still exact: no cap, no ellipsis, no "…and N more".
@@ -3325,15 +3336,10 @@ mod tests {
         }
     }
 
-    /// A grant that cannot be VALIDATED is reported as such, on its own row.
-    ///
-    /// The defect this detects cost the owner four and a half hours on
-    /// 2026-09-19 with nothing in the posture saying so: `running=` follows the
-    /// vnode, so it names the image's current path and reads healthy in exactly
-    /// the state where the bundle was renamed or deleted under a live process.
+    /// A grant that cannot be VALIDATED is reported as such, on its own row:
+    /// `running=` is the exec-time path and reads healthy after a swap, and
     /// `full_disk_access=granted` can be true at the same moment and mean
-    /// nothing, which is why the note is unconditional on the anchor rather
-    /// than folded into the probe's answer.
+    /// nothing, so the note keys on the anchor rather than the probe.
     #[test]
     fn an_unvalidatable_identity_is_reported_and_does_not_hide_behind_a_granted_probe() {
         use aterm_containment::ImageAnchor;
@@ -3536,64 +3542,13 @@ mod tests {
         );
     }
 
-    /// The signing readers, over recorded `codesign -d -r- --verbose=2`
-    /// output. They fail toward the WEAKER claim: anything unrecognised is
-    /// `unknown`, never `developer-id`.
+    /// The dev-build mark: case-insensitive, and fail-OPEN — a plist that
+    /// cannot be read is never a dev build.
     #[test]
-    fn the_signing_readers_fail_toward_the_weaker_claim() {
-        let devid = "Executable=/Applications/aterm.app/Contents/MacOS/aterm\n\
-                     Identifier=com.aterm.aterm\n\
-                     TeamIdentifier=A66A9P66Z7\n\
-                     designated => identifier \"com.aterm.aterm\" and anchor apple generic\n";
-        assert_eq!(classify_signing(devid), "developer-id");
-        assert_eq!(team_identifier(devid).as_deref(), Some("A66A9P66Z7"));
-        assert_eq!(
-            consent::classify_dr(&designated_requirement(devid).unwrap()),
-            DrClass::Identity
-        );
-
-        let adhoc = "Identifier=com.aterm.aterm.dev\n\
-                     Signature=adhoc\n\
-                     TeamIdentifier=not set\n\
-                     designated => cdhash H\"abc\"\n";
-        assert_eq!(classify_signing(adhoc), "adhoc");
-        assert_eq!(team_identifier(adhoc), None, "`not set` is not a team id");
-        assert_eq!(
-            consent::classify_dr(&designated_requirement(adhoc).unwrap()),
-            DrClass::Cdhash,
-            "a cdhash pin does not survive a rebuild"
-        );
-
-        let unsigned = "/x: code object is not signed at all\n";
-        assert_eq!(classify_signing(unsigned), "unsigned");
-        assert_eq!(designated_requirement(unsigned), None);
-
-        assert_eq!(classify_signing("something else entirely\n"), "unknown");
-    }
-
-    /// The plist reader: XML only, exact key, and a binary plist reads as
-    /// absent rather than as a wrong answer.
-    #[test]
-    fn the_plist_reader_is_exact_and_xml_only() {
-        let xml = "<plist><dict>\
-                   <key>CFBundleIdentifier</key><string>com.aterm.aterm.dev</string>\
-                   <key>CFBundleName</key><string>aterm (dev)</string>\
-                   <key>ATermDevBuild</key><string>TRUE</string>\
-                   </dict></plist>";
-        assert_eq!(
-            plist_string(xml, "CFBundleIdentifier"),
-            Some("com.aterm.aterm.dev")
-        );
-        assert_eq!(plist_string(xml, "CFBundleName"), Some("aterm (dev)"));
-        assert_eq!(plist_string(xml, "CFBundleDisplayName"), None);
-        assert!(plist_marks_dev_build(xml), "the mark is case-insensitive");
-        // A key whose value is not the next element must not bind to a later
-        // string.
-        assert_eq!(
-            plist_string("<key>A</key><key>B</key><string>v</string>", "A"),
-            None
-        );
-        // Fails OPEN: an unreadable plist is never a dev build.
+    fn the_dev_build_mark_fails_open() {
+        assert!(plist_marks_dev_build(
+            "<key>ATermDevBuild</key><string>TRUE</string>"
+        ));
         assert!(!plist_marks_dev_build("bplist00\u{0}\u{1}"));
         assert!(!plist_marks_dev_build(
             "<key>ATermDevBuild</key><string>false</string>"

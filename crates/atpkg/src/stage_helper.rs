@@ -14,20 +14,27 @@
 //! 2026-09-12, bundle `trust/8590`). Nothing a tracked process spawns escapes — `fork`,
 //! `posix_spawn`, `setsid`, `osascript`, `exec` into a clean image were all measured
 //! tagged. The one thing that does escape is a job LAUNCHD spawns from an UNTAGGED
-//! executable: launchd is the job's parent, not us.
+//! executable that sits in no stamped `.app`: launchd is the job's parent, not us, and
+//! the kernel charges a process to the outermost `.app` above its executable (measured
+//! 2026-09-23 — [`crate::provenance::taint_candidates`]).
 //!
 //! # The mechanism (measured: `scratchpad/provenance/probe2.sh` m6/m8/m17/m18 on
 //! 2026-09-12, re-measured on 2026-09-13 — the commit that introduced [`plan_helper`])
 //!
 //! 1. The tracked parent writes a small SPEC (archive, destination, the fields
 //!    [`crate::install::stage_payload_spec`] reads) into the per-program staging scratch.
-//! 2. It MEASURES this very binary (`xattr`, [`crate::provenance::xattr_names`]) and plans
-//!    the job from that ([`plan_helper`]):
-//!    * an UNTAGGED binary — the installed app's own executable, a build made from an
-//!      untracked shell — is run IN PLACE, by its real path: launchd is the job's parent
-//!      and the tag follows the executable, so the job is untracked and writes clean
-//!      files (a launchd job exec'ing a clean script writes clean files; one exec'ing a
-//!      tagged script writes tagged files — both measured 2026-09-13);
+//! 2. It MEASURES this very binary and every `.app` directory above it (`xattr`,
+//!    [`crate::provenance::provenance_carrier`]) and plans the job from that
+//!    ([`plan_helper`]). "Tagged" below means that walk found a carrier:
+//!    * an UNTAGGED binary — a build made from an untracked shell, the installed app's
+//!      own executable when its bundle is clean too — is run IN PLACE, by its real path:
+//!      launchd is the job's parent, so the job is untracked and writes clean files (a
+//!      launchd job exec'ing a clean script writes clean files; one exec'ing a tagged
+//!      script writes tagged files — both measured 2026-09-13). The executable alone is
+//!      NOT the whole question: a clean executable inside a stamped bundle runs tracked
+//!      (measured 2026-09-23), which is the shape of an app placed by a tracked
+//!      v0.86.0–v0.89.0 updater, and until 2026-09-23 this step read the executable alone and ran that
+//!      shape in place;
 //!    * a TAGGED binary that stands alone — a `target/debug/aterm` built from a tracked
 //!      shell — is first BYTE-COPIED by the job itself (`cat`, by the untracked job: the
 //!      copy is clean and runs clean, measured; `cp`/`ditto` would carry the tag across)
@@ -68,16 +75,14 @@
 //!
 //! Not a trust boundary: the helper is our own bytes (in place, or a copy in our own
 //! `0700` staging dir under the store lock), and the root it reports is re-verified
-//! against the SIGNED root by the parent as always (`ATPKG_STAGE_DISK_REVERIFY` re-arms
-//! the on-disk walk). Not silent once it is needed: a tracked installer whose lane
-//! cannot run — no launchd, a job that never starts, a helper that does not answer —
-//! stages in-process, says so, and RECORDS it beside the build
-//! (`<build>.tracked-install`), which `aterm pkg doctor` reports as the cause and
-//! `aterm pkg repair` names as needing a re-seed; `ATPKG_REFUSE_TRACKED_INSTALL=1`
-//! REFUSES the install instead ([`crate::install::StageError::TrackedInstaller`]) for an
-//! operator who would rather have no toolchain than a tagged one
-//! ([`crate::install::stage_for_store_with`] has the decision, [`crate::lay`] the policy
-//! and why the default flipped on 2026-09-14). And it is only half of the story:
+//! against the SIGNED root by the parent as always (the `ATPKG_STAGE_DISK_REVERIFY`
+//! development seam re-arms the on-disk walk). Not the last word either: a tracked
+//! installer whose lane cannot run — no launchd, a job that never starts, a helper that
+//! does not answer — stages in-process, and whatever came out tagged is then cleared in
+//! place by [`crate::provenance::heal`] before the build is swapped in. Only a heal that
+//! fails leaves a record beside the build (`<build>.tracked-install`), or — under
+//! `[packages] tracked_install = "refuse"` — refuses the install
+//! ([`crate::install::StageError::TrackedInstaller`]). And it is only half of the story:
 //! `bin/<tool>` is a `#!/bin/sh`
 //! script, and a tagged shim tracks the tool it execs (law m21) — so the shims, the
 //! `agents/` twins, the pending and reroute stubs and the tombstones go through the same
@@ -98,6 +103,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 use crate::install::StageSpec;
@@ -116,11 +122,13 @@ const SPEC_HEADER: &str = "atpkg-stage-spec v1";
 /// seconds, not three (audit 2026-09-14): under load launchd has taken longer than three
 /// to start a submitted job, and a job called dead before it ran was a lane "failure"
 /// that sent a clean install down the in-process path.
+#[cfg(target_os = "macos")]
 const EXIT_GRACE: Duration = Duration::from_secs(10);
 
 /// The absolute ceiling on one staged extraction (the shipped `trust` member is 3.4 GB;
 /// a slow disk is minutes, never hours). Past this the lane is declared wedged — a lane
 /// failure, which the caller's policy answers (an in-process stage, recorded, by default).
+#[cfg(target_os = "macos")]
 const CEILING: Duration = Duration::from_secs(6 * 60 * 60);
 
 // ---------------------------------------------------------------------------------------
@@ -330,12 +338,16 @@ pub fn exe_serves_hidden_verb(exe: &Path) -> bool {
 
 /// What the untracked lane laid: the folded `tree_root`, and whether the first regular
 /// file it laid nevertheless came back carrying the tag — MEASURED, not assumed. A tagged
-/// witness means the lane ran but did not achieve its purpose (never observed: launchd is
-/// the job's parent and the helper it runs is untagged — in place or as a clean copy —
-/// so every measurement came back clean);
-/// the tree is still the verified tree, and the caller decides under its policy
-/// ([`crate::install::stage_for_store_with`]) whether to keep it and record the fact or
-/// to refuse.
+/// witness means the lane ran but did not achieve its purpose. This said "never
+/// observed" until 2026-09-23. On 2026-09-22 the owner's Mac held eight such records,
+/// every `<build>.tracked-install` sidecar in its store, the Trust toolchain among them;
+/// five survived the garbage collection of their siblings. The sidecars do not name the
+/// plan, so the cause is inferred: they date from 2026-09-18 to 2026-09-20, when the
+/// installed app had a stamped bundle around a clean executable, and that shape was
+/// planned in place ([`plan_for_exe`], which now measures the bundle too). The reading
+/// is what caught it, which is why it stays a measurement. The tree is still the
+/// verified tree; the caller keeps it and clears the tag
+/// ([`crate::install::verify_and_stage_with`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedUntracked {
     /// The folded `tree_root` of what the job laid.
@@ -438,6 +450,7 @@ pub fn stage_untracked(
 
 /// Empty `dir` in place (remove its contents, keep the directory) — the state the
 /// in-process lane's `require_empty_destination` accepts.
+#[cfg(target_os = "macos")]
 fn clear_dir(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
@@ -454,6 +467,7 @@ fn clear_dir(dir: &Path) {
 
 /// The first regular file under `dir`, depth-first in name order — `Ok(None)` for a
 /// tree with none, `Err` for a walk that could not look (an error, never "clean").
+#[cfg(target_os = "macos")]
 pub(crate) fn first_regular_file(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
         .collect::<Result<Vec<_>, _>>()?
@@ -476,17 +490,20 @@ pub(crate) fn first_regular_file(dir: &Path) -> std::io::Result<Option<PathBuf>>
 }
 
 /// How the launchd job runs the helper — decided by [`plan_helper`] from a MEASUREMENT
-/// of the binary (its tag) and its shape (a bundle's own executable or free-standing),
-/// never from where it was built.
+/// of the binary AND every `.app` directory above it (the tag, the quarantine
+/// attribute — [`crate::provenance::taint_candidates`]) and its shape (a bundle's own
+/// executable or free-standing), never from where it was built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperPlan {
-    /// The binary is untagged: the job runs it in place, by its real path. launchd is
-    /// the parent and the tag follows the executable, so the job is untracked.
+    /// Nothing that decides tracking is stamped — not the binary, not any `.app` above
+    /// it: the job runs it in place, by its real path. launchd is the parent, so the job
+    /// is untracked.
     ExecOriginal,
-    /// The binary is tagged and free-standing: the job `cat`s it to a clean copy first
+    /// The binary is tainted and free-standing: the job `cat`s it to a clean copy first
     /// (a byte copy made by an untracked process is clean — measured) and runs the copy.
     CopyThenExec,
-    /// The binary is tagged and is a bundle's own executable (`<bundle>.app/Contents/
+    /// The binary is tainted — it, or an `.app` above it, carries the tag or the
+    /// quarantine attribute — and is a bundle's own executable (`<bundle>.app/Contents/
     /// MacOS/<exe>`): the job byte-copies the WHOLE bundle — every directory, every
     /// symlink re-linked, every regular file `cat`'d, executables re-marked `0755` —
     /// into its scratch and runs the copy's executable of the same name. A lone copy
@@ -527,9 +544,9 @@ pub fn bundle_of(exe: &Path) -> Option<PathBuf> {
     contents.parent().map(Path::to_path_buf)
 }
 
-/// Decide how the job runs `exe` from the two facts about it: `tagged` (measured —
-/// [`crate::provenance::carries_provenance`]) and the bundle it belongs to, if any
-/// ([`bundle_of`]). An untagged binary runs in place whatever its shape; a tagged
+/// Decide how the job runs `exe` from the two facts about it: `tagged` (measured on the
+/// binary and every `.app` above it — [`crate::provenance::provenance_carrier`], plus the
+/// quarantine attribute) and the bundle it belongs to, if any ([`bundle_of`]). An untagged binary runs in place whatever its shape; a tagged
 /// free-standing one is copied clean by the job; a tagged bundle executable is run from
 /// a clean copy of its WHOLE bundle ([`HelperPlan::CopyBundleThenExec`]) — in place it
 /// would be tracked, and a lone copy of the executable cannot run. Every shape has a
@@ -547,32 +564,39 @@ pub fn plan_helper(_exe: &Path, tagged: bool, bundle: Option<&Path>) -> HelperPl
 }
 
 /// [`plan_helper`] for a real binary: the tag AND the quarantine attribute measured with
-/// `xattr` (on the binary, and for a bundle executable on the bundle), the bundle read off
-/// the path. A binary that cannot be inspected is an error, not "untagged" — a plan built
-/// on a failure to look would run a possibly tainted helper and call its files clean.
+/// `xattr` on the binary and on every `.app` directory above it
+/// ([`crate::provenance::taint_candidates`]), the bundle read off the path. A binary or
+/// bundle that cannot be inspected is an error, not "untagged" — a plan built on a
+/// failure to look would run a possibly tainted helper and call its files clean.
 pub fn plan_for_exe(exe: &Path) -> Result<HelperPlan, String> {
-    let names = crate::provenance::xattr_names(exe).map_err(|e| {
-        format!(
-            "cannot inspect {} for com.apple.provenance: {e}",
-            exe.display()
-        )
-    })?;
-    let tagged = names
-        .iter()
-        .any(|n| n == crate::provenance::PROVENANCE_XATTR);
+    plan_for_exe_with(exe, crate::provenance::PROVENANCE_XATTR)
+}
+
+/// [`plan_for_exe`] for the tag `attr` — a parameter so a test can taint a bundle with an
+/// attribute it is able to set (`com.apple.provenance` cannot be set by hand).
+pub(crate) fn plan_for_exe_with(exe: &Path, attr: &str) -> Result<HelperPlan, String> {
+    let bundle = bundle_of(exe);
+    // THE BUNDLE'S STAMP COUNTS (2026-09-23). This read the tag off the executable
+    // alone, which was right while a self-updated app carried the tag on every file. A
+    // tracked updater from v0.86.0 to v0.89.0 wrote the files clean and still stamped the
+    // bundle DIRECTORY with the rename that placed it (8e7868f52 cleaned the files; 15ec68a85,
+    // in v0.90.0, cleaned the root), and a plain-rename fallback still can. A clean
+    // executable run in place from a stamped bundle is tracked all the same (measured;
+    // the table is on `taint_candidates`). So that shape planned `ExecOriginal`: the
+    // job ran in place on the belief that it was untracked, and its own witness measured
+    // otherwise — the eight `<build>.tracked-install` records the owner's Mac held on
+    // 2026-09-22, the Trust toolchain among them. `tests/untracked_stamped_bundle.rs`
+    // is the regression.
+    let tagged = crate::provenance::carrier_of(exe, attr)?.is_some();
     // QUARANTINE COUNTS THE SAME. A browser download carries `com.apple.quarantine` and
     // no provenance tag at all, so it reads as untagged — and yet a launchd job that
     // exec's it IN PLACE is tracked and writes tagged files (measured 2026-09-14 on m16
     // with the Safari-installed 0.84.0: the result file its hidden verb wrote came back
-    // tagged). Planning that binary `ExecOriginal` is the one way this lane can still
-    // hand out a tagged toolchain while believing it laid a clean one, so a quarantined
-    // helper takes the copy lane exactly as a tagged one does.
+    // tagged). Planning that binary `ExecOriginal` runs it in place on a false belief
+    // that the job is untracked — the same failure as the stamped bundle above — so a
+    // quarantined helper takes the copy lane exactly as a tagged one does.
     let quarantined = crate::provenance::quarantined_carrier(exe).is_some();
-    Ok(plan_helper(
-        exe,
-        tagged || quarantined,
-        bundle_of(exe).as_deref(),
-    ))
+    Ok(plan_helper(exe, tagged || quarantined, bundle.as_deref()))
 }
 
 /// Where THIS process keeps its bundle replica: `<lanes scratch>/replica-<pid>-0-<nonce>/`,
@@ -660,10 +684,6 @@ pub const LANE_PARENT_ENV: &str = "ATPKG_LANE_PARENT";
 /// Every hidden verb calls it first. No variable (a helper run by hand, an old parent)
 /// arms nothing.
 pub fn arm_parent_watchdog() {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return;
-    }
     #[cfg(target_os = "macos")]
     let Some(parent) = std::env::var(LANE_PARENT_ENV)
         .ok()
@@ -753,9 +773,10 @@ fn label_is_listed(label: &str) -> bool {
 }
 
 /// One submitted job: its scratch dir, label and files. Shared by the two hidden verbs —
-/// the staging lane here and the executable-laying lane ([`crate::lay`]) — so there is
-/// ONE launchd choreography (plan, wrapper, result and status files, grace, ceiling,
-/// self-removal, sweep, cleanup).
+/// the staging lane here and the executable-laying lane ([`crate::lay`]) — and by the tag
+/// heal ([`crate::provenance::heal`], [`Job::submit_platform`]), so there is ONE launchd
+/// choreography (plan, wrapper, result and status files, grace, ceiling, self-removal,
+/// sweep, cleanup).
 #[cfg(target_os = "macos")]
 pub(crate) struct Job {
     dir: PathBuf,
@@ -774,12 +795,18 @@ pub(crate) struct Job {
 #[cfg(target_os = "macos")]
 const LABEL_PREFIX: &str = "systems.alab.atpkg.";
 
-/// The stems a job directory or label can carry — the three lanes' and the
-/// process-wide bundle replica's — and the ONLY names the dead-pid sweep removes: a
-/// name whose stem is not one of these is not a job of ours, whatever the rest of it
-/// looks like; the sweep DELETES what it accepts.
+/// The stems a job directory or label can carry — the three lanes', the tag heal's
+/// ([`crate::provenance::heal`]) and the process-wide bundle replica's — and the ONLY
+/// names the dead-pid sweep removes: a name whose stem is not one of these is not a job
+/// of ours, whatever the rest of it looks like; the sweep DELETES what it accepts.
 #[cfg(target_os = "macos")]
-const JOB_STEMS: &[&str] = &["stage-helper", "lay-helper", "view-helper", "replica"];
+const JOB_STEMS: &[&str] = &[
+    "stage-helper",
+    "lay-helper",
+    "view-helper",
+    "heal",
+    "replica",
+];
 
 /// The scratch the executable-laying and view lanes use when this process has a store:
 /// `<prefix>/staging/.lanes/`, `0700` under a `0700` prefix and dot-hidden (Spotlight
@@ -938,6 +965,77 @@ impl Job {
             ));
         }
         Ok(())
+    }
+
+    /// `launchctl submit` a job made only of PLATFORM binaries: `/bin/sh -c <script>`
+    /// with `$0` = `name`, `$1` = the status file, `$2` = this job's label, and `args`
+    /// after them. No helper plan — nothing of ours runs, so nothing of ours can make the
+    /// job tracked (`/bin/sh` and what it calls under `/usr/bin` cannot carry the tag).
+    /// The script must record its status in `$1` (temp + rename) and remove its own label
+    /// (`$2`) as its last acts, as the lanes' wrapper does.
+    pub(crate) fn submit_platform(
+        &mut self,
+        name: &str,
+        script: &str,
+        args: &[&std::ffi::OsStr],
+    ) -> Result<(), String> {
+        self.helper = PathBuf::from("/bin/sh");
+        let out = std::process::Command::new("/bin/launchctl")
+            .arg("submit")
+            .args(["-l", &self.label])
+            .arg("-o")
+            .arg(&self.out_log)
+            .arg("-e")
+            .arg(&self.err_log)
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(name)
+            .arg(&self.status)
+            .arg(&self.label)
+            .args(args)
+            .output()
+            .map_err(|e| format!("spawn /bin/launchctl: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "launchctl submit failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Wait at most `bound` for the status the job records, and return it — `None` when
+    /// the bound passed first, or when launchd no longer lists the job and it recorded
+    /// nothing (the script records its status BEFORE it removes its own label, so a label
+    /// gone without a status is a job that died). The caller drops the job either way,
+    /// which removes a label still registered.
+    pub(crate) fn wait_for_status(&self, bound: Duration) -> Option<i32> {
+        let started = Instant::now();
+        let mut last_look = started;
+        loop {
+            if let Some(status) = self.read_status() {
+                return Some(status);
+            }
+            if started.elapsed() >= bound {
+                return None;
+            }
+            if last_look.elapsed() >= Duration::from_millis(500) {
+                last_look = Instant::now();
+                if matches!(self.liveness(), Liveness::Unknown) {
+                    return self.read_status();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// This job's launchd label.
+    #[cfg(test)]
+    pub(crate) fn label(&self) -> &str {
+        &self.label
     }
 
     /// What launchd says about the label right now.
@@ -1474,6 +1572,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// THE BUNDLE ROOT IS TAINT TOO (2026-09-23). A clean executable inside a bundle
+    /// whose ROOT carries the tag, run in place by launchd, laid TAGGED files — the cause of
+    /// every "the lane ran, but its files came back tagged" record — so it is planned as a
+    /// tagged bundle: run from a clean copy of the whole bundle. The tag is minted as a
+    /// synthetic attribute through the very path production reads (`com.apple.provenance`
+    /// cannot be set by hand); a tag on a bundle file that is neither the executable nor
+    /// the root plans nothing new.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_clean_executable_in_a_tagged_bundle_root_is_planned_as_a_tagged_bundle() {
+        let d =
+            std::env::temp_dir().join(format!("atpkg-stage-helper-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let app = d.join("aterm.app");
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::write(contents.join("Info.plist"), b"<plist/>").unwrap();
+        let exe = contents.join("MacOS").join("aterm");
+        std::fs::write(&exe, b"").unwrap();
+        let attr = "user.aterm.probe";
+        assert_eq!(
+            plan_for_exe_with(&exe, attr).unwrap(),
+            HelperPlan::ExecOriginal,
+            "clean root, clean executable: in place"
+        );
+        crate::provenance::set_xattr_for_test(&contents.join("Info.plist"), attr, b"1").unwrap();
+        assert_eq!(
+            plan_for_exe_with(&exe, attr).unwrap(),
+            HelperPlan::ExecOriginal,
+            "a tagged file inside the bundle is not its root"
+        );
+        crate::provenance::set_xattr_for_test(&app, attr, b"1").unwrap();
+        assert_eq!(
+            plan_for_exe_with(&exe, attr).unwrap(),
+            HelperPlan::CopyBundleThenExec {
+                bundle: app.clone()
+            },
+            "a tagged ROOT over a clean executable: a clean copy of the whole bundle"
+        );
+        // A free-standing binary has no root to read.
+        let lone = d.join("atpkg");
+        std::fs::write(&lone, b"").unwrap();
+        assert_eq!(
+            plan_for_exe_with(&lone, attr).unwrap(),
+            HelperPlan::ExecOriginal
+        );
+        // An executable that cannot be inspected is an error, never "clean".
+        assert!(plan_for_exe_with(&d.join("absent"), attr).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A platform job that does not finish inside its bound is answered `None`, and
+    /// dropping it removes its label from launchd and its scratch from disk — the heal's
+    /// timeout path. One that finishes answers the status it recorded, and its own label is
+    /// gone with it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_platform_job_is_waited_for_within_its_bound_and_removed_on_every_path() {
+        let scratch =
+            std::env::temp_dir().join(format!("atpkg.platform.job.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let listed = |label: &str| label_is_listed(label);
+
+        // Finishes: records 7, removes its own label.
+        let mut job = Job::prepare(&scratch, "heal").unwrap();
+        job.submit_platform(
+            "atpkg-test",
+            r#"printf '%s\n' 7 > "$1.tmp" && /bin/mv -f "$1.tmp" "$1"; /bin/launchctl remove "$2"; exit 0"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(job.wait_for_status(Duration::from_secs(20)), Some(7));
+        let label = job.label().to_string();
+        drop(job);
+        assert!(!listed(&label), "{label} removed itself");
+
+        // Never finishes: the bound answers `None`, and the drop removes the label.
+        let mut job = Job::prepare(&scratch, "heal").unwrap();
+        job.submit_platform("atpkg-test", "exec /bin/sleep 60", &[])
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(job.wait_for_status(Duration::from_millis(700)), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let label = job.label().to_string();
+        assert!(listed(&label), "still running before the drop");
+        drop(job);
+        assert!(!listed(&label), "{label} removed by the drop");
+        let left: Vec<_> = std::fs::read_dir(&scratch).unwrap().flatten().collect();
+        assert!(left.is_empty(), "no job scratch left: {left:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// The wrapper, run by `/bin/sh` directly (no launchd): in place it makes no copy and
     /// records the helper's exit status; a helper killed by SIGKILL is recorded as 137
     /// (`128 + 9`, the shell's convention); with a copy path it `cat`s the helper there,
@@ -1687,6 +1878,11 @@ mod tests {
         assert_eq!(
             owner_pid_of_label("systems.alab.atpkg.lay-helper-4281-1-18d4bf61975232a8"),
             Some(4281)
+        );
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.heal-4281-2-18d4bf61975232a9"),
+            Some(4281),
+            "the tag heal's job is one of ours"
         );
         assert_eq!(
             owner_pid_of_label("systems.alab.atpkg.test.clean.123"),

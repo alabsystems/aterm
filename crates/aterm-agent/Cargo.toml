@@ -65,6 +65,24 @@ aterm-json = { workspace = true }
 # (aterm-pty + aterm-uds) with no third-party package behind it, and no cycle:
 # aterm-session does not depend on aterm-agent.
 aterm-session = { workspace = true }
+# The box escalation cuts the badge's line by terminal CELLS, not chars (a wide
+# character is two): the workspace's own width tables, `char_width`. Not a new
+# edge in the shipped graph — aterm-core already links it — and its one
+# dependency, aterm-types, is already this crate's.
+aterm-grapheme = { workspace = true }
+# `aterm harness upgrade` reads another process's argv and environment (the
+# launch flags a resume must carry, the tab id the process was started in)
+# through atpkg's one KERN_PROCARGS2 / procfs reader, finds the managed twin
+# through the store layout, and heals the relaunched shell with the hook atpkg
+# writes. No cycle: atpkg depends on no aterm-agent; aterm-cli and aterm-gui,
+# this crate's two binary consumers, already link it.
+atpkg = { workspace = true }
+# The harness's master switch (`harness.enabled`) and `disk.apply` are read out
+# of aterm.toml with the SAME parser the GUI's Settings page seeds from, so the
+# switch cannot read OFF on the glass and ON here (`harness::cli::toml_bool`).
+# Not a new edge in the shipped graph — atpkg above already depends on it — and
+# its one dependency is `serde`.
+aterm-toml = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

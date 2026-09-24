@@ -1,28 +1,32 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A DISABLED MANAGER ADOPTS NOTHING (2026-09-15), at the real process edge.
+//! A SEED WITHOUT THE INSTALL CONSENT ADOPTS NOTHING (2026-09-15, re-spelled
+//! 2026-09-23), at the real process edge.
 //!
 //! `atpkg seed` used to write `<prefix>/adopted`, lay a pending stub for every
 //! default-set / agent / extra name under `bin/` and `agents/`, lay the reroute stubs
-//! and reassert the rustup seam, and only THEN notice `ATPKG_DISABLE` and say "lane
-//! skipped (fail-closed)". Every stub then promised a pass that the same switch
-//! refuses, and the durable adoption installed the whole set over the network the
-//! first tick after the switch was lifted. This drives the dev binary with the switch
-//! set, seedless and with a (placeholder) seal, and asserts the store is untouched —
-//! then, as the non-vacuity half, drives the SAME fixture with the switch unset and
-//! asserts it does adopt, so the first half cannot pass merely because the fixture
-//! never reaches the adoption line.
+//! and reassert the rustup seam, and only THEN notice that it was switched off. Every
+//! stub then promised a pass that the same switch refuses, and the durable adoption
+//! installed the whole set over the network the first tick after the switch was
+//! lifted. The switch this drives is the ONE install consent, `[packages] auto_install
+//! = false` in a scratch aterm.toml — the environment kill switch the test was first
+//! written against, `ATPKG_DISABLE`, is gone (R2: settings, not env vars), and the
+//! disabled-manager arm it reached is now only an unpinned build's. The store stays
+//! untouched — then, as the non-vacuity half, the SAME fixture with the default config
+//! adopts, so the first half cannot pass merely because the fixture never reaches the
+//! adoption line. (It also ran once "with a (placeholder) seal", through the
+//! `ATPKG_BUNDLED_SEED` seam; Phase 5 deleted the sealed-payload lane and the seam
+//! with it.)
 //!
 //! NEVER THE REAL STORE OR MACHINE. HOME is a temp directory (so the default prefix
 //! and `~/.rustup` sit under it, and the machine-settings lane refuses a synthetic
-//! home), XDG_CONFIG_HOME is absent, the registry is an empty local dir (no network),
-//! and `ATPKG_BUNDLED_SEED` is pinned so an app bundle's seal on the developer's
-//! machine is never discovered.
+//! home), XDG_CONFIG_HOME is a temp directory holding the scratch config, and the
+//! registry is an empty local dir (no network).
 
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 struct Fixture {
@@ -52,24 +56,18 @@ impl Fixture {
         }
     }
 
-    /// A placeholder seal: `bundled_seed_dir` accepts a directory holding the four
-    /// signed-registry files by name. Its contents never matter to the disabled lane,
-    /// which must refuse before reading them.
-    fn seal(&self) -> PathBuf {
-        let seal = self.root.join("seal");
-        std::fs::create_dir_all(&seal).unwrap();
-        for f in [
-            "index.toml",
-            "index.toml.sig",
-            "aterm-machines.toml",
-            "aterm-machines.toml.sig",
-        ] {
-            std::fs::write(seal.join(f), b"placeholder\n").unwrap();
-        }
-        seal
-    }
-
-    fn seed(&self, disabled: bool, seal: Option<&Path>) -> Output {
+    fn seed(&self, declined: bool) -> Output {
+        let config = self.root.join("config");
+        std::fs::create_dir_all(config.join("aterm")).unwrap();
+        std::fs::write(
+            config.join("aterm/aterm.toml"),
+            if declined {
+                "[packages]\nauto_install = false\n"
+            } else {
+                ""
+            },
+        )
+        .unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.arg("seed")
             .env("HOME", &self.home)
@@ -78,20 +76,11 @@ impl Fixture {
                 "ATPKG_REGISTRY",
                 format!("dir:{}", self.root.join("registry").display()),
             )
-            .env(
-                "ATPKG_BUNDLED_SEED",
-                seal.map_or_else(|| "off".into(), |s| s.as_os_str().to_owned()),
-            )
             .env_remove("RUSTUP_HOME")
             .env_remove("ATERM_CHILD")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if disabled {
-            cmd.env("ATPKG_DISABLE", "1");
-        } else {
-            cmd.env_remove("ATPKG_DISABLE");
-        }
         cmd.output().expect("run dev atpkg seed")
     }
 
@@ -126,44 +115,36 @@ fn describe(out: &Output) -> String {
 }
 
 #[test]
-fn a_disabled_manager_seed_adopts_nothing_and_lays_no_stubs() {
-    for sealed in [false, true] {
-        let fx = Fixture::new(if sealed { "sealed" } else { "seedless" });
-        let seal = sealed.then(|| fx.seal());
-        let out = fx.seed(true, seal.as_deref());
-        let text = describe(&out);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success(),
-            "a disabled seed is a quiet skip: {text}"
-        );
-        assert!(
-            stdout.contains("the manager is disabled — lane skipped (fail-closed)"),
-            "the refusal says why: {text}"
-        );
-        assert_eq!(
-            stdout.contains("bundled seed present"),
-            sealed,
-            "the refusal names the seal it skipped, and only when there is one: {text}"
-        );
-        assert_eq!(
-            fx.adoption_writes(),
-            Vec::<PathBuf>::new(),
-            "ATPKG_DISABLE must stop seed before adoption, stubs, reroutes or the rustup \
-             seam (sealed={sealed}): {text}"
-        );
-    }
+fn a_declined_seed_adopts_nothing_and_lays_no_stubs() {
+    let fx = Fixture::new("declined");
+    let out = fx.seed(true);
+    let text = describe(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "a declined seed is a quiet skip: {text}"
+    );
+    assert!(
+        stdout.contains("[packages].auto_install = false — not installing"),
+        "the skip says why: {text}"
+    );
+    assert_eq!(
+        fx.adoption_writes(),
+        Vec::<PathBuf>::new(),
+        "`auto_install = false` must stop seed before adoption, stubs, reroutes or \
+         the rustup seam: {text}"
+    );
 
-    // NON-VACUITY: the same seedless fixture with the switch unset reaches the
+    // NON-VACUITY: the same fixture with the default config reaches the
     // adoption line and lays the stubs, so the empty lists above are the gate's doing.
     // (A build that pins no root key is disabled either way and has nothing to show.)
-    if atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS, false) {
+    if atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
         let fx = Fixture::new("enabled");
-        let out = fx.seed(false, None);
+        let out = fx.seed(false);
         let text = describe(&out);
         assert!(
             fx.layout.adopted().is_file(),
-            "an enabled seedless seed adopts: {text}"
+            "an enabled seed adopts: {text}"
         );
         assert!(
             fx.layout.bin_dir().is_dir(),

@@ -96,7 +96,11 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
     if let Some(rest) = lower.strip_prefix("in ") {
         return parse_span(rest).map(ResetSpec::In);
     }
-    let text = match lower.strip_prefix("continuing automatically at ") {
+    let auto = aterm_phase::anchor("wall.auto_continue");
+    let text = match lower
+        .strip_prefix(auto)
+        .and_then(|rest| rest.strip_prefix(" at "))
+    {
         Some(rest) => text[text.len() - rest.len()..].trim(),
         None => text,
     };
@@ -147,7 +151,8 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
 /// not the notice.
 pub fn resumes_by_itself(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("continuing automatically") || lower.contains("continuing shortly")
+    lower.contains(aterm_phase::anchor("wall.auto_continue"))
+        || lower.contains("continuing shortly")
 }
 
 /// `3h`, `2h 30m`, `45m`, `3 hours`, `1h30m`, `90 minutes` → a span.

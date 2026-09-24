@@ -553,6 +553,19 @@ impl GridStorage {
         self.rows.get(idx)
     }
 
+    /// The row at `visible_row` display-mapped through the ring WITHOUT the
+    /// viewport bound — the one-past-the-viewport read the M1b incoming-row
+    /// apron needs (`visible_row == visible_rows`). `None` beyond the ring
+    /// (tiered history), exactly where [`row`](Self::row) answers `None` for an
+    /// in-viewport index.
+    pub(crate) fn row_past_viewport(&self, visible_row: u16) -> Option<&Row> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let idx = self.row_index(visible_row)?;
+        self.rows.get(idx)
+    }
+
     /// The live on-screen row at `screen_row`, IGNORING `display_offset` (as if
     /// the viewport were at the bottom). Absolute-frame readers (block text
     /// extraction) use this so the current scroll position cannot shift which

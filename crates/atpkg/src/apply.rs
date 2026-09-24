@@ -46,7 +46,8 @@ pub struct Group {
 
 /// Partition a channel's pinned programs into coherence groups (§7) and order them
 /// dependency-first (§17.10). A pinned program the index does not name is excluded
-/// (reachability, §5). Grouped members are gathered by their `coherence_group`; ungrouped
+/// (reachability, §5), and so is a vendor-direct program: its vendor lane owns it, and a
+/// legacy pin must never downgrade or tombstone the build that lane installed. Grouped members are gathered by their `coherence_group`; ungrouped
 /// programs become singleton groups. Deterministic order: named groups first (by name),
 /// then ungrouped singletons, members sorted — and then [`order_by_requires`] moves every
 /// group behind the groups it requires, that partition order as the stable tiebreak.
@@ -55,6 +56,9 @@ pub fn plan_groups(index: &Index, channel: &Channel) -> Vec<Group> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut singletons: Vec<String> = Vec::new();
     for program in channel.pin.keys() {
+        if crate::vendor_direct::is_vendor(program) {
+            continue;
+        }
         // Reachability: only programs the verified index NAMES are installable.
         let Some(p) = index.program(program) else {
             continue;
@@ -289,6 +293,10 @@ repo = "clt"
 [programs.brew]
 repo = "brew"
 requires = ["clt"]
+[programs.claude]
+repo = "aterm"
+[programs.codex]
+repo = "aterm"
 "#
         );
         // Machine-signed through the real roster chain: `VerifiedBytes` still has no
@@ -330,6 +338,25 @@ requires = ["clt"]
                 },
             ]
         );
+    }
+
+    /// THE CHOKEPOINT: a vendor-direct program is never planned, however the index names
+    /// and pins it — so no group lane can reinstall, downgrade or tombstone the build its
+    /// vendor lane installed with a legacy pin, yanked or not.
+    #[test]
+    fn plan_groups_excludes_vendor_direct_programs() {
+        let idx = index_with_groups();
+        let mut ch = channel(&[
+            ("ny", 9),
+            ("claude", 2_026_091_901),
+            ("codex", 2_026_091_901),
+        ]);
+        ch.yanked = vec!["claude@2026091901".into()];
+        let planned: Vec<String> = plan_groups(&idx, &ch)
+            .into_iter()
+            .flat_map(|g| g.members)
+            .collect();
+        assert_eq!(planned, ["ny"]);
     }
 
     /// The plan is DEPENDENCY-FIRST (§17.10): a group follows every group it requires —

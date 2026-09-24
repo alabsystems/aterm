@@ -113,6 +113,15 @@ fn hermetic_env(cmd: &mut Command, tmp: &Path) {
     launch_isolation::apply(cmd, tmp);
 }
 
+/// THE SCRATCH WORLD KEEPS EVERY LAUNCH OFF THE MACHINE, through CONFIG (2026-09-23):
+/// the update system's environment vetoes are gone, so the observer reads the shipping
+/// config readers in the child's real launch environment and records what the
+/// automatic lanes would do — the app updater (`[update] enabled`), the package loop
+/// (`[packages] enabled`) — while the reroute's escape is a FLAG no environment can
+/// carry (`aterm --no-reroute`; the internal marker is cleared at the front door). The
+/// negative control is the same scratch world with the switches left at their
+/// batteries-included defaults, which must read as "would run", so the isolated
+/// "blocked" is the config's doing.
 #[test]
 fn private_launch_environment_gates_host_maintenance() {
     const OBSERVER: &str = "ATERM_FIXTURE_OBSERVER_ROOT";
@@ -127,50 +136,70 @@ fn private_launch_environment_gates_host_maintenance() {
             ("XDG_CACHE_HOME", "cache"),
             ("XDG_DATA_HOME", "data"),
             ("XDG_STATE_HOME", "state"),
-            ("ATERM_UPDATE_ROOT", "updates"),
             ("ATERM_CONTROL_SOCK", "run/aterm/aterm.sock"),
         ] {
             assert_eq!(std::env::var_os(name), Some(root.join(relative).into()));
         }
         assert!(std::env::var_os("ATERM_PARENT_SESSION_ID").is_none());
+        // No environment veto is set, and none is needed: nothing reads one.
         for name in [
             "ATERM_NO_AUTO_UPDATE",
             "ATERM_NO_AUTO_APPLY",
             "ATPKG_DISABLE",
+            "ATERM_NO_REROUTE",
+            "ATERM_UPDATE_ROOT",
+            atpkg::reroute::PASSTHROUGH_ENV,
         ] {
-            assert_eq!(std::env::var(name).as_deref(), Ok("1"));
+            assert_eq!(std::env::var_os(name), None, "{name}");
         }
         let layout = atpkg::store::resolve_configured().expect("private store resolves");
         assert!(layout.prefix.starts_with(root.join("home")));
-        assert_eq!(atpkg::config::load().enabled, Some(false));
+        let updates = aterm_update_core::seal_guard::updates_root().expect("updates root");
+        assert!(
+            updates.starts_with(root.join("home")),
+            "{}",
+            updates.display()
+        );
         let machine = atpkg::config::load_machine();
         assert!(!machine.spotlight_noindex());
         assert_eq!(
             machine.universal_control(),
             atpkg::config::UniversalControlPolicy::Leave
         );
-        let disabled = atpkg::reroute::engaged(
-            std::env::var(atpkg::reroute::NO_REROUTE_ENV)
-                .ok()
-                .as_deref(),
-        );
+        let config = root.join("cfg/aterm/aterm.toml");
+        let updater = aterm_update_core::settings::update_enabled_at(&config);
+        let packages = atpkg::config::load().enabled();
         // A fake writer records the real admission decision in private state.
-        // It does not call lay(), launchd, defaults, or any host maintenance.
+        // It does not run an updater, a pass, launchd, defaults, or any maintenance.
         std::fs::write(
             root.join("observed"),
-            if disabled { "blocked" } else { "would-lay" },
+            if updater || packages {
+                "would-run"
+            } else {
+                "blocked"
+            },
         )
         .unwrap();
         return;
     }
 
     let base = std::env::temp_dir().join(format!("atconn-isolation-{}", std::process::id()));
-    for (case, force_reroute, expected) in [
+    for (case, defaults, expected) in [
         ("isolated", false, "blocked"),
-        ("negative-control", true, "would-lay"),
+        ("negative-control", true, "would-run"),
     ] {
         let root = base.join(case);
         launch_isolation::prepare(&root).unwrap();
+        if defaults {
+            // The update switches at their defaults; the host settings still left
+            // alone, so the observer's `[machine]` assertions hold either way.
+            std::fs::write(
+                root.join("cfg/aterm/aterm.toml"),
+                "agents_auto_prime = false\n[machine]\nspotlight_noindex = false\n\
+                 universal_control = \"leave\"\n",
+            )
+            .unwrap();
+        }
         let log = root.join("observer.log");
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
@@ -180,15 +209,14 @@ fn private_launch_environment_gates_host_maintenance() {
         ])
         // Explicit foreign overrides must be removed as well as ambient ones.
         .env("ATERM_PARENT_SESSION_ID", "foreign-session")
-        .env("ATERM_CONTROL_SOCK", base.join("foreign.sock"));
+        .env("ATERM_CONTROL_SOCK", base.join("foreign.sock"))
+        .env("ATERM_NO_AUTO_UPDATE", "1")
+        .env(atpkg::reroute::PASSTHROUGH_ENV, "1");
         hermetic_env(&mut cmd, &root);
         cmd.env(OBSERVER, &root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
-        if force_reroute {
-            cmd.env(atpkg::reroute::NO_REROUTE_ENV, "0");
-        }
         let mut child = cmd.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -230,7 +258,7 @@ fn boot() -> Option<Instance> {
     };
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     hermetic_env(&mut cmd, &tmp);
-    cmd.arg("--headless")
+    cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .env("ATERM_LINES", "40")
         .env("ATERM_COLUMNS", "120")
         .stdin(Stdio::null())

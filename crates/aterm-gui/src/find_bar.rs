@@ -44,7 +44,7 @@
 //!   the number is a past census and can be wrong in EITHER direction; it
 //!   refreshes on the next edit or ⌘S/⌘R. Spelled out as `(stale)`.
 //!
-//! Pure + themed like the config-notice bands (it reuses
+//! Pure + themed like the paste banner and the link caption (it reuses
 //! [`crate::settings::blank_row`]/[`crate::settings::write_str`] +
 //! [`crate::chrome_band::band_colors`]), so the band builder unit-tests with no window
 //! and is drawn by `App::splice_find_bar` (app_render.rs), which OVERWRITES its rows

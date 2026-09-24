@@ -315,9 +315,8 @@ pub(crate) fn cmd_text(term: &Arc<Mutex<Terminal>>) -> String {
 ///
 /// It lives HERE, beside [`visible_row`] and [`cmd_text_opt`], because the
 /// whole value of the hash is that a reader can recompute it from what `text`
-/// served: `aterm-link hook --report-to` reads `status` for the stamp and
-/// `text` for the rows, hashes the rows itself, and posts nothing when the two
-/// disagree. Two loops in two modules would have been two chances to disagree
+/// served: a reporter reads `status` for the stamp and `text` for the rows,
+/// hashes the rows itself, and holds the two against each other. Two loops in two modules would have been two chances to disagree
 /// about a trailing space; `screen_stamp_matches_the_text_verbs_rows` pins
 /// that they do not.
 ///
@@ -335,14 +334,69 @@ pub(crate) fn screen_stamp(t: &Terminal) -> (u64, u64) {
     )
 }
 
+/// THE SCREEN'S GENERATION: `(invalidation epoch, content seq)`, spelled
+/// `<epoch>.<seq>` on the wire (`status gen=`, `agent_gen=`, `if-gen=`).
+///
+/// WHY NOT `seq=` ALONE. `content_seq` is the ACTIVE grid's counter, and every
+/// alternate-screen entry installs a fresh grid whose counter starts again at
+/// 1 — so a TUI that leaves and re-enters the alternate screen and draws a
+/// second dialog with the same number of writes shows the first dialog's
+/// `seq=` over a different screen. Measured on a private headless aterm: box A
+/// `ls -la /tmp/work` and box B `rm -rf /tmp/work` both read `seq=15`, and a
+/// fence on that value pressed into B. The epoch is the terminal's
+/// [`ContentScrollState::invalidation_epoch`](aterm_core::terminal::ContentScrollState),
+/// monotonic for the terminal's life and advanced by every screen switch
+/// (aterm-core pins that as
+/// `every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once`)
+/// and by RIS, so within one epoch the grid is one grid and its seq only
+/// grows. The pair therefore names a screen generation that never repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScreenGen {
+    /// The terminal-wide invalidation epoch.
+    pub(crate) epoch: u64,
+    /// The active grid's content seq within that epoch.
+    pub(crate) seq: u64,
+}
+
+impl ScreenGen {
+    /// Parse the wire spelling `<epoch>.<seq>` (two unsigned decimals); any
+    /// other shape — one number, a sign, a third part — is `None`.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let (epoch, seq) = value.split_once('.')?;
+        let decimal = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
+        Some(Self {
+            epoch: decimal(epoch)?,
+            seq: decimal(seq)?,
+        })
+    }
+}
+
+impl std::fmt::Display for ScreenGen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.epoch, self.seq)
+    }
+}
+
+/// [`ScreenGen`] of `t` now (the caller holds its lock).
+pub(crate) fn screen_gen(t: &Terminal) -> ScreenGen {
+    ScreenGen {
+        epoch: t.content_scroll_state().invalidation_epoch,
+        seq: t.content_seq(),
+    }
+}
+
 /// The whole visible screen as text: every row [`visible_row`] renders, each
 /// followed by a newline, untrimmed.
 ///
 /// THE ONE CONSTRUCTION the hashed screen has. `turn` used to build this inline
 /// and [`screen_stamp`] built it again, which made "the same pair `turn`
 /// returns" true by coincidence rather than by construction — a trailing space
-/// added to one loop and not the other would have made every `--report-to`
-/// unpostable and nothing would have failed until it did. `cmd_text_opt` keeps
+/// added to one loop and not the other would have made every stamped report
+/// unmatchable and nothing would have failed until it did. `cmd_text_opt` keeps
 /// its own loop because it serves a row SPAN (`tail=`, `rows=`), and that the
 /// bare span agrees with this is pinned by
 /// `screen_stamp_matches_the_text_verbs_rows`.
@@ -725,10 +779,11 @@ pub(crate) fn cmd_dims(
 /// present→present gap of the frame that set the present max, which separates
 /// "nothing presented for that long" from "frames kept coming while this output
 /// waited". Every `_at_ms` is on the process clock `metrics_now_ms` reads at the
-/// same instant, so "how long ago" is one subtraction. A spike over 100 ms also
-/// writes ONE `aterm.log` line per 10 s in EVERY build — the only other
-/// per-spike record is `$ATERM_TRACE_LATENCY`'s stderr line, and the release
-/// stall watchdog's threshold is 5 s.
+/// same instant, so "how long ago" is one subtraction. A run of spikes over
+/// 100 ms also writes an `aterm.log` line when it starts and, when it had more
+/// than one, a summary when it ends, in EVERY build — the only other per-spike
+/// record is `$ATERM_TRACE_LATENCY`'s stderr line, and the release stall
+/// watchdog's threshold is 5 s.
 ///
 /// THE PARK OUTSIDE THE REDRAW. Everything named so far prices a redraw, a
 /// wake's lateness, or an end-to-end interval that contains both. None of them
@@ -3788,15 +3843,21 @@ pub(crate) fn cmd_appstatus(proxy: &EventLoopProxy<Wake>) -> String {
     }
 }
 
-/// `appnotice <toolchain|update> <text>` -> `OK posted`: a text row on the named
-/// pull-down lane, from OUTSIDE the process. The write face of the STATUS SURFACE
-/// (`appstatus` is the read face): an `aterm pkg install claude` run in a terminal
-/// has no GUI child to stream markers through, so this is how it says what it did
-/// on the same rows the GUI's own passes use. The text is bounded and sanitized for
-/// cells on the main thread like every other row; the lane word is checked HERE so
-/// a bad lane is a usage error and never a wake.
+/// `appnotice <toolchain|update|harness> <text>` -> `OK recorded`: a text RECORDED in
+/// the message log on the named lane, from OUTSIDE the process — never a row (design
+/// §10.5 H7, ruling 83): free text has no severity, no action and no progress.
+/// Toolchain text shaped like the `managed-current:` / `machine-settings:` markers is
+/// taken as the marker is (2026-09-22); every note on the `harness` lane is an
+/// `appstatus` entry of kind=harness (2026-09-23). The write face of the STATUS
+/// SURFACE (`appstatus` is the read face): an `aterm pkg install claude` run in a
+/// terminal has no GUI child to stream markers through, and an agent harness outside
+/// the window runs in another process (the window's own supervisor, `harness_host`,
+/// posts no note), so this is how they say what they did in the same record the GUI's
+/// own passes write. The text is bounded and sanitized on the main thread like every
+/// other message; the lane word is checked HERE so a bad lane is a usage error and
+/// never a wake.
 pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    const USAGE: &str = "ERR usage: appnotice <toolchain|update> <text>\n";
+    const USAGE: &str = "ERR usage: appnotice <toolchain|update|harness> <text>\n";
     /// Longer than any marker body atpkg prints; a row is one line of chrome.
     const MAX_TEXT_BYTES: usize = 512;
     let t = rest.trim();
@@ -3804,7 +3865,7 @@ pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String 
         return USAGE.to_string();
     };
     let text = text.trim();
-    if !matches!(lane, "toolchain" | "update") || text.is_empty() {
+    if !matches!(lane, "toolchain" | "update" | "harness") || text.is_empty() {
         return USAGE.to_string();
     }
     if text.len() > MAX_TEXT_BYTES {
@@ -3812,7 +3873,7 @@ pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String 
     }
     let (lane, text) = (lane.to_string(), text.to_string());
     match control_media::call_main(proxy, |reply| Wake::AppNotice { lane, text, reply }) {
-        Ok(Ok(())) => "OK posted\n".to_string(),
+        Ok(Ok(crate::AppNoticeTaken::Recorded)) => "OK recorded\n".to_string(),
         Ok(Err(error)) | Err(error) => format!("ERR {error}\n"),
     }
 }
@@ -3902,10 +3963,13 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
     format!("OK {}\n", pct_encode(cwd.as_deref().unwrap_or("")))
 }
 
-/// `text --json` -> `{"rows":["<row0>",...],"cursor":{...},"seq":N,"dims":{...}}`.
+/// `text --json` -> `{"rows":["<row0>",...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S"}`.
 /// The rows are the SAME grapheme-faithful, control-collapsed, tail-trimmed lines
-/// `cmd_text` emits, the cursor/dims mirror the `cursor`/`dims` verbs, and `seq`
-/// is the engine `content_seq` (so an agent can diff frames without re-reading).
+/// `cmd_text` emits, the cursor/dims mirror the `cursor`/`dims` verbs, `seq` is the
+/// engine `content_seq` (so an agent can diff frames without re-reading), and `gen`
+/// is the [`ScreenGen`] of the same instant — the value a fenced press names
+/// (`key if-gen=`), so a supervisor binds its press to the very read it judged
+/// rather than to a `status` read taken after it.
 /// The bare form of [`cmd_text_json_opt`] — test-only, like [`cmd_text`], since the
 /// dispatch passes its tail through the `_opt` form (the name stays so the
 /// `json_ok_sites_match_the_json_capable_verbs` scrape still binds `text`).
@@ -3922,15 +3986,18 @@ pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
 /// object ends with `"first":<row>` (the twin of ` first=<row>`; after `trimmed`,
 /// new fields go LAST). `dims.rows` stays the GRID's row count, so `rows.len()`
 /// says what was sent, `first` where it starts and `dims` what the screen is; each
-/// field is only written when its option was asked for, keeping the bare reply
-/// byte-identical.
+/// of those two is only written when its option was asked for. `gen` (2026-09-24,
+/// harness/integrate) is the one field every reply carries, right after the `seq`
+/// it qualifies: a `seq` alone repeats after an alternate-screen re-entry, and a
+/// supervisor that fenced its press on the generation of a LATER `status` read
+/// would press into whatever box replaced the one it judged.
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
     // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
     // styled frame already uses. Every field is read inside the single hold, so the
     // reply still describes one instant; the escaping and JSON assembly are pure
     // string work over owned data, and doing them under the mutex made the PTY
     // reader's `process()` and the frame snapshot queue behind a screen read.
-    let (rows_text, c, vis, style, rows, cols, seq, first) = {
+    let (rows_text, c, vis, style, rows, cols, seq, generation, first) = {
         let t = term_lock(term);
         let rows = t.rows() as usize;
         let (first, end) = match args.shape.select(rows) {
@@ -3946,6 +4013,7 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> 
             rows,
             t.cols(),
             t.content_seq(),
+            screen_gen(&t),
             first,
         )
     };
@@ -3976,7 +4044,7 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> 
         let _ = write!(
             out,
             "],\"cursor\":{{\"row\":{},\"col\":{},\"visible\":{vis},{}}},\
-             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq}",
+             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq},\"gen\":\"{generation}\"",
             c.row,
             c.col,
             json_str_field("style", style),
@@ -4652,6 +4720,8 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         scroll_frac_px: _, // OMITTED: M1b sub-row present translate, display-only (not cell content)
         grid_top_row: _,   // OMITTED: M1b grid/chrome partition, display-only
         grid_bot_row: _,   // OMITTED: M1b grid/chrome partition, display-only
+        apron_row: _, // OMITTED: M1b incoming-row apron — the present translate's strip source, display-only
+        apron_stamp: _, // OMITTED: the apron's extraction stamp, display-only bookkeeping
         fx_clip: _, // OMITTED: focused-pane present-time post-fx clip box (split-pane audit), display-only
         selection: _, // frame "selection" kind + projected geometry (F3)
         selection_clip: _, // OMITTED: host-only split composition bounds; engine styled frames have none
@@ -5127,8 +5197,8 @@ mod tests {
     }
 
     /// **THE STAMP MUST MATCH THE ROWS.** `status`'s `hash=` is FNV-1a-64 over
-    /// the untrimmed visible screen, and `aterm-link hook --report-to` reads
-    /// `status` for the stamp, `text` for the rows, and hashes the rows ITSELF
+    /// the untrimmed visible screen, and a reporter reads `status` for the
+    /// stamp, `text` for the rows, and hashes the rows ITSELF
     /// to check the two describe one screen — posting nothing when they differ.
     /// So the bytes `screen_stamp` hashes must be exactly the bytes `text`
     /// sends under its header: same rows, same order, one `\n` after each,
@@ -7326,6 +7396,49 @@ mod trim_tests {
         let blank = term_with(3, b"");
         assert_eq!(cmd_text_opt(&blank, TRIM), "OK 0 trimmed=3\n");
         assert_eq!(cmd_text_opt(&blank, TextArgs::default()), "OK 3\n\n\n\n");
+    }
+
+    /// `text --json` carries the GENERATION of the rows it sends (`"gen":"E.S"`,
+    /// read under the same lock hold), so a supervisor can fence its press on the
+    /// read it judged (`key if-gen=`). Box A and box B drawn in two alternate-screen
+    /// sessions with the same number of writes: NEGATIVE CONTROL, the `seq` the two
+    /// reads carry is the same — a fence on it would press into B — while `gen`
+    /// differs, and each is the value `status gen=` prints for that screen.
+    #[test]
+    fn text_json_carries_the_generation_of_the_rows_it_sends() {
+        const ALT_A: &[u8] = b"\x1b[?1049h\x1b[H Bash command\r\n   ls -la /tmp/work\r\n";
+        const ALT_B: &[u8] = b"\x1b[H Bash command\r\n   rm -rf /tmp/work\r\n";
+        let term = term_with(6, ALT_A);
+        let field = |json: &str, key: &str| {
+            let at = json.find(&format!("\"{key}\":")).expect(key) + key.len() + 3;
+            json[at..]
+                .split([',', '}'])
+                .next()
+                .unwrap()
+                .trim_matches('"')
+                .to_string()
+        };
+        let a = cmd_text_json(&term);
+        let gen_a = super::screen_gen(&term.lock().unwrap()).to_string();
+        assert_eq!(field(&a, "gen"), gen_a, "{a}");
+        term.lock()
+            .unwrap()
+            .process(&[b"\x1b[?1049l\x1b[?1049h".as_slice(), ALT_B].concat());
+        let b = cmd_text_json(&term);
+        assert!(b.contains("rm -rf"), "PRECONDITION: box B is up: {b}");
+        assert_eq!(
+            field(&a, "seq"),
+            field(&b, "seq"),
+            "NEGATIVE CONTROL: seq repeats"
+        );
+        assert_ne!(field(&a, "gen"), field(&b, "gen"), "the generation moved");
+        assert_eq!(
+            field(&b, "gen"),
+            super::screen_gen(&term.lock().unwrap()).to_string()
+        );
+        // A shaped read carries it too, before `trimmed`/`first`, which stay last.
+        let tail = cmd_text_json_opt(&term, args("tail=2 trim"));
+        assert_eq!(field(&tail, "gen"), field(&b, "gen"), "{tail}");
     }
 
     /// `text --json trim`: `rows` stops at the last non-blank row and the object

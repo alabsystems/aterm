@@ -13,10 +13,10 @@
 //! # The law (docs/DESIGN-auto-apply-ladder-2026-09-21.md)
 //!
 //! A verified staged build applies by itself, in place, with every shell
-//! preserved, within [`LANDS_WITHIN`] of being armed — on any machine, including
-//! one that is never idle. Activity (keystrokes, PTY output, focus) may DELAY the
-//! landing inside that bound; it may never disable the lane or convert it to
-//! manual-only. Only a genuine physical failure of the handoff may do that, on
+//! preserved, within a minute of being armed ([`LANDS_WITHIN`] plus the
+//! [`SWITCH_ALLOWANCE`]) — on any machine, including one that is never idle.
+//! Activity (keystrokes, PTY output, focus) may DELAY the landing inside that
+//! bound; it may never disable the lane or convert it to manual-only. Only a genuine physical failure of the handoff may do that, on
 //! its own bounded, converging budget.
 //!
 //! The ladder is a preference for a comfortable moment that weakens with time.
@@ -27,33 +27,53 @@
 //! 2026-09-20 the owner's own aterm cycled through all of them eleven times in
 //! seven hours without ever landing a verified 0.89.0. The phases below are the
 //! same preferences, in the same order, each with a stated end.
+//!
+//! The ends are SECONDS (2026-09-23). The first ladder spent 120 + 180 + 600 s
+//! on them, and on a busy machine v0.91.0 sat "ready" for 203 s — to avoid a
+//! freeze of about 0.4 s in which no keystroke is lost (typed input is queued
+//! and replayed after Commit). Now an idle machine lands at the first poll, a
+//! busy one at its first pause, and nobody waits more than a minute.
 
 use std::time::Duration;
 
 /// How long the lane holds out for a machine-wide idle moment — no HID input,
 /// no keystroke in an aterm window, every live session's output quiet — before
-/// it stops asking for one. Long enough that an ordinary pause wins the race and
-/// the update lands invisibly.
-pub(crate) const PREFER_IDLE_WINDOW: Duration = Duration::from_secs(120);
+/// it stops asking for one. A few quiet-epoch polls: on an idle machine the
+/// first one wins and the update lands invisibly; on a busy one it costs
+/// seconds, not minutes.
+pub(crate) const PREFER_IDLE_WINDOW: Duration = Duration::from_secs(3);
 
 /// How long after that the lane still waits for a gap in the terminal's own
 /// output while an aterm window is focused (the owner's 2026-09-18 ruling: a
 /// stream the user is watching should not skip a beat). Since the late park the
-/// freeze that would interrupt it is about 300 ms, measured, so this preference
-/// is bounded rather than absolute.
-pub(crate) const PREFER_OUTPUT_GAP_WINDOW: Duration = Duration::from_secs(180);
+/// freeze that would interrupt it is about 300-450 ms, measured, so this
+/// preference is bounded rather than absolute.
+pub(crate) const PREFER_OUTPUT_GAP_WINDOW: Duration = Duration::from_secs(7);
 
 /// How long after THAT the lane still waits for a gap between keystrokes (the
-/// one comfort rule with a natural bound: nobody types for ten minutes without
-/// a two-and-a-half-second pause). Past it the lane lands regardless; input
-/// typed during the freeze is queued and replayed after Commit, never swallowed.
-pub(crate) const KEYS_ONLY_WINDOW: Duration = Duration::from_secs(600);
+/// one comfort rule with a natural bound: nobody types for most of a minute
+/// without a two-and-a-half-second pause). Past it the lane lands regardless;
+/// input typed during the freeze is queued and replayed after Commit, never
+/// swallowed.
+pub(crate) const KEYS_ONLY_WINDOW: Duration = Duration::from_secs(45);
 
-/// The bound every surface quotes: an armed automatic apply parks its readers
-/// no later than this after arming, whatever the terminal is doing.
+/// When the ladder stops waiting: from this long after arming, the next poll
+/// starts the attempt whatever the terminal is doing (a consent warm-up the
+/// user started is the one hold, capped by its own setting). The switch itself
+/// follows ([`SWITCH_ALLOWANCE`]), so this ends early enough that the build is
+/// RUNNING within the minute every surface quotes.
 pub(crate) const LANDS_WITHIN: Duration = Duration::from_secs(
     PREFER_IDLE_WINDOW.as_secs() + PREFER_OUTPUT_GAP_WINDOW.as_secs() + KEYS_ONLY_WINDOW.as_secs(),
 );
+
+/// What the switch takes once an attempt starts: the next poll (500 ms), the
+/// new process's launch (1.3-1.4 s measured on 0.90/0.91), the park and the
+/// freeze (0.3-0.45 s), with room for a busier machine.
+pub(crate) const SWITCH_ALLOWANCE: Duration = Duration::from_secs(5);
+
+// "Within a minute" is what the surfaces say: the ladder AND the switch after
+// it may not outgrow it.
+const _: () = assert!(LANDS_WITHIN.as_secs() + SWITCH_ALLOWANCE.as_secs() <= 60);
 
 /// Where on the ladder an armed artifact stands, as a function of how long ago
 /// it was armed. Monotone in that duration: a phase, once reached, is never
@@ -119,7 +139,7 @@ pub(crate) struct ActivityFacts {
     /// input, PTY output or structural event, machine-wide.
     pub(crate) quiet: bool,
     /// `App::update_apply_hands_off_keys`: no keystroke landed in an aterm
-    /// window inside the typing gap (and no warm-up gesture holds the lane).
+    /// window inside the typing gap.
     pub(crate) hands_off_keys: bool,
     /// `App::automatic_update_output_quiet`: every live session's PTY output is
     /// at least one quiet epoch old.
@@ -127,7 +147,18 @@ pub(crate) struct ActivityFacts {
     /// `App::any_os_window_focused`: an aterm window has keyboard focus, so the
     /// user is looking at this terminal.
     pub(crate) focused: bool,
+    /// `App::update_apply_warmup_holds`: a folder-access warm-up the user
+    /// started is still running, so a macOS consent dialog may be on screen.
+    /// Refused in EVERY phase, `Land` included: it is the user's own gesture,
+    /// capped by `[privacy] warmup_hold_ms`, and landing on top of a dialog
+    /// they asked for would throw away their answer.
+    pub(crate) consent_warmup: bool,
 }
+
+/// The refusal that means only the person's TYPING holds the park — the one a
+/// surface may turn into "finishes when you stop typing".
+pub(crate) const TYPING_REFUSAL: &str =
+    "a keystroke landed in an aterm window inside the typing gap";
 
 /// Why the automatic lane will not park in `phase` given `facts`, or `None`
 /// when it may. ONE predicate for the two places that ask — the entry
@@ -139,11 +170,12 @@ pub(crate) fn automatic_park_refusal(
     phase: ApplyPhase,
     facts: ActivityFacts,
 ) -> Option<&'static str> {
+    if facts.consent_warmup {
+        return Some("a folder-access warm-up the user started is still running");
+    }
     match phase {
         ApplyPhase::Land => None,
-        _ if !facts.hands_off_keys => {
-            Some("a keystroke landed in an aterm window inside the typing gap")
-        }
+        _ if !facts.hands_off_keys => Some(TYPING_REFUSAL),
         ApplyPhase::PreferIdle if !facts.quiet => {
             Some("terminal input/output is still inside the quiet epoch")
         }
@@ -549,12 +581,17 @@ mod tests {
             assert!(got >= last, "monotone at {since:?}");
             last = got;
         }
-        assert_eq!(LANDS_WITHIN, Duration::from_secs(15 * 60));
+        assert_eq!(LANDS_WITHIN, Duration::from_secs(55));
+        assert!(
+            LANDS_WITHIN + SWITCH_ALLOWANCE <= Duration::from_secs(60),
+            "the attempt the ladder starts at its end still lands inside the minute"
+        );
     }
 
     /// Each phase weakens exactly one preference, in order, and `Land` refuses
-    /// nothing — including the keystroke gap, which the deferred-input queue
-    /// makes safe to override.
+    /// nothing the terminal does — including the keystroke gap, which the
+    /// deferred-input queue makes safe to override. The one refusal no phase
+    /// relaxes is the user's own consent warm-up.
     #[test]
     fn each_phase_relaxes_exactly_its_own_preference() {
         let calm = ActivityFacts {
@@ -562,6 +599,7 @@ mod tests {
             hands_off_keys: true,
             output_quiet: true,
             focused: true,
+            consent_warmup: false,
         };
         for phase in [
             ApplyPhase::PreferIdle,
@@ -627,6 +665,25 @@ mod tests {
             None,
             "the streaming machine this ladder exists for lands here"
         );
+
+        // A warm-up the user started holds every phase — `Land` included, or a
+        // landing could arrive while its consent dialog is up.
+        let warming = ActivityFacts {
+            consent_warmup: true,
+            ..calm
+        };
+        for phase in [
+            ApplyPhase::PreferIdle,
+            ApplyPhase::PreferOutputGap,
+            ApplyPhase::KeysOnly,
+            ApplyPhase::Land,
+        ] {
+            assert_eq!(
+                automatic_park_refusal(phase, warming),
+                Some("a folder-access warm-up the user started is still running"),
+                "{phase:?}"
+            );
+        }
     }
 
     #[test]

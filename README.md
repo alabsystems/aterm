@@ -41,11 +41,11 @@ The recommended install is one line:
 curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
 ```
 
-**~27 MB download. aterm opens immediately; the ALab toolchain installs itself
+**The macOS app is a ~27 MB download. aterm opens immediately; the ALab toolchain installs itself
 on first launch with live progress** — each program downloads individually and
 resumably, only the builds for your machine, visible end to end in the app.
 
-The script picks the newest app release, checks the download's SHA-256 against
+On macOS the script picks the newest app release, checks the download's SHA-256 against
 the release manifest, verifies the app's Developer ID signature and
 notarization, puts `aterm.app` in `/Applications` (or `~/Applications`), and
 links the `aterm` command and its man pages under `~/.local`. `--no-toolchain`
@@ -57,7 +57,7 @@ no config, so the app's first launch still installs the toolset unless
 `[packages].seed_install = false` is in `aterm.toml` first (`aterm help pkg`).
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
-and Intel), and for Linux x86_64 as a tarball on the same releases, from the
+and Intel), from the
 public release channel at
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
 The channel carries two kinds of cut: **app releases** ship the containers
@@ -99,13 +99,34 @@ spctl -a -t exec -vv /Applications/aterm.app
 
 The last must report `source=Notarized Developer ID`.
 
-On Linux x86_64 the same command installs the release's
-`aterm-<version>-linux-x86_64.tar.gz`, checked against its `.sha256` digest
-asset before anything is unpacked. The tarball is built from the release commit
-on upstream stable Rust; it sits outside the release manifest (the appcast is
-macOS-only for now) and has no Developer ID or notarization counterpart, so its
-trust is TLS plus that digest — a weaker chain than the macOS one. There is no
-self-updater on Linux: re-run the installer to update.
+### Linux
+
+The native installer supports `aarch64-unknown-linux-gnu` and
+`x86_64-unknown-linux-gnu` when the channel publishes their signed raw executables,
+named `aterm-<version>-linux-aarch64` and `aterm-<version>-linux-x86_64`.
+It requires Python 3.11+, curl and OpenSSL with Ed25519 support. It verifies the
+committed master key, current signed machine roster, appcast, exact digest,
+size, ELF target and executable identity before the runtime installs and
+enrolls the app in one locked, recoverable transaction. Existing sessions are
+never restarted. The installed command lives under `~/.local`:
+
+```sh
+aterm --window
+aterm update status
+```
+
+A downloaded raw file is not an automatically updating installation by itself;
+use the installer above. It checks that the executable can start on your
+userland before replacing an existing app. Distribution/glibc requirements
+depend on the native release build; the Ubuntu 24.04 development build was
+validated on this machine and requires glibc 2.39.
+
+**Publication status, checked 2026-09-15:** the public 0.86.0 appcast has no
+native Linux artifact. The historical 0.68.0 x86_64 tarball is checksum-only,
+not ARM64 and not an authenticated native-update fallback. The installer
+reports this absence; local implementation and tests do not publish a release.
+The authorized publisher must first include the native worker artifacts in the
+signed cut. `tools/install.sh --help` lists the Linux install and update options.
 
 ### Homebrew
 
@@ -124,17 +145,31 @@ toolchain's name — install one or the other, not both.
 
 ### Staying current
 
-Installed copies keep themselves current: the app checks the release channel in
+Installed macOS copies keep themselves current: the app checks the release channel in
 the background, verifies the new build, and swaps it in at a quiet moment —
 every window, tab, split, and live shell survives, and if the handoff cannot
 complete the update lands at the next launch. Settings ▸ Software Update shows
 what is staged plus the release notes; `aterm ctl update status` says the same
 on the command line, and `aterm update` is the headless lane for a machine with
-no window open. `ATERM_NO_AUTO_UPDATE=1` turns the updater off;
-`[update] auto_apply = false` in `aterm.toml` stages the build and leaves
+no window open. Settings ▸ Terminal ▸ Updates ("Check for updates
+automatically", `[update] enabled = false` in `aterm.toml`) stops the background
+checks — Check for Updates and `aterm update check` still check when asked;
+`[update] auto_apply = false` stages the build and leaves
 applying it to you (Software Update, `aterm ctl update apply`, or the next
-launch). This lane is macOS-only; a Linux install stays current by re-running
-the installer.
+launch).
+
+Enrolled Linux copies check while an ordinary window or interactive session is
+running, normally every thirty minutes with shared retry backoff. By default
+they replace only the on-disk executable; open windows and PTYs keep running
+their existing binary. A later GUI launch confirms the new version's trial
+health. `[update] auto_apply = false` leaves a verified
+stage for explicit `aterm update apply`. `aterm update status` and Settings
+distinguish a Linux stage, an installed trial and a failed check; Linux does not
+pretend to use the macOS live-session handoff. `[update] enabled = false` disables
+background checks from the next launch; explicit checks and applies remain
+available. Locally built installations require explicit
+`aterm update enable`; that trusts the local baseline, not unsigned future
+updates. No update can arrive until an admissible signed native release exists.
 
 ### Build from source
 
@@ -152,10 +187,11 @@ cargo build --locked -p aterm
 `./target/debug/aterm --version` should agree with `[workspace.package]
 version` in the root `Cargo.toml`. Build from the workspace — aterm's crates are
 not on crates.io, so there is nothing to `cargo install`. Linux and Windows
-build from source too and have in-tree build lanes and tests; Linux x86_64 also
-has a released tarball behind the same installer, but only macOS has signed,
-notarized binaries and the self-updater, and a source build is a real aterm, not
-the byte-identical notarized release.
+build from source too and have in-tree build lanes and tests. The public source
+snapshot uses its stock compiler pin; private development and the native Linux
+release worker use the pinned Trust toolchain. A source build is a real aterm,
+not a byte-identical signed release, and is not automatically enrolled for
+replacement. Linux release availability and enrollment are described above.
 
 The name has neighbours, so aim carefully: the crates.io package named `aterm`,
 the `aterm` in MacPorts and old `brew install aterm` guides (an X11 terminal
@@ -305,8 +341,9 @@ one:
 
 ```sh
 aterm ctl windows                              # one row per window: which sessions sit on its active tab
-aterm ctl ls                                   # every session of every live instance, with window=, detail= (what it runs) and identity= (whose agent login)
+aterm ctl ls                                   # every session of every live instance, with window=, detail= (what it runs), identity= (whose agent login) and path= (frozen|live)
 #   wfocus=1 marks aterm's most recently focused window (a minimize or the app deactivating does not clear it)
+#   path=frozen names a tab whose shell predates the self-healing sessions: `claude`/`codex` there run the foreign copies until `. ~/.aterm/shell.d/00-atpkg.zsh` is typed in it
 sid=$(aterm ctl spawn window=1 | cut -d' ' -f2)   # a fresh tab in window 1, immediately addressable — not raised
 #   (an unknown id is refused by name; a --headless instance owns logical window 0, the one `ls` and `windows` show)
 aterm ctl "@$sid" turn 'make test'
@@ -550,12 +587,14 @@ it as privileged:
   answered rather than left hanging), and a multi-line paste into a shell without
   bracketed paste asks first (macOS and Windows).
 
-**Release trust** — for the macOS app updater and the toolchain package index —
+**Release trust** — for the macOS/Linux app updaters and the toolchain package index —
 is anchored by a **paper master key** that exists on no computer. It signs only a
 machine roster: one signing key per publishing machine, plus the deny-list that
 withdraws one. A release must carry a master-signed roster, a manifest signed by
-a rostered, unrevoked machine, a forward-only build number, a matching DMG
-digest, and a Developer ID signature pinned to one Team ID plus notarization; the
+a rostered, unrevoked machine, a forward-only build number and a matching
+artifact digest. macOS additionally verifies a Developer ID signature pinned
+to one Team ID plus notarization; native Linux verifies the exact ELF target,
+size and compiled identity before replacement. The
 64-byte `.sig` assets are those detached Ed25519 signatures
 (`aterm-appcast.toml.sig` over the manifest, `aterm-machines.toml.sig` over the
 roster). A stolen machine key is therefore revocable by an authority the thief
@@ -569,9 +608,11 @@ paper master public key (Ed25519, base64):
 DtiLfpk0iUSrK1/LkyIVf+4C2eGjD2Myf4Sr/FCoMPQ=
 ```
 
-Bootstrap trust is tiered: the installer roots trust in the Apple Developer ID
-chain (Team `A66A9P66Z7`), and the installed updater additionally verifies this
-Ed25519 chain, whose anchors are compiled into the binary it updates.
+On macOS bootstrap roots trust in the Apple Developer ID chain (Team
+`A66A9P66Z7`), and the installed updater additionally verifies this Ed25519
+chain. The Linux bootstrap itself requires the committed master-to-roster-to-
+manifest Ed25519 chain. Neither Linux installation nor automatic updates falls
+back to a checksum-only legacy tarball.
 
 Containment is a launch-time choice: `--containment <mode>` with modes `master`,
 `user` (default), `safety`, and `containment`. `--sandbox` is shorthand for the
@@ -681,9 +722,12 @@ file. The window watches the configuration and applies supported changes without
 a restart, and Settings ▸ Manual opens the file in the native editor.
 
 By default the windowed app talks to GitHub for at most two things — the app
-update check (macOS builds) and the toolchain package update pass — and contains
+update check (eligible macOS or enrolled Linux installs) and the toolchain package update pass — and contains
 no telemetry. Descriptive tab titles use a local summarizer unless you opt into a
-remote provider. Headless and command-line use makes no automatic network calls.
+remote provider. Ordinary interactive terminal sessions also run the eligible
+update/package checks. Noninteractive helpers and introspection harnesses do
+not start those background checks; explicit network commands still perform
+their requested work.
 
 ## Community and license
 

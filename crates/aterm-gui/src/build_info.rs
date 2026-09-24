@@ -40,6 +40,12 @@ pub const VERSION: &str = aterm_types::version::APP_VERSION;
 /// build time (e.g. a source tarball). Stamped by `build.rs`.
 pub const GIT_COMMIT: &str = env!("ATERM_GIT_COMMIT");
 
+/// Full source identity for authenticated native-artifact probes. Unlike the
+/// display abbreviation this binds all forty hexadecimal commit characters.
+pub const GIT_COMMIT_FULL: &str = env!("ATERM_GIT_COMMIT_FULL");
+pub const GIT_DIRTY: &str = env!("ATERM_GIT_DIRTY");
+pub const BINARY_TARGET: &str = env!("ATERM_BINARY_TARGET");
+
 /// UTC build timestamp (RFC3339), or `"unknown"`. Stamped by `build.rs`.
 pub const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
 

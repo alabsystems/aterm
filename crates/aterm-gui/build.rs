@@ -111,8 +111,10 @@ fn main() {
     // this script then asks git nothing and WATCHES NOTHING. That is the whole
     // point: see `git_watch_paths` for the defect the watch caused.
     let pinned_commit = pinned("ATERM_BUILD_GIT_COMMIT");
+    let pinned_full_commit = pinned("ATERM_BUILD_GIT_COMMIT_FULL");
     let pinned_dev_commits = pinned("ATERM_BUILD_DEV_COMMITS");
-    let git_is_pinned = pinned_commit.is_some() && pinned_dev_commits.is_some();
+    let git_is_pinned =
+        pinned_commit.is_some() && pinned_full_commit.is_some() && pinned_dev_commits.is_some();
 
     // Git commit (short, 12 hex) + a "-dirty" suffix when the tree isn't clean.
     let commit = match &pinned_commit {
@@ -129,6 +131,15 @@ fn main() {
         }
     };
     println!("cargo:rustc-env=ATERM_GIT_COMMIT={commit}");
+    let full_commit = pinned_full_commit
+        .unwrap_or_else(|| run("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into()));
+    let dirty = commit.ends_with("-dirty");
+    println!("cargo:rustc-env=ATERM_GIT_COMMIT_FULL={full_commit}");
+    println!("cargo:rustc-env=ATERM_GIT_DIRTY={dirty}");
+    println!(
+        "cargo:rustc-env=ATERM_BINARY_TARGET={}",
+        std::env::var("TARGET").expect("Cargo target")
+    );
 
     // THE DEV COUNTER (owner, 2026-08-16: dev builds are identified by "the
     // 3rd developer number and the hash", never by advancing the version):
@@ -271,6 +282,7 @@ fn main() {
     // `git_watch_paths`.
     if git_is_pinned {
         println!("cargo:rerun-if-env-changed=ATERM_BUILD_GIT_COMMIT");
+        println!("cargo:rerun-if-env-changed=ATERM_BUILD_GIT_COMMIT_FULL");
         println!("cargo:rerun-if-env-changed=ATERM_BUILD_DEV_COMMITS");
     } else {
         for path in git_watch_paths() {
@@ -330,7 +342,7 @@ fn git_abs_path(args: &[&str]) -> Option<PathBuf> {
 /// file's mtime landed between two builds of one gate run. The stamp really can
 /// change with those files (`git describe --tags` reads them), so the watch is
 /// not wrong — it is unpinnable from inside a build script. `ATERM_BUILD_GIT_COMMIT`
-/// and `ATERM_BUILD_DEV_COMMITS` are the answer: a caller that has already
+/// with `ATERM_BUILD_GIT_COMMIT_FULL` and `ATERM_BUILD_DEV_COMMITS` are the answer: a caller that has already
 /// resolved the facts passes them, and then neither the probe nor this watch runs.
 fn git_watch_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();

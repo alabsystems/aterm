@@ -88,10 +88,12 @@
 //!    (quotes do not hide `-rf` from `rm`): short clusters over `dfiIPrRvx` and
 //!    the GNU long forms; anything else abstains. `--no-preserve-root` is a
 //!    deny pattern. Redirects are read from the quote-stripped token (that is
-//!    what the shell sees) and must be to `/dev/null` or a descriptor; one
-//!    glued to a word (`/etc/x>/dev/null`) abstains, since the word in front of
-//!    it is an operand classify's redirect reader would skip. A backslash or a
-//!    `<` in an `rm` segment abstains.
+//!    what the shell sees) and must be to `/dev/null` or a descriptor. Since
+//!    2026-09-23 classify's splitter detaches a redirect glued to a word the
+//!    way the shell does (`/etc/x>/dev/null` is the operand `/etc/x` and a
+//!    redirect), so the operand is judged like any other; the glued-redirect
+//!    abstention below stays as a guard. A backslash or a `<` in an `rm`
+//!    segment abstains.
 //! 7. **Operands resolve, lexically.** These can NOT be resolved without a
 //!    shell and always abstain, whatever the deny list says — removing them
 //!    would not widen the policy, it would make the resolver wrong: any `$`
@@ -157,9 +159,11 @@
 //! choosing or assign a variable: `git -c core.fsmonitor='…' status`, `rg --pre
 //! ./x.sh foo`, `sort --compress-program=./x.sh f`, `/tmp/evil/ls`, `printf -v
 //! PATH /evil` — the reason rule 4 has a companion list. This slice was allowed
-//! to change that module's visibility only, so the fixes are NOT there; rules 2
-//! and 4 refuse those shapes here, and the lines are pinned in this module's
-//! corpus so that an `rm` verdict cannot regress with them.
+//! to change that module's visibility only, so rules 2 and 4 refuse those
+//! shapes here, and the lines are pinned in this module's corpus so that an
+//! `rm` verdict cannot regress with them. (Fixed in classify itself on
+//! 2026-09-23, audit APR-4: several of those lines now abstain on classify's
+//! own reason, which the corpus below records.)
 //!
 //! # MEASURED versus assumed
 //!
@@ -329,11 +333,11 @@ pub enum CwdPrefix {
     /// [`DenyPattern::Home`] matches the home directory itself, an ancestor
     /// of it, and a glob DIRECTLY inside it — one level deeper is not
     /// matched. MEASURED under `Off` with the shipped deny list and a home
-    /// of `/Users//owner`: `rm -rf /etc/passwd`, `rm -rf /usr/local`,
+    /// of `/Users//_owner`: `rm -rf /etc/passwd`, `rm -rf /usr/local`,
     /// `rm -rf /System/Library`, `rm -rf /bin`, `rm -rf /var`,
-    /// `rm -rf /Applications`, `rm -rf /Users//owner/.ssh` and
-    /// `rm -rf /Users//owner/Documents` all come back [`Verdict::Allow`],
-    /// while `rm -rf /` and `rm -rf /Users//owner/*` stay abstentions. So
+    /// `rm -rf /Applications`, `rm -rf /Users//_owner/.ssh` and
+    /// `rm -rf /Users//_owner/Documents` all come back [`Verdict::Allow`],
+    /// while `rm -rf /` and `rm -rf /Users//_owner/*` stay abstentions. So
     /// `Off` does not mean "no directory requirement" in practice, it means
     /// "auto-approve the whole filesystem but a handful of shapes": give it
     /// [`RmPolicy::deny_patterns`] of your own, or do not set it. Whether the
@@ -771,7 +775,7 @@ fn redirect_is_harmless(target: &str) -> bool {
 /// BSD and GNU `rm` flags that only change HOW the named operands are removed.
 /// `-W` (BSD undelete) and `--help`/`--version` are not deletions and are left
 /// unrecognised.
-fn is_known_flag(word: &str) -> bool {
+pub(crate) fn is_known_flag(word: &str) -> bool {
     if let Some(long) = word.strip_prefix("--") {
         return matches!(
             long,
@@ -794,7 +798,7 @@ fn is_known_flag(word: &str) -> bool {
     }
 }
 
-fn has_glob(s: &str) -> bool {
+pub(crate) fn has_glob(s: &str) -> bool {
     s.contains(['*', '?', '['])
 }
 
@@ -877,7 +881,7 @@ fn is_users_dir(comps: &[String]) -> bool {
 }
 
 /// `Some(name of the pattern)` when `pattern` refuses this target.
-fn denied(
+pub(crate) fn denied(
     pattern: &DenyPattern,
     comps: &[String],
     path: &str,
@@ -1014,9 +1018,9 @@ fn clip(s: &str) -> String {
 /// `ts` included, since this module reads no clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LedgerFields<'a> {
-    /// The row id. The ring assigns a slot id at append
-    /// ([`super::ring::Ring::next_id`] says which); pass that, so the row and
-    /// its frame carry one number.
+    /// The row id: the caller's own sequence for the ledger it appends to
+    /// (the hook-era ring that assigned it was deleted on 2026-09-23), so the
+    /// row and its frame carry one number.
     pub id: u64,
     /// The timestamp, already formatted (RFC 3339 in the design's example).
     pub ts: &'a str,
@@ -1116,7 +1120,7 @@ mod tests {
 
     fn policy() -> RmPolicy {
         RmPolicy {
-            home: Some(PathBuf::from("/Users//owner")),
+            home: Some(PathBuf::from("/Users//_owner")),
             ..RmPolicy::default()
         }
     }
@@ -1253,7 +1257,7 @@ mod tests {
         ("rm -rf /.", Abstain("deny:filesystem root")),
         ("rm -rf x /", Abstain("deny:filesystem root")),
         (
-            "rm -rf x /Users//owner/../..",
+            "rm -rf x /Users//_owner/../..",
             Abstain("unresolvable:a .. component"),
         ),
         ("rm -rf /*", Abstain("deny:glob at root")),
@@ -1277,10 +1281,10 @@ mod tests {
             Abstain("line:${…}, $'…' or $\"…\" is not modelled"),
         ),
         ("rm -rf '$HOME'", Abstain("unresolvable:$HOME")),
-        ("rm -rf /Users//owner", Abstain("deny:home")),
-        ("rm -rf /users/OWNER/", Abstain("deny:home")),
+        ("rm -rf /Users//_owner", Abstain("deny:home")),
+        ("rm -rf /users/_OWNER/", Abstain("deny:home")),
         ("rm -rf /Users", Abstain("deny:home")),
-        ("rm -rf /Users//someone", Abstain("deny:/Users")),
+        ("rm -rf /Users//_someone", Abstain("deny:/Users")),
         ("rm -rf /home/someone", Abstain("deny:/Users")),
         // Anything a shell would still expand.
         ("rm -rf $TMPDIR/x", Abstain("unresolvable:an unexpanded $")),
@@ -1372,9 +1376,15 @@ mod tests {
         ),
         (
             "PATH=/evil; rm x",
-            Abstain("segment:an assignment on an rm line"),
+            // classify refuses a PATH= assignment itself now, before this
+            // module's own assignment rule is reached.
+            Abstain("segment:not rm and not read-only (PATH="),
         ),
-        ("export PATH=/evil; rm x", Abstain("segment:export changes")),
+        (
+            "export PATH=/evil; rm x",
+            Abstain("segment:not rm and not read-only (PATH="),
+        ),
+        ("export FOO=/evil; rm x", Abstain("segment:export changes")),
         ("cd /etc && rm -rf x", Abstain("segment:cd changes")),
         ("cd build; rm -rf x", Abstain("segment:cd changes")),
         // Wrappers: every one abstains in this slice, and the reason names it.
@@ -1440,10 +1450,8 @@ mod tests {
         ("rm x >&out.txt", Abstain("rm:redirect > &out.txt")),
         ("rm x 2>\"/dev/null\"", Abstain("rm:redirect >")),
         ("rm x >", Abstain("rm:redirect > (no target)")),
-        (
-            "rm /etc/x>/dev/null",
-            Abstain("rm:a redirect glued to an argument"),
-        ),
+        // The operand in front of a glued redirect is an operand.
+        ("rm /etc/x>/dev/null", Abstain("prefix:/etc/x is outside")),
         ("rm x < list", Abstain("rm:an input redirect")),
         ("rm x <<EOF\ny\nEOF", Abstain("line:a here-document")),
         // A line mixing rm with a write.
@@ -1469,7 +1477,7 @@ mod tests {
         ),
         (
             "rm a & ./deploy.sh",
-            Abstain("segment:not rm and not read-only (deploy.sh)"),
+            Abstain("segment:not rm and not read-only (./deploy.sh (a program named by path))"),
         ),
         (
             "yes | rm -i x",
@@ -1483,15 +1491,15 @@ mod tests {
         ),
         (
             "rm x; git -c core.fsmonitor='touch /tmp/p' status",
-            Abstain("segment:git is not a companion"),
+            Abstain("segment:not rm and not read-only (git -c"),
         ),
         (
             "rg --pre ./x.sh foo; rm x",
-            Abstain("segment:rg is not a companion"),
+            Abstain("segment:not rm and not read-only (rg --pre"),
         ),
         (
             "sort --compress-program=./x.sh f; rm x",
-            Abstain("segment:sort is not"),
+            Abstain("segment:not rm and not read-only (sort --compress-program"),
         ),
         (
             "find . -name '*.o' | head; rm x",
@@ -1503,15 +1511,23 @@ mod tests {
         ("sed -n 1p f; rm x", Abstain("segment:sed is not")),
         (
             "python3 scripts/sat_score_table.py; rm x",
-            Abstain("segment:python3 is not"),
+            Abstain(
+                "segment:not rm and not read-only (python3 scripts/sat_score_table.py is not on",
+            ),
         ),
         (
             "/tmp/evil/ls; rm x",
-            Abstain("segment:/tmp/evil/ls is not a companion"),
+            Abstain("segment:not rm and not read-only (/tmp/evil/ls"),
         ),
-        ("./ls; rm x", Abstain("segment:./ls is not a companion")),
+        (
+            "./ls; rm x",
+            Abstain("segment:not rm and not read-only (./ls"),
+        ),
         // classify accepts `>&word`; bash writes `word`.
-        ("ls >&out.txt; rm x", Abstain("segment:redirect > &out.txt")),
+        (
+            "ls >&out.txt; rm x",
+            Abstain("segment:not rm and not read-only (redirect > &out.txt"),
+        ),
         // Escapes are not modelled.
         ("rm my\\ file", Abstain("rm:a backslash escape")),
         ("rm -rf \\/", Abstain("rm:a backslash escape")),
@@ -1533,10 +1549,7 @@ mod tests {
         ("rm \"file#1\"", Abstain("line:a # can start a comment")),
         ("rm x <<< y", Abstain("line:a here-document")),
         // An rm with no `rm` token: the redirect is glued to the head.
-        (
-            "rm a; rm>/dev/null -rf /",
-            Abstain("segment:starts with a redirect or a flag"),
-        ),
+        ("rm a; rm>/dev/null -rf /", Abstain("deny:filesystem root")),
         (
             "rm a; /bin/rm&>/dev/null -rf /",
             Abstain("segment:starts with a redirect or a flag"),
@@ -1554,7 +1567,10 @@ mod tests {
             "for PATH in /evil; do true; done; rm x",
             Abstain("segment:compound command (for)"),
         ),
-        ("printf -v PATH /evil; rm x", Abstain("segment:printf -v")),
+        (
+            "printf -v PATH /evil; rm x",
+            Abstain("segment:not rm and not read-only (printf -v"),
+        ),
         // GNU getopt takes any unambiguous prefix of a long flag.
         ("rm --no-p -rf x", Abstain("rm:unrecognised flag --no-p")),
         ("rm --no-preserve -rf x", Abstain("rm:unrecognised flag")),
@@ -1735,8 +1751,8 @@ mod tests {
         for (cmd, reason) in [
             ("rm -rf /", "deny:filesystem root"),
             ("rm -rf /*", "deny:glob at root"),
-            ("rm -rf /Users//owner", "deny:home"),
-            ("rm -rf /Users//owner/*", "deny:home"),
+            ("rm -rf /Users//_owner", "deny:home"),
+            ("rm -rf /Users//_owner/*", "deny:home"),
             ("rm -rf /USERS/x", "deny:/Users"),
             ("rm -rf ~/x", "unresolvable:~"),
             ("rm -rf ../x", "unresolvable:a .. component"),
@@ -1753,7 +1769,7 @@ mod tests {
         for cwd in [
             "/",
             "/Users",
-            "/Users//owner",
+            "/Users//_owner",
             "/users/other",
             "/home/me",
             "/home",
@@ -1899,7 +1915,7 @@ mod tests {
         }
         // With no home injected the shape rules still catch a home directory.
         let v = evaluate(
-            "rm -rf /Users//owner",
+            "rm -rf /Users//_owner",
             Path::new(CWD),
             HookEvent::PermissionRequest,
             &d,

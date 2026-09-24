@@ -88,6 +88,14 @@
 //! UserNotifications); adding one would move the identity from a subprocess to
 //! the bundle itself and needs the bundle's own notification consent — a design
 //! step, not a fallback swap.
+//!
+//! **aterm's own notices.** Two producers post text aterm wrote itself, not
+//! program output, and so are NOT behind `allow_notifications`: the consent
+//! attention path (`consent_observer::AttentionGate`) and the escalation herald
+//! (`status_item::Herald`, one notice per transition of a session into an
+//! agent prompt, question or usage limit, or into typed `attention`). Both use
+//! this same bounded queue and focus suppression, and both rate-limit
+//! themselves before the queue. The herald never runs in a headless instance.
 
 // Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
 // channel-draining stub (`spawn_delivery`), so the real-notification
@@ -188,9 +196,12 @@ pub fn spawn_delivery(
 /// `display notification`. Runs ONLY on the delivery thread (blocking is fine
 /// there). Best-effort: a missing notifier or a non-zero exit is swallowed.
 ///
-/// Reached only through the `allow_notifications` gate (the module doc's
-/// *Identity and consent* paragraph says what each subprocess asks the system for
-/// under aterm's name, and that the measured answer is: nothing that prompts).
+/// Program-originated notifications reach it only through the
+/// `allow_notifications` gate (the module doc's *Identity and consent* paragraph
+/// says what each subprocess asks the system for under aterm's name, and that
+/// the measured answer is: nothing that prompts). aterm's OWN notices — the
+/// consent attention path and the escalation herald — are not program output
+/// and do not pass that gate; see *aterm's own notices* in the module doc.
 #[cfg(target_os = "macos")]
 pub fn deliver(title: Option<&str>, body: &str, _silent: bool) {
     use std::process::{Command, Stdio};

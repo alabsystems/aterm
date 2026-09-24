@@ -63,6 +63,7 @@ fn journal(done: Vec<String>) -> publish::Journal {
         commit: "0123456789abcdef0123456789abcdef01234567".into(),
         min_build: Some(55),
         arm64_only: false,
+        linux: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

@@ -1,0 +1,40 @@
+user@host work1 % which claude; claude --version; echo $TERM_PROGRAM; env | grep -c -E "^(CLAU
+DE|ANTHROPIC)"
+/Users//_user/Library/Application Support/aterm/pkg/agents/claude
+2.1.280 (Claude Code)
+aterm
+0
+user@host work1 % claude --model haiku
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/claude-502/scratch/work1
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

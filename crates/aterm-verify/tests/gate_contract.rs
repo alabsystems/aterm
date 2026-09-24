@@ -231,12 +231,13 @@ case "$*" in
 #!/bin/sh
 # These are real spawn-time fixture preconditions, not runner-wide overrides:
 # an absent machine table still authorizes the product's per-user defaults.
-test "$ATERM_NO_REROUTE" = 1 || exit 81
+test -z "${ATERM_NO_REROUTE+set}${ATERM_NO_AUTO_UPDATE+set}" || exit 81
 test "$ATERM_CONTROL_SOCK" = "$XDG_RUNTIME_DIR/aterm/aterm.sock" || exit 88
 test "$HOME" = "${XDG_CONFIG_HOME%/cfg}/home" || exit 89
 test -d "$HOME" || exit 90
 config="$XDG_CONFIG_HOME/aterm/aterm.toml"
 grep -qx 'agents_auto_prime = false' "$config" || exit 87
+grep -qx '\[update\]' "$config" || exit 91
 grep -qx '\[packages\]' "$config" || exit 82
 grep -qx 'enabled = false' "$config" || exit 83
 grep -qx '\[machine\]' "$config" || exit 84
@@ -341,6 +342,13 @@ exit 0"#,
         // inheriting whatever ran the suite.
         env.cargo_build_jobs = None;
         tweak(&mut env);
+        // THE DISK FLOOR IS ZERO HERE. A fixture with a fake toolchain builds
+        // nothing, and the real floor made these tests' ladders refuse at the
+        // disk preflight whenever the HOST volume held less than it — measured
+        // 2026-09-23 inside a merge-contract run at 17.6 GiB free: 11 failures
+        // here, 12 in environment_contract.rs, every one a `disk preflight`
+        // COULD NOT RUN. The preflight itself is measured by its own laws, which
+        // set the floor they need.
         Ctx::new(
             self.root.clone(),
             mode,
@@ -349,6 +357,7 @@ exit 0"#,
             env,
             self.scratch.clone(),
         )
+        .with_disk_floor(0)
     }
 
     fn run(&self, mode: Mode, scope: Scope, selftest: bool) -> (String, i32) {
@@ -1465,6 +1474,7 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
                 "test-atpkg-mirror-extras.sh (selftest: not executed)"
             ),
             ("skip", "test-atpkg-auto-vendor.sh (selftest: not executed)"),
+            ("skip", "test-atpkg-auto-alab.sh (selftest: not executed)"),
             ("skip", "test-atpkg-target-pins.sh (selftest: not executed)"),
             (
                 "skip",
@@ -1473,6 +1483,14 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             (
                 "skip",
                 "test-atpkg-index-staging-collision.sh (selftest: not executed)"
+            ),
+            (
+                "skip",
+                "test-atpkg-index-vendor-direct.sh (selftest: not executed)"
+            ),
+            (
+                "skip",
+                "test-atpkg-prerelease-gate.sh (selftest: not executed)"
             ),
             ("skip", "test-atpkg-stale-pin.sh (selftest: not executed)"),
             (

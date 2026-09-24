@@ -4,13 +4,11 @@
 //! The Windows backend of [`crate::platform`]. Each function is the honest Windows
 //! analogue of the Unix primitive (see the module docs on [`crate::platform`]): a
 //! directory **junction** for the activation indirection, a `.cmd` batch wrapper for
-//! bin shims (and, for the `agents/` twin, the same wrapper behind a `goto`-shaped
-//! landing prelude — [`super::cmd_landing_prelude`], 2026-09-17; every `.cmd` behind
-//! the resume-proof frame [`super::CMD_FRAME_HEAD`], 2026-09-18), per-user
-//! `%LOCALAPPDATA%`-ACL privacy (no POSIX mode/owner bits), `GetDiskFreeSpaceExW` for
-//! free space, `spawn().wait()` + `exit` for exec (behind a console control handler that
-//! leaves Ctrl-C to the child), and `SetConsoleCtrlHandler` for the landing wait's
-//! Ctrl-C ([`add_ctrl_handler`], the `signal(SIGINT, …)` twin; 2026-09-17).
+//! bin shims and the `agents/` twin (every `.cmd` behind the resume-proof frame
+//! [`super::CMD_FRAME_HEAD`], 2026-09-18), per-user `%LOCALAPPDATA%`-ACL privacy (no
+//! POSIX mode/owner bits), `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` +
+//! `exit` for exec, behind a console control handler that leaves Ctrl-C to the child
+//! ([`add_ctrl_handler`], `SetConsoleCtrlHandler`; 2026-09-17).
 //!
 //! This backend has not been exercised on a real Windows host. `mod windows` is
 //! `#[cfg(windows)]`, so every line below is type-checked on all three Windows cells
@@ -468,14 +466,11 @@ pub fn shim_executable_to_env(
     ))
 }
 
-/// The `agents/` twin on Windows (2026-09-17, residual R4 closed): the `.cmd` shim with
-/// `prelude` — the [`super::cmd_landing_prelude`] the caller rendered — ahead of its
-/// `@set` lines and forward line ([`super::cmd_shim_content_twin`]), so a `claude` typed
-/// while `<prefix>/landing/claude` stands hands over to the embedded co-located
-/// `atpkg __landing` and falls through to the store build when that `atpkg` is gone.
-/// The same two injection refusals as [`shim_executable_to_env`]; the prelude's own
-/// paths were guarded when it was rendered (an unsafe one renders EMPTY, the plain shim).
-/// RENDERED but not written. Unverified on a Windows host, like everything here.
+/// The `agents/` twin on Windows: the `.cmd` shim with `prelude` — the caller's
+/// [`super::twin_prelude`], empty today, so the twin is the framed shim under the twin's
+/// name — ahead of its `@set` lines and forward line ([`super::cmd_shim_content_twin`]).
+/// The same two injection refusals as [`shim_executable_to_env`]. RENDERED but not
+/// written. Unverified on a Windows host, like everything here.
 pub fn twin_executable_to_env(
     shim: &Path,
     target: &Path,
@@ -557,22 +552,15 @@ unsafe extern "system" {
 }
 
 /// Install `handler` at the front of this process's console control handler list — it is
-/// called (on its own thread) for every Ctrl-C / Ctrl-Break / close event until removed by
-/// [`remove_ctrl_handler`]. `false` when the call failed; the caller then has the default
-/// behaviour (the process ends on Ctrl-C), never a wrong claim. The Windows analogue of
-/// `signal(SIGINT, …)` — the seam `cli::cmd_landing` arms for the landing wait's duration
-/// (2026-09-17; unverified on a Windows host).
+/// called (on its own thread) for every Ctrl-C / Ctrl-Break / close event for the rest of
+/// the process. `false` when the call failed; the caller then has the default behaviour
+/// (the process ends on Ctrl-C), never a wrong claim. The Windows analogue of
+/// `signal(SIGINT, …)`, armed by [`exec_or_run`] for its child's lifetime (2026-09-17;
+/// unverified on a Windows host).
 pub fn add_ctrl_handler(handler: CtrlHandler) -> bool {
     // SAFETY: `handler` is a plain `extern "system"` function that lives for the whole
     // program; kernel32 keeps only its address. No memory of ours is handed over.
     unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
-}
-
-/// Remove a handler [`add_ctrl_handler`] installed; `false` when it was not installed.
-pub fn remove_ctrl_handler(handler: CtrlHandler) -> bool {
-    // SAFETY: as in `add_ctrl_handler`; removing a routine that is not installed is a
-    // documented failure (`FALSE`), not undefined behaviour.
-    unsafe { SetConsoleCtrlHandler(Some(handler), 0) != 0 }
 }
 
 /// The wrapper's own Ctrl-C handler while a child owns the console: `TRUE` for Ctrl-C and
@@ -599,15 +587,16 @@ unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
 /// its own way. Installed for the rest of this process's life (it ends with the child's
 /// code). NOT the `NULL`-routine ignore flag, which children inherit.
 ///
-/// A `.cmd` program (the `bin/<program>.cmd` shim `cli::cmd_landing` runs through here
-/// after the wait) is routed by std through its own `cmd.exe /d /c` lane with batch-safe
+/// A `.cmd` program (the `bin/<program>.cmd` shim `cli::cmd_landing` runs through here)
+/// is routed by std through its own `cmd.exe /d /c` lane with batch-safe
 /// quoting — std may refuse arguments it cannot quote safely, the same as for any `.cmd`
 /// shim today. That lane is std's; it shares only the `cmd.exe` binary with
 /// [`atomic_symlink`]'s explicit `cmd /C mklink`, and nothing in this crate has exercised
 /// it. While a batch file is the child, `cmd.exe` itself may ask `Terminate batch job
 /// (Y/N)?` after a Ctrl-C — its own prompt for every `.cmd` shim, in any shell, since
-/// before this lane. And on the landing path there are TWO batch levels, not one
-/// (review, 2026-09-17): the `agents\<program>.cmd` twin the user's shell is running,
+/// before this lane. And on the landing path — an older twin's hand-over — there are
+/// TWO batch levels, not one (review, 2026-09-17): the `agents\<program>.cmd` twin the
+/// user's shell is running,
 /// and the `bin\<program>.cmd` shim this function spawns through `cmd.exe /d /c` — each
 /// `cmd.exe` that received the Ctrl-C asks its own question once the agent exits, so a
 /// Ctrl-C typed inside the agent (which `claude` treats as "stop this turn" and keeps

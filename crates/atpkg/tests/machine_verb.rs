@@ -38,7 +38,6 @@ impl Fixture {
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env_remove("ATPKG_DISABLE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

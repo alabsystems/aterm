@@ -624,6 +624,45 @@ impl<S: Read + Write> RelayClient<S> {
         Ok((header, body))
     }
 
+    /// Send one control line and read a BYTE-framed reply: the header, then
+    /// exactly `n` raw bytes when the header is `OK <n>` and `<n>` is a
+    /// number (`inbox get`, `cast`). A header that is not counted returns
+    /// with an empty body and no further read, as [`Self::request_counted`].
+    ///
+    /// # Errors
+    /// I/O errors, a body past the line bound, or a stream that ends inside
+    /// the body.
+    pub fn request_bytes(&mut self, line: &str) -> std::io::Result<(String, Vec<u8>)> {
+        self.write_line(line)?;
+        let header = self.read_line()?;
+        let count: Option<usize> = header
+            .strip_prefix("OK ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|tok| tok.parse().ok());
+        let Some(count) = count else {
+            return Ok((header, Vec::new()));
+        };
+        if count > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reply body exceeds the bound",
+            ));
+        }
+        while self.buf.len() < count {
+            let mut tmp = [0u8; 8192];
+            let n = self.io.read(&mut tmp)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "control connection closed inside a reply body",
+                ));
+            }
+            self.buf.extend_from_slice(&tmp[..n]);
+        }
+        let body: Vec<u8> = self.buf.drain(..count).collect();
+        Ok((header, body))
+    }
+
     /// Read ONE line a server PUSHED on a connection that is already parked
     /// on a stream (`subscribe`). Nothing is written.
     ///
@@ -742,7 +781,7 @@ USAGE
                       [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT]
                       [--journal FILE] [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
                       [--resume [RULES]]
-              | task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text...>
+              | task @sid [--deadline S] [--wait] [--inbox @sid] <text...>
               | report [@sid] [--since ORIGIN:I] [--max-rows N] [--final | --messages]
               | ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
 
@@ -767,24 +806,46 @@ COMMANDS
     help               Show this text.
 
 SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm ctl ls`)
+    Every Claude Code session in an aterm window is ALREADY supervised by the
+    window's own host, by default: this engine, one loop per session, under
+    aterm.toml's [harness] table (`aterm help harness` lists its keys;
+    `enabled = false`, or Settings ▸ Harness, turns it off; a headless
+    instance only with `headless = true`). `status`/`ls` name it as
+    `supervisor=aterm-harness@<pid>`; what it cannot prove safe goes to the
+    session's attention (owner=supervisor): one menu-bar row, one
+    notification. The commands below are for a manager of its own: a
+    `watch` started on a session the host holds watches only (WATCHING …),
+    and one started first holds the session until it ends.
     classify [--allow-python GLOB]... <cmd...>
                        Is this shell line READ-ONLY, the way the supervisor judges
                        it? Prints `read-only` (exit 0) or `not-read-only <reason>`
                        (exit 1). The flags come first; from the command's first
                        word on, every word is the command's (`classify git log
-                       --oneline` works unquoted; `--` also ends the flags). Quoted
-                       strings are dropped before the danger scan, every danger
-                       token anywhere fails it (rm mv cp tee … git push/reset/
-                       commit … a redirect to a file, sed -i, python3 -c, sort -o,
-                       uniq IN OUT, find -fprint), and every segment's head must be
-                       a known read-only program — a wrapper is seen through
-                       (`xargs touch`, `env FOO=1 ./x.sh` are touch and x.sh), a
-                       `&` ends a segment like `;`, git needs a read-only
-                       subcommand and form (`git branch NAME` creates), python3
-                       only a script on the --allow-python globs (default
-                       scripts/*standing*.py, scripts/*report*.py,
-                       scripts/*score*.py — all under scripts/; no `..`).
-                       The programs handed to awk and sed are read from the raw
+                       --oneline` works unquoted; `--` also ends the flags). The
+                       line is read as the shell reads it first: a `#` comment
+                       ends at its newline, a here-document body is data (one
+                       under an unquoted terminator that runs `$(…)` refuses),
+                       and `$'…'` with an escape, a `${…}` holding a quote or a
+                       substitution, and an unterminated quote all refuse. Then
+                       quoted strings are dropped, and every segment's HEAD must
+                       be a known read-only program (a program word elsewhere is
+                       data: `grep -rn open src` reads); a program named by a
+                       path outside /bin and /usr/bin is unknown; a wrapper is
+                       seen through (`xargs touch`, `env FOO=1 ./x.sh` are touch
+                       and ./x.sh), a `&` ends a segment like `;`, git needs a
+                       read-only subcommand and form (`git branch NAME`
+                       creates). Anywhere on the line, these refuse: git
+                       push/reset/commit…, `git -c`, `git --output`,
+                       `--ext-diff`, `grep -O`, a redirect to a file (`>&file`
+                       too), sed -i, python3 -c, sort -o and
+                       --compress-program, rg --pre, printf -v, less +cmd,
+                       date -s, uniq IN OUT, find -fprint, and an assignment
+                       to PATH (unless every entry is a system bin dir), HOME,
+                       GIT_*, LD_*/DYLD_*, a pager or an editor. `aterm ctl`
+                       reads only by verb AND form (`meta` reads, `meta set`
+                       writes). python3 runs only a script on the
+                       --allow-python globs (none by default; no `..`). The
+                       programs handed to awk and sed are read from the raw
                        words: `system(`, a redirect or a pipe in awk, a `w`/`e`
                        command or `s///w` flag in sed, a `-f` program file, all
                        refuse. A tie breaks toward not-read-only.
@@ -793,7 +854,7 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        `command`, `description`, one `note <text>` per note
                        row (a Bash box's warning rows, e.g. the critical-path
                        `rm` warning), `classify` (a Bash box), one `option N …`
-                       per option, then `cancel esc` or `cancel none`. For
+                       per option, then `cancel esc`. For
                        busy, `reason <where>: <rule>` names the signal that
                        fired. For limited, `message <text>` and `reset
                        <text|->`. A prompt wins over busy, busy over limited,
@@ -877,21 +938,51 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        read answered before the timeout` when none was.
     supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
               [--reconnect-s S] [--dismiss-surveys] [--context-warn PCT]
-                       The loop: await-turn; with --auto-reads, a Bash prompt whose
-                       command classifies read-only is approved (option 1, pressed
-                       GUARDED: `key if=Do.you.want.to.proceed 1` on a host that has
-                       it — `OK seq=<n>` is the press, `OK skipped seq=<n>` means
-                       NOTHING was pressed or approved: the box had left (the loop
-                       goes on), or the seq is the screen just parsed and the
-                       guard matched no row (that box is handed to you); a host
-                       without the guard answers a usage line or a bare `ERR` and
-                       the press falls back to read → confirm → press → re-read,
-                       backspacing a digit that landed in the composer — and
-                       with the session survey open on the confirming read it
-                       presses nothing and hands the box to you (a `1` that
-                       reaches the survey is a rating); `ERR busy sink` is
-                       retried, any other `ERR` stops the loop), one line
-                       appended to --notes, then `await seq` until the box has LEFT
+                       The loop: await-turn; with --auto-reads, the approval
+                       policy decides every box (one decider; option 1, `Yes`,
+                       only — never a don't-ask-again grant): a Bash box whose
+                       command classifies read-only both with its rows joined
+                       by newlines and by spaces, with no vendor note row and
+                       outside a bypass-permissions session; the rm circuit
+                       breaker (`Dangerous rm operation on possibly-empty
+                       variable path`) in a bypass session, when every rm
+                       operand resolves literally under a scratch root
+                       (/private/tmp/claude-<uid>/, $TMPDIR, /tmp/<x>/,
+                       <cwd>/target*) — the session's cwd is read from its
+                       `meta`, and unknown it is yours; a Read box whose one
+                       absolute path is outside the secrets list (.ssh, .aws,
+                       Keychains, *.pem, .env, *.token, …); and the folder-
+                       trust dialog (its trust option) when its folder is
+                       exactly the session's cwd and lies under a trust root
+                       (~/aterm*, ~/ay*, $HOME/trust*, /private/tmp/claude-*).
+                       --auto-reads is the switch for this whole policy, not
+                       only the read-only rule. Everything else is yours. The
+                       press is GUARDED by the row that was
+                       judged — `key if=<that row, anchored> 1`, plus
+                       `if-gen=<the read's generation>` (`text --json`'s gen)
+                       where `help key` names that fence — so a box swapped
+                       between the read and the press matches nothing, even
+                       one redrawn at the same seq after an alternate-screen
+                       re-entry: `OK seq=<n>` is the press, `OK skipped
+                       …` means NOTHING was pressed or approved: the box had
+                       left or the fenced screen moved (the loop reads and
+                       decides again), or the seq is the screen just parsed and
+                       the guard matched no row (that box is handed to you); a
+                       host without the guard answers a usage line or a bare
+                       `ERR` and the press falls back to read → confirm → press
+                       → re-read, backspacing a digit that landed in the
+                       composer — and with the session survey open on the
+                       confirming read it presses nothing and hands the box to
+                       you (a `1` that reaches the survey is a rating). `ERR
+                       halted` parks the loop until `status` says hold=0,
+                       `ERR busy …` (`busy sink` too) and `ERR rate` back it
+                       off; after either the box is read and decided again,
+                       never pressed again as it was; any other `ERR` stops
+                       the loop. Every decision is one row of the approval
+                       ledger, <aterm state>/drive/<sid>.jsonl (rule, outcome,
+                       the command's sha256 and its first 4 KiB, the reason,
+                       the box's seq). One line is appended to --notes, then
+                       `await seq` until the box has LEFT
                        before the next look (an unchanged screen is never pressed
                        twice; one that does not move after the press is handed to
                        you), and the loop continues. The same read coming back
@@ -900,7 +991,7 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        idle composer — prints the compact result (the phase lines,
                        then the prompt box or the last 28 non-blank rows) and
                        exits 0: that is YOUR review point. Once --max-s (default
-                       1800) is spent it prints TIMEOUT, then the last read's
+                       1800; 0 is no budget) is spent it prints TIMEOUT, then the last read's
                        compact result, and exits 124 — a turn read at or after
                        the deadline is not pressed, and a budget spent while a
                        lost connection is ridden out is the TIMEOUT too. The
@@ -955,7 +1046,8 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        point, as a fresh supervise's would. A worker without the
                        composer rules is looked at when its output pauses, as
                        await-turn waits. Every line is flushed. The last line is
-                       TIMEOUT (exit 124) once --max-s (default 1800) is spent —
+                       TIMEOUT (exit 124) once --max-s (default 1800; 0 is
+                       no budget) is spent —
                        no press and no EVENT comes after the deadline, and a
                        budget spent in an outage is the TIMEOUT too — or `EXIT
                        <reason>` (exit 1): the session ended (`EXIT session gone
@@ -1002,21 +1094,28 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        out its --max-s and exited; nobody could act for two
                        days). On `EVENT limited` it sets the worker's
                        attention (`meta set attention limited: <message>
-                       reset=<when>`, cut at 256 bytes — the typed escalation
+                       reset=<when>`, cut at 200 bytes — the typed escalation
                        aterm's menu bar badges), posts the same text as
                        `kind=control` mail from the worker's session to yours
                        (--inbox, else $ATERM_PARENT_SESSION_ID; with neither,
-                       skipped) and journals one `ESCALATED seq=<n>
+                       skipped) only while the worker's `status` says
+                       fabric=connected (else `mail=skipped: no fabric
+                       (fabric=<state>)`: a post the fabric cannot carry is no
+                       delivery) and journals one `ESCALATED seq=<n>
                        attention=<reply> mail=<reply>` line — once a limit
                        episode: a retry's notice prints its EVENT and
-                       escalates nothing again. It never exits on a limit: a
+                       escalates nothing again. With --resume a notice whose
+                       reset has passed is continued at once and raises
+                       nothing (journaled `LIMITED seq=<n> handled: …`); the
+                       notice again after that is escalated then, once. It
+                       never exits on a limit: a
                        --max-s that would run out before the reset the notice
                        names (`resets Sep 19 at 11am (America/Los_Angeles)`,
                        `resets 7:30pm`, `resets in 3h`; the zone's offset as
                        `date` reads it today, the local zone with none; a span
                        counts from the notice's print, so a watcher started
-                       onto a notice that sat reads it late — the probe's
-                       backoff covers that; a reset read as more than 8 days
+                       onto a notice that sat reads it late — the
+                       continuation's backoff covers that; a reset read as more than 8 days
                        off is misread and extends nothing) plus 10 min is
                        stretched to that, `EXTEND until=<UTC> reset=<text>`
                        printed once a reset. Claude Code's auto-continue
@@ -1041,59 +1140,79 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        spinner, then `continuing shortly`), is the same
                        episode opened again: the attention set again, no
                        second mail (`ESCALATED … mail=skipped: the retry hit
-                       the wall again, the episode of seq=<m>`), the probe's
-                       backoff standing. With --resume the loop PROBES
-                       the worker itself: at the reset (a minute past the
-                       time an auto-continue notice names: Claude Code's own
-                       continuation goes first) — or sooner, when the screen
-                       leaves the notice with no busy spell (the `/login` of
-                       another account, the `/model` output) — ONE turn
-                       (`turn idle=600 timeout=2500
-                       Manager's watcher: the usage limit should have reset.
-                       Answer with one line: can you work now, and what was
-                       the last thing you completed?`), only at an idle
-                       composer with nothing typed (a draft, or no composer on
-                       the screen — the `/login` dialog's code field — defers
-                       it a step, a question leaves it to you; journaled
-                       `PROBE sent|deferred seq=<n> …`). Its answer — a new
-                       done row, or a box; a worker still busy on it when 120
-                       s are up is waited for, as any turn is — prints `EVENT
-                       resumed seq=<n> <its line>` (the point is not reported
-                       again as idle) and, with RULES named, the file's
-                       contents are sent as ONE turn (`Manager's watcher,
-                       standing rules restated after a limit: <the file, line
-                       breaks as spaces>`; read at the launch and again then)
-                       and `EVENT rebriefed seq=<n>` follows — `EVENT
-                       rebrief-failed seq=<n> <why>` when it cannot be read or
-                       the turn was not submitted; a worker that answers on
-                       someone else's turn is rebriefed at that idle point the
-                       same way. The notice again, a turn not submitted, or no
-                       reaction within 120 s prints `EVENT still-limited
-                       seq=<n> <why>` and the next probe waits 10 min, then 30
-                       (never before a later reset a new notice names; the
-                       notice again with the same text — a retry's, an
-                       outage's re-report — moves no reset and brings no probe
-                       forward). The last unfinished directive is yours to
-                       resend — the journal and `history` show it; the loop
-                       invents no work. Without --resume every line is as
-                       above but for the one EXTEND.
-    task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text...>
+                       the wall again, the episode of seq=<m>`). With --resume
+                       the loop CONTINUES the worker itself, as you would: a
+                       minute past the reset (never on an auto-continue notice:
+                       Claude Code goes on by itself) — or at once, when the
+                       screen leaves the notice with no busy spell (the
+                       `/login` of another account, the `/model` output) — it
+                       types `keep going`, with RULES named `keep going
+                       (standing rules: <the file, line breaks as spaces, cut
+                       at 400 characters>)` (read when typed), only at an
+                       idle composer read with nothing typed (a draft, a box,
+                       or no composer on the screen — the `/login` dialog's
+                       code field — types nothing). Where the host fences
+                       `send`, the text is written only while the screen is
+                       still the read judged (`send if-gen=<g> if=<the
+                       composer row> -- <text>`; moved — a keystroke of
+                       yours — writes nothing), and Enter goes only once a
+                       read shows the composer holding exactly that text
+                       (`key if-gen=… enter`); elsewhere through the guarded
+                       submit (`turn submit=guarded:<the text's end>
+                       yield=0.2`: parked while you type, then PASTED — not
+                       fenced — and Enter only while the cursor's row still
+                       ends as the text does). Text it wrote and did not
+                       submit is escalated, never left. It prints
+                       `CONTINUED seq=<n>
+                       rule=usage-resume@v1 <text>`. The notice again after it
+                       is the same episode, and the next continuation waits 10
+                       min from then, then 30 (never before a later reset a new
+                       notice names; the notice again with the same text — a
+                       retry's, an outage's re-report — moves no reset);
+                       journaled `WAITING seq=<n> until=<UTC> <why>`. A model's
+                       own limit is waited out the same way. The last
+                       unfinished directive is yours to resend — the journal
+                       and `history` show it; the loop invents no work beyond
+                       `keep going`. Without --resume every line is as above
+                       but for the one EXTEND.
+                       A box the loop does not approve, and a question the
+                       worker asks, is the manager's: the worker's `attention`
+                       meta is set to `claude <kind>: <command, path or
+                       question, cut at 64 cells; else the box's own first
+                       row> (<why no rule approved it>)` (kind bash, read,
+                       edit, write, workflow, rm-breaker, trust, other,
+                       question) and ONE kind=ask is posted, without waiting
+                       for it to land, to the manager (--inbox, else
+                       $ATERM_PARENT_SESSION_ID) per review point, only while
+                       fabric=connected — a later look at the same point posts
+                       nothing, the same box back after the worker worked is
+                       asked again — and the badge is cleared when the point
+                       has left the screen (the `key`/`turn` that answers a
+                       box is the change the loop waits on: it waits for the
+                       box's own row to leave); journaled `ESCALATED seq=<n>
+                       …` (a queued post as `mail=queued id=<n> (…)`) and
+                       `CLEARED seq=<n> box …`. A box --auto-reads approves is
+                       never escalated. A watch starts by settling an
+                       attention a previous watcher left: kept (ADOPTED, no
+                       second ask) when its point still shows, unset
+                       (`CLEARED … stale`) when it does not; and it ends —
+                       TIMEOUT or EXIT, the session itself not gone — by
+                       clearing the badges it raised. supervise, one look with
+                       you right there, escalates nothing.
+    task @sid [--deadline S] [--wait] [--inbox @sid] <text...>
                        Give the worker its work BY MAIL: `post to=@sid
                        kind=task [dl=<S*1000>] <text>` from your own session
                        (@self: $ATERM_PARENT_SESSION_ID, or --inbox), so the
-                       body never goes through the PTY, then — unless
-                       --no-nudge — one read of the worker's screen, and ONLY
-                       when its phase is idle, the one-line nudge
+                       body never goes through the PTY, then one read of the
+                       worker's screen, and ONLY when its phase is idle, the
+                       one-line nudge
                          Inbox: task @<off>
                        typed as a `turn` (idle=600 timeout=2500, not waited
                        on: its verdict may say status=timeout — submitted=1 is
                        what counts) — a busy worker gets the mail alone, and
-                       reads it at its next look at the inbox (a worker with
-                       round 12's wake hooks installed, and your sid in their
-                       --accept-from — every human is accepted, a session only
-                       when listed — reads it on its next Stop, which is why
-                       such a worker needs --no-nudge: the hook wakes it, and
-                       a nudge typed over that is a second turn). Prints
+                       reads it at its next look at the inbox. Nothing wakes
+                       a worker for mail: it is typed to, as a human would
+                       type to it. Prints
                        `task @<off> nudged=0|1` once the post
                        LANDED (the broker's offset, which the worker's `inbox`
                        row shows as `off=` and its answer carries as `re=`).
@@ -1264,11 +1383,10 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        offset an answer names as re=; from: the attested
                        sender; nothing of the body — trust= is in the inbox
                        row, and the body is yours to read). The worker's
-                       end-of-turn `report` (the Stop hook posts what the
-                       worker's SCREEN says, `aterm link hook install claude
-                       --report-to @<you>`; its body opens with a
-                       `seq=<n> hash=<hex16>[ busy=1]` stamp line, which
-                       `rows=` below does NOT count) is folded into the idle
+                       end-of-turn `report` (one the worker posts itself, if
+                       it does — nothing posts one for it; a body that opens
+                       with a `seq=<n> hash=<hex16>[ busy=1]` stamp line has
+                       that line uncounted by `rows=` below) is folded into the idle
                        point of
                        the same turn: the point is HELD — nothing printed —
                        until the report lands or --idle-grace S (default 180)
@@ -1417,10 +1535,11 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        <reason>` for the error it ends on.
                          {\"t\":<unix ms>,\"sid\":\"<sid>\"|null,\"kind\":\"event|
                           approved|dismissed|reconnect|timeout|exit|mail|extend|
-                          escalated|cleared|probe\",\"phase\":
+                          escalated|cleared|continued|typed|waiting|skipped|
+                          unverified|limited\",\"phase\":
                           \"idle|question|prompt|limited|survey|context|
-                          compacted|turn|idle-no-report|resumed|still-limited|
-                          rebriefed|rebrief-failed|-\",\"seq\":<n>|null,
+                          compacted|turn|idle-no-report|<rule id>|-\",
+                          \"seq\":<n>|null,
                           \"complete\":0|1|null,
                           \"rows\":<n>|null,\"summary\":\"<the line's free-text
                           tail>\",\"line\":\"<the exact line>\",\"turn\":<id>|null}
@@ -1433,12 +1552,12 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        never stops the loop. `aterm drive ledger --journal
                        FILE` replays it. --notes is still what it was: one line
                        per Bash-prompt decision, and nothing else.
-    --resume [RULES]   (watch) Live through a usage limit's reset and probe
-                       the worker after it (see watch); RULES, when named, is
-                       the file whose contents are restated to the worker as
-                       ONE turn once it answers — keep your standing rules
-                       there (run nothing heavy while a flag file exists, …),
-                       and edit it as they change: it is read when sent.
+    --resume [RULES]   (watch) Live through a usage limit's reset and
+                       continue the worker after it (see watch); RULES, when
+                       named, is the file whose contents are typed with every
+                       continuation — keep your standing rules there (run
+                       nothing heavy while a flag file exists, …), and edit it
+                       as they change: it is read when typed.
                        Refused at the launch when it cannot be read or is
                        empty. The next word is the file unless it is a flag
                        or the worker's @sid.

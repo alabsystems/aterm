@@ -46,6 +46,60 @@ thread_local! {
 }
 
 #[cfg(test)]
+mod queued_key_present_tests {
+    use super::*;
+
+    #[test]
+    fn a_delayed_key_after_paste_releases_its_echo_at_the_half_refresh_floor() {
+        let mut app = App::headless_for_test();
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        let t0 = Instant::now();
+        let full = Duration::from_millis(16);
+        ws.input_hot = true;
+        ws.input_hot_until = Some(t0 + crate::app_input::INPUT_HOT_WINDOW);
+        // Paste output is presented after the key's arrival-time 50 ms tail.
+        // The key is still waiting on that paste's ordered egress FIFO.
+        ws.on_content_presented(t0 + Duration::from_millis(60));
+        assert!(!ws.input_hot);
+        ws.last_present_at = Some(t0 + Duration::from_millis(86));
+        ws.content_pending = true;
+        ws.redraw_pending = true;
+        assert_eq!(ws.content_pace_floor(full), full);
+
+        // Its actual write finishes at 90 ms; the echo's output wake may have
+        // deferred the dirty frame already. At 95 ms a full period has not
+        // elapsed since paste output, but a half period has.
+        assert!(ws.queued_key_delivery_releases_pending_frame(
+            t0 + Duration::from_millis(90),
+            t0 + Duration::from_millis(95),
+            full,
+        ));
+        assert_eq!(ws.content_pace_floor(full), full / 2);
+        assert_eq!(ws.input_hot_until, Some(t0 + Duration::from_millis(140)));
+        ws.on_content_presented(t0 + Duration::from_millis(100));
+        assert!(
+            ws.input_hot,
+            "a concurrent output frame cannot spend the key tail"
+        );
+        ws.on_content_presented(t0 + Duration::from_millis(141));
+        assert!(!ws.input_hot, "the write-time priority remains bounded");
+
+        ws.content_pending = false;
+        ws.redraw_pending = false;
+        assert!(!ws.queued_key_delivery_releases_pending_frame(
+            t0 + Duration::from_millis(150),
+            t0 + Duration::from_millis(155),
+            full,
+        ));
+        assert!(!ws.queued_key_delivery_releases_pending_frame(
+            t0 + Duration::from_millis(90),
+            t0 + Duration::from_millis(141),
+            full,
+        ));
+    }
+}
+
+#[cfg(test)]
 fn reset_visible_leaf_plan_builds() {
     VISIBLE_LEAF_PLAN_BUILDS.with(|count| count.set(0));
 }
@@ -149,19 +203,49 @@ pub fn running_build_number() -> u64 {
     build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0)
 }
 
-/// The update channel this machine is configured to check — the `[update]
-/// owner`/`repo` config table under the env override, exactly the resolution
-/// the window's background loop uses — for the front door's headless
-/// `aterm update check` and its session-mode background check (2026-09-14).
-/// They used to resolve from the environment alone, so a config-repointed
-/// machine was checked from the public channel by every terminal-only lane; and
-/// now that the env repoint no longer inherits into spawned shells
-/// (`ENV_DENY_VARS`), the config file is what keeps a window and the shells
-/// inside it on one channel.
+/// The running app version (`0.91.0`), for the headless update lane's one plain line
+/// (`aterm 0.91.0 is up to date · checked 12 min ago`) — the version a person knows,
+/// where the build number is About's.
+#[must_use]
+pub fn running_version() -> &'static str {
+    build_info::VERSION
+}
+
+/// Read-only compiled identity for the native updater and release worker. This
+/// does not resolve an installation, enroll updates, read config, or open a UI.
+#[must_use]
+pub fn running_binary_identity() -> aterm_update_core::linux::BinaryIdentity {
+    aterm_update_core::linux::BinaryIdentity {
+        schema: 1,
+        version: build_info::VERSION.into(),
+        build_number: running_build_number(),
+        commit: build_info::GIT_COMMIT_FULL.into(),
+        target: build_info::BINARY_TARGET.into(),
+        dirty: build_info::GIT_DIRTY == "true",
+    }
+}
+
+/// The same channel resolution as the window: the compiled channel in shipped
+/// builds, with `[update] owner`/`repo` repointing available only in development
+/// builds. Terminal-only checks do not gain a separate channel or ambient override.
 #[must_use]
 pub fn configured_update_source() -> aterm_update::Source {
     let (owner, repo) = app_config::update_repoint_setting();
     aterm_update::Source::resolve(owner.as_deref(), repo.as_deref())
+}
+
+/// The window's `aterm.log` for the terminal session (`aterm --session` in
+/// `crates/aterm`), whose background threads — the update check, the reroute lay, the
+/// detached-pass spawns — must log rather than print into the shell beside them. The file
+/// logger only; the window keeps its own [`main_entry`] setup.
+pub fn install_session_log() {
+    logging::init_session();
+}
+
+/// Persisted source and apply policy for CLI checks and interactive sessions.
+#[must_use]
+pub fn configured_update_settings() -> Option<aterm_update::CheckSettings> {
+    app_config::update_check_settings_setting()
 }
 mod cast;
 mod chrome_band;
@@ -187,7 +271,6 @@ mod compiler_probe;
 /// `privacy-access-card-answered`): the exclusive, bounded, never-written-
 /// through read/write rules, spelled once.
 mod config_marker;
-mod config_notice;
 mod config_watcher;
 /// The connection confirm/configure card (design §3.3 + §2.5 — one shared component).
 mod conn_card;
@@ -213,6 +296,10 @@ mod consent_card;
 /// environment variable and no control verb, because a consent surface an agent
 /// could enable from inside a session is exactly what this design removes.
 mod consent_observer;
+/// The Security panel's *Move to Trash* worker for conflicting copies of the
+/// app (design §3.7): owner-confirmed, off the event loop, re-checking every
+/// copy before it moves.
+mod consent_retire;
 /// The macOS consent WARM-UP (design §3.5): the owner-initiated, off-event-loop
 /// worker that lists each configured folder in sequence so macOS asks its
 /// question at a moment a human chose, plus the bounded in-place-apply hold that
@@ -272,6 +359,9 @@ mod handoff_carry;
 /// because the launched lane and the PTY-device proof term both are.
 #[cfg(target_os = "macos")]
 mod handoff_rendezvous;
+/// The in-GUI supervisor host: every Claude Code session this instance owns
+/// is supervised under aterm.toml's `[harness]` policy, with nothing typed.
+mod harness_host;
 #[cfg(windows)]
 mod hdr_win;
 mod hwkey;
@@ -284,6 +374,18 @@ mod instance_retention_conformance;
 /// tasks-only cut, registered best-effort after first present.
 #[cfg(windows)]
 mod jumplist_win;
+/// The unified message system's host modules (docs/DESIGN-unified-messages-2026-09-21.md
+/// §3): the band painter and hit test (`message_band`), the pre-App inbox
+/// (`message_inbox`), the `App` glue, the intent performer and the Settings
+/// ▸ Messages projection (`messages_host`) and the on-disk log
+/// (`messages_store`). Phase 1 replaced the status bars with the band;
+/// Phase 2 gave every row its `Details ›` and the page it opens
+/// (`native_settings::SettingsRoute::Messages`).
+mod message_band;
+mod message_inbox;
+mod message_reporters;
+mod messages_host;
+mod messages_store;
 mod palette;
 mod paste_banner;
 mod pinned_dir;
@@ -297,7 +399,13 @@ mod present;
 mod press_custody_conformance;
 mod provenance_repair;
 mod relaunch_notice;
-mod status_bars;
+/// The toolchain lane's word builders for the unified message system
+/// (docs/DESIGN-unified-messages-2026-09-21.md §6 R25–R34): the `Wake::Pkg*`
+/// arms call them and post through `messages_host`.
+mod toolchain_words;
+/// The update lane's word builders (design §6 R35–R38): the `Wake::Update*`
+/// arms and `app_update_screen` call them and post through `messages_host`.
+mod update_words;
 // The cursor aurora + sparkle-words engines (color math, genome, cat baker, nova
 // emitters) live in the shared `aterm-effects` crate so the web embedders
 // (aterm-wasm / aterm-gpu-web) drive the SAME art; the aliases keep every existing
@@ -396,7 +504,6 @@ mod native_updater_conformance;
 mod native_updater_service;
 mod net_connections;
 mod net_listen;
-mod notice;
 mod notify;
 mod operator_host;
 mod overlay;
@@ -426,6 +533,7 @@ mod pty_idem;
 mod qos;
 mod quit_safety;
 mod restore;
+mod robi_bubble;
 mod scroll_motion;
 // Proof-carrying DSU Rung 1b (SEAMLESS in-place update): a POSIX-only mechanism — the
 // live shell's PTY master fd is inherited across `execve` (CLOEXEC cleared so it survives),
@@ -1110,8 +1218,10 @@ fn effect_tick_interval(panel: Option<Duration>) -> Duration {
 /// that `Device::preferred()` picks) with a standalone `CAMetalLayer` in the
 /// SHIPPED swapchain config: `Rgba16Float` with
 /// `wantsExtendedDynamicRangeContent` and the extended-linear sRGB space —
-/// `hdr_glow_or_default()` is true, so `renderer.rs`'s attach picks the f16
-/// EDR pool on this SDR panel too — `maximumDrawableCount` 3,
+/// `hdr_glow_or_default()` is true and this panel reports an EDR potential of
+/// 2.0, so `renderer.rs`'s attach picks the f16 EDR pool here (its screen
+/// gate gives a screen that reports 1.0 the 8-bit pool) —
+/// `maximumDrawableCount` 3,
 /// `displaySyncEnabled` NO, `framebufferOnly` YES, opaque, `presentDrawable:`
 /// before `commit`, at the panel's own backing size (3360x2100 px: the
 /// "looks like 1680x1050" scale of a 2880x1800 panel), driven in the
@@ -1140,7 +1250,7 @@ fn effect_tick_interval(panel: Option<Duration>) -> Duration {
 /// * ~11 ms: 30/s p95 0.15-0.23 max ≤ 0.29 ms; 60/s p50 13.8-15.9 ms, 144-160
 ///   of 180 over 4 ms (154-168 over 1 ms) — the pool is simply too slow for
 ///   panel rate.
-/// * 120/s over-drive (the presents-per-millisecond the M3's 120 Hz panel
+/// * 120/s over-drive (the presents per second the M3's 120 Hz panel
 ///   saw) parks at the MEDIAN in two of the three ~3 ms clears (p50 3.81,
 ///   4.03 and 0.17 ms) and at p95 in all three (19-25 ms; 74-92 of 180 over
 ///   4 ms).
@@ -1356,6 +1466,38 @@ fn edr_requery_due(last: Option<Instant>, now: Instant, interval: Duration) -> b
     last.is_none_or(|t| now.duration_since(t) >= interval)
 }
 
+/// Whether `App::refresh_edr_headroom` runs on this redraw. `surface_hdr` is
+/// the window's present: `None` when it is not a GPU swapchain (never due),
+/// `Some(is_hdr)` when it is, 8-bit ones included for the screen re-pick.
+/// `last` is the window's re-query stamp: when it ran, and whether the
+/// surface was HDR then. Due on the throttle ([`edr_requery_due`]), and at
+/// once for an HDR surface whose last stamp was taken while it was 8-bit.
+///
+/// The second term covers a surface that turns HDR between two re-queries
+/// through a path that does not seed the headroom. The Windows wgpu arm's
+/// live SDR->HDR upgrade (`reconcile_live_hdr_state_if_due`) is one: it runs
+/// inside the present that follows the re-query in the same redraw, and it
+/// resets the window's `sdr_white_scale` to 1.0 and `edr_max` to 0.0 until
+/// the frontend's next query. That re-query has just stamped the 8-bit
+/// surface, so on the throttle alone every frame for up to one
+/// [`EDR_REQUERY_INTERVAL`] would draw the scRGB grid at 80-nit reference
+/// white instead of the display's SDR white level, with no aurora headroom.
+/// An 8-bit surface stays on the throttle, so its re-pick (on macOS, an
+/// AppKit read) still runs at most once per interval. A surface the
+/// monitor-change hook upgraded was seeded there; the forced re-query reads
+/// the same values again.
+fn edr_refresh_due(
+    surface_hdr: Option<bool>,
+    last: Option<(Instant, bool)>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    surface_hdr.is_some_and(|hdr| {
+        (hdr && last.is_some_and(|(_, stamped_hdr)| !stamped_hdr))
+            || edr_requery_due(last.map(|(at, _)| at), now, interval)
+    })
+}
+
 /// Throttle for re-READING the occupied monitor's refresh rate on the SAME
 /// monitor (`refresh_frame_interval`). The read stays ahead of the
 /// monitor-identity guard (W6: a mode change keeps the identity), but it is not
@@ -1365,22 +1507,24 @@ fn edr_requery_due(last: Option<Instant>, now: Instant, interval: Duration) -> b
 /// call — measured on a 2017 15" MacBook Pro's built-in 60 Hz panel (Intel HD
 /// 630 / Radeon Pro 560, macOS 13.7.8) with `tools/displaylink-cost-probe/`
 /// (N = 200 calls per loop, live app running): 200/200 calls took the fallback
-/// on every run; per-call mean 0.23–0.51 ms and worst 3.2–6.5 ms across the
-/// runs of 2026-09-06 and 2026-09-08 (load-dependent — `runs.txt` there is the
-/// captured 09-08 set), against 0.013–0.03 ms for the CG-only path a panel
-/// whose CG mode reports its rate takes. `Moved` streams continuously during a
-/// drag, so the unthrottled read put that on the thread that dispatches
-/// keystrokes. Same period as [`EDR_REQUERY_INTERVAL`], and like it
-/// event-gated, not a timer: on the same monitor the read recurs on the first
-/// `Moved` that arrives at least this long after the previous read — within
-/// the interval during a drag, on the next event (as before the throttle) on a
-/// stationary window — while `Focused(true)`, the single-monitor heal route,
-/// forces the read on every call. The drag stream in between pays only the
-/// `current_monitor()` identity check it always paid: `-[NSWindow screen]` ->
-/// `-deviceDescription` -> `objectForKey:` -> `unsignedIntValue` (unmeasured,
-/// pre-existing per-`Moved` cost this throttle neither adds nor removes), then
+/// on every run; per-call mean 0.23–0.52 ms and worst 3.2–6.5 ms across the
+/// 2026-09-06 session's two runs and the five in `runs.txt` there (2026-09-08),
+/// against 0.013–0.033 ms for the CG-only path a panel whose CG mode reports
+/// its rate takes. The figures move with load, so these are those seven runs'
+/// ranges, not bounds. `Moved` streams continuously during a drag, so the
+/// unthrottled read put that on the thread that dispatches keystrokes. Same
+/// period as [`EDR_REQUERY_INTERVAL`], and like it event-gated, not a timer: on
+/// the same monitor the read recurs on the first `Moved` that arrives at least
+/// this long after the previous read — within the interval during a drag, on
+/// the next event (as before the throttle) on a stationary window — while
+/// `Focused(true)`, the single-monitor heal route, forces the read on every
+/// call. The drag stream in between pays only the `current_monitor()` identity
+/// check it always paid: `-[NSWindow screen]` -> `-deviceDescription` ->
+/// `objectForKey:` -> `unsignedIntValue` (unmeasured, pre-existing per-`Moved`
+/// cost this throttle neither adds nor removes), then
 /// `CGDisplayCreateUUIDFromDisplayID` + a UUID-bytes compare — that tail alone
-/// is the probe's third loop, mean 0.012–0.03 ms.
+/// is the probe's third loop, mean 0.012–0.037 ms in the same seven runs
+/// (0.012–0.014 in `runs.txt`).
 const REFRESH_RATE_REREAD_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Whether `refresh_frame_interval` READS the refresh rate on this call. Two
@@ -2723,7 +2867,7 @@ mod win32 {
     /// aterm back on its own — the behaviour every restartable Windows app opts
     /// into and aterm never did. `dwFlags = 0` also accepts restart-after-crash
     /// and restart-after-hang; that is deliberate: a terminal that vanishes and
-    /// quietly returns (with the crash-evidence banner saying WHY — see
+    /// quietly returns (with the crash message saying WHY — see
     /// `logging::take_crash_evidence`) beats one that just vanishes. A boot-crash
     /// cannot loop: the API's own guard only restarts a process that stayed alive
     /// ≥ 60 seconds, so a build that dies at startup is restarted at most once.
@@ -3295,10 +3439,10 @@ struct RepaintKey {
     /// bump — presents on an otherwise-static grid. `0` when hidden ⇒ byte-identical to
     /// the no-badge path. See [`crate::build_badge`].
     badge_fp: u64,
-    /// Fingerprint of the transient update notice ([`crate::notice`]), quantized over its
-    /// fade so each fade STEP re-presents (but a steady hold does not churn). `0` when no
-    /// notice is up ⇒ byte-identical to the no-notice path.
-    notice_fp: u64,
+    /// Fingerprint of Robi's tip bubble ([`crate::robi_bubble`]), quantized over its
+    /// ramps so each STEP re-presents (but a steady hold does not churn). `0` when no
+    /// bubble is up ⇒ byte-identical to the no-bubble path.
+    bubble_fp: u64,
     /// Fingerprint of the LEVEL-UP celebration ([`crate::level_up`]), quantized to its
     /// ~30fps frame step so the pulsing border glow + rising up-arrow re-present every
     /// frame while up. `0` when no celebration is active ⇒ byte-identical to the pre-
@@ -3306,14 +3450,19 @@ struct RepaintKey {
     /// — and `0` while this window's overlay is open or an arrow-less drag hovers it,
     /// where no rim is painted (the key sites in `app_render.rs`).
     level_up_fp: u64,
-    /// Fingerprint of the STATUS BARS ([`status_bars::StatusBars`] — the toolchain
-    /// install and the self-update rows): everything the bar painter reads, with
-    /// the meter quantized to its drawable resolution, so a data tick that cannot
-    /// move a cell does not re-present. **`0` whenever no bar is up**, so an idle
-    /// key is byte-identical to the no-bar path (the FL-1 idle invariant every
-    /// sibling `*_fp` holds). The bars carry no time-driven decoration: a live
-    /// bar moves only with its data, a holding bar only at its fold.
-    status_bars_fp: u64,
+    /// Fingerprint of the MESSAGE BAND (`aterm_messages::MessageCenter::fingerprint`
+    /// at this window's width ⊕ this window's hover, [`message_band::band_fp`]):
+    /// everything the band painter reads, with the meter quantized to its
+    /// drawable resolution, so a data tick that cannot move a cell does not
+    /// re-present. **`0` whenever no row is committed**, so an idle key is
+    /// byte-identical to the no-band path (the FL-1 idle invariant every
+    /// sibling `*_fp` holds). The band now carries TIME-DRIVEN MOTION (design
+    /// §10.8): the frame `App::prepare_band_motion` computed for this present
+    /// is folded in as a third term — the comet, the glint, a glide, an echo,
+    /// the elapsed and ETA words — and that term is `0` when nothing moves, so
+    /// a motion-free band's key is byte-identical to the key before motion
+    /// existed. A holding row still moves only at its fold.
+    band_fp: u64,
     /// Fingerprint of this window's PRESENCE ([`presence::WindowView::fp`]): the
     /// rim state, the band row's words and the one 300 ms ripple step. **`0` on
     /// a quiet window** (no rim, no row, no ripple) — the FL-1 idle invariant,
@@ -3565,6 +3714,18 @@ pub(crate) enum RainCtlOp {
     Toggle,
 }
 
+/// How `appnotice` took its text ([`Wake::AppNotice`]): RECORDED — every text is
+/// in the message log (Settings ▸ Messages, `appstatus`) and never a row (design
+/// §10.5 H7): free text has no severity, no action and no progress, so it is FYI
+/// by construction; toolchain text shaped like the `managed-current:` /
+/// `machine-settings:` markers is that marker's own record (2026-09-22), and a
+/// note on the harness lane is its `harness`-tagged record. The reply says
+/// `OK recorded`, so it never names a row that is not there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppNoticeTaken {
+    Recorded,
+}
+
 /// Wake the UI when the PTY produced output, exited, a screen snapshot was
 /// requested (SIGUSR1), or the control socket needs the renderer (`Control`) —
 /// the latter two are aterm introspecting itself: it renders its CURRENT live
@@ -3584,6 +3745,11 @@ enum Wake {
     /// redraw is routed per-window — every window currently DISPLAYING this
     /// session is redrawn (the owner today; co-viewers in a later step).
     Output { session: u64, window: WindowId },
+    /// A key queued behind this session's paste actually reached the sink.
+    /// The writer posts this only for an accepted press, so a queued key whose
+    /// arrival-time 50 ms priority expired can still get its echo on the next
+    /// half-refresh. It does not claim terminal damage or force a new frame.
+    QueuedKeyDelivered { session: u64, at: Instant },
     /// A control connection CHANGED a session's user metadata (`meta set`/`meta
     /// unset`). The user title is a tab-label rung ABOVE the OSC title, so every
     /// window labeling a tab with this session must re-read its strip (native
@@ -3747,6 +3913,9 @@ enum Wake {
     /// disconnect edge ends the pass on the next drain, and the apply hold is
     /// capped whether or not anyone drains at all.
     WarmupResult,
+    /// The Security panel's *Move to Trash* worker (`consent_retire`) stored
+    /// its report. Payload-free: the report is in the worker's slot.
+    ClaimantRetired,
     /// The tccd CONSENT OBSERVER (`consent_observer`, design §3.6) queued one
     /// or more parsed log events and is asking the event loop to fold them into
     /// its correlation table. Payload-free ON PURPOSE, for exactly the reasons
@@ -3972,7 +4141,8 @@ enum Wake {
     /// default-on) is the seamless overlap handoff, which gives every PTY, screen and
     /// window to the successor, so the shells keep running; a cold re-exec (the staged
     /// build swapping in at the top of the new `main`, `apply_staged_if_ready`) is only
-    /// the `ATERM_NO_SEAMLESS_UPDATE` fallback. This is what lets an AI running IN the
+    /// the fallback where the handoff cannot run (headless, a control socket this
+    /// process does not own). This is what lets an AI running IN the
     /// session see the staged build (`update status`) and press the button itself.
     ApplyStagedUpdate,
     /// PROOF-CARRYING DSU (RFC Rung 2): the background update thread staged a
@@ -4083,6 +4253,11 @@ enum Wake {
     ReadSessionStatus {
         session: u64,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// `sessions status` (bridge roster round): one current-roster snapshot and
+    /// one event-loop wake for every session's ordinary `status` projection.
+    ReadSessionStatuses {
+        reply: std::sync::mpsc::Sender<String>,
     },
     /// `aterm ctl story <verb> [<text>]` (control socket, Owner-only): the
     /// watcher's decision for the target session — one story point on its
@@ -4653,51 +4828,38 @@ enum Wake {
         close: bool,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
-    /// The batteries-included TOOLCHAIN SEED reported. The lane is RESUMABLE: it acts
-    /// whenever the sealed registry still holds channel-pinned members this store
-    /// lacks, so an interrupted first launch finishes on a later one. (It was once
-    /// gated on an EMPTY store, which made it single-shot and stranded every member a
-    /// killed first run had not reached.) It remains a bootstrap source rather than an
-    /// update source: the seal is outranked by any newer network index, and programs
-    /// the user removed on purpose are excluded.
-    /// Constructed ONLY by the `atpkg-update` thread
-    /// (`spawn_pkg_update_check`), ONCE per process at most: the launch-time `atpkg seed`
-    /// child's captured stdout carried one of the two STABLE marker lines
-    /// (`atpkg: seed-installed: …` / `atpkg: seed-pending: …` — see
-    /// [`parse_seed_markers`]); a quiet seed posts nothing. `installed` is the bundled
-    /// programs the pass just installed (may be empty when only the consent-pending
-    /// marker matched); `pending` is the human tail of the pending line — present when a
-    /// seed is available but `[packages].seed_install = false` turned the first run back
-    /// into an offer. Fire-and-forget and safe by construction: the main thread only
-    /// raises the NON-clickable transient status pill (details stay in
-    /// Settings ▸ Packages, the same truth atpkg records in its own `status.toml`) — no
-    /// install authority crosses this event.
-    PkgSeed {
-        installed: Vec<String>,
-        pending: Option<String>,
-    },
+    /// The toolchain ARRIVED: `net-installed: <name>, …`, the programs a pass just
+    /// installed over the network ([`parse_seed_line`]). The main thread records the
+    /// roster (`toolchain_words::installed`; details stay in Settings ▸ Packages, the
+    /// same truth atpkg records in `status.toml`) — no install authority crosses this
+    /// event. (The sealed-seed lane's `seed-installed:` and its `seed-pending:` offer
+    /// were deleted in Phase 5 of docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md,
+    /// and their readers with them.)
+    PkgSeed { installed: Vec<String> },
     /// The FIRST-LAUNCH ADMIN STEP (`docs/TOOLCHAIN-PACKAGE-MANAGER.md` §17.8): after a
     /// seed or update pass, `status.toml` carries one or more `needs admin — run: aterm
     /// pkg install <name>` rows (or rows `blocked by` one) that "Not now" has not
     /// dismissed for this exact set (`packages_screen::admin_step_due`). `names` is the
     /// door order (`clt` before `brew`). Posted ONLY by the atpkg-update worker
     /// ([`post_admin_step`] — it reads the file and the marker off the UI thread) and
-    /// only on macOS, where the osascript door exists. The main thread raises ONE passive
-    /// notice card (`notice::TransientNotice::admin_step`); no install authority crosses
-    /// this event — the press on the card's Install control is what runs the door.
+    /// only on macOS, where the osascript door exists. The main thread posts ONE
+    /// decision row on the message band (`App::post_admin_step`, R18); no install
+    /// authority crosses this event — the press on the row's Install capsule is what
+    /// runs the door.
     PkgNeedsAdmin { names: Vec<String> },
     /// One report from inside aterm's OWN update check
     /// ([`aterm_update::Progress`]: a container download's bytes, the verify /
     /// stage that follows, and how it ended) — posted by the process-wide observer
     /// the window installs at startup, from whichever thread is running the
-    /// check. Feeds the update STATUS BAR (`status_bars`); carries no authority
+    /// check. Feeds the update lane's band row (`update_words`); carries no authority
     /// (the apply lane reads its own durable facts, never this).
     UpdateProgress(aterm_update::Progress),
-    /// The batteries-included seed pass has STARTED laying the toolset down — raised
-    /// from the streamed `seed-starting:` marker before the multi-GB extraction, so the
-    /// user is told what is happening while it happens rather than after. Non-clickable
-    /// transient pill only, same as [`Wake::PkgSeed`]; no authority crosses it.
-    PkgSeedStarted { detail: String },
+    /// An install pass has STARTED laying the toolset down — raised from the streamed
+    /// `net-starting:` marker before the multi-GB download. `first_run` is the lane's
+    /// verdict for the pass that printed it ([`pass_is_first_run`], tagged by
+    /// [`run_atpkg_pass`]; `false` from every other reader): only a first run opens the
+    /// toolchain bar (2026-09-22). No authority crosses it.
+    PkgSeedStarted { detail: String, first_run: bool },
     /// The bundled toolchain has no build this machine can run — raised from the
     /// streamed `seed-unusable:` marker. It exists so the "Installing…" notice
     /// [`Wake::PkgSeedStarted`] raised is always ANSWERED: an announced install that
@@ -4715,16 +4877,11 @@ enum Wake {
     /// `detail` is atpkg's own sentence; display only, no authority crosses it.
     PkgSeedDone { detail: String },
     /// An announced pass that exited ZERO and left the store EMPTY. Its own variant
-    /// for the reason [`Wake::PkgSeedPartial`] has one: both obvious renderings lie.
+    /// because both obvious renderings lie.
     /// "Install failed" asserts a failure nobody observed — the pass reported success
     /// — and the success row asserts a toolchain that is demonstrably not on the disk.
     /// The only honest sentence names the promise and the outcome and nothing else.
     PkgSeedNothing { detail: String },
-    /// Some members installed and some did not — raised from `seed-partial:`. Its own
-    /// variant because the two obvious renderings are both lies: the success pill
-    /// claims a toolchain the machine does not have, and the failure pill hides the
-    /// programs that did arrive.
-    PkgSeedPartial { detail: String },
     /// atpkg's `lock-waiting:` line: this launch child is QUEUED behind another
     /// atpkg process at the store lock (`--wait-lock`, 2026-09-10). One INFO log
     /// line; NO row since 2026-09-18 (the row asserted "another aterm" for a
@@ -4735,22 +4892,23 @@ enum Wake {
     PkgLockAcquired { detail: String },
     /// The waited-on sibling did not finish inside the child's bound (atpkg exit 75):
     /// the pass is DEFERRED, not failed — the loop retries on a short backoff.
-    /// `detail` says what happens next (`StatusBars::toolchain_deferred`).
-    PkgLockTimedOut { detail: String },
+    /// `detail` says what happens next (`toolchain_words::deferred`, a record).
+    /// `stands_down`: this window will NOT retry this launch and the detail names the
+    /// command to run — the Settings ▸ Packages badge, not only the ledger.
+    PkgLockTimedOut { detail: String, stands_down: bool },
     /// `managed-current:` — every AGENT program (claude, codex) that is installed AND
-    /// at the index pin, as atpkg lists it at the end of a pass (`claude 2.1.267
-    /// (build 2026091001); codex 0.154.0 (build 2026091001)`). Raises the "Claude
-    /// Code X · Codex Y — aterm-managed, current" row on the toolchain lane (R6,
-    /// 2026-09-10) — once per text per launch: atpkg prints it on every pass and
-    /// this wake fires from the recurring pass too, so `StatusBars` records a
-    /// repeat in the ledger without moving the grid. Display only; no authority
-    /// crosses it.
+    /// at its vendor's latest, as atpkg lists it at the end of a pass (`claude 2.1.280
+    /// (Anthropic latest); codex 0.156.0 (OpenAI latest)`). A log line and a
+    /// [`aterm_messages::Hold::LogOnly`] record ("Claude Code X and Codex Y are up to
+    /// date") on `appstatus` and Settings ▸ Messages, never a row on glass
+    /// (2026-09-22) — recorded again only when its words change
+    /// (`App::post_managed_current`): atpkg prints it at the end of every pass.
+    /// Display only; no authority crosses it.
     PkgManagedCurrent(String),
     /// `machine-settings:` — the machine-level settings a pass CHANGED per doctor
     /// (`spotlight-noindex 73 dir(s) migrated; universal-control disabled`), listed
-    /// only when something changed. Raises ONE row per item — "Universal Control
-    /// disabled", whose detail says how to revert, ahead of "Spotlight: 73 build
-    /// dirs moved to .noindex" (R5/R6, 2026-09-10; per-item since the UX review).
+    /// only when something changed. A log line, one ledger row per item, and the
+    /// Security page's "Last change" — never a row on glass (2026-09-22).
     PkgMachineSettings(String),
     /// `machine-state:` — the record a PASS printed after its apply (2026-09-16;
     /// [`atpkg::cli::MACHINE_STATE_MARKER`]): the machine's posture measured by the
@@ -4765,35 +4923,33 @@ enum Wake {
     /// predates, so the read is spawned after all.
     PkgMachineRecordMissing,
     /// `group-aborted:` — a coherence group's transaction aborted (2026-09-15;
-    /// [`atpkg::cli::GROUP_ABORTED_MARKER`]): a TERMINAL that renders as a Warn row on
-    /// the toolchain lane. Until it existed the abort reached the log alone — the
-    /// 2026-09-14 incident's "rustc update ABORTED at trust during stage" was on no
-    /// screen while the seed lane's row said "install failed" for another reason.
+    /// [`atpkg::cli::GROUP_ABORTED_MARKER`]): a failure — a Warn ledger row and the
+    /// Settings ▸ Packages badge, never a row on glass (2026-09-22). Until it existed
+    /// the abort reached the log alone — the 2026-09-14 incident's "rustc update
+    /// ABORTED at trust during stage" was on no screen at all.
     /// `detail` is atpkg's own sentence, the cause included; display only.
     PkgGroupAborted { detail: String },
-    /// `tracked-install:` — a bundle staged IN-PROCESS by a provenance-tracked installer
-    /// whose untracked lane could not run ([`atpkg::cli::TRACKED_INSTALL_MARKER`],
-    /// 2026-09-15): the install succeeded and every executable carries the tag. A Warn
-    /// row naming the program and `aterm pkg doctor`, so the default policy's recorded
-    /// outcome is never a silent one. Not a terminal: the pass goes on.
-    PkgTrackedInstall { detail: String },
     /// A pass REFUSED to apply the `[machine]` settings, or its write did not land:
     /// the sentence to show, already prefixed `not applied — ` / `failed — `.
     PkgMachineRefused(String),
-    /// `aterm ctl appnotice <lane> <text>` — a text row posted to the pull-down from
+    /// `aterm ctl appnotice <lane> <text>` — a text recorded in the message log from
     /// OUTSIDE the process (an `aterm pkg install claude` run in a terminal has no
-    /// GUI child to stream markers through). Owner-only at the socket; `lane` is
-    /// `toolchain` or `update`, anything else is refused on the reply. Toolchain text
-    /// shaped like the two markers above renders as that marker's row.
+    /// GUI child to stream markers through), never a row on the glass (ruling 147).
+    /// Owner-only at the socket; `lane` is `toolchain`, `update` or `harness`,
+    /// anything else is refused on the reply. Toolchain text shaped like the two
+    /// markers above is taken as that marker is (its own record since 2026-09-22),
+    /// every harness note is a `harness`-tagged record
+    /// (`message_reporters::harness_note`), and any other text a record on its lane;
+    /// the reply is always `OK recorded` ([`AppNoticeTaken::Recorded`]).
     AppNotice {
         lane: String,
         text: String,
-        reply: std::sync::mpsc::Sender<Result<(), &'static str>>,
+        reply: std::sync::mpsc::Sender<Result<AppNoticeTaken, &'static str>>,
     },
     /// One parsed-and-classified `<prefix>/progress.json` snapshot from the
     /// CHILD-SCOPED tailer thread ([`PkgProgressTailer`]) — the machine channel
     /// the toolchain STATUS BAR renders from (§3 of the streaming-batteries
-    /// design; the presentation is `status_bars`). Posted ONLY when the file's content (or the derived running
+    /// design; the presentation is `toolchain_words`). Posted ONLY when the file's content (or the derived running
     /// verdict) actually changed, at most ~10Hz, and only while an `atpkg`
     /// seed/update child is alive: no child ⇒ no tailer ⇒ no wakes (FL-1 holds by
     /// construction). `None` clears the live bar — posted once at child exit when
@@ -4801,9 +4957,20 @@ enum Wake {
     /// stale bar can never outlive its data. The snapshot is UNTRUSTED display
     /// data: it carries no install authority, and the tailer already applied the
     /// size cap / regular-file / staleness rules ([`read_pkg_progress_snapshot`]).
+    /// `first_run` is the lane's verdict for the child the tailer is scoped to
+    /// ([`pass_is_first_run`]): only a first run's reads paint the bar.
     PkgProgress {
         snapshot: Option<Box<PkgProgressSnapshot>>,
+        first_run: bool,
     },
+    /// A launch child of the toolchain lane exited ([`PkgLane::run`]): the first-run
+    /// bar it held folds now (`App::toolchain_pass_ended`). `clean` is a
+    /// WHOLE pass (not a targeted `update <program>`) that ran, exited 0 and printed
+    /// no failure marker ([`SeedMarkers::saw_failure`]): it clears the trouble the
+    /// Settings ▸ Packages badge remembers from an earlier pass
+    /// (`PackagesService::note_pass_clean`). Either way the host re-reads the
+    /// Packages record, whose failure rows are the rest of the badge.
+    PkgPassEnded { clean: bool },
 }
 
 /// MEM-ACCT-3(b) shed policy: the low scrollback watermark (bytes) to evict down to when
@@ -4839,10 +5006,11 @@ fn pressure_shed_budget(budget: usize, critical: bool) -> usize {
 /// caches", as that aggravates the pressure.
 /// So WARN trims only the sessions already above half their ceiling, and only their
 /// oldest half: half the budget is also the store's own yellow-exit level
-/// (`aterm_scrollback::YELLOW_EXIT_PERCENT`), the occupancy it already calls relaxed,
-/// so the tier borrows an existing number rather than inventing one. CRITICAL keeps its
-/// eighth — it is the tier nearing the swap-unthrottle / compressor-pool limits, and the
-/// aggregate 4 GiB lane (`enforce_global_scrollback_cap`) sheds at the same fraction.
+/// (aterm-scrollback's crate-private `YELLOW_EXIT_PERCENT` in `watermark.rs`, 50%), the
+/// occupancy it already calls relaxed, so the tier borrows an existing number rather than
+/// inventing one. CRITICAL keeps its eighth — it is the tier nearing the swap-unthrottle /
+/// compressor-pool limits, and the aggregate 4 GiB lane (`enforce_global_scrollback_cap`)
+/// sheds at the same fraction.
 /// What stands behind CRITICAL on macOS is the low-swap path, not the embedded
 /// page-shortage jetsam. In xnu-8796.101.5 `CONFIG_JETSAM` is an embedded-only option
 /// (`config/MASTER`: "enable jetsam - used on embedded"); neither `MASTER.x86_64` nor
@@ -6429,6 +6597,283 @@ const fn defer_font_seal(headless: bool) -> bool {
     headless
 }
 
+/// `NSApplicationActivationPolicy`, spelled here so the DECISION is a pure value
+/// on every platform and only the macOS arm of `apply_launch_posture` speaks winit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppActivation {
+    /// `NSApplicationActivationPolicyRegular` (0): a Dock tile, a menu bar, may
+    /// activate — what winit gives an UNBUNDLED binary by default.
+    Regular,
+    /// `NSApplicationActivationPolicyAccessory` (1): no Dock tile; may own
+    /// windows and may still be activated programmatically.
+    Accessory,
+    /// `NSApplicationActivationPolicyProhibited` (2): no Dock tile, no windows,
+    /// and AppKit refuses to activate it — a process with no glass.
+    Prohibited,
+}
+
+impl AppActivation {
+    /// The SDK's raw value (`NSApplication.h`), which the live regression test
+    /// (`crates/aterm/tests/headless_activation.rs`) reads back through
+    /// `NSRunningApplication.activationPolicy`.
+    #[must_use]
+    pub const fn ns_raw(self) -> isize {
+        match self {
+            Self::Regular => 0,
+            Self::Accessory => 1,
+            Self::Prohibited => 2,
+        }
+    }
+}
+
+/// What a launch asks AppKit for at `applicationDidFinishLaunching:` — the two
+/// `EventLoopBuilderExtMacOS` knobs that decide whether a process can take the
+/// keyboard, as one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchPosture {
+    /// `None` leaves the policy to winit: Regular when unbundled, the bundle's
+    /// `LSUIElement` otherwise.
+    pub policy: Option<AppActivation>,
+    /// Send `activateIgnoringOtherApps:YES` at launch.
+    pub activate_on_launch: bool,
+}
+
+impl LaunchPosture {
+    /// `PlatformSpecificEventLoopAttributes::default()` in
+    /// `vendor/winit/src/platform_impl/macos/event_loop.rs`, spelled once here:
+    /// the windowed lane must stay byte-identical to what winit does alone.
+    pub const WINIT_DEFAULT: Self = Self {
+        policy: None,
+        activate_on_launch: true,
+    };
+
+    /// The posture of a gate driver (`aterm-redraw-conformance`, the toolbar
+    /// drive, the `objc_*_drive` examples): it owns real windows, some of them
+    /// visible, so it cannot be `Prohibited`, but nothing it measures needs it
+    /// to be the active app — and `tools/verify.sh --fast` runs every one of
+    /// them while the developer is typing somewhere else. `Accessory` keeps it
+    /// out of the Dock and Cmd-Tab; not activating at launch keeps the keyboard
+    /// where it was. A drive that audits activation itself (the window drive's
+    /// `focus_window`) still activates, explicitly, in the stage that audits
+    /// it. The toolbar drive sends synthetic mouse events directly to its own
+    /// window so its click checks do not depend on taking foreground focus.
+    pub const QUIET_DRIVER: Self = Self {
+        policy: Some(AppActivation::Accessory),
+        activate_on_launch: false,
+    };
+}
+
+/// THE HEADLESS ACTIVATION POSTURE, the third headless decision beside
+/// `defer_gpu_build` and `defer_font_seal`, and decided for the same reason:
+/// NO GLASS.
+///
+/// The incident (2026-09-21, an Intel Mac on macOS 13.7): "something keeps
+/// stealing focus while I type". On macOS a `--headless` run builds the real
+/// AppKit event loop — winit's display-free backend exists only for a free-unix
+/// host with no display server — and winit's `applicationDidFinishLaunching:`
+/// then does two things for it that only make sense for a process with a
+/// window: an UNBUNDLED binary is given `NSApplicationActivationPolicyRegular`
+/// (a Dock tile, a Cmd-Tab entry, a LaunchServices record as a second "aterm"),
+/// and every launch is sent `activateIgnoringOtherApps:YES`. So every headless
+/// instance took the keyboard from whatever the human was typing into and had
+/// nothing to show for it — and the verify gate boots dozens of them per run
+/// (each paint and spin conformance row, the control-socket smoke, the headless
+/// integration tests), which is exactly the periodic theft that was reported.
+///
+/// Headless is `Prohibited` and never activates on launch. `Prohibited` is the
+/// structural half — AppKit refuses to activate such a process at all, so the
+/// guarantee does not rest on the second knob staying set — and it costs
+/// nothing, because a headless run creates no OS window by construction:
+/// `resumed` returns before any attach, `Wake::CreateWindow` is ignored, the
+/// menu and the status item hang off the first window attach, the paste sheet
+/// needs a live `ns_window`, and capture, consent and the update handoff are
+/// all headless-inert. An EXPLICIT policy also overrides the bundle manifest
+/// (winit consults `LSUIElement` only when none is given), so a bundled
+/// headless launch (`ATERM_HEADLESS=1` on the installed `.app`) is `Prohibited`
+/// too. `activate_on_launch: false` is defense in depth on both lanes: the one
+/// knob that still matters if the policy is ever relaxed to `Accessory`.
+///
+/// WINDOWED IS UNTOUCHED: [`LaunchPosture::WINIT_DEFAULT`], so a window still
+/// becomes Regular and comes to the front, and a bundle's `LSUIElement` is
+/// still honoured. The windowed update successor's launch-time activation is a
+/// separate, documented item (docs/RFC-proof-carrying-dsu.md) that this
+/// decision does not reach.
+#[must_use]
+pub const fn launch_posture(headless: bool) -> LaunchPosture {
+    if headless {
+        LaunchPosture {
+            policy: Some(AppActivation::Prohibited),
+            activate_on_launch: false,
+        }
+    } else {
+        LaunchPosture::WINIT_DEFAULT
+    }
+}
+
+/// Put a [`LaunchPosture`] onto a builder — the ONLY place aterm-gui speaks
+/// `EventLoopBuilderExtMacOS`. It adds no `sel!` site: the sends it causes
+/// (`setActivationPolicy:`, `activateIgnoringOtherApps:`) are the vendored
+/// winit's own, already pinned by
+/// `crates/aterm-objc/tests/winit_sent_prototypes.rs`. Other hosts have no
+/// AppKit activation policy, so their arm leaves the builder unchanged.
+#[cfg(target_os = "macos")]
+pub fn apply_launch_posture<T: 'static>(
+    builder: &mut winit::event_loop::EventLoopBuilder<T>,
+    posture: LaunchPosture,
+) {
+    use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS as _};
+    if let Some(policy) = posture.policy {
+        builder.with_activation_policy(match policy {
+            AppActivation::Regular => ActivationPolicy::Regular,
+            AppActivation::Accessory => ActivationPolicy::Accessory,
+            AppActivation::Prohibited => ActivationPolicy::Prohibited,
+        });
+    }
+    builder.with_activate_ignoring_other_apps(posture.activate_on_launch);
+}
+
+/// The arm for every other platform: activation policy is an AppKit concept, so
+/// there is nothing to put on the builder. It exists for the reason
+/// [`handoff_proof_term`]'s non-Unix twin does — a caller that is not gated to
+/// macOS must still find the function on Windows and Linux, or the Windows
+/// build stops with `E0425` where no Unix gate would ever look.
+#[cfg(not(target_os = "macos"))]
+pub fn apply_launch_posture<T: 'static>(
+    _builder: &mut winit::event_loop::EventLoopBuilder<T>,
+    _posture: LaunchPosture,
+) {
+}
+
+/// The event-loop builder for a gate driver, under an EXPLICIT posture:
+/// `EventLoop::<T>::with_user_event()` with `posture` applied on macOS, the
+/// plain builder elsewhere. Every driver the verify gate runs
+/// (`aterm-redraw-conformance`, the toolbar drive, the `objc_*_drive`
+/// examples) builds its loop through this or [`quiet_driver_event_loop_builder`]
+/// — a unit test pins that — so none of them can drift back to winit's
+/// take-the-front default by omission; a driver that ever needs that default
+/// says so by naming [`LaunchPosture::WINIT_DEFAULT`] here, with a measured
+/// reason (today none does).
+#[must_use]
+pub fn driver_event_loop_builder<T: 'static>(
+    posture: LaunchPosture,
+) -> winit::event_loop::EventLoopBuilder<T> {
+    let mut builder = winit::event_loop::EventLoop::<T>::with_user_event();
+    apply_launch_posture(&mut builder, posture);
+    builder
+}
+
+/// [`driver_event_loop_builder`] under [`LaunchPosture::QUIET_DRIVER`]: the
+/// spelling for a driver nothing in which needs the process to be the active
+/// app at launch, which is all seven.
+#[must_use]
+pub fn quiet_driver_event_loop_builder<T: 'static>() -> winit::event_loop::EventLoopBuilder<T> {
+    driver_event_loop_builder(LaunchPosture::QUIET_DRIVER)
+}
+
+#[cfg(test)]
+mod headless_activation_posture_tests {
+    use super::{AppActivation, LaunchPosture, launch_posture};
+
+    /// The whole decision, both rows: headless is a process that cannot be
+    /// activated, and windowed is EXACTLY what winit would have done alone.
+    #[test]
+    fn only_a_headless_launch_refuses_activation_and_windowed_is_the_winit_default() {
+        assert_eq!(
+            launch_posture(true),
+            LaunchPosture {
+                policy: Some(AppActivation::Prohibited),
+                activate_on_launch: false,
+            },
+            "headless: no Dock tile, no activation"
+        );
+        assert_eq!(
+            launch_posture(false),
+            LaunchPosture::WINIT_DEFAULT,
+            "windowed: winit's own default"
+        );
+    }
+
+    /// The windowed posture ASKS FOR NOTHING winit does not already do — pinned
+    /// literally against `PlatformSpecificEventLoopAttributes::default()`
+    /// (vendor/winit/src/platform_impl/macos/event_loop.rs), whose fields are
+    /// pub(crate) and cannot be read from here. A change on either side must
+    /// come through this test.
+    #[test]
+    fn the_windowed_posture_is_winit_s_own_default_spelled_out() {
+        let w = launch_posture(false);
+        assert_eq!(w.policy, None, "the bundle's LSUIElement still decides");
+        assert!(w.activate_on_launch, "a window must come to the front");
+    }
+
+    /// Neither posture this crate hands a windowless or gate process can be the
+    /// focus thief: each names a policy (never winit's unbundled-Regular rule),
+    /// never the Regular one, and never asks to activate.
+    #[test]
+    fn no_headless_or_driver_posture_can_take_the_front() {
+        for p in [launch_posture(true), LaunchPosture::QUIET_DRIVER] {
+            assert!(p.policy.is_some(), "an explicit policy: {p:?}");
+            assert_ne!(p.policy, Some(AppActivation::Regular), "{p:?}");
+            assert!(!p.activate_on_launch, "{p:?}");
+        }
+    }
+
+    /// The raw values are the SDK's, in the order AppKit declares them; the
+    /// live test compares `NSRunningApplication.activationPolicy` against
+    /// `ns_raw()`, so a shuffled enum would fail there, not here.
+    #[test]
+    fn the_raw_policy_values_are_the_sdk_s() {
+        assert_eq!(AppActivation::Regular.ns_raw(), 0);
+        assert_eq!(AppActivation::Accessory.ns_raw(), 1);
+        assert_eq!(AppActivation::Prohibited.ns_raw(), 2);
+    }
+
+    /// The seven gate drivers build their loop through a driver builder and
+    /// nowhere else — a SOURCE pin, because winit's builder state is
+    /// `pub(crate)` and cannot be read back, and the live test only boots
+    /// `main_entry`. Comment lines are skipped (a driver may name the old
+    /// spelling in prose); a raw `EventLoop::new(` or `with_user_event(` on a
+    /// code line is a loop built with winit's take-the-front default BY
+    /// OMISSION, which is the drift this forbids — a driver that needs that
+    /// default names `LaunchPosture::WINIT_DEFAULT` through the builder.
+    #[test]
+    fn every_gate_driver_builds_its_loop_through_the_quiet_builder() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            "src/control_redraw_conformance.rs",
+            "src/toolbar_drive.rs",
+            "examples/objc_live_class_audit.rs",
+            "examples/objc_ime_drive.rs",
+            "examples/objc_window_drive.rs",
+            "examples/objc_event_drive.rs",
+            "examples/objc_alert_drive.rs",
+        ] {
+            let src =
+                std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let code: Vec<&str> = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+            // Matches both `quiet_driver_event_loop_builder` and the explicit
+            // `driver_event_loop_builder(posture)` spelling.
+            let quiet = code
+                .iter()
+                .filter(|l| l.contains("driver_event_loop_builder"))
+                .count();
+            assert_eq!(
+                quiet, 1,
+                "{rel}: exactly one driver-builder call, found {quiet}"
+            );
+            for raw in ["EventLoop::new(", "with_user_event("] {
+                assert!(
+                    !code.iter().any(|l| l.contains(raw)),
+                    "{rel}: `{raw}` builds a loop with winit's take-the-front default; \
+                     build it through `quiet_driver_event_loop_builder` instead"
+                );
+            }
+        }
+    }
+}
+
 /// What one [`App::ensure_pixel_backend`] did, leg by leg, in milliseconds —
 /// the material of the ONE info line it writes (see
 /// [`pixel_backend_redemption_line`]). Every leg is optional because the
@@ -6437,9 +6882,18 @@ const fn defer_font_seal(headless: bool) -> bool {
 /// before the install.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct PixelBackendRedemptionLegs {
-    /// The deferred font seal (three font files read and parsed on this
-    /// thread; Apple Color Emoji alone is 190 MB), when one was owed.
+    /// The deferred font seal ALONE, when one was owed:
+    /// `seal_admitted_font_sources`, three font files read and parsed on this
+    /// thread (Apple Color Emoji alone is 190 MB).
     seal_ms: Option<f64>,
+    /// The chrome re-sync [`App::redeem_deferred_font_seal`] runs right after
+    /// the seal (`sync_chrome_fonts`): the chrome rasterizer's primary and
+    /// bold faces handed over again — the bold one discovered on demand if
+    /// nothing has needed it yet — and its semantic surface re-forked from the
+    /// now-sealed generation (`fork_semantic_surface`). Timed as a leg of its
+    /// own because it is not those three files: a `font seal` figure that
+    /// folded it in would credit its cost to them.
+    chrome_sync_ms: Option<f64>,
     /// Forking the CPU face the device will be handed.
     fork_ms: Option<f64>,
     /// `GpuRenderer::new_with_family`, with its answer: `Ok(name (backend))`
@@ -6510,10 +6964,11 @@ fn elapsed_ms(since: Instant) -> f64 {
 /// INSIDE this redemption on a headless instance's first capture — the line
 /// was written at 14:29:36.4, the instance's stderr named its device (the
 /// Radeon Pro 560) only at 14:29:40.7, and the PNG was created at 14:29:41.7,
-/// so the reported window lies in the seal, fork and `new_with_family` legs
-/// and the first frame's Metal mint was in the 945 ms tail (with the
-/// install, the frame, the encode and the write; nothing timed it alone) —
-/// and nothing in the log said which leg, or what any of them had cost. The
+/// so the reported window lies in the seal, chrome re-sync, fork and
+/// `new_with_family` legs and the first frame's Metal mint was in the 945 ms
+/// tail (with the install, the frame, the encode and the write; nothing
+/// timed it alone) — and nothing in the log said which leg, or what any of
+/// them had cost. The
 /// device leg is split further (font thread, join wait) because on the macOS
 /// Metal arm it is max(device name, font discovery + parse + prewarm) plus a
 /// struct-assembly tail, and the line could not otherwise tell a slow Metal
@@ -6526,6 +6981,9 @@ fn pixel_backend_redemption_line(legs: &PixelBackendRedemptionLegs, total_ms: f6
     let mut parts: Vec<String> = Vec::new();
     if let Some(ms) = legs.seal_ms {
         parts.push(format!("font seal {ms:.0} ms"));
+    }
+    if let Some(ms) = legs.chrome_sync_ms {
+        parts.push(format!("chrome re-sync {ms:.0} ms"));
     }
     if let Some(ms) = legs.fork_ms {
         parts.push(format!("face fork {ms:.0} ms"));
@@ -6716,6 +7174,41 @@ mod headless_font_seal_deferral_tests {
         assert!(sealed(&app));
     }
 
+    /// The seal and the chrome re-sync after it come back timed APART, and
+    /// once: the redemption line prints them as two legs, because the re-sync
+    /// is not the three files the seal reads. The re-sync really ran inside the
+    /// redemption — this thread's chrome-font epoch moved across it — and a
+    /// spent debt times nothing.
+    #[test]
+    fn the_seal_and_its_chrome_resync_are_timed_apart_and_once() {
+        let mut app = super::App::headless_for_test();
+        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
+            super::Renderer::from_system(super::FONT_PX, app.theme)
+                .expect("system font for an unsealed generation"),
+        ));
+        app.deferred_font_seal = true;
+        let epoch = crate::tray_raster::chrome_font_epoch_for_test();
+        let (seal_ms, chrome_sync_ms) = app
+            .redeem_deferred_font_seal()
+            .expect("an owed seal is redeemed, and both halves are timed");
+        assert!(seal_ms.is_finite() && seal_ms >= 0.0, "{seal_ms}");
+        assert!(
+            chrome_sync_ms.is_finite() && chrome_sync_ms >= 0.0,
+            "{chrome_sync_ms}"
+        );
+        assert!(sealed(&app), "the first half sealed the generation");
+        assert_ne!(
+            crate::tray_raster::chrome_font_epoch_for_test(),
+            epoch,
+            "the second half re-synced the chrome faces inside the redemption"
+        );
+        assert_eq!(
+            app.redeem_deferred_font_seal(),
+            None,
+            "a spent debt times nothing"
+        );
+    }
+
     /// The negative control, and the reason the flag exists rather than a
     /// `headless` test: an App with no seal owed must not have one performed for
     /// it. Every windowed run and every already-redeemed headless run reaches
@@ -6805,9 +7298,11 @@ mod headless_gpu_deferral_tests {
         // with the device name hidden under it — which is what the split
         // exists to tell when the seconds land in that leg. No surviving
         // 2026-09-06 artifact carries a split line; the two real redemption
-        // lines that evening (509 and 533 ms) predate the split.
+        // lines that evening (509 and 533 ms) predate both splits — their
+        // `font seal` leg also held the chrome re-sync.
         let built = PixelBackendRedemptionLegs {
-            seal_ms: Some(131.4),
+            seal_ms: Some(91.4),
+            chrome_sync_ms: Some(40.0),
             fork_ms: Some(12.0),
             device: Some((9012.0, Ok("Intel(R) HD Graphics 630 (Metal)".into()))),
             font_thread_ms: Some(8990.4),
@@ -6816,8 +7311,9 @@ mod headless_gpu_deferral_tests {
         };
         assert_eq!(
             pixel_backend_redemption_line(&built, 9163.6),
-            "headless pixel backend redeemed on the main thread in 9164 ms: font seal 131 ms, \
-             face fork 12 ms, GPU device 9012 ms (font thread 8990 ms, join wait 8980 ms; \
+            "headless pixel backend redeemed on the main thread in 9164 ms: font seal 91 ms, \
+             chrome re-sync 40 ms, face fork 12 ms, GPU device 9012 ms (font thread 8990 ms, \
+             join wait 8980 ms; \
              Intel(R) HD Graphics 630 (Metal)), install 8 ms — the first pixel demand of a \
              headless run pays this once"
         );
@@ -6836,7 +7332,8 @@ mod headless_gpu_deferral_tests {
         // The context failed before the join: the font thread ran (and may
         // have landed its slot) but was never joined, so only its half prints.
         let unavailable = PixelBackendRedemptionLegs {
-            seal_ms: Some(120.0),
+            seal_ms: Some(90.0),
+            chrome_sync_ms: Some(30.0),
             fork_ms: Some(11.0),
             device: Some((5.0, Err("no Metal device on this machine".into()))),
             font_thread_ms: Some(4.0),
@@ -6854,6 +7351,7 @@ mod headless_gpu_deferral_tests {
         assert!(!line.contains("install"), "{line}");
         let fork_failed = PixelBackendRedemptionLegs {
             seal_ms: None,
+            chrome_sync_ms: None,
             fork_ms: Some(3.0),
             device: None,
             font_thread_ms: None,
@@ -6865,15 +7363,22 @@ mod headless_gpu_deferral_tests {
             line.contains("no device built (the face fork failed"),
             "{line}"
         );
+        assert!(
+            !line.contains("font seal") && !line.contains("chrome re-sync"),
+            "no seal owed, neither half printed: {line}"
+        );
+        // A `--cpu` headless run: the seal and the chrome re-sync after it are
+        // two legs, never one `font seal` figure that hides the re-sync.
         let cpu_only = PixelBackendRedemptionLegs {
-            seal_ms: Some(118.0),
+            seal_ms: Some(80.0),
+            chrome_sync_ms: Some(38.0),
             ..PixelBackendRedemptionLegs::default()
         };
         assert_eq!(
             pixel_backend_redemption_line(&cpu_only, 118.0),
-            "headless pixel backend redeemed on the main thread in 118 ms: font seal 118 ms, \
-             no GPU intent (the CPU renderer serves) — the first pixel demand of a headless \
-             run pays this once"
+            "headless pixel backend redeemed on the main thread in 118 ms: font seal 80 ms, \
+             chrome re-sync 38 ms, no GPU intent (the CPU renderer serves) — the first pixel \
+             demand of a headless run pays this once"
         );
     }
 
@@ -6966,15 +7471,22 @@ mod headless_gpu_deferral_tests {
     /// it first — but its SUPPRESSION can be, and is, below.
     #[test]
     fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
-        let _lane = crate::config_notice::lane_test_guard();
+        let _lane = crate::message_inbox::lane_test_guard();
+        // `set_deferred_gpu` and the redemption below WRITE the process-global mirror,
+        // so this test owns it for its length, as every writer must
+        // ([`super::DEFERRED_GPU_INTENT_OWNER`]): unowned, its armed `true` could land
+        // inside another test's settled reading. Disarmed at once: the window in which
+        // the mirror reads `true` stays the one the intent below opens.
+        let _mirror = super::DeferredGpuIntentGuard::arm();
+        super::set_backend_gpu_undecided(false);
         let mut app = super::App::headless_for_test();
-        let _ = crate::config_notice::take_deferred();
+        let _ = crate::message_inbox::take_queued();
         // A launch that asked for translucent glass, on a boot that has not yet
         // decided whether it has a GPU to composite it with.
         app.render_knobs.background_opacity = 0.5;
         app.set_deferred_gpu(true);
         app.pin_backend_render_config_core();
-        let withheld = crate::config_notice::take_deferred();
+        let withheld = crate::message_inbox::take_queued();
         let undecided = (
             app.backend_kind_undecided(),
             backend_background_opacity(&app),
@@ -6996,8 +7508,8 @@ mod headless_gpu_deferral_tests {
             backend_background_opacity(&app),
         );
         // Whatever the process-wide `Once` did with it, this test does not leave
-        // a notice behind for the banner-drain tests to find.
-        let _ = crate::config_notice::take_deferred();
+        // a message behind for the inbox-drain tests to find.
+        let _ = crate::message_inbox::take_queued();
 
         assert_eq!(
             undecided,
@@ -7477,6 +7989,9 @@ struct Session {
     /// thread (NOT the Vec index, which shifts when an earlier tab closes).
     id: u64,
     term: Arc<Mutex<Terminal>>,
+    /// Published by the GUI's two vi toggles immediately after reading the
+    /// engine state under `term_lock`. Shared views read the same flag on a key.
+    vi_active: Arc<std::sync::atomic::AtomicBool>,
     master: i32,
     /// This session's child shell pid == its process-group id (`forkpty` ->
     /// `login_tty` -> `setsid` makes it a session leader). Used by `Drop` to
@@ -10062,9 +10577,10 @@ struct WindowState {
     /// before its tick. The engine diffs consecutive probes; a kill-key hint
     /// plus a same-row net shrink puffs smoke off the vanished span.
     poof_row_buf: Vec<char>,
-    /// STAR-LANDING neighbor captures (reused every frame — zero steady-state
-    /// alloc): the rows flanking the probed cursor row, captured under the
-    /// SAME term lock as `poof_row_buf` and fed to
+    /// STAR-LANDING neighbor captures (resident capacity — zero steady-state
+    /// alloc): while Rainbow Kitty owns the frame, the rows flanking the
+    /// probed cursor row are captured under the SAME term lock as
+    /// `poof_row_buf` and fed to
     /// `CursorGlow::observe_neighbor_rows` right after its `observe_row`. The
     /// displaced rainbow ribbon stars paint in the ADJACENT rows' pixel bands,
     /// so their TEXT-FIRST gate needs those rows' occupancy — the spark's own
@@ -10214,17 +10730,20 @@ struct WindowState {
     /// [`EFFECT_LANE_PANEL_RATE_AT_60HZ`] would present at panel rate; it clears
     /// when the lane idles (`park_terminal_effect_scheduler`), so the next
     /// episode probes the pool again. Set from the wait the renderer MEASURED
-    /// on the present's own acquire (`App::last_acquire_wait_ns`, rewritten on
-    /// every successful acquire; never inferred), by
-    /// `App::finalize_successful_present` — the success boundary the routes
-    /// share — on the two routes that draw cursor effects: the terminal route
-    /// (`redraw_window_with_layout`) and the heterogeneous one
-    /// (`redraw_heterogeneous_window`: a mixed native + terminal tab, whose
-    /// focused terminal leaf runs this lane on the same drawable pool). The
-    /// native route draws no cursor effect and does not feed it. Nor does a
-    /// REFUSED acquire (a timeout, an occluded surface): that present failed
-    /// before its wait was recorded, so a pool still full is heard through
-    /// the retry's own wait.
+    /// on the present's own acquire (`App::last_acquire_wait_ns`: rewritten on
+    /// every completed acquisition, refusals included, and on the shipped
+    /// Metal attach measured on the surface's drawable worker; never
+    /// inferred), by `App::finalize_successful_present` — the success
+    /// boundary the routes share — on the two routes that draw cursor
+    /// effects: the terminal route (`redraw_window_with_layout`) and the
+    /// heterogeneous one (`redraw_heterogeneous_window`: a mixed native +
+    /// terminal tab, whose focused terminal leaf runs this lane on the same
+    /// drawable pool). The native route draws no cursor effect and does not
+    /// feed it. Nor does a REFUSED acquire (a timeout, an occluded surface):
+    /// its wait is recorded, but its present fails before
+    /// `finalize_successful_present`, and the retry's own acquisition
+    /// overwrites the value before the next finalize reads it, so a pool
+    /// still full is heard through the retry's own wait.
     effect_lane_parked: bool,
     /// CHROME-DECORATION MOTION, as a LEVEL with an expiry: "a redraw drew a
     /// decoration mid-motion no longer ago than this instant". Robi walking his
@@ -10503,8 +11022,9 @@ struct WindowState {
     /// CURRENT brightness, which the user changes on the SAME monitor with no
     /// screen-parameter or `Moved` event to hook — so the aurora present path
     /// re-samples it on a throttle ([`EDR_REQUERY_INTERVAL`]) rather than only on
-    /// an actual monitor change.
-    last_edr_query: Option<Instant>,
+    /// an actual monitor change. The `bool` records whether the window's GPU
+    /// surface was HDR when the stamp was taken ([`edr_refresh_due`]).
+    last_edr_query: Option<(Instant, bool)>,
     /// Last time this window's refresh RATE was read from its monitor (`None` =
     /// never). `refresh_frame_interval` reads it on every monitor change, on
     /// every forced call (`Focused(true)`), and otherwise on a throttle
@@ -10683,13 +11203,47 @@ struct WindowState {
     /// The painted tab-strip rows from the last build (see `last_strip_fp`). Cloned
     /// into `input_scratch` on a cache hit; rebuilt on a miss.
     cached_strip_rows: Vec<Vec<RenderCell>>,
-    /// The painted STATUS BAR rows from the last build (see `last_bars_key`):
-    /// prepended below the strip rows by the same splice, rebuilt only when the
-    /// bars' fingerprint, the column count or the chrome palette moved.
-    cached_bar_rows: Vec<Vec<RenderCell>>,
-    /// `(status_bars fingerprint, cols, palette key)` the cached bar rows were
-    /// painted for; `None` before the first paint.
-    last_bars_key: Option<(u64, usize, u64)>,
+    /// The painted MESSAGE BAND rows from the last build (see `last_band_key`):
+    /// ONE motion frame of the band (`message_band::paint_rows_on` over
+    /// [`Self::band_motion`]), prepended below the strip rows by the same
+    /// splice, rebuilt only when the center's fingerprint, the column count,
+    /// the chrome palette, the hover, the window geometry a full-width meter is
+    /// mapped onto, or the motion frame's fingerprint moved.
+    cached_band_rows: Vec<Vec<RenderCell>>,
+    /// Per cached band row, its meter's `(left, right)` gutter tones (`None` on
+    /// an unmetered row) — handed to the renderer's chrome bleed so a metered
+    /// row's fill (or a busy row's comet) runs through the side gutters to the
+    /// window edge (`message_band::MeterSpan`: the edge cells' spans ARE the
+    /// gutters').
+    cached_band_edges: Vec<Option<([u8; 3], [u8; 3])>>,
+    /// `(center fingerprint at cols, cols, palette key, hover, geometry, motion
+    /// fp)` the cached band rows were painted for; `None` before the first
+    /// paint.
+    last_band_key: Option<message_band::BandKey>,
+    /// The band's layout for this window, keyed by `(center fingerprint,
+    /// cols)` — the time-free presentation the motion frame is read against,
+    /// and what every motion frame re-paints without re-running the width law.
+    band_layout: Option<(u64, usize, aterm_messages::Presentation)>,
+    /// The band's MOTION frame prepared for this window's next present
+    /// (`App::prepare_band_motion`): `None` with no committed row.
+    band_motion: Option<aterm_messages::BandMotion>,
+    /// [`Self::band_motion`]'s fingerprint (0 when nothing moves) — the
+    /// RepaintKey's motion term.
+    band_motion_fp: u64,
+    /// The look [`Self::band_motion`] was drawn in.
+    band_motion_look: Option<aterm_messages::Look>,
+    /// The OS reports this window occluded (minimized, fully covered): its
+    /// band does not move (`App::band_on_screen`).
+    occluded: bool,
+    /// A test's stand-in for a real OS window: a headless window has none,
+    /// so its band never moves; the motion scheduling tests set this to
+    /// drive the on-screen branch (`messages_host::band_on_screen`).
+    #[cfg(test)]
+    band_on_screen_for_test: bool,
+    /// Which band chip the pointer is over in THIS window, if any
+    /// (`App::track_band_hover`); part of the paint key, so the lit chip
+    /// re-presents. `None` off the band.
+    band_hover: Option<message_band::BandHover>,
     /// This window's PRESENCE view ([`presence::WindowView`]): the rim, the band
     /// row (committed rows, words, painted cache), the story watermark and the
     /// ripple — every field the frame path reads is plain data, rebuilt only
@@ -10933,14 +11487,14 @@ struct WindowState {
     /// an open overlay covers the badge and it returns when the overlay closes. `None`
     /// when the `show_build_badge` setting is off. See [`crate::build_badge`].
     badge_card: Option<SettingsCard>,
-    /// The rasterized transient update NOTICE pill (paint-only), when [`App::notice`] is
-    /// live. Composited with priority OVER `badge_card` (the fading pill briefly replaces
-    /// the static badge) but UNDER `settings_card` (a modal covers it). `None` when no
-    /// notice is showing. See [`crate::notice`].
-    notice_card: Option<SettingsCard>,
+    /// The rasterized ROBI TIP BUBBLE (paint-only), when [`App::robi_bubble`] is live.
+    /// Composited with priority OVER `badge_card` (the bubble briefly covers the static
+    /// badge) but UNDER `settings_card` (a modal covers it). `None` when no bubble is
+    /// showing. See [`crate::robi_bubble`].
+    bubble_card: Option<SettingsCard>,
     /// The rasterized LEVEL-UP rising up-arrow (paint-only), when [`App::level_up`] is
-    /// live AND the arrow is still visible. Composited with priority OVER `notice_card`
-    /// (the burst momentarily supersedes the pill, which shows once the arrow clears) but
+    /// live AND the arrow is still visible. Composited with priority OVER `bubble_card`
+    /// (the burst momentarily supersedes the bubble, which shows once the arrow clears) but
     /// UNDER `settings_card`. `None` when no celebration / the arrow has faded. The border
     /// glow layer rides the drop-overlay pass, not this card. See [`crate::level_up`].
     level_up_card: Option<SettingsCard>,
@@ -10949,7 +11503,7 @@ struct WindowState {
     /// a connection drag from THIS window is in flight and the cursor is over
     /// it (beyond the source window the pushed chip highlights + the cursor
     /// carry the signal). Composited with priority OVER `level_up_card`/
-    /// `notice_card`/`badge_card` — the drag is the foreground act for its few
+    /// `bubble_card`/`badge_card` — the drag is the foreground act for its few
     /// hundred milliseconds — and UNDER `settings_card` (no modal can be open
     /// mid-drag anyway: the overlays claim the pointer before the strip). See
     /// `App::splice_conn_wire`.
@@ -10978,23 +11532,23 @@ struct WindowState {
 }
 
 impl WindowState {
-    /// Whether the notice card is the one ACTUALLY ON GLASS in this window.
+    /// Whether Robi's tip bubble is the card ACTUALLY ON GLASS in this window.
     ///
     /// The paint-only cards share ONE composited slot, in the order
-    /// `settings_card → conn_wire_card → level_up_card → notice_card → badge_card` (see
-    /// `App::fold_route_card`), so "a notice is armed" and "a notice is visible" are
-    /// different facts: `App::notice` is global, its card can be absent in this window
-    /// (serious mode, zero columns, a rect the paint region rejected), and even a present
-    /// card is invisible while the level-up flourish owns the slot for the first ~1.1 s of
-    /// the pill's life.
+    /// `settings_card → conn_wire_card → level_up_card → bubble_card → badge_card` (see
+    /// `App::fold_route_card`), so "a bubble is armed" and "a bubble is visible" are
+    /// different facts: `App::robi_bubble` is global, its card can be absent in this
+    /// window (serious mode, zero columns, a rect the paint region rejected), and even a
+    /// present card is invisible while the level-up flourish owns the slot.
     ///
     /// Anything with a SIDE EFFECT must ask this question rather than the model's. The
-    /// click path did not: it hit-tested the pill's rectangle whenever `App::notice` was
-    /// `Some`, so a click on that patch of otherwise-blank terminal — during the level-up
-    /// burst, or in a window whose card never composited — silently applied the update and
-    /// re-execed the whole app.
-    pub(crate) fn notice_is_on_glass(&self) -> bool {
-        self.notice_card.is_some()
+    /// retired notice's click path did not: it hit-tested the card's rectangle whenever a
+    /// card was armed, so a click on that patch of otherwise-blank terminal — during the
+    /// level-up burst, or in a window whose card never composited — silently applied the
+    /// update and re-execed the whole app. The bubble's press only dismisses it, but the
+    /// press it swallows is a press meant for the robot or the tab under it.
+    pub(crate) fn bubble_is_on_glass(&self) -> bool {
+        self.bubble_card.is_some()
             && self.settings_card.is_none()
             && self.conn_wire_card.is_none()
             && self.level_up_card.is_none()
@@ -11025,14 +11579,14 @@ impl WindowState {
 
     /// One backend tray surface in final paint priority. Native/mixed routes
     /// may precompose their full native layer with the selected global card;
-    /// terminal routes use the established modal/level/notice/badge fallback.
+    /// terminal routes use the established modal/level/bubble/badge fallback.
     fn present_card(&self) -> Option<&SettingsCard> {
         self.route_card
             .as_ref()
             .or(self.settings_card.as_ref())
             .or(self.conn_wire_card.as_ref())
             .or(self.level_up_card.as_ref())
-            .or(self.notice_card.as_ref())
+            .or(self.bubble_card.as_ref())
             .or(self.badge_card.as_ref())
     }
 
@@ -11159,6 +11713,39 @@ impl WindowState {
             self.input_hot = false;
             self.input_hot_until = None;
         }
+    }
+
+    /// A key queued behind this session's paste reached the sink after its
+    /// arrival-time priority may already have expired. Extend only to the
+    /// writer's bounded completion deadline; repeated completion wakes do not
+    /// extend it, and an older delivery cannot shorten a newer key's window.
+    fn refresh_queued_key_present_priority(&mut self, write_at: Instant, now: Instant) -> bool {
+        let until = write_at + crate::app_input::INPUT_HOT_WINDOW;
+        if write_at > now || until <= now {
+            return false;
+        }
+        self.input_hot = true;
+        self.input_hot_until = Some(self.input_hot_until.map_or(until, |old| old.max(until)));
+        true
+    }
+
+    /// A queued key can arrive after the echo's output wake already set a
+    /// deferred content level. Re-evaluate that level against the half-refresh
+    /// floor without making a new frame when no content is waiting.
+    fn queued_key_delivery_releases_pending_frame(
+        &mut self,
+        write_at: Instant,
+        now: Instant,
+        default_interval: Duration,
+    ) -> bool {
+        self.refresh_queued_key_present_priority(write_at, now)
+            && self.content_pending
+            && self.redraw_pending
+            && !self.gpu_acquire_pending()
+            && self.last_present_at.is_none_or(|presented| {
+                now.saturating_duration_since(presented)
+                    >= self.content_pace_floor(default_interval)
+            })
     }
 
     /// How long after this window's last CONTENT present its next one may land —
@@ -11408,10 +11995,12 @@ impl WindowState {
     /// two of twenty 30/s arms, both stalls at a ~8 ms frame, none at any
     /// other frame cost — the constant's doc), so a clean 30/s present says
     /// nothing about whether the frame got cheap again: a retry is a blind
-    /// probe that costs a park on the winit main thread — the very cost the
-    /// halving exists to avoid — so it is spent once per episode, at the next
-    /// one's start, not once per clean present (which would park every other
-    /// frame on a frame that is simply too dear for panel rate).
+    /// probe that costs a park — the very cost the halving exists to avoid;
+    /// on the shipped Metal attach the surface's drawable worker waits it
+    /// out, off the winit main thread, but the frame still waits for that
+    /// drawable — so it is spent once per episode, at the next one's start,
+    /// not once per clean present (which would park every other frame on a
+    /// frame that is simply too dear for panel rate).
     fn note_acquire_wait(&mut self, acquire_wait_ns: u64) {
         if acquire_wait_ns >= EFFECT_LANE_ACQUIRE_PARK_NS {
             self.effect_lane_parked = true;
@@ -12154,6 +12743,7 @@ impl WindowState {
     )]
     fn new_terminal(
         term: Arc<Mutex<Terminal>>,
+        vi_active: Arc<std::sync::atomic::AtomicBool>,
         master: i32,
         sink: Arc<SinkWriter>,
         ui_waiting: Arc<std::sync::atomic::AtomicU32>,
@@ -12176,6 +12766,7 @@ impl WindowState {
         let active_terminal = Some(front_content::TerminalMirror {
             session,
             term,
+            vi_active,
             master,
             sink,
             ui_waiting,
@@ -12455,8 +13046,17 @@ impl WindowState {
             band_menu_release_pending: false,
             rename_edit: None,
             cached_strip_rows: Vec::new(),
-            cached_bar_rows: Vec::new(),
-            last_bars_key: None,
+            cached_band_rows: Vec::new(),
+            cached_band_edges: Vec::new(),
+            last_band_key: None,
+            band_layout: None,
+            band_motion: None,
+            band_motion_fp: 0,
+            band_motion_look: None,
+            occluded: false,
+            #[cfg(test)]
+            band_on_screen_for_test: false,
+            band_hover: None,
             presence: presence::WindowView::default(),
             strip_row_pool: Vec::new(),
             strip_titles_scratch: Vec::new(),
@@ -12499,7 +13099,7 @@ impl WindowState {
             settings_card: None,
             route_card: None,
             badge_card: None,
-            notice_card: None,
+            bubble_card: None,
             level_up_card: None,
             conn_wire_card: None,
             pending_close: false,
@@ -12626,6 +13226,15 @@ const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = native_update_auto_intent::PRE
 /// (`ApplyPhase::Land`) stops honouring it too, because a refusal that can
 /// repeat forever is a feature that silently stops working.
 const AUTOMATIC_UPDATE_KEYSTROKE_GAP: Duration = Duration::from_millis(2_500);
+
+/// The keystroke gate's rule ([`App::update_apply_hands_off_keys`]), pure so it
+/// is testable without a window surface: open when no aterm window is focused,
+/// or when the last keystroke is at least [`AUTOMATIC_UPDATE_KEYSTROKE_GAP`] old.
+fn hands_off_keys(focused: bool, last_keystroke_at: Option<Instant>, now: Instant) -> bool {
+    !focused
+        || last_keystroke_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= AUTOMATIC_UPDATE_KEYSTROKE_GAP)
+}
 
 /// True once the most recently consumed PTY burst is old enough for automatic
 /// update admission. A zero stamp means that session has produced no output.
@@ -13103,9 +13712,10 @@ fn handoff_deferrable_input(event: &WindowEvent) -> bool {
 #[must_use]
 fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
     match ev {
-        Wake::Output { .. } | Wake::Bell { .. } | Wake::Input { .. } => {
-            UpdateHandoffEventClass::Tolerated
-        }
+        Wake::Output { .. }
+        | Wake::QueuedKeyDelivered { .. }
+        | Wake::Bell { .. }
+        | Wake::Input { .. } => UpdateHandoffEventClass::Tolerated,
         Wake::Exit { .. }
         | Wake::MenuAction { .. }
         | Wake::OperatorAction { .. }
@@ -13467,10 +14077,9 @@ struct PendingUpdateHandoff {
     child_pid: Option<u32>,
     mode: native_updater_service::ApplyMode,
     apply_attempt: Option<native_updater_service::ApplyAttemptTicket>,
-    /// Which ticket-less authority this attempt ran under, if any — the QA seam or a
-    /// provenance repair. Carried so the completion reduction can tell them apart
-    /// instead of inferring "seam" from an absent ticket, which stopped being a sound
-    /// inference when the repair lane was added (2026-09-17).
+    /// Which ticket-less authority this attempt ran under, if any — today only the QA
+    /// seam. Carried so the completion reduction reads the seam from the attempt rather
+    /// than inferring it from an absent ticket.
     same_image: Option<app_update_handoff::SameImageHandoff>,
     target_build: u64,
     target_commit: String,
@@ -13503,6 +14112,7 @@ struct PendingUpdateHandoff {
     /// PARK (`App::any_os_window_focused`): the one input to whether the parent
     /// activates the successor at Commit (2026-09-19). Sampled here, not at the
     /// launch — under the late park the two are seconds or minutes apart.
+    #[cfg(target_os = "macos")]
     activate_at_commit: bool,
     /// Set by the main-thread final-admission gate when it REJECTED this
     /// attempt for an activity-shaped reason (session/layout/epoch drift,
@@ -13963,6 +14573,10 @@ struct App {
     /// reload can change the saved next-launch intent but cannot stop or mint
     /// this detached thread, so Settings projects both facts.
     package_update_loop_running: bool,
+    /// "Check for updates automatically" as this process read it at launch
+    /// (`aterm_update::automatic`, read once per process). A saved flip applies next
+    /// launch, so Settings ▸ Software Update projects both this and the saved value.
+    update_checks_running: bool,
     native_update_reconcile_worker: Option<app_native::NativeUpdateReconcileSender>,
     next_native_update_reconcile_sequence: u64,
     last_native_update_reconcile_sequence: u64,
@@ -14451,11 +15065,12 @@ struct App {
     /// [`Wake::Control`]) all run, but nothing is presented on screen.
     headless: bool,
     /// This instance's control-socket plan (cloned at boot) + whether the bind
-    /// actually happened — retained so the OVERLAP-HANDOFF success exit (which
-    /// leaves from inside the `Wake` handler, never reaching the loop-exit
-    /// teardown) can run the same `cleanup_socket` discipline: unlink our
-    /// pid-keyed socket + token, and the `latest` symlink only while it still
-    /// points at us (the child repointed it at ITS bind — the guard keeps it).
+    /// actually happened — retained for the overlap handoff, whose committed
+    /// parent `_exit`s at Commit and never reaches the loop-exit `cleanup_socket`:
+    /// a rolled-back handoff republishes our socket as the `latest` alias
+    /// (`handoff_parent_socket`), and a successor sweeps the socket and token its
+    /// predecessor left once that predecessor is gone
+    /// (`control::sweep_after_handoff`).
     sock_plan: Option<control_auth::SocketPlan>,
     sock_bound: Arc<std::sync::atomic::AtomicBool>,
     /// The confirm policy of the close IN PROGRESS ([`app_window::CloseConfirm`]):
@@ -14521,6 +15136,10 @@ struct App {
     /// without touching the filesystem, because a warm-up's whole job is to
     /// raise a system dialog and a unit test must never raise one.
     consent_warmup: consent_warmup::WarmupState,
+    /// The Security panel's *Move to Trash* worker for conflicting copies of
+    /// the app (design §3.7): at most one, started only by that button, and
+    /// inert on a headless instance and in every unit test.
+    claimant_retire: consent_retire::RetireState,
     /// THE tccd CONSENT OBSERVER (design §3.6), OFF unless `[privacy] observer`
     /// says otherwise. Injected exactly like `consent`/`consent_warmup`: a
     /// headless instance and every unit test get the arm that spawns nothing
@@ -14822,15 +15441,18 @@ struct App {
     /// (window-uniform): read by every window's `splice_tab_strip`/`strip_col_at`.
     /// NOTE: the per-frame laid-out `tab_segments` are PER-WINDOW (in `WindowState`).
     tab_strip_rows: u16,
-    /// Transient in-window banner listing config-load/reload warnings (dropped
-    /// `[key_sequences]`/`[keybindings]` rules). GLOBAL like the config it reflects;
-    /// painted into every window, auto-expires after `NOTICE_TTL`. `None` = no banner.
-    config_notice: Option<config_notice::ConfigNotice>,
-    /// The subtle TRANSIENT update notice (a DrawPrim pill that appears, holds, then
-    /// fades): "Update ready" when a build stages (clickable → the Software Update
-    /// overlay), or a cursor-themed "leveled-up" flourish right after the app relaunches
-    /// into a newer build. GLOBAL like `config_notice`; auto-expires. See [`crate::notice`].
-    notice: Option<notice::TransientNotice>,
+    /// The first window id that counts as "a new window" after the GPU was
+    /// lost (`recover_from_gpu_loss_with`): the GPU-lost row (R7) stands until
+    /// a window created after the loss paints, and `finalize_successful_present`
+    /// resolves it on that window's first frame. `None` = no loss outstanding.
+    gpu_lost_remedy_floor: Option<WindowId>,
+    /// ROBI'S TIP BUBBLE (a DrawPrim speech bubble that drops in over his head,
+    /// holds, then lifts away): a decoration, not a message — never posted,
+    /// logged or announced (design D7, R23). GLOBAL (App-level) like the robot's
+    /// own state; auto-expires. What survives of the retired transient notice
+    /// (`notice.rs`, 2026-09-23), whose other producers are message-band rows.
+    /// See [`crate::robi_bubble`].
+    robi_bubble: Option<robi_bubble::RobiBubble>,
     /// ROBI's click-dismissal in flight ([`RobiDismissal`]) — the pending-dismissal
     /// LATCH. Armed by `App::robi_press_at` when a press on his body queues the
     /// `robi = false` write; the render gate consults it (`Some` retires him on the
@@ -14871,34 +15493,130 @@ struct App {
     /// reappears where the old one was. `take()`n on use; `None` = fresh launch.
     seamless_position: Option<(i32, i32)>,
     /// The brief "LEVEL UP" celebration (pulsing accent border glow + a rising up-arrow),
-    /// fired when an update becomes available or is applied. GLOBAL like `config_notice`;
+    /// fired when an update becomes available or is applied. GLOBAL (App-level);
     /// painted into every window; auto-expires. `None` = no celebration. Animates for its
     /// whole life, so it schedules a repaint every frame while up. See [`crate::level_up`].
     level_up: Option<level_up::LevelUp>,
-    /// THE STATUS BARS ([`status_bars::StatusBars`]): the toolchain-install lane
-    /// (fed by `Wake::PkgProgress` snapshots from the child-scoped tailer and the
-    /// seed/net markers) and the self-update lane (fed by `Wake::UpdateProgress`).
-    /// GLOBAL like `notice` (both passes are machine-wide) and painted as chrome
-    /// ROWS in every window; hidden = every FL-1 term is byte-identical to the
-    /// no-bar path.
-    status_bars: status_bars::StatusBars,
-    /// The update bar as it read BEFORE `begin_update_installing` rewrote it
-    /// to "installing", so a refusal — synchronous before the park, or the
-    /// returned completion after it — can put the words back
-    /// (`retire_update_installing`). `None` outside an attempt; an outcome
-    /// posted over the row clears it.
-    update_bar_before_install: Option<status_bars::Bar>,
+    /// The update lane's progress row as it read BEFORE `begin_update_installing`
+    /// re-worded it to "installing", so a refusal — synchronous before the
+    /// park, or the returned completion after it — can put the words back
+    /// (`retire_update_installing`). `None` outside an attempt, and when the
+    /// explicit lane ADDED the row (a refusal then takes it away again).
+    update_row_before_install: Option<(aterm_messages::Message, messages_host::UpdateFlow)>,
+    /// A toolchain child's row is LATCHED — a FIRST RUN, or a VERY HEAVY routine
+    /// pass (design §10.5 H8) (`App::announce_toolchain_pass`,
+    /// `App::apply_toolchain_snapshot`): its row holds until the lane reports the
+    /// child's exit (`Wake::PkgPassEnded` → `App::toolchain_pass_ended`), not at
+    /// the end of one of its sub-passes. One first-run `update` child prints the
+    /// vendor lane's own announcement, meter and `net-installed:` before the ALab
+    /// set's, and folding there reopened the row seconds later — two more
+    /// re-grids of every window (upstream ac7942234, the silent lane's review).
+    toolchain_row_latched: bool,
+    /// The live toolchain meter's high-water mark and the pass it belongs to
+    /// (`App::apply_toolchain_snapshot`): a LIVE METER NEVER RUNS BACKWARDS
+    /// within one pass — atpkg's `.part` poller reports 0 for the instant
+    /// between curl promoting the file and the watch stopping — and a
+    /// different pass (name + start stamp) starts fresh. `None` with no live
+    /// meter.
+    toolchain_pass_peak: Option<(toolchain_words::PassId, u16)>,
+    /// The latched toolchain child is a FIRST RUN (not a heavy routine pass):
+    /// its short end is a failure row, not only a record
+    /// (`App::toolchain_pass_ended`, review 2026-09-24).
+    toolchain_first_run: bool,
+    /// The failure row a first run's marker named (`seed-failed:`,
+    /// `seed-partial:`, …), posted at the child's exit when it exits unclean
+    /// (`App::note_toolchain_first_run_short`).
+    toolchain_first_run_short: Option<aterm_messages::Message>,
+    /// The staged build and the posture the `aterm vX is ready` decision was
+    /// last raised under (`App::ensure_staged_decision_in`): a decision is
+    /// raised once per build and posture — the reconcile that re-runs on every
+    /// check never puts a lapsed question back on the glass (review
+    /// 2026-09-24).
+    staged_decision_raised: Option<(u64, crate::update_words::ApplyPosture)>,
+    /// The `config.` families a reload found FIXED since their words were last
+    /// on the glass (`App::replace_config_set`): the same words coming back
+    /// after a fix are a problem broken again — raised, not recorded as a
+    /// repeat (review 2026-09-24).
+    config_cleared: std::collections::BTreeSet<String>,
+    /// The managed-current words this process last RECORDED (title, detail), so a
+    /// marker every pass prints is one record per change, not one per pass
+    /// (`App::post_managed_current`): a log-noise rule that keeps the shared
+    /// `LOG_CAP` ring and Settings ▸ Messages for news, not the retired glass rule
+    /// (design ruling 34).
+    managed_current_recorded: Option<(String, Vec<String>)>,
+    /// The harness note this process last recorded (`App::record_harness_note`): a
+    /// note repeated word for word is not written again.
+    harness_note_recorded: Option<String>,
+    /// THE UPDATE'S FLOW ROW, as state (`messages_host::UpdateFlow`): which live
+    /// `update.progress` row is the lane's, for which version and in which phase —
+    /// what a row IS is never read off its glyph or title. Readers re-validate the
+    /// id against the center (`MessageCenter::live`): a row that folded, went stale
+    /// or was superseded by a wire post is not the flow.
+    update_flow: Option<messages_host::UpdateFlow>,
+    /// When this process finished downloading (and checking) a build: `(build,
+    /// instant)`, set at the `Staged` report (`Wake::UpdateProgress`) or carried
+    /// from the predecessor that handed over (`update_words::carried_verification`).
+    /// Taken at the landing, whose record says how long the update took.
+    update_verified: Option<(u64, Instant)>,
+    /// What the update-health warning said when it was announced (title,
+    /// `detail[0]`), so its healing is recorded once against it
+    /// (`App::heal_update_health`).
+    update_health_said: Option<(String, String)>,
+    /// The switch to a new version this process put on record and has not seen end:
+    /// `Some(Some(version))` installing that version, `Some(None)` a reload in place
+    /// (`App::record_update_switch_started`). Taken when the attempt stops with this
+    /// process still running, which writes that down too
+    /// (`App::record_update_switch_stopped`).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    update_switch_on_record: Option<Option<String>>,
+    /// The build whose automatic switch this process already put on record: the
+    /// automatic ladder's retries of one build are one record, not one per retry
+    /// (the `LOG_CAP` ring is shared by every reporter; `aterm.log` keeps each).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    update_switch_recorded_for: Option<u64>,
     /// The cold lane's "Updated" row, waiting for the first present: a re-grid
     /// inside `resumed` would run before the Linux initial-frame settle has seen
     /// the grid the attach asked for. `Some(build)` until it is raised.
     landed_row_pending: Option<u64>,
-    /// The bars' row count as COMMITTED to the window geometry — the term
+    /// THE MESSAGE CENTER (`aterm_messages::MessageCenter`,
+    /// docs/DESIGN-unified-messages-2026-09-21.md): every unretired message,
+    /// the stable-ordered glass, the D1 row hysteresis and the log ring —
+    /// the one model behind the message band. GLOBAL like `notice` (every
+    /// reporter is machine-wide) and painted as chrome ROWS in every window;
+    /// hidden = a `0` fingerprint and no deadline (FL-1). Every input goes
+    /// through `messages_host.rs` (`post_message` / `restate_message` /
+    /// `resolve_message`), which settles, commits the rows and drains the
+    /// log after each.
+    messages: aterm_messages::MessageCenter,
+    /// The band's row count as COMMITTED to the window geometry — the term
     /// [`Self::chrome_rows`] adds to `tab_strip_rows`. Moved only by
-    /// [`Self::sync_status_bar_rows`], which re-grids every window (a bar
-    /// appearing takes a terminal row; one folding gives it back), so the grid
-    /// the PTY was told about and the rows the compose reserves can never differ
-    /// mid-frame.
-    status_bar_rows: u16,
+    /// `sync_message_band_rows`, which re-grids every window (a row appearing
+    /// takes a terminal row; one folding gives it back), so the grid the PTY
+    /// was told about and the rows the compose reserves can never differ
+    /// mid-frame. The handoff carry keeps its serde name (`status_bar_rows`:
+    /// "committed chrome rows above the grid" for both).
+    message_band_rows: u16,
+    /// The `messages.log` appender (`messages_store::Writer`), `None` for a
+    /// test App — its rows are a test's, not the person's record — or when
+    /// the file could not be opened (logged).
+    messages_log: Option<messages_store::Writer>,
+    /// When the Settings ▸ Messages projection was last published, the
+    /// 2 Hz gate that keeps a downloading update from repainting the page at
+    /// the tailer's rate and the 60 s tick that moves its relative times
+    /// (design §4.2, `publish_native_messages_state_if_due`).
+    messages_last_publish: Option<Instant>,
+    /// The center's revision the last published projection was built at:
+    /// a publish is due only once the center has moved past it.
+    messages_published_revision: u64,
+    /// The Full-Disk-Access question's row, while the card watches it
+    /// (R15/R16): posted once, restated in place to the route words after
+    /// *Open Settings*, and watched BY ID — a row that left the center
+    /// unanswered is the card's unanswered path (`tick_macos_access_card`).
+    consent_card_message: Option<aterm_messages::MessageId>,
+    /// The admin install's LIVE row (R19) this process started from the
+    /// admin step's *Install*: the packages pass that carries the install
+    /// resolves it by id when it ends (`App::finish_admin_install`).
+    admin_step_message: Option<aterm_messages::MessageId>,
     /// PRESENCE (round 19): one slot per live session — who drives it, its
     /// agent phase, hold, mail, link — folded from the session's own leaf locks
     /// at change rate (`app_presence.rs`) and projected per window into
@@ -14927,7 +15645,7 @@ struct App {
     /// [`crate::quit_safety::JOB_PROBE_MAX_AGE`] while nothing moves.
     job_probe: crate::quit_safety::JobProbe,
     /// PROOF-CARRYING DSU (RFC Rung 2): the PERSISTENT "update ready — apply now"
-    /// nudge. GLOBAL like `config_notice`; painted into every window; does NOT
+    /// nudge. GLOBAL (App-level); painted into every window; does NOT
     /// auto-expire (a pending update stays offered until applied or dismissed). `None`
     /// = no nudge. Set from `Wake::UpdateStaged` when a strictly-newer build stages.
     relaunch: Option<relaunch_notice::RelaunchNotice>,
@@ -14978,20 +15696,15 @@ struct App {
     /// reader here is live. Read beside `pending_update_handoff` by the
     /// in-flight guard; cleared by the completion reducer.
     update_handoff_prelaunch: Option<HandoffPrelaunch>,
-    /// The one-shot provenance self-repair latch ([`crate::provenance_repair`]): whether
-    /// this process may ask to be replaced by itself because it is provenance-TRACKED
-    /// while the bundle it runs from is clean. Measured OFF the event loop, consumed at
-    /// most once, and never re-armed — the module explains why every unmeasurable
-    /// reading refuses.
-    provenance_repair: crate::provenance_repair::RepairPosture,
-    /// Where the prober publishes its verdict: the outer `Option` is "has it answered",
-    /// the inner is the refusal reason (`None` = eligible). Read with `try_lock` on the
-    /// GUI thread, never a blocking `lock`.
-    provenance_repair_verdict: std::sync::Arc<std::sync::Mutex<Option<Option<&'static str>>>>,
     /// Resident operator authority used only to fence process replacement. The
     /// reversible token is acquired at the final update seam, never retained in
     /// ordinary rendering/input state.
     operator_control: Option<operator_host::ControlHandle>,
+    /// The in-GUI supervisor host (`harness_host`): its policy follows a
+    /// config reload, and a seamless update's Commit suspends it here and
+    /// resumes it in the successor. `None` when this instance has no control
+    /// socket for its workers to use.
+    harness: Option<harness_host::HostHandle>,
     /// Monotonic user/output activity identity. A handoff captures it after
     /// parking; any later input/window activity invalidates final Commit and
     /// signals the worker to kill/reap the child before readers resume.
@@ -15014,7 +15727,7 @@ struct App {
     /// [`JUST_UPDATED`] run until [`relaunch_notice::REALIZED_ARROW_TTL`] elapses. While
     /// live, the version-menu title keeps the trailing ⬆️ ("freshly upgraded" — the
     /// attention draw pointing at the version-number menu) and the palette's Version
-    /// section shows the time-faded "↑ Updated to v<new>" row. Dropped — and the menu
+    /// section shows the time-faded "↑ Updated to aterm v<new>" row. Dropped — and the menu
     /// retitled back to plain `v<version>` — by the `about_to_wait` sweep.
     upgrade_realized: Option<Instant>,
     /// The last realized-arrow fade bucket (~30s quantum) the `about_to_wait` sweep
@@ -15111,15 +15824,15 @@ impl App {
             self.trail_audio.replace(false);
             self.sparkle = None;
             self.level_up = None;
-            let cleared_level_up_notice = self.notice.as_ref().is_some_and(|n| n.is_level_up());
-            if cleared_level_up_notice {
-                self.notice = None;
-            }
+            // Robi's tip bubble is his, and Serious Mode owns the whole
+            // companion family: the bubble leaves with him rather than finishing
+            // its line over a serious window.
+            let cleared_bubble = self.robi_bubble.take().is_some();
             for ws in self.windows.values_mut() {
                 ws.drain_serious_effects();
                 ws.last_present = None;
-                if cleared_level_up_notice {
-                    ws.notice_card = None;
+                if cleared_bubble {
+                    ws.bubble_card = None;
                 }
                 if let Some(settings) = ws.settings_mut() {
                     settings.kitty_pop = None;
@@ -15328,9 +16041,7 @@ impl App {
                 "overlap handoff: {dropped} input event(s) typed before Commit exceeded \
                  the {MAX_DEFERRED_HANDOFF_INPUT}-event queue and were dropped"
             );
-            self.surface_gesture_failure(&format!(
-                "The update dropped {dropped} keystroke(s) typed while it finished"
-            ));
+            self.post_message(message_reporters::keystrokes_dropped(dropped));
         }
         // A CHORD THAT LOST ITS RELEASE MUST NOT ARM THE NEXT KEY. If the queue
         // went incoherent — a drop broke a press/release pair, or a live
@@ -15358,39 +16069,15 @@ impl App {
         dropped
     }
 
-    /// HANDS OFF THE KEYS: whether an automatic apply may start its freeze now.
-    ///
-    /// True when no aterm window holds focus (the user is somewhere else, so a
-    /// keystroke of theirs cannot be interrupted by this), or when the last key
-    /// they pressed is at least [`AUTOMATIC_UPDATE_KEYSTROKE_GAP`] old.
-    ///
-    /// The focus aggregate is the window state the process already maintains for
-    /// Secure Keyboard Entry; asking the OS instead would be a WindowServer call
-    /// from the main thread, which this process does not make (see the 2026-08-17
-    /// watchdog incident). Pure and total, so the policy is unit-testable.
-    ///
-    /// # The consent warm-up's bounded hold rides here too (design §3.5)
-    ///
-    /// This is the process's one AUTOMATIC-ONLY refusal that outranks the
-    /// past-grace force and returns above `begin_apply_preflight`, so it mints
-    /// no ticket and spends no retry budget — exactly the shape the warm-up
-    /// hold needs, and the reason §3.5 says the warm-up "reuses" this
-    /// mechanism rather than inventing one. An explicit
-    /// `aterm ctl update apply` never reaches here at all: the sole caller
-    /// (`App::apply_native_update`) consults it only under
-    /// `ApplyMode::is_automatic()`.
-    ///
-    /// The hold is checked FIRST, before the focus shortcut, on purpose: a
-    /// system consent dialog takes focus away from every aterm window, which is
-    /// precisely the case the shortcut answers `true` for.
     /// Whether an aterm window with a real OS surface has keyboard focus. The
     /// per-window `focused` flag alone is not trusted: a logical window is born
     /// believing it has focus and only a real `WindowEvent::Focused` corrects it,
     /// so a surfaceless window (`os_window == None`) would read as focused
     /// forever — `recompute_focus_boost` gates the same predicate the same way.
     /// The one input to "is the user looking at aterm" for the automatic update
-    /// lanes (2026-09-18): whether the successor is ACTIVATED, and whether the
-    /// past-grace lane holds for a gap in terminal output.
+    /// lanes (2026-09-18): whether the successor is ACTIVATED, whether the
+    /// past-grace lane holds for a gap in terminal output, and whether the
+    /// keystroke gap is consulted at all ([`Self::update_apply_hands_off_keys`]).
     pub(crate) fn any_os_window_focused(&self) -> bool {
         self.windows
             .values()
@@ -15406,19 +16093,37 @@ impl App {
         self.pending_update_handoff.is_some() || self.update_handoff_prelaunch.is_some()
     }
 
+    /// HANDS OFF THE KEYS: whether an automatic apply may start its freeze now.
+    ///
+    /// True when no aterm window holds focus (the user is somewhere else, so a
+    /// keystroke of theirs cannot be interrupted by this), or when the last key
+    /// they pressed is at least [`AUTOMATIC_UPDATE_KEYSTROKE_GAP`] old.
+    ///
+    /// The focus aggregate is [`Self::any_os_window_focused`], the same one the
+    /// ladder's output rule reads, so the two can never disagree about whether
+    /// the user is looking at aterm; asking the OS instead would be a
+    /// WindowServer call from the main thread, which this process does not make
+    /// (see the 2026-08-17 watchdog incident). Pure and total, so the policy is
+    /// unit-testable. Consulted only on an automatic lane: an explicit
+    /// `aterm ctl update apply` never reaches here at all.
     fn update_apply_hands_off_keys(&self, now: Instant) -> bool {
-        // A warm-up worker is mid-gesture. Bounded by `[privacy]
-        // warmup_hold_ms` inside `holds_automatic_apply`, so this refusal
-        // cannot repeat forever and cannot pin a build — and it is NOT
-        // "defer while agents are live", which §3.9 refuses outright.
-        if self.consent_warmup.holds_automatic_apply(now) {
-            return false;
-        }
-        if !self.windows.values().any(|ws| ws.focused) {
-            return true;
-        }
-        self.last_keystroke_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= AUTOMATIC_UPDATE_KEYSTROKE_GAP)
+        hands_off_keys(self.any_os_window_focused(), self.last_keystroke_at, now)
+    }
+
+    /// THE CONSENT WARM-UP'S BOUNDED HOLD (design §3.5): a warm-up worker is
+    /// mid-gesture, so a macOS consent dialog the user asked for may be on
+    /// screen. Its own fact in the ladder
+    /// (`native_update_auto_intent::ActivityFacts::consent_warmup`), refused in
+    /// every phase — `Land` included, so no bound on the ladder can land an
+    /// update on the dialog. Bounded by `[privacy] warmup_hold_ms`
+    /// inside `holds_automatic_apply`, so it cannot repeat forever and cannot
+    /// pin a build — and it is NOT "defer while agents are live", which §3.9
+    /// refuses outright. It is checked apart from the keystroke gap on
+    /// purpose: a consent dialog takes focus away from every aterm window,
+    /// which is exactly when that gap answers `true`. Consulted only on an
+    /// automatic lane.
+    fn update_apply_warmup_holds(&self, now: Instant) -> bool {
+        self.consent_warmup.holds_automatic_apply(now)
     }
 
     /// THE WARM-UP GESTURE (design §3.5) — *Ask for folder access now*, on the
@@ -15431,7 +16136,7 @@ impl App {
     /// — this crate writes no protected-folder literal (`grep_guard` B13).
     ///
     /// While the worker is live the instance holds a bounded hold on the
-    /// automatic in-place apply (see [`Self::update_apply_hands_off_keys`]),
+    /// automatic in-place apply (see [`Self::update_apply_warmup_holds`]),
     /// capped by `[privacy] warmup_hold_ms`. A manual apply is never held, and
     /// if an apply lands anyway the successor starts with an empty consent
     /// cache and every row back at `unknown`: it makes no claim about a modal
@@ -15496,27 +16201,48 @@ impl App {
         self.consent_warmup.last_pass_ms()
     }
 
+    /// The Security panel's *Move to Trash*, for the copies the owner was
+    /// shown (design §3.7). Reachable from that button's drain only; refused
+    /// with the privacy checks off, on a headless instance, or with no bundle
+    /// id to take a census of. `false` when nothing was started.
+    pub(crate) fn begin_claimant_retire(&mut self, plan: Vec<std::path::PathBuf>) -> bool {
+        let Some(bundle_id) = control_privacy::running_bundle_id_if_warm() else {
+            return false;
+        };
+        if plan.is_empty() || !self.config.privacy_enabled() || self.headless {
+            return false;
+        }
+        let proxy = self.proxy.clone();
+        self.claimant_retire
+            .start(bundle_id.to_owned(), plan, move || {
+                if let Some(proxy) = &proxy {
+                    let _ = proxy.send_event(Wake::ClaimantRetired);
+                }
+            })
+    }
+
     // -----------------------------------------------------------------------
-    // THE macOS ACCESS CARD (design §3.4, amended 2026-09-07)
+    // THE macOS ACCESS CARD (design §3.4, amended 2026-09-07) — a decision
+    // row on the message band since 2026-09-23 (design §3.10, R15–R17)
     // -----------------------------------------------------------------------
 
     /// One step of the card's lifecycle, from the park point. The machine is
     /// `consent_card::CardState`; this is the glue that touches `App`.
     ///
+    /// * Current `[privacy]` switches gate every phase, including a row
+    ///   already on the band: turning either off settles the card and
+    ///   resolves every `privacy.` row.
+    /// * The row is WATCHED BY ID (`consent_card_message`): a row that left
+    ///   the band with nothing pressed — it folded on its Ask hold — is the
+    ///   unanswered path (`CardState::on_row_retired`: settled, with the
+    ///   daily return). Nothing displaces it: the band ranks a decision row
+    ///   first, so the retired toast's slot arbitration is gone.
     /// * `Idle` → spawn the worker ONCE (identity warm-up + marker read, off
-    ///   this thread). Current `[privacy]` switches gate every phase, including
-    ///   a card already on screen or waiting for another notice to leave.
-    /// * `Due` → re-read the CACHED probe first (a grant made while the slot
-    ///   was busy — from the Security page's own button, say — must not raise
-    ///   a card that says otherwise), then raise the card the first time the
-    ///   shared notice slot is free. An actionable card, the admin card and a
-    ///   live status pill are never clobbered
-    ///   (`TransientNotice::yields_to_disclosure`).
-    /// * `Watching` → if the slot no longer holds the card or its own
-    ///   follow-up pill and the owner never pressed it, the card was DISPLACED
-    ///   by another producer (every other writer of the slot is unconditional)
-    ///   and goes back to `Due` for as long as its own hold would have run;
-    ///   and one CACHED probe per `probe_interval_ms`, for at most
+    ///   this thread).
+    /// * `Due` → re-read the CACHED probe first (a grant made from the
+    ///   Security page's own button must not raise a row that says
+    ///   otherwise), then post the question — once, keyed `privacy.fda`.
+    /// * `Watching` → one CACHED probe per `probe_interval_ms`, for at most
     ///   `consent_card::WATCH_FOR`, so a switch flipped while the owner is in
     ///   Settings is noticed with nothing further pressed.
     fn tick_macos_access_card(&mut self, now: Instant) {
@@ -15528,15 +16254,23 @@ impl App {
             self.config.privacy_notice(),
         ) {
             self.consent_card_pending_marker = None;
-            if self
-                .notice
-                .as_ref()
-                .is_some_and(|n| n.is_macos_access_owned())
-            {
-                self.notice = None;
-                self.request_redraw_all_windows();
-            }
+            self.retract_macos_access_rows(now);
             return;
+        }
+        // THE ROW'S OWN END, watched by id: gone from the center with the
+        // card still watching means it retired without an answer the card
+        // saw (a `Not now` settles the card before this runs; the grant
+        // resolves it here, on this thread).
+        if let Some(id) = self.consent_card_message
+            && self.messages.live(id).is_none()
+        {
+            self.consent_card_message = None;
+            if self.consent_card.on_row_retired(now) {
+                aterm_log::info!(
+                    "macOS access card: the row folded unanswered; offered again after a day, \
+                     or by a later process"
+                );
+            }
         }
         if self.consent_card.expire_wait(now) {
             self.consent_card_pending_marker = None;
@@ -15596,41 +16330,7 @@ impl App {
             // Retry/reoffer transitions happen before this match, so the same
             // wake starts the next decision instead of stranding an Idle card.
             consent_card::CardPhase::Settled | consent_card::CardPhase::Deciding { .. } => {}
-            // The grant was observed while another card held the slot: the ✓
-            // waits for the slot exactly as the card does, and gives up only
-            // after its patience — leaving the `opened` marker for the next
-            // process to acknowledge.
-            consent_card::CardPhase::Confirming { .. } => {
-                if self.consent_card.confirmation_expired(now) {
-                    aterm_log::info!(
-                        "macOS access card: the granted pill never found the slot; \
-                         a later launch will say it"
-                    );
-                    return;
-                }
-                let panel = self.consent_panel_facts();
-                if panel.probe == aterm_containment::consent::ProbeLabel::Pending {
-                    return;
-                }
-                if panel.fda != aterm_containment::consent::FdaState::Granted {
-                    self.consent_card.settle();
-                    return;
-                }
-                if self.show_macos_access_granted(now) {
-                    self.clear_macos_access_opened_marker();
-                    self.consent_card.settle();
-                }
-            }
             consent_card::CardPhase::Due => {
-                // No polling while another producer owns the slot. Its own
-                // expiry or another event lets us recheck access before raising.
-                if self
-                    .notice
-                    .as_ref()
-                    .is_some_and(|n| !n.yields_to_disclosure(now))
-                {
-                    return;
-                }
                 let panel = self.consent_panel_facts();
                 if panel.fda == aterm_containment::consent::FdaState::Granted {
                     self.note_macos_access_granted(now);
@@ -15644,37 +16344,38 @@ impl App {
                     return;
                 }
                 if !self.consent_card.raise_allowed(now) {
-                    aterm_log::info!("macOS access card: past its own hold; not raised again");
+                    aterm_log::info!("macOS access card: past its own wait; not posted");
                     return;
                 }
-                let free = self
-                    .notice
-                    .as_ref()
-                    .is_none_or(|n| n.yields_to_disclosure(now));
-                if free {
-                    self.notice = Some(notice::TransientNotice::macos_access(now));
-                    self.consent_card.on_raised(now);
-                    aterm_log::info!(
-                        "macOS access card: offered (current process access probe denied; Settings switch unknown)"
-                    );
-                    self.request_redraw_all_windows();
-                }
+                // Posted ONCE, keyed: a question a carried row already asks
+                // (the parent of a seamless update posted it) is a duplicate,
+                // and the card adopts that row's id.
+                let id = self.post_message(crate::message_reporters::file_access_question());
+                self.consent_card_message = Some(id);
+                self.consent_card.on_raised(now);
+                aterm_log::info!(
+                    "macOS access card: offered (current process access probe denied; Settings switch unknown)"
+                );
             }
             consent_card::CardPhase::Watching { .. } => {
-                // A newly observed grant wins over displacement: another tab's
-                // notice must not send this card back through its raise path.
                 if self.consent_card.wants_probe(now) && self.macos_access_probe_reads_granted() {
                     self.note_macos_access_granted(now);
-                    return;
-                }
-                let ours_on_glass = self
-                    .notice
-                    .as_ref()
-                    .is_some_and(|n| n.is_macos_access_owned());
-                if !ours_on_glass && self.consent_card.on_displaced(now) {
-                    aterm_log::info!("macOS access card: displaced; waiting for the slot again");
                 }
             }
+        }
+    }
+
+    /// The card's `[privacy]` switch went off (or its decision said no): every
+    /// `privacy.` row leaves the band, resolved — the question, its route
+    /// words, a carried one — and the card forgets the id it watched.
+    fn retract_macos_access_rows(&mut self, now: Instant) {
+        self.consent_card_message = None;
+        if self
+            .messages
+            .resolve_key_prefix("privacy.", aterm_messages::Outcome::Ok, now)
+            > 0
+        {
+            self.sync_messages();
         }
     }
 
@@ -15699,14 +16400,6 @@ impl App {
         if self.consent_card.phase() == consent_card::CardPhase::Settled {
             return cap; // at most one daily reoffer, never a background probe
         }
-        if self.consent_card.phase() == consent_card::CardPhase::Due
-            && self
-                .notice
-                .as_ref()
-                .is_some_and(|n| !n.yields_to_disclosure(now))
-        {
-            return cap;
-        }
         match (cap, self.next_consent_probe_deadline(now)) {
             (Some(cap), Some(refresh)) => Some(cap.min(refresh)),
             (cap, refresh) => cap.or(refresh),
@@ -15717,7 +16410,9 @@ impl App {
     /// on this thread, against the cached probe — the same state the Security
     /// page renders — and log every reason not to show, by name. A `Confirm`
     /// verdict (the owner opened Settings from an earlier process, and the
-    /// grant is now held) shows the ✓ pill once and clears the marker.
+    /// grant is now held) records the grant once and clears the marker. A
+    /// quiet verdict also resolves a question the parent of a seamless update
+    /// carried in: this process decided it is not due.
     fn decide_macos_access_card(&mut self, marker: Option<consent_card::Marker>) {
         if !self.consent_card.admit_current_policy(
             self.config.privacy_probe_gate().permits(),
@@ -15767,50 +16462,47 @@ impl App {
             }
         }
         let now = Instant::now();
-        if self.consent_card.on_decided(&verdict, now)
-            && verdict == consent_card::Verdict::Confirm
-            && self.show_macos_access_granted(now)
-        {
-            self.clear_macos_access_opened_marker();
-            self.consent_card.settle();
+        if !self.consent_card.on_decided(&verdict, now) {
+            return;
+        }
+        match verdict {
+            consent_card::Verdict::Offer => {}
+            consent_card::Verdict::Confirm => {
+                self.show_macos_access_granted(now);
+                self.clear_macos_access_opened_marker();
+            }
+            consent_card::Verdict::Quiet(_) => self.retract_macos_access_rows(now),
         }
     }
 
-    /// The probe observed the grant while the card was watching (or waiting
-    /// to return): acknowledge it and consume an `opened` marker — now if the
-    /// slot allows, else as soon as it does (`CardPhase::Confirming`).
+    /// The probe observed the grant while the card was due or watching:
+    /// record it, consume an `opened` marker, settle.
     fn note_macos_access_granted(&mut self, now: Instant) {
         aterm_log::info!("macOS access card: full disk access observed granted");
-        if self.show_macos_access_granted(now) {
-            self.clear_macos_access_opened_marker();
-            self.consent_card.settle();
-        } else {
-            self.consent_card.on_grant_awaiting_slot(now);
-        }
+        self.show_macos_access_granted(now);
+        self.clear_macos_access_opened_marker();
+        self.consent_card.settle();
     }
 
-    /// The ✓ pill: replaces the card or its own follow-up pill, or fills a
-    /// free slot; never clobbers another card — `false` when it could not be
-    /// shown. Deliberately says nothing about scope or coverage (design §3.4:
-    /// S1 and S4 are unrun).
-    fn show_macos_access_granted(&mut self, now: Instant) -> bool {
-        let ours = self
-            .notice
-            .as_ref()
-            .is_some_and(|n| n.is_macos_access_owned());
-        let free = self
-            .notice
-            .as_ref()
-            .is_none_or(|n| n.yields_to_disclosure(now));
-        if !(ours || free) {
-            return false;
-        }
-        self.notice = Some(notice::TransientNotice::update_status(
-            consent_card::GRANTED_CAPTION,
+    /// THE GRANT SUPERSEDES THE QUESTION BY KEY (R17): the live `privacy.fda`
+    /// row — the question, its route words, or one carried in — resolves, so
+    /// it leaves the band, and the grant is a RECORD (the owner's attention
+    /// rule: a confirmation interrupts nobody; Settings ▸ Messages keeps it).
+    /// A `LogOnly` post never supersedes a live row in the engine (the silent
+    /// toolchain lane records under its row's key without folding it), so the
+    /// host resolves by key first. Deliberately says nothing about scope or
+    /// coverage (design §3.4: S1 and S4 are unrun).
+    fn show_macos_access_granted(&mut self, now: Instant) {
+        self.consent_card_message = None;
+        let resolved = self.messages.resolve_key_prefix(
+            crate::message_reporters::KEY_FILE_ACCESS,
+            aterm_messages::Outcome::Ok,
             now,
-        ));
-        self.request_redraw_all_windows();
-        true
+        );
+        self.record_message(crate::message_reporters::file_access_granted());
+        if resolved > 0 {
+            self.sync_messages();
+        }
     }
 
     /// Record a marker beside `aterm.toml`, off the UI thread (a tiny file,
@@ -15851,34 +16543,14 @@ impl App {
         }
     }
 
-    /// *Open Settings* on the card: the Full Disk Access deep link through
-    /// this instance's gesture arm (the Security page's own seam — a headless
-    /// instance's arm reaches no `NSWorkspace`), then the card's OWN follow-up
-    /// pill naming the route in words, because `openURL:` reports only that
-    /// Settings TOOK the URL, never that it scrolled to the row. The `opened`
-    /// marker is recorded so a later process can acknowledge the flip (Apple's
-    /// own sheet offers Quit & Reopen). The card keeps watching for the grant;
-    /// nothing here grants anything.
-    pub(crate) fn open_macos_access_settings(&mut self, now: Instant) {
-        let pane = menu::PrivacyPane::FullDiskAccess;
-        let opened = matches!(
-            native_settings::ConsentGestures::for_instance(self.headless).open_settings(pane),
-            menu::SettingsOpen::Anchored | menu::SettingsOpen::PaneRoot
-        );
-        let text =
-            consent_card::opened_settings_caption(opened, menu::privacy_settings_path_words(pane));
-        self.notice = Some(notice::TransientNotice::macos_access_route(
-            text,
-            consent_card::OPENED_SETTINGS_TTL,
-            now,
-        ));
-        self.request_redraw_all_windows();
-        self.note_macos_access_settings_opened(now);
-    }
-
-    /// Shared completion of the card and Security-page Settings gestures.
-    /// An old cached grant cannot acknowledge a newly opened Settings pane;
-    /// the bounded worker must publish a fresh observation first.
+    /// Shared completion of the row's *Open Settings* capsule
+    /// (`App::perform_intent`, which restates the row to the route words) and
+    /// the Security page's own Settings gesture. The `opened` marker is
+    /// recorded so a later process can acknowledge the flip (Apple's own
+    /// sheet offers Quit & Reopen). An old cached grant cannot acknowledge a
+    /// newly opened Settings pane; the bounded worker must publish a fresh
+    /// observation first. The card keeps watching for the grant; nothing here
+    /// grants anything.
     pub(crate) fn note_macos_access_settings_opened(&mut self, now: Instant) {
         self.record_macos_access_marker(consent_card::Marker::Opened);
         self.consent_card_pending_marker = None;
@@ -16224,7 +16896,7 @@ impl App {
     }
 
     /// Request a redraw of EVERY open window. Used by GLOBAL banner state (the
-    /// `config_notice` expiry, the Rung 2 update-ready nudge appear/dismiss): a repaint is
+    /// message band settle, the Rung 2 update-ready nudge appear/dismiss): a repaint is
     /// SCHEDULED here, and the corresponding `RepaintKey` term (e.g. `relaunch_fp`)
     /// makes `should_repaint` actually present it even on an otherwise static grid.
     pub(crate) fn request_redraw_all_windows(&self) {
@@ -16643,9 +17315,9 @@ impl App {
         // cheap enough for the continuous `Moved` stream during a drag — but that
         // cost model does not hold on macOS: a panel whose CG display mode reports
         // no refresh rate sends vendored winit through a CVDisplayLink
-        // create/query/release per call (mean 0.23–0.51 ms, worst 3.2–6.5 ms
-        // across runs on a 2017 MacBook Pro's built-in panel —
-        // `tools/displaylink-cost-probe/`, see `REFRESH_RATE_REREAD_INTERVAL`).
+        // create/query/release per call — measured with
+        // `tools/displaylink-cost-probe/` on a 2017 MacBook Pro's built-in panel;
+        // the dated per-call figures are on `REFRESH_RATE_REREAD_INTERVAL`.
         // So the read keeps its W6 place ahead of the guard, but on the SAME
         // monitor the `Moved` stream reads on a throttle rather than per event.
         // The throttle is event-gated, not a timer: the read recurs on the first
@@ -16763,15 +17435,26 @@ impl App {
     /// on, one `-window` / `-screen` / potential read. The headroom itself is
     /// read for HDR GPU swapchains only — including one the re-pick just
     /// moved; an 8-bit present never runs the aurora pass.
+    ///
+    /// The stamp records whether the surface was HDR, and an HDR surface whose
+    /// last stamp was 8-bit is due at once ([`edr_refresh_due`]). On Windows
+    /// the wgpu arm's live SDR->HDR upgrade runs in the present after this
+    /// call and resets the headroom and reference white, and the 8-bit stamp
+    /// this call took must not hold that surface's first seed off for an
+    /// interval.
     fn refresh_edr_headroom(&mut self, wid: WindowId, now: Instant) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         // Cheap gate before any AppKit crossing: a GPU present (8-bit ones
         // included, for the screen re-pick) that has not been re-sampled
-        // within the throttle window.
-        let gpu = matches!(&ws.present, Some(PresentTarget::Gpu { .. }));
-        if !gpu || !edr_requery_due(ws.last_edr_query, now, EDR_REQUERY_INTERVAL) {
+        // within the throttle window, or that turned HDR since an 8-bit
+        // stamp.
+        let surface_hdr = match &ws.present {
+            Some(PresentTarget::Gpu { gpu_surface, .. }) => Some(gpu_surface.is_hdr()),
+            _ => None,
+        };
+        if !edr_refresh_due(surface_hdr, ws.last_edr_query, now, EDR_REQUERY_INTERVAL) {
             return;
         }
         // Disjoint-field borrows (`self.backend` / `self.apprt` vs
@@ -16780,6 +17463,7 @@ impl App {
         // moves to f16 is seeded below in the same call. Idempotent when the
         // headroom is unchanged — the renderer only invalidates the aurora
         // present when the value actually moves.
+        let mut stamped_hdr = surface_hdr == Some(true);
         if let Some(PresentTarget::Gpu {
             gpu_surface,
             window_gpu,
@@ -16795,12 +17479,17 @@ impl App {
                 gpu_surface,
                 window,
             );
-            if gpu_surface.is_hdr() {
+            stamped_hdr = gpu_surface.is_hdr();
+            if stamped_hdr {
                 window_gpu.set_edr_max(self.apprt.screen_edr_max(window));
                 window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(window));
             }
         }
-        ws.last_edr_query = Some(now);
+        // The stamp keeps the surface kind this call left behind: a surface
+        // the re-pick moved is stamped HDR (it was seeded above), and an
+        // 8-bit one that turns HDR before anything seeds it is due at its
+        // next redraw.
+        ws.last_edr_query = Some((now, stamped_hdr));
     }
 
     /// Window `wid`'s canonical active TERMINAL tab's compatibility pane tree, or
@@ -17112,6 +17801,7 @@ impl App {
                     ws.active_terminal = Some(front_content::TerminalMirror {
                         session: s.id,
                         term: s.term.clone(),
+                        vi_active: s.vi_active.clone(),
                         master: s.master,
                         sink: s.ctx.sink.clone(),
                         ui_waiting: s.ctx.ui_waiting.clone(),
@@ -17763,6 +18453,7 @@ impl App {
             .expect("initial test tab identity space");
         let ws0 = WindowState::new_terminal(
             term.clone(),
+            session0.vi_active.clone(),
             master,
             app_sink,
             session0.ctx.ui_waiting.clone(),
@@ -17822,6 +18513,7 @@ impl App {
             ),
             native_packages_service: packages_screen::PackagesService::new(),
             package_update_loop_running: false,
+            update_checks_running: true,
             native_update_reconcile_worker: None,
             next_native_update_reconcile_sequence: 1,
             last_native_update_reconcile_sequence: 0,
@@ -17954,6 +18646,7 @@ impl App {
             user_input_recent: platform::no_recent_user_input_event,
             consent: control_privacy::ConsentState::inert(),
             consent_warmup: consent_warmup::WarmupState::inert(),
+            claimant_retire: consent_retire::RetireState::new(true),
             consent_observer: consent_observer::ObserverState::inert(),
             consent_attention: consent_observer::AttentionGate::new(),
             consent_observer_started: false,
@@ -17990,8 +18683,8 @@ impl App {
             session_chrome_expiry: SessionChromeExpiryScan::default(),
             title_drift: TitleDrift::default(),
             tab_strip_rows: 0,
-            config_notice: None,
-            notice: None,
+            gpu_lost_remedy_floor: None,
+            robi_bubble: None,
             robi_dismissal: None,
             level_up_done: false,
             level_up_deferred: None,
@@ -18000,15 +18693,37 @@ impl App {
             boot_health_confirmation_retry_at: None,
             seamless_position: None,
             level_up: None,
-            status_bars: status_bars::StatusBars::default(),
-            status_bar_rows: 0,
+            // A test App records nothing: an empty ring, no writer.
+            messages: aterm_messages::MessageCenter::new(
+                aterm_messages::MessageLog::empty(),
+                Instant::now(),
+            ),
+            message_band_rows: 0,
+            messages_log: None,
+            messages_last_publish: None,
+            messages_published_revision: 0,
+            consent_card_message: None,
+            admin_step_message: None,
+            toolchain_row_latched: false,
+            toolchain_pass_peak: None,
+            toolchain_first_run: false,
+            toolchain_first_run_short: None,
+            staged_decision_raised: None,
+            config_cleared: std::collections::BTreeSet::new(),
+            managed_current_recorded: None,
+            harness_note_recorded: None,
+            update_flow: None,
+            update_verified: None,
+            update_health_said: None,
+            update_switch_on_record: None,
+            update_switch_recorded_for: None,
             presence: app_presence::PresenceTable::default(),
             last_ledger_plan: None,
             presence_band_on: true,
             presence_rim_on: true,
             last_fabric_plan: None,
             last_menu_document: None,
-            update_bar_before_install: None,
+            update_row_before_install: None,
             landed_row_pending: None,
             job_probe: crate::quit_safety::JobProbe::default(),
             relaunch: None,
@@ -18021,9 +18736,8 @@ impl App {
             handoff_preverified: std::sync::Arc::default(),
             pending_update_handoff: None,
             update_handoff_prelaunch: None,
-            provenance_repair: crate::provenance_repair::RepairPosture::default(),
-            provenance_repair_verdict: std::sync::Arc::new(std::sync::Mutex::new(None)),
             operator_control: None,
+            harness: None,
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
             last_keystroke_at: None,
@@ -18306,9 +19020,9 @@ impl App {
         };
         if let Some(reason) = refusal {
             // The same two-channel answer every impossible gesture gives: the
-            // card answers the person, the log answers the investigator.
+            // band's row answers the person, the log answers the investigator.
             crate::logging::stderr_line!("aterm-gui: {reason}");
-            self.surface_gesture_failure(&format!("✕ {reason}"));
+            self.post_message(message_reporters::split_refused(&reason));
             return Err(reason);
         }
         let id = self.next_session_id;
@@ -18400,10 +19114,10 @@ impl App {
             }
             Err(e) => {
                 // The `New tab` / `New window` shape: the log carries the whole
-                // error, the card carries its first line to the person who
-                // pressed the key and saw nothing happen.
+                // error, the band's row tells the person who pressed the key and
+                // saw nothing happen, the whole error behind its Details.
                 crate::logging::stderr_line!("aterm-gui: could not split the pane: {e}");
-                self.surface_gesture_failure(&format!("✕ Split failed: {e}"));
+                self.post_message(message_reporters::split_failed(&e.to_string()));
                 Err(format!("could not split the pane: {e}"))
             }
         }
@@ -18597,6 +19311,9 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        // EVERY present target records it (design §10.8): an occluded window's
+        // band arms no motion frames.
+        ws.occluded = occluded;
         // W6a: record BOTH edges on the window's GPU state — the first-party
         // Metal present arm classifies a bounded nil-acquire as Occluded
         // (park) vs Timeout (bounded retry) by this frontend-owned bit,
@@ -19888,12 +20605,23 @@ impl App {
     /// pin a SECOND copy of it for that thread's life. Re-forking from the sealed
     /// generation is what keeps one copy of each file in the process, which is the
     /// property this deferral exists to protect.
-    fn redeem_deferred_font_seal(&mut self) {
+    ///
+    /// Returns what each half cost, `(seal_ms, chrome_sync_ms)`, when a debt
+    /// was outstanding, and `None` when none was. They are timed apart for
+    /// [`Self::ensure_pixel_backend`]'s redemption line: the re-sync is not the
+    /// three files the seal reads, and one clock around both would credit its
+    /// cost to them. The rebuild caller (`rebuild_backend_with_prepared`) has no
+    /// line to write and drops them.
+    fn redeem_deferred_font_seal(&mut self) -> Option<(f64, f64)> {
         if !self.settle_deferred_font_seal() {
-            return;
+            return None;
         }
+        let seal_started = Instant::now();
         self.backend.seal_admitted_font_sources();
+        let seal_ms = elapsed_ms(seal_started);
+        let chrome_sync_started = Instant::now();
         self.sync_chrome_fonts();
+        Some((seal_ms, elapsed_ms(chrome_sync_started)))
     }
 
     /// Mark the owed seal PAID WITHOUT performing it, for the one caller that
@@ -19965,11 +20693,10 @@ impl App {
         // `--cpu` ones that have no GPU intent at all and return below. Sealing
         // before the fork also keeps `cpu_renderer_from_admitted`'s precondition
         // — a sealed generation to rebuild from — exactly as the eager path left
-        // it.
-        if self.deferred_font_seal {
-            let seal_started = Instant::now();
-            self.redeem_deferred_font_seal();
-            legs.seal_ms = Some(elapsed_ms(seal_started));
+        // it. The seal and the chrome re-sync after it come back timed apart.
+        if let Some((seal_ms, chrome_sync_ms)) = self.redeem_deferred_font_seal() {
+            legs.seal_ms = Some(seal_ms);
+            legs.chrome_sync_ms = Some(chrome_sync_ms);
         }
         if !self.deferred_gpu {
             aterm_log::info!(
@@ -20787,6 +21514,18 @@ impl ApplicationHandler<Wake> for App {
                 window.request_redraw();
             }
         }
+        // The message band's MOTION: a level judged on every wake, like the
+        // cursor-effects clock — a PTY stream's `WaitCancelled` turns must not
+        // freeze the spinner or the comet, and a frame whose instant passed must
+        // not stay armed. A repaint only, of the windows whose next frame is due
+        // (`band_motion_due`: on screen, in the look the frame on glass was not
+        // drawn in, or past its engine deadline — nothing under a handoff
+        // freeze); it touches no activity clock and never the center.
+        for wid in self.band_motion_due(Instant::now()) {
+            if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                window.request_redraw();
+            }
+        }
         // M1 glide / M1b bounce: their anchored ticks are LEVELS judged on EVERY
         // wake, like the cursor-effects clock above. A `WaitCancelled` turn (the
         // trackpad's next delta, a PTY burst) that lands after the slot must
@@ -20815,23 +21554,13 @@ impl ApplicationHandler<Wake> for App {
             let pill_fade_full = self
                 .effect_policy(crate::motion::MotionEffect::ScrollPill, true)
                 .animate(crate::motion::MotionEffect::ScrollPill);
-            // The config-warning banner is GLOBAL (App-level), not per-window: expire it
-            // HERE, before the `&mut self.windows` loop, then (after the loop) redraw every
-            // window so the banner clears. Mirrors the per-window close_warning lifecycle.
-            let notice_expired = self
-                .config_notice
-                .as_ref()
-                .is_some_and(|n| n.is_expired(now));
-            if notice_expired {
-                self.config_notice = None;
-            }
-            // The transient update NOTICE pill fades, so it must repaint every animation
+            // Robi's tip BUBBLE slides and fades, so it must repaint every animation
             // tick while up (not only on expiry). Drop it when its lifetime ends.
-            let pill_gone = self.notice.as_ref().is_some_and(|n| n.is_expired(now));
-            if pill_gone {
-                self.notice = None;
+            let bubble_gone = self.robi_bubble.as_ref().is_some_and(|b| b.is_expired(now));
+            if bubble_gone {
+                self.robi_bubble = None;
             }
-            let pill_animating = self.notice.is_some();
+            let bubble_animating = self.robi_bubble.is_some();
             // The LEVEL-UP celebration animates the whole way (border breathes + arrow
             // rises), so — like the pill — repaint every tick while up, then drop it and
             // repaint the clearing frame when its lifetime ends.
@@ -20840,7 +21569,7 @@ impl ApplicationHandler<Wake> for App {
                 self.level_up = None;
             }
             let level_up_animating = self.level_up.is_some();
-            // The STATUS BARS: a bar holding a terminal outcome folds at its
+            // THE MESSAGE BAND: a row holding a terminal outcome folds at its
             // deadline — the grid gets its row back (a re-grid, exactly like a
             // `tab_strip_rows` edit) and every window repaints the clearing frame.
             // Outside the `windows` borrow below: the re-grid resizes each window.
@@ -20848,9 +21577,8 @@ impl ApplicationHandler<Wake> for App {
             // way to every wait (`about_to_wait`): a refused apply retires the
             // row it added without syncing (see `retire_update_installing`),
             // and its outcome may add none. Folds are held back while a handoff
-            // freezes the count (`settle_status_bars`).
-            let bars_settled = self.settle_status_bars(now);
-            let bars_folded = self.sync_status_bar_rows() || bars_settled;
+            // freezes the count (`settle_messages`).
+            let band_folded = self.settle_messages(now);
             // PRESENCE: the band's `since` figures and a finished ripple.
             let presence_dirty = self.presence_tick(now);
             for (id, ws) in self.windows.iter_mut() {
@@ -21028,15 +21756,11 @@ impl ApplicationHandler<Wake> for App {
                     to_redraw.push(*id);
                 }
             }
-            // The global banner just expired: every window must repaint to drop it.
-            if notice_expired {
-                to_redraw.extend(self.windows.keys().copied());
-            }
-            // The update notice is up: repaint every window this tick so its fade
+            // Robi's bubble is up: repaint every window this tick so its ramp
             // advances (or it clears the frame it just expired). `should_repaint` early-
-            // outs during the steady HOLD — the quantized `notice_fp` only changes across
-            // the fade — so this is cheap until the pill actually fades.
-            if pill_animating || pill_gone {
+            // outs during the steady HOLD — the quantized `bubble_fp` only changes across
+            // the ramps — so this is cheap until the bubble actually moves.
+            if bubble_animating || bubble_gone {
                 to_redraw.extend(self.windows.keys().copied());
             }
             // The level-up celebration is up (or just expired): repaint every window this
@@ -21045,9 +21769,12 @@ impl ApplicationHandler<Wake> for App {
             if level_up_animating || level_up_gone {
                 to_redraw.extend(self.windows.keys().copied());
             }
-            if bars_folded {
+            if band_folded {
                 to_redraw.extend(self.windows.keys().copied());
             }
+            // The band's motion: every on-screen window whose next frame is due.
+            // A motion wake never re-grids — it only re-presents.
+            to_redraw.extend(self.band_motion_due(now));
             to_redraw.extend(presence_dirty);
             let native_preview_phase_ms =
                 u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -21118,11 +21845,13 @@ impl ApplicationHandler<Wake> for App {
                     .then(|| self.capture_restore_manifest()),
             );
         }
-        // THE HONESTY DRAIN: explanations queued from contexts that cannot reach
-        // `App` (the backend build thread, an `AppRt` chrome call, `run()` before
-        // App exists) become an in-window notice here. One relaxed atomic load on
-        // an empty lane, which is every park but a handful per run.
-        self.drain_deferred_config_notices();
+        // THE PRE-APP MESSAGE INBOX (design §3.3): what a thread queued before
+        // `App` existed (the launch's config warnings, the crash message, a
+        // launch load failure), or off the main thread since (the backend
+        // build thread, an `AppRt` chrome call, the panic hook), is posted
+        // here — one atomic load when it is empty, which is every park but a
+        // handful per run.
+        self.drain_message_inbox();
         // THE CONSENT OBSERVER'S ONE-SHOT START (design §3.6). Off unless
         // `[privacy] observer` says otherwise, so on every shipping config this
         // is one `bool` test and nothing else — and the latch makes it exactly
@@ -21153,19 +21882,6 @@ impl ApplicationHandler<Wake> for App {
             && (self.pending_restore.is_some() || !self.seamless_adopt.is_empty())
         {
             self.apply_pending_restore(el);
-            // THE MANAGED ROW'S COUNT CATCHES UP (review, 2026-09-16): a
-            // `managed-current:` marker that arrived before this adoption was
-            // counted with the pending adoptees included (`frozen_path_tabs`);
-            // an adoptee that did not register as counted is settled here, and
-            // only a changed count posts.
-            let frozen_tabs = self.frozen_path_tabs();
-            let hooked = self.this_tab_hooked();
-            if self
-                .status_bars
-                .refresh_managed_current(frozen_tabs, hooked, Instant::now())
-            {
-                self.sync_status_bars();
-            }
             self.request_redraw_all_windows();
         }
         // THE COLD LANE'S "UPDATED" ROW, deferred out of `resumed` (see the
@@ -21174,25 +21890,21 @@ impl ApplicationHandler<Wake> for App {
         if self.first_present_done
             && let Some(build) = self.landed_row_pending.take()
         {
-            // The COLD lane: this process adopted no shells, so the row must not
-            // say any kept running.
-            self.status_bars.update_landed(
-                crate::build_info::version_display(),
-                build,
-                false,
-                Instant::now(),
-            );
-            self.sync_status_bars();
+            self.post_update_landed(crate::build_info::version_display(), build);
         }
-        // …AND SO DO THE FOLDS. `new_events` retires expired bars only on a
+        // …AND SO DO THE FOLDS. `new_events` retires expired rows only on a
         // `ResumeTimeReached` wake, which a shell streaming output can starve
         // indefinitely: the "Updated" row would sit past its hold for as long as
-        // the flood lasts. Retiring here costs two instant comparisons.
+        // the flood lasts. Retiring here costs a few instant comparisons.
         {
             let now = Instant::now();
-            if self.settle_status_bars(now) {
+            if self.settle_messages(now) {
                 self.request_redraw_all_windows();
             }
+            // Settings ▸ Messages follows the center on the way to every
+            // wait: what the 2 Hz gate held back, and the 60 s tick that
+            // moves the page's relative times while a view is on the route.
+            self.publish_native_messages_state_if_due(now);
             if self.level_up.as_ref().is_some_and(|l| l.is_expired(now)) {
                 self.level_up = None;
                 self.request_redraw_all_windows();
@@ -21205,12 +21917,7 @@ impl ApplicationHandler<Wake> for App {
         if self.headless && !self.level_up_done && JUST_UPDATED.get().copied().unwrap_or(false) {
             self.level_up_done = true;
             let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
-            self.status_bars.update_landed(
-                crate::build_info::version_display(),
-                build,
-                !self.seamless_adopt.is_empty(),
-                Instant::now(),
-            );
+            self.post_update_landed(crate::build_info::version_display(), build);
         }
         // THE macOS ACCESS POSTURE, published on the way to every wait. The
         // Security page's whole point is to answer "what does aterm actually
@@ -21227,10 +21934,10 @@ impl ApplicationHandler<Wake> for App {
         // THE ROW COUNT CONVERGES ON THE WAY TO EVERY WAIT. A refused apply
         // retires the row it added without a sync of its own
         // (`retire_update_installing`), and its outcome may add none — so the
-        // committed count is checked here, not only when a bar folds on a timer
+        // committed count is checked here, not only when a row folds on a timer
         // wake. An early-out when the counts agree; refused while a handoff is
         // pending (the count is frozen for Commit).
-        if self.sync_status_bar_rows() {
+        if self.sync_message_band_rows(Instant::now()) {
             self.request_redraw_all_windows();
         }
         // THE LATE PARK'S GATE, re-run while a prelaunched attempt waits for a
@@ -21315,26 +22022,10 @@ impl ApplicationHandler<Wake> for App {
         {
             self.try_pending_native_auto_apply(false);
         }
-        // PROVENANCE SELF-REPAIR, on the same fold and deliberately AFTER the auto-apply
-        // poll: a real staged update always gets the tick first, and a repair only ever
-        // runs on a tick where that lane already declined. No new timer, thread source or
-        // wake exists for it — the measurement is one off-thread shot whose verdict is
-        // collected here, and everything after it refuses rather than forces
-        // (`crate::provenance_repair`).
+        // PROVENANCE: one off-thread measurement per process, logged once and never acted
+        // on — a tracked aterm is not relaunched (`crate::provenance_repair`).
         #[cfg(target_os = "macos")]
-        {
-            self.spawn_provenance_repair_probe();
-            // `try_lock`, never `lock`: the GUI thread must not block on the prober.
-            if let Ok(mut slot) = self.provenance_repair_verdict.try_lock()
-                && let Some(refusal) = slot.take()
-            {
-                if let Some(reason) = refusal {
-                    aterm_log::info!("provenance self-repair: not eligible — {reason}");
-                }
-                self.provenance_repair.record(refusal);
-            }
-            self.try_provenance_self_repair();
-        }
+        crate::provenance_repair::log_once_in_background();
         // OVERLAP HANDOFF reveal fallback: a window still hidden past its
         // deadline (its presents kept dropping — e.g. a GPU that refuses
         // drawables for an un-composited layer) must appear anyway; its next
@@ -22012,26 +22703,15 @@ impl ApplicationHandler<Wake> for App {
                 );
             }
         }
-        // The global config-warning banner auto-dismisses at its deadline: fold it into
-        // the wait, AFTER the windows borrow ends (it borrows `&self.config_notice`).
-        if let Some(n) = &self.config_notice {
-            let d = n.deadline();
+        // Robi's tip BUBBLE animates: wake at the exit start (steady hold) then every
+        // frame through the ramps (see `RobiBubble::deadline`).
+        if let Some(b) = &self.robi_bubble {
+            let d = b.deadline(Instant::now());
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,
                 d,
-                metrics::DeadlineOwner::ConfigNotice,
-            );
-        }
-        // The transient update NOTICE animates: wake at the fade start (steady hold) then
-        // every frame through the fade tail (see `TransientNotice::deadline`).
-        if let Some(n) = &self.notice {
-            let d = n.deadline(Instant::now(), self.notice_is_sparkling());
-            fold_owned_deadline(
-                &mut deadline,
-                &mut deadline_owner,
-                d,
-                metrics::DeadlineOwner::UpdateNotice,
+                metrics::DeadlineOwner::RobiBubble,
             );
         }
         // The LEVEL-UP celebration animates for its whole life, so wake every frame while
@@ -22056,20 +22736,40 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::Presence,
             );
         }
-        // The status bars wake the loop exactly once per bar: at the fold of a
-        // bar holding a terminal outcome. A live bar folds nothing (its next paint
-        // arrives with its next `Wake::PkgProgress` / `Wake::UpdateProgress`), and
-        // no bar folds nothing — an idle window never wakes for them (FL-1).
-        // ASKED THROUGH THE APP, not the bars directly: while a handoff freezes
-        // the holds the settle declines them, and arming a hold the settle will
-        // not act on is a wake that does nothing and re-arms the same past
-        // instant for the length of the freeze.
-        if let Some(d) = self.status_bars_deadline() {
+        // The message band wakes the loop exactly once per row: at the fold of
+        // a row holding a terminal outcome, or at a live row's staleness cap. A
+        // live row otherwise folds nothing (its next paint arrives with its next
+        // `Wake::PkgProgress` / `Wake::UpdateProgress`), and no row folds
+        // nothing — an idle window never wakes for the band (FL-1). ASKED
+        // THROUGH THE APP, not the center directly: while a handoff freezes the
+        // holds the settle declines them, and arming a hold the settle will not
+        // act on is a wake that does nothing and re-arms the same past instant
+        // for the length of the freeze. Slot 34 (`DeadlineOwner::MessageBand`,
+        // the bars' slot renamed 2026-09-22).
+        if let Some(d) = self.messages_deadline() {
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,
                 d,
-                metrics::DeadlineOwner::StatusBars,
+                metrics::DeadlineOwner::MessageBand,
+            );
+        }
+        // THE BAND'S MOTION (design §10.8), under its own owner (slot 39): the
+        // next frame of a live row's indicator on an ON-SCREEN window — a
+        // sweeping comet, a glide, a travelling glint, an echo — at most one per
+        // 33 ms frame, or a time word's tick. A resting comet or glint arms its
+        // next start, never a frame; a still look arms only the text ticks; an
+        // occluded, minimized or headless window arms nothing; an idle band
+        // arms nothing at all (FL-1); a handoff freeze arms nothing either (the
+        // parked frame stays where it is). The band's ONLY clock since the
+        // merge with main (ruling 140): main's 125 ms busy frame, which folded
+        // under slot 34, retired into it.
+        if let Some(d) = self.band_motion_deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                d,
+                metrics::DeadlineOwner::MessageBandMotion,
             );
         }
         if let Some(d) = fold_auto_apply_deadline(self.auto_apply_intent, None) {
@@ -22502,7 +23202,7 @@ impl ApplicationHandler<Wake> for App {
                     self.landed_row_pending = Some(build);
                 }
                 // The REALIZED ⬆️ arrow: for the next REALIZED_ARROW_TTL the version
-                // menu reads "v<new> ⬆️" with an "Updated to v<new> just now" first item
+                // menu reads "v<new> ⬆️" with an "Updated to aterm v<new> just now" first item
                 // (and the palette's Version section shows the time-faded twin) —
                 // drawing the eye to the version-number menu, then decaying via the
                 // about_to_wait sweep. The menu handle already exists: attach_os_window
@@ -22554,9 +23254,10 @@ impl ApplicationHandler<Wake> for App {
         //
         // Sited at the END of `resumed`, which returns early when the OS window
         // is already attached, so this runs on the launch that creates the first
-        // window and not on a second `resumed`. It borrows the admin step's
-        // lifetime rather than the transient one: an install this copy cannot
-        // undo is not a pill that should fade in a few seconds.
+        // window and not on a second `resumed`. A ROW (R21, the owner's
+        // attention rule: a failure only the person can fix), held ten minutes:
+        // an install this copy cannot undo is not a pill that should fade in a
+        // few seconds, and the posture with nothing to fix posts nothing.
         #[cfg(target_os = "macos")]
         if let Ok(exe) = std::env::current_exe() {
             // Canonicalize for the same reason `bundle::resolve_layout` does —
@@ -22565,12 +23266,13 @@ impl ApplicationHandler<Wake> for App {
             // back to the raw path rather than skipping the check.
             let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
             let posture = aterm_update::which_copy::posture_from(&exe);
-            if let Some(remedy) = posture.remedy() {
-                aterm_log::info!("install posture: {} ({remedy})", posture.summary());
-                self.surface_update_status_for(
-                    &format!("{} \u{2014} {remedy}", posture.summary()),
-                    crate::notice::ADMIN_STEP_TTL,
+            if let Some(msg) = message_reporters::install_posture(posture) {
+                aterm_log::info!(
+                    "install posture: {} ({})",
+                    posture.summary(),
+                    posture.remedy().unwrap_or_default()
                 );
+                self.post_message(msg);
             }
         }
     }
@@ -22593,7 +23295,11 @@ impl ApplicationHandler<Wake> for App {
             .is_some_and(crate::spawn::DeferredReaderGate::is_released)
             && matches!(
                 &ev,
-                Wake::Ready { .. } | Wake::Output { .. } | Wake::Exit { .. } | Wake::Bell { .. }
+                Wake::Ready { .. }
+                    | Wake::Output { .. }
+                    | Wake::QueuedKeyDelivered { .. }
+                    | Wake::Exit { .. }
+                    | Wake::Bell { .. }
             );
         if self.incoming_handoff_pending
             && !matches!(
@@ -22638,6 +23344,26 @@ impl ApplicationHandler<Wake> for App {
         }
         match ev {
             Wake::TitleSummaryReady => self.poll_title_summaries(),
+            Wake::QueuedKeyDelivered { session, at } => {
+                let now = Instant::now();
+                let frame_interval = self.frame_interval;
+                let view_store = &self.view_store;
+                for ws in self.windows.values_mut() {
+                    if !active_tab_displays_session(ws, view_store, session)
+                        || !ws.queued_key_delivery_releases_pending_frame(at, now, frame_interval)
+                    {
+                        continue;
+                    }
+                    let Some(window) = ws.os_window.clone() else {
+                        continue;
+                    };
+                    // If the echo's output wake raced the writer completion,
+                    // it may already be deferred at the full interval. Recheck
+                    // that existing dirty level against the new half-floor.
+                    ws.redraw_pending = false;
+                    window.request_redraw();
+                }
+            }
             // A pane produced output. Its reader thread already fed the matching
             // engine (it holds that session's own `term`); the main thread only
             // needs to repaint, and ONLY when the producing pane is VISIBLE — a pane
@@ -23171,10 +23897,10 @@ impl ApplicationHandler<Wake> for App {
                     // Announced for the watchdog: a capture is the control verb
                     // the 2026-09-06 stall was inside (`video` and `snapshot`
                     // render on this thread too, and announce only the
-                    // redemption they nest) — and, headless, the first one
-                    // redeems the deferred pixel backend inside it
-                    // (`ensure_pixel_backend` announces that nested phase
-                    // itself).
+                    // redemption they nest) — and, headless, the capture that
+                    // is the run's first pixel demand redeems the deferred
+                    // pixel backend inside it (`ensure_pixel_backend`
+                    // announces that nested phase itself).
                     let _phase = crate::watchdog::phase(crate::watchdog::Phase::ImageCapture);
                     self.render_image(req);
                 }
@@ -23220,6 +23946,14 @@ impl ApplicationHandler<Wake> for App {
                 // the attention path (§3.6) exists to surface. Rate-limited to
                 // one notification per posture transition by the gate itself.
                 self.note_warmup_denials();
+            }
+            // A *Move to Trash* finished: what is on disk changed, so the next
+            // read takes a fresh census rather than serving the one it replaced.
+            Wake::ClaimantRetired => {
+                if self.claimant_retire.take_arrival() {
+                    self.consent.invalidate_census();
+                }
+                self.request_redraw_all_windows();
             }
             // The observer queued parsed log events. Fold them; the verdicts
             // are read on demand by whoever reports `blocked_on=`. Never joins,
@@ -23287,10 +24021,15 @@ impl ApplicationHandler<Wake> for App {
             // from the main-thread-owned per-window state. A dropped control
             // client only drops the reply; this read never mutates App state.
             Wake::ReadAppStatus { reply } => {
-                // Rendered by `StatusBars` itself (it owns both the live bars and
-                // the ledger); the main thread's job here is only to be the place
-                // where App state is legal to read.
-                let _ = reply.send(self.status_bars.activity_rows(Instant::now()));
+                // The bars' grammar over the center (design §5.3, byte-identical):
+                // the toolchain- and update-tagged rows live, then those the
+                // process retired; the main thread's job here is only to be the
+                // place where App state is legal to read.
+                let _ = reply.send(aterm_messages::wire::activity_rows_compat(
+                    &self.messages,
+                    Instant::now(),
+                    &crate::control::pct_encode,
+                ));
             }
             Wake::ReadUpdateControl { reply } => {
                 let _ = reply.send(update_control::Snapshot::capture(self));
@@ -23579,11 +24318,11 @@ impl ApplicationHandler<Wake> for App {
                 // The presence rows were frozen for Commit; re-sync them now.
                 self.refresh_presence_all_windows();
                 self.finish_update_handoff(el, completion);
-                // A status-bar row change is DEFERRED while a handoff is pending
-                // (`sync_status_bar_rows`: a re-grid mid-handoff reads as a
+                // A band row change is DEFERRED while a handoff is pending
+                // (`sync_message_band_rows`: a re-grid mid-handoff reads as a
                 // topology change at Commit). Now that it has settled either way,
-                // commit whatever the bars want.
-                self.sync_status_bars();
+                // commit whatever the center wants.
+                self.sync_messages();
             }
             Wake::ControlPrepared => self.maybe_signal_handoff_ready(),
             Wake::UpdateHandoffAwaitingPark {
@@ -23605,6 +24344,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::ActivateCommittedHandoff { mut expected } => {
                 self.incoming_handoff_pending = false;
+                // The predecessor leaves at Commit without its graceful cleanup; its
+                // per-process files go once it has.
+                control::sweep_after_handoff(self.sock_plan.as_ref());
                 // Everything typed into the revealed window while we waited for Commit
                 // now runs through the ordinary path, in order. Taken BEFORE the replay
                 // so a re-entrant deferral cannot loop.
@@ -23615,6 +24357,11 @@ impl ApplicationHandler<Wake> for App {
                 // `aterm_update::set_uncommitted_handoff_candidate`).
                 aterm_update::set_uncommitted_handoff_candidate(false);
                 self.handoff_reader_gate.take();
+                // The predecessor's supervisor host stopped at its Commit; this
+                // one takes the sessions over now (one supervisor per session).
+                if let Some(host) = self.harness.as_ref() {
+                    host.resume();
+                }
                 // THE SAME TERM THE WAITER USED (2026-09-14): `expected`'s middle
                 // term is `handoff_proof_term` — the PTY DEVICE number on the
                 // launched lane, the fd number on the fork lane. Rebuilding
@@ -23664,19 +24411,14 @@ impl ApplicationHandler<Wake> for App {
                 // charging rim becomes the landing burst, and the carried
                 // "finishing" row says the new build is on — the update lane's
                 // words live on the status bar, never on a floating card.
-                // A carried TOOLCHAIN row has no feed in this process: it folds
-                // after the ordinary hold rather than sitting live to its cap.
-                self.status_bars.after_handoff_commit(Instant::now());
+                // Every carried row takes its own lifetime back at Commit: a
+                // held one anchors its hold now, a live one its cap.
+                self.messages.after_handoff_commit(Instant::now());
                 if let Some(build) = self.level_up_deferred.take() {
                     self.spawn_upgrade_surge(crate::level_up::Phase::Landing, build);
-                    self.status_bars.update_landed(
-                        crate::build_info::version_display(),
-                        build,
-                        true,
-                        Instant::now(),
-                    );
-                    self.sync_status_bars();
+                    self.post_update_landed(crate::build_info::version_display(), build);
                 }
+                self.sync_messages();
                 // What the queue could not carry, said out loud; and a chord
                 // whose release it dropped disarmed rather than replayed.
                 self.settle_replayed_handoff_input();
@@ -23737,57 +24479,15 @@ impl ApplicationHandler<Wake> for App {
             // Self-healing: a ledger threshold event from the background update
             // thread (persistent failure) — surface it.
             Wake::UpdateHealth { title, body } => {
-                // THE LEDGER HEALED: the check thread reports the recovery it
-                // observed (`aterm_update::HEALTH_RECOVERED_TITLE`) so the standing
-                // row below can leave. Nothing to notify about; the log line is the
-                // record.
-                if title == aterm_update::HEALTH_RECOVERED_TITLE {
-                    aterm_log::info!("update-health: {title}");
-                    if self.status_bars.update_health_healed(Instant::now()) {
-                        self.sync_status_bars();
-                    }
+                // The ledger healed, the count moved, or a class is failing:
+                // `App::note_update_health` says which, on the band and on record.
+                // Only an ANNOUNCEMENT is owed the OS banner below.
+                let announced = self.note_update_health(&title, &body);
+                if !announced {
                     self.request_native_update_reconcile(
                         crate::app_native::NativeUpdateReconcilePurpose::Refresh,
                     );
                     return;
-                }
-                // THE COUNT MOVED on a class this process already announced
-                // (`aterm_update::HEALTH_RESTATED_TITLE`, 2026-09-14): the standing
-                // row is rewritten in place under the failing title it already
-                // carries, and no notification is owed — the person was told when
-                // it was announced. Before this the row read "3 consecutive …" all
-                // day while the ledger climbed to 6.
-                if title == aterm_update::HEALTH_RESTATED_TITLE {
-                    aterm_log::info!("update-health: {title}: {body}");
-                    if self.status_bars.update_health_standing(
-                        aterm_update::HEALTH_FAILING_TITLE,
-                        &format!("{body} — see Settings ▸ Software Update"),
-                    ) {
-                        self.sync_status_bars();
-                    }
-                    self.request_native_update_reconcile(
-                        crate::app_native::NativeUpdateReconcilePurpose::Refresh,
-                    );
-                    return;
-                }
-                aterm_log::warn!("update-health: {title}: {body}");
-                // SAY WHAT IS WRONG, where the user is looking: the typed body carries
-                // the cause and the count; the pill used to discard it and point at a
-                // menu that has no failure text (measured 2026-08-18: eight hours of
-                // publisher-side rejections, invisible in the app). And re-read the
-                // ledger so Settings ▸ Software Update headlines the same verdict.
-                // On the update bar's row (2026-09-07) — and since 2026-09-10 a
-                // STANDING row: it stays until the ledger heals rather than folding
-                // after 45 s of a process that runs for weeks (m21 showed it for 45 s
-                // of a pipeline that had been failing since 2026-08-27). Never a
-                // floating card. The command in the body survives the width law
-                // (`status_bars::shape_detail`).
-                self.retire_update_installing();
-                if self.status_bars.update_health_standing(
-                    &title,
-                    &format!("{body} — see Settings ▸ Software Update"),
-                ) {
-                    self.sync_status_bars();
                 }
                 // THE OS NOTIFICATION the updater's contract promises (no_token.rs:
                 // "the only surface the owner sees without going looking"): the
@@ -23797,10 +24497,14 @@ impl ApplicationHandler<Wake> for App {
                 // process per class, so a short-lived delivery thread is cheap —
                 // and `notify::deliver` blocks on a notifier subprocess, which must
                 // never happen on the UI thread. No focus suppression on purpose:
-                // updater health belongs to no session/tab.
+                // updater health belongs to no session/tab. The banner says what
+                // the row says — which half is broken and since when — and where
+                // the rest is; the count, the raw timestamp and the command are
+                // the log line's above.
                 #[cfg(target_os = "macos")]
                 {
-                    let (title, body) = (title.clone(), body.clone());
+                    let title = title.clone();
+                    let body = crate::update_words::health_notification_body(&body);
                     std::thread::spawn(move || {
                         crate::notify::deliver(Some(&title), &body, false);
                     });
@@ -23875,7 +24579,7 @@ impl ApplicationHandler<Wake> for App {
             // it, arm the in-session apply lane, and show the persistent update-ready
             // nudge on every window. A NEWER build re-arms the nudge.
             Wake::UpdateStaged { build, version } => {
-                if std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_some() {
+                if aterm_types::dev_seam!("ATERM_DEBUG_RELAUNCH_NUDGE").is_some() {
                     // Visual-only QA seam: it may paint supplied data, but never gains
                     // install authority and never arms automatic application.
                     self.relaunch = Some(crate::relaunch_notice::RelaunchNotice {
@@ -23897,67 +24601,72 @@ impl ApplicationHandler<Wake> for App {
                     );
                 }
             }
-            // Batteries-included toolchain seed: the atpkg-update thread's one-shot
-            // launch-time `atpkg seed` pass matched a stable stdout marker. Raise the
-            // NON-clickable transient status pill only — details stay in
-            // Settings ▸ Packages (App ▸ Packages… jumps straight there).
-            // The seed pass has begun. Say so NOW — the extraction that follows is
-            // minutes long and gigabytes wide, and an app that does that silently on
-            // first launch is indistinguishable from one that is misbehaving.
-            Wake::PkgSeedStarted { detail } => {
-                // The one Wake serves the seed lane AND the network lane (`net-starting:`),
-                // so the log line names the event, not a lane: "atpkg seed failed" over a
+            // THE TOOLCHAIN LANE IS SILENT BY DEFAULT (2026-09-22, `toolchain_words` module
+            // doc): the one row it raises is the FIRST-RUN row, opened by the
+            // announcement of a pass the lane tagged `first_run`, before the multi-GB
+            // extraction, because an app doing that silently is indistinguishable from
+            // one that is misbehaving. Every other announcement is a log line.
+            Wake::PkgSeedStarted { detail, first_run } => {
+                // The log line names the event, not a lane: "atpkg seed failed" over a
                 // network provisioning failure sent the 2026-09-14 reader to the wrong lane.
-                aterm_log::info!("atpkg install pass starting: {detail}");
-                // The toolchain STATUS BAR opens on the announcement itself —
-                // before `progress.json` exists (atpkg prints this marker first),
-                // and even when there is no store layout to tail at all. atpkg
-                // computes the size from the signed manifests precisely so the
-                // user sees what they are committing; the bar keeps it.
-                self.status_bars
-                    .toolchain_announced(&detail, Instant::now());
-                self.sync_status_bars();
+                aterm_log::info!(
+                    "atpkg install pass starting{}: {detail}",
+                    if first_run { " (first run)" } else { "" }
+                );
+                // Only a first run opens the row — before `progress.json` exists
+                // (atpkg prints this marker first), and even when there is no store
+                // layout to tail at all; atpkg computes the size from the signed
+                // manifests precisely so the user sees what they are committing, and
+                // the row keeps it (`App::announce_toolchain_pass`).
+                self.announce_toolchain_pass(&detail, first_run);
             }
-            // Answer the bar honestly rather than leaving "installing…" as the
-            // last thing the user saw. Each holds long enough to read, then folds;
-            // the durable record is Settings ▸ Packages, which a click on the bar
-            // opens.
-            Wake::PkgSeedPartial { detail } => {
-                aterm_log::warn!("atpkg seed partial: {detail}");
-                self.status_bars
-                    .toolchain_failed("partly installed — see Settings ▸ Packages", Instant::now());
-                self.sync_status_bars();
-            }
+            // THE ANSWERS: each folds the first-run row (at its child's exit while
+            // that child runs) and is a `Hold::LogOnly` record — `appstatus`,
+            // Settings ▸ Messages and the log (2026-09-22). A failure also lights
+            // the Settings ▸ Packages badge and names itself on that page's
+            // headline ([`App::note_package_pass_failure`]); the durable record is
+            // the page. A FIRST RUN's failure is also a row, raised at its child's
+            // unclean exit ([`App::note_toolchain_first_run_short`], review
+            // 2026-09-24, ruling 144): the deliverable the person was told to wait
+            // for did not arrive, and they have something to do.
             Wake::PkgSeedFailed { detail } => {
                 aterm_log::warn!("atpkg install pass failed: {detail}");
                 // atpkg's own sentence when it has one (the `net-failed:`/`seed-failed:`
-                // line names the reason), the fixed words when it does not — a row that
-                // threw the reason away for a fixed sentence sent the user to a page to
-                // read what the marker had already said (audit 2026-09-14).
-                self.status_bars
-                    .toolchain_failed(&failure_row_text(&detail, "install failed"), Instant::now());
-                self.sync_status_bars();
+                // line names the reason), the fixed words when it does not (audit
+                // 2026-09-14).
+                self.record_toolchain_outcome(toolchain_words::failed(&failure_row_text(
+                    &detail,
+                    "install failed",
+                )));
+                let cause = failure_cause(&detail, "install failed");
+                self.note_toolchain_first_run_short(toolchain_words::FirstRunShort::Failed, &cause);
+                self.note_package_pass_failure(cause);
             }
-            // THE POSITIVE TERMINAL (2026-09-11). An announcement that ended well now
-            // has a row of its own, so the held "Installing…" card is retired by a
-            // statement instead of by the reader's guess at a silence. It claims no
-            // roster: the lanes that install a roster say so with `seed-installed:` /
-            // `net-installed:`, and this row exists for the ones that have none to name.
+            // THE POSITIVE TERMINAL (2026-09-11). An announcement that ended well is
+            // retired by a statement instead of by the reader's guess at a silence. It
+            // claims no roster: a pass that installs a roster says so with
+            // `net-installed:`, and this entry exists for the ones that have none to name.
             Wake::PkgSeedDone { detail } => {
                 aterm_log::info!("atpkg seed done: {detail}");
-                self.status_bars.toolchain_ended(&detail, Instant::now());
-                self.sync_status_bars();
+                // An ANSWER like the others (upstream `toolchain_ended` →
+                // `retire_answered_toolchain`): the record, and the live row
+                // folds unless a first-run child still runs.
+                self.record_toolchain_outcome(toolchain_words::ended(&detail));
             }
             // Exit 0, announced, and nothing on the disk. Neither "failed" (no failure
             // was observed) nor a tick (no toolchain is there) — so it says exactly
             // that, and points at the page that holds each program's reason.
             Wake::PkgSeedNothing { detail } => {
                 aterm_log::warn!("atpkg pass installed nothing: {detail}");
-                self.status_bars.toolchain_failed(
-                    "the pass finished without installing anything — see Settings ▸ Packages",
-                    Instant::now(),
+                self.record_toolchain_outcome(toolchain_words::not_installed(
+                    "the update finished without installing anything \u{2014} see Settings \u{25b8} Packages",
+                ));
+                let cause = "the last pass finished without installing anything".to_string();
+                self.note_toolchain_first_run_short(
+                    toolchain_words::FirstRunShort::Nothing,
+                    &cause,
                 );
-                self.sync_status_bars();
+                self.note_package_pass_failure(cause);
             }
             Wake::PkgSeedUnusable { detail } => {
                 aterm_log::info!("atpkg seed unusable: {detail}");
@@ -23965,11 +24674,21 @@ impl ApplicationHandler<Wake> for App {
                 // pin — used to render as "no build for this machine's architecture",
                 // one cause of several (audit 2026-09-14); the marker's own sentence
                 // says which.
-                self.status_bars.toolchain_failed(
-                    &failure_row_text(&detail, "no build this machine can use"),
-                    Instant::now(),
-                );
-                self.sync_status_bars();
+                self.record_toolchain_outcome(toolchain_words::not_installed(&failure_row_text(
+                    &detail,
+                    "no build this machine can use",
+                )));
+                // An unserved architecture or a toolset removed on purpose is a fact
+                // about the machine, not a failure: the page states the first, and the
+                // second is the user's own decision.
+                if !atpkg::cli::seed_unusable_is_informational(&detail) {
+                    let cause = failure_cause(&detail, "no build this machine can use");
+                    self.note_toolchain_first_run_short(
+                        toolchain_words::FirstRunShort::Nothing,
+                        &cause,
+                    );
+                    self.note_package_pass_failure(cause);
+                }
             }
             // QUEUED BEHIND ANOTHER ATPKG PASS at the store lock (2026-09-10): one
             // INFO line and NO ROW (2026-09-18). It used to raise a live Info row
@@ -23980,7 +24699,7 @@ impl ApplicationHandler<Wake> for App {
             // window continues" named a wait the window never had. Nothing on the
             // glass needs the user here: a holder with a plan shows through the
             // tailer's meter, a no-op holder is nothing to show, and a wait that
-            // runs out is the deferred notice below. Never the failure bar — the
+            // runs out is the deferred entry below. Never a failure — the
             // 2026-09-10 incident rendered this exact event as "⚠ ALab toolchain
             // install failed".
             Wake::PkgLockWaiting { detail } => {
@@ -23991,25 +24710,37 @@ impl ApplicationHandler<Wake> for App {
             Wake::PkgLockAcquired { detail } => {
                 aterm_log::info!("atpkg took the store lock after its wait: {detail}");
             }
-            Wake::PkgLockTimedOut { detail } => {
+            // A deferred pass is routine (another pass holds the store): the log and
+            // the ledger, never a row (2026-09-22) — nothing on glass needs the user.
+            // A STAND-DOWN is not routine: this window will not retry for the rest of
+            // the launch and the user must run the command it names, so it is also
+            // the Settings ▸ Packages badge. No producer sets `stands_down` since
+            // 9545a1131 (upstream deleted the bounded seed retry that was the only
+            // one); the half stays while the wake keeps the field (design ruling 42).
+            Wake::PkgLockTimedOut {
+                detail,
+                stands_down,
+            } => {
                 aterm_log::info!("the ALab toolchain pass is deferred: {detail}");
-                self.status_bars.toolchain_deferred(&detail, Instant::now());
-                self.sync_status_bars();
+                self.record_message(toolchain_words::deferred(&detail));
+                if stands_down {
+                    self.note_package_pass_trouble(
+                        crate::packages_screen::PassTroubleKind::StoodDown,
+                        detail,
+                    );
+                }
             }
-            // The R6 rows (2026-09-10): the managed agents in use, and the machine
-            // settings a pass changed. Both queue behind a pass row on the toolchain
-            // lane so each is read in turn and each lands in the `appstatus` ledger.
+            // The R6 markers (2026-09-10): the managed agents in use, and the machine
+            // settings a pass changed. Routine news atpkg prints at the end of every
+            // pass: the log and a `Hold::LogOnly` record, never a row (2026-09-22) —
+            // recorded, and logged at INFO, only when the words changed (2026-09-23
+            // audit: the same line at every pass, four and more times a day).
             Wake::PkgManagedCurrent(detail) => {
-                aterm_log::info!("atpkg managed-current: {detail}");
-                let frozen_tabs = self.frozen_path_tabs();
-                let hooked = self.this_tab_hooked();
-                self.status_bars.toolchain_managed_current(
-                    &detail,
-                    frozen_tabs,
-                    hooked,
-                    Instant::now(),
-                );
-                self.sync_status_bars();
+                if self.post_managed_current(&detail) {
+                    aterm_log::info!("atpkg managed-current: {detail}");
+                } else {
+                    aterm_log::debug!("atpkg managed-current (unchanged): {detail}");
+                }
             }
             Wake::PkgMachineRefused(detail) => {
                 aterm_log::info!("atpkg machine: {detail}");
@@ -24023,9 +24754,7 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::PkgMachineSettings(detail) => {
                 aterm_log::info!("atpkg machine-settings: {detail}");
-                self.status_bars
-                    .toolchain_machine_settings(&detail, Instant::now());
-                self.sync_status_bars();
+                self.post_machine_settings(&detail);
                 // THE TWO CALLS BELOW ARE THE WHOLE PATH from a pass's marker to the
                 // card, and `machine_change_effects` is what a test can reach: the arm
                 // itself needs a window. Keep them together, and keep the seam.
@@ -24044,7 +24773,10 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::PkgMachineState(body) => match atpkg::machine::parse_machine_state(&body) {
                 Some(state) => {
-                    aterm_log::info!("atpkg machine-state: {body}");
+                    // A measurement every pass prints, sometimes twice (a partial scan,
+                    // then the complete one): the card keeps it, the log at DEBUG —
+                    // the change it follows is the `machine-settings:` INFO line.
+                    aterm_log::debug!("atpkg machine-state: {body}");
                     self.native_packages_service.note_machine_record(state);
                     self.publish_native_packages_state();
                 }
@@ -24068,65 +24800,29 @@ impl ApplicationHandler<Wake> for App {
             // and the page that holds the member's own row.
             Wake::PkgGroupAborted { detail } => {
                 aterm_log::warn!("atpkg group aborted: {detail}");
-                self.status_bars.toolchain_failed(
-                    &format!("{detail} \u{2014} see Settings \u{25b8} Packages"),
-                    Instant::now(),
-                );
-                self.sync_status_bars();
-            }
-            // A recorded tracked install (2026-09-15): installed, tagged, said so.
-            Wake::PkgTrackedInstall { detail } => {
-                aterm_log::warn!("atpkg tracked install: {detail}");
-                self.status_bars
-                    .toolchain_tracked_install(&detail, Instant::now());
-                self.sync_status_bars();
+                self.record_toolchain_outcome(toolchain_words::failed(&format!(
+                    "{detail} \u{2014} see Settings \u{25b8} Packages"
+                )));
+                self.note_package_pass_failure(failure_cause(&detail, "a group update aborted"));
             }
             // `aterm ctl appnotice <lane> <text>`: the out-of-process voice of the
-            // pull-down. A marker-shaped toolchain text renders as that marker's row;
-            // anything else is a plain Info row on the named lane.
+            // pull-down. A marker-shaped toolchain text is that marker's record (no
+            // row, like the marker itself — and the reply says `recorded`), as is every
+            // harness note (a `harness`-tagged record); anything else is a plain Info
+            // row on the named lane. A record repaints nothing: the park persists it.
             Wake::AppNotice { lane, text, reply } => {
-                let now = Instant::now();
-                let result = match lane.as_str() {
-                    "toolchain" => {
-                        if let Some(body) = r6_marker_body(&text, MANAGED_CURRENT_MARKER) {
-                            let frozen_tabs = self.frozen_path_tabs();
-                            let hooked = self.this_tab_hooked();
-                            self.status_bars.toolchain_managed_current(
-                                body,
-                                frozen_tabs,
-                                hooked,
-                                now,
-                            );
-                        } else if let Some(body) = r6_marker_body(&text, MACHINE_SETTINGS_MARKER) {
-                            self.status_bars.toolchain_machine_settings(body, now);
-                        } else {
-                            self.status_bars.notice(
-                                crate::status_bars::Lane::Toolchain,
-                                &text,
-                                now,
-                            );
-                        }
-                        Ok(())
-                    }
-                    "update" => {
-                        self.status_bars
-                            .notice(crate::status_bars::Lane::Update, &text, now);
-                        Ok(())
-                    }
-                    _ => Err("lane must be toolchain or update"),
-                };
+                let result = self.take_app_notice(&lane, &text);
                 if result.is_ok() {
                     aterm_log::info!("appnotice {lane}: {text}");
-                    self.sync_status_bars();
                 }
                 let _ = reply.send(result);
             }
-            Wake::PkgSeed { installed, pending } => {
+            Wake::PkgSeed { installed } => {
                 if !installed.is_empty() {
-                    // The bar reads the RUNTIME shell-integration outcome so an
-                    // unknown-shell / unwritable-cache user is not promised tools
-                    // no tab of this window can deliver; the specific reason goes
-                    // to the log (the bar points at Settings instead).
+                    // The ledger entry reads the RUNTIME shell-integration outcome
+                    // so an unknown-shell / unwritable-cache user is not promised
+                    // tools no tab of this window can deliver; the specific reason
+                    // goes to the log (the entry points at Settings instead).
                     let si = crate::spawn::shell_integration_outcome();
                     if let Some(
                         outcome @ (crate::spawn::ShellIntegrationOutcome::UnknownShell(_)
@@ -24140,66 +24836,76 @@ impl ApplicationHandler<Wake> for App {
                     }
                     let frozen_tabs = self.frozen_path_tabs();
                     // The frozen-tab remedy is spelled for the shell this window
-                    // spawns — the managed row's own dialect (`set_hook_shell`).
-                    let hook = crate::status_bars::HookDialect::from(spawn::detect_spawn_shell(
-                        self.session_factory.shell_override.as_deref(),
+                    // spawns — the managed record's own dialect (`hook_dialect`).
+                    let hook = self.hook_dialect();
+                    self.record_toolchain_outcome(toolchain_words::installed(
+                        &toolchain_words::seed_pill_text(
+                            &installed,
+                            si.as_ref(),
+                            frozen_tabs,
+                            hook,
+                        ),
                     ));
-                    self.status_bars.toolchain_installed(
-                        &seed_pill_text(&installed, si.as_ref(), frozen_tabs, hook),
-                        Instant::now(),
-                    );
-                    self.sync_status_bars();
-                } else if let Some(tail) = pending {
-                    // `[packages].seed_install = false`: offer, don't act. No pass
-                    // runs and no progress exists — this is an OFFER, not
-                    // activity, so it stays a transient pill rather than a bar.
-                    // The full roster stays in the log; the pill points at the switch.
-                    aterm_log::info!("atpkg seed pending: {tail}");
-                    self.surface_nonmodal_update_status(
-                        "⇣ ALab toolchain available — install via Settings ▸ Packages",
-                    );
                 }
             }
-            // The first-launch ADMIN STEP: ONE passive card, never a dialog and never a
-            // focus change. The same set already on screen is left alone (its timer
-            // too), and an "Update ready" card is never clobbered — the next pass asks
-            // again. The card's Install control runs the osascript door through the
-            // Packages seam (`App::notice_click`); Not now records the dismissal.
+            // The first-launch ADMIN STEP (R18): ONE decision row, never a dialog and
+            // never a focus change. The same set already asking — or an install
+            // already running — is left alone (its hold too); the next pass asks
+            // again. The row's Install capsule runs the osascript door through the
+            // Packages seam (`App::perform_intent`); Not now records the dismissal.
             Wake::PkgNeedsAdmin { names } => {
-                let same_card_up = self
-                    .notice
-                    .as_ref()
-                    .is_some_and(|n| n.admin_step_names() == Some(names.as_slice()));
-                if same_card_up {
+                let listed = names.join(", ");
+                let first = names.first().cloned().unwrap_or_default();
+                if self.post_admin_step(names) {
                     aterm_log::info!(
-                        "atpkg: {} still waiting on an administrator (card deferred)",
-                        names.join(", ")
+                        "atpkg: {listed} waiting on an administrator — run: aterm pkg install {first}"
                     );
                 } else {
                     aterm_log::info!(
-                        "atpkg: {} waiting on an administrator — run: aterm pkg install {}",
-                        names.join(", "),
-                        names.first().map_or("", String::as_str)
+                        "atpkg: {listed} still waiting on an administrator (row already up)"
                     );
-                    self.notice = Some(crate::notice::TransientNotice::admin_step(
-                        names,
-                        Instant::now(),
-                    ));
-                    self.request_redraw_all_windows();
                 }
             }
             // Live provisioning progress from the child-scoped tailer (design §3):
-            // fold the snapshot into the toolchain bar. The bar is a chrome ROW in
-            // every window, so every window repaints (the RepaintKey's quantized
-            // `status_bars_fp` keeps a byte-identical tick from re-presenting).
-            Wake::PkgProgress { snapshot } => {
-                let now = Instant::now();
-                self.status_bars
-                    .toolchain_snapshot(snapshot.as_deref(), now);
-                self.sync_status_bars();
+            // fold the snapshot into the toolchain row — a FIRST RUN's only
+            // (`first_run`, 2026-09-22). The row is chrome in every window, so a
+            // changed row repaints every window (the RepaintKey's quantized
+            // `band_fp` keeps a byte-identical tick from re-presenting); a routine
+            // pass's reads change nothing and touch no window.
+            Wake::PkgProgress {
+                snapshot,
+                first_run,
+            } => {
+                self.apply_toolchain_snapshot(snapshot.as_deref(), first_run);
             }
-            // aterm's own updater reporting from inside its check: the update bar.
+            // A lane child exited: the first-run row it held folds now, and not at
+            // the end of one of its sub-passes; a clean whole pass clears the
+            // remembered pass trouble, and the Packages record — the rest of the
+            // badge — and the log the pass wrote to are re-read for a Settings that
+            // shows them.
+            Wake::PkgPassEnded { clean } => {
+                self.toolchain_pass_ended(clean);
+                if clean && self.native_packages_service.note_pass_clean() {
+                    self.publish_native_packages_state();
+                }
+                if self
+                    .native_runtime
+                    .instance_by_kind(crate::native_app::AppKind::Settings)
+                    .is_some()
+                {
+                    self.start_native_packages_refresh();
+                }
+            }
+            // aterm's own updater reporting from inside its check: the update's flow row
+            // — and the durable record: when a build was downloaded and verified (the
+            // fact that answers "downloaded but didn't install"), which is also where
+            // the landing measures how long the update took. A failure's or a
+            // deferral's whole sentence is the flow row's detail and the log's.
             Wake::UpdateProgress(progress) => {
+                if let aterm_update::Progress::Staged { version, build } = &progress {
+                    self.update_verified = Some((*build, Instant::now()));
+                    self.record_message(update_words::downloaded(version, *build));
+                }
                 self.note_update_progress(&progress);
             }
             // `spawn` (control socket). RAISE POLICY (design S3, finding F3): the
@@ -24334,6 +25040,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::ReadSessionStatus { session, reply } => {
                 let _ = reply.send(self.session_status_record(session));
+            }
+            Wake::ReadSessionStatuses { reply } => {
+                let _ = reply.send(self.session_statuses_record());
             }
             // `aterm ctl story`: the watcher's decision reaches the band. A
             // dropped receiver (dead client) just makes send() fail; ignore.
@@ -24507,7 +25216,11 @@ impl ApplicationHandler<Wake> for App {
                         "aterm-gui: document was not opened: {}",
                         rejected.detail()
                     );
-                    menu::notify("Couldn’t Open File", rejected.detail());
+                    // Headless has no glass for the sheet — and a `Prohibited` process
+                    // could not present it — so the stderr line is the whole report.
+                    if !self.headless {
+                        menu::notify("Couldn’t Open File", rejected.detail());
+                    }
                 }
             },
             // The pastejacking sheet was answered. `deliver_paste_confirmed` (not
@@ -25309,6 +26022,12 @@ fn pkg_unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Unix seconds of `at` as the machine-wide stamps count them (0 before the epoch).
+fn unix_secs(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// The RUNNING verdict for one progress snapshot, pure so the staleness laws are
 /// unit-testable: a cleared pid, a heartbeat outside the freshness window in either
 /// direction (dead writer / absurd future stamp), or a dead process all read as NOT
@@ -25406,8 +26125,8 @@ fn read_pkg_progress_snapshot(
 /// lock behind a sibling window's pass (`--wait-lock`, 2026-09-10) the tailer is
 /// alive and follows the SIBLING's `progress.json` through the foreign-pid path, so
 /// this window shows the real install — when the holder writes one (a window's pass
-/// does; a terminal `aterm pkg install` or the session lane's detached pass writes
-/// none, and the waiting row is all there is to show).
+/// does, and so does a pass a person typed on a terminal; the session lane's detached
+/// pass writes none, and the waiting row is all there is to show).
 struct PkgProgressTailer {
     stop: Arc<AtomicBool>,
     /// Whether a RUNNING sibling's file — the holder our child is queued behind —
@@ -25541,83 +26260,568 @@ struct BumpWatch {
     acted_mtime: Option<std::time::SystemTime>,
     /// When the last bump-TRIGGERED early pass started — the rate floor's clock.
     last_trigger: Option<Instant>,
+    /// The last local attempt to consult the store-scoped index probe. The probe
+    /// has its own file-locked stamp, so other aterm processes share the bound.
+    last_index_probe: Option<Instant>,
+    /// At most one index network probe runs beside the vendor checks. Its answer
+    /// is harvested by this package lane, never by a GUI callback.
+    pending_index_probe: Option<PendingIndexProbe>,
+    /// Invalidates an answer that was sampled before this lane's next whole-store
+    /// pass. The worker remains owned until it finishes, even when invalidated.
+    pass_generation: u64,
+    /// Highest published index this lane's pass ran for and did NOT land (the verified floor
+    /// stayed below it): no equal or older hint wakes another pass. Without
+    /// it an index a pass cannot land — a release abandoned half uploaded (its
+    /// `index.toml` HEADs as published, the listing the pass reads skips it), a roster
+    /// this client does not trust yet — cost a full pass at every positive probe
+    /// cooldown for as long as the release stood (found in review of Phase 3's parallel
+    /// loop, p3/sched 2026-09-22; true of this one until 2026-09-23). Noted whatever the
+    /// pass's ending ([`note_pass_ending`]): the failure ladder retries the old build,
+    /// while a newly published higher build may wake immediately.
+    unlanded: Option<u64>,
 }
 
-/// Park the update loop for `interval`, in 5-second slices that watch
-/// `<prefix>/bump` (design §4): a fresh bump — new mtime, admitted names, rate floor
-/// honored, not a failure the current pass already recorded — RETURNS EARLY, which
-/// the caller turns into an immediate `atpkg update` pass. The 6h cadence itself is
-/// unchanged: with no bump this sleeps the whole interval. A 5s stat in a parked
-/// background thread costs zero frames — FL-1 governs repaints, not worker threads.
-/// The stat is `symlink_metadata` and regular-file-gated like every other read of
-/// this file; a non-regular plant is ignored outright.
-fn sleep_interval_watching_bump(
-    layout: Option<&atpkg::store::Layout>,
-    interval: Duration,
-    watch: &mut BumpWatch,
-) {
-    let end = Instant::now() + interval;
-    loop {
-        let now = Instant::now();
-        let Some(remaining) = end.checked_duration_since(now) else {
-            return;
-        };
-        std::thread::sleep(remaining.min(Duration::from_secs(5)));
-        let Some(l) = layout else {
-            continue;
-        };
-        let Ok(meta) = std::fs::symlink_metadata(l.bump_file()) else {
-            continue;
-        };
-        if !meta.file_type().is_file() {
-            continue;
-        }
-        let Ok(mtime) = meta.modified() else {
-            continue;
-        };
-        if watch.acted_mtime == Some(mtime) {
-            continue;
-        }
-        if !bump_pass_allowed(Instant::now(), watch.last_trigger) {
-            // Floored: do NOT mark the mtime acted-on — the same bump re-qualifies
-            // once the floor lapses, so a wish made during the cooldown is delayed,
-            // never lost.
-            continue;
-        }
-        let names = atpkg::progress::read_bump(l);
-        let progress = atpkg::progress::read_progress(l);
-        if !bump_should_trigger(&names, progress.as_ref()) {
-            // Nothing actionable (garbage-only file, or every name's failure is
-            // already recorded in the current pass): consume this mtime so the
-            // watch does not re-evaluate it every slice.
-            watch.acted_mtime = Some(mtime);
-            continue;
-        }
-        watch.acted_mtime = Some(mtime);
-        watch.last_trigger = Some(Instant::now());
-        return;
+struct PendingIndexProbe {
+    worker: std::thread::JoinHandle<atpkg::index_probe::Probe>,
+    pass_generation: u64,
+    /// A positive near HEAD can wake the signed pass while the worker still
+    /// owns its far HEAD and listing helpers. Zero means no positive hint.
+    near_build: Arc<AtomicU64>,
+    /// The highest near hint this lane has consumed. A pass generation change
+    /// invalidates the final far/listing answer, but a higher near HEAD observed
+    /// after that pass started can still wake a new signed pass.
+    near_offered: Option<u64>,
+}
+
+impl BumpWatch {
+    fn note_full_pass_started(&mut self) {
+        // A pending probe lasts seconds; wrapping all the way back to its
+        // generation while it is owned would require 2^64 package passes.
+        self.pass_generation = self.pass_generation.wrapping_add(1);
     }
 }
 
-/// How many failure-ladder rungs a ONCE-pass (`ATPKG_UPDATE_INTERVAL_SECS=0`) climbs
-/// before it ends after a failed pass (2026-09-15): the ladder's first two parks, ten
-/// and twenty minutes — a transient refusal gets its retry, a permanent one ends the
-/// once-pass as it always did.
-const ONCE_PASS_FAILURE_RETRIES: u32 = 2;
+/// The one tick decision for a published-index hint: the build to run the signed pass
+/// for, or `None`. `now` and `probe` are parameters so the cadence and wake can be checked
+/// without a real timer or network. The store-scoped helper independently deduplicates
+/// across processes. The highest index this lane's pass did not land
+/// ([`BumpWatch::unlanded`]) suppresses equal and lower hints; only a higher build
+/// can wake a new pass. A genuinely global missing answer forgets it.
+#[cfg(test)]
+fn published_index_wakes(
+    layout: &atpkg::store::Layout,
+    watch: &mut BumpWatch,
+    enabled: bool,
+    now: Instant,
+    probe: impl FnOnce(&atpkg::store::Layout) -> atpkg::index_probe::Probe,
+) -> Option<u64> {
+    if !enabled
+        || !watch.last_index_probe.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_some_and(|age| age >= atpkg::index_probe::INTERVAL)
+        })
+    {
+        return None;
+    }
+    watch.last_index_probe = Some(now);
+    index_probe_answer_wakes(watch, probe(layout))
+}
 
-/// How many times the launch seed is run again behind a holder when the update loop
-/// is OFF and would never run it otherwise (2026-09-15): the contention ladder's first
-/// five rungs, about a quarter of an hour of parks, each followed by a full
-/// `--wait-lock` bound. Then the deferred row names the remedy, as before.
-const SEED_RETRIES_WITHOUT_LOOP: u32 = 5;
+fn index_probe_answer_wakes(
+    watch: &mut BumpWatch,
+    answer: atpkg::index_probe::Probe,
+) -> Option<u64> {
+    match answer {
+        atpkg::index_probe::Probe::Published(build)
+            if watch.unlanded.is_some_and(|unlanded| build <= unlanded) =>
+        {
+            None
+        }
+        atpkg::index_probe::Probe::Published(build) => {
+            watch.unlanded = None;
+            aterm_log::info!(
+                "atpkg index {build} appeared on the release host; asking for a signed update \
+                 pass for it"
+            );
+            Some(build)
+        }
+        atpkg::index_probe::Probe::Missing => {
+            watch.unlanded = None;
+            None
+        }
+        atpkg::index_probe::Probe::Deferred => None,
+    }
+}
 
-/// The launch children's `--wait-lock` bound: 30 min. Bounded by the RETRY, not by
-/// the download — curl's own per-file ceiling can exceed this on a slow link — so a
-/// wait that runs out is retried ([`ContentionBackoff`]), never reported as a failed
-/// install. The child is idle while it waits, and the child-scoped tailer follows the
-/// SIBLING's `progress.json` through the foreign-pid path meanwhile; the wait itself
+/// Launch one due probe without making a completed vendor GET wait for its network.
+/// The handle stays in `BumpWatch` until harvested, so a slow host cannot grow a
+/// second worker on the next park slice or after Automatic updates is toggled.
+fn start_index_probe_with_near_hint(
+    layout: &atpkg::store::Layout,
+    watch: &mut BumpWatch,
+    enabled: bool,
+    now: Instant,
+    probe: impl FnOnce(&atpkg::store::Layout, &AtomicU64) -> atpkg::index_probe::Probe + Send + 'static,
+) {
+    if !enabled
+        || watch.pending_index_probe.is_some()
+        || !watch.last_index_probe.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_some_and(|age| age >= atpkg::index_probe::INTERVAL)
+        })
+    {
+        return;
+    }
+    watch.last_index_probe = Some(now);
+    let layout = layout.clone();
+    let pass_generation = watch.pass_generation;
+    let near_build = Arc::new(AtomicU64::new(0));
+    let worker_near = Arc::clone(&near_build);
+    match std::thread::Builder::new()
+        .name("atpkg-index-probe".into())
+        .spawn(move || {
+            crate::qos::set_self(crate::qos::Role::Background);
+            probe(&layout, &worker_near)
+        }) {
+        Ok(worker) => {
+            watch.pending_index_probe = Some(PendingIndexProbe {
+                worker,
+                pass_generation,
+                near_build,
+                near_offered: None,
+            });
+        }
+        Err(error) => {
+            // This optional hint can wait for its next interval; the signed full
+            // pass remains the authority and its deadline is still watched.
+            aterm_log::warn!("atpkg index probe helper unavailable: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+fn start_index_probe(
+    layout: &atpkg::store::Layout,
+    watch: &mut BumpWatch,
+    enabled: bool,
+    now: Instant,
+    probe: impl FnOnce(&atpkg::store::Layout) -> atpkg::index_probe::Probe + Send + 'static,
+) {
+    start_index_probe_with_near_hint(layout, watch, enabled, now, move |layout, _| probe(layout));
+}
+
+fn index_probe_answer_ready(watch: &BumpWatch) -> bool {
+    watch.pending_index_probe.as_ref().is_some_and(|pending| {
+        pending.worker.is_finished()
+            || pending.near_build.load(Ordering::Acquire) > pending.near_offered.unwrap_or(0)
+    })
+}
+
+fn take_ready_index_probe(layout: &atpkg::store::Layout, watch: &mut BumpWatch) -> Option<u64> {
+    let pending = watch.pending_index_probe.as_ref()?;
+    if pending.worker.is_finished() {
+        let pending = watch.pending_index_probe.take().expect("ready index probe");
+        let answer = pending
+            .worker
+            .join()
+            .unwrap_or(atpkg::index_probe::Probe::Deferred);
+        if pending.pass_generation != watch.pass_generation {
+            // The final answer may contain far/listing observations from before
+            // the pass. A newer near HEAD, however, can have arrived after the
+            // pass sampled its signed listing. The worker is joined before this
+            // read so its latest near hint is visible even if it just finished.
+            let near = pending.near_build.load(Ordering::Acquire);
+            return if near > pending.near_offered.unwrap_or(0)
+                && near > atpkg::index_probe::verified_floor(layout)
+            {
+                index_probe_answer_wakes(watch, atpkg::index_probe::Probe::Published(near))
+            } else {
+                None
+            };
+        }
+        if let Some(near) = pending.near_offered
+            && !matches!(answer, atpkg::index_probe::Probe::Published(build) if build > near)
+        {
+            return None;
+        }
+        return index_probe_answer_wakes(watch, answer);
+    }
+    let near = pending.near_build.load(Ordering::Acquire);
+    if near <= pending.near_offered.unwrap_or(0) {
+        return None;
+    }
+    let stale_final = pending.pass_generation != watch.pass_generation;
+    watch
+        .pending_index_probe
+        .as_mut()
+        .expect("early index probe")
+        .near_offered = Some(near);
+    // Mark the hint consumed before a floor or unlanded suppression, so a
+    // rejected hint cannot keep the park on a zero-delay ready loop. Read the
+    // current durable floor only for a worker that crossed a full pass.
+    if stale_final && near <= atpkg::index_probe::verified_floor(layout) {
+        return None;
+    }
+    index_probe_answer_wakes(watch, atpkg::index_probe::Probe::Published(near))
+}
+
+/// A bump already waiting on disk outranks any network hint. The caller checks
+/// the park deadline again after this local read, so a due HEAD cannot delay the
+/// ordinary full pass after its timer has expired. The deadline is the park's WALL-clock
+/// one; `now` answers both clocks — the monotonic one paces the probe's local cadence.
+/// `None`: the park goes on.
+#[cfg(test)]
+fn package_park_tick_wakes(
+    layout: &atpkg::store::Layout,
+    watch: &mut BumpWatch,
+    probe_index: bool,
+    deadline: std::time::SystemTime,
+    mut bump: impl FnMut(&atpkg::store::Layout, &mut BumpWatch) -> bool,
+    now: impl FnOnce() -> (Instant, std::time::SystemTime),
+    probe: impl FnOnce(&atpkg::store::Layout) -> atpkg::index_probe::Probe,
+) -> Option<ParkEnd> {
+    if bump(layout, watch) {
+        return Some(ParkEnd::Bumped);
+    }
+    let (now, wall) = now();
+    if wall >= deadline {
+        return None;
+    }
+    let last_probe = watch.last_index_probe;
+    if let Some(build) = published_index_wakes(layout, watch, probe_index, now, probe) {
+        return Some(ParkEnd::IndexPublished(build));
+    }
+    // A bump can land while the synchronous HEAD is in flight. Only repeat the
+    // cheap local read when a probe actually ran; this avoids another 5s wait
+    // while adding no steady-state stat to the other park slices.
+    (watch.last_index_probe != last_probe && bump(layout, watch)).then_some(ParkEnd::Bumped)
+}
+
+/// Why a park ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ParkEnd {
+    /// The park ran its course.
+    Elapsed,
+    /// A fresh local bump asked for a pass now.
+    Bumped,
+    /// The release host published this index; run the ordinary signed update for it.
+    IndexPublished(u64),
+    /// The head watch saw these programs' vendor heads pass the installed builds.
+    VendorMoved(Vec<&'static str>),
+    /// Automatic updates was turned off ([`LiveSwitch`]). Never returned by
+    /// [`PkgLane::park`], which stands by inside the park and parks on.
+    SwitchedOff,
+}
+
+impl ParkEnd {
+    /// The pass a park that ended this way asks for: a stub's wish, the index the probe
+    /// saw, or — a park that ran its course — `on_elapse` (the walk, the retry, or the same
+    /// pass after a contention park, [`PassWhy::after_park`]).
+    fn pass_why(self, on_elapse: PassWhy) -> PassWhy {
+        match self {
+            Self::Bumped => PassWhy::Bumped,
+            // A parked Published(45) can observe an older probe answer after
+            // the holder's pass; never replace its pending high-water with 44.
+            Self::IndexPublished(build) => match on_elapse {
+                PassWhy::Published(pending) => PassWhy::Published(pending.max(build)),
+                _ => PassWhy::Published(build),
+            },
+            Self::Elapsed | Self::VendorMoved(_) => on_elapse,
+            // Never out of a park ([`PkgLane::park`]); were it, the loop's own read of the
+            // switch decides before any pass, and the elapse is only what it resumes to.
+            Self::SwitchedOff => on_elapse,
+        }
+    }
+}
+
+/// The vendor head watch a park rides, and the GET it reads heads through
+/// ([`atpkg::vendor_direct::watch::for_this_process`]).
+type VendorHeads = (
+    atpkg::vendor_direct::watch::HeadWatch,
+    Arc<atpkg::vendor_direct::watch::ConcurrentVendorGetFn<'static>>,
+);
+
+/// How long one slice of a park sleeps before it looks again.
+const PARK_SLICE: Duration = Duration::from_secs(5);
+
+/// Park until the WALL-clock `until` — at most `longest` from now, give or take the head
+/// watch's margin ([`park_slice`]): a deadline further out is a clock set back, and ends the
+/// park rather than stranding the loop until that clock comes round again — in 5-second
+/// slices. A local bump wins before either network hint.
+/// The published-index probe runs in healthy and failure parks and wakes the ordinary
+/// signed update for a strictly newer build; vendor heads are watched in every park,
+/// including lock-contention backoff, and run targeted update passes. A moved vendor head resumes
+/// toward the original deadline, preserving the full-scan cadence. The index probe's
+/// thirty-second local cadence and store-scoped lock bound cross-process network work. No
+/// network probe starts after a due full pass.
+///
+/// THE WALL CLOCK, NOT `Instant` (Phase 3, 2026-09-23): the monotonic clock stops while a
+/// Mac sleeps, so a six-hour `Instant` park slept through overnight was still hours from
+/// due at breakfast. A slice that took far more wall clock than it slept is a WAKE (the
+/// head watch's own rule, [`atpkg::vendor_direct::watch::WAKE_GAP`]); a deadline the sleep
+/// carried past moves to [`atpkg::vendor_direct::watch::AFTER_WAKE`] after it, so the pass
+/// it owes does not run into a network still coming up ([`park_deadline_after_slice`]).
+fn sleep_interval_watching_bump(
+    layout: Option<&atpkg::store::Layout>,
+    until: &mut std::time::SystemTime,
+    longest: Duration,
+    watch: &mut BumpWatch,
+    probe_index: bool,
+    mut heads: Option<&mut VendorHeads>,
+    switch: &mut LiveSwitch,
+) -> ParkEnd {
+    watch.last_index_probe.get_or_insert_with(Instant::now);
+    loop {
+        let wall_before = std::time::SystemTime::now();
+        let Some(slice) = park_slice(*until, wall_before, longest) else {
+            return ParkEnd::Elapsed;
+        };
+        // A completed index worker needs no further sleep. Keep the same local
+        // priority checks before consuming its result.
+        if probe_index && index_probe_answer_ready(watch) {
+            if switch.poll() != LoopGate::On {
+                return ParkEnd::SwitchedOff;
+            }
+            if let Some(l) = layout {
+                if bump_fired(l, watch) {
+                    return ParkEnd::Bumped;
+                }
+                if std::time::SystemTime::now() >= *until {
+                    return ParkEnd::Elapsed;
+                }
+                if let Some(build) = take_ready_index_probe(l, watch) {
+                    return ParkEnd::IndexPublished(build);
+                }
+            }
+        }
+        let mono_before = Instant::now();
+        // While a network probe is live, one-second waits bound the delivery of
+        // its completed answer without a busy loop or an extra notifier thread.
+        let wait = if probe_index && watch.pending_index_probe.is_some() {
+            slice.min(Duration::from_secs(1))
+        } else {
+            slice
+        };
+        if let Some((head_watch, _)) = heads.as_deref_mut() {
+            head_watch.park_for_hint(wait);
+        } else {
+            std::thread::sleep(wait);
+        }
+        // THE SWITCH, LIVE (Phase 4): Automatic updates turned off is answered within this
+        // slice — before any probe, head check or pass: [`PkgLane::park`] stands the lane
+        // down there and parks on toward `until` once it is on again.
+        if switch.poll() != LoopGate::On {
+            return ParkEnd::SwitchedOff;
+        }
+        let slept_to = std::time::SystemTime::now();
+        *until = park_deadline_after_slice(
+            *until,
+            slept_to,
+            slept_to.duration_since(wall_before).ok(),
+            mono_before.elapsed(),
+        );
+        let Some(l) = layout else {
+            continue;
+        };
+        if bump_fired(l, watch) {
+            return ParkEnd::Bumped;
+        }
+        // A due full pass outranks a new index probe. Parks with that probe
+        // disabled retain the head watch's final-slice check.
+        if probe_index && std::time::SystemTime::now() >= *until {
+            return ParkEnd::Elapsed;
+        }
+        if probe_index && let Some(build) = take_ready_index_probe(l, watch) {
+            return ParkEnd::IndexPublished(build);
+        }
+        start_index_probe_with_near_hint(
+            l,
+            watch,
+            probe_index,
+            Instant::now(),
+            atpkg::index_probe::successor_reporting_near,
+        );
+        let Some((head_watch, get)) = heads.as_deref_mut() else {
+            continue;
+        };
+        // THE PER-PROGRAM GATES, LIVE: `[packages].exclude` as this slice's poll read it;
+        // the watch reads removed, held and dev-linked off the store at each check.
+        head_watch.set_exclude(switch.exclude());
+        let wall = std::time::SystemTime::now();
+        let head_due = head_watch.due(wall);
+        let moved = head_watch_slice(
+            head_watch,
+            l,
+            wall,
+            wall.duration_since(wall_before).ok(),
+            mono_before.elapsed(),
+            get,
+            watch.pending_index_probe.is_some(),
+        );
+        // A vendor GET can spend several seconds in a short network timeout.
+        // Give a local index bump that arrived during it priority over targeted
+        // vendor work, without adding a second stat to ordinary park slices.
+        let bumped = head_due && bump_fired(l, watch);
+        let full_due = probe_index && std::time::SystemTime::now() >= *until;
+        if let Some(end) =
+            finish_head_watch_slice(l, head_watch, watch, bumped, full_due, probe_index, moved)
+        {
+            return end;
+        }
+    }
+}
+
+/// The next slice a park sleeps at `wall` toward the WALL-clock `until`, or `None`: the
+/// park is over — the deadline is here, or further out than the park's own length `longest`
+/// by more than the head watch's margin ([`atpkg::vendor_direct::watch::WAKE_GAP`], its own
+/// set-back rule's), which only a clock set back can make. The margin is what lets the
+/// deadline a wake moved to [`atpkg::vendor_direct::watch::AFTER_WAKE`] stand on a park
+/// shorter than that, and a clock stepped back a few seconds early in a park; with none,
+/// both ended the park at once — a pass run into a network still coming up, a failed pass
+/// retried back to back (found in review of p3/reconciled, 2026-09-23). Pure for the test.
+fn park_slice(
+    until: std::time::SystemTime,
+    wall: std::time::SystemTime,
+    longest: Duration,
+) -> Option<Duration> {
+    let set_back = longest.saturating_add(atpkg::vendor_direct::watch::WAKE_GAP);
+    match until.duration_since(wall) {
+        Ok(left) if !left.is_zero() && left <= set_back => Some(left.min(PARK_SLICE)),
+        _ => None,
+    }
+}
+
+/// The park's deadline after one slice that ended at `wall`, over which the wall clock
+/// moved `wall_elapsed` (`None`: backwards) and the monotonic clock `mono_elapsed`: the
+/// same deadline — unless the slice was a WAKE (the wall clock outran the monotonic one by
+/// more than [`atpkg::vendor_direct::watch::WAKE_GAP`]) that carried the park past its
+/// deadline, which then moves to [`atpkg::vendor_direct::watch::AFTER_WAKE`] from `wall`:
+/// the pass is owed, and the network gets its time to come back first. Pure for the test.
+fn park_deadline_after_slice(
+    until: std::time::SystemTime,
+    wall: std::time::SystemTime,
+    wall_elapsed: Option<Duration>,
+    mono_elapsed: Duration,
+) -> std::time::SystemTime {
+    let woke = wall_elapsed.is_some_and(|slept| {
+        slept > mono_elapsed.saturating_add(atpkg::vendor_direct::watch::WAKE_GAP)
+    });
+    if woke && until <= wall {
+        aterm_log::info!(
+            "atpkg lane: the machine slept through the package loop's deadline \u{2014} the \
+             pass it owes runs {} after the wake",
+            human_park(atpkg::vendor_direct::watch::AFTER_WAKE)
+        );
+        return wall + atpkg::vendor_direct::watch::AFTER_WAKE;
+    }
+    until
+}
+
+/// Whether `<prefix>/bump` asks for a pass now. The stat is `symlink_metadata` and
+/// regular-file-gated like every other read of this file; a non-regular plant is
+/// ignored outright.
+fn bump_fired(l: &atpkg::store::Layout, watch: &mut BumpWatch) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(l.bump_file()) else {
+        return false;
+    };
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    if watch.acted_mtime == Some(mtime) {
+        return false;
+    }
+    if !bump_pass_allowed(Instant::now(), watch.last_trigger) {
+        // Floored: do NOT mark the mtime acted-on — the same bump re-qualifies
+        // once the floor lapses, so a wish made during the cooldown is delayed,
+        // never lost.
+        return false;
+    }
+    let names = atpkg::progress::read_bump(l);
+    let progress = atpkg::progress::read_progress(l);
+    watch.acted_mtime = Some(mtime);
+    if !bump_should_trigger(&names, progress.as_ref()) {
+        // Nothing actionable (garbage-only file, or every name's failure is
+        // already recorded in the current pass): this mtime is consumed so the
+        // watch does not re-evaluate it every slice.
+        return false;
+    }
+    watch.last_trigger = Some(Instant::now());
+    true
+}
+
+/// One park slice of the vendor head watch (design §1.6): the slice's clocks (a wake
+/// asks every head 20 s later), the heads asked through `get` when due, one INFO line
+/// per note, and the programs whose head moved — `None` when none did.
+fn head_watch_slice(
+    heads: &mut atpkg::vendor_direct::watch::HeadWatch,
+    layout: &atpkg::store::Layout,
+    wall: std::time::SystemTime,
+    wall_elapsed: Option<Duration>,
+    mono_elapsed: Duration,
+    get: &Arc<atpkg::vendor_direct::watch::ConcurrentVendorGetFn<'static>>,
+    index_in_flight: bool,
+) -> Option<Vec<&'static str>> {
+    heads.note_slice(wall, wall_elapsed, mono_elapsed);
+    if !heads.due(wall) {
+        return None;
+    }
+    let moved = heads.check_pending_with_index_in_flight(layout, wall, get, index_in_flight);
+    for line in heads.take_notes() {
+        aterm_log::info!("{line}");
+    }
+    (!moved.is_empty()).then_some(moved)
+}
+
+/// The bump, full-pass deadline, and ready index keep their priority after a
+/// vendor result is harvested. Carry that result to the next park instead of
+/// consuming its offer without running either its targeted or whole-store pass.
+fn finish_head_watch_slice(
+    layout: &atpkg::store::Layout,
+    heads: &mut atpkg::vendor_direct::watch::HeadWatch,
+    watch: &mut BumpWatch,
+    bumped: bool,
+    full_due: bool,
+    probe_index: bool,
+    moved: Option<Vec<&'static str>>,
+) -> Option<ParkEnd> {
+    let prior = if bumped {
+        Some(ParkEnd::Bumped)
+    } else if full_due {
+        Some(ParkEnd::Elapsed)
+    } else if probe_index {
+        take_ready_index_probe(layout, watch).map(ParkEnd::IndexPublished)
+    } else {
+        None
+    };
+    if let Some(end) = prior {
+        if let Some(programs) = moved {
+            heads.defer_moved(&programs);
+        }
+        return Some(end);
+    }
+    moved.map(ParkEnd::VendorMoved)
+}
+
+/// The passes a head-watch trigger runs: one `update <program>` per program.
+fn vendor_moved_verbs(programs: &[&'static str]) -> Vec<PassVerb> {
+    programs
+        .iter()
+        .copied()
+        .map(PassVerb::UpdateProgram)
+        .collect()
+}
+
+/// The launch children's `--wait-lock` bound: 30 min, the one every lane that schedules
+/// a pass uses ([`aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS`]). Bounded by the
+/// RETRY, not by the download — curl's own per-file ceiling can exceed this on a slow
+/// link — so a wait that runs out is retried ([`ContentionBackoff`]), never reported as a
+/// failed install. The child is idle while it waits, and the child-scoped tailer follows
+/// the SIBLING's `progress.json` through the foreign-pid path meanwhile; the wait itself
 /// is a log line, never a row (2026-09-18).
-pub(crate) const ATPKG_WAIT_LOCK_SECS: u64 = 30 * 60;
+pub(crate) const ATPKG_WAIT_LOCK_SECS: u64 = aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS;
 
 /// The update loop's first park after a pass that timed out waiting on the store
 /// lock — seconds, never the six-hour interval. It doubles ONCE (60 s): the third
@@ -25635,7 +26839,7 @@ const CONTENTION_BACKOFF_FIRST: Duration = Duration::from_secs(30);
 /// slow link legitimately outlasts three of these waits, and that is a slow install
 /// being followed, not a wedge being counted.
 const CONTENTION_WEDGE_CYCLES: u32 = 3;
-/// The park once the holder looks wedged: an hour, never the six-hour interval. A
+/// The park once the holder looks wedged: an hour, never the six-hour walk. A
 /// wedge is a human-attended state — the dialog gets answered, the sudo prompt its
 /// password, the typed install finishes or dies — and a window parked for the
 /// interval on it sat out the rest of the six hours with an incomplete store after
@@ -25688,8 +26892,8 @@ impl Backoff {
 /// The park after a store-lock timeout (atpkg exit 75): 30 s, then 60 s; the
 /// third timed-out wait in a row with nothing moving is the wedge (`wedged`,
 /// [`CONTENTION_WEDGE_CYCLES`]) and the loop's park is then an hour
-/// ([`wedge_park`]), so only `CONTENTION_WEDGE_CYCLES - 1` backoff parks are ever
-/// applied. Reset by any pass that actually ran — and by a wait during which the
+/// ([`CONTENTION_WEDGE_PARK`]), so only `CONTENTION_WEDGE_CYCLES - 1` backoff parks are
+/// ever applied. Reset by any pass that actually ran — and by a wait during which the
 /// holder's work visibly advanced. Every timed-out wait is tallied, the launch
 /// seed's included ([`PkgLane`]): three waits in a row is the wedge whichever
 /// child waited them. Pure for the test.
@@ -25728,17 +26932,6 @@ impl ContentionBackoff {
     fn cycles(&self) -> u32 {
         self.0.cycles()
     }
-}
-
-/// The update loop's park once the holder looks WEDGED, given the loop's interval
-/// in seconds: [`CONTENTION_WEDGE_PARK`], never longer than the interval — and
-/// `None` for a ONCE-PASS (`ATPKG_UPDATE_INTERVAL_SECS=0`), which stands down for
-/// this launch after a wedge instead of parking (the loop's exit rule; the three
-/// doc sites — `prefs.rs`, `pkg_check.rs`, the streaming design §4 — say so), so
-/// its log line and its ⏸ row never promise a retry the loop will not make. Pure
-/// for the test.
-fn wedge_park(interval_secs: u64) -> Option<Duration> {
-    (interval_secs > 0).then(|| CONTENTION_WEDGE_PARK.min(Duration::from_secs(interval_secs)))
 }
 
 /// The update loop's park after a pass that RAN and FAILED (exit ≠ 0: a refusal, a
@@ -25782,9 +26975,29 @@ fn stood_aside_line(verb: PassVerb, seen: SeedMarkers) -> String {
         " (atpkg exit 75, no `seed-busy:` line)"
     };
     format!(
-        "the ALab toolchain {verb} pass waited {bound} for another atpkg pass to release \
-         the store lock and stood aside{said}"
+        "{} pass waited {bound} for another atpkg pass to release the store lock and \
+         stood aside{said}",
+        pass_name(verb)
     )
+}
+
+/// What the log calls a pass: a targeted one by its own command (it keeps a vendor
+/// program, not the ALab toolchain), every other by the toolchain it keeps.
+fn pass_name(verb: PassVerb) -> String {
+    match verb.program() {
+        Some(_) => format!("the atpkg {verb}"),
+        None => format!("the ALab toolchain {verb}"),
+    }
+}
+
+/// The WARN line for a [`PassVerdict::Refused`] pass. A targeted pass reports what it
+/// refused on stderr without a marker, so its markerless failure is a pass that ran and
+/// failed, never one that "did not run". Pure for the test.
+fn refused_line(verb: PassVerb, unanswered: &str) -> String {
+    match verb.program() {
+        Some(_) => format!("{} pass failed: {unanswered}", pass_name(verb)),
+        None => format!("{} pass did not run: {unanswered}", pass_name(verb)),
+    }
 }
 
 /// The `outcome=` clause of the loop's one "atpkg {verb} pass finished" INFO line:
@@ -25808,6 +27021,1235 @@ fn pass_outcome_clause(
         .unwrap_or_else(|| "(no status.toml)".to_string())
 }
 
+/// Whether an update pass that exited 0 ran on the §14 index CACHE: it stamped a
+/// success (`last_success_at` moved) but never REACHED the signed listing
+/// (`last_index_reached_at` did not move) — a rate limit, an outage, a refusing
+/// proxy. atpkg records such a pass as a success on purpose (it did resolve an
+/// index), so the loop must not read exit 0 as "checked": parking the interval on
+/// it froze a managed `claude`/`codex` at the cached pin for six hours whenever the
+/// anonymous GitHub budget of the machine's IP was spent (measured 2026-09-22, the
+/// first 0.91.0 launch on the cutting machine: `index from cache — GitHub rate
+/// limit hit (HTTP 403)`). Such a pass retries on the failure ladder instead —
+/// minutes, doubling — until a pass reaches the listing. Pure for the test.
+fn update_pass_served_from_cache(
+    before: Option<&atpkg::status::Status>,
+    after: Option<&atpkg::status::Status>,
+) -> bool {
+    let Some(after) = after else {
+        return false;
+    };
+    let (success_before, reached_before) = before.map_or(("", ""), |b| {
+        (b.last_success_at.as_str(), b.last_index_reached_at.as_str())
+    });
+    after.last_success_at != success_before && after.last_index_reached_at == reached_before
+}
+
+/// Whether an update pass REACHED the signed index: it was not served from the §14 cache
+/// ([`update_pass_served_from_cache`]), and it did not write a `*toolset*` row saying the
+/// index could not be reached — the one exit-2 verdict a retry can change
+/// ([`atpkg::state::TOOLSET_INDEX_UNREACHABLE`]). What [`pass_ending`] reads beside the
+/// exit code.
+///
+/// THE ROW IS THIS PASS'S ONLY WHEN THIS PASS WROTE THE RECORD (`after` differs from
+/// `before`, the rule [`pass_outcome_clause`] attributes an outcome by): the row stands
+/// until a pass rewrites or clears it, so one an EARLIER pass left is read through every
+/// pass that writes nothing — a translated process's refusal (exit 2), a holder's pass this
+/// one stood down behind — and such a pass is judged by its exit alone. Until 2026-09-23
+/// the row was read off `after` alone, which put a declined store's exit 0 on the failure
+/// ladder for good and turned the Rosetta exit 2 back into a dozen retries a day (found in
+/// review of p3/reconciled). And never when the pass recorded that it ended `ok`: every
+/// full pass records its end now (2026-09-24), a declined store's `update` with nothing to
+/// check included, so the record moves under it — and a pass that ended ok never found the
+/// index unreachable. No positive stamp can replace the rest: atpkg's empty-store verdicts —
+/// the translated-process refusal, the unserved triple — exit 2 without stamping
+/// `last_index_reached_at`. Pure for the test.
+fn update_pass_reached_index(
+    before: Option<&atpkg::status::Status>,
+    after: Option<&atpkg::status::Status>,
+) -> bool {
+    let unreached_toolset = after != before
+        && after.is_some_and(|status| {
+            status.last_pass != aterm_update_core::pkg_check::PassOutcome::Ok.word()
+                && status
+                    .programs
+                    .get("*toolset*")
+                    .is_some_and(|row| row.state == atpkg::state::TOOLSET_INDEX_UNREACHABLE)
+        });
+    !update_pass_served_from_cache(before, after) && !unreached_toolset
+}
+
+/// How a pass that RAN ended, for the failure ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassEnding {
+    /// Exit 0 with the index reached — and, for a pass a published index woke, that index
+    /// landed. The ladder starts over.
+    Ok,
+    /// An `update` that exited 2 with the index reached: nothing lands on this machine
+    /// until something new is published (an unserved architecture, a translated process,
+    /// every build refused) — "not a failure to retry" in atpkg's own words. No retry
+    /// changes that, so none is made: the next pass is a newly published index's or the
+    /// fallback walk. Until 2026-09-23 it retried on the failure ladder like any failure,
+    /// about a dozen metered passes a day, forever, on an unserved Mac (found in review of
+    /// Phase 3's parallel loop, p3/sched 2026-09-22).
+    Settled,
+    /// Anything else that ran — a failure, an exit 0 served from the cache, a published
+    /// index the pass did not land, a signal: retried on the failure ladder.
+    Failed,
+}
+
+/// [`PassEnding`] of a pass that ran: `verb`, its exit `code`, whether it `reached` the
+/// signed index ([`update_pass_reached_index`]; a seed's is always its own), and whether
+/// the index it ran for `landed` (always, for a pass no published index woke). Pure.
+fn pass_ending(verb: PassVerb, code: Option<i32>, reached: bool, landed: bool) -> PassEnding {
+    match code {
+        Some(0) if reached && landed => PassEnding::Ok,
+        Some(2) if verb == PassVerb::Update && reached => PassEnding::Settled,
+        _ => PassEnding::Failed,
+    }
+}
+
+/// What a pass that RAN, run for `why` and ended `ending` at `at`, leaves for the schedule;
+/// answers whether the lane is now failing (its next park is the failure ladder's, whatever
+/// the verb). Only a full `update` is a check: it records this lane's own success or failure
+/// ([`OwnPasses`], which the walk and the retry's re-check fold in) and — WHATEVER ITS
+/// ENDING, a settled pass's too — the published index it ran for and did not `landed`
+/// ([`BumpWatch::unlanded`]). A seed moves the ladder alone: it stamps no success and checks
+/// nothing, and read as a success it pushed the machine's walk six hours past the seed. Both
+/// found in review of p3/reconciled (2026-09-23); the unlanded index was noted only on a
+/// failure, so a Published pass that SETTLED on an index it could not land (a release
+/// abandoned half uploaded on an unserved Mac) woke a full pass at every five-minute
+/// published cooldown, as p3/sched's own `ended` did not. Pure for the test.
+fn note_pass_ending(
+    verb: PassVerb,
+    why: PassWhy,
+    ending: PassEnding,
+    landed: bool,
+    at: i64,
+    own: &mut OwnPasses,
+    unlanded: &mut Option<u64>,
+) -> bool {
+    let failed = ending == PassEnding::Failed;
+    if verb == PassVerb::Update {
+        if let PassWhy::Published(build) = why
+            && !landed
+        {
+            *unlanded = Some(unlanded.map_or(build, |previous| previous.max(build)));
+        }
+        if failed {
+            own.failed_at = Some(at);
+        } else {
+            own.failed_at = None;
+            own.ok_at = Some(at);
+        }
+    }
+    failed
+}
+
+/// Why the loop's next full `update` pass runs — what the re-check before it
+/// ([`scheduled_pass_gate`]) reads the machine-wide stamps against, and what its log
+/// line says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassWhy {
+    /// Owed whatever the record says: the first launch of a new app build
+    /// ([`JUST_UPDATED`]).
+    Launch,
+    /// The launch's own rule found the record due ([`launch_update_park`]): never checked,
+    /// its last pass failed, or its last success older than the walk's interval.
+    LaunchDue,
+    /// A healthy park ran its course: the fallback walk, owed on the machine-wide rule
+    /// ([`aterm_update_core::pkg_check::full_pass_owed`]).
+    Walk,
+    /// This lane's last pass failed and its failure-ladder park ran out.
+    Retry,
+    /// The next-index probe saw this index published ([`atpkg::index_probe`]).
+    Published(u64),
+    /// A pending stub asked for a pass (`<prefix>/bump`).
+    Bumped,
+}
+
+impl PassWhy {
+    /// The reason, as the loop's log line says it.
+    fn words(self) -> String {
+        match self {
+            Self::Launch => "the first launch of this app build".into(),
+            Self::LaunchDue => "the store's record owes this launch a pass".into(),
+            Self::Walk => "the six-hour walk".into(),
+            Self::Retry => "retrying the pass that failed".into(),
+            Self::Published(n) => format!("index {n} is published"),
+            Self::Bumped => "a pending program asked for it".into(),
+        }
+    }
+
+    /// What a park that ran its course asks for next: the same pass after a contention
+    /// park (it is still owed), the retry after a failure park, the walk after a healthy one.
+    fn after_park(self, busy: bool, failing: bool) -> Self {
+        if busy {
+            self
+        } else if failing {
+            Self::Retry
+        } else {
+            Self::Walk
+        }
+    }
+}
+
+/// This lane's own full passes, read beside the record's stamps: `ok_at` its last that
+/// succeeded or settled, `failed_at` its last that failed while no success followed it.
+#[derive(Debug, Clone, Copy, Default)]
+struct OwnPasses {
+    ok_at: Option<i64>,
+    failed_at: Option<i64>,
+}
+
+/// Local status recheck while a newly published build waits for a live holder.
+/// The network probe retains its independent thirty-second cadence.
+const PUBLISHED_HOLDER_RECHECK: Duration = Duration::from_secs(5);
+
+/// THE RE-CHECK RIGHT BEFORE A SCHEDULED PASS (Phase 3, 2026-09-23), over the machine-wide
+/// stamps as they stand NOW ([`pass_stamps`]): `None` runs the pass; `Some((park, then))`
+/// parks and asks again for `then`. So several aterm processes never run the same pass
+/// back to back, failed or not:
+///
+/// * a stub's wish always runs — a person is waiting on the program;
+/// * every other pass waits out a rate-limit hold: the metered listing was refused until a
+///   reset it named ([`aterm_update_core::pkg_check::Stamps::metered_hold_in`]), and a pass
+///   before it would be refused again and run on the cache;
+/// * a launch owed whatever the record says always runs then;
+/// * nothing else starts while ANOTHER process's pass is installing (its progress file
+///   names a live writer) or within [`aterm_update_core::pkg_check::PASS_SPACING_SECS`] of
+///   its attempt, except a strictly newer published build after a sibling's recorded
+///   older target — an attempt no later than this lane's own last child (`ran_at`) is
+///   this lane's, never a sibling's; the next look sees what it left;
+/// * a published index the record's verified floor already covers (a sibling landed it)
+///   is not run again, a retry whose failure a sibling's success healed is done, and a
+///   launch's pass the record no longer owes (a sibling's pass succeeded while it parked:
+///   the record's last pass did not fail, so the launch's own rule, [`launch_pass_park`],
+///   is the walk's) is not run: all become the walk, at the rest of its interval;
+/// * the walk runs when the machine's last success is the interval old
+///   ([`aterm_update_core::pkg_check::full_pass_due_in`] over the success alone, with this
+///   lane's own last success folded in, so a `status.toml` that cannot be read does not owe
+///   a pass every park) — a sibling's walk counts as this one's.
+///
+/// Until 2026-09-23 the loop ran every pass its park ended on: two windows each walked
+/// every six hours, and a window whose probe saw a published index five minutes after a
+/// sibling's pass failed on it ran the same failing pass again (the dedup found missing in
+/// review of Phase 3's parallel loop, p3/sched 2026-09-22). Pure for the test.
+fn scheduled_pass_gate(
+    why: PassWhy,
+    stamps: &aterm_update_core::pkg_check::Stamps,
+    own: OwnPasses,
+    ran_at: Option<i64>,
+    now: i64,
+) -> Option<(Duration, PassWhy)> {
+    use aterm_update_core::pkg_check::{self, Stamps};
+    if why == PassWhy::Bumped {
+        return None;
+    }
+    let held = stamps.metered_hold_in(now);
+    if held > 0 {
+        return Some((Duration::from_secs(held), why));
+    }
+    if why == PassWhy::Launch {
+        return None;
+    }
+    let theirs = Stamps {
+        last_attempt: stamps
+            .last_attempt
+            .filter(|&attempt| ran_at.is_none_or(|ours| attempt > ours)),
+        ..*stamps
+    };
+    // A sibling that attempted 44 cannot hold a newly published 45
+    // for five minutes. The target is written atomically with that pass's end;
+    // without it, or behind an in-flight pass, keep the dedup wait.
+    let newer_than_sibling =
+        matches!(why, PassWhy::Published(build) if theirs.completed_older_index_pass(build, now));
+    if theirs.attempted_recently(now) && !newer_than_sibling {
+        if stamps.in_flight && matches!(why, PassWhy::Published(_)) {
+            return Some((PUBLISHED_HOLDER_RECHECK, why));
+        }
+        let spacing = i64::try_from(pkg_check::PASS_SPACING_SECS).unwrap_or(i64::MAX);
+        let left = if stamps.in_flight {
+            spacing
+        } else {
+            theirs
+                .last_attempt
+                .map_or(spacing, |then| {
+                    then.saturating_add(spacing).saturating_sub(now)
+                })
+                .clamp(1, spacing)
+        };
+        return Some((Duration::from_secs(left.unsigned_abs()), why));
+    }
+    // The walk counts from the machine's last success, this lane's own folded in. Not
+    // from an attempt: `updated_at` moves on every write — a vendor head-watch pass, a
+    // typed verb — so "attempted after the last success" is no proof a pass FAILED, and a
+    // sibling's failed pass is its own ladder's to retry. The spacing above is the dedup.
+    let walk = || {
+        let folded = Stamps {
+            last_success: stamps.last_success.max(own.ok_at),
+            last_attempt: None,
+            in_flight: false,
+            ..*stamps
+        };
+        let due = pkg_check::full_pass_due_in(&folded, now);
+        (due > 0).then(|| (Duration::from_secs(due), PassWhy::Walk))
+    };
+    match why {
+        PassWhy::Published(n) if stamps.last_index_build >= n => walk(),
+        // A launch parked behind a sibling was run unchecked once the spacing passed, a second
+        // full pass minutes after the sibling's had succeeded (found in review of
+        // p3/reconciled, 2026-09-23; p3/sched's `still_owed` re-applied its launch rule).
+        PassWhy::LaunchDue if !stamps.last_failed() => walk(),
+        PassWhy::Retry
+            if own
+                .failed_at
+                .is_some_and(|failed| stamps.last_success.is_some_and(|ok| ok > failed)) =>
+        {
+            walk()
+        }
+        PassWhy::Walk => walk(),
+        _ => None,
+    }
+}
+
+/// The machine-wide stamps a pass is scheduled on, NOW — every lane's reading
+/// ([`atpkg::status::pass_stamps`]: the outcome the last pass recorded, the index build it
+/// verified, a rate-limit hold, a pass installing; this lane's own children have exited
+/// whenever it reads them). No store resolves: no stamps.
+fn pass_stamps(store: Option<&atpkg::store::Layout>) -> aterm_update_core::pkg_check::Stamps {
+    store.map_or_else(aterm_update_core::pkg_check::Stamps::default, |store| {
+        atpkg::status::pass_stamps(store, unix_secs(std::time::SystemTime::now()))
+    })
+}
+
+#[cfg(test)]
+mod update_pass_served_from_cache_tests {
+    use super::*;
+
+    fn status(success: &str, reached: &str) -> atpkg::status::Status {
+        atpkg::status::Status {
+            last_success_at: success.to_string(),
+            last_index_reached_at: reached.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A record whose `*toolset*` row reads `state`.
+    fn with_toolset(state: &str) -> atpkg::status::Status {
+        let mut s = status("2026-09-22T20:00:00Z", "2026-09-22T20:00:00Z");
+        s.programs.insert(
+            "*toolset*".to_string(),
+            atpkg::status::ProgramStatus {
+                installed_build: None,
+                state: state.to_string(),
+                tree_root: String::new(),
+            },
+        );
+        s
+    }
+
+    /// A success stamped without the listing reached is the cache; the same pass
+    /// that also reached the listing is a real check (the negative control); a pass
+    /// that stamped no success, or wrote no record, is not this rule's to judge.
+    #[test]
+    fn a_success_that_never_reached_the_listing_is_the_cache() {
+        let before = status("2026-09-22T20:00:00Z", "2026-09-22T20:00:00Z");
+        assert!(update_pass_served_from_cache(
+            Some(&before),
+            Some(&status("2026-09-23T00:01:09Z", "2026-09-22T20:00:00Z"))
+        ));
+        assert!(!update_pass_served_from_cache(
+            Some(&before),
+            Some(&status("2026-09-23T00:01:09Z", "2026-09-23T00:01:09Z"))
+        ));
+        assert!(!update_pass_served_from_cache(Some(&before), Some(&before)));
+        assert!(!update_pass_served_from_cache(Some(&before), None));
+        assert!(update_pass_served_from_cache(
+            None,
+            Some(&status("2026-09-23T00:01:09Z", ""))
+        ));
+    }
+
+    /// An exit-2 pass settles only when it reached the index: its `*toolset*` row naming
+    /// an unserved architecture (or no row, a translated process) is a verdict no retry
+    /// changes; the row saying the index could not be reached is a failure to retry. A
+    /// pass served from the cache never reached it either.
+    #[test]
+    fn a_pass_reached_the_index_unless_its_row_or_the_cache_says_not() {
+        let before = status("2026-09-22T20:00:00Z", "2026-09-22T20:00:00Z");
+        let unserved = with_toolset(atpkg::state::TOOLSET_UNSERVED);
+        assert!(update_pass_reached_index(Some(&before), Some(&unserved)));
+        assert!(update_pass_reached_index(Some(&before), Some(&before)));
+        let unreached = with_toolset(atpkg::state::TOOLSET_INDEX_UNREACHABLE);
+        assert!(!update_pass_reached_index(Some(&before), Some(&unreached)));
+        assert!(!update_pass_reached_index(
+            Some(&before),
+            Some(&status("2026-09-23T00:01:09Z", "2026-09-22T20:00:00Z"))
+        ));
+    }
+
+    /// THE ROW IS THIS PASS'S ONLY WHEN THIS PASS WROTE THE RECORD: an index-unreachable
+    /// `*toolset*` row an EARLIER pass left stands through every pass that writes nothing — a
+    /// declined store's `update` (exit 0), a translated process's refusal (exit 2), a holder's
+    /// pass it stood down behind — and reading it as theirs put an exit 0 on the failure
+    /// ladder for good and turned a Rosetta exit 2 back into a dozen retries a day (found in
+    /// review of p3/reconciled, 2026-09-23). Such a pass is judged by its exit alone, and so
+    /// is one that moved the record only to say it ended ok (2026-09-24); the negative
+    /// controls, a pass that wrote the row again or recorded a failure, still retry.
+    #[test]
+    fn an_unreachable_row_an_earlier_pass_left_is_not_this_passs() {
+        let update = PassVerb::Update;
+        let stale = with_toolset(atpkg::state::TOOLSET_INDEX_UNREACHABLE);
+        let reached = update_pass_reached_index(Some(&stale), Some(&stale));
+        assert!(reached, "a pass that wrote nothing did not write the row");
+        assert_eq!(
+            pass_ending(update, Some(0), reached, true),
+            PassEnding::Ok,
+            "a declined store's update"
+        );
+        assert_eq!(
+            pass_ending(update, Some(2), reached, true),
+            PassEnding::Settled,
+            "a translated process's refusal"
+        );
+        let written_again = atpkg::status::Status {
+            updated_at: "2026-09-23T00:01:09Z".to_string(),
+            ..stale.clone()
+        };
+        assert!(!update_pass_reached_index(
+            Some(&stale),
+            Some(&written_again)
+        ));
+        // A declined store's `update` records that it ended ok (2026-09-24): the record moved,
+        // and the row is still not its.
+        let ended_ok = atpkg::status::Status {
+            updated_at: "2026-09-23T00:01:09Z".to_string(),
+            last_pass: "ok".to_string(),
+            last_pass_at: "2026-09-23T00:01:09Z".to_string(),
+            ..stale.clone()
+        };
+        let reached = update_pass_reached_index(Some(&stale), Some(&ended_ok));
+        assert!(reached, "a pass that ended ok did not write the row");
+        assert_eq!(pass_ending(update, Some(0), reached, true), PassEnding::Ok);
+        let ended_failed = atpkg::status::Status {
+            last_pass: "failed".to_string(),
+            ..ended_ok
+        };
+        assert!(
+            !update_pass_reached_index(Some(&stale), Some(&ended_failed)),
+            "the negative control: one that ended failed may have"
+        );
+        assert!(
+            update_pass_reached_index(None, None),
+            "no record either side: the exit decides"
+        );
+    }
+
+    /// WHAT A PASS THAT RAN LEAVES FOR THE SCHEDULE: a full `update` records this lane's own
+    /// success or failure (what the walk and the retry's re-check fold in) and, WHATEVER ITS
+    /// ENDING, the published index it ran for and did not land — a pass that SETTLED on it
+    /// included, which every positive probe cooldown otherwise woke again for as long
+    /// as the release stood. A seed is no full check: it moves the failure ladder and never
+    /// the walk's clock, which it pushed six hours past the seed (both found in review of
+    /// p3/reconciled, 2026-09-23). The negative control: an index the pass landed is noted
+    /// nowhere.
+    #[test]
+    fn a_full_pass_notes_its_ending_and_its_unlanded_index_and_a_seed_only_the_ladder() {
+        let at = 1_790_000_000;
+        let mut own = OwnPasses::default();
+        let mut unlanded = None;
+        let settled = note_pass_ending(
+            PassVerb::Update,
+            PassWhy::Published(44),
+            PassEnding::Settled,
+            false,
+            at,
+            &mut own,
+            &mut unlanded,
+        );
+        assert!(!settled);
+        assert_eq!(unlanded, Some(44), "the settled pass's index is noted");
+        assert_eq!((own.ok_at, own.failed_at), (Some(at), None));
+        let mut unlanded = None;
+        assert!(note_pass_ending(
+            PassVerb::Update,
+            PassWhy::Published(45),
+            PassEnding::Failed,
+            false,
+            at + 60,
+            &mut own,
+            &mut unlanded
+        ));
+        assert_eq!(unlanded, Some(45));
+        assert_eq!((own.ok_at, own.failed_at), (Some(at), Some(at + 60)));
+        let mut landed = None;
+        assert!(!note_pass_ending(
+            PassVerb::Update,
+            PassWhy::Published(46),
+            PassEnding::Ok,
+            true,
+            at + 120,
+            &mut OwnPasses::default(),
+            &mut landed
+        ));
+        assert_eq!(landed, None, "an index the pass landed");
+        let (seed_ok, seed_failed) = (
+            note_pass_ending(
+                PassVerb::Seed,
+                PassWhy::LaunchDue,
+                PassEnding::Ok,
+                true,
+                at + 180,
+                &mut own,
+                &mut unlanded,
+            ),
+            note_pass_ending(
+                PassVerb::Seed,
+                PassWhy::LaunchDue,
+                PassEnding::Failed,
+                true,
+                at + 240,
+                &mut own,
+                &mut unlanded,
+            ),
+        );
+        assert_eq!(
+            (seed_ok, seed_failed),
+            (false, true),
+            "a seed moves the ladder"
+        );
+        assert_eq!(
+            (own.ok_at, own.failed_at),
+            (Some(at), Some(at + 60)),
+            "and neither the walk's clock nor the retry's"
+        );
+    }
+
+    /// EXIT 2 SETTLES (Phase 3): an `update` that reached the index and exits 2 — nothing
+    /// installable here — is not put on the failure ladder, where an unserved Mac retried
+    /// it about a dozen times a day, forever; one that never reached the index is. Exit 0
+    /// is a success only when the index was reached and, for a pass a published index
+    /// woke, landed; a signal and exit 1 are failures; a seed never settles.
+    #[test]
+    fn exit_2_with_the_index_reached_settles_and_everything_else_is_the_ladders() {
+        let update = PassVerb::Update;
+        assert_eq!(pass_ending(update, Some(0), true, true), PassEnding::Ok);
+        assert_eq!(
+            pass_ending(update, Some(2), true, true),
+            PassEnding::Settled
+        );
+        assert_eq!(
+            pass_ending(update, Some(2), false, true),
+            PassEnding::Failed,
+            "the index was not reached: retried"
+        );
+        assert_eq!(
+            pass_ending(update, Some(0), false, true),
+            PassEnding::Failed,
+            "served from the cache"
+        );
+        assert_eq!(
+            pass_ending(update, Some(0), true, false),
+            PassEnding::Failed,
+            "a published index the pass did not land"
+        );
+        assert_eq!(pass_ending(update, Some(1), true, true), PassEnding::Failed);
+        assert_eq!(
+            pass_ending(
+                update,
+                Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT)),
+                true,
+                true
+            ),
+            PassEnding::Failed,
+            "offline retries quietly on the ladder"
+        );
+        assert_eq!(pass_ending(update, None, true, true), PassEnding::Failed);
+        assert_eq!(
+            pass_ending(PassVerb::Seed, Some(2), true, true),
+            PassEnding::Failed
+        );
+        assert_eq!(
+            pass_ending(PassVerb::Seed, Some(0), true, true),
+            PassEnding::Ok
+        );
+    }
+}
+
+#[cfg(test)]
+mod full_pass_rule_conformance {
+    use super::*;
+    use aterm_spec::derive::{Model, atpkg_full_pass_rule_model};
+    use aterm_update_core::pkg_check::{FULL_PASS_INTERVAL_SECS, PassOutcome, Stamps};
+
+    type State = std::collections::BTreeMap<&'static str, i64>;
+    /// A model tick as a wall-clock age: each side of the spacing and of the interval.
+    const AGE_SECS: [i64; 5] = [60, 15 * 60, 3 * 3600, 6 * 3600 + 60, 9 * 3600];
+    const HOLD_SECS: [i64; 3] = [0, 10 * 60, 30 * 60];
+    /// What a reader sees of a state: the record and the pass in flight.
+    const RECORD: [&str; 7] = [
+        "rec",
+        "pass_age",
+        "ever_ok",
+        "ok_age",
+        "write_age",
+        "hold",
+        "running",
+    ];
+
+    /// One reachable state per distinct record — the readers see nothing else.
+    fn records(model: &Model) -> Vec<State> {
+        let mut order = vec![model.init_state()];
+        let mut seen: std::collections::BTreeSet<State> = order.iter().cloned().collect();
+        let mut at = 0;
+        while at < order.len() {
+            for action in model.actions.iter().map(|a| a.name) {
+                let mut next = order[at].clone();
+                if model.fire(action, &mut next) && seen.insert(next.clone()) {
+                    order.push(next);
+                }
+            }
+            at += 1;
+        }
+        let mut read = std::collections::BTreeSet::new();
+        order
+            .into_iter()
+            .filter(|state| read.insert(RECORD.map(|field| state[field])))
+            .collect()
+    }
+
+    fn walk(model: &Model, actions: &[&str]) -> State {
+        let mut state = model.init_state();
+        for action in actions {
+            assert!(model.fire(action, &mut state), "{action}: {state:?}");
+        }
+        state
+    }
+
+    /// `state` after the look `action`, taken with no child queued (no reader sees one).
+    fn looks(model: &Model, action: &str, state: &State) -> State {
+        let mut next = state.clone();
+        next.insert("queued", 0);
+        next.insert("behind", 0);
+        assert!(model.fire(action, &mut next), "{action}: {state:?}");
+        next
+    }
+
+    fn stamp(unix: i64) -> String {
+        aterm_types::rfc3339::format_rfc3339(unix.unsigned_abs())
+    }
+
+    /// `state`'s record laid down at `now` in a scratch store by atpkg's own writers, as its
+    /// conformance lays it: the success, and — `records_pass_end` — each pass's recorded end
+    /// with the hold it met (else the writer of before `last_pass`, a failed pass a bare
+    /// write); a vendor row written after the last pass.
+    fn realize(
+        dir: &std::path::Path,
+        state: &State,
+        records_pass_end: bool,
+        now: i64,
+    ) -> atpkg::store::Layout {
+        use atpkg::status::{MeteredHold, stamp_pass_end, stamp_success};
+        let layout = atpkg::store::Layout {
+            prefix: dir.join("pkg"),
+        };
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        let at = |ticks: i64| now - AGE_SECS[usize::try_from(ticks).unwrap()];
+        let hold = |fallback: MeteredHold| match state["hold"] {
+            0 => fallback,
+            left => MeteredHold::Until(now + HOLD_SECS[usize::try_from(left).unwrap()]),
+        };
+        let (rec, pass_age) = (state["rec"], state["pass_age"]);
+        if state["ever_ok"] == 1 {
+            let success = stamp(at(state["ok_age"]) - i64::from(rec == 2));
+            stamp_success(&layout, &success).unwrap();
+            if records_pass_end {
+                let own = if rec == 1 {
+                    hold(MeteredHold::Lifted)
+                } else {
+                    MeteredHold::Lifted
+                };
+                stamp_pass_end(&layout, &success, PassOutcome::Ok, own).unwrap();
+            }
+        }
+        if rec == 2 {
+            if records_pass_end {
+                stamp_pass_end(
+                    &layout,
+                    &stamp(at(pass_age)),
+                    PassOutcome::Failed,
+                    hold(MeteredHold::Kept),
+                )
+                .unwrap();
+            } else {
+                let mut status = atpkg::status::seed_for_rewrite(&layout).unwrap();
+                status.updated_at = stamp(at(pass_age));
+                atpkg::status::write(&layout, &status).unwrap();
+            }
+        }
+        let last_write = if rec >= 1 {
+            pass_age
+        } else if state["ever_ok"] == 1 {
+            state["ok_age"]
+        } else {
+            4
+        };
+        if state["write_age"] < last_write {
+            let mut status = atpkg::status::seed_for_rewrite(&layout).unwrap();
+            status.programs.insert(
+                "claude".into(),
+                atpkg::status::ProgramStatus {
+                    installed_build: Some(1),
+                    state: "managed 2.1.280 \u{2014} Anthropic's latest".into(),
+                    tree_root: String::new(),
+                },
+            );
+            status.updated_at = stamp(at(state["write_age"]));
+            atpkg::status::write(&layout, &status).unwrap();
+        }
+        layout
+    }
+
+    /// THE READERS THIS REPLACED (ac5b4c144), kept as the negative control: the attempt is
+    /// `updated_at`, else the success; a failure is an attempt after the success, or any
+    /// attempt and none — as the [`Stamps`] the gate reads, with no hold (that gate had
+    /// none) — and the launch parked on the success unless that read a failure.
+    fn legacy_stamps(layout: &atpkg::store::Layout, now: i64) -> Stamps {
+        let status = atpkg::status::read(layout).unwrap_or_default();
+        let unix = |stamp: &str| aterm_update_core::pkg_check::rfc3339_to_unix(stamp.trim());
+        let success = unix(&status.last_success_at);
+        let attempt = unix(&status.updated_at).or(success);
+        let failed = match (attempt, success) {
+            (Some(attempt), Some(success)) => attempt > success,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        Stamps {
+            last_success: success,
+            last_attempt: attempt,
+            last_outcome: attempt.map(|_| {
+                if failed {
+                    PassOutcome::Failed
+                } else {
+                    PassOutcome::Ok
+                }
+            }),
+            in_flight: atpkg::progress::pass_running(layout, now.unsigned_abs()),
+            ..Stamps::default()
+        }
+    }
+
+    fn legacy_launch_park(stamps: &Stamps, now: i64) -> Option<Duration> {
+        let success = stamps.last_success?;
+        if stamps.last_failed() {
+            return None;
+        }
+        let age = u64::try_from(now.saturating_sub(success)).unwrap_or(0);
+        launch_pass_park_from(Some(age), FULL_PASS_INTERVAL_SECS)
+    }
+
+    /// TIER-1 OF THE DERIVED MODEL `AtpkgFullPassRule`, the window's half (atpkg's
+    /// `status` conformance binds the writer and the session lane, its `cli` one the queue):
+    /// over every record the model reaches at `Buggy=0`, laid down by atpkg's own writers,
+    /// the real gate before the walk ([`scheduled_pass_gate`] over [`pass_stamps`]) runs a
+    /// pass exactly when `WindowWalk` does, and a window's launch — [`launch_pass_park`],
+    /// then the gate — exactly when `WindowLaunch` does, reading the failure its `verdict`
+    /// reads. THE NEGATIVE CONTROL replays the defect on real text: the readers this replaced
+    /// ([`legacy_stamps`], the gate with no hold) over every record `Buggy=1` reaches, laid
+    /// down by the writer of that day, are `Buggy=1`'s window — and on the replayed defect (a
+    /// success, then a head-watch write) the old launch runs the pass the real one parks.
+    #[test]
+    fn the_windows_gate_and_launch_conform_to_the_full_pass_rule() {
+        let model = atpkg_full_pass_rule_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let none = OwnPasses::default();
+        let lanes = |stamps: &Stamps, park: Option<Duration>, now: i64| {
+            let walk = scheduled_pass_gate(PassWhy::Walk, stamps, none, None, now).is_none();
+            let launch = park.is_none()
+                && scheduled_pass_gate(PassWhy::LaunchDue, stamps, none, None, now).is_none();
+            (walk, launch)
+        };
+        let fixed = records(&model);
+        assert!(fixed.len() > 20, "{}", fixed.len());
+        for state in &fixed {
+            // Each state at its own now: a progress heartbeat is fresh for seconds only.
+            let now = unix_secs(std::time::SystemTime::now());
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let layout = realize(dir.path(), state, true, now);
+            let _sink = (state["running"] >= 1).then(|| {
+                atpkg::progress::ProgressSink::create(&layout.progress_file(), "update").unwrap()
+            });
+            let stamps = pass_stamps(Some(&layout));
+            let park = launch_pass_park(Some(&layout), FULL_PASS_INTERVAL_SECS, now.unsigned_abs());
+            let launch_look = looks(&model, "WindowLaunch", state);
+            assert_eq!(
+                stamps.last_failed(),
+                launch_look["verdict"] == 1,
+                "{state:?}"
+            );
+            assert_eq!(
+                lanes(&stamps, park, now),
+                (
+                    looks(&model, "WindowWalk", state)["queued"] > 0,
+                    launch_look["queued"] > 0
+                ),
+                "{state:?} {stamps:?}"
+            );
+        }
+        let old = records(&buggy);
+        assert!(old.len() > 5, "{}", old.len());
+        for state in &old {
+            let now = unix_secs(std::time::SystemTime::now());
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let layout = realize(dir.path(), state, false, now);
+            let _sink = (state["running"] >= 1).then(|| {
+                atpkg::progress::ProgressSink::create(&layout.progress_file(), "update").unwrap()
+            });
+            let stamps = legacy_stamps(&layout, now);
+            assert_eq!(
+                lanes(&stamps, legacy_launch_park(&stamps, now), now),
+                (
+                    looks(&buggy, "WindowWalk", state)["queued"] > 0,
+                    looks(&buggy, "WindowLaunch", state)["queued"] > 0
+                ),
+                "{state:?} {stamps:?}"
+            );
+        }
+        // The replayed defect: a success three hours old, the head watch's row since.
+        let defect = walk(
+            &model,
+            &[
+                "WindowLaunch",
+                "TakeLockFresh",
+                "PassSucceeds",
+                "Tick",
+                "OtherWrite",
+                "Tick",
+            ],
+        );
+        let now = unix_secs(std::time::SystemTime::now());
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let layout = realize(dir.path(), &defect, true, now);
+        let parks = launch_pass_park(Some(&layout), FULL_PASS_INTERVAL_SECS, now.unsigned_abs());
+        assert!(
+            parks.is_some(),
+            "the real launch parks on the young success"
+        );
+        assert_eq!(looks(&model, "WindowLaunch", &defect)["queued"], 0);
+        let legacy = legacy_stamps(&layout, now);
+        assert!(
+            lanes(&legacy, legacy_launch_park(&legacy, now), now).1,
+            "the old launch read the write as a failed pass and ran one"
+        );
+        assert_eq!(looks(&buggy, "WindowLaunch", &defect)["queued"], 1);
+    }
+}
+
+#[cfg(test)]
+mod scheduled_pass_gate_tests {
+    use super::*;
+    use aterm_update_core::pkg_check::{
+        FULL_PASS_INTERVAL_SECS, PASS_SPACING_SECS, PassOutcome, Stamps,
+    };
+
+    const NOW: i64 = 1_790_000_000;
+    const HOUR: i64 = 3600;
+    const WALK: i64 = FULL_PASS_INTERVAL_SECS as i64;
+
+    /// A record whose last full pass ended at `attempt`: the success itself (it was `ok`),
+    /// or a pass that recorded a failure.
+    fn record(success: Option<i64>, attempt: Option<i64>, build: u64) -> Stamps {
+        Stamps {
+            last_success: success,
+            last_attempt: attempt,
+            last_outcome: attempt.map(|attempt| {
+                if success == Some(attempt) {
+                    PassOutcome::Ok
+                } else {
+                    PassOutcome::Failed
+                }
+            }),
+            last_index_build: build,
+            last_pass_target: None,
+            metered_hold_until: None,
+            in_flight: false,
+        }
+    }
+
+    /// A record checked `ago` seconds before NOW, index `build` verified.
+    fn checked(ago: i64, build: u64) -> Stamps {
+        record(Some(NOW - ago), Some(NOW - ago), build)
+    }
+
+    fn gate(
+        why: PassWhy,
+        stamps: &Stamps,
+        own: OwnPasses,
+        ran_at: Option<i64>,
+    ) -> Option<(Duration, PassWhy)> {
+        scheduled_pass_gate(why, stamps, own, ran_at, NOW)
+    }
+
+    /// A STUB'S WISH ALWAYS RUNS, AND A LAUNCH OWED WHATEVER THE RECORD SAYS RUNS OUTSIDE A
+    /// HOLD — even over a sibling's pass installing now (they queue behind it at the store
+    /// lock, as before). Inside a rate-limit hold only the wish runs: a person is waiting on
+    /// its program, and the launch's metered listing would be refused again (2026-09-23).
+    #[test]
+    fn a_stubs_wish_always_runs_and_a_forced_launch_outside_a_hold() {
+        let installing = Stamps {
+            in_flight: true,
+            ..checked(10, 42)
+        };
+        for why in [PassWhy::Launch, PassWhy::Bumped] {
+            assert_eq!(
+                gate(why, &installing, OwnPasses::default(), None),
+                None,
+                "{why:?}"
+            );
+        }
+        let held = Stamps {
+            metered_hold_until: Some(NOW + 600),
+            ..checked(10, 42)
+        };
+        assert_eq!(
+            gate(PassWhy::Bumped, &held, OwnPasses::default(), None),
+            None
+        );
+        assert_eq!(
+            gate(PassWhy::Launch, &held, OwnPasses::default(), None),
+            Some((Duration::from_secs(600), PassWhy::Launch))
+        );
+    }
+
+    /// A RATE-LIMIT HOLD HOLDS EVERY SCHEDULED PASS until the reset GitHub named (§3.2 of
+    /// the 2026-09-22 design) — the walk, a retry, a published index's, the launch's own —
+    /// and parks for exactly the rest of it, asking again for the same pass; at the reset
+    /// the pass runs. A reset further out than an hour (a clock since set back) holds
+    /// nothing: the negative control.
+    #[test]
+    fn a_rate_limit_hold_holds_every_scheduled_pass_until_its_reset() {
+        let stale = checked(10 * HOUR, 42);
+        let held = |until: i64| Stamps {
+            metered_hold_until: Some(until),
+            ..stale
+        };
+        let own = OwnPasses {
+            ok_at: None,
+            failed_at: Some(NOW - 20 * 60),
+        };
+        for why in [
+            PassWhy::Walk,
+            PassWhy::Retry,
+            PassWhy::Published(43),
+            PassWhy::LaunchDue,
+        ] {
+            assert_eq!(
+                gate(why, &held(NOW + 1500), own, Some(NOW - 20 * 60)),
+                Some((Duration::from_secs(1500), why)),
+                "{why:?} inside the hold"
+            );
+            assert_eq!(
+                scheduled_pass_gate(why, &held(NOW + 1500), own, Some(NOW - 20 * 60), NOW + 1500),
+                None,
+                "{why:?} at the reset"
+            );
+            assert_eq!(
+                gate(why, &held(NOW + 2 * HOUR), own, Some(NOW - 20 * 60)),
+                None,
+                "{why:?}: a reset past the hour is not believed"
+            );
+        }
+    }
+
+    /// A SIBLING'S PASS installing now, or attempted within the spacing, holds every other
+    /// scheduled pass — a published index's, a retry, the walk, the launch's own — until the
+    /// next look sees what it left. A published build rechecks a live holder in five seconds;
+    /// the other reasons retain the spacing park. An attempt no later than this lane's own
+    /// last child was this lane's, never a sibling's (the negative control).
+    #[test]
+    fn a_siblings_pass_in_flight_or_a_moment_old_holds_every_scheduled_pass() {
+        let installing = Stamps {
+            in_flight: true,
+            ..checked(3 * HOUR, 42)
+        };
+        let sibling_attempt = record(Some(NOW - 7 * HOUR), Some(NOW - 60), 42);
+        for why in [
+            PassWhy::Published(43),
+            PassWhy::Retry,
+            PassWhy::Walk,
+            PassWhy::LaunchDue,
+        ] {
+            let in_flight_park = if matches!(why, PassWhy::Published(_)) {
+                PUBLISHED_HOLDER_RECHECK
+            } else {
+                Duration::from_secs(PASS_SPACING_SECS)
+            };
+            assert_eq!(
+                gate(why, &installing, OwnPasses::default(), None),
+                Some((in_flight_park, why)),
+                "{why:?} behind a pass installing"
+            );
+            assert_eq!(
+                gate(why, &sibling_attempt, OwnPasses::default(), None),
+                Some((Duration::from_secs(PASS_SPACING_SECS - 60), why)),
+                "{why:?} a minute after a sibling's attempt"
+            );
+        }
+        // Our own attempt a minute ago is no sibling's: the walk is owed on the record.
+        assert_eq!(
+            gate(
+                PassWhy::LaunchDue,
+                &sibling_attempt,
+                OwnPasses::default(),
+                Some(NOW - 30)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn published_45_runs_after_sibling_checked_44_but_same_or_failed_attempts_still_space() {
+        let model = aterm_spec::derive::atpkg_published_spacing_model();
+        let mut modeled = model.init_state();
+        for action in ["EndOldOk", "Publish45", "DecideGui"] {
+            assert!(model.fire(action, &mut modeled), "{action}: {modeled:?}");
+        }
+        let older_success = Stamps {
+            last_pass_target: Some((NOW - 60, 44)),
+            ..record(Some(NOW - 60), Some(NOW - 60), 44)
+        };
+        let actual = gate(
+            PassWhy::Published(45),
+            &older_success,
+            OwnPasses::default(),
+            None,
+        );
+        assert_eq!(actual.is_none(), modeled["gui"] == 1);
+        assert_eq!(actual, None, "a newly published build runs now");
+        assert_eq!(
+            gate(
+                PassWhy::Published(44),
+                &older_success,
+                OwnPasses::default(),
+                None
+            ),
+            Some((
+                Duration::from_secs(PASS_SPACING_SECS - 60),
+                PassWhy::Published(44)
+            )),
+            "the same build remains deduplicated"
+        );
+        let failed = Stamps {
+            last_pass_target: Some((NOW - 60, 44)),
+            ..record(Some(NOW - 7 * HOUR), Some(NOW - 60), 44)
+        };
+        assert_eq!(
+            gate(PassWhy::Published(45), &failed, OwnPasses::default(), None),
+            None,
+            "a newer 45 can run after the holder failed on 44"
+        );
+        let failed_same_target = Stamps {
+            last_pass_target: Some((NOW - 60, 45)),
+            ..failed
+        };
+        assert_eq!(
+            gate(
+                PassWhy::Published(45),
+                &failed_same_target,
+                OwnPasses::default(),
+                None
+            ),
+            Some((
+                Duration::from_secs(PASS_SPACING_SECS - 60),
+                PassWhy::Published(45)
+            )),
+            "the holder already failed on 45, so the sibling must wait"
+        );
+        let unknown = record(Some(NOW - 60), Some(NOW - 60), 44);
+        assert_eq!(
+            gate(PassWhy::Published(45), &unknown, OwnPasses::default(), None),
+            Some((
+                Duration::from_secs(PASS_SPACING_SECS - 60),
+                PassWhy::Published(45)
+            )),
+            "older records fail closed"
+        );
+        let installing = Stamps {
+            in_flight: true,
+            ..older_success
+        };
+        assert_eq!(
+            gate(
+                PassWhy::Published(45),
+                &installing,
+                OwnPasses::default(),
+                None
+            ),
+            Some((PUBLISHED_HOLDER_RECHECK, PassWhy::Published(45))),
+            "a live holder owns the store, but its completion is rechecked promptly"
+        );
+        assert_eq!(
+            gate(
+                PassWhy::Published(45),
+                &older_success,
+                OwnPasses::default(),
+                None
+            ),
+            None,
+            "after the older holder ends, the same published wake runs"
+        );
+    }
+
+    /// A PUBLISHED INDEX A SIBLING ALREADY LANDED is not run again: the verified floor
+    /// covers it, and the lane goes back to the walk at the rest of its interval. The
+    /// negative control: an index above the floor runs.
+    #[test]
+    fn a_published_index_a_sibling_landed_is_the_walk_not_a_pass() {
+        let landed = checked(20 * 60, 43);
+        assert_eq!(
+            gate(PassWhy::Published(43), &landed, OwnPasses::default(), None),
+            Some((Duration::from_secs((WALK - 20 * 60) as u64), PassWhy::Walk))
+        );
+        assert_eq!(
+            gate(PassWhy::Published(44), &landed, OwnPasses::default(), None),
+            None
+        );
+    }
+
+    /// A LAUNCH'S PASS PARKED BEHIND A SIBLING is re-checked against the record like every
+    /// other scheduled pass: the sibling's pass succeeded meanwhile, so the launch owes
+    /// nothing and the lane goes back to the walk at the rest of its interval. At a login
+    /// where a terminal session's pass and the window started together, the window ran a
+    /// second full signed pass five minutes after the session's had succeeded (found in
+    /// review of p3/reconciled, 2026-09-23). The negative controls: the sibling's pass failed
+    /// (the record's last attempt is after its last success), the record is still stale, or
+    /// it was never checked — the launch's pass runs.
+    #[test]
+    fn a_launch_pass_a_sibling_covered_while_it_parked_is_the_walk() {
+        let none = OwnPasses::default();
+        let stale = checked(10 * HOUR, 42);
+        let installing = Stamps {
+            in_flight: true,
+            ..stale
+        };
+        assert_eq!(
+            gate(PassWhy::LaunchDue, &installing, none, None),
+            Some((Duration::from_secs(PASS_SPACING_SECS), PassWhy::LaunchDue))
+        );
+        let spacing = PASS_SPACING_SECS as i64;
+        let covered = checked(spacing + 30, 42);
+        assert_eq!(
+            gate(PassWhy::LaunchDue, &covered, none, None),
+            Some((
+                Duration::from_secs((WALK - spacing - 30) as u64),
+                PassWhy::Walk
+            ))
+        );
+        let failed = record(Some(NOW - 10 * HOUR), Some(NOW - spacing - 30), 42);
+        assert_eq!(gate(PassWhy::LaunchDue, &failed, none, None), None);
+        assert_eq!(gate(PassWhy::LaunchDue, &stale, none, None), None);
+        assert_eq!(
+            gate(PassWhy::LaunchDue, &Stamps::default(), none, None),
+            None,
+            "never checked"
+        );
+    }
+
+    /// A RETRY A SIBLING'S SUCCESS HEALED is done: this lane's pass failed, another's
+    /// succeeded after it — the walk takes over at the rest of its interval. The negative
+    /// control: no success since the failure, the retry runs.
+    #[test]
+    fn a_retry_a_siblings_success_healed_is_done() {
+        let own = OwnPasses {
+            ok_at: None,
+            failed_at: Some(NOW - HOUR),
+        };
+        let healed = checked(20 * 60, 42);
+        assert_eq!(
+            gate(PassWhy::Retry, &healed, own, Some(NOW - HOUR)),
+            Some((Duration::from_secs((WALK - 20 * 60) as u64), PassWhy::Walk))
+        );
+        let still_failing = record(Some(NOW - 9 * HOUR), Some(NOW - HOUR), 42);
+        assert_eq!(
+            gate(PassWhy::Retry, &still_failing, own, Some(NOW - HOUR)),
+            None
+        );
+    }
+
+    /// THE WALK IS MACHINE-WIDE: a sibling's success three hours ago is this window's walk
+    /// too (it waits the other three), this lane's own success counts where the record
+    /// cannot be read, and a walk six hours on runs. A later write (a vendor head-watch
+    /// pass, a typed verb — or a sibling's pass that failed, its own ladder's to retry)
+    /// moves `updated_at` and proves no failure: it never pushes the walk back.
+    #[test]
+    fn the_walk_is_owed_on_the_machine_wide_rule() {
+        let none = OwnPasses::default();
+        assert_eq!(
+            gate(PassWhy::Walk, &checked(3 * HOUR, 42), none, None),
+            Some((Duration::from_secs((3 * HOUR) as u64), PassWhy::Walk))
+        );
+        assert_eq!(gate(PassWhy::Walk, &checked(WALK, 42), none, None), None);
+        let unreadable = Stamps::default();
+        assert_eq!(
+            gate(PassWhy::Walk, &unreadable, none, None),
+            None,
+            "never checked"
+        );
+        let ours = OwnPasses {
+            ok_at: Some(NOW - HOUR),
+            failed_at: None,
+        };
+        assert_eq!(
+            gate(PassWhy::Walk, &unreadable, ours, Some(NOW - HOUR)),
+            Some((Duration::from_secs((WALK - HOUR) as u64), PassWhy::Walk)),
+            "this lane's own success, where the record says nothing"
+        );
+        let later_write = record(Some(NOW - 9 * HOUR), Some(NOW - HOUR), 42);
+        assert_eq!(gate(PassWhy::Walk, &later_write, none, None), None);
+        let ours_then_a_vendor_pass = record(Some(NOW - 4 * HOUR), Some(NOW - HOUR), 42);
+        assert_eq!(
+            gate(
+                PassWhy::Walk,
+                &ours_then_a_vendor_pass,
+                OwnPasses {
+                    ok_at: Some(NOW - 4 * HOUR),
+                    failed_at: None
+                },
+                Some(NOW - HOUR)
+            ),
+            Some((Duration::from_secs((WALK - 4 * HOUR) as u64), PassWhy::Walk)),
+            "the walk counts from the success, not from the head-watch pass after it"
+        );
+    }
+
+    /// What a park that ended asks for next: the same pass after contention, the retry
+    /// after a failure park, the walk after a healthy one — and a wish or a published
+    /// index whatever the park was.
+    #[test]
+    fn a_park_ending_names_the_next_pass() {
+        let published = PassWhy::Published(43);
+        assert_eq!(published.after_park(true, false), published);
+        assert_eq!(published.after_park(false, true), PassWhy::Retry);
+        assert_eq!(published.after_park(false, false), PassWhy::Walk);
+        assert_eq!(ParkEnd::Elapsed.pass_why(PassWhy::Retry), PassWhy::Retry);
+        assert_eq!(ParkEnd::Bumped.pass_why(PassWhy::Retry), PassWhy::Bumped);
+        assert_eq!(
+            ParkEnd::IndexPublished(44).pass_why(PassWhy::Walk),
+            PassWhy::Published(44)
+        );
+        assert_eq!(
+            ParkEnd::IndexPublished(44).pass_why(PassWhy::Published(45)),
+            PassWhy::Published(45),
+            "a stale probe must not downgrade the parked new build"
+        );
+        assert_eq!(
+            ParkEnd::IndexPublished(46).pass_why(PassWhy::Published(45)),
+            PassWhy::Published(46),
+            "a newer probe raises the parked build"
+        );
+    }
+}
+
 /// How an `atpkg` seed/update child ENDED, from its exit code and the two marker
 /// facts the stdout loop kept — classified in ONE place, purely: a store-lock
 /// contention refusal (atpkg's own sentence says "retry when it exits") is a
@@ -25825,6 +28267,11 @@ enum PassVerdict {
     /// atpkg's contention code (75): the child queued behind another atpkg pass at
     /// the store lock and its bound ran out. Deferred, never failed.
     Busy,
+    /// atpkg's offline code ([`aterm_update_core::pkg_check::PASS_OFFLINE_EXIT`]): the
+    /// pass ran, but no host answered — the index listing's link failed and no vendor
+    /// channel answered (a listing that REFUSED is a failure, exit 1). Not a failure and
+    /// not a success — a quiet pass to retry soon.
+    Offline,
     /// A markerless non-zero exit that is NOT contention: the CLI-edge `Io` refusal
     /// (an unwritable prefix), a spawn that died, a signal — or a verb that ran and
     /// exited 1 or 2 without a marker. A real failure; whether it wrote
@@ -25845,6 +28292,10 @@ fn classify_pass_exit(code: Option<i32>, saw_start: bool, saw_marker: bool) -> P
         PassVerdict::AnnouncedThenDied
     } else if code == Some(i32::from(atpkg::lock::CONTENDED_EXIT)) {
         PassVerdict::Busy
+    } else if code == Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT)) {
+        // Before the markers: an offline pass that answered its own announcement
+        // (`net-failed:`) is still offline, never a failure to show.
+        PassVerdict::Offline
     } else if saw_marker {
         PassVerdict::Answered
     } else if code == Some(0) {
@@ -25904,6 +28355,7 @@ fn holder_work_advanced(
 #[cfg(test)]
 mod pkg_progress_tests {
     use super::*;
+    use aterm_spec::derive::atpkg_index_wake_highwater_model;
     use atpkg::progress::{Overall, Phase, ProgramProgress, ProgressFile};
 
     fn file_with(pid: Option<u32>, heartbeat_unix: u64) -> ProgressFile {
@@ -26135,6 +28587,343 @@ mod pkg_progress_tests {
         );
     }
 
+    /// A published-index hint actually interrupts a parked successful lane; a
+    /// missing hint leaves its full-scan deadline in force, and a contention park
+    /// leaves the probe to the holder. The transport is injected, so no network or
+    /// five-second timer is needed to exercise the loop's decision.
+    #[test]
+    fn published_index_wakes_the_package_park_without_cutting_failure_backoff() {
+        let layout = atpkg::store::Layout {
+            prefix: std::env::temp_dir().join("aterm-pkg-park-probe-absent"),
+        };
+        let now = Instant::now();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(now),
+            ..BumpWatch::default()
+        };
+        let mut calls = 0;
+        assert_eq!(
+            published_index_wakes(&layout, &mut watch, true, now, |_| {
+                calls += 1;
+                atpkg::index_probe::Probe::Published(44)
+            }),
+            None
+        );
+        assert_eq!(calls, 0, "the probe waits for its own cadence");
+
+        let due = now + atpkg::index_probe::INTERVAL;
+        assert_eq!(
+            published_index_wakes(&layout, &mut watch, false, due, |_| panic!(
+                "a contended pass leaves the probe to its holder"
+            )),
+            None
+        );
+        assert_eq!(watch.last_index_probe, Some(now));
+
+        assert_eq!(
+            published_index_wakes(&layout, &mut watch, true, due, |_| {
+                atpkg::index_probe::Probe::Missing
+            }),
+            None
+        );
+        assert_eq!(watch.last_index_probe, Some(due));
+
+        assert_eq!(
+            published_index_wakes(
+                &layout,
+                &mut watch,
+                true,
+                due + atpkg::index_probe::INTERVAL,
+                |_| {
+                    calls += 1;
+                    atpkg::index_probe::Probe::Published(44)
+                },
+            ),
+            Some(44)
+        );
+        assert_eq!(calls, 1);
+    }
+
+    /// AN INDEX THIS LANE'S PASS DID NOT LAND is no wake again (Phase 3, 2026-09-23): the
+    /// probe keeps answering `Published(44)` at every five-minute cooldown while the
+    /// verified floor stays below it, and every answer used to start a full pass. Now
+    /// only the failure ladder retries it; a different answer — the next index, or none —
+    /// forgets it, and the same index seen after that is a wake again.
+    #[test]
+    fn an_index_the_pass_did_not_land_is_not_a_wake_at_every_cooldown() {
+        let layout = atpkg::store::Layout {
+            prefix: std::env::temp_dir().join("aterm-pkg-park-unlanded-absent"),
+        };
+        let minute = atpkg::index_probe::INTERVAL;
+        let t0 = Instant::now();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(t0),
+            unlanded: Some(44),
+            ..BumpWatch::default()
+        };
+        let published =
+            |build| move |_: &atpkg::store::Layout| atpkg::index_probe::Probe::Published(build);
+        for k in 1..=12 {
+            assert_eq!(
+                published_index_wakes(&layout, &mut watch, true, t0 + minute * k, published(44)),
+                None,
+                "minute {k}: the index the pass did not land"
+            );
+        }
+        assert_eq!(watch.unlanded, Some(44), "a deferred answer keeps it");
+        assert_eq!(
+            published_index_wakes(&layout, &mut watch, true, t0 + minute * 13, |_| {
+                atpkg::index_probe::Probe::Deferred
+            }),
+            None
+        );
+        assert_eq!(watch.unlanded, Some(44));
+        assert_eq!(
+            published_index_wakes(&layout, &mut watch, true, t0 + minute * 14, published(45)),
+            Some(45),
+            "the next index is a new question"
+        );
+        assert_eq!(watch.unlanded, None);
+        // A probe that stopped seeing it forgets it: seen again, it wakes.
+        let mut again = BumpWatch {
+            last_index_probe: Some(t0),
+            unlanded: Some(44),
+            ..BumpWatch::default()
+        };
+        assert_eq!(
+            published_index_wakes(&layout, &mut again, true, t0 + minute, |_| {
+                atpkg::index_probe::Probe::Missing
+            }),
+            None
+        );
+        assert_eq!(
+            published_index_wakes(&layout, &mut again, true, t0 + minute * 2, published(44)),
+            Some(44),
+            "the negative control: forgotten, it is a wake"
+        );
+    }
+
+    #[test]
+    fn failed_index_highwater_and_failure_park_refine_the_derived_model() {
+        let model = atpkg_index_wake_highwater_model();
+        let mut state = model.init_state();
+        assert!(model.fire("FailMiddle", &mut state));
+        let layout = atpkg::store::Layout {
+            prefix: std::env::temp_dir().join("aterm-pkg-highwater-absent"),
+        };
+        let minute = atpkg::index_probe::INTERVAL;
+        let t0 = Instant::now();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(t0),
+            unlanded: Some(49),
+            ..BumpWatch::default()
+        };
+        let lower = published_index_wakes(&layout, &mut watch, true, t0 + minute, |_| {
+            atpkg::index_probe::Probe::Published(45)
+        });
+        assert!(model.fire("HintLow", &mut state));
+        assert_eq!(lower, None, "a near 45 cannot replay after far 49 failed");
+        assert_eq!(
+            (watch.unlanded, state["unlanded"], state["wake"]),
+            (Some(49), 2, 0)
+        );
+
+        let deferred = published_index_wakes(&layout, &mut watch, true, t0 + minute * 2, |_| {
+            atpkg::index_probe::Probe::Deferred
+        });
+        assert!(model.fire("Deferred", &mut state));
+        assert_eq!(deferred, None);
+        assert_eq!((watch.unlanded, state["unlanded"]), (Some(49), 2));
+
+        // The loop passes `probe_index=true` during a failure-ladder park. A new
+        // published index must interrupt that park instead of waiting for its retry.
+        let wall = std::time::SystemTime::now();
+        let higher = package_park_tick_wakes(
+            &layout,
+            &mut watch,
+            true,
+            wall + Duration::from_secs(3600),
+            |_, _| false,
+            || (t0 + minute * 3, wall),
+            |_| atpkg::index_probe::Probe::Published(50),
+        );
+        assert!(model.fire("HintHigh", &mut state));
+        assert_eq!(higher, Some(ParkEnd::IndexPublished(50)));
+        assert_eq!(
+            (watch.unlanded, state["unlanded"], state["wake"]),
+            (None, 0, 3)
+        );
+
+        // A later failed older pass must not lower the mark left by a newer one.
+        let mut unlanded = Some(50);
+        assert!(model.fire("FailHigh", &mut state));
+        assert!(note_pass_ending(
+            PassVerb::Update,
+            PassWhy::Published(45),
+            PassEnding::Failed,
+            false,
+            1_790_000_000,
+            &mut OwnPasses::default(),
+            &mut unlanded,
+        ));
+        assert!(model.fire("FailLow", &mut state));
+        assert_eq!((unlanded, state["unlanded"]), (Some(50), 3));
+        assert!(model.check_invariant("FailureMarkNeverDowngrades", &state));
+    }
+
+    /// A due local wish wins without starting a HEAD, and a timer that elapsed
+    /// during the local read starts the ordinary full pass without a HEAD. The park's
+    /// deadline is the WALL clock's.
+    #[test]
+    fn package_park_checks_bump_and_deadline_before_remote_probe() {
+        let layout = atpkg::store::Layout {
+            prefix: std::env::temp_dir().join("aterm-pkg-park-priority-absent"),
+        };
+        let last_probe = Instant::now();
+        let now = last_probe + atpkg::index_probe::INTERVAL;
+        let wall = std::time::SystemTime::now();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(last_probe),
+            ..BumpWatch::default()
+        };
+        assert_eq!(
+            package_park_tick_wakes(
+                &layout,
+                &mut watch,
+                true,
+                wall + Duration::from_secs(1),
+                |_, _| true,
+                || panic!("a local bump must win before consulting the clock"),
+                |_| panic!("a local bump must win before network I/O"),
+            ),
+            Some(ParkEnd::Bumped)
+        );
+        assert_eq!(watch.last_index_probe, Some(last_probe));
+
+        assert_eq!(
+            package_park_tick_wakes(
+                &layout,
+                &mut watch,
+                true,
+                wall,
+                |_, _| false,
+                || (now, wall),
+                |_| panic!("an elapsed park deadline must win before network I/O"),
+            ),
+            None
+        );
+        assert_eq!(watch.last_index_probe, Some(last_probe));
+
+        assert_eq!(
+            package_park_tick_wakes(
+                &layout,
+                &mut watch,
+                true,
+                wall + Duration::from_secs(1),
+                |_, _| false,
+                || (now, wall),
+                |_| atpkg::index_probe::Probe::Published(44),
+            ),
+            Some(ParkEnd::IndexPublished(44))
+        );
+        assert_eq!(watch.last_index_probe, Some(now));
+
+        let next = now + atpkg::index_probe::INTERVAL;
+        let bump_reads = std::cell::Cell::new(0);
+        assert_eq!(
+            package_park_tick_wakes(
+                &layout,
+                &mut watch,
+                true,
+                wall + Duration::from_secs(1),
+                |_, _| {
+                    bump_reads.set(bump_reads.get() + 1);
+                    bump_reads.get() == 2
+                },
+                || (next, wall),
+                |_| atpkg::index_probe::Probe::Missing,
+            ),
+            Some(ParkEnd::Bumped)
+        );
+        assert_eq!(
+            bump_reads.get(),
+            2,
+            "a bump arriving during HEAD is read immediately"
+        );
+    }
+
+    /// THE WALL-CLOCK DEADLINE ACROSS A WAKE (Phase 3, 2026-09-23): an ordinary slice, a
+    /// small NTP step and a clock set back leave the deadline alone; a slice the machine
+    /// slept through, past the deadline, moves it to twenty seconds after the wake — the
+    /// network's time to come back — and a wake that did NOT cross it leaves it alone.
+    #[test]
+    fn a_wake_past_the_deadline_runs_the_pass_twenty_seconds_after_it() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let five = Duration::from_secs(5);
+        let until = t0 + Duration::from_secs(60);
+        assert_eq!(
+            park_deadline_after_slice(until, t0, Some(five), five),
+            until
+        );
+        assert_eq!(
+            park_deadline_after_slice(until, t0, Some(Duration::from_secs(20)), five),
+            until,
+            "a small step is no wake"
+        );
+        assert_eq!(
+            park_deadline_after_slice(until, t0, None, five),
+            until,
+            "set back"
+        );
+        let woke = t0 + Duration::from_secs(8 * 3600);
+        assert_eq!(
+            park_deadline_after_slice(until, woke, Some(Duration::from_secs(8 * 3600)), five),
+            woke + atpkg::vendor_direct::watch::AFTER_WAKE,
+            "slept through the deadline"
+        );
+        let later = woke + Duration::from_secs(3600);
+        assert_eq!(
+            park_deadline_after_slice(later, woke, Some(Duration::from_secs(8 * 3600)), five),
+            later,
+            "the negative control: a wake short of the deadline keeps it"
+        );
+    }
+
+    /// THE SET-BACK RULE HAS THE HEAD WATCH'S MARGIN: a deadline further out than the park's
+    /// own length by more than [`atpkg::vendor_direct::watch::WAKE_GAP`] is a clock set back
+    /// and ends the park; within it the deadline stands — the twenty seconds after a wake on
+    /// a park shorter than that, and a clock stepped back a few seconds early in a park.
+    /// With no margin both ended the park at once, so a short park that spanned a sleep ran
+    /// its pass into a network still coming up, and a small step back just after a failure
+    /// park began retried the failed pass back to back (found in review of p3/reconciled,
+    /// 2026-09-23).
+    #[test]
+    fn a_park_keeps_a_deadline_within_the_wake_gap_of_its_length() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let five = Duration::from_secs(5);
+        let ten_minutes = Duration::from_secs(600);
+        let three = Duration::from_secs(3);
+        assert_eq!(park_slice(t0 + ten_minutes, t0, ten_minutes), Some(five));
+        assert_eq!(park_slice(t0 + three, t0, three), Some(three));
+        assert_eq!(
+            park_slice(t0 + atpkg::vendor_direct::watch::AFTER_WAKE, t0, three),
+            Some(five),
+            "the twenty seconds after a wake, on a three-second park"
+        );
+        assert_eq!(
+            park_slice(t0 + ten_minutes + Duration::from_secs(2), t0, ten_minutes),
+            Some(five),
+            "a clock stepped back two seconds early in the park"
+        );
+        assert_eq!(
+            park_slice(t0 + Duration::from_secs(3600), t0, Duration::from_secs(300)),
+            None,
+            "an hour out on a five-minute park: the clock went back"
+        );
+        assert_eq!(park_slice(t0, t0, ten_minutes), None, "due");
+        assert_eq!(park_slice(t0 - five, t0, ten_minutes), None, "past");
+    }
+
     /// The park after a store-lock timeout: 30 s, doubling to the 10 min cap, reset
     /// by a pass that ran; three in a row with nothing moving and the holder
     /// counts as wedged — a wait during which the holder's work advanced is not a
@@ -26152,7 +28941,10 @@ mod pkg_progress_tests {
             FAILURE_BACKOFF_FIRST,
             "a clean pass starts it over"
         );
-        assert!(FAILURE_BACKOFF_CAP < Duration::from_secs(6 * 60 * 60));
+        assert!(
+            FAILURE_BACKOFF_CAP
+                < Duration::from_secs(aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS)
+        );
     }
 
     /// The loop's outcome line names what THIS pass recorded, never the last pass's
@@ -26209,11 +29001,11 @@ mod pkg_progress_tests {
 
     /// The park after a store-lock timeout: 30 s, then 60 s — the two parks the
     /// loop ever applies — reset by a pass that ran; the third in a row with
-    /// nothing moving is the wedge, whose park the loop takes from `wedge_park`
-    /// instead of this type (so the value `park` returns on the wedging call is
-    /// never consulted — the "doubling to 10 min" once pinned here was a sequence
-    /// the loop never reached). A wait during which the holder's work advanced is
-    /// not a cycle at all, and the wedged park is an hour, never the interval.
+    /// nothing moving is the wedge, whose park the loop takes from
+    /// `CONTENTION_WEDGE_PARK` instead of this type (so the value `park` returns on the
+    /// wedging call is never consulted — the "doubling to 10 min" once pinned here was a
+    /// sequence the loop never reached). A wait during which the holder's work advanced
+    /// is not a cycle at all, and the wedged park is an hour, never the walk's interval.
     #[test]
     fn contention_backoff_doubles_once_then_wedges_and_resets() {
         assert_eq!(
@@ -26255,27 +29047,16 @@ mod pkg_progress_tests {
         // The wedged park: above every backoff park, an hour, well under the interval.
         assert!(CONTENTION_WEDGE_PARK > Duration::from_secs(60));
         assert_eq!(CONTENTION_WEDGE_PARK, Duration::from_secs(3600));
-        assert!(CONTENTION_WEDGE_PARK < Duration::from_secs(6 * 3600));
+        assert!(
+            CONTENTION_WEDGE_PARK
+                < Duration::from_secs(aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS)
+        );
         assert_eq!(human_park(Duration::from_secs(30)), "30 s");
         assert_eq!(human_park(Duration::from_secs(120)), "2 min");
         assert_eq!(human_park(Duration::from_secs(600)), "10 min");
         assert_eq!(human_park(Duration::from_secs(1800)), "30 min");
         assert_eq!(human_park(Duration::from_secs(6 * 3600)), "6 h");
         assert_eq!(human_park(Duration::from_secs(90)), "90 s");
-    }
-
-    /// The wedged park is the hour, bounded by the interval — and a ONCE-PASS has
-    /// no park at all: the loop stands down for this launch after a wedge, so
-    /// neither the log nor the ⏸ row may promise a retry it will not make.
-    #[test]
-    fn a_once_pass_has_no_wedged_park_to_promise() {
-        assert_eq!(
-            wedge_park(0),
-            None,
-            "interval 0 is one pass: no retry to name"
-        );
-        assert_eq!(wedge_park(30), Some(Duration::from_secs(30)));
-        assert_eq!(wedge_park(6 * 3600), Some(CONTENTION_WEDGE_PARK));
     }
 
     /// A SIBLING's file whose writer died mid-pass (dead pid, no `ended_unix`) is
@@ -26512,6 +29293,24 @@ mod pass_verdict_tests {
         assert_eq!(classify_pass_exit(None, false, false), PassVerdict::Refused);
     }
 
+    /// OFFLINE IS ITS OWN ENDING (Phase 3): atpkg's offline code is neither a failure to
+    /// show nor contention — whatever marker answered, short of an unanswered card — and
+    /// the constant is the one atpkg exits with, read from the crate both share.
+    #[test]
+    fn the_offline_code_is_offline() {
+        let code = Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT));
+        assert_eq!(code, Some(69));
+        assert_eq!(classify_pass_exit(code, false, false), PassVerdict::Offline);
+        assert_eq!(classify_pass_exit(code, true, true), PassVerdict::Offline);
+        assert_eq!(
+            classify_pass_exit(code, true, false),
+            PassVerdict::AnnouncedThenDied,
+            "an opened card is still answered"
+        );
+        let offline = run(code, SeedMarkers::default(), "");
+        assert!(offline.ran() && !offline.ok() && !offline.clean());
+    }
+
     use super::{PassVerb, Wake, carry_wait_row, report_pass_verdict};
 
     fn run(code: Option<i32>, seen: SeedMarkers, said: &str) -> PassRun {
@@ -26537,12 +29336,16 @@ mod pass_verdict_tests {
             PassVerdict::Answered,
             PassVerdict::Refused,
             PassVerdict::AnnouncedThenDied,
+            PassVerdict::Offline,
         ] {
             let mut posted = Vec::new();
             let open = carry_wait_row(false, true, verdict, |e| posted.push(e));
             assert!(!open, "{verdict:?}: the row is retired");
             assert!(
-                matches!(posted.as_slice(), [Wake::PkgProgress { snapshot: None }]),
+                matches!(
+                    posted.as_slice(),
+                    [Wake::PkgProgress { snapshot: None, .. }]
+                ),
                 "{verdict:?}: exactly the clear is posted: {posted:?}"
             );
             // Carried from an earlier child, no wait line of its own: the same.
@@ -26565,34 +29368,52 @@ mod pass_verdict_tests {
     }
 
     /// The 2026-08-31 three-week incident: a seed's markerless refusal is said
-    /// ON SCREEN, first or retried, carrying the child's own stderr; the
-    /// six-hourly update's stays a log line; and a quiet healthy launch posts
-    /// nothing whatever the card flag (the round-10 guard). The card was the
-    /// other rule 561b0f987 carried without a witness.
+    /// as a failure, first or retried, carrying the child's own stderr — and so,
+    /// since 2026-09-22, is a WHOLE update's (it was a log line while a failure
+    /// meant a row; a six-hourly update killed mid-download, no marker and no
+    /// record row, was otherwise said nowhere). A targeted `update <program>`
+    /// stays a log line: its refusal is the row it records. A quiet healthy
+    /// launch posts nothing whatever the flag (the round-10 guard).
     #[test]
-    fn a_refused_seed_raises_its_card_and_a_refused_update_does_not() {
+    fn a_refused_whole_pass_is_a_failure_and_a_targeted_one_is_its_row() {
         let refused = run(
             Some(1),
             SeedMarkers::default(),
             "atpkg: prefix is not writable\n",
         );
         assert_eq!(refused.verdict(), PassVerdict::Refused);
-        for (verb, card) in [(PassVerb::Seed, true), (PassVerb::Update, false)] {
-            assert_eq!(verb.refusal_is_a_card(), card, "{verb}");
+        for (verb, failure) in [
+            (PassVerb::Seed, true),
+            (PassVerb::Update, true),
+            (PassVerb::UpdateProgram("codex"), false),
+        ] {
+            assert_eq!(verb.refusal_is_a_failure(), failure, "{verb}");
             let mut posted = Vec::new();
             report_pass_verdict(verb, &refused, None, |e| posted.push(e));
-            if card {
+            if failure {
                 assert!(
                     matches!(
                         posted.as_slice(),
                         [Wake::PkgSeedFailed { detail }] if detail == "atpkg: prefix is not writable"
                     ),
-                    "{verb}: the refusal is a card carrying the trimmed stderr: {posted:?}"
+                    "{verb}: the refusal is a failure carrying the trimmed stderr: {posted:?}"
                 );
             } else {
                 assert!(posted.is_empty(), "{verb}: a log line only: {posted:?}");
             }
         }
+        // Killed mid-download (a signal: no code), no marker: a failure too.
+        let killed = run(None, SeedMarkers::default(), "");
+        assert_eq!(killed.verdict(), PassVerdict::Refused);
+        let mut posted = Vec::new();
+        report_pass_verdict(PassVerb::Update, &killed, None, |e| posted.push(e));
+        assert!(
+            matches!(
+                posted.as_slice(),
+                [Wake::PkgSeedFailed { detail }] if detail == "atpkg ended without saying what happened"
+            ),
+            "{posted:?}"
+        );
         let quiet = run(Some(0), SeedMarkers::default(), "");
         assert_eq!(quiet.verdict(), PassVerdict::Quiet);
         let mut posted = Vec::new();
@@ -26664,7 +29485,7 @@ mod pass_verdict_tests {
         );
     }
 
-    use super::{ContentionBackoff, PkgLane};
+    use super::{CONTENTION_WEDGE_PARK, ContentionBackoff, PkgLane};
     use std::sync::{Arc, Mutex};
 
     /// A lane over a `Vec<Wake>` sink, with the waiting row open as a `Busy` child
@@ -26679,54 +29500,66 @@ mod pass_verdict_tests {
             layout: None,
             post: move |e| sink.lock().unwrap().push(e),
             wait_row_open: true,
-            seed_announced_work: false,
             backoff: ContentionBackoff::default(),
+            ran_at: None,
+            switch: super::LiveSwitch::new(None, super::LoopGate::On),
         }
     }
 
-    fn deferred_detail(posted: &Arc<Mutex<Vec<Wake>>>) -> String {
+    /// The one deferred notice posted, and whether it STANDS DOWN (the badge).
+    fn deferred(posted: &Arc<Mutex<Vec<Wake>>>) -> (String, bool) {
         let mut posted = posted.lock().unwrap();
         match posted.drain(..).collect::<Vec<_>>().as_slice() {
-            [Wake::PkgLockTimedOut { detail }] => detail.clone(),
+            [
+                Wake::PkgLockTimedOut {
+                    detail,
+                    stands_down,
+                },
+            ] => (detail.clone(), *stands_down),
             other => panic!("exactly one deferred row is posted: {other:?}"),
         }
     }
 
-    /// The park after a tick whose wait timed out: the backoff (30 s, then 60 s),
-    /// then the wedge — an hour, never the interval — and, for a once-pass, no
-    /// park at all, which is the loop's stand-down; the deferred row says which,
-    /// and the child's answer closes the row it left open.
+    /// A routine deferral's words: it retries, so it is no stand-down.
+    fn deferred_detail(posted: &Arc<Mutex<Vec<Wake>>>) -> String {
+        let (detail, stands_down) = deferred(posted);
+        assert!(!stands_down, "a deferral that retries is routine: {detail}");
+        detail
+    }
+
+    /// The park after a pass whose wait timed out: the backoff (30 s, then 60 s), then
+    /// the wedge — an hour; the deferred row says which, and the child's answer closes the
+    /// row it left open. (The once-pass knob's stand-down went with the knob, Phase 3:
+    /// every wedge parks and tries again.)
     #[test]
-    fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge_and_a_once_pass_stands_down() {
+    fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge() {
         let busy = run(Some(75), SeedMarkers::default(), "");
         assert_eq!(busy.verdict(), PassVerdict::Busy);
-        let six_hours = 6 * 60 * 60;
         let posted = Arc::new(Mutex::new(Vec::new()));
         let mut lane = busy_lane(&posted);
-        let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy, six_hours);
-        assert_eq!(park, Some(Duration::from_secs(30)));
+        let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy);
+        assert_eq!(park, Duration::from_secs(30));
         assert!(
             !lane.wait_row_open,
             "the deferred row answers the waiting row"
         );
         assert_eq!(
             deferred_detail(&posted),
-            "an earlier toolchain pass is still running — trying again in 30 s (each try waits up to 30 min)"
+            "waiting for an earlier package update to finish — trying again in 30 s"
         );
-        let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy, six_hours);
-        assert_eq!(park, Some(Duration::from_secs(60)));
+        let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy);
+        assert_eq!(park, Duration::from_secs(60));
         assert_eq!(
             deferred_detail(&posted),
-            "an earlier toolchain pass is still running — trying again in 1 min (each try waits up to 30 min)"
+            "waiting for an earlier package update to finish — trying again in 1 min"
         );
-        let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy, six_hours);
-        assert_eq!(park, Some(Duration::from_secs(3600)), "the wedge: an hour");
+        let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy);
+        assert_eq!(park, Duration::from_secs(3600), "the wedge: an hour");
         assert!(lane.backoff.wedged());
         let detail = deferred_detail(&posted);
         assert_eq!(
             detail,
-            "an earlier toolchain pass has been running for over an hour with no visible progress — \
-             this window tries again in 1 h"
+            "an earlier package update has shown no progress for over an hour — trying again in 1 h"
         );
         // No "lock", "blocked" or "another aterm" on the glass (owner rulings
         // 2026-09-14 / 2026-09-18): the notice names the pass, not the mechanism.
@@ -26735,53 +29568,101 @@ mod pass_verdict_tests {
             !words.contains("lock") && !words.contains("blocked") && !words.contains("another"),
             "{words}"
         );
-        // A once-pass at the wedge has no park: it stands down for this launch.
+        // A seed at the wedge parks the same hour and tries again: nothing stands down,
+        // so the row is routine — the ledger, not the Settings ▸ Packages badge.
         let mut lane = busy_lane(&posted);
-        lane.park_after_timed_out_wait(PassVerb::Seed, &busy, 0);
-        lane.park_after_timed_out_wait(PassVerb::Seed, &busy, 0);
+        lane.park_after_timed_out_wait(PassVerb::Seed, &busy);
+        lane.park_after_timed_out_wait(PassVerb::Seed, &busy);
         posted.lock().unwrap().clear();
-        let park = lane.park_after_timed_out_wait(PassVerb::Seed, &busy, 0);
-        assert_eq!(park, None, "no park: the loop's exit");
-        assert!(lane.backoff.wedged());
         assert_eq!(
-            deferred_detail(&posted),
-            "an earlier toolchain pass has been running for over an hour with no visible progress — \
-             this window will not retry; run: aterm pkg seed"
+            lane.park_after_timed_out_wait(PassVerb::Seed, &busy),
+            CONTENTION_WEDGE_PARK
+        );
+        assert!(lane.backoff.wedged());
+        assert!(
+            !deferred(&posted).1,
+            "a wedge that retries is routine, not a badge"
         );
     }
 }
 
 /// The verb a launch child runs — `atpkg seed` (the one-shot fill, first or
-/// retried) or `atpkg update` (every tick of the loop). Its name is the argv word
-/// and the word every log line carries.
+/// retried), `atpkg update` (every tick of the loop), or `atpkg update <program>`
+/// (a vendor head the watch saw move, design §1.6). Its name is the argv word and,
+/// with its program, what every log line carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassVerb {
     Seed,
     Update,
+    UpdateProgram(&'static str),
 }
 
 impl PassVerb {
     fn name(self) -> &'static str {
         match self {
             Self::Seed => "seed",
-            Self::Update => "update",
+            Self::Update | Self::UpdateProgram(_) => "update",
         }
     }
 
-    /// A seed's refusal is said ON SCREEN (`PkgSeedFailed`); the update's stays a
-    /// log line. The seed is the launch whose whole job is laying the toolchain
-    /// down, and a markerless refusal was the one failing path with no card — a
+    /// The one program a targeted pass names.
+    fn program(self) -> Option<&'static str> {
+        match self {
+            Self::UpdateProgram(program) => Some(program),
+            Self::Seed | Self::Update => None,
+        }
+    }
+
+    /// A WHOLE pass's refusal — or a child that could not be launched — is said as
+    /// a FAILURE (`PkgSeedFailed`: the Settings ▸ Packages badge since 2026-09-22, a
+    /// card before). A markerless refusal was the one failing path with no card — a
     /// machine sat with no toolchain for three weeks in exactly that state
-    /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
-    fn refusal_is_a_card(self) -> bool {
-        self == Self::Seed
+    /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md) — and the update's used to
+    /// stay a log line only because a row for it was noise; a badge is not, and a
+    /// six-hourly update killed mid-download (no marker, no record row) was otherwise
+    /// said nowhere. A targeted `update <program>` stays a log line: its refusal is the
+    /// `error:` row it records, which the badge reads.
+    fn refusal_is_a_failure(self) -> bool {
+        self.program().is_none()
     }
 }
 
 impl std::fmt::Display for PassVerb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
+        f.write_str(self.name())?;
+        match self.program() {
+            Some(program) => write!(f, " {program}"),
+            None => Ok(()),
+        }
     }
+}
+
+/// A launch child's argv: the verb, and for a targeted pass its program and
+/// [`atpkg::cli::HEAD_WATCH_FLAG`] (the unattended door, not a person's); `--wait-lock`;
+/// and `--progress-file` when there is a store. Pure for the test.
+fn pass_args(
+    verb: PassVerb,
+    layout: Option<&atpkg::store::Layout>,
+    published_index: Option<u64>,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![verb.name().into()];
+    if let Some(program) = verb.program() {
+        args.push(program.into());
+        args.push(atpkg::cli::HEAD_WATCH_FLAG.into());
+    }
+    if verb == PassVerb::Update
+        && let Some(build) = published_index
+    {
+        args.push(atpkg::cli::PUBLISHED_INDEX_HINT_FLAG.into());
+        args.push(build.to_string().into());
+    }
+    args.push("--wait-lock".into());
+    args.push(ATPKG_WAIT_LOCK_SECS.to_string().into());
+    if let Some(l) = layout {
+        args.push("--progress-file".into());
+        args.push(l.progress_file().into());
+    }
+    args
 }
 
 /// What one `atpkg` launch child said and how it ended — [`run_atpkg_pass`]'s
@@ -26830,6 +29711,13 @@ impl PassRun {
             .collect()
     }
 
+    /// A CLEAN pass: it ran, exited 0 and printed no failure marker
+    /// ([`SeedMarkers::saw_failure`]) — what clears a failure the Packages badge
+    /// remembers ([`Wake::PkgPassEnded`]).
+    fn clean(&self) -> bool {
+        self.ran() && self.ok() && !self.seen.saw_failure
+    }
+
     /// Whether the child RAN a pass — any ending but `Busy`. A child that stood
     /// aside at the lock (exit 75) wrote no rows; what the admin step would read
     /// after it is the sibling's file, mid-pass, or the previous pass's — so the
@@ -26840,14 +29728,15 @@ impl PassRun {
     }
 }
 
-/// Run one `atpkg <verb>` launch child and wait for it — the seed pass and every
-/// tick of the update loop are this ONE shape: spawned with `--wait-lock`
-/// ([`ATPKG_WAIT_LOCK_SECS`]), `--progress-file` when there is a store, the
-/// spawner's pid ([`atpkg::cli::SPAWNER_PID_ENV`]) and the login shell's PATH
-/// (`child_path`); stdout STREAMED line by line through [`read_seed_markers`], so
-/// an announcement lands while the work runs; stderr captured ([`PassRun::said`])
-/// and drained CONCURRENTLY on a scoped thread; the child-scoped tailer joined
-/// right after `wait()`; and the admin step after a pass that RAN.
+/// Run one `atpkg <verb>` launch child and wait for it — the seed pass, every tick
+/// of the update loop and every head-watch pass are this ONE shape ([`pass_args`]):
+/// spawned with `--wait-lock` ([`ATPKG_WAIT_LOCK_SECS`]), `--progress-file` when
+/// there is a store, the spawner's pid ([`atpkg::cli::SPAWNER_PID_ENV`]) and the
+/// login shell's PATH (`child_path`); stdout STREAMED line by line through
+/// [`read_seed_markers`], so an announcement lands while the work runs; stderr
+/// captured ([`PassRun::said`]) and drained CONCURRENTLY on a scoped thread; the
+/// child-scoped tailer joined right after `wait()`; and the admin step after a pass
+/// that RAN.
 ///
 /// The child QUEUES behind a sibling's pass instead of refusing: the macOS Full
 /// Disk Access grant quits the app and opens it again while the first window's
@@ -26884,31 +29773,60 @@ impl PassRun {
 /// contention retry.
 ///
 /// `post` is the lane's event sink — the tailer thread posts through a clone of it.
+/// `first_run` ([`pass_is_first_run`]) rides this child's announcement and every
+/// read of its tailer ([`tag_first_run`]): only a first run paints the bar.
 /// `Err` is a failed SPAWN — a bundle whose co-located atpkg cannot exec — which
 /// [`PkgLane::run`] gives its voice. The incidents: CHANGELOG 2026-09-10/13.
 fn run_atpkg_pass<P: Fn(Wake) + Clone + Send + 'static>(
     verb: PassVerb,
+    published_index: Option<u64>,
     atpkg: &std::path::Path,
     child_path: &str,
     layout: Option<&atpkg::store::Layout>,
+    first_run: bool,
     post: &P,
 ) -> std::io::Result<PassRun> {
     let mut cmd = crate::qos::command(crate::qos::Role::Background, atpkg);
-    cmd.arg(verb.name())
-        .arg("--wait-lock")
-        .arg(ATPKG_WAIT_LOCK_SECS.to_string())
+    // NO STDIN: a window started from a terminal would hand its tty to the pass, which then
+    // announced itself as a PERSON's verb holding the store (`store.lock.holder`), and a
+    // Settings Check failed at once behind the window's own pass.
+    cmd.args(pass_args(verb, layout, published_index))
         .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
         .env("PATH", child_path)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(l) = layout {
-        cmd.arg("--progress-file").arg(l.progress_file());
+    let (run, _) = run_pass_child(&mut cmd, layout, first_run, post)?;
+    // THE ADMIN STEP FOLLOWS A PASS THAT RAN ([`PassRun::ran`]): a child that stood
+    // aside at the lock wrote no rows, and the file it would read is the sibling's.
+    if run.ran() {
+        post_admin_step(layout, post);
     }
+    Ok(run)
+}
+
+/// Spawn one pass child from `cmd` (stdout and stderr piped) and run it the lanes' way:
+/// its stdout read LIVE through the marker reader — so a `lock-waiting:` row appears while
+/// it queues behind another pass and `lock-acquired:` retires it — its stderr drained
+/// whole, and a progress tailer on its pid. Shared by the lanes ([`run_atpkg_pass`]) and
+/// the Settings Check, which used to collect its stdout only at exit: a Check clicked
+/// during a multi-GB pass sat busy for up to its 30-minute bound with no waiting row.
+/// The exit status rides beside the run for a caller that wants it whole. `Err` is a
+/// failed spawn.
+fn run_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
+    cmd: &mut std::process::Command,
+    layout: Option<&atpkg::store::Layout>,
+    first_run: bool,
+    post: &P,
+) -> std::io::Result<(PassRun, std::io::Result<std::process::ExitStatus>)> {
     let mut child = cmd.spawn()?;
     let tailer = layout.cloned().and_then(|l| {
         let post = post.clone();
         PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
-            post(Wake::PkgProgress { snapshot });
+            post(Wake::PkgProgress {
+                snapshot,
+                first_run,
+            });
         })
     });
     let mut refusal = child.stderr.take();
@@ -26918,24 +29836,52 @@ fn run_atpkg_pass<P: Fn(Wake) + Clone + Send + 'static>(
             .as_mut()
             .map(|pipe| scope.spawn(move || read_pass_stderr(pipe)));
         if let Some(out) = child.stdout.take() {
-            seen = read_seed_markers(std::io::BufReader::new(out), post);
+            seen = read_seed_markers(std::io::BufReader::new(out), |event| {
+                post(tag_first_run(event, first_run));
+            });
         }
         drain.and_then(|h| h.join().ok()).unwrap_or_default()
     });
-    let status = child.wait().ok();
+    let status = child.wait();
     let holder_advanced = tailer.is_some_and(PkgProgressTailer::finish);
     let run = PassRun {
         seen,
-        code: status.and_then(|s| s.code()),
+        code: status
+            .as_ref()
+            .ok()
+            .and_then(std::process::ExitStatus::code),
         holder_advanced,
         said,
     };
-    // THE ADMIN STEP FOLLOWS A PASS THAT RAN ([`PassRun::ran`]): a child that stood
-    // aside at the lock wrote no rows, and the file it would read is the sibling's.
-    if run.ran() {
-        post_admin_step(layout, post);
+    Ok((run, status))
+}
+
+/// THE FIRST RUN (2026-09-22): the pass about to run lays the default set onto a
+/// machine that has none of the ALab set — the store holds no program but the vendor
+/// agents ([`atpkg::vendor_direct::is_vendor`]), or there is no store. The agents
+/// do not count: the vendor lane lands claude and codex BEFORE the multi-GB ALab set
+/// (atpkg `run_update_pass`), so a first pass cut short after them — a dropped
+/// network, a closed lid — left a store whose next pass, the rest of that same first
+/// install, would otherwise run with no bar. Read by the lane BEFORE the child is
+/// spawned, so what the pass itself lands cannot turn its own later announcement
+/// routine. The one pass the toolchain bar is shown for: every other pass — an update
+/// of an installed program, vendor or ALab, a set completion onto a store that holds
+/// the set, a resumed seed onto a partly-installed one — is routine and silent.
+fn pass_is_first_run(layout: Option<&atpkg::store::Layout>) -> bool {
+    !layout.is_some_and(|l| {
+        atpkg::active_builds(l)
+            .keys()
+            .any(|program| !atpkg::vendor_direct::is_vendor(program))
+    })
+}
+
+/// `event` as the lane's child said it: an announcement carries the lane's
+/// [`pass_is_first_run`] verdict; every other event passes through untouched.
+fn tag_first_run(event: Wake, first_run: bool) -> Wake {
+    match event {
+        Wake::PkgSeedStarted { detail, .. } => Wake::PkgSeedStarted { detail, first_run },
+        other => other,
     }
-    Ok(run)
 }
 
 /// An atpkg child's whole stderr, to EOF ([`PassRun::said`]), decoded LOSSILY:
@@ -26969,7 +29915,10 @@ fn carry_wait_row(
 ) -> bool {
     let open = open || saw_lock_wait;
     if open && verdict != PassVerdict::Busy {
-        post(Wake::PkgProgress { snapshot: None });
+        post(Wake::PkgProgress {
+            snapshot: None,
+            first_run: false,
+        });
         return false;
     }
     open
@@ -26987,10 +29936,10 @@ fn carry_wait_row(
 ///   marker: every ordinary launch of a provisioned Mac): NOTHING is raised; stderr
 ///   still reaches the log, at INFO or WARN by the exit.
 /// * `Refused` — a markerless non-zero exit that is not contention: always a WARN
-///   line, and for the seed also a card ([`PassVerb::refusal_is_a_card`]) — its
-///   refusal is the one failing path the announcement's card cannot cover, since
-///   a refusal never gets as far as announcing. A healthy machine exits ZERO,
-///   which is `Quiet`, so the card raises no false positive.
+///   line, and for a whole pass also a failure ([`PassVerb::refusal_is_a_failure`];
+///   the Packages badge since 2026-09-22) — its refusal is the one failing path no
+///   marker covers, since a refusal never gets as far as announcing. A healthy
+///   machine exits ZERO, which is `Quiet`, so it raises no false positive.
 ///
 /// `post` is the lane's event sink, as for [`carry_wait_row`].
 fn report_pass_verdict(
@@ -27033,13 +29982,17 @@ fn report_pass_verdict(
             }
         }
         PassVerdict::Refused => {
-            aterm_log::warn!("the ALab toolchain {verb} pass did not run: {unanswered}");
-            if verb.refusal_is_a_card() {
+            aterm_log::warn!("{}", refused_line(verb, unanswered));
+            if verb.refusal_is_a_failure() {
                 post(Wake::PkgSeedFailed {
                     detail: pass_said_detail(&run.said),
                 });
             }
         }
+        PassVerdict::Offline => aterm_log::info!(
+            "atpkg {verb}: offline \u{2014} neither the package index nor any vendor channel \
+             answered; nothing is wrong but the network"
+        ),
         PassVerdict::Busy => {}
     }
 }
@@ -27070,13 +30023,13 @@ struct PkgLane<'a, P> {
     /// live bar (a holder's tailed meter) is cleared. No row is opened by the wait
     /// itself (2026-09-18).
     wait_row_open: bool,
-    /// Whether the launch seed ANNOUNCED work (`seed-starting:`) — it installed
-    /// from the sealed registry. The store it leaves has never been checked
-    /// against the network, and its own writes move the record: the launch
-    /// update runs at once behind it, whatever [`launch_pass_park`] would say
-    /// (2026-09-18).
-    seed_announced_work: bool,
     backoff: ContentionBackoff,
+    /// When this lane's last child ended (unix seconds): an attempt `status.toml` stamps
+    /// no later than this was this lane's own, never a sibling's ([`scheduled_pass_gate`]).
+    ran_at: Option<i64>,
+    /// The Automatic-updates switch, read live ([`LiveSwitch`]): every park of this lane
+    /// ends within a slice of it going off.
+    switch: LiveSwitch,
 }
 
 impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
@@ -27084,15 +30037,33 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
         (self.post)(event);
     }
 
-    /// One pass — spawned, tailed, drained and joined ([`run_atpkg_pass`]) — and
-    /// the waiting row carried across its exit. A spawn that died is a
-    /// provisioning outage, not a quiet tick: it is logged here, and to the row it
-    /// is a refused pass (`None`).
-    fn run(&mut self, verb: PassVerb) -> Option<PassRun> {
-        let run = match run_atpkg_pass(verb, self.atpkg, self.child_path, self.layout, &self.post) {
+    /// One pass — spawned, tailed, drained and joined ([`run_atpkg_pass`]), tagged
+    /// with its [`pass_is_first_run`] verdict — the waiting row carried across its
+    /// exit, and the exit reported ([`Wake::PkgPassEnded`]). A spawn that died is a
+    /// provisioning outage, not a quiet tick: it is logged here, for a whole pass it
+    /// is a failure ([`PassVerb::refusal_is_a_failure`]), and to the row it is a
+    /// refused pass (`None`).
+    fn run(&mut self, verb: PassVerb, published_index: Option<u64>) -> Option<PassRun> {
+        let first_run = pass_is_first_run(self.layout);
+        let run = run_atpkg_pass(
+            verb,
+            published_index,
+            self.atpkg,
+            self.child_path,
+            self.layout,
+            first_run,
+            &self.post,
+        );
+        self.ran_at = Some(unix_secs(std::time::SystemTime::now()));
+        let run = match run {
             Ok(run) => Some(run),
             Err(error) => {
                 aterm_log::warn!("could not launch atpkg {verb}: {error}");
+                if verb.refusal_is_a_failure() {
+                    self.post(Wake::PkgSeedFailed {
+                        detail: format!("could not launch atpkg {verb}: {error}"),
+                    });
+                }
                 None
             }
         };
@@ -27101,134 +30072,81 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
         });
         self.wait_row_open =
             carry_wait_row(self.wait_row_open, saw_lock_wait, verdict, |e| self.post(e));
+        // A targeted `update <program>` that went well says nothing of a whole pass
+        // that failed, so only a whole pass can be the clean one.
+        self.post(Wake::PkgPassEnded {
+            clean: verb.program().is_none() && run.as_ref().is_some_and(PassRun::clean),
+        });
         run
     }
 
     /// THE LAUNCH SEED (docs/GOLDEN-INSTALL-PATH.md §3): one `atpkg seed` before
     /// the loop. It records adoption, lays a pending stub per default-set name and
-    /// reads the signed index to say what this machine will get (a pre-v0.63
-    /// seeded bundle fills an empty store from its seal); the update that follows
-    /// installs the default set. The child claims the durable seal-read marker
-    /// itself (`aterm_update_core::seal_guard`), which is what holds the
-    /// self-updater off while it reads the bundle. Answers whether the seed is
+    /// reads the signed index to say what this machine will get; the update that
+    /// follows installs the default set. (It installs nothing itself: the lane that
+    /// filled an empty store from a seal inside the bundle, and the marker that held
+    /// the self-updater off while it read, were deleted in Phase 5 of
+    /// docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md.) Answers whether the seed is
     /// still OWED: a seed that stood aside at the lock (`Busy`) is run again by the
     /// loop ahead of its first update — `atpkg update` on a store the seed has not
     /// adopted is an empty no-op — and its timed-out wait is tallied like the
-    /// loop's own. Without the loop the deferred row says so and names the remedy,
-    /// which is the seed. A half-hour wait is an anomaly, so the log line is a
-    /// WARN; a Warn ROW would call a deferred pass a failed one.
-    fn run_launch_seed(&mut self, run_update_loop: bool) -> bool {
-        let Some(run) = self.run(PassVerb::Seed) else {
+    /// loop's own. A half-hour wait is an anomaly, so the log line is a WARN; a Warn
+    /// ROW would call a deferred pass a failed one.
+    fn run_launch_seed(&mut self) -> bool {
+        let Some(run) = self.run(PassVerb::Seed, None) else {
             return false;
         };
-        self.seed_announced_work = run.seen.saw_start;
         if run.ran() {
             report_pass_verdict(PassVerb::Seed, &run, self.layout, |e| self.post(e));
             return false;
         }
         // One timed-out wait on the tally; the park itself is not taken — the
-        // loop's first retry runs at once.
+        // loop's first retry runs at once. (There is no launch without the loop any
+        // more: `[packages] enabled` is the one switch, and the retired `auto_update`
+        // that kept the seed while it stopped the loop is folded into it, 2026-09-23 —
+        // so the bounded retry and the "run: aterm pkg seed" row that launch needed
+        // went with it.)
         let _ = self.backoff.park(run.holder_advanced);
         aterm_log::warn!(
-            "{}{}",
-            stood_aside_line(PassVerb::Seed, run.seen),
-            if run_update_loop {
-                " — the update loop tries the seed again behind it"
-            } else {
-                " — automatic updates are off, so this window will not retry"
-            }
+            "{} — the update loop tries the seed again behind it",
+            stood_aside_line(PassVerb::Seed, run.seen)
         );
         let why = run.why();
         if !why.is_empty() {
             aterm_log::info!("atpkg seed said: {why}");
         }
-        if !run_update_loop {
-            // BOUNDED RETRY, not a row telling the user to type the seed (audit
-            // 2026-09-14): with the loop off nothing else would ever run the seed
-            // again, so a holder that outlasted the half-hour wait — a 3 GB default
-            // set on a slow link in the sibling window — left this window's toolset
-            // unadopted until the next launch. The loop's own contention ladder, for
-            // a bounded number of rungs, and only then the deferred row and its remedy.
-            for _ in 0..SEED_RETRIES_WITHOUT_LOOP {
-                std::thread::sleep(self.backoff.park(false));
-                let Some(again) = self.run(PassVerb::Seed) else {
-                    break;
-                };
-                if again.ran() {
-                    report_pass_verdict(PassVerb::Seed, &again, self.layout, |e| self.post(e));
-                    return false;
-                }
-                aterm_log::warn!("{}", stood_aside_line(PassVerb::Seed, again.seen));
-            }
-            let bound = wait_bound();
-            self.post(Wake::PkgLockTimedOut {
-                // No "lock" on the glass (owner ruling 2026-09-14): the row names
-                // the pass, not the mechanism.
-                detail: format!(
-                    "an earlier toolchain pass was still running after {bound} \
-                     \u{2014} automatic updates are off; run: aterm pkg seed"
-                ),
-            });
-            self.wait_row_open = false;
-        }
         true
     }
 
-    /// THE PARK AFTER A TICK WHOSE WAIT TIMED OUT (atpkg exit 75): deferred, never
-    /// failed. The park is the contention backoff, never the interval — until the
-    /// holder looks WEDGED (three waits in a row with nothing moving in its file;
-    /// a holder whose work the tailer saw advance is a slow install and never
-    /// counts), when it stretches to an hour, still never the interval. The
-    /// deferred row says which. A once-pass (interval 0) has no wedge park: it
-    /// stands down for this launch (`None`, the loop's exit) and says so instead
-    /// of promising a retry ([`wedge_park`]). The child wrote no `status.toml` of
-    /// its own, so it has no outcome to report; the deferred row posted here is
-    /// its answer to the waiting row it left open.
-    fn park_after_timed_out_wait(
-        &mut self,
-        verb: PassVerb,
-        run: &PassRun,
-        interval: u64,
-    ) -> Option<Duration> {
+    /// THE PARK AFTER A PASS WHOSE WAIT TIMED OUT (atpkg exit 75): deferred, never
+    /// failed. The park is the contention backoff, never the walk's interval — until the
+    /// holder looks WEDGED (three waits in a row with nothing moving in its file; a holder
+    /// whose work the tailer saw advance is a slow install and never counts), when it
+    /// stretches to an hour ([`CONTENTION_WEDGE_PARK`]). The deferred row says which. The
+    /// child wrote no `status.toml` of its own, so it has no outcome to report; the
+    /// deferred row posted here is its answer to the waiting row it left open. (The
+    /// once-pass knob's stand-down went with the knob, Phase 3: every wedge parks and
+    /// tries again.)
+    fn park_after_timed_out_wait(&mut self, verb: PassVerb, run: &PassRun) -> Duration {
         let bound = wait_bound();
         let backoff_park = self.backoff.park(run.holder_advanced);
         let park = if self.backoff.wedged() {
-            let park = wedge_park(interval);
-            if let Some(park) = park {
-                aterm_log::warn!(
-                    "another atpkg pass has held the store lock through \
-                     {} consecutive {bound} waits of this window's {verb} \
-                     pass with no visible progress \u{2014} trying again \
-                     in {} (a stub run still triggers an early pass)",
-                    self.backoff.cycles(),
-                    human_park(park)
-                );
-                self.post(Wake::PkgLockTimedOut {
-                    detail: format!(
-                        "an earlier toolchain pass has been running for over \
-                         an hour with no visible progress \u{2014} this \
-                         window tries again in {}",
-                        human_park(park)
-                    ),
-                });
-            } else {
-                aterm_log::warn!(
-                    "another atpkg pass has held the store lock through \
-                     {} consecutive {bound} waits of this window's {verb} \
-                     pass with no visible progress \u{2014} standing down \
-                     for this launch (ATPKG_UPDATE_INTERVAL_SECS=0); run: \
-                     aterm pkg {verb}",
-                    self.backoff.cycles()
-                );
-                self.post(Wake::PkgLockTimedOut {
-                    detail: format!(
-                        "an earlier toolchain pass has been running for over \
-                         an hour with no visible progress \u{2014} this \
-                         window will not retry; run: aterm pkg {verb}"
-                    ),
-                });
-            }
-            park
+            aterm_log::warn!(
+                "another atpkg pass has held the store lock through {} consecutive {bound} \
+                 waits of this window's {verb} pass with no visible progress \u{2014} trying \
+                 again in {} (a stub run still triggers an early pass)",
+                self.backoff.cycles(),
+                human_park(CONTENTION_WEDGE_PARK)
+            );
+            self.post(Wake::PkgLockTimedOut {
+                detail: format!(
+                    "an earlier package update has shown no progress for over an hour \
+                     \u{2014} trying again in {}",
+                    human_park(CONTENTION_WEDGE_PARK)
+                ),
+                stands_down: false,
+            });
+            CONTENTION_WEDGE_PARK
         } else {
             aterm_log::warn!(
                 "{} \u{2014} trying again in {}",
@@ -27237,12 +30155,13 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
             );
             self.post(Wake::PkgLockTimedOut {
                 detail: format!(
-                    "an earlier toolchain pass is still running \u{2014} trying \
-                     again in {} (each try waits up to {bound})",
+                    "waiting for an earlier package update to finish \u{2014} trying again \
+                     in {}",
                     human_park(backoff_park)
                 ),
+                stands_down: false,
             });
-            Some(backoff_park)
+            backoff_park
         };
         let why = run.why();
         if !why.is_empty() {
@@ -27251,12 +30170,194 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
         self.wait_row_open = false;
         park
     }
+
+    /// THE LAUNCH'S FIRST UPDATE, and what it is for (read after the seed, or the retried
+    /// seed): owed whatever the record says — the first launch of a new app build
+    /// (`just_updated`, [`PassWhy::Launch`]); owed by the record ([`PassWhy::LaunchDue`]);
+    /// or not yet ([`launch_update_park`]): the lane then parks for the rest of the walk's
+    /// interval, and answers what that park ended on.
+    fn launch_update_why(
+        &mut self,
+        just_updated: bool,
+        bump: &mut BumpWatch,
+        heads: Option<&mut VendorHeads>,
+        retried_seed: bool,
+    ) -> PassWhy {
+        let interval = aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS;
+        let park = match self.launch_update_owed(just_updated, interval, pkg_unix_now()) {
+            Ok(why) => return why,
+            Err(park) => park,
+        };
+        aterm_log::info!(
+            "atpkg launch update skipped{}: the store's last successful pass is younger than \
+             the {} walk \u{2014} the next runs in {}",
+            if retried_seed {
+                " after the retried seed"
+            } else {
+                ""
+            },
+            human_park(Duration::from_secs(interval)),
+            human_park(park)
+        );
+        self.park(park, bump, true, heads).pass_why(PassWhy::Walk)
+    }
+
+    /// [`Self::launch_update_why`]'s decision, before any park: `Ok` runs a pass now for
+    /// that reason — a first launch of a new build ([`PassWhy::Launch`]), or a record that
+    /// owes one ([`PassWhy::LaunchDue`]) — and `Err` is the park until the walk owes one.
+    /// Pure over the record and `now_unix`. (A launch seed that installed was owed a pass
+    /// here too, until Phase 5 left the seed installing nothing.)
+    fn launch_update_owed(
+        &self,
+        just_updated: bool,
+        interval: u64,
+        now_unix: u64,
+    ) -> Result<PassWhy, Duration> {
+        match launch_update_park(just_updated, self.layout, interval, now_unix) {
+            Some(park) => Err(park),
+            None if just_updated => Ok(PassWhy::Launch),
+            None => Ok(PassWhy::LaunchDue),
+        }
+    }
+
+    /// Park for `park` on the WALL clock ([`sleep_interval_watching_bump`]) until it
+    /// elapses, a bump or a published index asks for the ordinary signed pass, which it
+    /// answers with (`Elapsed`, `Bumped` or `IndexPublished`). A moved vendor head runs
+    /// targeted passes at once ([`Self::run_vendor_moved`]) and resumes toward the same
+    /// deadline, preserving the full-pass cadence.
+    fn park(
+        &mut self,
+        park: Duration,
+        bump: &mut BumpWatch,
+        probe_index: bool,
+        mut heads: Option<&mut VendorHeads>,
+    ) -> ParkEnd {
+        let mut until = std::time::SystemTime::now() + park;
+        loop {
+            match sleep_interval_watching_bump(
+                self.layout,
+                &mut until,
+                park,
+                bump,
+                probe_index,
+                heads.as_deref_mut(),
+                &mut self.switch,
+            ) {
+                ParkEnd::VendorMoved(programs) => {
+                    let watch = heads.as_deref_mut().map(|(watch, _)| watch);
+                    self.run_vendor_moved(&programs, watch);
+                }
+                // THE SWITCH, LIVE (Phase 4): Automatic updates turned off mid-park stands
+                // the lane down INSIDE the park — no probe, no head check, no pass — and,
+                // turned on again, the park goes on toward the SAME deadline: minutes off
+                // cost the walk nothing, and a deadline that passed while off ends the
+                // park at once, so the pass it owed runs. A park is never ended by the
+                // switch, so an off/on flick can never read as an elapsed walk.
+                ParkEnd::SwitchedOff => {
+                    aterm_log::info!(
+                        "atpkg lane: Automatic updates turned off \u{2014} the package loop \
+                         stands down"
+                    );
+                    stand_by(&mut self.switch, |gate| gate == LoopGate::On);
+                    aterm_log::info!(
+                        "atpkg lane: Automatic updates turned on \u{2014} the package loop \
+                         resumes toward the same deadline"
+                    );
+                }
+                end => return end,
+            }
+        }
+    }
+
+    /// THE HEAD WATCH'S PASSES (design §1.6): `atpkg update <program> --head-watch` for
+    /// each program whose vendor head moved, through this lane like every other pass —
+    /// verdict, outcome line, tailer. A pass that ran starts the contention tally over; a
+    /// pass that stood aside at the lock counts on it, like the loop's own, and the
+    /// programs after it are not queued behind the same holder — the watch offers a head
+    /// the build has not reached again on the hour. While the holder looks wedged none is
+    /// run: the loop's own `update` pass, which runs the vendor lane too, takes them.
+    fn run_vendor_moved(
+        &mut self,
+        programs: &[&'static str],
+        mut watch: Option<&mut atpkg::vendor_direct::watch::HeadWatch>,
+    ) {
+        if self.backoff.wedged() {
+            aterm_log::info!(
+                "vendor head moved ({}) while another atpkg pass looks wedged at the store \
+                 lock \u{2014} the loop's next update pass takes it",
+                programs.join(", ")
+            );
+            return;
+        }
+        let verbs = vendor_moved_verbs(programs);
+        for (i, &verb) in verbs.iter().enumerate() {
+            let recorded_before = self.layout.and_then(atpkg::status::read);
+            let Some(run) = self.run(verb, None) else {
+                if let Some(watch) = watch.as_deref_mut() {
+                    watch.note_pass_result(programs[i], false, std::time::SystemTime::now());
+                }
+                continue;
+            };
+            if let Some(watch) = watch.as_deref_mut() {
+                // A vendor check can exit 0 when the head is unreachable. Only
+                // an installed version that reached the offered head counts as
+                // success; a transient no-op gets one short retry.
+                let reached = run.ok()
+                    && self
+                        .layout
+                        .is_some_and(|layout| watch.head_reached(layout, programs[i]));
+                watch.note_pass_result(programs[i], reached, std::time::SystemTime::now());
+            }
+            if run.ran() {
+                self.backoff.reset();
+                report_pass_verdict(verb, &run, self.layout, |e| self.post(e));
+                let outcome = pass_outcome_clause(
+                    recorded_before.as_ref(),
+                    self.layout.and_then(atpkg::status::read),
+                );
+                aterm_log::info!(
+                    "atpkg {verb} pass finished: exit={} outcome={outcome}",
+                    if run.ok() { "ok" } else { "failed" }
+                );
+                continue;
+            }
+            let _ = self.backoff.park(run.holder_advanced);
+            let rest: Vec<&str> = verbs[i + 1..].iter().filter_map(|v| v.program()).collect();
+            if let Some(watch) = watch.as_deref_mut() {
+                for &program in &programs[i + 1..] {
+                    watch.note_pass_result(program, false, std::time::SystemTime::now());
+                }
+            }
+            aterm_log::warn!(
+                "{}{}",
+                stood_aside_line(verb, run.seen),
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " \u{2014} {} waits for the watch's next offer",
+                        rest.join(", ")
+                    )
+                }
+            );
+            if self.wait_row_open {
+                self.post(Wake::PkgProgress {
+                    snapshot: None,
+                    first_run: false,
+                });
+                self.wait_row_open = false;
+            }
+            return;
+        }
+    }
 }
 
-/// One `atpkg machine apply`, detached, for a launch whose package loop is switched
-/// off ([`spawn_pkg_update_check`]). The child gets the same PATH and spawner pid the
-/// passes get, no `--wait-lock` (the verb takes no store lock — it writes a per-host
-/// preference and renames build output the user owns), and its stdout runs through
+/// One `atpkg machine apply`, detached — every launch's, at once, beside its launch seed
+/// (or alone with the package manager switched off, [`spawn_pkg_update_check`]): the passes
+/// no longer apply the `[machine]` settings (Phase 3), so this is what keeps them applied.
+/// The child gets the same PATH and spawner pid the passes get, no `--wait-lock` (the
+/// verb takes no store lock — it writes a per-host preference and renames build output
+/// the user owns), and its stdout runs through
 /// [`read_seed_markers`] so the `machine-settings:` line lands where a pass's would.
 /// Never joined (`consent_warmup.rs` rule): a wedged `defaults` must not hold a launch.
 fn spawn_machine_settings_once(atpkg: std::path::PathBuf, proxy: EventLoopProxy<Wake>) {
@@ -27295,40 +30396,33 @@ fn spawn_machine_settings_once(atpkg: std::path::PathBuf, proxy: EventLoopProxy<
 
 /// The park a LAUNCH owes before its first UPDATE pass (2026-09-18; the launch
 /// seed always runs):
-/// `Some(remaining)` when the store's last ATTEMPTED pass (`status.toml`
-/// `updated_at`, moved by every pass whether it succeeded or failed — the same
-/// stamp the session lane reads) is younger than `interval`, `None` when a pass
-/// is due now: never attempted, older than the interval, or the once-pass knob
-/// (`interval == 0`), which always runs. Pure over the age so the rule is pinned
-/// without a store.
+/// `Some(remaining)` when the store's last SUCCESSFUL full pass
+/// ([`launch_pass_park`] reads it; until 2026-09-23 it read `updated_at`, every
+/// writer's) is younger than `interval`, `None` when a pass is due now: never
+/// checked, or older than the interval. Pure over the age so the rule is pinned
+/// without a store; `interval` is the seam the tests inject (production passes
+/// [`aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS`]).
 fn launch_pass_park_from(last_attempt_age_secs: Option<u64>, interval: u64) -> Option<Duration> {
-    if interval == 0 {
-        return None;
-    }
     let age = last_attempt_age_secs?;
     (age < interval).then(|| Duration::from_secs(interval - age))
 }
 
 /// [`launch_pass_park_from`] over the store's record, keyed on the last pass
 /// that SUCCEEDED: `last_success_at` is stamped only by an update-class pass
-/// that resolved the index and ran to its end, while `updated_at` moves on every
-/// write — a failed resolve, a seed's own install, a typed `install <p>`. So a
-/// record whose last attempt is LATER than its last success (the last pass
-/// failed) owes a pass now — the failure ladder's minutes-scale retry, not a
-/// six-hour park — and a machine never checked (no store, no record, no
-/// success) is due at once.
+/// that resolved the index and ran to its end. A record whose last full pass
+/// FAILED — as that pass recorded it ([`aterm_update_core::pkg_check::Stamps::last_failed`];
+/// until 2026-09-23 read off `updated_at`, which every write moves, so a vendor head-watch
+/// write after the last success read as a failed pass) — owes a pass now: the failure
+/// ladder's minutes-scale retry, not a six-hour park. A machine never checked (no store,
+/// no record, no success) is due at once.
 fn launch_pass_park(
     layout: Option<&atpkg::store::Layout>,
     interval: u64,
     now_unix: u64,
 ) -> Option<Duration> {
-    let text = std::fs::read_to_string(layout?.status()).ok()?;
-    let success = aterm_update_core::pkg_check::last_success_at(&text)
-        .and_then(|stamp| aterm_update_core::pkg_check::rfc3339_to_unix(&stamp))?;
-    let attempt = aterm_update_core::pkg_check::last_attempt_at(&text)
-        .and_then(|stamp| aterm_update_core::pkg_check::rfc3339_to_unix(&stamp))
-        .unwrap_or(success);
-    if attempt > success {
+    let stamps = aterm_update_core::pkg_check::Stamps::read(&layout?.status());
+    let success = stamps.last_success?;
+    if stamps.last_failed() {
         return None;
     }
     let now = i64::try_from(now_unix).ok()?;
@@ -27350,7 +30444,7 @@ fn launch_pass_park(
 /// lock, measured 2026-09-18) — and it IS paid behind a predecessor's pass still in
 /// flight: the launch seed is the child that queues behind it, so the update child
 /// that follows finds the lock free and never reaches `atpkg`'s
-/// `pass_finished_while_we_waited`. Kept on purpose: that pass also rewrites the
+/// `pass_ended_while_we_waited`. Kept on purpose: that pass also rewrites the
 /// shell hook with THIS build's atpkg, which an old-build orphan's pass would not.
 /// Detected through the update lanes' `ATERM_UPDATED_FROM` stamp only, so a first
 /// launch after a manual install still parks on the record.
@@ -27372,7 +30466,7 @@ mod launch_pass_park_tests {
 
     /// I1 (2026-09-18): a launch whose store was checked inside the interval owes
     /// no pass now — it parks for the remainder; a never-checked or stale store
-    /// runs at once; the once-pass knob always runs.
+    /// runs at once. (The once-pass knob went with `ATPKG_UPDATE_INTERVAL_SECS`, Phase 3.)
     #[test]
     fn a_fresh_record_parks_for_the_remainder_and_a_stale_or_absent_one_runs_now() {
         let six_hours = 6 * 60 * 60;
@@ -27397,14 +30491,13 @@ mod launch_pass_park_tests {
             None,
             "never checked"
         );
-        assert_eq!(launch_pass_park_from(Some(0), 0), None, "once-pass knob");
-        assert_eq!(launch_pass_park_from(None, 0), None);
     }
 
     /// The store-backed reader: no layout is a pass due; a record whose last
     /// SUCCESS is inside the interval parks for the remainder; a record with no
-    /// success, or whose last attempt came after its last success (it failed),
-    /// is due now.
+    /// success, or whose last full pass recorded a failure after its last success, is
+    /// due now — and a write after the last success that no pass made (a vendor
+    /// head-watch row) is no failed pass (2026-09-23: it read as one).
     #[test]
     fn the_store_record_decides_on_the_last_success_not_the_last_write() {
         assert_eq!(launch_pass_park(None, 100, 1_700_000_000), None);
@@ -27440,12 +30533,25 @@ mod launch_pass_park_tests {
             Some(Duration::from_secs(70))
         );
         assert_eq!(launch_pass_park(Some(&layout), 100, 1_700_000_100), None);
-        // The last attempt came AFTER the last success: it failed — the failure
-        // ladder's retry is owed now, never a six-hour park.
+        // A write AFTER the last success that no pass recorded: still the success's park.
         std::fs::write(
             layout.status(),
             "schema = 1\nupdated_at = \"2023-11-14T22:13:50Z\"\nenabled = true\n\
-             last_success_at = \"2023-11-14T22:13:20Z\"\n",
+             last_success_at = \"2023-11-14T22:13:20Z\"\nlast_pass = \"ok\"\n\
+             last_pass_at = \"2023-11-14T22:13:20Z\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            launch_pass_park(Some(&layout), 100, 1_700_000_060),
+            Some(Duration::from_secs(40))
+        );
+        // The last full pass FAILED after the last success: the failure ladder's retry is
+        // owed now, never a six-hour park.
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2023-11-14T22:13:50Z\"\nenabled = true\n\
+             last_success_at = \"2023-11-14T22:13:20Z\"\nlast_pass = \"failed\"\n\
+             last_pass_at = \"2023-11-14T22:13:50Z\"\n",
         )
         .unwrap();
         assert_eq!(launch_pass_park(Some(&layout), 100, 1_700_000_060), None);
@@ -27482,35 +30588,1803 @@ mod launch_pass_park_tests {
     }
 }
 
-/// Spawn the toolchain launch thread: the one-shot `atpkg seed`, then the loop that
-/// runs the co-located `atpkg update` every interval so the managed programs keep
-/// current (and, with `[packages].auto_install = true`, installs missing
-/// default-set members — atpkg reads that consent flag from the same config
-/// itself). Both passes stream through [`run_atpkg_pass`] over one [`PkgLane`].
+#[cfg(test)]
+mod head_watch_park_tests {
+    use super::*;
+    use atpkg::vendor_direct::watch::{ConcurrentVendorGetFn, HeadWatch};
+    use atpkg::{VendorFetchError, VendorGet};
+    use std::sync::{Condvar, Mutex};
+    use std::time::SystemTime;
+
+    const CLAUDE_HEAD: &str = "https://downloads.claude.ai/claude-code-releases/latest";
+
+    fn modeled_park_choice(end: &ParkEnd) -> i64 {
+        match end {
+            ParkEnd::Bumped => 1,
+            ParkEnd::Elapsed => 2,
+            ParkEnd::IndexPublished(_) => 3,
+            ParkEnd::VendorMoved(_) => 4,
+            ParkEnd::SwitchedOff => 0,
+        }
+    }
+
+    fn modeled_index_owner(watch: &BumpWatch) -> i64 {
+        i64::from(watch.pending_index_probe.is_some())
+    }
+
+    /// A store whose `claude` is a legacy index build — older than any head.
+    fn store_with_legacy_claude(label: &str) -> atpkg::store::Layout {
+        let prefix =
+            std::env::temp_dir().join(format!("aterm-head-watch-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&prefix);
+        let layout = atpkg::store::Layout { prefix };
+        let build = layout.build_dir("claude", 2_026_092_201);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        atpkg::atomic_symlink(&build, &layout.program_current("claude")).unwrap();
+        layout
+    }
+
+    /// The claude head at `version` (its ETag the version), a 304 to that ETag, and a
+    /// log of every GET's `If-None-Match`.
+    fn vendor(
+        version: &'static str,
+        asked: Arc<Mutex<Vec<Option<String>>>>,
+    ) -> impl Fn(&str, &str, u64, Option<&str>) -> Result<VendorGet, VendorFetchError> + Send + Sync
+    {
+        move |program, url, _cap, etag| {
+            assert_eq!((program, url), ("claude", CLAUDE_HEAD));
+            asked.lock().unwrap().push(etag.map(str::to_string));
+            let tag = format!("\"{version}\"");
+            if etag == Some(tag.as_str()) {
+                return Ok(VendorGet::NotModified { etag: tag });
+            }
+            Ok(VendorGet::Body {
+                bytes: version.as_bytes().to_vec(),
+                etag: Some(tag),
+                effective_url: url.to_string(),
+            })
+        }
+    }
+
+    /// A targeted pass is `update <program> --head-watch` on the same lane flags as every
+    /// pass.
+    #[test]
+    fn a_targeted_pass_names_its_program_on_the_lanes_own_argv() {
+        let layout = atpkg::store::Layout {
+            prefix: std::path::PathBuf::from("/p"),
+        };
+        let progress = layout.progress_file().into_os_string();
+        let words = |verb, layout| {
+            pass_args(verb, layout, None)
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let progress = progress.to_string_lossy().into_owned();
+        assert_eq!(
+            words(PassVerb::UpdateProgram("claude"), Some(&layout)),
+            [
+                "update",
+                "claude",
+                "--head-watch",
+                "--wait-lock",
+                "1800",
+                "--progress-file",
+                &progress
+            ]
+        );
+        assert_eq!(
+            words(PassVerb::UpdateProgram("codex"), None),
+            ["update", "codex", "--head-watch", "--wait-lock", "1800"],
+            "the door is the flag, never the progress file"
+        );
+        assert_eq!(
+            words(PassVerb::Update, Some(&layout)),
+            [
+                "update",
+                "--wait-lock",
+                "1800",
+                "--progress-file",
+                &progress
+            ]
+        );
+        assert_eq!(
+            pass_args(PassVerb::Update, Some(&layout), Some(45))
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "update",
+                atpkg::cli::PUBLISHED_INDEX_HINT_FLAG,
+                "45",
+                "--wait-lock",
+                "1800",
+                "--progress-file",
+                &progress,
+            ],
+            "a published wake carries its target into the lock waiter and pass-end record"
+        );
+        assert_eq!(words(PassVerb::Seed, None), ["seed", "--wait-lock", "1800"]);
+        assert_eq!(PassVerb::UpdateProgram("codex").to_string(), "update codex");
+        assert_eq!(PassVerb::Update.to_string(), "update");
+        assert!(!PassVerb::UpdateProgram("claude").refusal_is_a_failure());
+    }
+
+    /// A VendorMoved trigger is one targeted update per program, in the watch's order.
+    #[test]
+    fn a_vendor_moved_trigger_maps_to_targeted_update_verbs() {
+        assert_eq!(
+            vendor_moved_verbs(&["claude", "codex"]),
+            [
+                PassVerb::UpdateProgram("claude"),
+                PassVerb::UpdateProgram("codex")
+            ]
+        );
+        assert!(vendor_moved_verbs(&[]).is_empty());
+    }
+
+    /// A 20 ms park over `layout`, with a fresh bump watch and the switch on.
+    fn park_20ms(layout: &atpkg::store::Layout, heads: Option<&mut VendorHeads>) -> ParkEnd {
+        park_20ms_reading(layout, heads, &mut LiveSwitch::new(None, LoopGate::On))
+    }
+
+    /// [`park_20ms`] reading `[packages]` through `switch`.
+    fn park_20ms_reading(
+        layout: &atpkg::store::Layout,
+        heads: Option<&mut VendorHeads>,
+        switch: &mut LiveSwitch,
+    ) -> ParkEnd {
+        let twenty = Duration::from_millis(20);
+        sleep_interval_watching_bump(
+            Some(layout),
+            &mut (SystemTime::now() + twenty),
+            twenty,
+            &mut BumpWatch::default(),
+            false,
+            heads,
+            switch,
+        )
+    }
+
+    /// A completed vendor hint can leave the package park while the independent
+    /// index probe is still waiting on its host. A completed index answer, and a
+    /// local bump, retain priority when both answers are already available.
+    #[test]
+    fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
+        let model = aterm_spec::derive::atpkg_index_pending_park_model();
+        let mut state = model.init_state();
+        let layout = store_with_legacy_claude("index-overlap");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let get: Arc<ConcurrentVendorGetFn<'static>> =
+            Arc::new(vendor("2.1.281", Arc::clone(&asked)));
+        let mut heads: VendorHeads = (HeadWatch::new(&[]), get);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
+            ..BumpWatch::default()
+        };
+        start_index_probe(&layout, &mut watch, true, Instant::now(), move |_| {
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            atpkg::index_probe::Probe::Published(77)
+        });
+        assert!(model.fire("Start", &mut state));
+        assert!(watch.pending_index_probe.is_some());
+        assert_eq!(state["phase"], 1);
+        assert_eq!(modeled_index_owner(&watch), 1);
+        let started = Instant::now();
+        let end = sleep_interval_watching_bump(
+            Some(&layout),
+            &mut (SystemTime::now() + Duration::from_secs(3)),
+            Duration::from_secs(3),
+            &mut watch,
+            true,
+            Some(&mut heads),
+            &mut LiveSwitch::new(None, LoopGate::On),
+        );
+        assert!(model.fire("VendorReady", &mut state));
+        assert!(model.fire("ChooseVendor", &mut state));
+        assert_eq!(end, ParkEnd::VendorMoved(vec!["claude"]));
+        assert_eq!(modeled_park_choice(&end), state["chosen"]);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(asked.lock().unwrap().as_slice(), [None]);
+        assert!(
+            watch.pending_index_probe.is_some(),
+            "one owned probe remains"
+        );
+        // Even if another minute elapses while that request is blocked, the
+        // package lane cannot start a second index worker.
+        start_index_probe(
+            &layout,
+            &mut watch,
+            true,
+            Instant::now() + atpkg::index_probe::INTERVAL,
+            |_| panic!("a second network worker must not start"),
+        );
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !watch
+            .pending_index_probe
+            .as_ref()
+            .is_some_and(|pending| pending.worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(model.fire("FinishPublished", &mut state));
+        assert_eq!(modeled_index_owner(&watch), 1, "ready still owned");
+        assert!(model.fire("NextPark", &mut state));
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), Some(77));
+        assert!(model.fire("Harvest", &mut state));
+        assert!(model.fire("ChooseIndex", &mut state));
+        assert_eq!(state["chosen"], 3);
+        assert!(watch.pending_index_probe.is_none());
+        assert_eq!(modeled_index_owner(&watch), 0);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A positive near HEAD wakes the signed pass without waiting for the
+    /// probe worker's far HEAD or listing. The worker remains owned through
+    /// the pass and its later final answer is invalidated by that pass.
+    #[test]
+    fn near_index_wakes_while_unrelated_probe_helpers_are_still_running() {
+        let model = aterm_spec::derive::atpkg_index_pending_park_model();
+        let mut state = model.init_state();
+        let layout = atpkg::store::Layout {
+            prefix: std::env::temp_dir()
+                .join(format!("aterm-near-index-early-{}", std::process::id())),
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
+            ..BumpWatch::default()
+        };
+        start_index_probe_with_near_hint(
+            &layout,
+            &mut watch,
+            true,
+            Instant::now(),
+            move |_, near| {
+                near.store(44, Ordering::Release);
+                release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                atpkg::index_probe::Probe::Published(49)
+            },
+        );
+        assert!(model.fire("Start", &mut state));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !index_probe_answer_ready(&watch) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(index_probe_answer_ready(&watch), "the near hint arrived");
+        assert!(
+            !watch
+                .pending_index_probe
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished(),
+            "the final answer is still blocked"
+        );
+        let end = sleep_interval_watching_bump(
+            Some(&layout),
+            &mut (SystemTime::now() + Duration::from_secs(60)),
+            Duration::from_secs(60),
+            &mut watch,
+            true,
+            None,
+            &mut LiveSwitch::new(None, LoopGate::On),
+        );
+        assert_eq!(end, ParkEnd::IndexPublished(44));
+        assert!(model.fire("NearPublished", &mut state));
+        assert!(model.fire("ChooseIndex", &mut state));
+        assert_eq!(modeled_park_choice(&end), state["chosen"]);
+        assert_eq!(modeled_index_owner(&watch), 1);
+        assert_eq!(
+            watch.pending_index_probe.as_ref().unwrap().near_offered,
+            Some(44)
+        );
+        assert!(
+            !index_probe_answer_ready(&watch),
+            "the delivered near hint must not spin the park"
+        );
+
+        assert!(model.fire("NextPark", &mut state));
+        watch.note_full_pass_started();
+        watch.unlanded = Some(44);
+        assert!(model.fire("FullPass", &mut state));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watch
+            .pending_index_probe
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(model.fire("FinishPublished", &mut state));
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), None);
+        assert!(model.fire("Harvest", &mut state));
+        assert_eq!(watch.unlanded, Some(44));
+        assert!(watch.pending_index_probe.is_none());
+        assert!(model.check_invariant("NoStaleAnswerApplied", &state));
+    }
+
+    /// A second near HEAD can publish while the signed pass for the first is
+    /// reading an older listing. The still-owned worker must offer that higher
+    /// build immediately; its older far/listing answer remains invalidated.
+    #[test]
+    fn higher_near_index_after_pass_start_wakes_before_unrelated_helpers_finish() {
+        let model = aterm_spec::derive::atpkg_index_pending_park_model();
+        let mut state = model.init_state();
+        let layout = atpkg::store::Layout {
+            prefix: std::env::temp_dir().join(format!(
+                "aterm-near-index-after-pass-{}",
+                std::process::id()
+            )),
+        };
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        std::fs::write(layout.floor(), "43").unwrap();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
+            ..BumpWatch::default()
+        };
+        start_index_probe_with_near_hint(
+            &layout,
+            &mut watch,
+            true,
+            Instant::now(),
+            move |_, near| {
+                near.store(44, Ordering::Release);
+                advance_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                near.store(45, Ordering::Release);
+                finish_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                atpkg::index_probe::Probe::Published(49)
+            },
+        );
+        assert!(model.fire("Start", &mut state));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !index_probe_answer_ready(&watch) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), Some(44));
+        for action in ["NearPublished", "ChooseIndex", "NextPark"] {
+            assert!(model.fire(action, &mut state), "{action}: {state:?}");
+        }
+        watch.note_full_pass_started();
+        std::fs::write(layout.floor(), "44").unwrap();
+        watch.unlanded = Some(44);
+        assert!(model.fire("FullPass", &mut state));
+        assert!(!index_probe_answer_ready(&watch), "44 was already offered");
+        advance_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !index_probe_answer_ready(&watch) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            index_probe_answer_ready(&watch),
+            "45 must wake before the final answer"
+        );
+        assert!(
+            !watch
+                .pending_index_probe
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished(),
+            "the far/listing answer is still blocked"
+        );
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), Some(45));
+        for action in ["NearAfterPass", "ChooseIndex"] {
+            assert!(model.fire(action, &mut state), "{action}: {state:?}");
+        }
+        assert!(model.check_invariant("NoStaleNearChosen", &state));
+        assert!(
+            !index_probe_answer_ready(&watch),
+            "45 must not spin the park"
+        );
+        watch.note_full_pass_started();
+        watch.unlanded = Some(45);
+        finish_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watch
+            .pending_index_probe
+            .as_ref()
+            .is_some_and(|pending| pending.worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), None);
+        assert_eq!(watch.unlanded, Some(45), "stale final49 must not clear it");
+        assert!(watch.pending_index_probe.is_none());
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// Joining a worker and seeing its final answer must not hide a higher near
+    /// HEAD it published just before finishing. A floor already at that build
+    /// does suppress the wake, including without leaving a ready-loop behind.
+    #[test]
+    fn finished_stale_probe_keeps_newer_near_hint_unless_the_floor_landed_it() {
+        for (label, landed, expected) in [("unlanded", 44, Some(45)), ("landed", 45, None)] {
+            let layout = atpkg::store::Layout {
+                prefix: std::env::temp_dir().join(format!(
+                    "aterm-near-index-finished-{label}-{}",
+                    std::process::id()
+                )),
+            };
+            let _ = std::fs::remove_dir_all(&layout.prefix);
+            std::fs::create_dir_all(&layout.prefix).unwrap();
+            std::fs::write(layout.floor(), "43").unwrap();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            let mut watch = BumpWatch {
+                last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
+                ..BumpWatch::default()
+            };
+            start_index_probe_with_near_hint(
+                &layout,
+                &mut watch,
+                true,
+                Instant::now(),
+                move |_, near| {
+                    near.store(44, Ordering::Release);
+                    finish_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                    near.store(45, Ordering::Release);
+                    atpkg::index_probe::Probe::Published(49)
+                },
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !index_probe_answer_ready(&watch) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert_eq!(take_ready_index_probe(&layout, &mut watch), Some(44));
+            watch.note_full_pass_started();
+            std::fs::write(layout.floor(), landed.to_string()).unwrap();
+            watch.unlanded = Some(44);
+            finish_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !watch
+                .pending_index_probe
+                .as_ref()
+                .is_some_and(|pending| pending.worker.is_finished())
+                && Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            assert!(index_probe_answer_ready(&watch));
+            assert_eq!(
+                take_ready_index_probe(&layout, &mut watch),
+                expected,
+                "{label}"
+            );
+            assert!(
+                watch.pending_index_probe.is_none(),
+                "{label}: worker joined"
+            );
+            assert_eq!(watch.unlanded, expected.map_or(Some(44), |_| None));
+            let _ = std::fs::remove_dir_all(&layout.prefix);
+        }
+    }
+
+    #[test]
+    fn a_suppressed_near_build_does_not_hide_a_higher_near_build() {
+        let layout = atpkg::store::Layout {
+            prefix: std::env::temp_dir()
+                .join(format!("aterm-near-index-highwater-{}", std::process::id())),
+        };
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
+            unlanded: Some(44),
+            ..BumpWatch::default()
+        };
+        start_index_probe_with_near_hint(
+            &layout,
+            &mut watch,
+            true,
+            Instant::now(),
+            move |_, near| {
+                near.store(44, Ordering::Release);
+                advance_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                near.store(45, Ordering::Release);
+                release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                atpkg::index_probe::Probe::Published(45)
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !index_probe_answer_ready(&watch) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), None);
+        assert_eq!(watch.unlanded, Some(44));
+        assert!(
+            !index_probe_answer_ready(&watch),
+            "an old hint may not re-arm a zero-delay park"
+        );
+        advance_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !index_probe_answer_ready(&watch) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !watch
+                .pending_index_probe
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished(),
+            "the higher near hint precedes the worker's final answer"
+        );
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), Some(45));
+        assert_eq!(watch.unlanded, None);
+        release_tx.send(()).unwrap();
+        watch.note_full_pass_started();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watch
+            .pending_index_probe
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), None);
+        assert!(watch.pending_index_probe.is_none());
+    }
+
+    #[test]
+    fn stale_missing_index_answer_keeps_the_new_full_pass_mark() {
+        let model = aterm_spec::derive::atpkg_index_pending_park_model();
+        let mut state = model.init_state();
+        let layout = store_with_legacy_claude("stale-index-after-pass");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut watch = BumpWatch {
+            last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
+            ..BumpWatch::default()
+        };
+        start_index_probe(&layout, &mut watch, true, Instant::now(), move |_| {
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            atpkg::index_probe::Probe::Missing
+        });
+        assert!(model.fire("Start", &mut state));
+        assert_eq!(modeled_index_owner(&watch), 1);
+
+        // The same park's local bump wins before the blocked network answer.
+        std::fs::write(layout.bump_file(), "claude\n").unwrap();
+        let end = sleep_interval_watching_bump(
+            Some(&layout),
+            &mut (SystemTime::now() + Duration::from_millis(20)),
+            Duration::from_millis(20),
+            &mut watch,
+            true,
+            None,
+            &mut LiveSwitch::new(None, LoopGate::On),
+        );
+        assert_eq!(end, ParkEnd::Bumped);
+        for action in ["BumpReady", "ChooseBump", "NextPark"] {
+            assert!(model.fire(action, &mut state), "{action}");
+        }
+        assert_eq!(modeled_park_choice(&end), 1);
+        std::fs::remove_file(layout.bump_file()).unwrap();
+
+        // The full pass finishes with a newer unlanded decision. Its start
+        // invalidates the older probe, but does not release the worker slot.
+        watch.note_full_pass_started();
+        watch.unlanded = Some(88);
+        assert!(model.fire("FullPass", &mut state));
+        assert_eq!(
+            i64::try_from(watch.pass_generation).unwrap(),
+            state["pass_generation"]
+        );
+        assert_eq!(modeled_index_owner(&watch), 1);
+        start_index_probe(
+            &layout,
+            &mut watch,
+            true,
+            Instant::now() + atpkg::index_probe::INTERVAL,
+            |_| panic!("an invalidated worker still owns the only probe slot"),
+        );
+        assert_eq!(modeled_index_owner(&watch), 1);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !watch
+            .pending_index_probe
+            .as_ref()
+            .is_some_and(|pending| pending.worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(model.fire("FinishMissing", &mut state));
+        assert_eq!(take_ready_index_probe(&layout, &mut watch), None);
+        assert!(model.fire("Harvest", &mut state));
+        assert_eq!(i64::from(watch.unlanded.is_some()), state["unlanded"]);
+        assert_eq!(watch.unlanded, Some(88));
+        assert_eq!(modeled_index_owner(&watch), 0);
+
+        // Negative control: applying that old Missing answer without the
+        // generation check would erase the full pass's newer suppression mark.
+        let mut without_generation = BumpWatch {
+            unlanded: Some(88),
+            ..BumpWatch::default()
+        };
+        assert_eq!(
+            index_probe_answer_wakes(&mut without_generation, atpkg::index_probe::Probe::Missing),
+            None
+        );
+        assert_eq!(without_generation.unlanded, None);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    #[test]
+    fn a_ready_index_wins_before_a_ready_vendor_get() {
+        let model = aterm_spec::derive::atpkg_index_pending_park_model();
+        let mut state = model.init_state();
+        let layout = store_with_legacy_claude("index-priority");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let get: Arc<ConcurrentVendorGetFn<'static>> =
+            Arc::new(vendor("2.1.281", Arc::clone(&asked)));
+        let mut heads: VendorHeads = (HeadWatch::new(&[]), get);
+        let mut watch = BumpWatch {
+            pending_index_probe: Some(PendingIndexProbe {
+                worker: std::thread::spawn(|| atpkg::index_probe::Probe::Published(77)),
+                pass_generation: 0,
+                near_build: Arc::new(AtomicU64::new(0)),
+                near_offered: None,
+            }),
+            ..BumpWatch::default()
+        };
+        assert!(model.fire("Start", &mut state));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !watch
+            .pending_index_probe
+            .as_ref()
+            .is_some_and(|pending| pending.worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(model.fire("FinishPublished", &mut state));
+        // A local wish and an elapsed full-pass deadline both win. A store-lock
+        // contention park holds the answer for its next index-enabled park.
+        std::fs::write(layout.bump_file(), "claude\n").unwrap();
+        let bump_end = sleep_interval_watching_bump(
+            Some(&layout),
+            &mut (SystemTime::now() + Duration::from_millis(20)),
+            Duration::from_millis(20),
+            &mut watch,
+            true,
+            None,
+            &mut LiveSwitch::new(None, LoopGate::On),
+        );
+        assert_eq!(bump_end, ParkEnd::Bumped);
+        assert!(model.fire("BumpReady", &mut state));
+        assert!(model.fire("ChooseBump", &mut state));
+        assert_eq!(modeled_park_choice(&bump_end), state["chosen"]);
+        assert!(model.fire("NextPark", &mut state));
+        std::fs::remove_file(layout.bump_file()).unwrap();
+        let full_end = sleep_interval_watching_bump(
+            Some(&layout),
+            &mut (SystemTime::now() - Duration::from_secs(1)),
+            Duration::from_secs(1),
+            &mut watch,
+            true,
+            None,
+            &mut LiveSwitch::new(None, LoopGate::On),
+        );
+        assert_eq!(full_end, ParkEnd::Elapsed);
+        assert!(model.fire("FullDue", &mut state));
+        assert!(model.fire("ChooseFull", &mut state));
+        assert_eq!(modeled_park_choice(&full_end), state["chosen"]);
+        assert!(model.fire("NextPark", &mut state));
+        assert_eq!(
+            sleep_interval_watching_bump(
+                Some(&layout),
+                &mut (SystemTime::now() + Duration::from_millis(20)),
+                Duration::from_millis(20),
+                &mut watch,
+                false,
+                None,
+                &mut LiveSwitch::new(None, LoopGate::On),
+            ),
+            ParkEnd::Elapsed
+        );
+        assert!(watch.pending_index_probe.is_some());
+        assert!(model.fire("VendorReady", &mut state));
+        let index_end = sleep_interval_watching_bump(
+            Some(&layout),
+            &mut (SystemTime::now() + Duration::from_millis(20)),
+            Duration::from_millis(20),
+            &mut watch,
+            true,
+            Some(&mut heads),
+            &mut LiveSwitch::new(None, LoopGate::On),
+        );
+        assert_eq!(index_end, ParkEnd::IndexPublished(77));
+        assert!(model.fire("Harvest", &mut state));
+        assert!(model.fire("ChooseIndex", &mut state));
+        assert_eq!(modeled_park_choice(&index_end), state["chosen"]);
+        // Negative control: the conformance projection rejects a vendor-first
+        // decision if a completed index answer was available at that decision.
+        assert_ne!(
+            modeled_park_choice(&ParkEnd::VendorMoved(vec!["claude"])),
+            state["chosen"]
+        );
+        assert!(!model.action_enabled("ChooseVendor", &state));
+        assert!(asked.lock().unwrap().is_empty(), "index wins before a GET");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    #[test]
+    fn a_vendor_hint_harvested_with_a_higher_priority_event_survives_to_the_next_park() {
+        let model = aterm_spec::derive::atpkg_index_pending_park_model();
+        for (label, bumped, full_due, index_ready) in [
+            ("bump", true, false, false),
+            ("deadline", false, true, false),
+            ("index", false, false, true),
+        ] {
+            let layout = store_with_legacy_claude(label);
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let get: Arc<ConcurrentVendorGetFn<'static>> =
+                Arc::new(vendor("2.1.281", Arc::clone(&asked)));
+            let mut heads: VendorHeads = (HeadWatch::new(&[String::from("codex")]), get);
+            let moved = heads.0.check(&layout, SystemTime::now(), heads.1.as_ref());
+            assert_eq!(moved, ["claude"], "{label}: the head is actionable");
+            let mut watch = BumpWatch::default();
+            if index_ready {
+                watch.pending_index_probe = Some(PendingIndexProbe {
+                    worker: std::thread::spawn(|| atpkg::index_probe::Probe::Published(77)),
+                    pass_generation: 0,
+                    near_build: Arc::new(AtomicU64::new(0)),
+                    near_offered: None,
+                });
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !watch
+                    .pending_index_probe
+                    .as_ref()
+                    .is_some_and(|pending| pending.worker.is_finished())
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    watch
+                        .pending_index_probe
+                        .as_ref()
+                        .unwrap()
+                        .worker
+                        .is_finished()
+                );
+            }
+            let end = finish_head_watch_slice(
+                &layout,
+                &mut heads.0,
+                &mut watch,
+                bumped,
+                full_due,
+                true,
+                Some(moved),
+            )
+            .expect("higher-priority event");
+            assert_eq!(
+                end,
+                if bumped {
+                    ParkEnd::Bumped
+                } else if full_due {
+                    ParkEnd::Elapsed
+                } else {
+                    ParkEnd::IndexPublished(77)
+                },
+                "{label} keeps priority"
+            );
+
+            let mut state = model.init_state();
+            if index_ready {
+                for action in ["Start", "FinishPublished", "Harvest"] {
+                    assert!(model.fire(action, &mut state), "{label}: {action}");
+                }
+            }
+            assert!(model.fire("VendorReady", &mut state));
+            let (ready, choose) = if bumped {
+                (Some("BumpReady"), "ChooseBump")
+            } else if full_due {
+                (Some("FullDue"), "ChooseFull")
+            } else {
+                (None, "ChooseIndex")
+            };
+            if let Some(ready) = ready {
+                assert!(model.fire(ready, &mut state), "{label}: {ready}");
+            }
+            assert!(model.fire(choose, &mut state), "{label}: {choose}");
+            assert!(model.fire("NextPark", &mut state));
+            assert_eq!(state["vendor"], 1, "{label}: model retains the hint");
+            assert!(heads.0.due(SystemTime::now()), "{label}: real hint is due");
+
+            // A coalesced full pass can stand down behind another process; if
+            // that pass did not land Claude, the next park must deliver this
+            // exact hint without another GET or a five-minute reoffer wait.
+            let replay = sleep_interval_watching_bump(
+                Some(&layout),
+                &mut (SystemTime::now() + Duration::from_secs(2)),
+                Duration::from_secs(2),
+                &mut watch,
+                false,
+                Some(&mut heads),
+                &mut LiveSwitch::new(None, LoopGate::On),
+            );
+            assert_eq!(replay, ParkEnd::VendorMoved(vec!["claude"]), "{label}");
+            assert!(model.fire("ChooseVendor", &mut state));
+            assert_eq!(asked.lock().unwrap().len(), 1, "{label}: no second GET");
+            assert_eq!(park_20ms(&layout, Some(&mut heads)), ParkEnd::Elapsed);
+            let _ = std::fs::remove_dir_all(&layout.prefix);
+        }
+    }
+
+    /// `[packages].exclude` REACHES THE HEAD WATCH LIVE (design §4.3's owed item): the
+    /// park hands the watch the list its slice's poll of `aterm.toml` read, so claude
+    /// excluded in a running window is not asked (no GET, no pass), and taken off the list
+    /// is asked within a slice — no relaunch. Before, the list was read once at launch.
+    #[test]
+    fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let get: Arc<ConcurrentVendorGetFn<'static>> =
+            Arc::new(vendor("2.1.281", Arc::clone(&asked)));
+        let layout = store_with_legacy_claude("live-exclude");
+        let config = layout.prefix.join("aterm.toml");
+        std::fs::write(&config, "[packages]\nexclude = [\"claude\"]\n").unwrap();
+        let mut switch = LiveSwitch::new(Some(config.clone()), LoopGate::On);
+        // The launch watch, as the thread builds it: nothing excluded yet.
+        let mut heads: VendorHeads = (HeadWatch::new(&[]), get);
+        assert_eq!(
+            park_20ms_reading(&layout, Some(&mut heads), &mut switch),
+            ParkEnd::Elapsed
+        );
+        assert!(asked.lock().unwrap().is_empty(), "excluded: never asked");
+        std::fs::write(&config, "[packages]\nexclude = []\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut end = ParkEnd::Elapsed;
+        while Instant::now() < deadline {
+            end = park_20ms_reading(&layout, Some(&mut heads), &mut switch);
+            if matches!(end, ParkEnd::VendorMoved(_)) {
+                break;
+            }
+        }
+        assert_eq!(
+            end,
+            ParkEnd::VendorMoved(vec!["claude"]),
+            "the negative control: included again, asked in the next slice"
+        );
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The park is on the WALL clock (Phase 3): a deadline already past ends it at once,
+    /// and so does one further out than the park's own length — a clock set back, which
+    /// must not strand the loop until the clock comes round again.
+    #[test]
+    fn the_park_ends_at_a_wall_clock_deadline_and_never_strands_on_a_clock_set_back() {
+        let layout = store_with_legacy_claude("wall");
+        let started = Instant::now();
+        let five_minutes = Duration::from_secs(300);
+        assert_eq!(
+            sleep_interval_watching_bump(
+                Some(&layout),
+                &mut (SystemTime::now() - Duration::from_secs(60)),
+                five_minutes,
+                &mut BumpWatch::default(),
+                false,
+                None,
+                &mut LiveSwitch::new(None, LoopGate::On),
+            ),
+            ParkEnd::Elapsed
+        );
+        assert_eq!(
+            sleep_interval_watching_bump(
+                Some(&layout),
+                &mut (SystemTime::now() + Duration::from_secs(3600)),
+                five_minutes,
+                &mut BumpWatch::default(),
+                false,
+                None,
+                &mut LiveSwitch::new(None, LoopGate::On),
+            ),
+            ParkEnd::Elapsed,
+            "an hour out, on a five-minute park: the clock went back"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "neither slept");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The park ends early with the programs whose head moved, and a park resumed after
+    /// the passes runs out without asking again: the head is on the cadence now. A bump
+    /// ends a park before a due head is asked; with no watch, or nothing installed, no
+    /// vendor is asked.
+    #[test]
+    fn a_moved_head_ends_the_park_with_its_programs() {
+        // The due head now runs on its own worker. A 20 ms park can end before
+        // that worker is scheduled under a busy test host; the next park must
+        // still harvest its completion and leave promptly.
+        fn park_until_moved(layout: &atpkg::store::Layout, heads: &mut VendorHeads) -> ParkEnd {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let end = park_20ms(layout, Some(heads));
+                if matches!(end, ParkEnd::VendorMoved(_)) || Instant::now() >= deadline {
+                    return end;
+                }
+                assert_eq!(end, ParkEnd::Elapsed);
+            }
+        }
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let get: Arc<ConcurrentVendorGetFn<'static>> =
+            Arc::new(vendor("2.1.281", Arc::clone(&asked)));
+        let layout = store_with_legacy_claude("park");
+        let mut heads: VendorHeads = (HeadWatch::new(&[]), Arc::clone(&get));
+        assert_eq!(
+            park_until_moved(&layout, &mut heads),
+            ParkEnd::VendorMoved(vec!["claude"])
+        );
+        assert_eq!(asked.lock().unwrap().as_slice(), [None]);
+        assert_eq!(park_20ms(&layout, Some(&mut heads)), ParkEnd::Elapsed);
+        assert_eq!(asked.lock().unwrap().len(), 1, "resumed: not asked again");
+        // A bump written while a head is due: the bump, and no GET.
+        let mut due: VendorHeads = (HeadWatch::new(&[]), Arc::clone(&get));
+        std::fs::write(layout.bump_file(), "claude\n").unwrap();
+        assert_eq!(park_20ms(&layout, Some(&mut due)), ParkEnd::Bumped);
+        assert_eq!(asked.lock().unwrap().len(), 1, "the bump first: no GET");
+        std::fs::remove_file(layout.bump_file()).unwrap();
+        // No watch (the manager off, a `dir:` registry): no GET.
+        assert_eq!(park_20ms(&layout, None), ParkEnd::Elapsed);
+        assert_eq!(asked.lock().unwrap().len(), 1, "no watch: no GET");
+        // The negative control: that watch was due.
+        assert_eq!(
+            park_until_moved(&layout, &mut due),
+            ParkEnd::VendorMoved(vec!["claude"])
+        );
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        let empty = atpkg::store::Layout {
+            prefix: layout.prefix.join("empty"),
+        };
+        std::fs::create_dir_all(&empty.prefix).unwrap();
+        let mut heads: VendorHeads = (HeadWatch::new(&[]), Arc::clone(&get));
+        assert_eq!(park_20ms(&empty, Some(&mut heads)), ParkEnd::Elapsed);
+        assert_eq!(asked.lock().unwrap().len(), 2, "nothing installed: no GET");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A ready Codex hint starts its targeted pass while the independent Claude
+    /// request is still stalled. This binds the pending watch to the GUI package
+    /// lane, rather than only checking that two GETs overlap.
+    #[cfg(unix)]
+    #[test]
+    fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let layout = store_with_legacy_claude("ready-codex");
+        let codex_build = layout.build_dir("codex", 2_026_092_201);
+        std::fs::create_dir_all(codex_build.join("bin")).unwrap();
+        atpkg::atomic_symlink(&codex_build, &layout.program_current("codex")).unwrap();
+        let argv_log = layout.prefix.join("argv");
+        let atpkg = layout.prefix.join("atpkg-fake");
+        std::fs::write(
+            &atpkg,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
+                argv_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let claude_finished = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&release);
+        let finished = Arc::clone(&claude_finished);
+        let get: Arc<ConcurrentVendorGetFn<'static>> = Arc::new(move |program, url, _, _| {
+            let bytes = if program == "claude" {
+                let (lock, ready) = &*gate;
+                let released = lock.lock().unwrap();
+                let (released, _) = ready
+                    .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+                    .unwrap();
+                assert!(*released, "test releases Claude before its network timeout");
+                finished.store(true, Ordering::Release);
+                b"2.1.281".to_vec()
+            } else {
+                assert_eq!(program, "codex");
+                br#"{"tag_name":"rust-v0.157.0","assets":[]}"#.to_vec()
+            };
+            Ok(VendorGet::Body {
+                bytes,
+                etag: None,
+                effective_url: url.to_string(),
+            })
+        });
+        let mut head_watch = HeadWatch::new(&[]);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        assert_eq!(
+            head_watch_slice(
+                &mut head_watch,
+                &layout,
+                now,
+                Some(Duration::ZERO),
+                Duration::ZERO,
+                &get,
+                false,
+            ),
+            None
+        );
+        assert_eq!(head_watch.pending_count(), 2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let moved = loop {
+            head_watch.park_for_hint(Duration::from_millis(100));
+            let moved = head_watch_slice(
+                &mut head_watch,
+                &layout,
+                now + Duration::from_secs(1),
+                Some(Duration::from_secs(1)),
+                Duration::from_secs(1),
+                &get,
+                false,
+            );
+            if moved.is_some() || Instant::now() >= deadline {
+                break moved;
+            }
+        };
+        assert_eq!(moved, Some(vec!["codex"]));
+
+        let mut lane = PkgLane {
+            atpkg: atpkg.as_path(),
+            child_path: "",
+            layout: Some(&layout),
+            post: |_| {},
+            wait_row_open: false,
+            backoff: ContentionBackoff::default(),
+            ran_at: None,
+            switch: LiveSwitch::new(None, LoopGate::On),
+        };
+        lane.run_vendor_moved(&["codex"], Some(&mut head_watch));
+        assert_eq!(
+            std::fs::read_to_string(&argv_log).unwrap(),
+            format!(
+                "update codex --head-watch --wait-lock 1800 --progress-file {}\n",
+                layout.progress_file().display()
+            )
+        );
+        assert!(
+            !claude_finished.load(Ordering::Acquire),
+            "the targeted pass started while Claude was stalled"
+        );
+        assert_eq!(head_watch.pending_count(), 1);
+
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        head_watch.park_for_hint(Duration::from_secs(5));
+        assert_eq!(
+            head_watch_slice(
+                &mut head_watch,
+                &layout,
+                now + Duration::from_secs(2),
+                Some(Duration::from_secs(1)),
+                Duration::from_secs(1),
+                &get,
+                false,
+            ),
+            Some(vec!["claude"])
+        );
+        assert_eq!(head_watch.pending_count(), 0);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The passes one trigger runs: every program while they run, and the contention
+    /// tally starts over; the first that stands aside at the lock counts on the tally
+    /// and ends the trigger — the next program is not queued behind the same holder —
+    /// and none runs while the holder looks wedged.
+    #[cfg(unix)]
+    #[test]
+    fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("aterm-head-watch-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv_log = dir.join("argv");
+        let atpkg = dir.join("atpkg");
+        let fake = |exit: u8| {
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit {exit}\n",
+                argv_log.display()
+            );
+            std::fs::write(&atpkg, script).unwrap();
+            std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_file(&argv_log);
+        };
+        let runs = || std::fs::read_to_string(&argv_log).unwrap_or_default();
+        let mut lane = PkgLane {
+            atpkg: atpkg.as_path(),
+            child_path: "",
+            layout: None,
+            post: |_| {},
+            wait_row_open: false,
+            backoff: ContentionBackoff::default(),
+            ran_at: None,
+            switch: LiveSwitch::new(None, LoopGate::On),
+        };
+        fake(75);
+        lane.run_vendor_moved(&["claude", "codex"], None);
+        assert_eq!(
+            runs(),
+            "update claude --head-watch --wait-lock 1800\n",
+            "codex is not queued behind the same holder"
+        );
+        assert_eq!(lane.backoff.cycles(), 1, "the wait is on the tally");
+        fake(1);
+        lane.run_vendor_moved(&["claude", "codex"], None);
+        assert_eq!(
+            runs(),
+            "update claude --head-watch --wait-lock 1800\n\
+             update codex --head-watch --wait-lock 1800\n",
+            "passes that ran: every program"
+        );
+        assert_eq!(
+            lane.backoff.cycles(),
+            0,
+            "a pass that ran starts the tally over"
+        );
+        // A holder that looks wedged: no targeted pass queues behind it.
+        for _ in 0..CONTENTION_WEDGE_CYCLES {
+            let _ = lane.backoff.park(false);
+        }
+        assert!(lane.backoff.wedged());
+        fake(1);
+        lane.run_vendor_moved(&["claude"], None);
+        assert_eq!(runs(), "", "the loop's own pass takes it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE FIRST RUN, DEFINED BY THE STORE AT THE PASS'S START (2026-09-22), and
+    /// what each pass tells the host at its exit. A real child prints an install
+    /// announcement: over a store that holds no program the lane tags it FIRST RUN
+    /// (the one pass the bar is shown for), over a store that holds one it is
+    /// ROUTINE — and the child's own landing cannot flip that verdict, because it
+    /// is read before the spawn. Every exit posts `PkgPassEnded`: clean for a whole
+    /// pass that ran, exited 0 and printed no failure marker; not for a failed
+    /// one, nor a failure marker at exit 0, nor any targeted `update <program>`.
+    /// A refused vendor program's head-watch pass (exit 1, no marker) posts
+    /// nothing that could raise a row — its refusal is the recorded `error:` row
+    /// the Packages badge reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("aterm-first-run-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let atpkg = dir.join("atpkg");
+        let fake = |stdout: &str, exit: u8| {
+            let script = format!("#!/bin/sh\nprintf '%s\\n' '{stdout}'\nexit {exit}\n");
+            std::fs::write(&atpkg, script).unwrap();
+            std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let announce = format!(
+            "atpkg: {}installing 10 program(s) over the network (about 3 GB)",
+            atpkg::cli::NET_STARTING_MARKER
+        );
+        let empty = atpkg::store::Layout {
+            prefix: dir.join("empty"),
+        };
+        std::fs::create_dir_all(&empty.prefix).unwrap();
+        // One installed program, as a pass leaves it: its build and the shim into it.
+        let stocked = atpkg::store::Layout {
+            prefix: dir.join("stocked"),
+        };
+        let tool = stocked.build_dir("ay", 1971).join("bin").join("ay");
+        std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+        std::fs::write(&tool, "").unwrap();
+        std::fs::create_dir_all(stocked.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(&tool, stocked.bin_dir().join("ay")).unwrap();
+        assert!(pass_is_first_run(None), "no store: nothing of it is here");
+        assert!(pass_is_first_run(Some(&empty)));
+        assert!(!pass_is_first_run(Some(&stocked)));
+        // THE AGENTS DO NOT COUNT: the vendor lane lands claude before the ALab set,
+        // so a first pass cut short after it leaves a store whose next pass is the
+        // rest of that first install — still a first run, bar and all.
+        let agents_only = atpkg::store::Layout {
+            prefix: dir.join("agents-only"),
+        };
+        let agent = agents_only
+            .build_dir("claude", 7)
+            .join("bin")
+            .join("claude");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, "").unwrap();
+        std::fs::create_dir_all(agents_only.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(&agent, agents_only.bin_dir().join("claude")).unwrap();
+        assert!(
+            pkg_store_holds_programs(Some(&agents_only)),
+            "not vacuous: the store holds a live claude"
+        );
+        assert!(
+            pass_is_first_run(Some(&agents_only)),
+            "claude alone: still the first run"
+        );
+        let drive = |layout: &atpkg::store::Layout, verb: PassVerb| {
+            let posted = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&posted);
+            let mut lane = PkgLane {
+                atpkg: atpkg.as_path(),
+                child_path: "",
+                layout: Some(layout),
+                post: move |e| sink.lock().unwrap().push(e),
+                wait_row_open: false,
+                backoff: ContentionBackoff::default(),
+                ran_at: None,
+                switch: LiveSwitch::new(None, LoopGate::On),
+            };
+            lane.run(verb, None).expect("the child ran");
+            std::mem::take(&mut *posted.lock().unwrap())
+        };
+        let started = |posted: &[Wake]| {
+            posted.iter().find_map(|e| match e {
+                Wake::PkgSeedStarted { first_run, .. } => Some(*first_run),
+                _ => None,
+            })
+        };
+        let ended = |posted: &[Wake]| {
+            posted.iter().find_map(|e| match e {
+                Wake::PkgPassEnded { clean } => Some(*clean),
+                _ => None,
+            })
+        };
+        fake(&announce, 0);
+        let first = drive(&empty, PassVerb::Update);
+        assert_eq!(started(&first), Some(true), "an empty store: the first run");
+        assert_eq!(
+            ended(&first),
+            Some(true),
+            "exit 0, no failure marker: clean"
+        );
+        let routine = drive(&stocked, PassVerb::Update);
+        assert_eq!(started(&routine), Some(false), "a stocked store: routine");
+        assert_eq!(ended(&routine), Some(true));
+        fake(&announce, 1);
+        assert_eq!(
+            ended(&drive(&stocked, PassVerb::Update)),
+            Some(false),
+            "exit 1"
+        );
+        fake(
+            &format!(
+                "atpkg: {}network provisioning installed nothing",
+                atpkg::cli::NET_FAILED_MARKER
+            ),
+            0,
+        );
+        assert_eq!(
+            ended(&drive(&stocked, PassVerb::Update)),
+            Some(false),
+            "a failure marker at exit 0 is not clean"
+        );
+        // The refused vendor program: a head-watch pass, exit 1, no marker.
+        fake("atpkg: codex 0.157.0 refused: SHA256SUMS disagrees", 1);
+        let refused = drive(&stocked, PassVerb::UpdateProgram("codex"));
+        assert!(
+            refused.iter().all(|e| matches!(
+                e,
+                Wake::PkgPassEnded { clean: false } | Wake::PkgProgress { .. }
+            )),
+            "no marker, so nothing that could raise a row: {refused:?}"
+        );
+        fake("", 0);
+        assert_eq!(
+            ended(&drive(&stocked, PassVerb::UpdateProgram("codex"))),
+            Some(false),
+            "a targeted pass never clears a whole pass's failure"
+        );
+        fake(&announce, 0);
+        assert_eq!(
+            started(&drive(&agents_only, PassVerb::Update)),
+            Some(true),
+            "the lane tags a claude-only store's pass a first run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AN ATPKG THAT CANNOT BE LAUNCHED IS A FAILURE for a whole pass (2026-09-22):
+    /// no child, no marker, no record row — it was a log line, and the badge it now
+    /// lights is the only place it is said. A targeted pass stays a log line; every
+    /// exit still reports itself, not clean.
+    #[test]
+    fn a_whole_pass_that_cannot_launch_is_a_failure() {
+        use std::sync::{Arc, Mutex};
+        let missing =
+            std::env::temp_dir().join(format!("aterm-no-such-atpkg-{}/atpkg", std::process::id()));
+        for (verb, failure) in [
+            (PassVerb::Seed, true),
+            (PassVerb::Update, true),
+            (PassVerb::UpdateProgram("codex"), false),
+        ] {
+            let posted = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&posted);
+            let mut lane = PkgLane {
+                atpkg: missing.as_path(),
+                child_path: "",
+                layout: None,
+                post: move |e| sink.lock().unwrap().push(e),
+                wait_row_open: false,
+                backoff: ContentionBackoff::default(),
+                ran_at: None,
+                switch: LiveSwitch::new(None, LoopGate::On),
+            };
+            assert!(lane.run(verb, None).is_none(), "{verb}: nothing ran");
+            let posted = std::mem::take(&mut *posted.lock().unwrap());
+            let failed = posted.iter().any(|e| {
+                matches!(e, Wake::PkgSeedFailed { detail }
+                    if detail.starts_with(&format!("could not launch atpkg {verb}: ")))
+            });
+            assert_eq!(failed, failure, "{verb}: {posted:?}");
+            assert!(
+                posted
+                    .iter()
+                    .any(|e| matches!(e, Wake::PkgPassEnded { clean: false })),
+                "{verb}: {posted:?}"
+            );
+        }
+    }
+
+    /// A `seed-unusable:` that states a FACT — the architecture is unserved, or every
+    /// program the index serves here was removed on purpose — is no failure: it neither
+    /// lights the Packages badge nor keeps the pass from being clean (an Intel Mac printed
+    /// the first on every launch, and it lit a badge nobody could clear). An exclusion
+    /// that leaves nothing stays a failure, as do the other failure markers. The three
+    /// bodies are atpkg's own words, as `report_seedless_posture` prints them (atpkg's
+    /// `an_unserved_architecture_and_a_removal_are_facts_an_exclusion_is_not` pins them).
+    #[test]
+    fn an_informational_unusable_marker_is_no_failure() {
+        let unusable = |detail: &str| Wake::PkgSeedUnusable {
+            detail: detail.to_string(),
+        };
+        assert!(!seed_event_is_failure(&unusable(
+            "the signed index publishes no artifact for this machine's architecture \
+             (x86_64-apple-darwin) — nothing was installed, and nothing arrives until one \
+             is published"
+        )));
+        assert!(!seed_event_is_failure(&unusable(
+            "every program the signed index serves here was removed on this machine (ay, \
+             trust) — nothing to install. `aterm pkg install <program>` brings one back"
+        )));
+        assert!(seed_event_is_failure(&unusable(
+            "[packages].exclude narrows the toolset to nothing installable on this machine \
+             (aarch64-apple-darwin; excluded: ay, clean) — shorten it to receive the toolset"
+        )));
+        assert!(seed_event_is_failure(&Wake::PkgSeedFailed {
+            detail: "nothing could be installed".into()
+        }));
+    }
+
+    /// The tag rides the announcement only; every other event passes untouched.
+    #[test]
+    fn only_the_announcement_carries_the_first_run_tag() {
+        let tagged = tag_first_run(
+            Wake::PkgSeedStarted {
+                detail: "installing 1".into(),
+                first_run: false,
+            },
+            true,
+        );
+        assert!(matches!(
+            tagged,
+            Wake::PkgSeedStarted {
+                first_run: true,
+                ..
+            }
+        ));
+        let other = tag_first_run(
+            Wake::PkgSeedDone {
+                detail: "ok".into(),
+            },
+            true,
+        );
+        assert!(matches!(other, Wake::PkgSeedDone { .. }));
+    }
+
+    /// A targeted pass's markerless failure ran and failed, and is named by its own
+    /// command; the toolchain passes keep their words.
+    #[test]
+    fn a_targeted_pass_is_named_by_its_command_and_its_refusal_is_a_failure() {
+        let why = "atpkg: codex 0.157.0 refused: SHA256SUMS disagrees";
+        assert_eq!(
+            refused_line(PassVerb::UpdateProgram("codex"), why),
+            format!("the atpkg update codex pass failed: {why}")
+        );
+        assert_eq!(
+            refused_line(PassVerb::Update, why),
+            format!("the ALab toolchain update pass did not run: {why}")
+        );
+        let seen = SeedMarkers::default();
+        assert!(
+            stood_aside_line(PassVerb::UpdateProgram("claude"), seen)
+                .starts_with("the atpkg update claude pass waited 30 min")
+        );
+        assert!(
+            stood_aside_line(PassVerb::Seed, seen)
+                .starts_with("the ALab toolchain seed pass waited 30 min")
+        );
+    }
+
+    /// One slice at a time: due at once, then on the cadence; a wake asks again 20 s
+    /// later, conditionally, and a 304 is nothing.
+    #[test]
+    fn the_slice_asks_when_due_and_twenty_seconds_after_a_wake() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let get: Arc<ConcurrentVendorGetFn<'static>> =
+            Arc::new(vendor("2.1.281", Arc::clone(&asked)));
+        let layout = store_with_legacy_claude("slice");
+        let mut heads = HeadWatch::new(&[String::from("codex")]);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let five = Duration::from_secs(5);
+        let slice = |heads: &mut HeadWatch, at: SystemTime, wall: Duration| {
+            head_watch_slice(heads, &layout, at, Some(wall), five, &get, false)
+        };
+        assert_eq!(
+            slice(&mut heads, t0, five),
+            None,
+            "launched the head worker"
+        );
+        heads.park_for_hint(Duration::from_secs(5));
+        assert_eq!(
+            slice(&mut heads, t0 + Duration::from_secs(1), five),
+            Some(vec!["claude"])
+        );
+        assert_eq!(slice(&mut heads, t0 + five, five), None, "not due");
+        let woke = t0 + Duration::from_secs(60);
+        assert_eq!(slice(&mut heads, woke, Duration::from_secs(55)), None);
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "the wake waits 20 s for the network"
+        );
+        assert_eq!(
+            slice(&mut heads, woke + Duration::from_secs(20), five),
+            None
+        );
+        heads.park_for_hint(Duration::from_secs(5));
+        assert_eq!(
+            slice(&mut heads, woke + Duration::from_secs(21), five),
+            None,
+            "a 304 is harvested without a moved head"
+        );
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [None, Some(String::from("\"2.1.281\""))],
+            "asked again after the wake, conditionally: a 304 is nothing"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+}
+
+/// Where the window's package loop stands, from `[packages]` (Phase 4). TWO states, not
+/// three (2026-09-23): the retired `auto_update`, which once stopped the loop but kept the
+/// launch seed, is folded into `enabled` — one switch, one question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopGate {
+    /// Automatic updates off (`enabled = false`, or a retired `auto_update = false`):
+    /// nothing runs (no seed, no pass, no probe, no head check).
+    Off,
+    /// Automatic updates on: the seed, then the loop.
+    On,
+}
+
+impl LoopGate {
+    /// `enabled` is the RESOLVED switch — `atpkg::config::PackagesConfig::enabled` (or its
+    /// GUI twin, [`Config::packages_enabled`]) — never the raw key.
+    fn of(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+}
+
+/// THE AUTOMATIC-UPDATES SWITCH, READ LIVE (Phase 4, 2026-09-23). The owner's direction:
+/// updates have "controls [that] can be reviewed in settings" — and a control that applies
+/// "next launch" is not one. The loop asks [`Self::poll`] before every pass and every
+/// [`PARK_SLICE`] of a park; a poll `stat`s `aterm.toml` and re-reads its `[packages]`
+/// table only when the file changed (mtime or length). A file that cannot be read, or whose
+/// table does not parse, keeps the gate it had: a half-written save must not start (or
+/// stop) anything. `path` `None` (no config location) keeps the launch gate for good.
 ///
-/// THE GATES read launch-time config only (flipping a switch takes effect at the
-/// next launch). `[packages].enabled` gates everything here — with it off the
-/// `[machine]` settings still get their own one-shot ([`spawn_machine_settings_once`]),
-/// since they are applied by the passes and are not what the switch is about.
-/// `[packages].auto_update` gates ONLY the loop: the seed is not an update — it
-/// records adoption, lays the pending stubs and reads the signed index to say what
-/// this machine will get — so a cadence preference must not cancel the first
-/// launch's toolchain. No co-located `atpkg` (dev / `cargo run`) spawns nothing;
+/// The same read carries `[packages].exclude` ([`Self::exclude`]), which the vendor head
+/// watch takes before every slice of a park ([`sleep_interval_watching_bump`]): one reader of
+/// the table for the whole loop, and an exclusion edited in a running window is heard
+/// within a slice, as atpkg's own passes hear it.
+struct LiveSwitch {
+    path: Option<std::path::PathBuf>,
+    /// The file's `(mtime, length)` at the last read; `Some(None)` for an absent file,
+    /// `None` before the first read.
+    seen: Option<Option<(Option<std::time::SystemTime>, u64)>>,
+    gate: LoopGate,
+    /// `[packages].exclude` at the last read that parsed; empty before one.
+    exclude: Vec<String>,
+}
+
+impl LiveSwitch {
+    fn new(path: Option<std::path::PathBuf>, gate: LoopGate) -> Self {
+        Self {
+            path,
+            seen: None,
+            gate,
+            exclude: Vec::new(),
+        }
+    }
+
+    /// `[packages].exclude` as the last [`Self::poll`] read it.
+    fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    /// The gate as the file says it NOW (see the type's doc).
+    fn poll(&mut self) -> LoopGate {
+        let Some(path) = self.path.as_deref() else {
+            return self.gate;
+        };
+        let stamp = std::fs::metadata(path)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()));
+        if self.seen == Some(stamp) {
+            return self.gate;
+        }
+        let first_read = self.seen.is_none();
+        self.seen = Some(stamp);
+        if let Some(cfg) = atpkg::config::load_live(path)
+            && !cfg.unreadable
+        {
+            let gate = LoopGate::of(cfg.enabled());
+            if gate != self.gate {
+                aterm_log::info!(
+                    "atpkg lane: [packages] now reads {gate:?} (was {:?})",
+                    self.gate
+                );
+            }
+            self.gate = gate;
+            if cfg.exclude() != self.exclude.as_slice() {
+                if !first_read {
+                    aterm_log::info!(
+                        "atpkg lane: [packages] exclude now reads {:?} (was {:?})",
+                        cfg.exclude(),
+                        self.exclude
+                    );
+                }
+                self.exclude = cfg.exclude().to_vec();
+            }
+        }
+        self.gate
+    }
+}
+
+/// Stand by until the switch reads a gate `ready` accepts, looking every [`PARK_SLICE`].
+/// Nothing else runs meanwhile.
+fn stand_by(switch: &mut LiveSwitch, ready: impl Fn(LoopGate) -> bool) {
+    while !ready(switch.poll()) {
+        std::thread::sleep(PARK_SLICE);
+    }
+}
+
+#[cfg(test)]
+mod live_switch_tests {
+    use super::{LiveSwitch, LoopGate, ParkEnd, sleep_interval_watching_bump};
+    use std::time::{Duration, Instant, SystemTime};
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-live-switch-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("aterm.toml")
+    }
+
+    /// THE SWITCH IS LIVE (Phase 4): the loop's next read of `aterm.toml` sees an edit —
+    /// Automatic updates off stands everything down, and so does the retired
+    /// `auto_update = false` (folded into the one switch, 2026-09-23), back on resumes —
+    /// with no relaunch. A file that cannot be read, or a table
+    /// that does not parse, keeps the gate it had (a half-written save starts and stops
+    /// nothing); a file that is gone is the defaults; no config location keeps the launch
+    /// gate for good.
+    #[test]
+    fn a_config_edit_is_seen_by_the_next_read() {
+        let path = scratch("edit");
+        std::fs::write(&path, "[packages]\nenabled = true\n").unwrap();
+        let mut switch = LiveSwitch::new(Some(path.clone()), LoopGate::On);
+        assert_eq!(switch.poll(), LoopGate::On);
+        std::fs::write(&path, "[packages]\nenabled = false\n").unwrap();
+        assert_eq!(switch.poll(), LoopGate::Off, "turned off: seen at once");
+        assert_eq!(
+            switch.poll(),
+            LoopGate::Off,
+            "an unchanged file is not re-read"
+        );
+        std::fs::write(&path, "[packages]\nenabled = true\n").unwrap();
+        assert_eq!(switch.poll(), LoopGate::On);
+        std::fs::write(&path, "[packages]\nenabled = true\nauto_update = false\n").unwrap();
+        assert_eq!(
+            switch.poll(),
+            LoopGate::Off,
+            "the retired auto_update = false is the one switch, off"
+        );
+        std::fs::write(&path, "[packages]\nenabled = true\n").unwrap();
+        assert_eq!(switch.poll(), LoopGate::On, "back on: resumed");
+        // A torn save keeps the gate it had.
+        std::fs::write(&path, "[packages]\nenabled = fal").unwrap();
+        assert_eq!(switch.poll(), LoopGate::On);
+        std::fs::write(&path, "[packages]\nenabled = false\n").unwrap();
+        assert_eq!(switch.poll(), LoopGate::Off);
+        std::fs::write(&path, "[packages\nenabled = true\n").unwrap();
+        assert_eq!(
+            switch.poll(),
+            LoopGate::Off,
+            "an unparsable file changes nothing"
+        );
+        // Gone: the defaults (on).
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(switch.poll(), LoopGate::On);
+        // No config location: the launch gate stands.
+        let mut fixed = LiveSwitch::new(None, LoopGate::Off);
+        assert_eq!(fixed.poll(), LoopGate::Off);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A PARK HEARS THE SWITCH within a slice, before any probe or head check: it answers
+    /// `SwitchedOff` at the first slice's end instead of running on to its deadline (the
+    /// lane then stands by inside the park — `PkgLane::park`).
+    #[test]
+    fn a_park_answers_the_switch_within_a_slice() {
+        let path = scratch("park");
+        std::fs::write(&path, "[packages]\nenabled = false\n").unwrap();
+        let started = Instant::now();
+        let end = sleep_interval_watching_bump(
+            None,
+            &mut (SystemTime::now() + Duration::from_millis(30)),
+            Duration::from_secs(300),
+            &mut super::BumpWatch::default(),
+            true,
+            None,
+            // Launched On; the slice's read of the file says Off.
+            &mut LiveSwitch::new(Some(path.clone()), LoopGate::On),
+        );
+        assert_eq!(end, ParkEnd::SwitchedOff);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// THE SAME READ CARRIES `[packages].exclude` for the head watch: an edit is seen by
+    /// the next read, a torn save keeps the list it had, and a file that is gone is the
+    /// defaults (nothing excluded).
+    #[test]
+    fn the_exclusion_rides_the_same_read() {
+        let path = scratch("exclude");
+        let mut switch = LiveSwitch::new(Some(path.clone()), LoopGate::On);
+        assert!(switch.exclude().is_empty(), "nothing read yet");
+        std::fs::write(&path, "[packages]\nexclude = [\"codex\"]\n").unwrap();
+        assert_eq!(switch.poll(), LoopGate::On);
+        assert_eq!(switch.exclude(), ["codex".to_string()]);
+        std::fs::write(&path, "[packages]\nexclude = [\"claude\", \"codex\"]\n").unwrap();
+        switch.poll();
+        assert_eq!(
+            switch.exclude(),
+            ["claude".to_string(), "codex".to_string()]
+        );
+        std::fs::write(&path, "[packages\nexclude = []\n").unwrap();
+        switch.poll();
+        assert_eq!(switch.exclude().len(), 2, "a torn save keeps the list");
+        std::fs::remove_file(&path).unwrap();
+        switch.poll();
+        assert!(switch.exclude().is_empty(), "gone: the defaults");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+/// Spawn the LIVE AGENT UPGRADE host: every minute, the harness's `upgrade` sweep
+/// ([`aterm_agent::harness::upgrade_drive::host`]) moves each Claude Code session in
+/// THIS instance's tabs one step toward a newer build — the managed twin, or the native
+/// install's current version for a session that runs native: the answer to Claude Code's
+/// own "Update installed" banner, without anyone typing it. The sweep is
+/// cooperative by construction: it types a notice asking the agent to reach a stopping
+/// point, waits for its READY answer and for every shell under it to finish (never
+/// killing one), and only then ends the agent with SIGTERM and resumes the same
+/// conversation in the same tab.
+///
+/// ON BY DEFAULT, gated live every tick by aterm.toml's `[harness] enabled` (Settings ▸
+/// Harness) and `[harness] upgrade` (this sweep's own switch; it moved there from the
+/// harness's deleted `config.toml`). No environment switch. Skipped headless, and a
+/// handoff candidate waits until it is committed, like the packages loop.
+fn spawn_agent_live_upgrade() {
+    let Some(home) = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|h| h.is_absolute())
+    else {
+        return;
+    };
+    let Ok(root) = aterm_agent::operator::default_state_root() else {
+        return;
+    };
+    let state = root
+        .join("harness")
+        .join(aterm_agent::harness::cli::HARNESS);
+    let pid = std::process::id();
+    let _ = std::thread::Builder::new()
+        .name("agent-upgrade".into())
+        .spawn(move || {
+            // A background sweep no human waits on.
+            crate::qos::set_self(crate::qos::Role::Background);
+            let _ = aterm_update::wait_while_uncommitted_handoff_candidate(
+                aterm_update::UNCOMMITTED_CANDIDATE_HOLD_BOUND,
+            );
+            // Gated by the window's own parsed `[harness]` table, not a
+            // second reader of the file.
+            aterm_agent::harness::upgrade_drive::host(
+                &home,
+                &state,
+                harness_host::upgrade_enabled,
+                pid,
+                |r| aterm_log::info!("agent upgrade: {}", r.line()),
+            );
+        });
+}
+
+/// Spawn the toolchain launch thread: the one-shot `atpkg seed`, then the loop that
+/// runs the co-located `atpkg update` so the managed programs keep current (and, under
+/// the one install consent `[packages].auto_install`, default on, installs missing
+/// default-set members — atpkg reads that key from the same config itself). Every pass
+/// streams through [`run_atpkg_pass`] over one [`PkgLane`].
+///
+/// THE GATE IS LIVE (Phase 4, 2026-09-23): the thread starts whatever the switch says and
+/// reads it from `aterm.toml` as it goes ([`LiveSwitch`]) — before the seed, before every
+/// pass, and every slice of every park — so "Automatic updates" off stands the loop down
+/// within seconds and on resumes it, with no relaunch. `[packages].enabled` — Automatic
+/// updates, THE switch, with the retired `auto_update` folded in exactly as atpkg folds it
+/// (`atpkg::config::PackagesConfig::enabled`; [`Config::packages_enabled`] at launch) —
+/// gates everything here, the launch seed included, but the `[machine]` settings' one-shot
+/// ([`spawn_machine_settings_once`]), which every launch runs — the passes no longer apply
+/// them (Phase 3) — and which is not what the switch is about. There is no environment
+/// kill switch (2026-09-23). Standing by costs one `stat` of `aterm.toml` per slice: no
+/// pass, no probe, no head check. No co-located `atpkg` (dev / `cargo run`) spawns nothing;
 /// `atpkg` verifies its own signed channel and is inert on a build with no pinned
-/// root key, so for a real `.app` this is always safe. The interval is
-/// `ATPKG_UPDATE_INTERVAL_SECS` (default 6 h; 0 = once): the env override survives
-/// the config gate on purpose — it tunes cadence, never consent.
+/// root key, so for a real `.app` this is always safe.
+///
+/// THE SCHEDULE (Phase 3, 2026-09-23). DISCOVERY is atpkg's next-index probe
+/// ([`atpkg::index_probe`]: HEADs of the next index tags every minute and five minutes,
+/// with shared stamps across processes), which wakes healthy or failure parks for a
+/// strictly newer index;
+/// the vendor head watch rides every park. THE FALLBACK is the six-hour walk
+/// ([`aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS`], no knob — the
+/// `ATPKG_UPDATE_INTERVAL_SECS` override and its once-pass mode are gone), machine-wide:
+/// every park is on the WALL clock, so a Mac that slept through the deadline runs the
+/// walk twenty seconds after it wakes, and every pass but a forced launch and a stub's
+/// wish is re-checked against the stamps right before it runs
+/// ([`scheduled_pass_gate`]), so windows share one walk and never run a pass a sibling is
+/// running, just ran, or just landed.
 ///
 /// CONTENTION: a pass that finds another atpkg's install in flight WAITS for it
 /// (`--wait-lock`, [`ATPKG_WAIT_LOCK_SECS`]) and then runs; a wait that runs out
 /// is retried after 30 s, then 60 s ([`ContentionBackoff`]), and the third in a
-/// row with nothing moving is the wedge, whose park is an hour — never the
-/// interval. A seed whose wait ran out is run again by the loop at once, ahead of
-/// its first update ([`PkgLane::run_launch_seed`]). FAILURE: a pass that ran and
-/// exited non-zero parks on the failure ladder ([`Backoff::FAILURE`]), never the
-/// interval. ONCE-PASS: interval 0 means one pass that RAN — a contended one is
-/// retried until it does, or stood down for this launch once the holder looks
-/// wedged ([`wedge_park`]).
+/// row with nothing moving is the wedge, whose park is an hour. A seed whose wait ran
+/// out is run again by the loop at once, ahead of its first update
+/// ([`PkgLane::run_launch_seed`]). FAILURE: a pass that ran and failed — a published
+/// index it did not land included — parks on the failure ladder ([`Backoff::FAILURE`]:
+/// 10 min doubling to 2 h), never the walk's interval. The index probe keeps
+/// watching for a strictly newer published index during that park, except when
+/// GitHub refused a metered listing until its named reset: that parks the probe
+/// and every lane's next full pass until the reset ([`scheduled_pass_gate`]).
+/// An `update` that exited 2 with the index reached settles instead ([`PassEnding`]).
+/// HEAD WATCH: every park of the loop also watches the vendor heads ([`PkgLane::park`]);
+/// with the loop off there is no watch.
 fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool {
     let Some(atpkg) = co_located_atpkg() else {
         return false;
@@ -27525,16 +32399,22 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
         "atpkg lane: passes run {} (co-located with the running executable)",
         atpkg.display()
     );
-    if !config.packages_enabled() {
-        // The `[machine]` settings are applied by the passes this switch turns
-        // off, and they are not what it is about (a user who turned off toolchain
-        // maintenance silently lost Universal Control off and Spotlight kept out
-        // of their build output): they get their own one-shot. Idempotent —
-        // nothing to change prints nothing.
-        spawn_machine_settings_once(atpkg, proxy);
-        return false;
-    }
-    let run_update_loop = config.packages_update_loop_enabled();
+    // THE PASSES NO LONGER APPLY THEM (Phase 3, 2026-09-22): a pass carries only an edit
+    // to the `[machine]` table, so this launch runs their own verb — AT ONCE, beside the
+    // launch seed rather than after it: the seed can queue behind another window's pass
+    // for its whole `--wait-lock` bound, and a window that quit meanwhile never applied
+    // them. The two never walk `$HOME` together: atpkg queues every apply on
+    // `<prefix>/machine.lock`, and a seed edge carrying an edit re-reads the table there.
+    // And with Automatic updates OFF too: the `[machine]` settings are not what that
+    // switch is about (a user who turned off updates must not lose Universal Control off
+    // and Spotlight kept out of their build output). Idempotent — nothing to change prints
+    // nothing.
+    spawn_machine_settings_once(atpkg.clone(), proxy.clone());
+    let launch_gate = LoopGate::of(config.packages_enabled());
+    // ATPKG'S resolution of aterm.toml, not the window's: it falls back to the account's
+    // home where `HOME` is unset, so the switch and `[packages].exclude` read the file
+    // every pass this lane runs reads.
+    let config_path = atpkg::config::config_path();
     std::thread::Builder::new()
         .name("atpkg-update".into())
         .spawn(move || {
@@ -27542,6 +32422,18 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // human waits on (design §4 already calls this "a parked background
             // thread"). Undeclared it ran at DEFAULT, the typing band.
             crate::qos::set_self(crate::qos::Role::Background);
+            // THE SWITCH, LIVE (Phase 4): read from the file from here on. Off, the thread
+            // stands by — nothing runs — until it is turned on, and then launches as a
+            // window would: seed, then the loop.
+            let mut switch = LiveSwitch::new(config_path, launch_gate);
+            if switch.poll() == LoopGate::Off {
+                aterm_log::info!(
+                    "atpkg lane: Automatic updates is off (Settings \u{25b8} Packages) \u{2014} \
+                     standing by; nothing runs until it is turned on"
+                );
+                stand_by(&mut switch, |gate| gate == LoopGate::On);
+                aterm_log::info!("atpkg lane: Automatic updates turned on \u{2014} starting");
+            }
             // AN UNCOMMITTED HANDOFF CANDIDATE RUNS NO PASS (2026-09-19): a
             // successor waits here until the outgoing process has committed to
             // it — a pass from a process the parent may still reject would
@@ -27554,11 +32446,10 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     "atpkg lane: the launch passes waited for this handoff to be committed"
                 );
             }
-            // THE ONE READER (`pkg_check`), shared with the session lane: it caps
-            // the knob at the park's clock range (a raw parse accepted a value that
-            // panicked `Instant + Duration` at the first park and ended the loop
-            // silently).
-            let interval = aterm_update_core::pkg_check::update_interval_secs();
+            // THE WALK'S INTERVAL, the machine-wide rule's own (`pkg_check`), shared with
+            // the session lane. A constant: the `ATPKG_UPDATE_INTERVAL_SECS` knob that
+            // tuned it (and its once-pass mode) is gone (Phase 3).
+            let interval = aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS;
             let layout = atpkg::store::resolve_configured();
             let child_path = crate::spawn::atpkg_child_path();
             let mut lane = PkgLane {
@@ -27569,20 +32460,16 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     let _ = proxy.send_event(event);
                 },
                 wait_row_open: false,
-                seed_announced_work: false,
                 backoff: ContentionBackoff::default(),
+                ran_at: None,
+                switch,
             };
-            // The launch seed ALWAYS runs: its work under the lock is this build's
-            // own stub / reroute / rustup-seam / exec-root reconcile — about a
-            // second on a provisioned Mac — which a self-update's successor owes
-            // for the binary it now is. It may queue behind the predecessor's
-            // in-flight pass; that wait is a log line, never a row (2026-09-18).
-            let mut seed_pending = lane.run_launch_seed(run_update_loop);
-            if !run_update_loop {
-                // `auto_update = false`: the batteries went in above, and that
-                // is all this thread was asked to do.
-                return;
-            }
+            // The launch seed ALWAYS runs once Automatic updates is on: its work under the
+            // lock is this build's own stub / reroute / rustup-seam / exec-root reconcile —
+            // about a second on a provisioned Mac — which a self-update's successor owes
+            // for the binary it now is. It may queue behind the predecessor's in-flight
+            // pass; that wait is a log line, never a row (2026-09-18).
+            let mut seed_pending = lane.run_launch_seed();
             // THE FIRST UPDATE RUNS AT ONCE, after a seed too — WHEN IT IS OWED
             // (2026-09-18). `atpkg update` moves bytes only for a program whose
             // published pin drifted, and a cut DMG is stale by construction (the
@@ -27593,18 +32480,18 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // own update: the successor queued behind the predecessor's orphaned
             // pass at the store lock (12.7 s on the owner's machine) and then
             // re-did ~14 s of lock work on a store that had just been checked. The
-            // store's own record decides instead, the way the session lane already
-            // does (`pkg_check::session_pass_due`): a last ATTEMPT younger than
-            // the interval owes nothing now, and the loop's first park is the
+            // store's own record decides instead: a last SUCCESS younger than the
+            // walk's interval owes nothing now, and the loop's first park is the
             // remainder of that interval — so the six-hour cadence survives
             // handoffs and relaunches instead of restarting at each. Read AFTER
             // the seed, not at thread start: on a launch-time self-update the
             // predecessor's pass is still in flight when this thread starts and
             // stamps the record while the seed queues behind it. A machine never
             // checked, or checked longer ago than the interval, updates at once
-            // as before; the once-pass knob (`interval == 0`) always runs; a seed
-            // still owed (it stood aside at the lock) runs ahead of the update
-            // regardless. The FIRST LAUNCH OF A NEW APP BUILD updates at once
+            // as before (after the re-check, [`scheduled_pass_gate`]: not on top of a
+            // sibling's pass in flight or a moment old); a seed still owed (it stood
+            // aside at the lock) runs ahead of the update regardless. The FIRST LAUNCH
+            // OF A NEW APP BUILD updates at once
             // (2026-09-22, [`launch_update_park`]): its predecessor's record is the
             // old build's, and the pins published since are what it must fetch.
             let just_updated = JUST_UPDATED.get().copied().unwrap_or(false);
@@ -27615,21 +32502,99 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 );
             }
             let mut bump_watch = BumpWatch::default();
-            let mut failure_backoff = Backoff::FAILURE;
-            if !seed_pending
-                && !lane.seed_announced_work
-                && let Some(park) =
-                    launch_update_park(just_updated, layout.as_ref(), interval, pkg_unix_now())
-            {
+            // THE VENDOR HEAD WATCH (design §1.6) rides the same parks: claude and
+            // codex releases are noticed within minutes, not at the index cadence. None
+            // where the pass it hints for reaches no vendor (manager off, `dir:` registry).
+            let mut head_watch =
+                atpkg::vendor_direct::watch::for_this_process(lane.switch.exclude());
+            if head_watch.is_none() {
                 aterm_log::info!(
-                    "atpkg launch update skipped: the store's last successful pass is younger \
-                     than the {} interval — the next runs in {}",
-                    human_park(Duration::from_secs(interval)),
-                    human_park(park)
+                    "vendor head watch off: the package manager is disabled or its registry \
+                     is a local directory"
                 );
-                sleep_interval_watching_bump(layout.as_ref(), park, &mut bump_watch);
             }
+            let mut failure_backoff = Backoff::FAILURE;
+            // This lane's own full passes, and whether the last one failed (its park is
+            // the failure ladder's, with the index probe off).
+            let mut own = OwnPasses::default();
+            let mut failing = false;
+            let mut why = if seed_pending {
+                PassWhy::LaunchDue
+            } else {
+                lane.launch_update_why(just_updated, &mut bump_watch, head_watch.as_mut(), false)
+            };
             loop {
+                // THE SWITCH, LIVE (Phase 4): read before every pass. Off stands the loop
+                // down — no pass, no probe, no head check — until it is on again; then
+                // the launch rule decides at once whether a pass is owed (a day off owes
+                // one now; five minutes off, the rest of the walk's interval), and the
+                // re-check below still dedups it against a sibling's. A launch pass owed
+                // whatever the record says ([`PassWhy::Launch`]) that never ran is still
+                // owed.
+                if lane.switch.poll() != LoopGate::On {
+                    aterm_log::info!(
+                        "atpkg lane: Automatic updates turned off \u{2014} the package loop \
+                         stands down"
+                    );
+                    stand_by(&mut lane.switch, |gate| gate == LoopGate::On);
+                    aterm_log::info!(
+                        "atpkg lane: Automatic updates turned on \u{2014} the package loop \
+                         resumes"
+                    );
+                    if !seed_pending && why != PassWhy::Launch {
+                        why = lane.launch_update_why(
+                            false,
+                            &mut bump_watch,
+                            head_watch.as_mut(),
+                            false,
+                        );
+                    }
+                    continue;
+                }
+                // THE RE-CHECK (Phase 3): the stamps as they stand NOW, right before a
+                // scheduled update pass. A pass a sibling is running, just ran, or just
+                // landed is not run again back to back; the park it takes instead keeps
+                // the probe and the head watch, so a new index or a stub still wakes it.
+                let stamps = pass_stamps(layout.as_ref());
+                let now = unix_secs(std::time::SystemTime::now());
+                if !seed_pending
+                    && let Some((park, then)) =
+                        scheduled_pass_gate(why, &stamps, own, lane.ran_at, now)
+                {
+                    // The five-second local holder recheck is intentionally
+                    // quiet. Logging it every time would turn a long package
+                    // install into a steady stream of identical disk writes.
+                    if !(stamps.in_flight
+                        && matches!(why, PassWhy::Published(_))
+                        && park == PUBLISHED_HOLDER_RECHECK)
+                    {
+                        aterm_log::info!(
+                            "atpkg update pass not run now ({}): {} \u{2014} looking again in {}",
+                            why.words(),
+                            if stamps.metered_hold_in(now) > 0 {
+                                "GitHub's API refused this machine's listing until its rate-limit \
+                                 reset"
+                            } else if then == why {
+                                "another aterm process's pass is running or ran a moment ago"
+                            } else {
+                                "another aterm process's pass covered it"
+                            },
+                            human_park(park)
+                        );
+                    }
+                    if why == PassWhy::Retry && then != PassWhy::Retry {
+                        // A sibling's success healed this lane's failure: the ladder is done.
+                        failing = false;
+                        failure_backoff.reset();
+                        own.failed_at = None;
+                    }
+                    // A hold parks the index probe too: its listing is metered, and an index
+                    // it saw would only wake a pass the gate holds again.
+                    let probe = stamps.metered_hold_in(now) == 0;
+                    let end = lane.park(park, &mut bump_watch, probe, head_watch.as_mut());
+                    why = end.pass_why(then);
+                    continue;
+                }
                 // `update`, or `seed` again while the seed is still owed: the
                 // retried seed rides this lane's wait, tailer, backoff and wedge
                 // rule, and the update follows once it has run.
@@ -27643,10 +32608,18 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 let recorded_before = layout.as_ref().and_then(atpkg::status::read);
                 // The short park after THIS pass timed out queued behind a sibling
                 // (`Some` is also what says it did), and the park after a pass
-                // that ran and exited non-zero.
+                // that ran and failed.
                 let mut busy_park: Option<Duration> = None;
                 let mut failure_park: Option<Duration> = None;
-                if let Some(run) = lane.run(verb) {
+                // Both seed and update can change the store after a network
+                // probe sampled it. A worker finishing during either pass must
+                // not overwrite the pass's newer unlanded/floor decision.
+                bump_watch.note_full_pass_started();
+                let published_index = match why {
+                    PassWhy::Published(build) if verb == PassVerb::Update => Some(build),
+                    _ => None,
+                };
+                if let Some(run) = lane.run(verb, published_index) {
                     if run.ran() {
                         report_pass_verdict(verb, &run, lane.layout, |e| lane.post(e));
                         // A pass that RAN (it held the lock) or was refused at the
@@ -27654,28 +32627,72 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         // tally starts over.
                         lane.backoff.reset();
                         // A pass that RAN and FAILED parks on the failure ladder,
-                        // never the interval: a transient cause (network, disk, a
-                        // helper that died) is retried in minutes. A pass that
-                        // exits 0 starts the ladder over.
-                        if run.ok() {
-                            failure_backoff.reset();
-                        } else {
+                        // never the walk's interval: a transient cause (network, disk,
+                        // a helper that died) is retried in minutes. A pass that
+                        // succeeded — or settled ([`PassEnding::Settled`]) — starts the
+                        // ladder over. An update that exited 0 on the index CACHE never
+                        // checked, and one a published index woke that did not land it
+                        // did not do what it ran for: both retry on the same ladder
+                        // unless they settled ([`update_pass_served_from_cache`]), and the
+                        // index is no wake again either way ([`note_pass_ending`]).
+                        let recorded_after = layout.as_ref().and_then(atpkg::status::read);
+                        let reached = verb != PassVerb::Update
+                            || update_pass_reached_index(
+                                recorded_before.as_ref(),
+                                recorded_after.as_ref(),
+                            );
+                        let landed = match why {
+                            PassWhy::Published(build) if verb == PassVerb::Update => layout
+                                .as_ref()
+                                .is_some_and(|l| atpkg::index_probe::verified_floor(l) >= build),
+                            _ => true,
+                        };
+                        let ending = pass_ending(verb, run.code, reached, landed);
+                        failing = note_pass_ending(
+                            verb,
+                            why,
+                            ending,
+                            landed,
+                            unix_secs(std::time::SystemTime::now()),
+                            &mut own,
+                            &mut bump_watch.unlanded,
+                        );
+                        // A pass refused by GitHub's rate limit waits for the reset it named, not
+                        // a ladder rung inside it: a retry before it is refused again.
+                        let held = pass_stamps(layout.as_ref())
+                            .metered_hold_in(unix_secs(std::time::SystemTime::now()));
+                        if failing && held > 0 {
+                            failure_park = Some(Duration::from_secs(held));
+                        } else if failing {
                             failure_park = Some(failure_backoff.park());
+                        } else {
+                            failure_backoff.reset();
                         }
                         // One INFO line naming the outcome THIS pass recorded, so
                         // "did the check run, and when?" has an answer beside
                         // status.toml — and a pass that wrote nothing is not lent
                         // the previous pass's sentence ([`pass_outcome_clause`]).
-                        let outcome = pass_outcome_clause(
-                            recorded_before.as_ref(),
-                            layout.as_ref().and_then(atpkg::status::read),
-                        );
+                        let outcome = pass_outcome_clause(recorded_before.as_ref(), recorded_after);
                         aterm_log::info!(
-                            "atpkg {verb} pass finished: exit={}{} outcome={outcome}",
+                            "atpkg {verb} pass finished{}: exit={}{}{} outcome={outcome}",
+                            if verb == PassVerb::Update {
+                                format!(" ({})", why.words())
+                            } else {
+                                String::new()
+                            },
                             if run.ok() { "ok" } else { "failed" },
-                            match failure_park {
-                                Some(park) => format!(" (next try in {})", human_park(park)),
-                                None => String::new(),
+                            match (why, landed) {
+                                (PassWhy::Published(build), false) =>
+                                    format!(" (index {build} did not land)"),
+                                _ => String::new(),
+                            },
+                            match (ending, failure_park) {
+                                (PassEnding::Settled, _) => " (nothing installable here until \
+                                                             a new index is published; not \
+                                                             retried)"
+                                    .to_string(),
+                                (_, Some(park)) => format!(" (next try in {})", human_park(park)),
+                                _ => String::new(),
                             }
                         );
                         if seed_pending {
@@ -27685,65 +32702,38 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                             // launch takes (2026-09-18): the retried seed queued
                             // behind a holder that may have checked this store.
                             seed_pending = false;
-                            lane.seed_announced_work = run.seen.saw_start;
-                            if !lane.seed_announced_work
-                                && let Some(park) = launch_update_park(
-                                    just_updated,
-                                    layout.as_ref(),
-                                    interval,
-                                    pkg_unix_now(),
-                                )
-                            {
-                                aterm_log::info!(
-                                    "atpkg launch update skipped after the retried seed: the \
-                                     store's last successful pass is younger than the {} \
-                                     interval — the next runs in {}",
-                                    human_park(Duration::from_secs(interval)),
-                                    human_park(park)
-                                );
-                                sleep_interval_watching_bump(
-                                    layout.as_ref(),
-                                    park,
-                                    &mut bump_watch,
-                                );
-                            }
+                            why = lane.launch_update_why(
+                                just_updated,
+                                &mut bump_watch,
+                                head_watch.as_mut(),
+                                true,
+                            );
                             continue;
                         }
                     } else {
-                        busy_park = lane.park_after_timed_out_wait(verb, &run, interval);
+                        busy_park = Some(lane.park_after_timed_out_wait(verb, &run));
                     }
                 }
-                // A once-pass (`ATPKG_UPDATE_INTERVAL_SECS=0`, the test knob) ends
-                // after a pass that RAN — a contended one is retried until it does,
-                // unless the holder looks wedged, when a once-pass stands down for
-                // good rather than looping on half-hour waits (the three doc sites
-                // — `prefs.rs`, `pkg_check.rs`, the streaming design §4 — say the
-                // same). A retried seed that ran `continue`d above, so the update
-                // it owes still runs before this can end the once-pass.
-                // …and a once-pass that FAILED retries on the failure ladder first, as
-                // the ladder's own commit promised and this `break` denied (audit
-                // 2026-09-14): bounded by the ladder's rungs, so a test's once-pass over
-                // a permanently failing member still ends.
-                if interval == 0
-                    && (busy_park.is_none() || lane.backoff.wedged())
-                    && (failure_park.is_none()
-                        || failure_backoff.cycles() >= ONCE_PASS_FAILURE_RETRIES)
-                {
-                    break;
-                }
-                // Park — for the interval in 5s slices watching `<prefix>/bump`
-                // (design §4): a stub run while NO installer holds the flock can
-                // only wish — this watch is what grants it, turning a fresh bump
+                // Park — for the walk's interval, on the wall clock, in 5s slices watching
+                // `<prefix>/bump` (design §4): a stub run while NO installer holds the
+                // flock can only wish — this watch is what grants it, turning a fresh bump
                 // into an immediate pass. Rate-floored (one early pass per 5min),
-                // failure-aware (a program the current pass already recorded as
-                // failed does not re-trigger), and the 6h cadence itself stands.
-                // A failed pass parks on its ladder (never longer than the
-                // interval); a contended one on the contention backoff, which wins
-                // when both apply; the bump watch is kept either way.
+                // failure-aware (a program the current pass already recorded as failed
+                // does not re-trigger). A failed pass parks on its ladder (never longer
+                // than the interval); a contended one on the contention backoff, which
+                // wins when both apply; the bump watch is kept either way. The vendor head
+                // watch rides every park. An index probe may find a newer signed index
+                // during a failure park; contention parks leave probing to the holder.
                 let park = busy_park
-                    .or_else(|| failure_park.map(|p| p.min(Duration::from_secs(interval.max(1)))))
+                    .or_else(|| failure_park.map(|p| p.min(Duration::from_secs(interval))))
                     .unwrap_or_else(|| Duration::from_secs(interval));
-                sleep_interval_watching_bump(layout.as_ref(), park, &mut bump_watch);
+                let end = lane.park(
+                    park,
+                    &mut bump_watch,
+                    busy_park.is_none(),
+                    head_watch.as_mut(),
+                );
+                why = end.pass_why(why.after_park(busy_park.is_some(), failing));
             }
         })
         .is_ok()
@@ -27794,40 +32784,9 @@ fn post_macos_access_card_facts(
         .is_ok()
 }
 
-/// Scan an `atpkg seed` child's stdout for the two STABLE marker lines the
-/// batteries-included lane prints (crates/atpkg/src/cli.rs `cmd_seed` — the
-/// markers are a cross-crate contract; changing either side blinds the other):
-///
-///   `atpkg: seed-installed: <name>, <name>, …`
-///   `atpkg: seed-pending: <human tail>`
-///
-/// Returns `None` when neither matched (the quiet-seed common case), else
-/// `(installed_names, pending_tail)`. Pure so the contract is unit-testable
-/// without spawning a child.
-fn parse_seed_markers(stdout: &str) -> Option<(Vec<String>, Option<String>)> {
-    let mut installed: Vec<String> = Vec::new();
-    let mut pending: Option<String> = None;
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("atpkg: seed-installed: ") {
-            installed.extend(
-                rest.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-            );
-        } else if let Some(rest) = line.strip_prefix("atpkg: seed-pending: ") {
-            let tail = rest.trim();
-            if !tail.is_empty() {
-                pending = Some(tail.to_string());
-            }
-        }
-    }
-    (!installed.is_empty() || pending.is_some()).then_some((installed, pending))
-}
-
-/// The two R6 markers (2026-09-10), the stdout contract beside atpkg's eleven
-/// `seed-*`/`net-*` markers: `managed-current: <name> <version> (build <N>); …`
-/// lists every AGENT program installed AND at the index pin, and
+/// The two R6 markers (2026-09-10), the stdout contract beside atpkg's seven
+/// `seed-*`/`net-*` markers: `managed-current: <name> <version> (<Vendor> latest); …`
+/// lists every AGENT program installed AND at its vendor's latest, and
 /// `machine-settings: <item>; …` lists only what a pass CHANGED per doctor
 /// (omitted when nothing changed). Printed by `atpkg update`/`seed` with the
 /// `atpkg: ` prefix like every other marker; accepted here with or without it, so a
@@ -27848,7 +32807,7 @@ fn r6_marker_body<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
 }
 
 /// Whether a parsed marker event is a TERMINAL ANSWER to an announcement.
-/// `seed-starting:` OPENS the held "Installing the ALab toolchain…" card and never
+/// `net-starting:` OPENS the held "Installing ALab tools" row and never
 /// counts as an answer: a child that dies straight after printing it would
 /// otherwise have "answered", leaving the card up for its full 20-minute hold with
 /// the failure recorded nowhere. The list is explicit, never `_ => true`:
@@ -27863,11 +32822,23 @@ fn seed_event_is_terminal(event: &Wake) -> bool {
         event,
         Wake::PkgSeed { .. }
             | Wake::PkgSeedDone { .. }
-            | Wake::PkgSeedPartial { .. }
             | Wake::PkgSeedFailed { .. }
             | Wake::PkgSeedUnusable { .. }
             | Wake::PkgGroupAborted { .. }
     )
+}
+
+/// Whether a terminal marker event says the pass FAILED — the ones the Settings ▸
+/// Packages badge remembers (`App::note_package_pass_failure`). Explicit, like
+/// [`seed_event_is_terminal`]: a marker added later is not a failure until named here.
+/// A `seed-unusable:` that states a fact (an unserved architecture:
+/// [`atpkg::cli::seed_unusable_is_informational`]) is not one.
+fn seed_event_is_failure(event: &Wake) -> bool {
+    match event {
+        Wake::PkgSeedFailed { .. } | Wake::PkgGroupAborted { .. } => true,
+        Wake::PkgSeedUnusable { detail } => !atpkg::cli::seed_unusable_is_informational(detail),
+        _ => false,
+    }
 }
 
 /// What an `atpkg` child's stdout said about the marker contract: whether it OPENED
@@ -27884,6 +32855,9 @@ struct SeedMarkers {
     saw_terminal: bool,
     saw_lock_wait: bool,
     saw_busy: bool,
+    /// A FAILURE marker was read ([`seed_event_is_failure`]): the pass is not a
+    /// clean one, whatever its exit (`Wake::PkgPassEnded`).
+    saw_failure: bool,
     /// A `machine-settings:` change was read — the card now expects the pass's
     /// own `machine-state:` record behind it.
     saw_machine_change: bool,
@@ -27947,6 +32921,7 @@ fn read_seed_markers<R: std::io::BufRead>(out: R, mut post: impl FnMut(Wake)) ->
                 seen.saw_lock_wait = true;
             } else if seed_event_is_terminal(&event) {
                 seen.saw_terminal = true;
+                seen.saw_failure |= seed_event_is_failure(&event);
             } else if matches!(event, Wake::PkgMachineSettings(_)) {
                 seen.saw_machine_change = true;
             } else if matches!(event, Wake::PkgMachineState(_)) {
@@ -27983,7 +32958,7 @@ enum SeedRetire {
 /// three guards in order. No announcement, or a terminal marker that answered it,
 /// is `Nothing`: only a card that was actually raised is retired (`atpkg seed`
 /// exits quietly, markerlessly and zero on every launch of a provisioned Mac), and
-/// only a terminal answers (a child that dies after `seed-starting:` is still
+/// only a terminal answers (a child that dies after `net-starting:` is still
 /// unanswered). A non-zero exit is `Failed`, whatever the child printed. A zero
 /// exit is `Finished` or `FinishedEmpty` by the STORE — the one positive authority
 /// in reach: the pass said it succeeded, the marker stream's silence is no evidence
@@ -28034,7 +33009,7 @@ fn seed_retire_event(verdict: SeedRetire, said: &str) -> Option<Wake> {
         // install list, so claiming one would fabricate exactly the kind of fact this
         // whole change exists to stop.
         SeedRetire::Finished => Some(Wake::PkgSeedDone {
-            detail: "the toolchain pass finished".to_string(),
+            detail: "the package update finished".to_string(),
         }),
         // Exit 0 and an empty store. Its own words: "failed" would assert a failure
         // nobody saw, and a tick would assert a toolchain that is not there.
@@ -28042,12 +33017,10 @@ fn seed_retire_event(verdict: SeedRetire, said: &str) -> Option<Wake> {
     }
 }
 
-/// One STREAMED line of `atpkg` stdout → the `Wake` it should raise, if any: the
-/// line-at-a-time twin of [`parse_seed_markers`] (which stays as the whole-output
-/// parser its contract tests exercise). The ORDER the markers arrive in is the
-/// point: `seed-starting:` fires before the multi-GB extraction so the notice is
-/// on screen while it runs, and the terminals land when it is done. Anything else
-/// the child prints is diagnostics for `status.toml`, not UI.
+/// One STREAMED line of `atpkg` stdout → the `Wake` it should raise, if any. The ORDER
+/// the markers arrive in is the point: `net-starting:` fires before the multi-GB
+/// download so the notice is on screen while it runs, and the terminals land when it
+/// is done. Anything else the child prints is diagnostics for `status.toml`, not UI.
 fn parse_seed_line(line: &str) -> Option<Wake> {
     // The prefixes come from atpkg itself, so a rename is a COMPILE error on both
     // sides. They used to be literals duplicated here, which made this contract's
@@ -28059,12 +33032,6 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
     };
-    if let Some(detail) = marked(atpkg::cli::SEED_STARTING_MARKER) {
-        return Some(Wake::PkgSeedStarted { detail });
-    }
-    if let Some(detail) = marked(atpkg::cli::SEED_PARTIAL_MARKER) {
-        return Some(Wake::PkgSeedPartial { detail });
-    }
     if let Some(detail) = marked(atpkg::cli::SEED_FAILED_MARKER) {
         return Some(Wake::PkgSeedFailed { detail });
     }
@@ -28079,12 +33046,14 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     }
     // (`seed-busy:` is read by `read_seed_markers` ahead of this parser and never
     // becomes an event: its exit code is the verdict, and the lane writes the line.)
-    // The network lane's ANNOUNCEMENT and failure TERMINAL ride the seed
-    // lane's card semantics — to the user they are the same events (an install
-    // is starting; an install came to nothing), and the held "Installing…"
-    // card the announcement opens is retired by exactly the same terminals.
+    // THE ANNOUNCEMENT — the one marker that opens the held "Installing…" card; every
+    // terminal above and below retires it. It is ROUTINE until the lane that spawned
+    // the pass says otherwise ([`tag_first_run`]).
     if let Some(detail) = marked(atpkg::cli::NET_STARTING_MARKER) {
-        return Some(Wake::PkgSeedStarted { detail });
+        return Some(Wake::PkgSeedStarted {
+            detail,
+            first_run: false,
+        });
     }
     if let Some(detail) = marked(atpkg::cli::NET_FAILED_MARKER) {
         return Some(Wake::PkgSeedFailed { detail });
@@ -28100,8 +33069,7 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     if let Some(detail) = marked(atpkg::cli::LOCK_ACQUIRED_MARKER) {
         return Some(Wake::PkgLockAcquired { detail });
     }
-    // The NETWORK completion lane's arrival — same pill as a local install, because
-    // to the user it is the same event: the toolchain is now here.
+    // The toolchain's arrival: the roster the pass installed.
     if let Some(detail) = marked(atpkg::cli::NET_INSTALLED_MARKER) {
         return Some(Wake::PkgSeed {
             installed: detail
@@ -28110,16 +33078,11 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            pending: None,
         });
     }
-    // A coherence group's abort (a terminal) and a recorded tracked install (not one),
-    // both 2026-09-15 — see the variants.
+    // A coherence group's abort (a terminal, 2026-09-15) — see the variant.
     if let Some(detail) = marked(atpkg::cli::GROUP_ABORTED_MARKER) {
         return Some(Wake::PkgGroupAborted { detail });
-    }
-    if let Some(detail) = marked(atpkg::cli::TRACKED_INSTALL_MARKER) {
-        return Some(Wake::PkgTrackedInstall { detail });
     }
     // The R6 rows: what the managed agents are, and what the machine settings
     // pass changed. Both are TERMINAL rows the bar queues behind the pass row.
@@ -28149,21 +33112,29 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
             reason.trim()
         )));
     }
-    let (installed, pending) = parse_seed_markers(line)?;
-    Some(Wake::PkgSeed { installed, pending })
+    None
 }
 
-/// The failure row's sentence: atpkg's own `detail` — the marker's reason, clipped to
-/// the row — followed by the page that holds the per-program rows; `fallback` when the
-/// marker carried no sentence.
+/// The failure's record sentence (a `Hold::LogOnly` toolchain record,
+/// 2026-09-22): [`failure_cause`] followed by the page that holds the
+/// per-program rows.
 fn failure_row_text(detail: &str, fallback: &str) -> String {
+    format!(
+        "{} \u{2014} see Settings \u{25b8} Packages",
+        failure_cause(detail, fallback)
+    )
+}
+
+/// atpkg's own `detail` — the marker's reason, clipped to one sentence — or
+/// `fallback` when the marker carried none. The words the Packages headline and the
+/// ledger both carry.
+fn failure_cause(detail: &str, fallback: &str) -> String {
     let detail = detail.trim();
-    let head: String = if detail.is_empty() {
+    if detail.is_empty() {
         fallback.to_string()
     } else {
         atpkg::cli::clip_cause(detail)
-    };
-    format!("{head} \u{2014} see Settings \u{25b8} Packages")
+    }
 }
 
 /// The installed-roster pill caption. Extracted from the `Wake::PkgSeed` arm so
@@ -28238,12 +33209,72 @@ mod headless_display_probe_tests {
 }
 
 impl App {
+    /// `appnotice <lane> <text>` ([`Wake::AppNotice`]): toolchain text shaped like the
+    /// `managed-current:` / `machine-settings:` markers is taken as the marker is — its
+    /// `Hold::LogOnly` record — and so is every note on the harness lane
+    /// (`message_reporters::harness_note`, a `harness`-tagged record) and every other
+    /// text, a RECORD tagged with the named lane (R34, design §10.5 H7, ruling 147).
+    /// Never a row: [`AppNoticeTaken::Recorded`].
+    fn take_app_notice(&mut self, lane: &str, text: &str) -> Result<AppNoticeTaken, &'static str> {
+        match lane {
+            "toolchain" => {
+                if let Some(body) = r6_marker_body(text, MANAGED_CURRENT_MARKER) {
+                    self.post_managed_current(body);
+                } else if let Some(body) = r6_marker_body(text, MACHINE_SETTINGS_MARKER) {
+                    self.post_machine_settings(body);
+                } else {
+                    self.record_message(toolchain_words::appnotice(
+                        aterm_messages::tags::TOOLCHAIN,
+                        text,
+                    ));
+                }
+                Ok(AppNoticeTaken::Recorded)
+            }
+            "update" => {
+                self.record_message(toolchain_words::appnotice(
+                    aterm_messages::tags::UPDATE,
+                    text,
+                ));
+                Ok(AppNoticeTaken::Recorded)
+            }
+            "harness" => {
+                if !self.record_harness_note(text) {
+                    aterm_log::debug!("appnotice harness (unchanged): {text}");
+                }
+                Ok(AppNoticeTaken::Recorded)
+            }
+            _ => Err("lane must be toolchain, update or harness"),
+        }
+    }
+
+    /// A failed toolchain pass, remembered for the Settings ▸ Packages badge and
+    /// headline (`PackagesService::note_pass_trouble`) — a failure's one surface
+    /// since 2026-09-22; a pass completed since clears it (a clean one of this
+    /// lane, `Wake::PkgPassEnded`; a Settings Check/Install; a later record).
+    fn note_package_pass_failure(&mut self, cause: String) {
+        self.note_package_pass_trouble(crate::packages_screen::PassTroubleKind::Failed, cause);
+    }
+
+    /// [`Self::note_package_pass_failure`] for any kind of pass trouble.
+    fn note_package_pass_trouble(
+        &mut self,
+        kind: crate::packages_screen::PassTroubleKind,
+        cause: String,
+    ) {
+        if self
+            .native_packages_service
+            .note_pass_trouble(kind, cause, std::time::SystemTime::now())
+        {
+            self.publish_native_packages_state();
+        }
+    }
+
     /// HOW MANY LIVE TABS STILL RUN A SHELL WITH A FROZEN PATH (2026-09-16): adopted
     /// across the update from a build before
     /// the self-healing sessions (2026-09-16), so `<prefix>/agents/` is not in
     /// front and the managed `claude`/`codex` are not what those tabs run. Read at
-    /// post time by the rows that say what the managed programs run in
-    /// (`StatusBars::toolchain_managed_current`, the seed pill), from the registry
+    /// post time by the records that say what the managed programs run in
+    /// (`App::post_managed_current`, the seed pill), from the registry
     /// (`SessionStore::frozen_path_tabs`) PLUS the handed-off shells still waiting
     /// to be adopted (`seamless_adopt`, review 2026-09-16): the atpkg launch pass
     /// starts from `main_entry`, before the event loop, and on a warm machine
@@ -28252,10 +33283,9 @@ impl App {
     /// counted from the registry alone, the first row after a seamless update
     /// read "this one too" in exactly the frozen tab the owner complained about.
     /// Session 0 is spawned synchronously in `main_entry` and is on the registry
-    /// by then; the rest are here until the restore drains them, and the
-    /// restore re-runs the row against the registry's count as its backstop
-    /// (`StatusBars::refresh_managed_current`). The note the rows carry leaves
-    /// with the tabs — when they CLOSE: sourcing the hook in a frozen tab, the
+    /// by then; the rest are here until the restore drains them. The note the
+    /// records carry leaves with the tabs — when they CLOSE: sourcing the hook in
+    /// a frozen tab, the
     /// remedy the note names, lowers nothing (the shell reports nothing back),
     /// so the count is an upper bound until the tab is gone.
     fn frozen_path_tabs(&self) -> usize {
@@ -28290,131 +33320,6 @@ impl App {
             )
         )
     }
-}
-
-/// The installed pill's sentence. `frozen_tabs` is [`App::frozen_path_tabs`]: the
-/// live tabs adopted from a build whose sessions lack the managed `agents/`;
-/// `hook` is the dialect of the atpkg hook such a tab sources to catch up
-/// (`HookDialect::remedy` — the managed row's own spelling, ONE source since
-/// review 2026-09-16 closed the restated copy this file carried; the window's
-/// spawn shell). The frozen clause is joined with the row's ` · ` so the
-/// width law that keeps the row's remedy (`status_bars::shape_detail`, which
-/// knows ". " and " · " as sentence joints) keeps the pill's too — the first
-/// cut joined it with `;`/`:`, and at 90–130 cols the shaper kept the command
-/// and dropped the qualifier, leaving "ready in every tab opened… `. ~/…`" —
-/// the opposite meaning (review, 2026-09-16).
-fn seed_pill_text(
-    installed: &[String],
-    shell_integration: Option<&crate::spawn::ShellIntegrationOutcome>,
-    frozen_tabs: usize,
-    hook: crate::status_bars::HookDialect,
-) -> String {
-    // Cap the roster so the pill stays a pill: ≤5 names, then an ellipsis
-    // standing in for the rest.
-    let mut names = installed
-        .iter()
-        .take(5)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if installed.len() > 5 {
-        names.push('…');
-    }
-    // NOTHING ON THIS ROSTER SENDS ANYONE TO A NEW TAB (2026-09-16). Owner, that
-    // day, of a surface that did: "aterm atpkg DID install the latest but it didn't
-    // make them available for me. instead, it is telling me to open a new tab. NO!
-    // all the latest and best MUST WORK IN THE SAME TAB with live update! fix this
-    // and this message and audit that this is the actual behavior."
-    //
-    // The agent programs (`claude`/`codex`) are laid into `<prefix>/agents/`, which
-    // the spawn seam puts in FRONT of every session's PATH and ensures at launch
-    // (`spawn::managed_agents_dir`), and atpkg re-lays the twins in place — the
-    // next invocation in any tab runs the build just installed. The REST of the
-    // roster (`ay`, `trust`, `clean`, …) lives in `<prefix>/bin/`, which reaches a
-    // tab through the atpkg hook `hooks::refresh` writes to `~/.aterm/shell.d`
-    // AFTER this install — and until 2026-09-16 the shell integration sourced that
-    // directory ONCE, at shell startup, so the tab showing this pill had no `bin/`
-    // on PATH and `ay` there was "command not found": the pill said "open a new tab
-    // to use them", and that clause was the truth of its day. It is not any more.
-    // The integration's `__aterm_managed_path_live` (all four scripts) runs at
-    // EVERY precmd and preexec: it sources the hook the moment the file exists
-    // (`$ATPKG_AGENTS` unset; zsh also on the hook's zstat stamp changing) and
-    // re-asserts `reroute/` and `agents/` in front, and the hook appends `bin/`
-    // unconditionally — so the tab on glass has every program on the roster at
-    // its next prompt, and the pill says so for the whole roster (verified on the
-    // owner's machine, 2026-09-16: in the tab that had been told to open a new
-    // one, `. ~/.aterm/shell.d/00-atpkg.zsh` put `<prefix>/agents` at the head of
-    // PATH and `which claude` moved from `~/.local/bin` to the managed twin, with
-    // the integration intact — which is exactly what the live path does unasked).
-    //
-    // The one honest narrowing is the tab that may still run the PRE-2026-09-16
-    // script: adopted across the update from a build whose sessions lack the
-    // live re-assert (`App::frozen_path_tabs`, the count the managed row also
-    // carries). With such tabs alive the claim is the tabs opened since, and the
-    // frozen ones are named with their in-place remedy — sourcing the hook,
-    // spelled for the window's spawn shell (`HookDialect::remedy`; never `exec $SHELL`,
-    // which drops the tab's integration: `status_bars::HookDialect`). A roster
-    // of agent programs alone keeps naming them (the managed row that follows
-    // carries the frozen count and the remedy for those).
-    //
-    // …AND ONLY WHEN THE INTEGRATION RUNS IN THIS TAB (review, 2026-09-16). The
-    // seam's front position is not final: `/etc/zprofile`'s `path_helper` rebuilds
-    // PATH and an rc line `export PATH="$HOME/.local/bin:$PATH"` — the native
-    // installer's own line — goes in front of it (hooks.rs, measured on m27:
-    // `agents/` at position 14). What restores the order is the shell integration
-    // re-asserting it after the rc ran and sourcing the hook as it lands; a tab
-    // whose integration FAILED (unknown shell, unwritable loader cache — the
-    // recorded runtime outcome, not the advertised capability) has neither: no
-    // `bin/` ever, and `claude` is whichever copy the rc put first. For that
-    // outcome nothing is promised — say what is true, and point at the fix surface.
-    use crate::spawn::ShellIntegrationOutcome as Si;
-    if matches!(
-        shell_integration,
-        Some(Si::UnknownShell(_) | Si::WriteFailed(_))
-    ) {
-        return format!(
-            "✓ ALab toolchain installed: {names} — but this shell isn't hooked up to \
-             them; see Settings ▸ Packages"
-        );
-    }
-    let agents = installed
-        .iter()
-        .map(String::as_str)
-        .filter(|name| atpkg::stub::is_agent_program(name))
-        .collect::<Vec<_>>();
-    if !agents.is_empty() && agents.len() == installed.len() {
-        let clause = match agents.as_slice() {
-            [one] => format!("{one} already runs"),
-            [head @ .., last] => format!("{} and {last} already run", head.join(", ")),
-            [] => unreachable!("checked non-empty"),
-        };
-        let clause = if frozen_tabs == 0 {
-            format!("{clause} in every aterm tab, this one too")
-        } else {
-            let clause = clause.replace(" already run", " run");
-            format!("{clause} in every tab opened since this update")
-        };
-        return format!("✓ ALab toolchain installed: {names} — {clause}");
-    }
-    if frozen_tabs == 0 {
-        return format!(
-            "✓ ALab toolchain installed: {names} — ready in every aterm tab, this one too"
-        );
-    }
-    let mut pill = format!(
-        "✓ ALab toolchain installed: {names} — ready in every tab opened since this \
-         update · {frozen_tabs} {} from before it",
-        if frozen_tabs == 1 { "tab" } else { "tabs" }
-    );
-    match hook.remedy() {
-        Some(command) => {
-            pill.push_str(if frozen_tabs == 1 { " picks" } else { " pick" });
-            pill.push_str(" them up with ");
-            pill.push_str(&command);
-        }
-        None => pill.push_str(": a new tab picks them up"),
-    }
-    pill
 }
 
 /// THE OWNER'S BANNER, 2026-09-11: "⚠ ALab toolchain install failed — see Settings ▸
@@ -28463,8 +33368,8 @@ mod seed_announcement_verdict_tests {
     #[test]
     fn an_announced_pass_that_exits_zero_is_not_a_failure() {
         let (seen, ok, posted) = drive(
-            "echo 'atpkg: seed-starting: installing 2 ALab program(s) from the bundled \
-             registry (~4.1 GiB on disk when finished)'; exit 0",
+            "echo 'atpkg: net-starting: installing 2 program(s) over the network: claude, codex \
+             (~410 MB to download)'; exit 0",
         );
         assert!(seen.saw_start, "the announcement must be seen");
         assert!(!seen.saw_terminal, "this child prints no terminal marker");
@@ -28494,8 +33399,7 @@ mod seed_announcement_verdict_tests {
     /// NOT answered its announcement, and its non-zero exit is what names the outcome.
     #[test]
     fn a_child_that_dies_after_announcing_still_reports_a_failure() {
-        let (seen, ok, _) =
-            drive("echo 'atpkg: seed-starting: installing 9 ALab program(s)'; exit 7");
+        let (seen, ok, _) = drive("echo 'atpkg: net-starting: installing 9 program(s)'; exit 7");
         assert!(seen.saw_start && !seen.saw_terminal);
         assert!(!ok);
         assert_eq!(seed_retire(seen, ok, true), SeedRetire::Failed);
@@ -28548,7 +33452,7 @@ mod seed_announcement_verdict_tests {
     #[test]
     fn the_positive_terminal_answers_the_announcement() {
         let (seen, ok, posted) = drive(
-            "echo 'atpkg: seed-starting: installing 2 ALab program(s)'; \
+            "echo 'atpkg: net-starting: installing 2 program(s)'; \
              echo 'atpkg: seed-done: the pass finished; 12 ALab program(s) are installed'; exit 0",
         );
         assert!(seen.saw_start, "the announcement opened");
@@ -28571,7 +33475,7 @@ mod seed_announcement_verdict_tests {
     fn an_informational_row_does_not_answer_an_announcement() {
         let (seen, ok, posted) = drive(
             "echo 'atpkg: net-starting: installing 2 program(s) over the network: claude, codex'; \
-             echo 'atpkg: managed-current: claude 2.1.267 (build 2026091001)'; exit 0",
+             echo 'atpkg: managed-current: claude 2.1.280 (Anthropic latest)'; exit 0",
         );
         assert!(seen.saw_start);
         assert!(
@@ -28658,7 +33562,7 @@ mod seed_announcement_verdict_tests {
     #[test]
     fn a_non_utf8_stdout_line_does_not_end_the_marker_reader() {
         let (seen, code, posted) = drive_code(
-            "echo 'atpkg: seed-starting: installing 2 ALab program(s)'; \
+            "echo 'atpkg: net-starting: installing 2 program(s)'; \
              printf 'brew: \\377\\376 not utf-8\\n'; \
              echo 'atpkg: seed-done: the pass finished; 12 ALab program(s) are installed'; \
              exit 0",
@@ -28715,43 +33619,70 @@ mod seed_announcement_verdict_tests {
     }
 }
 
-/// The seed-marker contract with atpkg (`cmd_seed`'s two stable stdout lines):
-/// pinned here so a wording drift on either side goes red instead of silently
-/// blinding the first-run notice.
+/// The marker contract with atpkg (its stable stdout lines): pinned here so a wording
+/// drift on either side goes red instead of silently blinding the first-run notice.
 #[cfg(test)]
 mod seed_marker_tests {
-    use super::{Instant, Wake, parse_seed_line, parse_seed_markers, seed_pill_text};
+    use super::{Wake, parse_seed_line};
+    use crate::toolchain_words::seed_pill_text;
 
-    /// The STREAMING contract: `seed-starting:` must raise its event from a single
-    /// line, because that is the whole point — it arrives before the multi-GB
-    /// extraction, not bundled with the output after it. A quiet line raises nothing.
-    /// THE PACKAGES-DISABLED LAUNCH IS THE ONLY APPLY SUCH A MACHINE GETS, and nothing
-    /// pinned that the branch exists — the rework since 925b6a47e deleted and re-added
-    /// the function, and every suite would have stayed green had it not come back.
+    /// A LAUNCH WITH AUTOMATIC UPDATES OFF STILL APPLIES THE [machine] SETTINGS — the only
+    /// apply such a machine gets — and nothing pinned that until the rework since
+    /// 925b6a47e deleted and re-added the function, and every suite would have stayed
+    /// green had it not come back. Since Phase 4 there is no disabled branch to hold it:
+    /// the one-shot runs before any gate.
     /// A scrape, in the idiom of atpkg's own placement test, because the alternative is
     /// spawning a real detached child in a unit test.
     #[test]
-    fn the_packages_disabled_launch_runs_the_machine_one_shot() {
+    fn every_launch_runs_the_machine_one_shot_before_any_gate() {
         let src = include_str!("lib.rs");
         let start = src
             .find("\nfn spawn_pkg_update_check(")
             .expect("the launch check");
         let body = &src[start..];
         let body = &body[..body[3..].find("\nfn ").map_or(body.len(), |i| i + 3)];
-        let gate = body
-            .find("if !config.packages_enabled()")
-            .expect("the packages-disabled branch");
+        // Phase 4: the gates are LIVE, read inside the thread — so the one-shot runs once,
+        // UNCONDITIONALLY, before the thread (and any gate) exists: with Automatic updates
+        // off (a user who turned off updates keeps Universal Control off and Spotlight
+        // out of their build output), and with it on, at once and BEFORE the launch seed
+        // (which can wait out its whole lock bound behind another window's pass).
+        // atpkg's `machine.lock` keeps the two walks apart.
         let call = body
-            .find("spawn_machine_settings_once(")
-            .expect("the packages-disabled branch runs the [machine] one-shot");
+            .find("spawn_machine_settings_once(atpkg.clone(), proxy.clone())")
+            .expect("every launch runs the [machine] one-shot");
+        let thread = body
+            .find("std::thread::Builder::new()")
+            .expect("the lane's thread");
+        let gate = body
+            .find("LiveSwitch::new(")
+            .expect("the live switch, read inside the thread");
+        let seed = body
+            .find("lane.run_launch_seed()")
+            .expect("the launch seed");
         assert!(
-            gate < call,
-            "the one-shot belongs INSIDE the packages-disabled branch"
+            call < thread && thread < gate && gate < seed,
+            "{call} {thread} {gate} {seed}"
         );
-        let between = &body[gate..call];
         assert!(
-            !between.contains("\n}"),
-            "the one-shot must still be inside that branch, not after it"
+            !body[..call].contains("packages_enabled()\n        {")
+                && !body[..call].contains("return false;\n    }\n    spawn_machine"),
+            "no gate stands before the one-shot"
+        );
+        // THE LOOP READS THE SWITCH BEFORE EVERY PASS (Phase 4): inside the loop, the
+        // switch is polled — and stands the loop down — before the pass it would run.
+        let looped = &body[seed..];
+        let loop_top = looped
+            .find("\n            loop {")
+            .expect("the update loop");
+        let poll = looped[loop_top..]
+            .find("lane.switch.poll() != LoopGate::On")
+            .expect("the loop reads the switch");
+        let pass = looped[loop_top..]
+            .find("lane.run(verb, published_index)")
+            .expect("the loop's pass");
+        assert!(
+            poll < pass,
+            "the switch is read before the pass: {poll} {pass}"
         );
         // And it runs the lock-free verb, with its stdout read for markers.
         let spawner = src
@@ -28769,48 +33700,97 @@ mod seed_marker_tests {
         );
     }
 
+    /// THE LANE READS THE FILE ITS PASSES READ (2026-09-23 review). The live switch
+    /// carries `[packages] enabled` and `exclude` for the whole loop, so it takes atpkg's
+    /// path resolution — which falls back to the account's home without `HOME` (a launchd
+    /// job, a sandbox) — not the window's, which resolves nothing there: an empty exclude
+    /// would have had the head watch run passes for the programs atpkg itself refuses.
+    #[test]
+    fn the_package_lane_reads_atpkgs_config_path() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("\nfn spawn_pkg_update_check(")
+            .expect("the launch check");
+        let body = &src[start..];
+        let body = &body[..body[3..].find("\nfn ").map_or(body.len(), |i| i + 3)];
+        assert!(
+            body.contains("let config_path = atpkg::config::config_path();"),
+            "the lane resolves aterm.toml as atpkg does"
+        );
+        assert!(
+            !body.contains(concat!("app_config", "::config_path()")),
+            "not the window's resolution"
+        );
+    }
+
+    /// A LANE'S PASS NEVER INHERITS A TERMINAL: atpkg reads a tty on stdin (with no
+    /// `--wait-lock`) as a person's typed verb holding the store, and a window started from
+    /// a terminal handed its tty to every pass it spawned.
+    #[test]
+    fn a_lane_pass_child_gets_no_stdin() {
+        let src = include_str!("lib.rs");
+        let start = src.find("\nfn run_atpkg_pass<").expect("the lanes' child");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains(".stdin(std::process::Stdio::null())"),
+            "{body}"
+        );
+    }
+
+    /// The STREAMING contract: `net-starting:` must raise its event from a single
+    /// line, because that is the whole point — it arrives before the multi-GB
+    /// download, not bundled with the output after it. A quiet line raises nothing, and
+    /// neither do the sealed-seed lane's four markers, retired with it (Phase 5): nothing
+    /// prints them, and the window no longer reads them.
     #[test]
     fn a_streamed_start_marker_raises_the_started_wake() {
         let started = parse_seed_line(
-            "atpkg: seed-starting: installing the ALab toolset from the bundled registry \
-             (about 3 GB on disk when finished)",
+            "atpkg: net-starting: installing 2 program(s) over the network: claude, codex \
+             (~410 MB to download)",
         );
         match started {
-            Some(Wake::PkgSeedStarted { detail }) => {
+            Some(Wake::PkgSeedStarted { detail, first_run }) => {
+                assert!(detail.starts_with("installing 2 program(s)"), "{detail}");
                 assert!(
-                    detail.starts_with("installing the ALab toolset"),
-                    "{detail}"
+                    !first_run,
+                    "a line alone is routine: only the lane that spawned the pass tags it"
                 );
                 assert!(
-                    !detail.contains("seed-starting"),
+                    !detail.contains("net-starting"),
                     "the marker prefix is stripped, not echoed: {detail}"
                 );
             }
             other => panic!("expected PkgSeedStarted, got {other:?}"),
         }
-        // The completion markers still resolve line-at-a-time…
-        match parse_seed_line("atpkg: seed-installed: ay, trust") {
-            Some(Wake::PkgSeed { installed, pending }) => {
-                assert_eq!(installed, ["ay", "trust"]);
-                assert_eq!(pending, None);
-            }
+        // The completion marker still resolves line-at-a-time…
+        match parse_seed_line("atpkg: net-installed: claude, codex") {
+            Some(Wake::PkgSeed { installed }) => assert_eq!(installed, ["claude", "codex"]),
             other => panic!("expected PkgSeed, got {other:?}"),
         }
         // …and ordinary chatter raises nothing at all.
-        assert!(parse_seed_line("atpkg: no bundled seed — bootstrap is network-only").is_none());
+        assert!(parse_seed_line("atpkg: the store already holds the ALab toolset").is_none());
         assert!(
-            parse_seed_line("atpkg: seed-starting: ").is_none(),
+            parse_seed_line("atpkg: net-starting: ").is_none(),
             "empty tail"
         );
+        for retired in [
+            "atpkg: seed-starting: installing 2 ALab program(s)",
+            "atpkg: seed-installed: ay, trust",
+            "atpkg: seed-pending: 3 program(s) ready to install",
+            "atpkg: seed-partial: 3 installed, 5 failed",
+        ] {
+            assert!(parse_seed_line(retired).is_none(), "{retired}");
+        }
     }
 
     /// The two R6 markers (2026-09-10) resolve line-at-a-time, with or without
     /// atpkg's `atpkg: ` prefix (the `appnotice` verb carries the bare body), the
     /// prefix stripped and an empty body raising nothing.
-    /// The two markers of 2026-09-15 reach the glass: a coherence group's abort is a
-    /// TERMINAL Warn row, a recorded tracked install a Warn row that is not a terminal.
+    /// A coherence group's abort (2026-09-15) is a TERMINAL Warn row. The line atpkg
+    /// printed beside it for a tagged install is gone — atpkg clears the tag itself — and
+    /// a stray one from an older atpkg raises nothing.
     #[test]
-    fn the_abort_and_tracked_install_markers_parse_and_classify() {
+    fn the_abort_marker_parses_and_classifies_and_a_tracked_install_line_raises_nothing() {
         let aborted = parse_seed_line(
             "atpkg: group-aborted: rustc update aborted at trust during stage: staging failed",
         )
@@ -28823,25 +33803,20 @@ mod seed_marker_tests {
             crate::seed_event_is_terminal(&aborted),
             "an abort answers the announcement"
         );
-        let tracked = parse_seed_line(
-            "atpkg: tracked-install: trust build 8595 \u{2014} the untracked lane could not run",
-        )
-        .expect("parsed");
         assert!(
-            matches!(&tracked, Wake::PkgTrackedInstall { .. }),
-            "{tracked:?}"
-        );
-        assert!(
-            !crate::seed_event_is_terminal(&tracked),
-            "an install went on after it"
+            parse_seed_line(
+                "atpkg: tracked-install: trust build 8595 \u{2014} the untracked lane could \
+                 not run",
+            )
+            .is_none(),
+            "no row, no ledger entry, for a tag"
         );
         assert_eq!(atpkg::cli::GROUP_ABORTED_MARKER, "group-aborted: ");
-        assert_eq!(atpkg::cli::TRACKED_INSTALL_MARKER, "tracked-install: ");
     }
 
     #[test]
     fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
-        let managed = "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)";
+        let managed = "claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI latest)";
         match parse_seed_line(&format!("atpkg: managed-current: {managed}")) {
             Some(Wake::PkgManagedCurrent(body)) => assert_eq!(body, managed),
             other => panic!("expected PkgManagedCurrent, got {other:?}"),
@@ -28884,7 +33859,7 @@ mod seed_marker_tests {
         );
         assert!(parse_seed_line("atpkg: machine-settings:").is_none());
         assert!(
-            parse_seed_line("atpkg: claude: managed 2026091001 — pinned by index 21").is_none(),
+            parse_seed_line("atpkg: claude: managed 2.1.280 — Anthropic latest").is_none(),
             "a plain state line is not a marker"
         );
         // The state record (`machine-state:`) is the Security card's record — since
@@ -28909,23 +33884,86 @@ mod seed_marker_tests {
         assert_eq!(super::MACHINE_SETTINGS_MARKER, "machine-settings: ");
     }
 
+    /// `appnotice` TEXT IS RECORDED (design §10.5 H7, ruling 83; this pin
+    /// replaces `appnotice_says_recorded_for_a_marker_and_posted_for_a_row`).
+    /// Marker-shaped toolchain text is taken as the marker is, and any other text
+    /// is a record of its own on the named lane: no row either way, and the
+    /// reply says `recorded`; a bad lane is refused.
+    #[test]
+    fn appnotice_text_is_recorded() {
+        let mut app = super::App::headless_for_test();
+        let live = |app: &super::App| app.messages.live_rows().count();
+        for text in [
+            "managed-current: claude 2.1.280 (Anthropic latest)",
+            "atpkg: machine-settings: universal-control disabled",
+        ] {
+            assert_eq!(
+                app.take_app_notice("toolchain", text),
+                Ok(super::AppNoticeTaken::Recorded),
+                "{text}"
+            );
+            assert_eq!(live(&app), 0, "{text}: no row");
+        }
+        assert_eq!(
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.tag.as_str() == "toolchain")
+                .count(),
+            2,
+            "both are on record"
+        );
+        assert_eq!(
+            app.take_app_notice("toolchain", "claude installed from a terminal"),
+            Ok(super::AppNoticeTaken::Recorded)
+        );
+        assert_eq!(live(&app), 0, "a plain text is a record, not a row");
+        assert_eq!(
+            app.take_app_notice("update", "an operator's note"),
+            Ok(super::AppNoticeTaken::Recorded)
+        );
+        assert_eq!(live(&app), 0);
+        assert_eq!(app.message_band_rows, 0, "nothing reached the glass");
+        let texts: Vec<&str> = app
+            .messages
+            .log()
+            .records()
+            .map(|r| r.title.as_str())
+            .collect();
+        assert!(
+            texts.contains(&"claude installed from a terminal")
+                && texts.contains(&"an operator's note"),
+            "{texts:?}"
+        );
+        // THE HARNESS IS RECORDED, NEVER A ROW (2026-09-23): its every act used to
+        // take a toolchain row that re-gridded every window.
+        let before = app.messages.log().len();
+        assert_eq!(
+            app.take_app_notice("harness", "aterm harness acting \u{00b7} approving rm"),
+            Ok(super::AppNoticeTaken::Recorded)
+        );
+        assert_eq!(live(&app), 0, "no row for a harness note");
+        let last = app.messages.log().records().last().expect("on record");
+        assert_eq!(
+            (last.tag.as_str(), last.title.as_str()),
+            ("harness", "aterm harness acting \u{00b7} approving rm")
+        );
+        assert_eq!(app.messages.log().len(), before + 1);
+        assert!(app.take_app_notice("elsewhere", "x").is_err());
+    }
+
     /// THE ATPKG CONTRACT LITERALS THIS CRATE READS, pinned for the integrator
     /// (2026-09-10). atpkg's own side of the contract lands on another branch as
-    /// `atpkg::cli::MANAGED_CURRENT_MARKER`, `atpkg::cli::MACHINE_SETTINGS_MARKER`
-    /// and `atpkg::status::NEVER_CHECKED_LINE`; this crate already depends on
-    /// `atpkg`, so once those exist the three literals here (and
-    /// `aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE`) can be pointed
-    /// at them — and this test says, byte for byte, what they must equal for the
-    /// swap to be a no-op. A mismatch here is a contract drift, not a typo.
+    /// `atpkg::cli::MANAGED_CURRENT_MARKER` and `atpkg::cli::MACHINE_SETTINGS_MARKER`;
+    /// this crate already depends on `atpkg`, so once those exist the literals here can
+    /// be pointed at them — and this test says, byte for byte, what they must equal for
+    /// the swap to be a no-op. A mismatch here is a contract drift, not a typo. (The
+    /// never-checked stderr line it also pinned is gone, Phase 2, 2026-09-22: no edge
+    /// prints it.)
     #[test]
     fn the_atpkg_contract_literals_are_pinned_for_the_integrator() {
         assert_eq!(super::MANAGED_CURRENT_MARKER, "managed-current: ");
         assert_eq!(super::MACHINE_SETTINGS_MARKER, "machine-settings: ");
-        assert_eq!(
-            aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE,
-            "atpkg: no update check has run yet on this machine \u{2014} packages cannot be \
-             updated until the first pass completes (run: aterm pkg update)"
-        );
         // The markers are what `parse_seed_line` strips: a body must survive
         // the trip through them unchanged.
         for marker in [
@@ -28968,7 +34006,7 @@ mod seed_marker_tests {
                 .collect()
         };
         use crate::spawn::ShellIntegrationOutcome as Si;
-        use crate::status_bars::HookDialect;
+        use crate::toolchain_words::HookDialect;
         // ≤5: every name, no ellipsis.
         assert_eq!(
             seed_pill_text(&names(3), Some(&Si::Prepared), 0, HookDialect::Zsh),
@@ -29015,7 +34053,7 @@ mod seed_marker_tests {
     #[test]
     fn pill_says_the_bin_tools_are_ready_in_this_tab_and_names_the_frozen_ones() {
         use crate::spawn::ShellIntegrationOutcome as Si;
-        use crate::status_bars::HookDialect;
+        use crate::toolchain_words::HookDialect;
         let tools = vec!["ay".to_string(), "trust".to_string()];
         assert_eq!(
             seed_pill_text(&tools, Some(&Si::Prepared), 0, HookDialect::Zsh),
@@ -29056,122 +34094,32 @@ mod seed_marker_tests {
                 "{pill}"
             );
         }
-        // The bar strips the pill's opening and keeps the rest whole (≤160 cells),
-        // so the command survives onto the toolchain row.
-        let mut bars = crate::status_bars::StatusBars::default();
-        bars.toolchain_installed(
-            &seed_pill_text(&tools, None, 1, HookDialect::Zsh),
-            Instant::now(),
-        );
-        let (_, bar) = bars.bars().next().expect("the installed row posts");
+        // The record strips the pill's opening and keeps the rest whole (≤160
+        // cells), so the command survives onto it (no row since 2026-09-22: a
+        // `Hold::LogOnly` record, the ledger entry upstream's bars kept).
+        let record =
+            crate::toolchain_words::installed(&seed_pill_text(&tools, None, 1, HookDialect::Zsh));
+        assert_eq!(record.hold, aterm_messages::Hold::LogOnly, "no success row");
         assert_eq!(
-            bar.text.detail,
+            record.detail[0],
             "ay, trust — ready in every tab opened since this update · 1 tab from before it \
              picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`"
         );
     }
 
-    /// THE PILL'S CUT KEEPS ITS QUALIFIER (review, 2026-09-16). The first cut
-    /// joined the frozen clause with `;`/`:`, which `shape_detail` does not know
-    /// as a sentence joint, so at 90–130 cols the installed row read "ay, trust
-    /// — ready in every tab opened… `. ~/.aterm/shell.d/00-atpkg.zsh`" — the
-    /// command with the WRONG reason in front of it (source the hook
-    /// everywhere). With the row's ` · ` joint the shaper backs up to the clause
-    /// the command sits in, so what survives reads "1 tab from before it… `…`":
-    /// the count, then the command — as the managed row's own cut does
-    /// (`the_frozen_tab_note_keeps_its_command_at_120_cols_and_drops_whole_at_80`).
-    /// Pinned through `layout` of the installed row itself (title, 100 % meter).
-    #[test]
-    fn the_pills_frozen_clause_survives_the_cut_with_its_count() {
-        use crate::status_bars::{HookDialect, StatusBars, layout};
-        let tools = vec!["ay".to_string(), "trust".to_string()];
-        let mut bars = StatusBars::default();
-        bars.toolchain_installed(
-            &seed_pill_text(&tools, None, 1, HookDialect::Zsh),
-            Instant::now(),
-        );
-        let (_, bar) = bars.bars().next().expect("the installed row posts");
-        let command = "`. ~/.aterm/shell.d/00-atpkg.zsh`";
-        let mut seen = Vec::new();
-        for cols in [80usize, 90, 100, 110, 120, 130, 160] {
-            let l = layout(&bar.text, bar.fill, cols);
-            assert_eq!(l.title, "ALab toolchain installed");
-            let detail = l.detail.map(|(_, d)| d);
-            seen.push((cols, detail.clone()));
-            let Some(d) = detail else { continue };
-            // Whatever the width, the text on glass never says the hook is the
-            // remedy for THIS tab: the count precedes the command, or the
-            // command's own head is all there is.
-            if d.contains(command) && d != command {
-                assert!(
-                    d.contains("from before it") || d.starts_with("1 tab"),
-                    "{cols} cols: the qualifier must survive with the command: {d}"
-                );
-                assert!(
-                    !d.contains("ready in every tab") || d.contains("from before it"),
-                    "{cols} cols: the claim on every tab must not stand alone in front of \
-                     the command: {d}"
-                );
-            } else {
-                assert!(d.starts_with("`. ~/.aterm/shell.d"), "{cols} cols: {d}");
-            }
-        }
-        // The widths a laptop and an external display actually give the row,
-        // as measured (2026-09-16; the row's head is its title plus the 100 %
-        // meter, so the room is narrower than the managed row's at the same
-        // width). At 80 cols the room after the head holds exactly the
-        // command: the shaper's floor rule — the command's own head from the
-        // backtick, as the managed row pins for its narrow case — and nothing
-        // in front of it, which is not the false reason the `;` joint left.
-        // From 90 up the count leads, then the words as they fit, and at 130
-        // the roster returns in front of the whole clause.
-        let at = |cols: usize| -> Option<String> {
-            seen.iter()
-                .find(|(c, _)| *c == cols)
-                .and_then(|(_, d)| d.clone())
-        };
-        assert_eq!(at(80).as_deref(), Some(command));
-        assert_eq!(
-            at(90).as_deref(),
-            Some("1 tab… `. ~/.aterm/shell.d/00-atpkg.zsh`")
-        );
-        assert_eq!(
-            at(100).as_deref(),
-            Some("1 tab from before… `. ~/.aterm/shell.d/00-atpkg.zsh`")
-        );
-        assert_eq!(
-            at(120).as_deref(),
-            Some("1 tab from before it picks them up with… `. ~/.aterm/shell.d/00-atpkg.zsh`")
-        );
-        assert_eq!(
-            at(130).as_deref(),
-            Some(
-                "ay, trust… 1 tab from before it picks them up with \
-                 `. ~/.aterm/shell.d/00-atpkg.zsh`"
-            )
-        );
-        assert_eq!(
-            at(160).as_deref(),
-            Some(
-                "ay, trust — ready in every tab opened… 1 tab from before it picks them up \
-                 with `. ~/.aterm/shell.d/00-atpkg.zsh`"
-            )
-        );
-        // And what the `;` joint produced at 120 cols is exactly what must never
-        // come back: the claim on every tab with the command as its remedy.
-        let cut_at_120 = at(120).unwrap();
-        assert!(!cut_at_120.contains("ready in every tab"), "{cut_at_120}");
-    }
-
-    /// The pill's frozen-tab remedy and the managed row's are ONE spelling —
-    /// `status_bars::HookDialect::remedy`, which the pill reads directly since
+    /// (The installed row's width-law pin — "the pill's cut keeps its qualifier",
+    /// 2026-09-16 — went with the row on 2026-09-22: the sentence is a
+    /// `Hold::LogOnly` record now, and no glass cuts it.)
+    ///
+    /// The pill's frozen-tab remedy and the managed record's are ONE spelling —
+    /// `toolchain_words::HookDialect::remedy`, which the pill reads directly since
     /// review 2026-09-16 removed the restated `hook_remedy` this file carried.
     /// Kept as the regression pin of that single source: the pill's tail and
     /// the row's note are checked against the same call, per dialect, so a
     /// second spelling creeping back into either fails here.
     #[test]
     fn the_pills_frozen_tab_remedy_is_the_managed_rows() {
-        use crate::status_bars::{HookDialect, StatusBars};
+        use crate::toolchain_words::{HookDialect, managed_current};
         let tools = vec!["ay".to_string()];
         for hook in [
             HookDialect::Zsh,
@@ -29180,18 +34128,9 @@ mod seed_marker_tests {
             HookDialect::PowerShell,
             HookDialect::None,
         ] {
-            let mut bars = StatusBars::default();
-            bars.set_hook_shell(hook);
-            bars.toolchain_managed_current(
-                "claude 2.1.273 (build 2026091601)",
-                1,
-                true,
-                Instant::now(),
-            );
-            let (_, bar) = bars.bars().next().expect("the managed row posts");
-            let note = bar
-                .text
-                .detail
+            let record = managed_current("claude 2.1.273 (build 2026091601)", 1, true, hook)
+                .expect("the managed record posts");
+            let note = record.detail[0]
                 .rsplit(" \u{00b7} ")
                 .next()
                 .expect("the note is the last clause")
@@ -29250,7 +34189,7 @@ mod seed_marker_tests {
     #[test]
     fn pill_says_the_agents_run_in_this_tab_and_never_sends_anyone_to_a_new_one() {
         use crate::spawn::ShellIntegrationOutcome as Si;
-        use crate::status_bars::HookDialect as H;
+        use crate::toolchain_words::HookDialect as H;
         let agents = vec!["claude".to_string(), "codex".to_string()];
         assert_eq!(
             seed_pill_text(&agents, Some(&Si::Prepared), 0, H::Zsh),
@@ -29311,7 +34250,7 @@ mod seed_marker_tests {
     #[test]
     fn pill_stops_promising_this_tab_when_integration_failed() {
         use crate::spawn::ShellIntegrationOutcome as Si;
-        use crate::status_bars::HookDialect as H;
+        use crate::toolchain_words::HookDialect as H;
         let installed = vec!["ay".to_string()];
         for failed in [
             Si::UnknownShell("fish".into()),
@@ -29342,11 +34281,7 @@ mod seed_marker_tests {
     #[test]
     fn every_atpkg_marker_constant_has_a_wake_arm() {
         use super::parse_seed_line;
-        let cases: [(&str, &str); 10] = [
-            (
-                atpkg::cli::SEED_STARTING_MARKER,
-                "installing 8 ALab program(s)",
-            ),
+        let cases: [(&str, &str); 7] = [
             (
                 atpkg::cli::LOCK_WAITING_MARKER,
                 "another atpkg process holds the store lock at /x/store.lock \u{2014} \
@@ -29356,7 +34291,6 @@ mod seed_marker_tests {
                 atpkg::cli::LOCK_ACQUIRED_MARKER,
                 "the other process finished \u{2014} running now",
             ),
-            (atpkg::cli::SEED_PARTIAL_MARKER, "3 installed, 5 failed"),
             (atpkg::cli::SEED_FAILED_MARKER, "nothing could be installed"),
             (
                 atpkg::cli::SEED_UNUSABLE_MARKER,
@@ -29371,7 +34305,6 @@ mod seed_marker_tests {
                 atpkg::cli::NET_FAILED_MARKER,
                 "network provisioning installed nothing",
             ),
-            (atpkg::cli::SEED_INSTALLED_MARKER, "ay, trust"),
         ];
         for (marker, tail) in cases {
             let line = format!("atpkg: {marker}{tail}");
@@ -29510,8 +34443,8 @@ mod seed_marker_tests {
             "waited, timed out and said so: deferred"
         );
         let started = read(&format!(
-            "{line}\natpkg: {}installing 8 ALab program(s)\n",
-            atpkg::cli::SEED_STARTING_MARKER
+            "{line}\natpkg: {}installing 8 program(s)\n",
+            atpkg::cli::NET_STARTING_MARKER
         ));
         assert!(
             started.saw_start && !started.saw_terminal,
@@ -29522,9 +34455,9 @@ mod seed_marker_tests {
             PassVerdict::AnnouncedThenDied
         );
         let answered = read(&format!(
-            "{line}\natpkg: {}installing 8 ALab program(s)\natpkg: {}ay, trust\n",
-            atpkg::cli::SEED_STARTING_MARKER,
-            atpkg::cli::SEED_INSTALLED_MARKER
+            "{line}\natpkg: {}installing 8 program(s)\natpkg: {}ay, trust\n",
+            atpkg::cli::NET_STARTING_MARKER,
+            atpkg::cli::NET_INSTALLED_MARKER
         ));
         assert!(answered.saw_terminal, "a terminal marker is the answer");
         assert_eq!(
@@ -29575,46 +34508,12 @@ mod seed_marker_tests {
             "both lines are posted, in order: {posted:?}"
         );
     }
-
-    #[test]
-    fn quiet_seed_posts_nothing() {
-        assert_eq!(parse_seed_markers(""), None);
-        assert_eq!(
-            parse_seed_markers("atpkg: no bundled seed — bootstrap is network-only\n"),
-            None
-        );
-        assert_eq!(
-            parse_seed_markers(
-                "atpkg: store already provisioned — the bundled seed is a bootstrap-only source\n"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn installed_marker_yields_the_name_roster() {
-        let out = "atpkg: default set complete\n\
-                   atpkg: seed-installed: ay, trust, ty\n";
-        let (installed, pending) = parse_seed_markers(out).unwrap();
-        assert_eq!(installed, ["ay", "trust", "ty"]);
-        assert_eq!(pending, None);
-    }
-
-    #[test]
-    fn pending_marker_yields_the_human_tail() {
-        let out = "atpkg: seed-pending: 3 program(s) ready to install from the bundled seed: \
-                   ay, trust, ty (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg \
-                   install --default-set`)\n";
-        let (installed, pending) = parse_seed_markers(out).unwrap();
-        assert!(installed.is_empty());
-        assert!(pending.unwrap().starts_with("3 program(s) ready"));
-    }
 }
 
 /// Set ONCE in `main` (single-threaded launcher) from `$ATERM_UPDATED_FROM`: `true` when
 /// this process was re-exec'd by an update apply, so the App shows the quiet post-update
-/// "leveled-up" notice on the first window. The env is CLEARED right after it is read so
-/// it never leaks into the user's shell children. See [`crate::notice::NoticeKind::LevelUp`].
+/// "leveled-up" landing on the first window. The env is CLEARED right after it is read so
+/// it never leaks into the user's shell children. See [`crate::level_up`].
 static JUST_UPDATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Reattach the parent console (Windows) — exposed for the ONE binary's
@@ -29753,6 +34652,20 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Diagnostics first, before any thread spawns: without a logger every
     // aterm_log record — including containment_audit denials — is discarded.
     logging::init();
+    // atpkg's unasked notices (a config it cannot read, a prefix it will not use, a lay
+    // that is not provenance-clean) are aterm.log records here, before the first atpkg
+    // call: a window typed into a shell must not print into it.
+    atpkg::notice::to_host_log();
+    // THE MESSAGE LOG (docs/DESIGN-unified-messages-2026-09-21.md §3.7): the
+    // tail of `messages.log` is read right after the logger, so a reporter
+    // that speaks before `App` exists (the crash reporter, Phase 3) posts into
+    // a loaded ring and its ids continue from the file's. The writer opens at
+    // construction, after the compaction check. A `--headless` run records
+    // too (design §3.7): it is a real process under the person's log dir,
+    // driven by `aterm ctl appnotice` and the socket tests; only a test's
+    // `App::headless_for_test` has no writer.
+    let messages_loaded =
+        messages_store::path().map(|path| (messages_store::load_for_launch(&path), path));
     // The event-loop thread never waits for an iCloud Drive download (macOS;
     // no-op elsewhere): a dataless read on THIS thread fails fast as
     // `NotDownloaded` instead of stalling into the watchdog. Thread-scoped, so
@@ -29924,15 +34837,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // — still single-threaded, before any session/shell spawn — so it never leaks to the
     // user's shell children.
     let updated_from = std::env::var_os("ATERM_UPDATED_FROM");
-    // LATCH BEFORE THE UNSET. A same-image successor — the QA seam's, or a provenance
-    // repair's — is recognised by this variable naming OUR OWN build, and the unset two
-    // lines below is what would otherwise make that unknowable by the time the repair
-    // trigger runs (`crate::provenance_repair::same_image_successor`, which fails closed).
-    crate::provenance_repair::latch_same_image_successor(updated_from.as_deref());
-    // A SAME-IMAGE handoff is not a level-up, and must not claim one: the successor of a
-    // repair is the build it replaced. Narrowed to "present AND naming a different
-    // build", which is independently right — the QA seam has told the same small lie
-    // since it existed.
+    // A SAME-IMAGE handoff (the QA seam's) is not a level-up, and must not claim one: its
+    // successor is the build it replaced. Narrowed to "present AND naming a different
+    // build".
     let just_updated = updated_from
         .as_deref()
         .is_some_and(|from| from != std::ffi::OsStr::new(crate::build_info::BUILD_NUMBER));
@@ -29971,7 +34878,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // that arrives after the parent gave up and unlinked the socket) safe.
     // When this successor's rendezvous claim was GRANTED, on the lane that has
     // one. `None` on the fork lane (no rendezvous) and off macOS.
+    #[cfg(target_os = "macos")]
     let mut handoff_claimed_at: Option<std::time::Instant> = None;
+    #[cfg(not(target_os = "macos"))]
+    let handoff_claimed_at: Option<std::time::Instant> = None;
     #[cfg(target_os = "macos")]
     let out_of_band_handoff = handoff_rendezvous::rendezvous_present();
     #[cfg(not(target_os = "macos"))]
@@ -30280,6 +35190,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         }
         cli::HeadlessArming::Windowed => false,
     };
+    // Process-wide, before anything could raise a modal or any session
+    // spawns: a headless process presents no OS UI (`menu::os_ui_refused`),
+    // whatever path asks, and never runs the agent primer against the `$HOME`
+    // it inherited.
+    if headless {
+        menu::mark_process_headless();
+        spawn::mark_headless_instance();
+    }
     // Every process-environment mutation is now complete. Start the modern
     // Commit channel's parent-liveness watcher before any session/helper spawn:
     // parent EOF at preproof, ProofReady, or pre-Commit fail-stops this
@@ -30371,7 +35289,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // sized — the grid rows above are the same either way, but without this the
     // window itself came up one row shorter per bar at the swap instant.
     // `chrome_rows` reads the committed count from the first frame on.
-    let carried_status_bar_rows = carry_frame.as_ref().map_or(0, |w| w.status_bar_rows.min(2));
+    let carried_status_bar_rows = carry_frame
+        .as_ref()
+        .map_or(0, |w| w.status_bar_rows.min(aterm_messages::MAX_ROWS));
     // Rows reserved at the TOP of the window for the visible tab strip (env > config
     // > default 1). `0` is the byte-identical no-strip path.
     let tab_strip_rows = resolve_tab_strip_rows(&config);
@@ -30478,15 +35398,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             // a Windows user sets `background_material` and sees no Mica. And
             // aterm-gui is a GUI-subsystem binary: launched from the Start Menu,
             // a pinned tile or Explorer, the line above reaches NOBODY. Give it
-            // the two surfaces a windowed launch actually has: the in-window
-            // notice banner, and the `client=opaque(hdr_glow)` qualifier on
-            // `aterm-ctl chrome` so it is diagnosable with no console at all.
-            crate::config_notice::queue_deferred(
-                "background_material has no effect while hdr_glow is on (Windows): the HDR \
-                 swapchain and the Mica backdrop cannot coexist. Set hdr_glow = false and \
-                 relaunch."
-                    .to_string(),
-            );
+            // the two surfaces a windowed launch actually has: the message
+            // band (queued on the pre-App inbox — `App` does not exist yet), and
+            // the `client=opaque(hdr_glow)` qualifier on `aterm-ctl chrome` so
+            // it is diagnosable with no console at all.
+            message_inbox::queue_message(message_reporters::backdrop_declined(
+                "background_material has no effect while hdr_glow is on",
+                "the HDR swapchain and the Mica backdrop cannot coexist on Windows; set \
+                 hdr_glow = false to see the backdrop",
+            ));
             platform_win::note_client_backdrop_declined(
                 platform_win::ClientBackdropDecline::HdrGlow,
             );
@@ -30595,13 +35515,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // an admitted family becomes the exact PATH to build from, so the
         // renderer constructors below validate a file instead of walking the
         // directories again; a rejected one falls back to the built-in
-        // candidates, exactly as before, and says so on the notice lane.
+        // candidates, exactly as before, and says so on the pre-App inbox
+        // (this is the backend BUILD THREAD; `App` is not reachable here) —
+        // under its own key, so it never supersedes the launch's font row.
         let (family_for_build, font_family_admitted) =
             match app_config::Config::font_family_admission(family_for_build.as_deref()) {
                 Ok(path) => (path, true),
                 Err(warning) => {
                     aterm_log::warn!("{warning}");
-                    crate::config_notice::queue_deferred(format!("config {warning}"));
+                    message_inbox::queue_message(message_reporters::font_family_rejected(&warning));
                     (None, false)
                 }
             };
@@ -30654,15 +35576,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                         );
                         // Same honesty gap as the hdr_glow arm above, and reached
                         // from the BACKEND BUILD THREAD — which is exactly why the
-                        // notice lane is a process-global queue the event loop
-                        // drains rather than a call into `App` (there is no `App`
-                        // here, and this thread must not touch one if there were).
-                        crate::config_notice::queue_deferred(
-                            "background_material is off this run: the GPU renderer did not \
-                             start, and the backdrop needs it. A window opened before this \
-                             point may render blank until relaunch."
-                                .to_string(),
-                        );
+                        // inbox is a process-global queue the event loop drains
+                        // rather than a call into `App` (there is no `App` here,
+                        // and this thread must not touch one if there were).
+                        message_inbox::queue_message(message_reporters::backdrop_declined(
+                            "background_material is off this run",
+                            "the GPU renderer did not start, and the backdrop needs it; a \
+                             window opened before this point may render blank",
+                        ));
                         platform_win::note_client_backdrop_declined(
                             platform_win::ClientBackdropDecline::NoGpu,
                         );
@@ -30906,9 +35827,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     //    skip-if-present — see `spawn::reroute_path_env`. `ATERM_REROUTE_DIR` is
     //    exported so the shell integration can re-assert the dir after the user's
     //    rc files ran (a `.zshrc` sourcing `~/.cargo/env` prepends `~/.cargo/bin`
-    //    AFTER this environment was injected). `ATERM_NO_REROUTE` engaged
-    //    (`aterm --no-reroute`, or the variable itself; empty and `0` do not count)
-    //    ⇒ nothing laid, no prepend, no export. The directory must exist after
+    //    AFTER this environment was injected). `aterm --no-reroute` — the one spelling
+    //    of the escape: the front door turns it into the internal
+    //    `__ATERM_REROUTE_PASSTHROUGH` marker and clears an inherited one, so no
+    //    environment variable is a user knob here (2026-09-23) — ⇒ nothing laid, no
+    //    prepend, no export. The directory must exist after
     //    `lay`: on Windows nothing is laid (TARGET), so nothing is prepended there.
     // 2. CLIENT-2: a bundled aterm ships its control CLI co-located next to the
     //    executable (`Contents/MacOS/aterm-ctl`, beside `atpkg`) — that directory
@@ -30917,7 +35840,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     //    for nested aterm-inside-aterm sessions (already on the inherited PATH).
     // 3. The inherited PATH, verbatim.
     let reroute_dir = if atpkg::reroute::engaged(
-        std::env::var(atpkg::reroute::NO_REROUTE_ENV)
+        std::env::var(atpkg::reroute::PASSTHROUGH_ENV)
             .ok()
             .as_deref(),
     ) {
@@ -30949,9 +35872,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             // frame instead of in front of it. What this launch actually needs
             // synchronously is only that the directory EXIST, so the sessions it
             // spawns get it on PATH; that is one `mkdir -p`, and it is done here.
+            //
+            // Either failure is an aterm.log record, never stderr — the router's twin's
+            // rule: a window typed into a shell must not print into it, and a Finder
+            // launch's stderr is nowhere. `aterm pkg doctor` names an unlaid reroute.
             let dir = layout.reroute_dir();
             if let Err(error) = layout.ensure_dir(&dir) {
-                eprintln!(
+                aterm_log::warn!(
                     "aterm: reroute dir not created ({error}); the upstream Rust names are NOT rerouted in this window's sessions — `aterm pkg doctor` explains (aterm help reroute)"
                 );
             }
@@ -30961,8 +35888,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                     .name("aterm-reroute-lay".into())
                     .spawn(move || {
                         if let Err(error) = atpkg::reroute::lay(&layout) {
-                            // Never a SILENT un-rerouted tab (see the router's twin).
-                            eprintln!(
+                            aterm_log::warn!(
                                 "aterm: reroute stubs not laid ({error}); the upstream Rust names are NOT rerouted in this window's sessions — `aterm pkg doctor` explains (aterm help reroute)"
                             );
                         }
@@ -31139,6 +36065,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // keeps the real backend, so the two paths stay one code path everywhere the display
     // exists and the windowless lane is not a separately-rotting second implementation.
     let mut builder = EventLoop::<Wake>::with_user_event();
+    // macOS has no display-free backend: a `--headless` run builds the real AppKit
+    // loop below, so it must ask for the posture of a process with no glass (see
+    // `launch_posture`) or winit's `applicationDidFinishLaunching:` makes it a
+    // Regular, Dock-visible app that activates itself — the focus theft under the
+    // verify gate. Windowed passes winit's own default through, unchanged.
+    apply_launch_posture(&mut builder, launch_posture(headless));
     #[cfg(all(
         unix,
         not(any(target_os = "macos", target_os = "android", target_os = "ios"))
@@ -31189,22 +36121,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         event_loop.create_proxy(),
     );
 
-    // Silent background update check: off the event loop, on its own thread. It
-    // talks to the private GitHub Release, verifies a notarized + Team-ID-pinned
-    // newer build, and stages it for the in-session apply lane (the GUI applies it
-    // in place through the seamless overlap handoff; `apply_staged_if_ready` at the
-    // top of main picks a stage up only if no handoff ever completed). A no-op for dev
-    // builds, when the updater is disabled/unpinned, or when no update token is
-    // provisioned. Skipped in headless mode so automated introspection never
-    // reaches the network.
-    // Gate on `enabled()` BEFORE resolving the source, so a malformed `[update]` slug
-    // only ever warns on a build/platform where the updater actually runs (a pinned,
-    // installed macOS `.app`) — never on Linux or an unsigned dev build where the
-    // resolution would be pointless. `spawn_background_check` re-checks `enabled()`.
+    // Background update checks run off the event loop. macOS uses its authenticated
+    // bundle and in-session handoff lane; Linux authenticates a native executable
+    // and either holds it under manual policy or atomically replaces only disk
+    // bytes, preserving every running process/PTY. Public release discovery does
+    // not require a private token. Headless introspection never starts this loop.
+    // Gate on `enabled()` before resolving settings. The worker additionally
+    // requires an installed macOS bundle or an explicitly enrolled Linux binary;
+    // un-enrolled dev checkouts never start a replacement loop.
+    // `enabled()` is platform support, so manual checks still receive this setup
+    // when automatic checks are off. The background worker separately requires
+    // `[update] enabled`, read by `aterm_update::automatic()`.
     if !headless && aterm_update::enabled() {
-        // Which GitHub repo to pull releases from: config `[update] owner/repo`, with
-        // env (`ATERM_UPDATE_OWNER`/`_REPO`) overriding and a compiled-in default
-        // (derived from Cargo.toml's `repository`) as the fallback — see `Source::resolve`.
+        // Which GitHub repo to pull releases from: the compiled-in channel (derived from
+        // the workspace manifest), which only a DEVELOPMENT build lets `[update]
+        // owner/repo` repoint — see `Source::resolve`. No environment override
+        // (2026-09-23).
         let (cfg_owner, cfg_repo) = config
             .update
             .as_ref()
@@ -31227,12 +36159,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // The call can only ever ADD a requirement — a build with a Team ID
         // compiled in ignores it entirely (`aterm_update::set_required_team_id`),
         // so this can never become a way to weaken a signed build.
-        aterm_update::set_required_team_id(
-            config
-                .update
-                .as_ref()
-                .and_then(|u| u.require_team_id.as_deref()),
-        );
+        // A development setting since 2026-09-23: a shipped binary's compiled pin is its
+        // only anchor, so `update_required_team_id` answers `None` there.
+        aterm_update::set_required_team_id(crate::app_config::update_required_team_id(&config));
         // Self-healing surfacing: the check thread reports ledger threshold events
         // (persistent pipeline failure) through this hook; the main thread shows
         // them as an OS notification (`Wake::UpdateHealth`), so a broken update
@@ -31257,23 +36186,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // and socket checks read live config so a reload changes their source.
         let source = aterm_update::Source::resolve(cfg_owner, cfg_repo);
         aterm_update::set_configured_source(source);
-        let source_proxy = std::sync::Mutex::new(event_loop.create_proxy());
-        aterm_update::spawn_background_check_with_source(
+        aterm_update::spawn_background_check_with_settings(
             build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-            std::sync::Arc::new(move || {
-                let proxy = source_proxy.lock().ok()?;
-                let live = crate::control::control_media::call_main_within(
-                    &proxy,
-                    std::time::Duration::from_secs(2),
-                    |reply| Wake::ReadUpdateControl { reply },
-                )
-                .ok()?;
-                Some(aterm_update::Source::resolve(
-                    live.owner.as_deref(),
-                    live.repo.as_deref(),
-                ))
-            }),
+            crate::update_control::check_settings_provider(event_loop.create_proxy()),
             Some(Box::new(move |title, body| {
+                #[cfg(target_os = "linux")]
+                let _ = health_proxy.send_event(Wake::UpdateCheckCompleted);
                 let _ = health_proxy.send_event(Wake::UpdateHealth { title, body });
             })),
             Some(Box::new(move |build, version| {
@@ -31283,9 +36201,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     }
     // QA/screenshot hook (RFC Rung 2): `ATERM_DEBUG_RELAUNCH_NUDGE=<version>` seeds the
     // update-ready nudge through the REAL `Wake::UpdateStaged` dispatch path, so the nudge
-    // can be exercised/captured without waiting for a genuine background stage. Inert
-    // unless the env var is set; never affects a normal launch.
-    if let Some(v) = std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE") {
+    // can be exercised/captured without waiting for a genuine background stage. A
+    // DEVELOPMENT SEAM (`aterm_types::dev_seam!`): a shipped binary does not read it.
+    if let Some(v) = aterm_types::dev_seam!("ATERM_DEBUG_RELAUNCH_NUDGE") {
         let version = v.to_string_lossy().into_owned();
         let build = build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0) + 1;
         let _ = event_loop
@@ -31294,18 +36212,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     }
     // QA/screenshot hook for the STATUS BARS (the update-nudge seam's twin):
     // `ATERM_DEBUG_STATUS_BARS=1` seeds both lanes through their REAL wake
-    // paths — a toolchain announcement, then a mid-pass snapshot, and an update
-    // download in flight — so the rows can be captured with `image` without
-    // waiting for a genuine pass; `=staged` seeds a STAGED report in place of the
-    // download, so the "how it applies" line (the posture this process really
-    // computes) can be captured too. Inert unless set; never affects a normal
-    // launch, and the seeded bars fold at their staleness caps like any other.
-    // `=managed` / `=machine` (2026-09-10) seed the two R6 rows — the managed
-    // agents in use, and the machine settings a pass changed — through their real
-    // wakes, and nothing else, so each can be captured on its own. `=deferred`
-    // seeds the deferred notice a timed-out store-lock wait posts the same way
-    // (the live "waiting" row it used to pair with is gone, 2026-09-18).
-    if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS")
+    // paths — a FIRST-RUN toolchain announcement, then a mid-pass snapshot, and
+    // an update download in flight — so the rows can be captured with `image`
+    // without waiting for a genuine pass; `=staged` seeds a STAGED report in place
+    // of the download, so the "how it applies" line (the posture this process
+    // really computes) can be captured too. Inert unless set; never affects a
+    // normal launch, and the seeded bars fold at their staleness caps like any
+    // other. `=comet` seeds ONLY the first-run announcement (the live motion
+    // gate, design §10.8). `=managed` / `=machine` / `=deferred` seed the R6 markers and the
+    // deferred pass through their real wakes; since 2026-09-22 those paint no row
+    // and land in `aterm ctl appstatus` (and, for `=machine`, Settings ▸ Security).
+    // `=fill:<permille>` seeds both meters at that fill (0–1000), so the full-width
+    // meter's ends and middle (design ruling 55: 0 % empty, 50 % the window's
+    // middle, 100 % edge to edge) can be captured on glass. A DEVELOPMENT SEAM
+    // (`aterm_types::dev_seam!`): a shipped binary does not read it.
+    let status_bars_seam = aterm_types::dev_seam!("ATERM_DEBUG_STATUS_BARS");
+    if let Some(mode) = status_bars_seam.clone()
         && (mode == "managed" || mode == "machine" || mode == "deferred")
     {
         let proxy = event_loop.create_proxy();
@@ -31323,17 +36245,39 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             Wake::PkgMachineRecordMissing
         } else {
             Wake::PkgLockTimedOut {
-                detail: "an earlier toolchain pass is still running \u{2014} trying again in 30 s (each \
-                         try waits up to 30 min)"
+                detail: "waiting for an earlier package update to finish \u{2014} trying again in \
+                         30 s"
                     .to_string(),
+                stands_down: false,
             }
         });
-    } else if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS") {
+    } else if status_bars_seam.as_deref() == Some(std::ffi::OsStr::new("comet")) {
+        // THE LIVE MOTION GATE (design §10.8): only the first run's
+        // announcement — one Live row with no fraction, the comet, for its
+        // 20-minute cap — so `aterm ctl metrics` can count the band's motion
+        // arms (`message_band_motion`) focused, unfocused, occluded and after
+        // the fold.
+        let _ = event_loop.create_proxy().send_event(Wake::PkgSeedStarted {
+            detail: "installing 10 ALab program(s) over the network (about 3 GB on disk \
+                     when finished)"
+                .to_string(),
+            first_run: true,
+        });
+    } else if let Some(mode) = status_bars_seam {
         let proxy = event_loop.create_proxy();
+        // `fill:<permille>`: both seeded meters at that fill; else the historical
+        // 42.7 % toolchain pass and 60.8 % download.
+        let seeded_fill = mode
+            .to_str()
+            .and_then(|m| m.strip_prefix("fill:"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|p| p.min(1000));
+        let of_total = |total: u64, default: u64| seeded_fill.map_or(default, |p| total * p / 1000);
         let _ = proxy.send_event(Wake::PkgSeedStarted {
             detail: "installing 10 ALab program(s) over the network (about 3 GB on disk \
                      when finished)"
                 .to_string(),
+            first_run: true,
         });
         let mut programs = std::collections::BTreeMap::new();
         programs.insert(
@@ -31359,7 +36303,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                     overall: atpkg::progress::Overall {
                         programs_done: 3,
                         programs_total: 10,
-                        bytes_done: 512_000_000,
+                        bytes_done: of_total(1_200_000_000, 512_000_000),
                         bytes_total: 1_200_000_000,
                     },
                     queue: vec!["ty".to_string(), "ay".to_string()],
@@ -31368,6 +36312,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 },
                 running: true,
             })),
+            first_run: true,
         });
         let update = if mode == "staged" {
             aterm_update::Progress::Staged {
@@ -31377,7 +36322,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         } else {
             aterm_update::Progress::Downloading {
                 version: "0.62.0".to_string(),
-                bytes_done: 45_000_000,
+                bytes_done: of_total(74_000_000, 45_000_000),
                 bytes_total: 74_000_000,
             }
         };
@@ -31390,31 +36335,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // can't supply a fake `atpkg`). Distinct from aterm's own self-update: atpkg verifies
     // its own signed channel and is inert on a build with no pinned root key. A no-op for
     // dev/`cargo run` (no co-located `atpkg`), skipped headless (no background network),
-    // and gated on the `[packages]` loop flags (enabled + auto_update, default on).
+    // and gated on `[packages] enabled` (Automatic updates, default on; the retired
+    // `auto_update` folded in) — read LIVE inside the thread, which starts either way
+    // (Phase 4, [`LiveSwitch`]).
+    // A launch whose loop will not run says nothing about packages never checked (Phase
+    // 2, 2026-09-22; from 2026-09-10 it printed the never-checked line on stderr and
+    // logged it): `aterm pkg doctor` reports that condition, truthfully.
     let package_update_loop_running = !headless && spawn_pkg_update_check(&config, proxy.clone());
-    // R3 (2026-09-10): a launch whose loop will NOT run — headless, `[packages]`
-    // disabled, no co-located atpkg — on a machine where no atpkg pass has ever
-    // succeeded says so on stderr, in the one line every console edge prints
-    // (`aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE`); the session lane
-    // prints the same. A machine that has been checked stays quiet. The LOG copy
-    // is for a WINDOWED run whose loop will not start (the one a person cannot
-    // see stderr of); a headless run — every integration test that drives this
-    // binary — stays out of the machine's real `aterm.log`, which was gaining one
-    // recurring WARN per test run (2026-09-10 review).
-    if !package_update_loop_running
-        && let Some(layout) = atpkg::store::resolve_configured()
-        && aterm_update_core::pkg_check::never_checked(&layout.status())
-    {
-        eprintln!(
-            "{}",
-            aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE
-        );
-        if !headless {
-            aterm_log::warn!(
-                "{}",
-                aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE
-            );
-        }
+
+    // Live agent upgrade: the harness moves this window's Claude Code sessions onto a
+    // newer build in place, cooperatively ([`spawn_agent_live_upgrade`]). Default on;
+    // skipped headless.
+    if !headless {
+        spawn_agent_live_upgrade();
     }
 
     // Latency self-introspection state (see App::trace_latency). The epoch is a
@@ -31874,6 +36807,32 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         }
     };
 
+    // THE SUPERVISOR HOST (`harness_host`), beside the operator: every Claude
+    // Code session this instance owns is supervised under `[harness]`, by
+    // workers that speak to this instance's OWN control socket (the one
+    // interface). No socket, no host. A headless instance runs none unless
+    // `[harness] headless = true`; a seamless successor starts suspended and
+    // resumes at Commit (`Wake::ActivateCommittedHandoff`). Nothing here
+    // blocks: the host thread starts only when the policy is active.
+    let harness = sock_plan.as_ref().map(|plan| {
+        // A launch that could not load aterm.toml escalates only: the
+        // defaults would act on every switch the owner may have turned off.
+        let policy = config.harness_policy_at_launch(app_config::launch_load_failed());
+        harness_host::start_default(
+            store.clone(),
+            plan.sock_path.clone(),
+            policy,
+            headless,
+            handoff_reader_gate.is_some(),
+        )
+    });
+    // No vendor hook is installed into an agent any more: remove the ones an
+    // older aterm wrote, whatever `agents_auto_prime` says (off-thread). A
+    // headless instance never touches the user's settings.
+    if !headless {
+        harness_host::sweep_legacy_hooks();
+    }
+
     // Recursion discovery (Item 5b): the root session's graph entry is published
     // by `control::spawn` AFTER it binds (so it never races the stale sweep — see
     // the `root_identity` arg above). We retain `root_sid` here only for the
@@ -31890,6 +36849,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         .expect("initial tab identity space");
     let mut ws0 = WindowState::new_terminal(
         term.clone(),
+        session0.vi_active.clone(),
         master,
         app_sink.clone(),
         session0.ctx.ui_waiting.clone(),
@@ -31956,29 +36916,37 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
 
     // Resolve keybindings + key_sequences, COLLECTING any dropped-rule warnings so a
     // Finder-launched .app can surface them in-window (stderr is invisible there).
-    let (keybindings, mut cfg_warns) =
+    // The launch's config warnings, sorted into families as they are collected
+    // (`message_reporters::ConfigWarnings`): ONE message per family, queued on
+    // the pre-App inbox below — `App` does not exist yet — and posted at the
+    // first park (design R1). The stderr echo keeps every sentence verbatim.
+    use message_reporters::ConfigFamily;
+    let mut cfg_warns = message_reporters::ConfigWarnings::default();
+    let (keybindings, kb_warns) =
         keybinding::Keybindings::resolved_warn(config.keybindings.as_ref());
+    cfg_warns.extend(ConfigFamily::Keybindings, kb_warns);
     let (key_sequences, ks_warns) =
         keybinding::KeySequences::from_config_warn(config.key_sequences.as_ref());
-    cfg_warns.extend(ks_warns);
+    cfg_warns.extend(ConfigFamily::Keybindings, ks_warns);
     // Keys `aterm.toml` sets that this build does nothing with. Unlike every
-    // other line on this banner, these cannot be derived from the parsed
-    // `Config` — an unknown key leaves no trace in it — so they are read from
-    // the admitted TEXT instead. That text comes from `startup_config_snapshot`,
-    // the same binding `config` was cloned from, which is the seam that keeps a
-    // notice from ever describing a revision this launch did not apply.
-    cfg_warns.extend(app_config::ignored_key_notices(
-        &startup_config_snapshot.text,
-    ));
+    // other family here, these cannot be derived from the parsed `Config` — an
+    // unknown key leaves no trace in it — so they are read from the admitted
+    // TEXT instead. That text comes from `startup_config_snapshot`, the same
+    // binding `config` was cloned from, which is the seam that keeps a message
+    // from ever describing a revision this launch did not apply. A retired or
+    // deprecated spelling is a record, not a row
+    // (`app_config::collect_key_notices`).
+    app_config::collect_key_notices(&mut cfg_warns, &startup_config_snapshot.text);
     // W5h: a misspelled `font_family` previously reduced to the built-in
     // candidates with ZERO output. The backend worker — the thread that
-    // resolves the family — queues that warning on the deferred notice lane
-    // (`config_notice::queue_deferred`), and the event loop drains it into
-    // this same banner on its first park; nothing is resolved here.
+    // resolves the family — queues that warning on the same inbox
+    // (`message_reporters::font_family_rejected`), and the event loop posts it
+    // at its first park; nothing is resolved here.
     // An unrecognized `cursor_trail_style` silently draws the DEFAULT style
     // instead of the requested one — surface the typo at startup exactly like
     // the reload path does.
     cfg_warns.extend(
+        ConfigFamily::CursorTrail,
         config_assets
             .trail_packs
             .diagnostics
@@ -31986,35 +36954,45 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .map(|warning| format!("config {warning}")),
     );
     if let Some(w) = config.cursor_trail_style_warning(&config_assets.trail_packs) {
-        cfg_warns.push(format!("config {w}"));
+        cfg_warns.push(ConfigFamily::CursorTrail, format!("config {w}"));
     }
     // W6: surface the warnings collected while configured face names were
     // resolved concurrently with backend construction above.
-    cfg_warns.extend(font_cfg_warns);
+    cfg_warns.extend(ConfigFamily::Fonts, font_cfg_warns);
     // W9: malformed variable-font requests were skipped by the same startup
-    // generation and ride the shared warning banner.
-    cfg_warns.extend(vf_warns);
-    // LAST among the config lines, once every resolver above has had its say: a
-    // key spelled right whose VALUE this build does not accept keeps the default
-    // just as silently as a misspelled key ignores the edit, and says so only on
-    // the stderr a dock/Finder/Start-menu launch does not have. The filter reads
-    // the lines already collected, so a resolver that named the value it refused
-    // keeps its fuller sentence and this adds nothing for that key.
+    // generation and ride the same font row.
+    cfg_warns.extend(ConfigFamily::Fonts, vf_warns);
+    // LAST among the config families, once every resolver above has had its
+    // say: a key spelled right whose VALUE this build does not accept keeps the
+    // default just as silently as a misspelled key ignores the edit, and says
+    // so only on the stderr a dock/Finder/Start-menu launch does not have. The
+    // filter reads the sentences already collected, so a resolver that named
+    // the value it refused keeps its fuller sentence and this adds nothing for
+    // that key.
+    // The supervisor's `[harness]` values it refused (`harness_host`).
+    cfg_warns.extend(ConfigFamily::UnacceptedValues, config.harness_notices());
     let unaccepted_values =
-        app_config::unaccepted_value_notices(&startup_config_snapshot.text, &cfg_warns);
-    cfg_warns.extend(unaccepted_values);
+        app_config::unaccepted_value_notices(&startup_config_snapshot.text, &cfg_warns.told());
+    cfg_warns.extend(ConfigFamily::UnacceptedValues, unaccepted_values);
+    for w in cfg_warns.sentences() {
+        crate::logging::stderr_line!("aterm-gui: {w}");
+    }
+    for msg in cfg_warns.into_messages() {
+        message_inbox::queue_message(msg);
+    }
     // L6: evidence that the PREVIOUS run crashed (a non-empty fatal-signal
     // marker or a panic report in the log dir — see `logging::take_crash_evidence`)
-    // rides the same one-shot banner. Until this line, `crash_signal` carefully
-    // PRESERVED those artifacts and nothing ever read them, so a crash was
-    // completely silent at the next launch. Skipped headless: the scan CONSUMES
-    // (renames) the artifact, and a windowless run has no banner surface — it
-    // must not eat the notice the next windowed launch would have shown.
-    if !headless && let Some(crash_notice) = logging::take_crash_evidence() {
-        cfg_warns.push(crash_notice);
-    }
-    for w in &cfg_warns {
-        crate::logging::stderr_line!("aterm-gui: {w}");
+    // is the crash message (design R2): the artifact's absolute path and its
+    // first lines in the detail, `Open log` on the row. Until this line,
+    // `crash_signal` carefully PRESERVED those artifacts and nothing ever read
+    // them, so a crash was completely silent at the next launch. Skipped
+    // headless: the scan CONSUMES (renames) the artifact. A headless run
+    // composes a band of its own (`aterm ctl image` paints it), but nobody is
+    // sitting in front of it — it must not eat the one crash record the next
+    // windowed launch would put in front of a person.
+    if !headless && let Some(evidence) = logging::take_crash_evidence() {
+        crate::logging::stderr_line!("aterm-gui: {}", evidence.sentence());
+        message_inbox::queue_message(message_reporters::crash_message(&evidence));
     }
     // Seed the process-global search index depth cap (config `search_history_lines`)
     // before any ⌘F / socket `search` builds an index. Re-derived on config reload.
@@ -32044,6 +37022,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let focus_reported = ws0
         .front_content
         .and_then(front_content::FrontContent::terminal_session);
+    // THE MESSAGE LOG'S WRITER: the append handle over the file, which rotates
+    // itself while this process runs (`messages_store::BUDGET`, design ruling
+    // 64) — no rewrite at load, so no successor or second instance can strand
+    // another writer's lines in an unlinked inode.
+    let (messages_ring, messages_log) = match messages_loaded {
+        Some((loaded, path)) => (loaded.log, messages_store::Writer::spawn(&path)),
+        None => (aterm_messages::MessageLog::empty(), None),
+    };
     let mut app = App {
         apprt,
         system_reduce_motion: false,
@@ -32062,6 +37048,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         native_updater_service: app_native::load_native_updater_service(),
         native_packages_service: packages_screen::PackagesService::new(),
         package_update_loop_running,
+        // The value the background checker was spawned under (`aterm_update::automatic`
+        // is a once-per-process read, so this is the checker's own answer).
+        update_checks_running: aterm_update::automatic(),
         native_update_reconcile_worker,
         next_native_update_reconcile_sequence: 1,
         last_native_update_reconcile_sequence: 0,
@@ -32225,6 +37214,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         },
         consent: control_privacy::ConsentState::new(headless),
         consent_warmup: consent_warmup::WarmupState::new(headless),
+        claimant_retire: consent_retire::RetireState::new(headless),
         consent_observer: consent_observer::ObserverState::new(headless),
         consent_attention: consent_observer::AttentionGate::new(),
         consent_observer_started: false,
@@ -32277,8 +37267,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         title_drift: TitleDrift::default(),
         // GLOBAL tab-strip config (per-frame `tab_segments` live in WindowState).
         tab_strip_rows,
-        config_notice: None,
-        notice: None,
+        gpu_lost_remedy_floor: None,
+        robi_bubble: None,
         robi_dismissal: None,
         level_up_done: false,
         level_up_deferred: None,
@@ -32286,23 +37276,36 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         boot_health_confirmation_dispatched: false,
         boot_health_confirmation_retry_at: None,
         level_up: None,
-        // THE CARRIED BARS (2026-09-07): the successor paints what the outgoing
-        // window carried in the rows it reserved, with the update lane's words
-        // moved on to "finishing" when this process is the handed-off successor.
-        status_bars: status_bars::StatusBars::from_handoff_carry(
-            carry_frame.as_ref().map_or(&[][..], |w| w.bars.as_slice()),
-            (just_updated && overlap_channels_present && adopting)
-                .then_some(crate::build_info::version_display()),
-            Instant::now(),
-        ),
-        status_bar_rows: carried_status_bar_rows,
+        // The center over the loaded ring; the carried rows are seeded into it
+        // right after construction (`seed_carried_messages`), and the band's
+        // row count starts at the count the outgoing window had committed.
+        messages: aterm_messages::MessageCenter::new(messages_ring, Instant::now()),
+        message_band_rows: carried_status_bar_rows,
+        messages_log,
+        messages_last_publish: None,
+        messages_published_revision: 0,
+        consent_card_message: None,
+        admin_step_message: None,
+        toolchain_row_latched: false,
+        toolchain_pass_peak: None,
+        toolchain_first_run: false,
+        toolchain_first_run_short: None,
+        staged_decision_raised: None,
+        config_cleared: std::collections::BTreeSet::new(),
+        managed_current_recorded: None,
+        harness_note_recorded: None,
+        update_flow: None,
+        update_verified: None,
+        update_health_said: None,
+        update_switch_on_record: None,
+        update_switch_recorded_for: None,
         presence: app_presence::PresenceTable::default(),
         last_ledger_plan: None,
         presence_band_on: config.presence_band_enabled(),
         presence_rim_on: config.presence_rim_enabled(),
         last_fabric_plan: None,
         last_menu_document: None,
-        update_bar_before_install: None,
+        update_row_before_install: None,
         landed_row_pending: None,
         job_probe: crate::quit_safety::JobProbe::default(),
         relaunch: None,
@@ -32315,9 +37318,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_preverified: std::sync::Arc::default(),
         pending_update_handoff: None,
         update_handoff_prelaunch: None,
-        provenance_repair: crate::provenance_repair::RepairPosture::default(),
-        provenance_repair_verdict: std::sync::Arc::new(std::sync::Mutex::new(None)),
         operator_control: operator_control.clone(),
+        harness: harness.clone(),
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
         last_keystroke_at: None,
@@ -32335,12 +37337,24 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Install the exact startup catalog into the already-created first window.
     // This is Arc/scalar-only: the config service completed every bounded path
     // read and optional PNG decode before App construction.
-    // The frozen-tab note's remedy is spelled for the shell this window spawns
-    // (`status_bars::HookDialect`, 2026-09-16): the same detection the spawn
-    // seam uses, so a config `shell = "fish"` gets fish's `source`.
-    app.status_bars.set_hook_shell(spawn::detect_spawn_shell(
-        app.session_factory.shell_override.as_deref(),
-    ));
+    // THE CARRIED ROWS (2026-09-07): the successor paints what the outgoing
+    // window carried in the rows it reserved, with the update lane's words
+    // moved on to "finishing" when this process is the handed-off successor.
+    if let Some(carry) = carry_frame.as_ref() {
+        app.seed_carried_messages(
+            carry,
+            (just_updated && overlap_channels_present && adopting)
+                .then_some(crate::build_info::version_display()),
+        );
+        // When the predecessor finished downloading this build, so the landing's
+        // record can say how long the update took.
+        app.update_verified = crate::update_words::carried_verification(
+            carry.update_verified_unix_ms,
+            running_build_number(),
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
+    }
     app.install_window_config_assets(WindowId(0));
     // HEADLESS only: the backend worker already applied its complete font
     // generation (and, unless the seal is deferred to the first pixel demand,
@@ -32361,7 +37375,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // redraw retune can ever wipe them mid-recording (the frames=0 class).
         app.seed_headless_boot_metrics();
     }
-    app.config_notice = config_notice::ConfigNotice::new(cfg_warns, std::time::Instant::now());
     // Startup reconciliation is asynchronous and ordered like every later stage wake.
     // No ledger parse or installed-bundle probe can delay the first event-loop turn.
     if !headless {
@@ -32409,6 +37422,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // still executable; the worker never runs on or blocks the winit thread.
     if let Some(mut runtime) = operator_runtime.take() {
         runtime.shutdown_and_join();
+    }
+    // The supervisor workers next, bounded: their waits are cut, their badges
+    // cleared on the still-listening socket where the bound allows.
+    if let Some(host) = harness.as_ref() {
+        host.shutdown_and_join();
     }
     // The event loop is gone: no recording can produce another present or
     // completion. Answer its client and remove the pre-created directory before
@@ -32579,6 +37597,7 @@ fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),
         id,
         term,
+        vi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         master: -1,
         pid: -1,
         handoff_local_id: None,
@@ -33141,6 +38160,7 @@ mod overlap_handoff_tests {
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
             park_at: std::time::Instant::now(),
             proof_ready_at: None,
+            #[cfg(target_os = "macos")]
             activate_at_commit: false,
             attempt_id: 7,
             nonce: None,
@@ -33813,101 +38833,113 @@ mod overlap_handoff_tests {
     /// HANDS OFF THE KEYS: the automatic apply lane refuses to start its freeze
     /// inside a keystroke gap, and opens again once the user pauses.
     ///
-    /// The precondition assert is load-bearing. A headless window seeds
-    /// `focused: true` (only a real `WindowEvent::Focused` corrects it), so what
-    /// keeps every existing update test transparent to this gate is the ABSENT
-    /// keystroke stamp, not the focus state. If that default ever changes, this
-    /// test says so here rather than as a puzzling failure three files away.
+    /// The rule is driven through its pure form, because a focused window with
+    /// a real surface cannot be built headless. The App's gate reads it with
+    /// `any_os_window_focused`, so a surfaceless window — which is born
+    /// believing it has focus — never holds the lane, even mid-word: the same
+    /// "is aterm focused" the ladder's output rule reads.
     #[test]
     fn the_keystroke_gate_holds_an_automatic_apply_until_the_typing_pauses() {
-        use super::AUTOMATIC_UPDATE_KEYSTROKE_GAP;
+        use super::{AUTOMATIC_UPDATE_KEYSTROKE_GAP, hands_off_keys};
         use std::time::Instant;
 
-        let mut app = App::headless_for_test();
         let now = Instant::now();
-
         assert!(
-            app.windows.values().any(|ws| ws.focused),
-            "precondition: a headless window seeds focused = true"
-        );
-        assert!(
-            app.last_keystroke_at.is_none(),
-            "precondition: no keystroke has been observed"
-        );
-        assert!(
-            app.update_apply_hands_off_keys(now),
+            hands_off_keys(true, None, now),
             "a process that has never seen a keystroke never holds the lane"
         );
 
         // Mid-word: the freeze must not start here.
-        app.last_keystroke_at = Some(now);
-        assert!(!app.update_apply_hands_off_keys(now));
+        assert!(!hands_off_keys(true, Some(now), now));
         assert!(
-            !app.update_apply_hands_off_keys(now + AUTOMATIC_UPDATE_KEYSTROKE_GAP / 2),
+            !hands_off_keys(true, Some(now), now + AUTOMATIC_UPDATE_KEYSTROKE_GAP / 2),
             "an inter-keystroke pause shorter than the gap is still typing"
         );
 
         // A pause opens it, and the update lands invisibly as it always did.
-        assert!(app.update_apply_hands_off_keys(now + AUTOMATIC_UPDATE_KEYSTROKE_GAP));
+        assert!(hands_off_keys(
+            true,
+            Some(now),
+            now + AUTOMATIC_UPDATE_KEYSTROKE_GAP
+        ));
 
         // THE INVERSION LEG: the user is typing somewhere ELSE. Their keystrokes
         // are not ours to interrupt, so the lane proceeds — this is the leg that
         // would silently rot into "aterm never updates while any app is in use".
-        app.last_keystroke_at = Some(now);
-        for ws in app.windows.values_mut() {
-            ws.focused = false;
-        }
         assert!(
-            app.update_apply_hands_off_keys(now),
+            hands_off_keys(false, Some(now), now),
             "no aterm window has focus, so no keystroke of ours is being interrupted"
         );
+
+        // THE SURFACELESS LEG: a headless window seeds `focused: true` with no
+        // OS surface; the App's gate does not count it as focus.
+        let mut app = App::headless_for_test();
+        assert!(
+            app.windows.values().any(|ws| ws.focused) && !app.any_os_window_focused(),
+            "precondition: a headless window believes it has focus and has no surface"
+        );
+        app.last_keystroke_at = Some(now);
+        assert!(app.update_apply_hands_off_keys(now));
     }
 
     /// THE WARM-UP HOLD (design §3.5): while an owner-initiated consent warm-up
-    /// is mid-gesture the AUTOMATIC in-place apply stands off — and stops
-    /// standing off at `[privacy] warmup_hold_ms`, so it can never pin a build.
+    /// is mid-gesture the AUTOMATIC in-place apply stands off — in every ladder
+    /// phase, `Land` included — and stops standing off at
+    /// `[privacy] warmup_hold_ms`, so it can never pin a build.
     ///
-    /// The manual leg is structural rather than asserted here: this gate has one
-    /// caller (`App::apply_native_update`) and that caller consults it only
-    /// under `ApplyMode::is_automatic()`, which
-    /// `consent_warmup::tests::a_manual_apply_is_never_held` pins.
+    /// The manual leg: an explicit apply's facts never carry the hold, and
+    /// `consent_warmup::tests::a_manual_apply_is_never_held` pins that every
+    /// call site sits under `ApplyMode::is_automatic()`.
     #[test]
     fn a_live_consent_warm_up_holds_the_automatic_apply_but_only_to_its_cap() {
+        use crate::native_update_auto_intent::{ApplyPhase, automatic_park_refusal};
+        use crate::native_updater_service::ApplyMode;
         use std::time::{Duration, Instant};
 
         let mut app = App::headless_for_test();
         let now = Instant::now();
         assert!(
-            app.update_apply_hands_off_keys(now),
+            !app.update_apply_warmup_holds(now),
             "precondition: nothing holds the lane"
         );
 
         let cap = Duration::from_millis(120_000);
         app.consent_warmup.arm_hold_for_test(now, cap);
         assert!(
-            !app.update_apply_hands_off_keys(now),
+            app.update_apply_warmup_holds(now),
             "an owner-initiated warm-up is mid-gesture"
+        );
+        let facts = app.automatic_activity_facts(ApplyMode::AutomaticPastGrace, now);
+        assert!(facts.consent_warmup);
+        assert!(
+            automatic_park_refusal(ApplyPhase::Land, facts).is_some(),
+            "the ladder's last phase must not land on the dialog"
+        );
+        assert!(
+            !app.automatic_activity_facts(ApplyMode::Immediate, now)
+                .consent_warmup,
+            "an explicit apply is never held"
         );
 
         // THE ORDERING LEG. A system consent dialog takes focus away from every
-        // aterm window, which is exactly the case the no-focus shortcut answers
-        // `true` for — so the hold must be checked BEFORE it, or the hold would
-        // evaporate the instant the dialog it exists for appeared.
+        // aterm window, which is exactly the case the keystroke gate answers
+        // `true` for — so the hold is its own fact, not a part of that gate, or
+        // it would evaporate the instant the dialog it exists for appeared.
         for ws in app.windows.values_mut() {
             ws.focused = false;
         }
         assert!(
-            !app.update_apply_hands_off_keys(now),
+            app.update_apply_warmup_holds(now),
             "losing focus to the dialog must not end the hold"
         );
 
         // …AND IT CANNOT PIN A BUILD.
         assert!(
-            app.update_apply_hands_off_keys(now + cap),
+            !app.update_apply_warmup_holds(now + cap),
             "the hold expires at its cap"
         );
         assert!(
-            app.update_apply_hands_off_keys(now + cap + Duration::from_secs(3600)),
+            !app.update_apply_warmup_holds(now + cap + Duration::from_secs(3600)),
             "an hour past the cap the build is still not pinned"
         );
     }
@@ -33935,14 +38967,15 @@ mod overlap_handoff_tests {
 
     /// THE macOS ACCESS CARD NEVER REACHES A HEADLESS INSTANCE (design §3.4,
     /// amended 2026-09-07). A headless `App` — which is what every unit test
-    /// is — ticks the card's lifecycle without spawning the worker, raising a
-    /// card, or moving off `Idle`; a verdict that arrives anyway is stale
-    /// against `Idle` and raises nothing; and asked directly, the decision
+    /// is — ticks the card's lifecycle without spawning the worker, posting a
+    /// row, or moving off `Idle`; a verdict that arrives anyway is stale
+    /// against `Idle` and posts nothing; and asked directly, the decision
     /// names headlessness. No probe is consulted: the inert arm answers
-    /// `unknown`, which is not a denial and would earn no card either.
+    /// `unknown`, which is not a denial and would earn no row either.
     #[test]
     fn a_headless_instance_never_offers_the_macos_access_card() {
         use super::consent_card::{CardFacts, CardPhase, NotDue, Verdict, decide};
+        use super::message_reporters::KEY_FILE_ACCESS;
         use std::time::Instant;
 
         let mut app = App::headless_for_test();
@@ -33952,14 +38985,17 @@ mod overlap_handoff_tests {
         );
         app.tick_macos_access_card(Instant::now());
         assert_eq!(app.consent_card.phase(), CardPhase::Idle);
-        assert!(app.notice.is_none(), "no card on a headless instance");
+        assert!(
+            app.messages.live_by_key(KEY_FILE_ACCESS).is_none(),
+            "no row on a headless instance"
+        );
         app.decide_macos_access_card(None);
         assert_eq!(
             app.consent_card.phase(),
             CardPhase::Idle,
             "a stray verdict is stale"
         );
-        assert!(app.notice.is_none());
+        assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
         let panel = app.consent_panel_facts();
         assert_eq!(panel.fda, aterm_containment::consent::FdaState::Unknown);
         let facts = CardFacts {
@@ -33970,63 +39006,78 @@ mod overlap_handoff_tests {
         };
         assert_eq!(decide(&facts, None), Verdict::Quiet(NotDue::Headless));
         // The only headless path that reaches the decision code: a verdict
-        // in `Deciding` settles, and raises nothing.
+        // in `Deciding` settles, and posts nothing.
         assert!(app.consent_card.begin_deciding(Instant::now()));
         app.decide_macos_access_card(None);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.is_none());
+        assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
     }
 
-    /// THE CARD'S LIFECYCLE ON A WINDOWED INSTANCE, without a window: the
-    /// harness is headless-constructed — inert probe and gesture arms, so no
-    /// `tccd` and no `NSWorkspace` — and `headless` is flipped so the tick
-    /// runs its real branches. Every branch the park point can take is
-    /// driven: the switch, the missing proxy, the busy slot, the raise, a
-    /// displacement and its return, the hold's end, and the three presses.
+    /// A windowed-looking `App` for the access card's lifecycle, without a
+    /// window: headless-constructed — inert probe and gesture arms, so no
+    /// `tccd` and no `NSWorkspace` (the live Settings arm refuses off the
+    /// main thread, which is where a test runs) — with `headless` flipped so
+    /// the tick runs its real branches, and the cached probe reading DENIED.
+    fn access_card_windowed() -> App {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
+            aterm_containment::consent::FdaProbe {
+                state: aterm_containment::consent::FdaState::Denied,
+                label: aterm_containment::consent::ProbeLabel::OpenEperm,
+            },
+        );
+        app
+    }
+
+    /// Drive a due card through the park's tick at `now`: the question is on
+    /// the band, the card watches it BY ID. Returns the row's id.
+    fn access_card_posted(app: &mut App, now: std::time::Instant) -> aterm_messages::MessageId {
+        use super::consent_card::{CardPhase, FDA_TITLE, Verdict};
+        assert!(app.consent_card.begin_deciding(now));
+        assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+        app.tick_macos_access_card(now);
+        let row = app
+            .messages
+            .live_by_key(super::message_reporters::KEY_FILE_ACCESS)
+            .expect("the question is on the band");
+        assert_eq!(row.msg.title, FDA_TITLE);
+        let id = row.id;
+        assert_eq!(app.consent_card_message, Some(id), "watched by id");
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
+        id
+    }
+
+    /// THE ACCESS ROW'S LIFECYCLE (design §3.10, R15; §7.2's rewrite of the
+    /// retired card's slot tests): the verdict and the grant — the two paths
+    /// with no platform gate — hold on every host; on macOS the park posts
+    /// the question ONCE, a decision row ranked first, keyed `privacy.fda`;
+    /// `Not now` pressed through the engine and the performer (the band
+    /// capsule's own path) answers it, records the marker and settles the
+    /// card, which never reposts it; a row that folds on its Ask hold with
+    /// nothing pressed is the unanswered path — settled, with the daily
+    /// return.
     ///
-    /// THE PARK POINT IS macOS-ONLY, and flipping `headless` does not change
-    /// that: `tick_macos_access_card` returns at its FIRST line on every
-    /// other target, because Full Disk Access is a TCC concept and there is
-    /// nothing here to ask for. So the lifecycle above is a macOS claim, and
-    /// every other host gets an arm that asserts what it really does — the
-    /// tick is inert in each phase the machine can hold, no card ever reaches
-    /// the glass, and the pump schedules no wake for one. That arm reads
-    /// `cfg!(target_os = "macos")` DIRECTLY and never a constant the
-    /// production gate also reads, so deleting the gate turns this test red
-    /// instead of carrying it along. The two paths with no platform gate at
-    /// all — the verdict, and the ✓ pill's slot policy — are asserted first,
-    /// on every host.
+    /// THE PARK POINT IS macOS-ONLY: `tick_macos_access_card` returns at its
+    /// FIRST line on every other target, because Full Disk Access is a TCC
+    /// concept. The other hosts get an arm that asserts what the product
+    /// really does there — no row, no wake — read from `cfg!` directly, so
+    /// deleting the gate turns this red instead of carrying it along.
     #[test]
-    fn the_macos_access_card_waits_for_the_slot_returns_when_displaced_and_confirms() {
-        use super::consent_card::{
-            CardPhase, GRANTED_CAPTION, OPENED_SETTINGS_TTL, RERAISE_WITHIN, Verdict,
-            opened_settings_caption,
-        };
-        use super::notice::{NoticeHit, TransientNotice};
+    fn the_access_row_is_posted_once_watches_the_probe_and_settles_on_not_now() {
+        use super::consent_card::{CardPhase, REOFFER_AFTER, Verdict};
+        use super::message_reporters::KEY_FILE_ACCESS;
+        use aterm_messages::{ActionIndex, Decision, HOLD_ASK, Intent, Message, Severity, tags};
         use std::time::{Duration, Instant};
 
         let t0 = Instant::now();
-        let windowed = || {
-            let mut app = App::headless_for_test();
-            app.headless = false;
-            app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
-                aterm_containment::consent::FdaProbe {
-                    state: aterm_containment::consent::FdaState::Denied,
-                    label: aterm_containment::consent::ProbeLabel::OpenEperm,
-                },
-            );
-            app
-        };
+        let wid = WindowId(0);
 
-        // ASSERTED ON EVERY HOST. Neither path below reaches the park point:
-        // `decide_macos_access_card` and `show_macos_access_granted` carry no
-        // platform gate, so their claims are as true here as on a Mac.
-
-        // A verdict in DECIDING against the inert arm: the cached probe reads
-        // the denial the fixture planted, but the signing identity is cold, so
+        // EVERY HOST: a verdict in DECIDING against the inert arm. The cached
+        // probe reads the planted denial, but the signing identity is cold, so
         // a grant would be keyed to `dr=unknown` and would not survive a
-        // rebuild — quiet, nothing raised.
-        let mut app = windowed();
+        // rebuild — quiet, nothing posted.
+        let mut app = access_card_windowed();
         let panel = app.consent_panel_facts();
         assert_eq!(panel.fda, aterm_containment::consent::FdaState::Denied);
         assert!(
@@ -34037,344 +39088,302 @@ mod overlap_handoff_tests {
         assert!(app.consent_card.begin_deciding(Instant::now()));
         app.decide_macos_access_card(None);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.is_none());
+        assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
 
-        // THE ✓ PILL replaces the card or its own route pill, or fills a free
-        // slot — never another card.
-        let mut app = windowed();
-        app.notice = Some(TransientNotice::macos_access_route(
-            "route".to_string(),
-            OPENED_SETTINGS_TTL,
-            t0,
-        ));
-        assert!(app.show_macos_access_granted(t0 + Duration::from_secs(20)));
-        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
-        assert!(!app.show_macos_access_granted(t0));
-        assert!(
-            app.notice.as_ref().unwrap().admin_step_names().is_some(),
-            "never over the admin card"
-        );
-        app.notice = None;
-        assert!(app.show_macos_access_granted(t0));
-        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
-
-        // THE PARK POINT'S PLATFORM. Everything past this line is reached
-        // through `tick_macos_access_card`, whose first line is the macOS
-        // gate. On this host that gate is what the product really does, so it
-        // is what gets asserted: the tick is a no-op in every phase, and no
-        // macOS access card can reach a glass that has no TCC behind it.
         if !cfg!(target_os = "macos") {
-            let mut app = windowed();
+            let mut app = access_card_windowed();
             assert!(app.proxy.is_none(), "no event loop under the harness");
-
-            // IDLE with the switch on: no worker is asked for, and the phase
-            // does not even settle — the tick returned before it could.
             app.tick_macos_access_card(t0);
             assert_eq!(app.consent_card.phase(), CardPhase::Idle);
-            assert!(app.notice.is_none());
-
-            // IDLE with the switch off: the policy retraction is out of reach
-            // too, so the machine stays where it was.
-            app.config.privacy = Some(crate::app_config::PrivacyConfig {
-                notice: Some(false),
-                ..Default::default()
-            });
-            app.tick_macos_access_card(t0);
-            assert_eq!(app.consent_card.phase(), CardPhase::Idle);
-            assert!(app.notice.is_none());
-
-            // DUE with the slot free — the one branch that could put a card on
-            // the glass.
-            let mut app = windowed();
+            // DUE — the one branch that could post a row.
             assert!(app.consent_card.begin_deciding(t0));
             assert!(app.consent_card.on_decided(&Verdict::Offer, t0));
             app.tick_macos_access_card(t0);
             assert_eq!(app.consent_card.phase(), CardPhase::Due);
             assert!(
-                app.notice.is_none(),
-                "a macOS access card must never reach a non-macOS glass"
+                app.messages.live_by_key(KEY_FILE_ACCESS).is_none(),
+                "a macOS access row must never reach a non-macOS band"
             );
-
-            // WATCHING, displaced by an unconditional producer: no return to
-            // Due, and the producer keeps the slot.
-            app.consent_card.on_raised(t0);
-            assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
-            app.notice = Some(TransientNotice::update_status("\u{21e3} Installing", t0));
-            app.tick_macos_access_card(t0 + Duration::from_secs(3));
-            assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
-            assert!(
-                app.notice
-                    .as_ref()
-                    .is_some_and(|n| !n.is_macos_access_owned()),
-                "the other producer keeps the slot"
-            );
-
-            // CONFIRMING: the ✓ pill never arrives from the park point either.
-            app.notice = None;
-            app.consent_card.on_grant_awaiting_slot(t0);
-            assert_eq!(
-                app.consent_card.phase(),
-                CardPhase::Confirming { since: t0 }
-            );
-            app.tick_macos_access_card(t0 + Duration::from_secs(1));
-            assert_eq!(
-                app.consent_card.phase(),
-                CardPhase::Confirming { since: t0 }
-            );
-            assert!(app.notice.is_none());
-
-            // And the event loop is never woken for a card this platform
-            // cannot raise — the pump carries the same gate.
             assert!(app.next_macos_access_card_deadline(t0).is_none());
             return;
         }
 
-        let raised = |app: &mut App, now: Instant| {
-            assert!(app.consent_card.begin_deciding(Instant::now()));
-            assert!(app.consent_card.on_decided(&Verdict::Offer, now));
-            app.tick_macos_access_card(now);
-            assert!(
-                app.notice.as_ref().is_some_and(|n| n.is_macos_access()),
-                "the card is on the glass"
-            );
-            assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
-        };
-
-        // IDLE with the notice switched off: settled, no worker, no card.
-        let mut app = windowed();
+        // IDLE with the notice switched off: settled, no worker, no row.
+        let mut app = access_card_windowed();
         app.config.privacy = Some(crate::app_config::PrivacyConfig {
             notice: Some(false),
             ..Default::default()
         });
         app.tick_macos_access_card(t0);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.is_none());
+        assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
 
         // IDLE with the switch on but no event-loop proxy: settled — no
         // worker can post a verdict, so nothing waits forever.
-        let mut app = windowed();
+        let mut app = access_card_windowed();
         app.tick_macos_access_card(t0);
         assert_eq!(
             app.consent_card.phase(),
             CardPhase::Settled,
             "no proxy: no worker"
         );
-        assert!(app.notice.is_none());
 
-        // DUE: the admin card holds the slot → the card waits and the admin
-        // card is untouched; a decoration yields → the card is raised.
-        let mut app = windowed();
-        assert!(app.consent_card.begin_deciding(Instant::now()));
-        assert!(app.consent_card.on_decided(&Verdict::Offer, t0));
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
-        app.tick_macos_access_card(t0);
-        assert_eq!(app.consent_card.phase(), CardPhase::Due);
-        assert!(
-            app.notice
-                .as_ref()
-                .is_some_and(|n| n.admin_step_names().is_some()),
-            "an admin card is never clobbered"
+        // DUE: posted ONCE, first on the band even under a row already there
+        // (a decision ranks first — nothing to wait for, nothing displaces it),
+        // and a later tick posts nothing more.
+        let mut app = access_card_windowed();
+        app.post_message(Message::new(tags::SYSTEM, Severity::Warn, "already here"));
+        let id = access_card_posted(&mut app, t0);
+        assert_eq!(
+            app.messages.on_glass().next().map(|l| l.id),
+            Some(id),
+            "the question is the top row"
         );
-        app.notice = Some(TransientNotice::robi_tip("tip", None, t0));
-        app.tick_macos_access_card(t0);
-        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
-        assert!(app.notice.as_ref().is_some_and(|n| n.is_macos_access()));
+        let row = app.messages.live(id).expect("live");
+        assert_eq!(row.msg.hold, aterm_messages::Hold::Ask { for_: HOLD_ASK });
+        app.tick_macos_access_card(t0 + Duration::from_secs(1));
+        assert_eq!(
+            app.messages
+                .live_rows()
+                .filter(|l| l.msg.key.as_deref() == Some(KEY_FILE_ACCESS))
+                .count(),
+            1,
+            "posted once"
+        );
+        assert_eq!(app.consent_card_message, Some(id));
 
-        // WATCHING, displaced by an unconditional producer: back to Due, the
-        // producer's pill is left alone, and the card returns once the pill
-        // has visibly lifted — within its own hold only.
-        let t1 = t0 + Duration::from_secs(3);
-        app.notice = Some(TransientNotice::update_status("\u{21e3} Installing", t1));
-        app.tick_macos_access_card(t1);
-        assert_eq!(app.consent_card.phase(), CardPhase::Due);
-        assert!(
-            app.notice
-                .as_ref()
-                .is_some_and(|n| !n.is_macos_access_owned()),
-            "the pill is left alone"
-        );
-        app.tick_macos_access_card(t1 + Duration::from_secs(1));
+        // NOT NOW, through the band capsule's own path (the engine's `act`,
+        // then the performer): the row is answered and gone, the card settled
+        // with no daily return, and the park never posts it again.
+        let intent = app
+            .messages
+            .act(id, ActionIndex(1), t0)
+            .expect("Not now is the second capsule");
         assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Due,
-            "still on the glass"
+            intent,
+            Intent::NotNow {
+                decision: Decision::FileAccess
+            }
         );
-        let t2 = t1 + Duration::from_secs(10);
-        app.tick_macos_access_card(t2);
-        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t2 });
-        assert!(app.notice.as_ref().is_some_and(|n| n.is_macos_access()));
-        let t3 = t0 + RERAISE_WITHIN + Duration::from_secs(1);
-        app.notice = None;
-        app.tick_macos_access_card(t3);
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Watching { since: t2 },
-            "past its own hold it is not re-raised"
-        );
-        assert!(app.notice.is_none());
-
-        // OPEN SETTINGS: the card's OWN route pill (the inert arm refuses, so
-        // the "did not open" copy), held 90 s; the watch restarts; the pill is
-        // not a displacement; and a pressed card is never re-raised.
-        let mut app = windowed();
-        raised(&mut app, t0);
-        let t1 = t0 + Duration::from_secs(2);
-        app.notice_hit_dispatch(None, true, NoticeHit::Primary, t1);
-        let route = app.notice.as_ref().expect("the route pill");
-        assert!(route.is_macos_access_owned() && !route.is_macos_access());
-        assert_eq!(
-            route.text(),
-            opened_settings_caption(
-                false,
-                crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess)
-            )
-        );
-        assert!(!route.is_expired(t1 + OPENED_SETTINGS_TTL - Duration::from_secs(1)));
-        assert!(route.is_expired(t1 + OPENED_SETTINGS_TTL));
-        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t1 });
-        app.tick_macos_access_card(t1 + Duration::from_secs(1));
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Watching { since: t1 },
-            "our own pill is not a displacement"
-        );
-        app.notice = None;
-        app.tick_macos_access_card(t1 + Duration::from_secs(2));
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Watching { since: t1 },
-            "a pressed card is never re-raised"
-        );
-        assert!(app.notice.is_none());
-
-        // NOT NOW: settled, the slot empty.
-        let mut app = windowed();
-        raised(&mut app, t0);
-        app.notice_hit_dispatch(None, true, NoticeHit::NotNow, t0);
+        assert!(app.perform_intent(wid, id, intent));
+        assert!(app.messages.live(id).is_none(), "Not now closes the row");
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.is_none());
+        assert_eq!(app.consent_card_message, None);
+        let later = t0 + Duration::from_secs(2);
+        app.tick_macos_access_card(later);
+        assert!(
+            app.messages.live_by_key(KEY_FILE_ACCESS).is_none(),
+            "never reposted"
+        );
+        assert_eq!(
+            app.next_macos_access_card_deadline(later),
+            None,
+            "an answered card does not return"
+        );
 
-        // BODY: dismissed for now — the watch continues, nothing returns.
-        let mut app = windowed();
-        raised(&mut app, t0);
-        app.notice_hit_dispatch(None, true, NoticeHit::Body, t0);
-        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
-        assert!(app.notice.is_none());
-        app.tick_macos_access_card(t0 + Duration::from_secs(5));
-        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
-        assert!(app.notice.is_none());
+        // THE ROW FOLDS UNANSWERED on its Ask hold: the card sees its row gone
+        // by id with nothing pressed — settled, with the daily return.
+        let mut app = access_card_windowed();
+        let id = access_card_posted(&mut app, t0);
+        let folded = Instant::now() + HOLD_ASK + Duration::from_secs(1);
+        app.settle_messages(folded);
+        assert!(app.messages.live(id).is_none(), "folded on its hold");
+        app.tick_macos_access_card(folded);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert_eq!(app.consent_card_message, None);
+        assert_eq!(
+            app.next_macos_access_card_deadline(folded),
+            Some(folded + REOFFER_AFTER),
+            "an unanswered row returns after a day"
+        );
+    }
 
-        // THE GRANT SEEN WHILE ANOTHER CARD HOLDS THE SLOT: the ✓ waits like
-        // the card does, and shows the moment the slot frees.
-        let mut app = windowed();
-        raised(&mut app, t0);
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
-        let t1 = t0 + Duration::from_secs(30);
+    /// OPEN SETTINGS (R16): the capsule opens the pane through the instance's
+    /// gesture arm (it refuses off the main thread, so the "did not open"
+    /// words) and RESTATES the same row, in place, to the route — a terse
+    /// title, the route as `detail[0]`, no capsules, the route's short hold —
+    /// while the card keeps watching. The route row folding on that hold is
+    /// not the unanswered path (the owner pressed), and a Details press on the
+    /// question marks it read the same way.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn open_settings_restates_the_row_to_the_route_words_and_keeps_watching() {
+        use super::consent_card::CardPhase;
+        use aterm_messages::{ActionIndex, HOLD_ROUTE, Hold, Intent};
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let wid = WindowId(0);
+        let mut app = access_card_windowed();
+        let id = access_card_posted(&mut app, t0);
+        let intent = app
+            .messages
+            .act(id, ActionIndex(0), t0)
+            .expect("Open Settings is the first capsule");
+        assert!(matches!(intent, Intent::OpenSystemPane { .. }));
+        assert!(
+            !app.perform_intent(wid, id, intent),
+            "the arm refuses off the main thread"
+        );
+        let route =
+            crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess);
+        let row = app
+            .messages
+            .live(id)
+            .expect("the row stays for the watcher");
+        assert_eq!(
+            row.msg.title,
+            format!(
+                "Open {}",
+                route.trim_start_matches("System Settings \u{25b8} ")
+            ),
+            "the route is the title, verb first"
+        );
+        assert_eq!(
+            row.msg.detail[0], "Settings did not open",
+            "the outcome first behind it"
+        );
+        assert!(row.msg.actions.is_empty(), "nothing left to press");
+        assert_eq!(row.msg.hold, Hold::For(HOLD_ROUTE));
+        assert!(matches!(
+            app.consent_card.phase(),
+            CardPhase::Watching { .. }
+        ));
+        assert_eq!(app.consent_card_message, Some(id), "the same row, in place");
+        // The route words fold on their short hold; the watch goes on.
+        let folded = Instant::now() + HOLD_ROUTE + Duration::from_secs(1);
+        app.settle_messages(folded);
+        assert!(app.messages.live(id).is_none());
+        app.tick_macos_access_card(folded);
+        assert!(
+            matches!(app.consent_card.phase(), CardPhase::Watching { .. }),
+            "a pressed row's fold is not the unanswered path"
+        );
+        assert!(app.next_macos_access_card_deadline(folded).is_some());
+
+        // DETAILS on the question: read — the watch continues past its fold,
+        // and it is never re-offered in this process.
+        let mut app = access_card_windowed();
+        let id = access_card_posted(&mut app, t0);
+        assert!(app.perform_intent(wid, id, Intent::Details));
+        assert!(
+            app.messages.live(id).is_some(),
+            "an Ask row stays on Details"
+        );
+        let folded = Instant::now() + aterm_messages::HOLD_ASK + Duration::from_secs(1);
+        app.settle_messages(folded);
+        app.tick_macos_access_card(folded);
+        assert!(matches!(
+            app.consent_card.phase(),
+            CardPhase::Watching { .. }
+        ));
+    }
+
+    /// THE GRANT SUPERSEDES THE ROW BY KEY (R17): whichever words the row
+    /// wears — the question or its route words — the observed grant takes it
+    /// off the band (`resolved`, in the log), and the grant itself is a
+    /// RECORD: Settings ▸ Messages and messages.log keep it, the glass does
+    /// not (the owner's attention rule). The card settles.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_grant_supersedes_the_row_with_the_success_message() {
+        use super::consent_card::{CardPhase, GRANTED_CAPTION};
+        use super::message_reporters::KEY_FILE_ACCESS;
+        use aterm_messages::{LogRecord, Outcome, Retired};
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let mut app = access_card_windowed();
+        let id = access_card_posted(&mut app, t0);
         app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
             aterm_containment::consent::FdaProbe {
                 state: aterm_containment::consent::FdaState::Granted,
                 label: aterm_containment::consent::ProbeLabel::OpenOk,
             },
         );
-        app.note_macos_access_granted(t1);
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Confirming { since: t1 }
-        );
-        assert!(
-            app.notice.as_ref().unwrap().admin_step_names().is_some(),
-            "the admin card is untouched"
-        );
-        app.tick_macos_access_card(t1 + Duration::from_secs(1));
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Confirming { since: t1 }
-        );
-        app.notice = None;
-        app.tick_macos_access_card(t1 + Duration::from_secs(2));
+        app.tick_macos_access_card(t0 + Duration::from_secs(30));
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
-        // …and a pending confirmation that never gets the slot gives up.
-        let mut app = windowed();
-        raised(&mut app, t0);
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
-        app.note_macos_access_granted(t1);
-        app.tick_macos_access_card(t1 + super::consent_card::WATCH_FOR);
-        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.as_ref().unwrap().admin_step_names().is_some());
+        assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
+        assert_eq!(
+            app.messages.wanted_rows(),
+            0,
+            "nothing wants the glass (the band gives its row back after its quiet)"
+        );
+        assert!(matches!(
+            app.messages.log().get(id).and_then(LogRecord::retired),
+            Some(Retired::Resolved(Outcome::Ok))
+        ));
+        let granted = app
+            .messages
+            .log()
+            .records()
+            .next_back()
+            .expect("the grant is on record");
+        assert_eq!(granted.title, GRANTED_CAPTION);
+        assert_eq!(granted.key.as_deref(), Some(KEY_FILE_ACCESS));
+        assert_eq!(app.next_macos_access_card_deadline(t0), None);
     }
 
-    /// Disabling notices from any tab retracts the shared access card,
-    /// including a queued or displaced one. Other producers keep their slot.
+    /// Disabling the notice from any tab retracts the access row — the
+    /// question or its route words, `resolve_key_prefix("privacy.")` — and
+    /// settles the card; OTHER messages keep their rows (design §7.2, the
+    /// retired :34162 in spirit).
     ///
     /// macOS ONLY — and NOT so this box stops seeing a red.
     /// `tick_macos_access_card` returns on its first statement off macOS, so
     /// every assertion below would be measuring that early return instead of
     /// the retraction, and the retraction — the thing the test is named for
-    /// — would be proved on no platform at all. The card's lifecycle already
-    /// lives behind this gate: `macos_access_refresh_tests` is
-    /// `#[cfg(all(test, target_os = "macos"))]` as a whole module, and this
-    /// test had simply escaped it while sitting in a `cfg(unix)` neighbour.
-    /// What the early return owes every other unix is asserted next door, in
+    /// — would be proved on no platform at all. What the early return owes
+    /// every other host is asserted next door, in
     /// `macos_access_card_stays_inert_off_macos`; neither platform is left
     /// with an empty claim.
     #[test]
     #[cfg(target_os = "macos")]
-    fn macos_access_card_honors_live_policy_without_dismissing_other_notices() {
+    fn macos_access_card_honors_live_policy_without_dismissing_other_messages() {
         use super::consent_card::{CardPhase, Verdict};
-        use super::notice::TransientNotice;
+        use super::message_reporters::KEY_FILE_ACCESS;
+        use aterm_messages::{Message, Severity, tags};
         use std::time::Instant;
 
         let now = Instant::now();
         for master_off in [false, true] {
             for raised in [false, true] {
-                for other_notice in [false, true] {
-                    let mut app = App::headless_for_test();
-                    app.headless = false; // probes and gestures stay inert
+                for other in [false, true] {
+                    let mut app = access_card_windowed();
                     assert!(app.consent_card.begin_deciding(now));
                     assert!(app.consent_card.on_decided(&Verdict::Offer, now));
                     if raised {
-                        app.consent_card.on_raised(now);
-                        app.notice = Some(TransientNotice::macos_access(now));
+                        app.tick_macos_access_card(now);
+                        assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_some());
                     }
-                    if other_notice {
-                        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
-                    }
+                    let other_id = other.then(|| {
+                        app.post_message(
+                            Message::new(tags::PACKAGES, Severity::Warn, "someone else's row")
+                                .key("packages.other"),
+                        )
+                    });
                     app.config.privacy = Some(crate::app_config::PrivacyConfig {
                         enabled: Some(!master_off),
                         notice: Some(master_off),
                         ..Default::default()
                     });
                     app.tick_macos_access_card(now);
-                    if cfg!(target_os = "macos") {
-                        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-                        assert_eq!(app.notice.is_some(), other_notice);
-                    } else {
-                        assert_eq!(
-                            app.consent_card.phase(),
-                            if raised {
-                                CardPhase::Watching { since: now }
-                            } else {
-                                CardPhase::Due
-                            },
-                            "the park point is macOS-only: nothing moved"
+                    assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+                    assert!(
+                        app.messages.live_by_key(KEY_FILE_ACCESS).is_none(),
+                        "the policy retracted the access row"
+                    );
+                    assert_eq!(app.consent_card_message, None);
+                    if let Some(id) = other_id {
+                        assert!(
+                            app.messages.live(id).is_some(),
+                            "another reporter's row is left alone"
                         );
-                        assert_eq!(app.notice.is_some(), raised || other_notice);
                     }
-                    if other_notice {
-                        assert!(app.notice.as_ref().unwrap().admin_step_names().is_some());
-                    }
-                    // A delayed worker cannot resurrect an opted-out card. This
-                    // admission is not platform-gated, so the machine settles on
-                    // every host; only the card's own notice stays on a
-                    // non-macOS glass, because clearing it is the tick's job.
+                    // A delayed worker cannot resurrect an opted-out card.
                     app.decide_macos_access_card(None);
                     assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-                    assert_eq!(
-                        app.notice.is_some(),
-                        other_notice || (raised && !cfg!(target_os = "macos"))
-                    );
+                    assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
                 }
             }
         }
@@ -34382,23 +39391,24 @@ mod overlap_handoff_tests {
 
     /// THE OTHER SIDE OF THAT GATE. Full Disk Access is a TCC concept: off
     /// macOS there is no marker to read, no Security pane to route to and
-    /// nothing a card could ask for, so `tick_macos_access_card` returns
+    /// nothing a row could ask for, so `tick_macos_access_card` returns
     /// before it reads a switch, spawns a worker or so much as looks at the
-    /// shared notice slot. That early return is a PRODUCT PROMISE, not an
-    /// implementation detail — a Linux build must never raise a card telling
-    /// its owner to grant a macOS permission, and must never take or empty a
-    /// slot another producer is holding — so it is asserted here rather than
-    /// left to be implied by the macOS arm's absence.
+    /// band. That early return is a PRODUCT PROMISE, not an implementation
+    /// detail — a Linux build must never post a row telling its owner to
+    /// grant a macOS permission, and must never resolve a row another
+    /// reporter is holding — so it is asserted here rather than left to be
+    /// implied by the macOS arm's absence.
     ///
     /// The third row is a deliberate mutant: a card forced past any phase
-    /// this platform can reach. The tick must still leave it EXACTLY as
-    /// found, which is what pins the guard ABOVE `admit_current_policy`
-    /// rather than somewhere inside the match.
+    /// this platform can reach, with a question row planted on the band. The
+    /// tick must still leave both EXACTLY as found, which is what pins the
+    /// guard ABOVE `admit_current_policy` rather than somewhere inside it.
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn macos_access_card_stays_inert_off_macos() {
         use super::consent_card::{CardPhase, Verdict};
-        use super::notice::TransientNotice;
+        use super::message_reporters::{KEY_FILE_ACCESS, file_access_question};
+        use aterm_messages::{Message, Severity, tags};
         use std::time::Instant;
 
         let now = Instant::now();
@@ -34427,32 +39437,26 @@ mod overlap_handoff_tests {
                     "no verdict is ever asked for off macOS ({switches})"
                 );
                 assert!(
-                    app.notice.is_none(),
-                    "an inert card never writes the shared slot ({switches})"
+                    app.messages.live_by_key(KEY_FILE_ACCESS).is_none(),
+                    "an inert card never posts ({switches})"
                 );
 
-                // Another producer holds the slot: untouched in both
-                // directions, neither clobbered nor cleared.
+                // Another reporter's row: untouched.
                 let mut app = app_with(enabled, notice);
-                app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
+                let other = app.post_message(Message::new(tags::PACKAGES, Severity::Warn, "x"));
                 app.tick_macos_access_card(now);
                 assert_eq!(app.consent_card.phase(), CardPhase::Idle, "({switches})");
-                assert!(
-                    app.notice
-                        .as_ref()
-                        .is_some_and(|n| n.admin_step_names().is_some()),
-                    "another producer keeps its slot off macOS too ({switches})"
-                );
+                assert!(app.messages.live(other).is_some(), "({switches})");
 
-                // THE MUTANT. Even an opted-out card that is already on screen
-                // stays exactly where it stands: retracting it is the macOS
-                // arm's claim, and this platform never gets far enough to make
-                // it.
+                // THE MUTANT. Even an opted-out card whose row is already on
+                // the band stays exactly where it stands: retracting it is the
+                // macOS arm's claim, and this platform never gets that far.
                 let mut app = app_with(enabled, notice);
                 assert!(app.consent_card.begin_deciding(now));
                 assert!(app.consent_card.on_decided(&Verdict::Offer, now));
                 app.consent_card.on_raised(now);
-                app.notice = Some(TransientNotice::macos_access(now));
+                let id = app.post_message(file_access_question());
+                app.consent_card_message = Some(id);
                 app.tick_macos_access_card(now);
                 assert_eq!(
                     app.consent_card.phase(),
@@ -34460,10 +39464,8 @@ mod overlap_handoff_tests {
                     "the guard runs before any policy read ({switches})"
                 );
                 assert!(
-                    app.notice
-                        .as_ref()
-                        .is_some_and(|n| n.is_macos_access_owned()),
-                    "…and before any write of the slot ({switches})"
+                    app.messages.live(id).is_some(),
+                    "…and before any resolve ({switches})"
                 );
             }
         }
@@ -35115,10 +40117,23 @@ mod multi_window_tests {
         }
     }
 
+    /// The capture paths splice the MESSAGE BAND above the grid exactly as a
+    /// redraw does: with the crash message posted, row 0 of an 80-column
+    /// capture holds its title whole and the `Open log` capsule, and the
+    /// grid's own rows start below the band — a row the band ADDS, not one
+    /// it paints over (the retired config banner overwrote the top rows).
     #[test]
-    fn introspection_capture_paints_config_notice_banner() {
+    fn introspection_capture_paints_the_message_band() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        let evidence = crate::logging::CrashEvidence {
+            path: std::path::PathBuf::from(
+                "/Users//ana/Library/Logs/aterm/crash-signal-1-1.log.seen",
+            ),
+            head: vec!["fatal signal 11".to_string()],
+        };
+        app.post_message(crate::message_reporters::crash_message(&evidence));
+        assert_eq!(app.message_band_rows, 1, "the crash row is committed");
         // Size the capture buffer exactly as the capture path does (engine refill).
         {
             let terminal = app
@@ -35132,20 +40147,91 @@ mod multi_window_tests {
             let mut term = crate::term_lock(&terminal);
             term.cell_frame_into(&mut ws.input_scratch, 24, 80);
         }
-        // The exact line `reload_config` emits for a restart-only columns/lines edit.
-        let line = "columns/lines applies on next launch (resize the window to change size now)";
-        app.config_notice =
-            crate::config_notice::ConfigNotice::new(vec![line.to_string()], Instant::now());
-        // The topmost splice the capture path (snapshot/render_image) now performs.
-        app.splice_config_notice(wid);
-        // Row 0 is the banner title; row 1 the notice line — both overwrite the grid.
+        app.splice_message_band(wid, aterm_render::Theme::default());
         let Some(ws) = app.windows.get(&wid) else {
             unreachable!("front window present");
         };
         let row0: String = ws.input_scratch.cells[0].iter().map(|c| c.ch).collect();
-        let row1: String = ws.input_scratch.cells[1].iter().map(|c| c.ch).collect();
-        assert!(row0.contains("1 notice"), "banner title row: {row0:?}");
-        assert!(row1.contains("next launch"), "restart-notice row: {row1:?}");
+        assert!(
+            row0.contains("aterm crashed last time"),
+            "the crash title, whole, on the band row: {row0:?}"
+        );
+        assert!(row0.contains("Open log"), "the capsule: {row0:?}");
+        assert_eq!(
+            ws.input_scratch.cells.len(),
+            25,
+            "the band is a row above the 24 grid rows, not painted over them"
+        );
+    }
+
+    /// Refill window 0's capture buffer from the engine and splice the band, as a
+    /// redraw does.
+    fn compose_band_for_test(app: &mut App) {
+        let wid = WindowId(0);
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            let ws = app.windows.get_mut(&wid).expect("window 0");
+            let mut term = crate::term_lock(&terminal);
+            term.cell_frame_into(&mut ws.input_scratch, 24, 80);
+        }
+        app.splice_message_band(wid, aterm_render::Theme::default());
+    }
+
+    /// THE COMPOSED BAND IS SEALED ON THE ROW THAT MEETS THE TERMINAL. The seam
+    /// used to be stamped on the painter's last row, and the splice then padded
+    /// the cache to the committed count — which lags a dismissal by
+    /// `SHRINK_QUIET` — so the rule sat MID-band over an unruled blank row
+    /// touching the terminal. And a presence row with no band row under it was
+    /// promised the seam in three comments and never drawn one.
+    #[test]
+    fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
+        use aterm_messages::{Message, Severity, tags};
+        let ink = crate::chrome_band::band_colors(aterm_render::Theme::default()).label;
+        let sealed = |row: &[aterm_core::terminal::RenderCell]| {
+            row.iter().all(|c| {
+                c.underline == aterm_core::terminal::UnderlineStyle::Single
+                    && c.underline_color == Some(ink)
+            })
+        };
+        let bare = |row: &[aterm_core::terminal::RenderCell]| {
+            row.iter()
+                .all(|c| c.underline == aterm_core::terminal::UnderlineStyle::None)
+        };
+
+        // PADDED: two rows committed, one dismissed inside the shrink quiet.
+        let mut app = App::headless_for_test();
+        app.post_message(Message::new(tags::SESSION, Severity::Info, "first"));
+        let second = app.post_message(Message::new(tags::SESSION, Severity::Info, "second"));
+        assert_eq!(app.message_band_rows, 2, "two rows committed");
+        app.messages.dismiss(second, std::time::Instant::now());
+        app.sync_messages();
+        assert_eq!(
+            app.message_band_rows, 2,
+            "the count lags the dismissal, so the splice PADS — the case under test"
+        );
+        compose_band_for_test(&mut app);
+        let cells = &app.windows[&WindowId(0)].input_scratch.cells;
+        assert!(bare(&cells[0]), "the seam must leave the row above");
+        assert!(
+            sealed(&cells[1]),
+            "the padded row meets the terminal, so it carries the seam"
+        );
+
+        // PRESENCE ONLY: no band row follows, so the presence row closes the chrome.
+        let mut app = App::headless_for_test();
+        assert_eq!(app.message_band_rows, 0);
+        app.windows.get_mut(&WindowId(0)).unwrap().presence.rows = 1;
+        compose_band_for_test(&mut app);
+        let cells = &app.windows[&WindowId(0)].input_scratch.cells;
+        assert!(
+            sealed(&cells[0]),
+            "a presence row with nothing under it carries the closing seam"
+        );
+        assert!(bare(&cells[1]), "and the terminal's own first row does not");
     }
 
     #[test]
@@ -36244,7 +41330,6 @@ mod multi_window_tests {
             .unwrap_or_else(|p| p.into_inner())
             .snapshot()
             .len();
-        app.notice = None;
 
         let refusal = app
             .split_focused_pane_in(pane::SplitDir::Vertical, None)
@@ -36283,13 +41368,25 @@ mod multi_window_tests {
             "the tree is untouched — no invisible pane"
         );
 
-        // And the person is TOLD, the way every impossible gesture here answers.
-        let card = app
-            .notice
-            .as_ref()
-            .map(crate::notice::TransientNotice::text)
-            .expect("a refused split paints the failure card");
-        assert!(card.contains("Split refused"), "card text: {card}");
+        // And the person is TOLD, the way every impossible gesture here answers:
+        // a short band row titled in a few words, the whole reason behind Details
+        // (R14).
+        let row = app
+            .messages
+            .live_rows()
+            .find(|l| l.msg.title == "Split refused")
+            .expect("a refused split posts a Split refused row");
+        assert_eq!(
+            row.msg.detail[0], "pane 32\u{00d7}24, needs 33\u{00d7}3",
+            "the sizes are the excerpt: {:?}",
+            row.msg.detail
+        );
+        assert!(
+            row.msg.detail[1].starts_with("this pane is 32x24 cells"),
+            "the whole reason is behind it: {:?}",
+            row.msg.detail
+        );
+        assert_eq!(row.msg.severity, aterm_messages::Severity::Error);
 
         // The other axis still fits in 24 rows (2*3 + 1 = 7 needed), so the gate
         // is per-direction, not a blanket "this window is too small".
@@ -40049,12 +45146,12 @@ mod early_out_tests {
             // No build badge in these unit frames (the hidden sentinel).
             badge_fp: 0,
             // No transient notice in these unit frames (the no-notice sentinel).
-            notice_fp: 0,
+            bubble_fp: 0,
             // No level-up celebration in these unit frames (the no-celebration sentinel).
             level_up_fp: 0,
-            // No status bar in these unit frames — the hidden sentinel keeps the
-            // key byte-identical to the no-bar path.
-            status_bars_fp: 0,
+            // No message band in these unit frames — the hidden sentinel keeps the
+            // key byte-identical to the no-band path.
+            band_fp: 0,
             // No presence in these unit frames (the quiet sentinel).
             presence_fp: 0,
             // No connection drag in these unit frames (the no-drag sentinel).
@@ -43131,6 +48228,7 @@ mod session_pool_tests {
             child_reaped: std::sync::atomic::AtomicBool::new(false),
             id,
             term,
+            vi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             master: -1,
             pid: -1,
             handoff_local_id: None,
@@ -44971,13 +50069,52 @@ mod spec_xref_gate {
         // 2026-09-21: `NativeUpdateApplyLadder` (`native_update_apply_ladder_model`,
         // the automatic-update ladder's bound and its stand-down mutant) adds
         // one — 153 → 154.
-        // 2026-09-22: `TccIdentityClaimExclusivity`
-        // (`tcc_identity_claim_exclusivity_model`, the app's TCC identity is
-        // exclusive — a second bundle claiming it can destroy the grant for
-        // every copy, so a conflict is never silent and nothing is retired
-        // unnamed) adds one — 154 → 155.
+        // 2026-09-22: `TccIdentityClaimExclusivity` adds one — 154 → 155.
+        // 2026-09-22: `AtpkgIndexProbeCooldown`,
+        // `HarnessCaptureWorkerLifecycle`, `RainbowTypedContinuity`, and
+        // `SameCaretTypedEcho` add four distinct, Tier-1-bound machines —
+        // 155 → 159. The uniqueness check above guards against counting an
+        // accidental duplicate as one of them.
+        // 2026-09-22: `BroadcastHeadSubscription` adds one Tier-1-bound
+        // subscriber cursor machine — 159 → 160.
+        // 2026-09-23: `AtpkgTagRecord` (`atpkg_tag_record_model`, the store's tag
+        // record against the heal that clears it) adds one — 160 → 161.
+        // 2026-09-23: `AtpkgPendingWait` (`atpkg_pending_wait_model`, a pending stub
+        // reads the pass before the shim while it waits) adds one — 161 → 162.
+        // 2026-09-23: `TccIdentityClaimExclusivity` is removed — it restated
+        // a pure function the census's own tests already pin — 162 → 161.
+        // 2026-09-23: `AtpkgIndexSuccessorSelection`,
+        // `AtpkgIndexWakeHighwater`, `FabricOutboxWake`, and
+        // `PasteOrderSinkIsolation` add four Tier-1-bound machines — 161 → 165.
+        // 2026-09-24: `FabricReconnectBackoff` adds one Tier-1-bound machine
+        // for the broker retry deadline — 165 → 166.
+        // `AtpkgIndexPendingPark`, `AtpkgVendorPendingCheck`,
+        // `HarnessUpgradeStartupCadence`, `HarnessUpgradeNoticeOwner`, and
+        // `QueuedKeyKernelDelivery` add five — 166 → 171.
+        // The peer's `TrailAudioReopenLadder` (D5 device reopen budget) and
+        // `TrailSoundSeam` (D1/D2 key seam and its two readers) add two more
+        // Tier-1-bound machines — 171 → 173.
+        // 2026-09-24: `AtpkgFullPassRule` (`atpkg_full_pass_rule_model`, the
+        // machine-wide full-pass rule: atpkg's pass as the stamps' writer, the
+        // window's gate and the session lane as readers) adds one Tier-1-bound
+        // machine — 173 → 174.
+        // 2026-09-24: `ObservationScreenGeneration` (the observation kernel's
+        // change test across an equal-seq alternate-screen re-entry, Tier-1
+        // in aterm-core's conformance_observe) adds one — 174 → 175.
+        // 2026-09-24: `HarnessWorkerLifecycle` (the in-GUI supervisor host's
+        // per-session worker lifecycle, Tier-1 in harness_host) — 175 → 176
+        // (harness/integrate merged over origin/main).
+        // `BroadcastCursorCheckpoint` binds the bridge's delayed irrelevant
+        // cursor writes to restart replay and immediate delivered commits —
+        // 176 → 177.
+        // `UnknownInsertOrphanKey` binds exact queued-key recovery after
+        // unknown-width insert cleanup — 177 → 178.
+        // `AtpkgPublishedSpacing` binds the durable pass-target witness to
+        // GUI and queued-child scheduling — 178 → 179.
+        // `ComposedWitnessGeneration` binds captured ribbon rows to a frame's
+        // sample while fresh rows still require a matching generation — 179 → 180.
         assert_eq!(
-            total, 155,
+            total, 180,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -48699,8 +53836,9 @@ mod edr_headroom_tests {
     //! ([`super::EDR_REQUERY_INTERVAL`]) that is independent of monitor change —
     //! `maximumExtendedDynamicRangeColorComponentValue` moves with brightness on
     //! the SAME monitor, which no `Moved` / screen-parameter event reports. These
-    //! pin the pure cadence [`super::edr_requery_due`] drives.
-    use super::{EDR_REQUERY_INTERVAL, edr_requery_due};
+    //! pin the pure cadence [`super::edr_requery_due`] drives, and the re-query's
+    //! gate [`super::edr_refresh_due`] built on it.
+    use super::{EDR_REQUERY_INTERVAL, edr_refresh_due, edr_requery_due};
     use std::time::{Duration, Instant};
 
     /// NON-VACUITY + the fix: a never-sampled window is due; within the throttle
@@ -48743,18 +53881,83 @@ mod edr_headroom_tests {
         );
     }
 
+    /// The Windows reseed. A surface stamped at `t` while 8-bit that is HDR
+    /// at the next redraw — the wgpu arm's live upgrade ran in the stamping
+    /// redraw's present and reset the reference white and the headroom — is
+    /// due at once, not one throttle interval later. NEGATIVE CONTROL: the
+    /// time throttle alone, the gate's only term before the stamp carried
+    /// the surface kind, holds that re-query off.
+    #[test]
+    fn an_hdr_surface_stamped_while_8bit_is_due_at_once() {
+        let t = Instant::now();
+        let next_frame = t + Duration::from_millis(16);
+        assert!(
+            edr_refresh_due(
+                Some(true),
+                Some((t, false)),
+                next_frame,
+                EDR_REQUERY_INTERVAL
+            ),
+            "an HDR surface stamped while 8-bit is re-queried at the next redraw"
+        );
+        assert!(
+            !edr_requery_due(Some(t), next_frame, EDR_REQUERY_INTERVAL),
+            "control: the time throttle alone holds that re-query off"
+        );
+    }
+
+    /// The rest of the gate's domain. An 8-bit surface stays on the throttle
+    /// (its screen re-pick is bounded), so does an HDR surface stamped HDR,
+    /// a surface that fell back to 8-bit forces nothing, a never-stamped GPU
+    /// surface is due, and a window with no GPU present never is.
+    #[test]
+    fn the_gate_is_the_throttle_except_for_an_unseeded_hdr_surface() {
+        let t = Instant::now();
+        let next_frame = t + Duration::from_millis(16);
+        let elapsed = t + EDR_REQUERY_INTERVAL;
+        for hdr in [false, true] {
+            assert!(
+                edr_refresh_due(Some(hdr), None, t, EDR_REQUERY_INTERVAL),
+                "a never-stamped GPU surface (hdr={hdr}) is due"
+            );
+        }
+        for (stamped_hdr, hdr) in [(false, false), (true, true), (true, false)] {
+            let last = Some((t, stamped_hdr));
+            assert!(
+                !edr_refresh_due(Some(hdr), last, next_frame, EDR_REQUERY_INTERVAL),
+                "stamped hdr={stamped_hdr}, now hdr={hdr}: held within the interval"
+            );
+            assert!(
+                edr_refresh_due(Some(hdr), last, elapsed, EDR_REQUERY_INTERVAL),
+                "stamped hdr={stamped_hdr}, now hdr={hdr}: due once the interval elapses"
+            );
+        }
+        for last in [None, Some((t, false)), Some((t, true))] {
+            assert!(
+                !edr_refresh_due(None, last, elapsed, EDR_REQUERY_INTERVAL),
+                "no GPU present, stamp {last:?}: never due"
+            );
+        }
+    }
+
     /// WIRING FENCE for the screen re-pick. An 8-bit window whose screen
     /// gains EDR potential WITHOUT a monitor change (`hdr_glow` hot-reloaded
     /// on; a display-settings change) takes f16 only if the throttled
     /// re-query reaches the re-pick for 8-bit surfaces. The old gate
     /// (`!hdr || !edr_requery_due(..)`) skipped exactly those, so such a
-    /// window stayed 8-bit until it changed monitors. Checked by reading the
-    /// sources, the source-wiring idiom
+    /// window stayed 8-bit until it changed monitors. The gate is now the
+    /// pure `edr_refresh_due` alone, fed the live surface kind, and the two
+    /// tests above pin that it admits an 8-bit surface on the throttle. This
+    /// pins the wiring: nothing OR-ed into that early return, the re-pick
+    /// after it, the stamp's surface kind read after the re-pick (so a
+    /// surface the re-pick moved is seeded and stamped HDR in the same
+    /// call). Checked by reading the sources, the source-wiring idiom
     /// `every_non_boot_spawn_site_hands_over_a_real_cell_box` uses, because
     /// the re-pick needs a live `NSWindow` on a real screen.
     #[test]
     fn throttled_requery_reaches_the_screen_repick_for_8bit_windows() {
-        const THROTTLE: &str = "edr_requery_due(ws.last_edr_query, now, EDR_REQUERY_INTERVAL)";
+        const GATE: &str =
+            "edr_refresh_due(surface_hdr, ws.last_edr_query, now, EDR_REQUERY_INTERVAL)";
         let src: &'static str = include_str!("lib.rs");
         let body_of = |sig: &str, close: &str| -> &'static str {
             src.split_once(sig)
@@ -48764,44 +53967,66 @@ mod edr_headroom_tests {
                 .unwrap_or_else(|| panic!("`{sig}` must close"))
                 .0
         };
-        // Anything ahead of the throttle that gates on the surface being HDR
-        // keeps an 8-bit surface away from the re-pick.
-        let gates_on_hdr_first = |body: &str| {
-            body.find(THROTTLE)
-                .is_some_and(|at| body[..at].contains("is_hdr()"))
-        };
-        // NEGATIVE CONTROL: the pre-fix gate trips the same check.
+        // The early return that holds the throttle. Its whole condition must
+        // be the one pure gate: a term OR-ed in ahead of it (the old `!hdr`)
+        // turns an 8-bit surface away before the throttle is consulted.
+        fn gate_line(body: &str) -> &str {
+            body.lines()
+                .map(str::trim)
+                .find(|line| line.contains("EDR_REQUERY_INTERVAL)"))
+                .expect("the re-query must stay throttled")
+        }
+        let gate_alone = format!("if !{GATE} {{");
+        // NEGATIVE CONTROL: the pre-fix gate fails the same check.
         let pre_fix = concat!(
             "let hdr = matches!(&ws.present, Some(PresentTarget::Gpu { gpu_surface, .. }) ",
             "if gpu_surface.is_hdr());\n",
             "if !hdr || !edr_requery_due(ws.last_edr_query, now, EDR_REQUERY_INTERVAL) {",
         );
         assert!(
-            gates_on_hdr_first(pre_fix),
-            "control: the old gate kept 8-bit surfaces from the re-query"
+            gate_line(pre_fix).contains("!hdr ||") && gate_line(pre_fix) != gate_alone,
+            "control: the old gate turned 8-bit surfaces away ahead of the throttle"
         );
 
         let requery = body_of(
             "    fn refresh_edr_headroom(&mut self, wid: WindowId, now: Instant) {",
             "\n    }\n",
         );
-        let throttle = requery
-            .find(THROTTLE)
+        assert_eq!(
+            gate_line(requery),
+            gate_alone,
+            "nothing may be OR-ed into the gate: an 8-bit surface must reach the screen re-pick"
+        );
+        let gate = requery
+            .find(GATE)
             .expect("the re-query must stay throttled");
+        assert_eq!(
+            requery[..gate].matches("return;").count(),
+            1,
+            "the window lookup is the only early return ahead of the gate"
+        );
         assert!(
-            !gates_on_hdr_first(requery),
-            "nothing ahead of the throttle may gate on `is_hdr()`: an 8-bit surface must \
-             reach the screen re-pick"
+            requery[..gate].contains(
+                "Some(PresentTarget::Gpu { gpu_surface, .. }) => Some(gpu_surface.is_hdr()),"
+            ),
+            "the gate is fed the live surface kind of a GPU present"
         );
         let repick = requery
             .find("repick_gpu_surface_for_screen(")
             .expect("the throttled re-query must run the screen re-pick");
+        let kind = requery
+            .find("stamped_hdr = gpu_surface.is_hdr();")
+            .expect("the stamp must read the surface kind the re-pick left behind");
         let seed = requery
             .find("set_edr_max(")
             .expect("the throttled re-query must still seed the headroom");
+        let stamp = requery
+            .find("ws.last_edr_query = Some((now, stamped_hdr));")
+            .expect("the stamp must record the surface kind");
         assert!(
-            throttle < repick && repick < seed,
-            "throttle, then the re-pick, then the headroom (a just-upgraded surface is seeded)"
+            gate < repick && repick < kind && kind < seed && seed < stamp,
+            "the gate, the re-pick, the surface kind it left, the headroom (a just-upgraded \
+             surface is seeded), then the stamp"
         );
         let monitor = body_of(
             "    fn refresh_frame_interval(&mut self, wid: WindowId, force_read: bool) {",
@@ -48839,9 +54064,9 @@ mod refresh_rate_reread_tests {
     //! `refresh_frame_interval` keeps the refresh-RATE read ahead of the
     //! monitor-identity guard (W6) but off the per-`Moved` hot path: on a panel
     //! whose `CGDisplayModeGetRefreshRate` is 0 the read is a CVDisplayLink
-    //! create/query/release (mean 0.23–0.51 ms, worst 3.2–6.5 ms per call across
-    //! measured runs — see [`super::REFRESH_RATE_REREAD_INTERVAL`]), and `Moved`
-    //! streams continuously during a drag. These pin the pure gate
+    //! create/query/release per call (the dated measurements are on
+    //! [`super::REFRESH_RATE_REREAD_INTERVAL`]), and `Moved` streams
+    //! continuously during a drag. These pin the pure gate
     //! [`super::refresh_rate_read_due`]; the method itself needs an `os_window`,
     //! which a headless window never has. Each test drives the gate with the
     //! `(same_monitor, force_read)` pair its event produces at the call site — a
@@ -50740,14 +55965,14 @@ mod macos_access_refresh_tests {
     use super::App;
     use super::consent_card::{CardPhase, GRANTED_CAPTION, Marker, Verdict, WATCH_FOR};
     use super::control_privacy::ConsentState;
-    use super::notice::TransientNotice;
+    use super::message_reporters::KEY_FILE_ACCESS;
     use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
     use std::time::{Duration, Instant};
 
     /// Real App/card glue with synthetic published observations. The cache's
     /// own concurrent publication and invalidation are checked in
     /// control_privacy; these fixtures can never invoke a live OS probe.
-    fn windowed(probe: FdaProbe) -> App {
+    pub(super) fn windowed(probe: FdaProbe) -> App {
         let mut app = App::headless_for_test();
         app.headless = false;
         app.consent = ConsentState::with_cached_probe_for_test(probe);
@@ -50768,6 +55993,19 @@ mod macos_access_refresh_tests {
         }
     }
 
+    /// Whether the grant is on record (R17 is a record, never a row).
+    pub(super) fn grant_recorded(app: &App) -> bool {
+        app.messages
+            .log()
+            .records()
+            .any(|rec| rec.title == GRANTED_CAPTION)
+    }
+
+    /// Whether any `privacy.fda` row is on the band.
+    pub(super) fn access_row(app: &App) -> bool {
+        app.messages.live_by_key(KEY_FILE_ACCESS).is_some()
+    }
+
     #[test]
     fn pending_launch_retains_the_opened_marker_until_access_is_observed() {
         let now = Instant::now();
@@ -50777,95 +56015,92 @@ mod macos_access_refresh_tests {
         assert_eq!(app.consent_card.phase(), CardPhase::Deciding { since: now });
         assert_eq!(app.consent_card_pending_marker, Some(Some(Marker::Opened)));
         assert!(
-            app.notice.is_none(),
+            !access_row(&app) && !grant_recorded(&app),
             "pending is neither an offer nor a confirmation"
         );
 
         app.tick_macos_access_card(now);
         assert_eq!(app.consent_card_pending_marker, Some(Some(Marker::Opened)));
-        assert!(app.notice.is_none());
+        assert!(!access_row(&app) && !grant_recorded(&app));
         app.consent = ConsentState::with_cached_probe_for_test(granted());
         app.tick_macos_access_card(now);
         assert_eq!(app.consent_card_pending_marker, None);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+        assert!(grant_recorded(&app), "the confirmation is a record");
+        assert!(!access_row(&app));
+        assert_eq!(app.messages.wanted_rows(), 0, "…and never a row");
         assert_eq!(app.next_macos_access_card_deadline(now), None);
     }
 
+    /// A watch whose evidence goes PENDING, then DENIED, never records a
+    /// grant it did not observe: the grant is recorded only on a completed
+    /// `granted` read, the moment it is read (there is no slot to wait for,
+    /// so no older observation can be replayed as a confirmation later).
     #[test]
     fn pending_and_withdrawn_access_never_publish_an_old_confirmation() {
         let now = Instant::now();
-        let mut app = windowed(granted());
+        let mut app = windowed(denied());
         assert!(app.consent_card.begin_deciding(now));
         assert!(app.consent_card.on_decided(&Verdict::Offer, now));
-        app.consent_card.on_raised(now);
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
         app.tick_macos_access_card(now);
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Confirming { since: now }
-        );
-        assert!(app.notice.as_ref().unwrap().is_admin_step());
+        assert!(access_row(&app), "the question is up");
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
 
         app.consent =
             ConsentState::with_cached_probe_for_test(FdaProbe::refused(ProbeLabel::Pending));
-        app.notice = None;
-        app.tick_macos_access_card(now);
-        assert_eq!(
-            app.consent_card.phase(),
-            CardPhase::Confirming { since: now }
-        );
+        app.tick_macos_access_card(now + Duration::from_secs(1));
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
         assert!(
-            app.notice.is_none(),
+            !grant_recorded(&app),
             "expired evidence cannot confirm access"
         );
+        assert!(access_row(&app), "and the question stays up");
 
         app.consent = ConsentState::with_cached_probe_for_test(denied());
-        app.tick_macos_access_card(now);
-        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        app.tick_macos_access_card(now + Duration::from_secs(2));
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
         assert!(
-            app.notice.is_none(),
-            "a withdrawn grant cannot become a success pill"
+            !grant_recorded(&app),
+            "a withdrawn grant cannot become a success record"
         );
     }
 
     #[test]
-    fn a_queued_card_waits_for_pending_access_and_retires_an_unknown_result() {
+    fn a_due_card_waits_for_pending_access_and_retires_an_unknown_result() {
         let now = Instant::now();
         let mut app = windowed(FdaProbe::refused(ProbeLabel::Pending));
         assert!(app.consent_card.begin_deciding(now));
         assert!(app.consent_card.on_decided(&Verdict::Offer, now));
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
         app.tick_macos_access_card(now);
         assert_eq!(app.consent_card.phase(), CardPhase::Due);
-        assert!(app.notice.as_ref().unwrap().is_admin_step());
+        assert!(!access_row(&app), "a pending probe posts nothing yet");
 
         app.consent =
             ConsentState::with_cached_probe_for_test(FdaProbe::refused(ProbeLabel::RefusedNoHome));
         app.tick_macos_access_card(now);
-        assert_eq!(app.consent_card.phase(), CardPhase::Due);
-        assert!(
-            app.notice.as_ref().unwrap().is_admin_step(),
-            "another notice keeps its slot"
-        );
-        app.notice = None;
-        app.tick_macos_access_card(now);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
         assert!(
-            app.notice.is_none(),
-            "unknown access cannot raise the waiting card"
+            !access_row(&app),
+            "unknown access cannot post the waiting question"
         );
     }
 
     #[test]
-    fn disabling_checks_clears_a_pending_answer_and_its_shared_route() {
+    fn disabling_checks_clears_a_pending_answer_and_its_route_row() {
         let now = Instant::now();
         let mut app = windowed(FdaProbe::refused(ProbeLabel::Pending));
         assert!(app.consent_card.begin_deciding(now));
         app.decide_macos_access_card(Some(Marker::Opened));
-        app.notice = Some(TransientNotice::macos_access_route(
-            "route".into(),
-            Duration::from_secs(90),
+        // The route words of an earlier Open Settings, still on the band.
+        let id = app.post_message(super::message_reporters::file_access_question());
+        app.consent_card_message = Some(id);
+        assert!(app.messages.restate(
+            id,
+            aterm_messages::Restatement {
+                title: Some("Enable aterm in Full Disk Access".into()),
+                actions: Some(Vec::new()),
+                ..Default::default()
+            },
             now,
         ));
         app.config.privacy = Some(super::app_config::PrivacyConfig {
@@ -50875,10 +56110,11 @@ mod macos_access_refresh_tests {
         app.tick_macos_access_card(now);
         assert_eq!(app.consent_card_pending_marker, None);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.is_none());
+        assert!(!access_row(&app), "the route row is resolved with the card");
+        assert_eq!(app.consent_card_message, None);
         app.decide_macos_access_card(Some(Marker::Opened));
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.is_none());
+        assert!(!access_row(&app));
         assert_eq!(app.next_macos_access_card_deadline(now), None);
     }
 
@@ -50888,8 +56124,8 @@ mod macos_access_refresh_tests {
         let now = Instant::now();
         assert!(app.consent_card.begin_deciding(now));
         assert!(app.consent_card.on_decided(&Verdict::Offer, now));
-        app.consent_card.on_raised(now);
-        app.notice = Some(TransientNotice::macos_access(now));
+        app.tick_macos_access_card(now);
+        assert!(access_row(&app));
         for interval in [0, 250, 5000] {
             app.config.privacy = Some(super::app_config::PrivacyConfig {
                 probe_interval_ms: Some(interval),
@@ -50935,7 +56171,7 @@ mod macos_access_refresh_tests {
         app.consent = ConsentState::with_cached_probe_for_test(granted());
         app.tick_macos_access_card(now);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+        assert!(grant_recorded(&app));
         assert_eq!(app.next_macos_access_card_deadline(now), None);
 
         // The same explicit door still respects the current notice switch.
@@ -50951,81 +56187,32 @@ mod macos_access_refresh_tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_access_lifetime_tests {
-    use super::App;
-    use super::consent_card::{CardPhase, Marker, SLOT_WAIT_FOR, Verdict, WATCH_FOR};
+    use super::consent_card::{CardPhase, Marker, Verdict, WATCH_FOR};
     use super::control_privacy::ConsentState;
-    use super::notice::TransientNotice;
+    use super::macos_access_refresh_tests::{access_row, grant_recorded, windowed};
     use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
-    use std::time::{Duration, Instant};
-
-    fn windowed(probe: FdaProbe) -> App {
-        let mut app = App::headless_for_test();
-        app.headless = false;
-        app.consent = ConsentState::with_cached_probe_for_test(probe);
-        app
-    }
-
-    #[test]
-    fn occupied_notice_slot_schedules_only_the_first_offer_expiry() {
-        let now = Instant::now();
-        let mut app = windowed(FdaProbe {
-            state: FdaState::Denied,
-            label: ProbeLabel::OpenEperm,
-        });
-        assert!(app.consent_card.begin_deciding(now));
-        assert!(app.consent_card.on_decided(&Verdict::Offer, now));
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
-        for elapsed in [Duration::ZERO, Duration::from_secs(60)] {
-            let sample = now + elapsed;
-            app.tick_macos_access_card(sample);
-            assert_eq!(app.consent_card.phase(), CardPhase::Due);
-            assert!(app.notice.as_ref().unwrap().is_admin_step());
-            assert_eq!(
-                app.next_macos_access_card_deadline(sample),
-                Some(now + SLOT_WAIT_FOR),
-                "an occupied slot does not schedule periodic access probes"
-            );
-        }
-        // Even if the slot becomes free at this event, the expired offer gets
-        // no fresh lifetime. The next process may offer it again.
-        app.notice = None;
-        app.tick_macos_access_card(now + SLOT_WAIT_FOR);
-        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-        assert!(app.notice.is_none());
-        assert_eq!(
-            app.next_macos_access_card_deadline(now + SLOT_WAIT_FOR),
-            None
-        );
-    }
+    use std::time::Instant;
 
     #[test]
     fn pending_access_cannot_extend_any_waiting_phase() {
         let now = Instant::now();
-        for phase in ["due", "watching", "confirming"] {
+        for phase in ["due", "watching"] {
             let mut app = windowed(FdaProbe::pending());
             assert!(app.consent_card.begin_deciding(now));
             assert!(app.consent_card.on_decided(&Verdict::Offer, now));
-            let cap = match phase {
-                "due" => SLOT_WAIT_FOR,
-                "watching" => {
-                    app.consent_card.on_raised(now);
-                    WATCH_FOR
-                }
-                "confirming" => {
-                    app.consent_card.on_grant_awaiting_slot(now);
-                    WATCH_FOR
-                }
-                _ => unreachable!(),
-            };
-            app.tick_macos_access_card(now + cap);
+            if phase == "watching" {
+                app.consent_card.on_raised(now);
+            }
+            app.tick_macos_access_card(now + WATCH_FOR);
             assert_eq!(app.consent_card.phase(), CardPhase::Settled, "{phase}");
             assert!(
-                app.notice.is_none(),
+                !access_row(&app) && !grant_recorded(&app),
                 "an expired phase cannot offer or confirm"
             );
             assert_eq!(
-                app.next_macos_access_card_deadline(now + cap),
-                (phase == "watching").then_some(now + cap + super::consent_card::REOFFER_AFTER),
+                app.next_macos_access_card_deadline(now + WATCH_FOR),
+                (phase == "watching")
+                    .then_some(now + WATCH_FOR + super::consent_card::REOFFER_AFTER),
                 "only a previously shown unanswered offer returns"
             );
         }
@@ -51047,9 +56234,9 @@ mod macos_access_lifetime_tests {
             "the retry starts on this wake and settles because this fixture has no worker proxy"
         );
         assert_eq!(app.consent_card_pending_marker, None);
-        assert!(app.notice.is_none());
+        assert!(!access_row(&app) && !grant_recorded(&app));
         // A worker from the expired attempt cannot turn the retained marker
-        // into a success pill while no decision is active.
+        // into a success record while no decision is active.
         app.consent = ConsentState::with_cached_probe_for_test(FdaProbe {
             state: FdaState::Granted,
             label: ProbeLabel::OpenOk,
@@ -51057,7 +56244,7 @@ mod macos_access_lifetime_tests {
         app.decide_macos_access_card(Some(Marker::Opened));
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
         assert_eq!(app.consent_card_pending_marker, None);
-        assert!(app.notice.is_none());
+        assert!(!grant_recorded(&app));
     }
 }
 

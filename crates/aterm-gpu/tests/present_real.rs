@@ -312,6 +312,7 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         fh,
         false,
         live_bg,
+        0,
     );
 
     // Exercise the REAL swapchain present seam, not the dedicated blit helper:

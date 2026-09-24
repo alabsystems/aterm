@@ -180,7 +180,10 @@ impl Sandbox {
         // without this the pacing smoke measures whatever effect that machine
         // happens to have enabled. Config resolution has no probe marker, so the
         // launch env is the only lever. Keep rendering at its shipped defaults,
-        // but explicitly opt out of unrelated package and host maintenance.
+        // but explicitly opt out of unrelated update, package and host maintenance —
+        // through the config, the way a person does: the environment vetoes are gone
+        // (2026-09-23), so `[update] enabled = false` keeps the app updater's background
+        // checks off (nothing here asks it to check).
         // `[packages].enabled = false` alone still runs `machine apply`, whose
         // defaults change per-user settings even with a scratch config directory.
         // It closes a write path too: `aterm-ctl` auto-presents the token and
@@ -191,7 +194,8 @@ impl Sandbox {
         chmod_700(&cfgdir)?;
         std::fs::write(
             cfgdir.join("aterm/aterm.toml"),
-            "agents_auto_prime = false\n[packages]\nenabled = false\n\
+            "agents_auto_prime = false\n[update]\nenabled = false\nauto_apply = false\n\
+             [packages]\nenabled = false\n\
              [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n",
         )
         .ok()?;
@@ -310,9 +314,6 @@ fn bring_up(
         .env("XDG_RUNTIME_DIR", &sb.rundir)
         .env("XDG_CONFIG_HOME", &sb.cfgdir)
         .env("ATERM_CONTROL_SOCK", sb.sock())
-        .env("ATERM_NO_REROUTE", "1")
-        .env("ATERM_NO_AUTO_UPDATE", "1")
-        .env("ATERM_NO_AUTO_APPLY", "1")
         .env("SHELL", "/bin/sh")
         .stdout(log)
         .stderr(log2);

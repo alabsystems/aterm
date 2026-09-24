@@ -28,21 +28,18 @@
 //! nothing outside the process: the fabric plan is kept on the App, no child
 //! runs, no sheet is shown.
 
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-
-use crate::config_notice::ConfigNotice;
 use crate::menu::{FrontHold, MenuAction};
 use crate::platform::AppRt as _;
 use crate::presence::HoldFact;
 use crate::{App, WindowId};
+use std::path::{Path, PathBuf};
 
 /// The `[presence]` leaf keys the two View checkables write — the registered
 /// settings keys (`prefs::NESTED_LEAVES`), so the config lane admits them.
 pub(crate) const PRESENCE_BAND_KEY: &str = crate::prefs::EDIT_PRESENCE_BAND;
 pub(crate) const PRESENCE_RIM_KEY: &str = crate::prefs::EDIT_PRESENCE_RIM;
 
-/// The human name of a presence leaf key — the notice's subject.
+/// The human name of a presence leaf key — the row's subject.
 pub(crate) fn presence_key_label(key: &str) -> &'static str {
     if key == PRESENCE_RIM_KEY {
         "Presence Rim"
@@ -72,6 +69,16 @@ pub(crate) enum FabricVerb {
 }
 
 impl FabricVerb {
+    /// The verb's word in a message key (`fabric.<verb>`): one row per verb
+    /// on the band, so a rerun replaces its own outcome.
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
     /// The CLI's argv after the program.
     pub(crate) fn argv(self) -> Vec<String> {
         let mut v = vec!["fabric".to_string()];
@@ -81,6 +88,16 @@ impl FabricVerb {
             Self::Off => v.push("off".to_string()),
         }
         v
+    }
+
+    /// The verb as a row's title names it: `Fabric status`, `Fabric On`,
+    /// `Fabric Off`.
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::Status => "Fabric status",
+            Self::On => "Fabric On",
+            Self::Off => "Fabric Off",
+        }
     }
 
     /// The command as a human types it.
@@ -228,6 +245,16 @@ fn fabric_markdown(
 }
 
 /// One line saying how the child ended — the notice and the tab's subtitle.
+/// Why `aterm fabric …` did not end cleanly, in a few words: `exited 2`,
+/// `killed by a signal`, or the spawn's own error.
+fn fabric_failure_reason(status: &Result<Option<i32>, String>) -> String {
+    match status {
+        Ok(Some(code)) => format!("exited {code}"),
+        Ok(None) => "killed by a signal".to_string(),
+        Err(e) => e.clone(),
+    }
+}
+
 fn fabric_status_words(verb: FabricVerb, status: &Result<Option<i32>, String>) -> String {
     match status {
         Ok(Some(0)) => format!("{}: done.", verb.words()),
@@ -288,14 +315,12 @@ impl App {
         let desired = !current;
         self.set_presence_bit(key, desired);
         if let Err(error) = self.queue_presence_write(key, desired) {
-            self.config_notice = ConfigNotice::new(
-                vec![format!(
-                    "{} was not saved: {error}",
-                    presence_key_label(key)
-                )],
-                Instant::now(),
-            );
-            self.request_redraw_all_windows();
+            self.post_message(crate::message_reporters::presence_not_saved(
+                key,
+                presence_key_label(key),
+                &error.to_string(),
+                false,
+            ));
         }
     }
 
@@ -352,19 +377,25 @@ impl App {
         self.refresh_presence_session(session, false);
         self.publish_front_hold(wid);
         self.palette_refresh_live();
-        let words = if reply == HOLD_DENIED {
-            Some(
-                "This session is held by the fleet: the hold is the bridge's to lift, not this window's."
-                    .to_string(),
-            )
+        // A hold the menu could not place (design R10): a standing fleet hold
+        // makes a Hold press a record (the session is held, as asked) and a
+        // Release press a failure on the band; the bridge's refusal is a
+        // failure either way.
+        let refused = if reply == HOLD_DENIED {
+            Some(crate::message_reporters::fleet_hold(on))
         } else {
             reply
                 .strip_prefix("ERR ")
-                .map(|err| format!("Hold: {}", err.trim_end()))
+                .map(|err| crate::message_reporters::hold_refused(err.trim_end()))
         };
-        if let Some(words) = words {
-            self.config_notice = ConfigNotice::new(vec![words], Instant::now());
-            self.request_redraw_all_windows();
+        match refused {
+            Some(msg) if msg.hold == aterm_messages::Hold::LogOnly => {
+                self.record_message(msg);
+            }
+            Some(msg) => {
+                self.post_message(msg);
+            }
+            None => {}
         }
     }
 
@@ -383,7 +414,11 @@ impl App {
         let path = menu_document_path("inbox", &sid);
         match write_private(&path, &text) {
             Ok(()) => self.open_menu_document(wid, path),
-            Err(e) => self.menu_notice(format!("Inbox: could not write {}: {e}", path.display())),
+            Err(e) => self.menu_failure(
+                "inbox",
+                "Inbox did not open",
+                &[&e.to_string(), &path.display().to_string()],
+            ),
         }
     }
 
@@ -394,20 +429,30 @@ impl App {
         let uri = match crate::native_document_host::path_to_file_uri(&path) {
             Ok(uri) => uri,
             Err(e) => {
-                self.menu_notice(format!("could not open {}: {e}", path.display()));
+                self.menu_failure(
+                    "document",
+                    "Document did not open",
+                    &[&e.to_string(), &path.display().to_string()],
+                );
                 return;
             }
         };
         if let Err(e) =
             self.request_document_tab_in_window(wid, crate::native_app::AppKind::Markdown, &uri)
         {
-            self.menu_notice(format!("could not open {}: {e}", path.display()));
+            self.menu_failure(
+                "document",
+                "Document did not open",
+                &[&e.to_string(), &path.display().to_string()],
+            );
         }
     }
 
-    fn menu_notice(&mut self, words: String) {
-        self.config_notice = ConfigNotice::new(vec![words], Instant::now());
-        self.request_redraw_all_windows();
+    /// A fabric menu item that could not do its thing: a terse failure and
+    /// its cause (then the path) behind it on the band (design R11, §10.3
+    /// C19), keyed by `verb`.
+    fn menu_failure(&mut self, verb: &str, title: &str, lines: &[&str]) {
+        self.post_message(crate::message_reporters::fabric_failure(verb, title, lines));
     }
 
     /// Fabric Status… / Turn Fabric On… / Turn Fabric Off…: confirm when the
@@ -425,10 +470,14 @@ impl App {
                 Some(true) => {}
                 Some(false) => return,
                 None => {
-                    self.menu_notice(format!(
-                        "No confirmation dialog on this platform: run `{}` in a shell.",
-                        verb.words()
-                    ));
+                    self.menu_failure(
+                        verb.key(),
+                        &format!("{} did not start", verb.title()),
+                        &[
+                            "no confirmation dialog on this platform",
+                            &format!("run `{}` in a shell", verb.words()),
+                        ],
+                    );
                     return;
                 }
             }
@@ -477,17 +526,37 @@ impl App {
                 })));
             });
         if let Err(e) = spawned {
-            self.menu_notice(format!("{}: cannot spawn its thread: {e}", verb.words()));
+            self.menu_failure(
+                verb.key(),
+                &format!("{} did not start", verb.title()),
+                &[&e.to_string()],
+            );
         }
     }
 
-    /// The child ended (`Wake::FabricCli`): say how, and open its output as a
-    /// tab on the window that asked — or on the front window if that one is
-    /// gone.
+    /// The child ended (`Wake::FabricCli`): say how on the band (a clean exit
+    /// is a success row, anything else a warning — design R11), and open its
+    /// output as a tab on the window that asked — or on the front window if
+    /// that one is gone.
     pub(crate) fn complete_fabric_cli(&mut self, outcome: FabricCliOutcome) {
-        let words = fabric_status_words(outcome.plan.verb, &outcome.status);
-        self.config_notice = ConfigNotice::new(vec![words], Instant::now());
-        self.request_redraw_all_windows();
+        let verb = outcome.plan.verb;
+        let ok = matches!(outcome.status, Ok(Some(0)));
+        // A clean exit is a record in the words it always had (the output tab
+        // opens anyway); anything else is the person's command failing: a
+        // terse title, the reason, and where the output is (design §10.3 C20).
+        let (title, reason) = if ok {
+            (fabric_status_words(verb, &outcome.status), String::new())
+        } else {
+            (
+                format!("{} failed", verb.title()),
+                fabric_failure_reason(&outcome.status),
+            )
+        };
+        let mut msg = crate::message_reporters::fabric_status(verb.key(), &title, &reason, ok);
+        if !ok && outcome.plan.out.is_file() {
+            msg = msg.line("output is in the new tab");
+        }
+        self.post_message(msg);
         let wid = if self.windows.contains_key(&outcome.wid) {
             Some(outcome.wid)
         } else {
@@ -575,18 +644,38 @@ mod tests {
                 r.label
             );
         }
-        // A click that slipped past the grey: refused, shown, the hold stands.
+        // A Hold click that slipped past the grey asked for what already is —
+        // the session is held — so it is a record, never a row.
+        app.menu_hold(wid, true);
+        assert!(ctx.fabric.hold().is_some_and(|h| h.origin == "fleet"));
+        assert!(
+            app.messages
+                .live_by_key(crate::message_reporters::KEY_FABRIC_HOLD)
+                .is_none(),
+            "no row for a hold that already stands"
+        );
+        assert!(
+            app.messages
+                .log()
+                .records()
+                .any(|r| r.title == "Session already held" && !r.is_live()),
+            "…and the log keeps it"
+        );
+        // A Release click: refused, shown, the hold stands.
         app.menu_hold(wid, false);
         assert!(ctx.fabric.hold().is_some_and(|h| h.origin == "fleet"));
         assert!(
-            app.config_notice
-                .as_ref()
-                .is_some_and(|n| n.lines.iter().any(|l| l.contains("held by the fleet"))),
-            "the refusal is said"
+            app.has_live_message("Hold not lifted"),
+            "the refusal is said, as its outcome"
         );
         assert!(crate::fabric::apply_hold_for_test(&ctx, None));
         app.on_presence_wake(&ctx.self_id, false);
-        app.config_notice = None;
+        let refusal = app
+            .messages
+            .live_by_key(crate::message_reporters::KEY_FABRIC_HOLD)
+            .map(|l| l.id)
+            .expect("the refusal row");
+        assert!(app.resolve_message(refusal, aterm_messages::Outcome::Ok));
 
         // Hold This Session: a LOCAL hold, the band's stop rim, Lift now live.
         app.menu_hold(wid, true);
@@ -606,7 +695,12 @@ mod tests {
             row(&app, wid, MenuAction::LiftHold).label,
             "Lift Hold (This Session)"
         );
-        assert!(app.config_notice.is_none(), "no notice on success");
+        assert!(
+            app.messages
+                .live_by_key(crate::message_reporters::KEY_FABRIC_HOLD)
+                .is_none(),
+            "no message on success"
+        );
 
         // Lift Hold: gone, and the rows swap back.
         app.menu_hold(wid, false);
@@ -745,11 +839,7 @@ mod tests {
 
         // Headless has no event-loop proxy: the durable write cannot be queued
         // and the notice says so; the live flip stands.
-        assert!(
-            app.config_notice
-                .as_ref()
-                .is_some_and(|n| n.lines.iter().any(|l| l.contains("was not saved"))),
-        );
+        assert!(app.has_live_message("not saved"));
 
         // Back on: the row and the rim return.
         app.user_toggle_presence(MenuAction::TogglePresenceBand);

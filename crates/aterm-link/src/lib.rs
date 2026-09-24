@@ -42,9 +42,9 @@
 //! [`bridge::Bridge::expire_deadlines`] reads the asker's own lane to learn
 //! whether an `answer`/`report`/`ack` carrying it arrived before it publishes a
 //! verdict, this crate's own [`fabric`] report reads it to fold `answer`s
-//! against overdue asks for the `aterm fabric` WARNINGS, `aterm-gui`'s `fabric`
+//! against overdue asks for the `aterm fabric` WARNINGS, and `aterm-gui`'s `fabric`
 //! resolves it against the recipient's OWN outbound posts into the `re-id=` a
-//! reader sees, and [`mirror`] prints it. A correlation label is not
+//! reader sees. A correlation label is not
 //! a permission — a deadline verdict is a notification, never a keystroke or an
 //! admission: none of those readers can grant, apply, admit or deliver anything
 //! on the strength of one,
@@ -70,18 +70,13 @@ pub mod enable;
 /// `aterm fabric` — the fabric's state on one screen, and its traffic live.
 pub mod fabric;
 pub mod glance;
-pub mod hook;
 /// `aterm fabric mint-for|join` — a SECOND HOST joins the fleet over the
 /// sealed transport; see [`join::join`].
 pub mod join;
-/// A minimal JSON value, for the one document `hook install --merge` edits.
-pub mod json;
 pub mod mailbox;
-pub mod mirror;
 pub mod notify;
 pub mod pct;
-pub mod permission;
-/// The presence row's meaning fields (`role= detail= phase= context= title=`).
+/// The presence row's meaning fields (`role= detail= phase= title=`).
 pub mod presence;
 pub mod render;
 pub mod state;
@@ -155,10 +150,10 @@ mod tests {
     /// THE `re=` SENTENCE IS A CLAIM TOO, and the one that drifted.
     ///
     /// It used to read "a re= is read in one place only — replay". It was read
-    /// in at least four: `bridge::Bridge::deliver_record` forwards it onto the
+    /// in at least three: `bridge::Bridge::deliver_record` forwards it onto the
     /// `deliver` line, `aterm-gui`'s `fabric::deliver_row` turns it into
-    /// `re-id=<post id>` against the RECIPIENT's own posts, and `mirror` and
-    /// `fabric` render it. An auditor who believed the old sentence stopped
+    /// `re-id=<post id>` against the RECIPIENT's own posts, and `fabric` renders
+    /// it. An auditor who believed the old sentence stopped
     /// looking outside `replay` and never saw the seam where a sender-chosen
     /// offset becomes a correlation the reader trusts — and round 21 cut
     /// `replay` itself, so the one place the sentence named is now the one
@@ -192,10 +187,9 @@ mod tests {
         // EVERY MODULE THAT READS A BODY'S `re=` MUST BE NAMED. `body` is the
         // codec itself and `bridge` is named in prose above; the rest are named
         // by module. A new reader fails here until the sentence grows.
-        let named = ["bridge", "mirror", "fabric"];
+        let named = ["bridge", "fabric"];
         for (module, source) in [
             ("bridge", include_str!("bridge.rs")),
-            ("mirror", include_str!("mirror.rs")),
             ("body", include_str!("body.rs")),
             ("glance", include_str!("glance.rs")),
             ("notify", include_str!("notify.rs")),
@@ -203,8 +197,6 @@ mod tests {
             ("state", include_str!("state.rs")),
             ("subject", include_str!("subject.rs")),
             ("ctl", include_str!("ctl.rs")),
-            ("hook", include_str!("hook.rs")),
-            ("json", include_str!("json.rs")),
             ("fabric", include_str!("fabric.rs")),
             ("transport", include_str!("transport.rs")),
         ] {

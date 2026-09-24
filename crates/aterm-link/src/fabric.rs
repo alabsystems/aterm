@@ -75,10 +75,10 @@
 //!   joined by sid with what each local instance says about its own sessions:
 //!   `meta` for the title and role, and `inbox --peek --meta` for the inbox
 //!   numbers — `--peek` so no row becomes listed, `--meta` so no text is read.
-//!   The row's own `detail=`, `phase=` and `context=` (round 13's presence
-//!   with meaning: the running program, busy | idle | prompt | question |
-//!   limited | survey, and the context percentage) are the bridge's, so a
-//!   remote session shows them too; a local instance's `meta` wins for the
+//!   The row's own `detail=` and `phase=` (round 13's presence with meaning:
+//!   the running program, and busy | idle | prompt | question | limited |
+//!   survey — the server's agent verdict the bridge relays) are the bridge's,
+//!   so a remote session shows them too; a local instance's `meta` wins for the
 //!   title and role, the bus row fills them in for a remote one.
 //!   A HELD session's `timeline` is read for the hold's reason and origin, which
 //!   no other read verb reports; an unhandled task's or ask's age is the `t=` of
@@ -231,8 +231,10 @@ instance control sockets (fabric.toml) is read when the file has no command.
                    rendezvous file is there
                    --retire-ghosts lists every presence row this node advertises LIVE
                    that no local instance hosts and, after a y/N (or --yes), publishes
-                   `exited` for each. DRY by default. Refused while a local bridge runs:
-                   it owns this node's publish sequence.
+                   `exited` for each. DRY by default. With a local bridge UP the rows
+                   are retired THROUGH it (`aterm ctl fabric retire`, then the bus is
+                   read back); with none, this command publishes them itself — and a
+                   bridge from 0.91.0 or earlier answers `ERR usage`, which is reported.
   mint-for <node>  on the FIRST host (a `sealed` build): mint that node's 8 grants
                    (the node ring) on this host's fleet under this host's mint
                    secret, which never leaves it and is never printed. <node> is
@@ -2809,9 +2811,45 @@ pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Resul
     Ok(done)
 }
 
+/// The `state=` of each named session's presence row under this node, read
+/// off the bus with the cap files' grants — the doctor's read-back after it
+/// asked a bridge to retire. A sid with no row is absent from the map.
+///
+/// # Errors
+///
+/// The broker or the caps.
+pub fn presence_states(report: &Report, sids: &[&str]) -> io::Result<BTreeMap<String, String>> {
+    let cfg = &report.cfg;
+    let node = report
+        .node
+        .as_deref()
+        .ok_or_else(|| io::Error::other("this state dir has no node id"))?;
+    let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
+    for path in &cfg.cap_files {
+        for cap in read_cap_file(path)? {
+            conn.attach(&cap.grant, &cap.tag)?;
+        }
+    }
+    let mut out = BTreeMap::new();
+    let filter = format!("/f/{}/pub/{}/*/presence", cfg.fleet, node);
+    transport::walk_last(&mut conn, &filter, |(_, subject, raw)| {
+        if let Some(sid) = subject.split('/').nth(5) {
+            if sids.contains(&sid) {
+                let (body, _) = Body::decode(raw);
+                if let Some(state) = body.unknown.get("state") {
+                    out.insert(sid.to_string(), state.clone());
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 /// One presence body with `state=` set to `exited` and `t=` refreshed; every
-/// other token kept in place.
-fn retired_body(body: &str) -> String {
+/// other token kept in place. Shared with the bridge's operator-requested
+/// retire, so the two paths write the same row.
+pub(crate) fn retired_body(body: &str) -> String {
     let now = crate::now_ms().to_string();
     let mut out: Vec<String> = Vec::new();
     let (mut saw_state, mut saw_t) = (false, false);
@@ -2886,6 +2924,66 @@ pub(crate) fn ghost_rows<'r>(
         .iter()
         .filter(|s| s.pid.is_none() && s.bus == "live" && local.contains(s.node.as_str()))
         .collect()
+}
+
+/// EVERY SESSION ANY LOCAL INSTANCE HOSTS, by pid — the node's hosted set, read
+/// the way the report reads it (each instance's own `sessions`). `Err` when an
+/// instance could not be asked: a retire gated on this set must then refuse,
+/// because the session it would retire may be that instance's.
+pub(crate) fn node_hosted() -> Result<BTreeMap<String, u32>, String> {
+    let listed = aterm_ctl::local_instances().map_err(|e| e.reason)?;
+    let mut hosted = BTreeMap::new();
+    for (pid, sock) in listed {
+        let token = match aterm_ctl::instance_token(&sock) {
+            Ok(t) => t,
+            Err(_) if !aterm_uds::process::pid_alive(pid) => continue,
+            Err(e) => return Err(format!("instance {pid}: no Owner token: {e}")),
+        };
+        let mut ctl = match Ctl::connect(&sock, &token) {
+            Ok(c) => c,
+            Err(e)
+                if e.kind() == io::ErrorKind::ConnectionRefused
+                    && !aterm_uds::process::pid_alive(pid) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(format!("instance {pid}: connect: {e}")),
+        };
+        let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+        let _ = ctl.get_ref().set_write_timeout(Some(IO_TIMEOUT));
+        let reply = ask(&mut ctl, "sessions").map_err(|e| format!("instance {pid}: {e}"))?;
+        for row in reply.rows() {
+            if let Some(sid) = row
+                .split(' ')
+                .nth(1)
+                .filter(|s| crate::subject::is_principal(s))
+            {
+                hosted.insert(sid.to_string(), pid);
+            }
+        }
+    }
+    Ok(hosted)
+}
+
+/// Why a presence row may not be retired on an operator's request: the door
+/// the request came through is one instance's, the ghost list is the node's.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RetireRefusal {
+    /// A local instance hosts the session.
+    Hosted(u32),
+    /// The node's hosted set could not be read, so nobody can say it is a ghost.
+    Unaskable(String),
+}
+
+/// The refusal for `sid` against the node's hosted set, or `None`.
+pub(crate) fn retire_refusal(
+    sid: &str,
+    hosted: &Result<BTreeMap<String, u32>, String>,
+) -> Option<RetireRefusal> {
+    match hosted {
+        Err(e) => Some(RetireRefusal::Unaskable(e.clone())),
+        Ok(h) => h.get(sid).map(|pid| RetireRefusal::Hosted(*pid)),
+    }
 }
 
 /// The nodes this machine speaks for: every local instance's, plus this state
@@ -3020,10 +3118,10 @@ pub fn render_text(r: &Report) -> String {
         "presence",
         match r.presence {
             crate::presence::Mode::Meta => {
-                "meta (role, detail, phase, context and title on every session row)".to_string()
+                "meta (role, detail, phase and title on every session row)".to_string()
             }
             crate::presence::Mode::Minimal => {
-                "minimal (state, hold and attention only; no screen is read)".to_string()
+                "minimal (state, hold and attention only)".to_string()
             }
         },
     ));
@@ -3935,6 +4033,30 @@ mod tests {
     /// on `pid.is_none()` alone would sweep up every session that ended in the
     /// last hour); a row on a REMOTE node is not one (we cannot speak for it);
     /// and a row a local instance hosts is not one.
+    /// The door is per-instance and the ghost list per-node: a sid a SIBLING
+    /// instance hosts is refused with that instance's pid, and a node that
+    /// could not be asked refuses everything.
+    #[test]
+    fn a_retire_is_refused_for_a_sibling_hosted_sid_or_an_unaskable_node() {
+        let hosted: Result<BTreeMap<String, u32>, String> =
+            Ok([("s-aaaaaaaaaaaaaaaaaaaa".to_string(), 4242)]
+                .into_iter()
+                .collect());
+        assert_eq!(
+            retire_refusal("s-aaaaaaaaaaaaaaaaaaaa", &hosted),
+            Some(RetireRefusal::Hosted(4242))
+        );
+        assert_eq!(retire_refusal("s-bbbbbbbbbbbbbbbbbbbb", &hosted), None);
+        let unaskable: Result<BTreeMap<String, u32>, String> =
+            Err("instance 77: connect: Operation timed out".to_string());
+        assert_eq!(
+            retire_refusal("s-bbbbbbbbbbbbbbbbbbbb", &unaskable),
+            Some(RetireRefusal::Unaskable(
+                "instance 77: connect: Operation timed out".to_string()
+            ))
+        );
+    }
+
     #[test]
     fn ghost_rows_are_live_unhosted_and_ours() {
         let row = |sid: &str, pid: Option<u32>, node: &str, bus: &str| SessionRow {

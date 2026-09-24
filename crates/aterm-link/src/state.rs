@@ -21,6 +21,7 @@
 //! | `keys/<sid>` | `post key=` → the producer sequence it reserved, newest [`KEYS_KEEP`] per session | a re-post under a lost key is a second record; the bound is stated and the newest keys are the ones a retry names |
 //! | `acks/<sid>.<rid>` | the producer sequence reserved for one OWED receipt (R8), written BEFORE the publish, removed at retirement | a fresh sequence is a second `ack` on the sender's lane after a crash between the publish and the retirement |
 //! | `deadlines` | every `ask`/`task` this node published with `dl=` and has not seen answered, newest [`DEADLINES_KEEP`] | a lost table records no `expired` for those asks — the bus is checked before any verdict is published, so it can never record a false one |
+//! | `topics/<sid>` | one `<topic> <next>` line per broadcast opt-in: the offset the topic resumes from (see [`StateDir::topics`]) | the topic is re-resolved from the session's `since=` at the next attach — `head` skips whatever was published while the bridge was down, which is why this one is written on every step |
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -147,9 +148,8 @@ pub const DEADLINES_KEEP: usize = 4096;
 /// How many TOFU pins the table keeps, oldest-first-out.
 ///
 /// THE ONE DURABLE STRUCTURE HERE THAT HAD NO BOUND. Every sibling states one —
-/// `acked` at `SELF_ACK_KEEP`, notify's journal at `JOURNAL_KEEP`, the mirror's
-/// window at `DEDUP_KEEP`, `RETIRED_KEEP`, `RING_CAP` — and `mirror.rs`'s header
-/// puts the discipline in four words: "Nothing durable and unbounded". `pins`
+/// `acked` at `SELF_ACK_KEEP`, notify's journal at `JOURNAL_KEEP`, `RETIRED_KEEP`,
+/// `RING_CAP` — the discipline in four words: nothing durable and unbounded. `pins`
 /// grew one line per REMOTE sid ever addressed by a bare `@s-<sid>`, sids are
 /// per-session and never reused, and the node id that owns the file is minted
 /// once and kept forever; meanwhile `Bridge::pinned_node_for` re-reads and
@@ -169,45 +169,35 @@ pub const DEADLINES_KEEP: usize = 4096;
 /// exists to survive.
 pub const PINS_KEEP: usize = 4096;
 
-/// ONE SESSION'S POSITION ON ONE BROADCAST TOPIC.
-///
-/// `next` is the offset the topic resumes from — the delivery guarantee across
-/// a bridge restart. `serial` is the endpoint's serial for the `topic add` that
-/// created the entry, so `drop` then `add` under one name is a different entry
-/// even inside one roster round.
+/// ONE SESSION'S POSITION ON ONE BROADCAST TOPIC: the offset it resumes from —
+/// the delivery guarantee across a bridge restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TopicCursor {
     /// The next offset this topic may deliver from.
     pub next: u64,
-    /// The endpoint's `topic add` serial for this entry; 0 from an endpoint
-    /// too old to print one, which is stable and so keeps the old behaviour.
-    pub serial: u64,
 }
 
 impl TopicCursor {
-    /// `<topic> <next> [<serial>]` — the state file's line. `None` for anything
-    /// else, which the caller REPORTS rather than swallows.
+    /// `<topic> <next>` — the state file's line. `None` for anything else,
+    /// which the caller REPORTS rather than swallows. A 0.90.x bridge wrote a
+    /// third field (that release's add serial); it is read past.
     #[must_use]
     pub fn parse(line: &str) -> Option<(String, TopicCursor)> {
         let mut words = line.split_whitespace();
         let topic = words.next()?;
-        // Digits only, both numbers: `u64::from_str` would accept `+5`.
+        // Digits only: `u64::from_str` would accept `+5`.
         let number = |w: &str| {
             (!w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
                 .then(|| w.parse::<u64>().ok())?
         };
         let next = number(words.next()?)?;
-        // A two-field line is what a bridge before the serial wrote; it reads
-        // as generation 0, the same value an endpoint that prints no `gen=`
-        // reports, so the two agree instead of re-resolving every round.
-        let serial = match words.next() {
-            Some(g) => number(g)?,
-            None => 0,
-        };
+        if let Some(extra) = words.next() {
+            number(extra)?;
+        }
         if words.next().is_some() {
             return None;
         }
-        Some((topic.to_string(), TopicCursor { next, serial }))
+        Some((topic.to_string(), TopicCursor { next }))
     }
 }
 
@@ -515,7 +505,7 @@ impl StateDir {
     pub fn set_topics(&self, sid: &str, cursors: &BTreeMap<String, TopicCursor>) -> io::Result<()> {
         let body: Vec<String> = cursors
             .iter()
-            .map(|(t, c)| format!("{t} {} {}", c.next, c.serial))
+            .map(|(t, c)| format!("{t} {}", c.next))
             .collect();
         self.write(&format!("topics/{sid}"), &body.join("\n"))
     }
@@ -748,20 +738,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A cursor line is `<topic> <next> [<serial>]`; two fields read as
-    /// generation 0 (a bridge before the serial wrote them), anything else is
-    /// `None` — and a `None` in the file is DROPPED AND REPORTED, never
-    /// repaired, while the lines beside it survive.
+    /// A cursor line is `<topic> <next>` (a 0.90.x third field is read past);
+    /// anything else is `None` — and a `None` in the file is DROPPED AND
+    /// REPORTED, never repaired, while the lines beside it survive.
     #[test]
     fn a_topic_cursor_line_parses_or_is_dropped_beside_its_neighbours() {
-        let c = |next, serial| TopicCursor { next, serial };
+        let c = |next| TopicCursor { next };
         assert_eq!(
-            TopicCursor::parse("build.failed 42 7"),
-            Some(("build.failed".to_string(), c(42, 7)))
+            TopicCursor::parse("build.failed 42"),
+            Some(("build.failed".to_string(), c(42)))
         );
         assert_eq!(
-            TopicCursor::parse("old.topic 3"),
-            Some(("old.topic".to_string(), c(3, 0)))
+            TopicCursor::parse("old.topic 3 7"),
+            Some(("old.topic".to_string(), c(3)))
         );
         for bad in ["", "onlytopic", "t x", "t 1 y", "t 1 2 3", "t +5"] {
             assert_eq!(TopicCursor::parse(bad), None, "{bad:?}");
@@ -769,13 +758,13 @@ mod tests {
         let dir = scratch("topics");
         let st = StateDir::open(&dir).expect("open");
         let mut good = BTreeMap::new();
-        good.insert("a".to_string(), c(10, 1));
-        good.insert("b".to_string(), c(20, 2));
+        good.insert("a".to_string(), c(10));
+        good.insert("b".to_string(), c(20));
         st.set_topics("s-x", &good).expect("write");
         assert_eq!(st.topics("s-x"), good);
         std::fs::write(
             st.path("topics/s-x"),
-            "a 10 1\nthis is not a cursor \x1b[2J\nb 20 2\n",
+            "a 10\nthis is not a cursor \x1b[2J\nb 20\n",
         )
         .expect("corrupt one line");
         assert_eq!(st.topics("s-x"), good, "the neighbours survive");

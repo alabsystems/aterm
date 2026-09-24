@@ -13,9 +13,11 @@
 //! under a live pid, a dead-pid tail under another vendor's prefix, our prefix with a stem
 //! that is no lane of ours — must survive the same `launchctl remove` pass.
 //!
-//! Its own test binary: the fixture is a launchd job with a dead owner pid, and every sweep
-//! here stops exactly those, so a parallel unit suite would stop it first. Hence also one
-//! test function rather than four. macOS only — there is no launchd elsewhere.
+//! Its own test binary: the fixture becomes a launchd job with a dead owner pid, and every
+//! sweep here stops exactly those, so a parallel unit suite would stop it first. Hence also
+//! one test function rather than four. (No binary of its own keeps OTHER processes' sweeps
+//! away — so the owner dies only once the helper is writing; see `Owner`.) macOS only —
+//! there is no launchd elsewhere.
 //! macOS only: there is no launchd, and so no lane job to outlive anyone, anywhere else.
 
 #![cfg(target_os = "macos")]
@@ -25,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use atpkg::install::verify_and_stage;
+use atpkg::install::{StageHooks, verify_and_stage};
 use atpkg::manifest::{Artifact, Cost};
 
 /// A scratch root of this test's own.
@@ -87,16 +89,39 @@ fn artifact(archive: &Path) -> Artifact {
     }
 }
 
-/// A pid nothing runs under (macOS pids stay below 99999), found without spawning: a
-/// fork here would hand the child a copy of every fd this binary holds open.
-fn a_dead_pid() -> u32 {
-    (90_000..99_999u32)
-        .rev()
-        .find(|pid| {
-            let rc = unsafe { libc::kill(*pid as libc::pid_t, 0) };
-            rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        })
-        .expect("some pid below 99999 is unused")
+/// The pid the orphan's label and scratch carry: a child of ours, ALIVE while the fixture
+/// is armed and DEAD, reaped, once the helper is proven writing. Every atpkg on this
+/// machine stops a dead-owner job it finds — a parallel suite's sweep, this machine's own
+/// passes — so an orphan registered under a pid that was already dead could be stopped
+/// before it wrote anything (measured: "never started writing", 2026-09-23). While the
+/// owner lives the job is nobody's to stop; its death is the moment it becomes the orphan
+/// under test.
+struct Owner(std::process::Child);
+
+impl Owner {
+    fn spawn() -> Self {
+        Self(
+            Command::new("/bin/sleep")
+                .arg("600")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("/bin/sleep runs"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+/// Killed and reaped: from here `kill(pid, 0)` answers ESRCH, as for a killed pass.
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Whether launchd still lists `label` — `launchctl list <label>` fails for a label it
@@ -129,8 +154,10 @@ fn a_launchd_helper_outliving_a_killed_stager_is_stopped_before_its_scratch_is_s
 
     // The orphan: the scratch of a stager that is gone, with a launchd job still writing
     // into it. The label carries the lane's own shape (`<stem>-<pid>-<seq>-<nonce>` under
-    // `systems.alab.atpkg.`), which with a dead owner is what a killed stager leaves.
-    let dead = a_dead_pid();
+    // `systems.alab.atpkg.`), which with an owner that dies before the install is what a
+    // killed stager leaves.
+    let owner = Owner::spawn();
+    let dead = owner.pid();
     let me = std::process::id();
     let scratch = build.with_file_name(format!("18.incoming-{dead}"));
     let label = format!("systems.alab.atpkg.stage-helper-{dead}-0-{me:x}");
@@ -161,9 +188,11 @@ fn a_launchd_helper_outliving_a_killed_stager_is_stopped_before_its_scratch_is_s
         std::thread::sleep(Duration::from_millis(50));
     }
     let was_writing = scratch.join("bin.part").exists();
+    // Its owner dies only now, with the helper proven writing: the orphan from here on.
+    drop(owner);
 
     // The successor: a real install of build 18, whose first act is the scratch sweep.
-    let staged = verify_and_stage(&art, &archive, &build);
+    let staged = verify_and_stage(&art, &archive, &build, &StageHooks::NONE);
 
     let job_left_running = listed(&label);
     let bystanders_left: Vec<&String> = bystanders.iter().copied().filter(|l| !listed(l)).collect();

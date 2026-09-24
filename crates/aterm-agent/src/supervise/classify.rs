@@ -4,16 +4,31 @@
 //! Is this shell command line READ-ONLY? The one judgment a supervisor makes
 //! hundreds of times a session, so it lives here as a pure function with the
 //! corpus that shaped it pinned as tests. Every rule below was needed against a
-//! real Claude Code worker: the danger scan is a NEGATIVE filter over every
-//! token, the segment-head check a POSITIVE filter (an unknown program is not
-//! read-only), and quoted strings are dropped BEFORE either runs so a `>` inside
-//! a `git --format` string is not a redirect — except that the PROGRAMS a line
+//! real Claude Code worker. A pre-pass ([`prelex`]) first reads the line the
+//! way the shell does where the segment readers would not: a `#` comment ends
+//! at its newline, a here-document body is data up to its terminator, `$'…'`
+//! and `${…}` are followed or refused, and an unterminated quote is refused.
+//! Then the segment-head check is a POSITIVE filter (an unknown program is not
+//! read-only, and a program named by a path outside `/bin` and `/usr/bin` is
+//! unknown), and quoted strings are dropped BEFORE it runs so a `>` inside a
+//! `git --format` string is not a redirect — except that the PROGRAMS a line
 //! hands to awk and sed are read back from the raw words, since `system(…)`
-//! and `s///w file` live inside those quotes. A wrapper (`xargs`, `env`,
-//! `timeout`) is seen through to the command it runs, and `&` ends a segment
-//! like `;`, so a backgrounded command is a head too. False negatives (a read
-//! handed to the manager) cost a human a glance; a false positive would
-//! auto-approve a write, so every tie breaks toward "not read-only".
+//! and `s///w file` live inside those quotes. A program word is judged only
+//! where it runs, at a segment head: `grep -rn open src` is a read, `open
+//! src` is not. A wrapper (`xargs`, `env`, `timeout`) is seen through to the
+//! command it runs, and `&` ends a segment like `;`, so a backgrounded command
+//! is a head too. The flags by which a read tool runs a program or writes a
+//! file (`git -c`, `git --output`, `rg --pre`, `sort --compress-program`,
+//! `printf -v`, `less +…`, `date -s`) and the assignments that change what a
+//! later program is (`PATH=`, `GIT_*=`, `HOME=`) are refused wherever they sit.
+//!
+//! This judges ONE reading of a line. A screen-read command whose rows were
+//! joined with spaces is a different line from the one the shell runs (a
+//! newline ends a segment, a space does not), so a caller reading a box
+//! classifies BOTH readings and approves only when both are read-only
+//! (`supervise::policy::approval`). False negatives (a read handed to the
+//! manager) cost a human a glance; a false positive would auto-approve a write,
+//! so every tie breaks toward "not read-only".
 
 /// The verdict on one command line: `read_only`, and `reason` naming the rule
 /// that decided it (the token or segment head), so a supervisor's notes say WHY
@@ -38,16 +53,20 @@ impl Verdict {
 }
 
 /// The python scripts a worker may run as reads when no `--allow-python` glob
-/// is given: the standing / report / score generators of the owner's campaign.
-pub const DEFAULT_PYTHON_ALLOW: &[&str] = &[
-    "scripts/*standing*.py",
-    "scripts/*report*.py",
-    "scripts/*score*.py",
-];
+/// is given: none. A script is a program of the worker's choosing, and a name
+/// is no evidence of what it does (`scripts/purge_report.py --delete-all`
+/// matched the owner's campaign globs that used to sit here). A project that
+/// wants its generators approved names them with `--allow-python`, e.g.
+/// `scripts/*standing*.py`.
+pub const DEFAULT_PYTHON_ALLOW: &[&str] = &[];
 
 /// Programs a segment may START with and still be a read. Shell keywords are
 /// here because a `for`/`if` segment's head is the keyword; the real command
-/// after a `do`/`then` is checked too (see [`segment_head`]).
+/// after a `do`/`then` is checked too (see [`segment_head`]). `let` and
+/// `local` are not: both evaluate arithmetic (`local -i`), and the shell's
+/// arithmetic expands an array subscript, so `let 'x=a[$(touch M)]'` runs
+/// the `touch` from inside a quote this reader treats as opaque (measured
+/// under zsh and bash 3.2, lane B's review of 2026-09-23).
 const READ_ONLY: &[&str] = &[
     "git",
     "ls",
@@ -114,11 +133,18 @@ const READ_ONLY: &[&str] = &[
     "paste",
     "seq",
     "expr",
-    "let",
-    "local",
     "export",
     "cd",
     "tmutil",
+    "pgrep",
+    "sleep",
+    "strings",
+    "lsof",
+    "fold",
+    "uname",
+    "whoami",
+    "id",
+    "sw_vers",
 ];
 
 /// Keyword heads that merely PREFIX the command a segment really runs: `do rm x`
@@ -127,38 +153,43 @@ const KEYWORD_PREFIX: &[&str] = &[
     "do", "then", "else", "if", "elif", "while", "until", "!", "{",
 ];
 
-/// A danger token ANYWHERE — not only at a segment head — fails the line.
-const DANGER: &[&str] = &[
-    "rm",
-    "mv",
-    "cp",
-    "tee",
-    "chmod",
-    "chown",
-    "truncate",
-    "dd",
-    "sudo",
-    "kill",
-    "pkill",
-    "killall",
-    "cargo",
-    "targo",
-    "make",
-    "npm",
-    "pip",
-    "pip3",
-    "brew",
-    "curl",
-    "wget",
-    "ssh",
-    "scp",
-    "rsync",
-    "nohup",
-    "open",
-    "osascript",
-    "eval",
-    "source",
+/// The directories a program may be named from by path and still be the program
+/// its basename says: `/bin/ls` is `ls`, `/tmp/evil/ls` is not.
+const SYSTEM_BIN_DIRS: &[&str] = &["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"];
+
+/// Variables whose assignment changes what a LATER program runs or reads:
+/// the search path, the shell's own start-up and splitting, the pagers and
+/// editors a read tool may exec, the config roots git and rg read. `PATH` is
+/// allowed when every entry is a [`SYSTEM_BIN_DIRS`] directory.
+const HAZARD_VARS: &[&str] = &[
+    "PATH",
+    "IFS",
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "PS4",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PAGER",
+    "MANPAGER",
+    "LESS",
+    "LESSOPEN",
+    "LESSCLOSE",
+    "EDITOR",
+    "VISUAL",
+    "SHELL",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "ZDOTDIR",
+    "RIPGREP_CONFIG_PATH",
+    "PERL5OPT",
+    "NODE_OPTIONS",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
 ];
+
+/// Prefixes of [`HAZARD_VARS`]: the dynamic loader's and git's whole families.
+const HAZARD_VAR_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_", "BASH_FUNC_"];
 
 /// `git <sub>` reads. `worktree` and `stash` are read-only ONLY as `list`.
 const GIT_READ: &[&str] = &[
@@ -220,8 +251,14 @@ pub fn classify_command(cmd: &str) -> Verdict {
 /// Classify `cmd`; `python_allow` are the script-path globs `python3 <path>` may
 /// run as a read (`*` matches any run of characters, `?` one).
 pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
+    // (0) Comments, here-document bodies, `$'…'` and `${…}`, read as the shell
+    // reads them — or refused.
+    let cmd = match prelex(cmd) {
+        Ok(cmd) => cmd,
+        Err(reason) => return Verdict::no(reason),
+    };
     // (a) The worker's timeout idiom is a wrapper, not a perl program.
-    let cmd = strip_alarm_idiom(cmd);
+    let cmd = strip_alarm_idiom(&cmd);
     // (b) Quoted strings are opaque to the danger scan.
     let stripped = strip_quotes(&cmd);
     // (c)+(d) Segments of whitespace-split tokens.
@@ -246,6 +283,510 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
         read_only: true,
         reason: "every segment read-only".to_string(),
     }
+}
+
+/// The REST of an rm line, judged as a read: [`classify_command_with`] over
+/// every segment but the `rm` commands themselves (an `rm` head in any
+/// letter case, after its assignments), the assignment-only segments and
+/// the `mktemp` commands whose directory the rm resolver follows
+/// (`supervise::policy::rm_breaker`). What the rm circuit-breaker rule
+/// requires besides the resolver's verdict: the rule is only safe because a
+/// bypass session would run the rest unasked anyway, and the bypass it
+/// knows of was read off a footer the box has since replaced.
+pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
+    let lexed = match prelex(cmd) {
+        Ok(cmd) => cmd,
+        Err(reason) => return Verdict::no(reason),
+    };
+    let lexed = strip_alarm_idiom(&lexed);
+    let segments: Vec<Vec<String>> = split_segments(&strip_quotes(&lexed))
+        .into_iter()
+        .filter(|seg| {
+            let head = seg.iter().find(|t| !is_assignment(t));
+            match head {
+                None => false,
+                Some(h) => {
+                    let p = program(h).to_ascii_lowercase();
+                    p != "rm" && p != "mktemp"
+                }
+            }
+        })
+        .collect();
+    if let Some(reason) = danger_scan(&segments) {
+        return Verdict::no(reason);
+    }
+    if let Some(reason) = program_scan(&lexed) {
+        return Verdict::no(reason);
+    }
+    for seg in &segments {
+        if let Some(reason) = segment_head(seg, python_allow) {
+            return Verdict::no(reason);
+        }
+    }
+    Verdict {
+        read_only: true,
+        reason: "every segment but the rm and mktemp commands read-only".to_string(),
+    }
+}
+
+/// The shell's reading of the parts of a line the segment readers below get
+/// wrong, applied first: `Ok` is the line with every `#` comment and every
+/// here-document body removed (their newlines kept), `$"…"` read as `"…"` and
+/// a backslash-free `$'…'` as `'…'`; `Err` names the construct this reader
+/// will not follow, and the line is not read-only.
+///
+/// Why each: a comment's apostrophe opened a quote for [`strip_quotes`] that
+/// the shell never opened, hiding every later line (`git log # what's new⏎git
+/// push --force` read as one read); a here-document body is data, not code,
+/// but a quote inside it did the same (`cat <<EOF⏎echo '⏎EOF⏎rm -rf /`); and
+/// `$'a\'b'` ends where a plain `'…'` would not. A body under an UNQUOTED
+/// terminator still expands `$(…)` and backticks, so such a body is refused;
+/// so is a `${…}` holding a quote or a substitution, and any quote,
+/// substitution or here-document left open at the end.
+pub(crate) fn prelex(src: &str) -> Result<String, String> {
+    let mut lx = Prelex {
+        chars: src.chars().collect(),
+        i: 0,
+        out: String::with_capacity(src.len()),
+        heredocs: Vec::new(),
+    };
+    lx.run(None)?;
+    if !lx.heredocs.is_empty() {
+        // `cat <<EOF` with no newline after it: the shell reads the body from
+        // the lines that follow, and there are none on this line.
+        return Err("a here-document with no body".to_string());
+    }
+    Ok(lx.out)
+}
+
+/// A here-document whose body starts at the next newline.
+struct Heredoc {
+    delim: String,
+    /// `<<-`: leading tabs are stripped from each body line and the terminator.
+    strip_tabs: bool,
+    /// Any quoting in the delimiter word: the body is not expanded.
+    quoted: bool,
+}
+
+struct Prelex {
+    chars: Vec<char>,
+    i: usize,
+    out: String,
+    heredocs: Vec<Heredoc>,
+}
+
+impl Prelex {
+    fn peek(&self, k: usize) -> Option<char> {
+        self.chars.get(self.i + k).copied()
+    }
+
+    /// Whether position `i` starts a word: the shell's rule for where `#`
+    /// opens a comment.
+    fn at_word_start(&self) -> bool {
+        self.i == 0
+            || self.chars[self.i - 1].is_whitespace()
+            || matches!(self.chars[self.i - 1], ';' | '&' | '|' | '(' | ')')
+    }
+
+    /// One level: the top (`stop` none), a `$(…)` (`)`), or a backtick
+    /// substitution. Returns having consumed the closing character.
+    fn run(&mut self, stop: Option<char>) -> Result<(), String> {
+        let mut depth = 0usize;
+        while let Some(c) = self.peek(0) {
+            match c {
+                '\\' => {
+                    self.out.push(c);
+                    self.i += 1;
+                    if let Some(n) = self.peek(0) {
+                        self.out.push(n);
+                        self.i += 1;
+                    }
+                }
+                '\'' => self.single_quoted()?,
+                '"' => self.double_quoted()?,
+                '$' if self.peek(1) == Some('\'') => {
+                    // ANSI-C quoting: a backslash escape inside it is where a
+                    // plain `'…'` reader and the shell part ways.
+                    self.i += 2;
+                    let start = self.i;
+                    while let Some(d) = self.peek(0) {
+                        if d == '\\' {
+                            return Err("$'…' with a backslash escape".to_string());
+                        }
+                        if d == '\'' {
+                            break;
+                        }
+                        self.i += 1;
+                    }
+                    if self.peek(0) != Some('\'') {
+                        return Err("an unterminated $' quote".to_string());
+                    }
+                    let body: String = self.chars[start..self.i].iter().collect();
+                    self.i += 1;
+                    self.out.push('\'');
+                    self.out.push_str(&body);
+                    self.out.push('\'');
+                }
+                '$' if self.peek(1) == Some('"') => {
+                    // `$"…"` is `"…"` translated: the same expansion rules.
+                    self.i += 1;
+                    self.double_quoted()?;
+                }
+                '$' if self.peek(1) == Some('{') => self.braced_parameter()?,
+                '$' if self.peek(1) == Some('(') => {
+                    self.out.push_str("$(");
+                    self.i += 2;
+                    self.run(Some(')'))?;
+                    self.out.push(')');
+                }
+                '$' => self.bare_parameter()?,
+                '`' if stop == Some('`') => {
+                    self.i += 1;
+                    return Ok(());
+                }
+                '`' => {
+                    self.out.push('`');
+                    self.i += 1;
+                    self.run(Some('`'))?;
+                    self.out.push('`');
+                }
+                '(' => {
+                    depth += 1;
+                    self.out.push(c);
+                    self.i += 1;
+                }
+                ')' => {
+                    self.i += 1;
+                    if depth == 0 && stop == Some(')') {
+                        return Ok(());
+                    }
+                    depth = depth.saturating_sub(1);
+                    self.out.push(c);
+                }
+                '#' if self.at_word_start() => {
+                    // A comment runs to the newline, which is kept.
+                    while self.peek(0).is_some_and(|d| d != '\n') {
+                        self.i += 1;
+                    }
+                }
+                '<' if self.peek(1) == Some('<') && self.peek(2) == Some('<') => {
+                    // A here-string: a word, not a body.
+                    self.out.push_str("<<<");
+                    self.i += 3;
+                }
+                '<' if self.peek(1) == Some('<') => self.heredoc_operator()?,
+                '\n' => {
+                    self.out.push('\n');
+                    self.i += 1;
+                    self.heredoc_bodies()?;
+                }
+                _ => {
+                    self.out.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+        match stop {
+            Some(')') => Err("an unterminated $(".to_string()),
+            Some(_) => Err("an unterminated backtick".to_string()),
+            None => Ok(()),
+        }
+    }
+
+    fn single_quoted(&mut self) -> Result<(), String> {
+        let start = self.i;
+        self.i += 1;
+        while self.peek(0).is_some_and(|d| d != '\'') {
+            self.i += 1;
+        }
+        if self.peek(0).is_none() {
+            return Err("an unterminated ' quote".to_string());
+        }
+        self.i += 1;
+        self.out.extend(&self.chars[start..self.i]);
+        Ok(())
+    }
+
+    fn double_quoted(&mut self) -> Result<(), String> {
+        self.out.push('"');
+        self.i += 1;
+        loop {
+            let Some(d) = self.peek(0) else {
+                return Err("an unterminated \" quote".to_string());
+            };
+            match d {
+                '\\' => {
+                    self.out.push(d);
+                    self.i += 1;
+                    if let Some(n) = self.peek(0) {
+                        self.out.push(n);
+                        self.i += 1;
+                    }
+                }
+                '"' => {
+                    self.out.push(d);
+                    self.i += 1;
+                    return Ok(());
+                }
+                '$' if self.peek(1) == Some('(') => {
+                    self.out.push_str("$(");
+                    self.i += 2;
+                    self.run(Some(')'))?;
+                    self.out.push(')');
+                }
+                '$' if self.peek(1) == Some('{') => self.braced_parameter()?,
+                '$' => self.bare_parameter()?,
+                '`' => {
+                    self.out.push('`');
+                    self.i += 1;
+                    self.run(Some('`'))?;
+                    self.out.push('`');
+                }
+                _ => {
+                    self.out.push(d);
+                    self.i += 1;
+                }
+            }
+        }
+    }
+
+    /// A `$` that opens neither `${`, `$(`, `$'` nor `$"`: copied, unless it
+    /// opens an ARITHMETIC evaluation — `$[x]` (bash's old `$((x))`) or
+    /// zsh's unbraced subscript `$name[x]` — whose subscript expansion runs a
+    /// substitution held in the variable's value (`x='a[$(touch M)]'; echo
+    /// $[x]`, measured).
+    fn bare_parameter(&mut self) -> Result<(), String> {
+        if self.peek(1) == Some('[') {
+            return Err("a $[…] arithmetic expansion".to_string());
+        }
+        let mut k = 1;
+        while self
+            .peek(k)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            k += 1;
+        }
+        if k > 1 && self.peek(k) == Some('[') {
+            return Err("a $name[…] subscript (zsh evaluates it as arithmetic)".to_string());
+        }
+        self.out.push('$');
+        self.i += 1;
+        Ok(())
+    }
+
+    /// `${…}`: copied when it holds no quote, substitution or nested `${`,
+    /// which is every form a read uses (`${VAR}`, `${VAR:-x}`, `${#VAR}`),
+    /// and when every ARITHMETIC part of it is a literal ([`braced_is_literal`]):
+    /// an array subscript and a substring offset or length are evaluated as
+    /// arithmetic, which expands a subscript in a variable's value and runs
+    /// the substitution it holds (`x='a[$(touch M)]'; echo ${a[x]}`, `${y:x}`,
+    /// `${a[@]:x}`, measured under bash; `${#a[x]}` under both shells).
+    fn braced_parameter(&mut self) -> Result<(), String> {
+        let start = self.i;
+        self.i += 2;
+        while let Some(d) = self.peek(0) {
+            match d {
+                '}' => {
+                    let body: String = self.chars[start + 2..self.i].iter().collect();
+                    braced_is_literal(&body)?;
+                    self.i += 1;
+                    self.out.extend(&self.chars[start..self.i]);
+                    return Ok(());
+                }
+                '\'' | '"' | '`' | '\\' | '{' => {
+                    return Err(
+                        "a ${…} expansion holding a quote or a nested expansion".to_string()
+                    );
+                }
+                '$' if matches!(self.peek(1), Some('(' | '{')) => {
+                    return Err("a ${…} expansion holding a substitution".to_string());
+                }
+                _ => self.i += 1,
+            }
+        }
+        Err("an unterminated ${".to_string())
+    }
+
+    /// `<<[-]WORD`: the operator and its word stay in the line (the command
+    /// reads its stdin from it); the body is queued for the next newline.
+    fn heredoc_operator(&mut self) -> Result<(), String> {
+        self.out.push_str("<<");
+        self.i += 2;
+        let strip_tabs = self.peek(0) == Some('-');
+        if strip_tabs {
+            self.out.push('-');
+            self.i += 1;
+        }
+        while self.peek(0).is_some_and(|d| d == ' ' || d == '\t') {
+            self.out.push(self.chars[self.i]);
+            self.i += 1;
+        }
+        let mut delim = String::new();
+        let mut quoted = false;
+        while let Some(d) = self.peek(0) {
+            if d.is_whitespace() || matches!(d, ';' | '&' | '|' | '(' | ')' | '<' | '>') {
+                break;
+            }
+            self.out.push(d);
+            self.i += 1;
+            match d {
+                '\'' | '"' => {
+                    quoted = true;
+                    while let Some(e) = self.peek(0) {
+                        self.out.push(e);
+                        self.i += 1;
+                        if e == d {
+                            break;
+                        }
+                        delim.push(e);
+                    }
+                }
+                '\\' => {
+                    quoted = true;
+                    if let Some(e) = self.peek(0) {
+                        self.out.push(e);
+                        self.i += 1;
+                        delim.push(e);
+                    }
+                }
+                '$' | '`' => {
+                    return Err("a here-document delimiter with an expansion".to_string());
+                }
+                _ => delim.push(d),
+            }
+        }
+        if delim.is_empty() {
+            return Err("a here-document with no delimiter".to_string());
+        }
+        self.heredocs.push(Heredoc {
+            delim,
+            strip_tabs,
+            quoted,
+        });
+        Ok(())
+    }
+
+    /// At a newline: consume the queued bodies, each up to and including its
+    /// terminator line, and drop them from the output. A body that is never
+    /// terminated runs to the end of the line, as the shell reads it.
+    fn heredoc_bodies(&mut self) -> Result<(), String> {
+        for doc in std::mem::take(&mut self.heredocs) {
+            loop {
+                if self.i >= self.chars.len() {
+                    break;
+                }
+                let start = self.i;
+                while self.peek(0).is_some_and(|d| d != '\n') {
+                    self.i += 1;
+                }
+                let line: String = self.chars[start..self.i].iter().collect();
+                if self.peek(0) == Some('\n') {
+                    self.i += 1;
+                }
+                let bare = if doc.strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line.as_str()
+                };
+                if bare == doc.delim {
+                    break;
+                }
+                if !doc.quoted && (line.contains("$(") || line.contains('`')) {
+                    return Err(
+                        "a here-document body that runs a command (unquoted delimiter)".to_string(),
+                    );
+                }
+                if !doc.quoted {
+                    body_arithmetic_is_literal(&line)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The arithmetic parts of a `${…}` body (the text between `${` and `}`)
+/// are literals: its subscript is an integer, `@` or `*`, and a substring
+/// offset or length (`${y:1}`, `${y: -2:3}`) is an integer. The name is a
+/// plain name, a positional or a special parameter, optionally led by `#`
+/// or `!`; a form this reader does not know — zsh's `${(e)x}` flags among
+/// them, which evaluate the value as a command line — is refused. The
+/// default-value forms (`:-`, `:=`, `:+`, `:?`) and the pattern forms
+/// (`#`, `%`, `/`) evaluate no arithmetic.
+fn braced_is_literal(body: &str) -> Result<(), String> {
+    let refuse = |why: &str| Err(format!("a ${{{body}}} expansion with {why}"));
+    let int = |t: &str| {
+        let t = t.trim();
+        let t = t.strip_prefix('-').unwrap_or(t);
+        !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())
+    };
+    let mut rest = body;
+    if let Some(r) = rest.strip_prefix(['#', '!']) {
+        if r.is_empty() {
+            // `${#}` and `${!}`: the special parameters themselves.
+            return Ok(());
+        }
+        rest = r;
+    }
+    let name_len = if rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len())
+    } else if rest.starts_with(|c: char| c.is_ascii_digit()) {
+        rest.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len())
+    } else if rest.starts_with(['@', '*', '#', '?', '$', '!', '-']) {
+        1
+    } else {
+        return refuse("a form this reader does not follow");
+    };
+    rest = &rest[name_len..];
+    if let Some(r) = rest.strip_prefix('[') {
+        let Some(end) = r.find(']') else {
+            return refuse("an unterminated subscript");
+        };
+        let sub = &r[..end];
+        if !(sub == "@" || sub == "*" || int(sub)) {
+            return refuse("a subscript that is not a literal (evaluated as arithmetic)");
+        }
+        rest = &r[end + 1..];
+    }
+    if let Some(r) = rest.strip_prefix(':')
+        && !r.starts_with(['-', '=', '+', '?'])
+    {
+        // `${name:offset[:length]}`: both are arithmetic.
+        if !r.split(':').take(2).all(int) || r.split(':').count() > 2 {
+            return refuse("a substring offset that is not a literal (evaluated as arithmetic)");
+        }
+    }
+    Ok(())
+}
+
+/// The arithmetic an UNQUOTED here-document body expands is literal: its
+/// `${…}` forms pass [`braced_is_literal`], and it holds no `$[…]` and no
+/// `$name[…]` (the body of `cat <<EOF` is expanded as a double-quoted word).
+fn body_arithmetic_is_literal(line: &str) -> Result<(), String> {
+    let mut rest = line;
+    while let Some(at) = rest.find('$') {
+        let after = &rest[at + 1..];
+        if after.starts_with('[') {
+            return Err("a here-document body with a $[…] arithmetic expansion".to_string());
+        }
+        if let Some(b) = after.strip_prefix('{') {
+            let Some(end) = b.find('}') else {
+                return Err("an unterminated ${ in a here-document body".to_string());
+            };
+            braced_is_literal(&b[..end])?;
+        } else {
+            let n = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(after.len());
+            if n > 0 && after[n..].starts_with('[') {
+                return Err("a here-document body with a $name[…] subscript".to_string());
+            }
+        }
+        rest = after;
+    }
+    Ok(())
 }
 
 /// Remove every `perl -e 'alarm N; exec @ARGV'` (either quote) wrapper — that
@@ -412,7 +953,9 @@ fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char
 /// each segment is its whitespace-split tokens. A backslash-escaped character
 /// (find's `\;`) is literal, never a separator, and the `&` of a redirect
 /// (`2>&1`, `&>f`, `<&3`) stays in its token — only a job-control `&` splits,
-/// so the command run after `ls &` is a head of its own.
+/// so the command run after `ls &` is a head of its own. A `>` or `<` glued to
+/// the END of a word that is not a descriptor number starts a token of its
+/// own, as the shell reads it: `rm>/dev/null -rf /` is `rm` and a redirect.
 pub(crate) fn split_segments(s: &str) -> Vec<Vec<String>> {
     let mut segments = Vec::new();
     let mut cur = String::new();
@@ -436,6 +979,12 @@ pub(crate) fn split_segments(s: &str) -> Vec<Vec<String>> {
                 }
             }
             ';' | '|' | '(' | ')' | '`' | '\n' => flush(&mut cur, &mut segments),
+            '>' | '<' => {
+                if glued_to_a_word(&cur) {
+                    cur.push(' ');
+                }
+                cur.push(c);
+            }
             '&' if chars.get(i + 1) == Some(&'&') => {
                 flush(&mut cur, &mut segments);
                 i += 1;
@@ -461,6 +1010,16 @@ pub(crate) fn split_segments(s: &str) -> Vec<Vec<String>> {
     segments
 }
 
+/// Whether a redirect glyph arriving now would be glued to a WORD (`rm>x`),
+/// not to a descriptor (`2>x`), another glyph (`>>`, `<>`), or `&` (`&>x`).
+fn glued_to_a_word(cur: &str) -> bool {
+    let word = cur.rsplit(char::is_whitespace).next().unwrap_or("");
+    let Some(last) = word.chars().last() else {
+        return false;
+    };
+    !matches!(last, '>' | '<' | '&') && !word.chars().all(|c| c.is_ascii_digit())
+}
+
 /// The program name of a token: its basename, so `/bin/rm` and `rm` agree.
 pub(crate) fn program(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
@@ -480,8 +1039,14 @@ pub(crate) fn redirect_target(tok: &str) -> Option<Option<&str>> {
     Some((!rest.is_empty()).then_some(rest))
 }
 
+/// A redirect target that writes no file: `/dev/null`, a descriptor (`&1`), or
+/// a close (`&-`). `>&word` with any other word is bash for "stdout and stderr
+/// into the file `word`".
 pub(crate) fn redirect_is_safe(target: &str) -> bool {
-    target.starts_with('&') || target == "/dev/null"
+    target == "/dev/null"
+        || target.strip_prefix('&').is_some_and(|fd| {
+            fd == "-" || (!fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 /// Skip `git`'s global options to its subcommand: `-C <dir>`, `-c <k=v>`,
@@ -501,15 +1066,22 @@ fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
     None
 }
 
-/// The NEGATIVE filter: any danger token anywhere, a redirect to a file, a
-/// `find -delete` / `-exec <writer>`, `sed -i`, an inline-code interpreter, a
-/// python heredoc, or `xargs` feeding a writer.
+/// The NEGATIVE filter, over every token: a redirect to a file, a `find
+/// -delete` / `-exec <writer>`, `sed -i`, an inline-code interpreter, a python
+/// heredoc, `xargs` feeding a writer, a git write or a git flag that runs a
+/// program or writes a file, the flags by which `rg`, `sort`, `less` and
+/// `printf` do the same, a clock-setting `date`, and an assignment to a
+/// [`HAZARD_VARS`] variable. A program NAME is not judged here: that is the
+/// head check's, so `grep -rn open src` is a read and `open src` is not.
 pub(crate) fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
     for seg in segments {
         for (i, tok) in seg.iter().enumerate() {
             let prog = program(tok);
             let next = seg.get(i + 1).map(String::as_str);
             let next_prog = next.map(program);
+            if let Some(reason) = assignment_hazard(tok) {
+                return Some(reason);
+            }
             if prog == "xargs" {
                 // `xargs [-0] [-n N] [-I {}] <cmd>`: name the fed command.
                 let mut k = i + 1;
@@ -526,11 +1098,33 @@ pub(crate) fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                     return Some(format!("xargs {fed}"));
                 }
             }
-            if DANGER.contains(&prog) {
-                return Some(prog.to_string());
-            }
             if tok == "." && i == 0 {
                 return Some("source".to_string());
+            }
+            let test_head = tok == "["
+                || (tok == "test" && (i == 0 || KEYWORD_PREFIX.contains(&seg[i - 1].as_str())));
+            if tok == "[[" || test_head {
+                // `[[`'s arithmetic comparisons evaluate their operands as
+                // arithmetic, and so does `-v name[sub]` in `[[`, `[` and
+                // `test`: a subscript in a variable's value runs the
+                // substitution it holds (measured, bash and zsh). `[`/`test`
+                // with `-eq` compare integers without evaluating (measured).
+                let arith: &[&str] = if tok == "[[" {
+                    &["-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-v"]
+                } else {
+                    &["-v"]
+                };
+                if let Some(op) = seg[i + 1..]
+                    .iter()
+                    .take_while(|t| *t != "]]" && *t != "]")
+                    .find(|t| arith.contains(&t.as_str()))
+                {
+                    return Some(format!("{tok} {op} (evaluates arithmetic)"));
+                }
+            }
+            if tok.contains("<>") {
+                // Opens the file read-write, creating it.
+                return Some(format!("redirect <> {tok}"));
             }
             if tok == "-delete" {
                 return Some("find -delete".to_string());
@@ -573,6 +1167,9 @@ pub(crate) fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
             }
             if matches!(tok.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
                 match next_prog {
+                    Some(p) if next.is_some_and(|n| n.contains('/') && !is_system_bin(n)) => {
+                        return Some(format!("find {tok} {p} (by path)"));
+                    }
                     Some(p) if FIND_EXEC_READ.contains(&p) => {}
                     Some(p) => return Some(format!("find {tok} {p}")),
                     None => return Some(format!("find {tok}")),
@@ -609,10 +1206,56 @@ pub(crate) fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
             if matches!(prog, "bash" | "sh" | "zsh") && next == Some("-c") {
                 return Some(format!("{prog} -c"));
             }
+            if prog == "git" {
+                // Global options that set config or the helper path run a
+                // program of the line's choosing (`-c core.pager=…`,
+                // `-c core.fsmonitor=…`) whatever the subcommand.
+                let mut j = i + 1;
+                while let Some(t) = seg.get(j).map(String::as_str) {
+                    if t == "-c"
+                        || (t.starts_with("-c") && t.len() > 2)
+                        || t.starts_with("--config-env")
+                        || t.starts_with("--exec-path")
+                    {
+                        return Some(format!("git {t} (sets config for the run)"));
+                    }
+                    if t.starts_with("--git-dir") || t.starts_with("--work-tree") {
+                        // A repository of the line's choosing, bare or not,
+                        // whose config (`core.fsmonitor`, `diff.external`)
+                        // runs a program on a read. `-C` stays a read: `cd X
+                        // && git status` reaches the same repository.
+                        return Some(format!("git {t} (a repository of the line's choosing)"));
+                    }
+                    if matches!(t, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+                        j += 2;
+                    } else if t.starts_with('-') {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
             if prog == "git"
                 && let Some((sub_idx, sub)) = git_subcommand(seg, i)
             {
                 let arg = seg.get(sub_idx + 1).map(String::as_str);
+                // Flags of the read subcommands that write a file or run a
+                // program: `--output=<file>`, an external diff driver, `grep
+                // -O<pager>`. Read up to the segment's end (a later segment
+                // is its own command).
+                for t in &seg[sub_idx + 1..] {
+                    let t = t.as_str();
+                    if t == "--output"
+                        || t.starts_with("--output=")
+                        || t == "--ext-diff"
+                        || t == "--textconv"
+                        || t == "--filters"
+                        || t.starts_with("--open-files-in-pager")
+                        || (t.starts_with("-O") && !t.starts_with("--"))
+                    {
+                        return Some(format!("git {sub} {t}"));
+                    }
+                }
                 if GIT_DANGER.contains(&sub) {
                     return Some(format!("git {sub}"));
                 }
@@ -627,6 +1270,127 @@ pub(crate) fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `tok` names a program by a path in [`SYSTEM_BIN_DIRS`] and nowhere
+/// deeper (`/bin/ls`, not `/bin/x/ls` or `/bin/../tmp/ls`).
+fn is_system_bin(tok: &str) -> bool {
+    SYSTEM_BIN_DIRS.iter().any(|dir| {
+        tok.strip_prefix(dir)
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+    })
+}
+
+/// `Some(reason)` when `tok` assigns a [`HAZARD_VARS`] variable (or one of the
+/// [`HAZARD_VAR_PREFIXES`] families). `PATH` passes when every entry is a
+/// system directory (`env -i PATH=/bin ls`), and nothing else does: an entry
+/// read from a variable (`PATH=/x:$PATH`) or a quote is not a known directory.
+fn assignment_hazard(tok: &str) -> Option<String> {
+    if !is_assignment(tok) {
+        return None;
+    }
+    let (name, value) = tok.split_once('=')?;
+    if name == "PATH" {
+        let system = value.split(':').all(|entry| {
+            let entry = entry.trim_end_matches('/');
+            SYSTEM_BIN_DIRS
+                .iter()
+                .any(|dir| dir.trim_end_matches('/') == entry)
+        });
+        return (!system).then(|| format!("{name}= (changes which program a name runs)"));
+    }
+    (HAZARD_VARS.contains(&name) || HAZARD_VAR_PREFIXES.iter().any(|p| name.starts_with(p)))
+        .then(|| format!("{name}= (changes what a later program runs or reads)"))
+}
+
+/// The flags by which a read tool, at a segment head, runs a program or
+/// writes: `rg --pre <prog>`, `sort --compress-program=<prog>`, `printf -v
+/// NAME` (an assignment), `less`/`more` with a `+<command>`, a log file or a
+/// key file, `sysctl name=value`/`-w`, `hostname <name>`/`-F`, `file -C`,
+/// `tree -R`, and `date` setting the clock (`-s`, or a positional operand
+/// without BSD's `-j`).
+fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
+    let flag = |t: &str| format!("{head} {t}");
+    match head {
+        "rg" => args
+            .iter()
+            .find(|t| *t == "--pre" || t.starts_with("--pre="))
+            .map(|t| flag(t)),
+        "sort" => args
+            .iter()
+            .find(|t| t.starts_with("--compress-program"))
+            .map(|t| flag(t)),
+        "printf" => args
+            .iter()
+            .take_while(|t| t.starts_with('-'))
+            .find(|t| t.starts_with("-v"))
+            .map(|t| flag(t)),
+        "less" | "more" => args
+            .iter()
+            .find(|t| {
+                t.starts_with('+')
+                    || t.starts_with("--log-file")
+                    || t.starts_with("--LOG-FILE")
+                    || t.starts_with("--lesskey")
+                    || (t.starts_with('-')
+                        && !t.starts_with("--")
+                        && t[1..].chars().any(|c| matches!(c, 'o' | 'O' | 'k')))
+            })
+            .map(|t| flag(t)),
+        "sysctl" => args
+            .iter()
+            .find(|t| {
+                t.contains('=')
+                    || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('w'))
+            })
+            .map(|t| format!("sysctl {t} (sets a kernel value)")),
+        "hostname" => args
+            .iter()
+            .filter(|t| redirect_target(t).is_none())
+            .find(|t| !t.starts_with('-') || t.starts_with("-F"))
+            .map(|t| format!("hostname {t} (sets the host name)")),
+        "file" => args
+            .iter()
+            .find(|t| {
+                t.starts_with("--compile")
+                    || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('C'))
+            })
+            .map(|t| format!("file {t} (writes a compiled magic file)")),
+        "tree" => args
+            .iter()
+            .find(|t| t.starts_with('-') && !t.starts_with("--") && t[1..].contains('R'))
+            .map(|t| format!("tree {t} (writes 00Tree.html files)")),
+        "date" => {
+            let mut k = 0;
+            let mut positional = None;
+            let mut no_set = false;
+            while let Some(t) = args.get(k).map(String::as_str) {
+                if let Some(target) = redirect_target(t) {
+                    // `2>/dev/null` is the shell's, not an operand.
+                    k += if target.is_none() { 2 } else { 1 };
+                    continue;
+                }
+                if t == "-s" || t.starts_with("--set") {
+                    return Some(flag(t));
+                }
+                if t == "-j" {
+                    no_set = true;
+                }
+                if matches!(t, "-r" | "-f" | "-v" | "-d" | "-z") {
+                    k += 2;
+                    continue;
+                }
+                if !t.starts_with('-') && !t.starts_with('+') && positional.is_none() {
+                    positional = Some(t);
+                }
+                k += 1;
+            }
+            positional
+                .filter(|_| !no_set)
+                .map(|t| format!("date {t} (sets the clock)"))
+        }
+        _ => None,
+    }
 }
 
 /// Whether `tok` is a `VAR=value` assignment prefix.
@@ -668,29 +1432,62 @@ pub(crate) fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) ->
 /// <cmd>` — so a wrapper on the read-only list cannot launder the program it
 /// runs: `ls | xargs touch` is `touch`, `env FOO=1 ./deploy.sh` is `deploy.sh`.
 fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) -> Option<String> {
-    // Leading VAR=value assignments.
-    while j < seg.len() && is_assignment(&seg[j]) {
-        j += 1;
-    }
-    // A leading `timeout [flags] N`: flags, their numeric values, the duration.
-    if seg.get(j).map(String::as_str) == Some("timeout") {
-        j += 1;
-        while j < seg.len() && (seg[j].starts_with('-') || is_duration(&seg[j])) {
+    // Leading VAR=value assignments, a `timeout [flags] N` or `time [-p]`
+    // wrapper, and keyword prefixes (the command after `do` / `then` / `if`
+    // is the one that runs), in any order: `do n=$(…)` assigns.
+    loop {
+        let start = j;
+        while j < seg.len() && (is_assignment(&seg[j]) || KEYWORD_PREFIX.contains(&seg[j].as_str()))
+        {
             j += 1;
         }
-    }
-    // Keyword prefixes: the command after `do` / `then` / `if` is the one that runs.
-    while j < seg.len() && KEYWORD_PREFIX.contains(&seg[j].as_str()) {
-        j += 1;
+        match seg.get(j).map(String::as_str) {
+            Some("timeout") => {
+                j += 1;
+                while j < seg.len() && (seg[j].starts_with('-') || is_duration(&seg[j])) {
+                    j += 1;
+                }
+            }
+            Some("time") => {
+                j += 1;
+                while seg.get(j).map(String::as_str) == Some("-p") {
+                    j += 1;
+                }
+            }
+            _ => {}
+        }
+        if j == start {
+            break;
+        }
     }
     let head_tok = seg.get(j)?;
     if is_fragment(head_tok) {
         return None;
     }
+    if head_tok.contains('/') && !is_system_bin(head_tok) {
+        // `/tmp/evil/ls` and `./ls` are programs of the line's choosing
+        // whatever their basename says.
+        return Some(format!("{head_tok} (a program named by path)"));
+    }
     let head = program(head_tok);
     let rest = &seg[j + 1..];
     let arg = rest.first().map(String::as_str);
+    if let Some(reason) = runs_or_writes_by_flag(head, rest) {
+        return Some(reason);
+    }
     match head {
+        "aterm" | "aterm-ctl" | "aterm-drive" => aterm_read(head, rest),
+        "trustc" | "rustc" => {
+            // Version and configuration queries only: anything else compiles.
+            let query = !rest.is_empty()
+                && rest.iter().enumerate().all(|(k, t)| {
+                    matches!(t.as_str(), "-vV" | "-Vv" | "-V" | "-v" | "--version")
+                        || t == "--print"
+                        || t.starts_with("--print=")
+                        || (k > 0 && rest[k - 1] == "--print" && !t.starts_with('-'))
+                });
+            (!query).then(|| format!("{head} (compiles)"))
+        }
         "xargs" => {
             // `xargs [flags] [cmd [args]]`: the fed command is the head that
             // counts; a bare `xargs` runs echo.
@@ -768,15 +1565,17 @@ fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) ->
             let writes = match sub {
                 "branch" => {
                     // Short flags combine (`-avv`), so they are read by letter:
-                    // d D m M c C u f t write; a r l v list. A positional with
-                    // no list flag CREATES a branch (`git branch feature-x`).
+                    // d D m M c C u f t write; a r l list. A positional with
+                    // no list flag CREATES a branch (`git branch feature-x`) —
+                    // `-v`/`--verbose` are no list flag: `git branch -v x`
+                    // creates `x` (measured in a scratch repo).
                     let short = |a: &str| a.starts_with('-') && !a.starts_with("--") && a.len() > 1;
                     let write_short = args
                         .iter()
                         .any(|a| short(a) && a[1..].chars().any(|c| "dDmMcCuft".contains(c)));
                     let list_short = args
                         .iter()
-                        .any(|a| short(a) && a[1..].chars().any(|c| "arlv".contains(c)));
+                        .any(|a| short(a) && a[1..].chars().any(|c| "arl".contains(c)));
                     let list_long = has(&[
                         "--list",
                         "--all",
@@ -787,7 +1586,6 @@ fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) ->
                         "--no-merged",
                         "--points-at",
                         "--show-current",
-                        "--verbose",
                     ]);
                     let positional = args.iter().any(|a| !a.starts_with('-'));
                     write_short
@@ -882,6 +1680,120 @@ fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) ->
         h if READ_ONLY.contains(&h) => None,
         h => Some(h.to_string()),
     }
+}
+
+/// `aterm ctl` verbs that only read: the screen, the session's state and
+/// history, the roster. By VERB AND FORM, never by verb alone: `meta` reads
+/// but `meta set attention …` writes the owner's badge, and `inbox` reads but
+/// `inbox seen` writes (`meta` and `inbox` are judged separately below).
+/// `image`, `window`, `video` and `cast` are left out — they write a file.
+const ATERM_CTL_READ: &[&str] = &[
+    "status",
+    "text",
+    "screen",
+    "line",
+    "lines",
+    "offscreen",
+    "cell",
+    "cursor",
+    "dims",
+    "modes",
+    "title",
+    "cwd",
+    "colors",
+    "search",
+    "blocks",
+    "blocktext",
+    "metrics",
+    "timeline",
+    "history",
+    "panes",
+    "ready",
+    "await",
+    "wait",
+    "family",
+    "edges",
+    "grants",
+    "ls",
+    "windows",
+    "sessions",
+    "help",
+    "version",
+    "who",
+    "whoami",
+];
+
+/// `aterm pkg` and `aterm drive` verbs that only read.
+const ATERM_PKG_READ: &[&str] = &["list", "which", "doctor"];
+const ATERM_DRIVE_READ: &[&str] = &["phase", "classify", "help"];
+
+/// `aterm …` (or its `aterm-ctl` / `aterm-drive` argv0 aliases): `None` when
+/// the form only reads — `--version`, `help`, the [`ATERM_CTL_READ`] verbs,
+/// bare `meta`, bare `inbox` and `inbox get <id>`, and the read verbs of `pkg`
+/// and `drive`.
+fn aterm_read(head: &str, rest: &[String]) -> Option<String> {
+    let args: &[String] = match head {
+        "aterm-ctl" => return aterm_ctl_read(rest),
+        "aterm-drive" => {
+            return match rest.first().map(String::as_str) {
+                Some(v) if ATERM_DRIVE_READ.contains(&v) => None,
+                v => Some(
+                    format!("aterm-drive {}", v.unwrap_or(""))
+                        .trim()
+                        .to_string(),
+                ),
+            };
+        }
+        _ => rest,
+    };
+    let sub = args.first().map(String::as_str);
+    let verb = args.get(1).map(String::as_str);
+    match sub {
+        Some("--version" | "-V" | "version" | "help" | "--help" | "-h") => None,
+        Some("ctl") => aterm_ctl_read(&args[1..]),
+        Some("pkg") if verb.is_some_and(|v| ATERM_PKG_READ.contains(&v)) => None,
+        Some("drive") if verb.is_some_and(|v| ATERM_DRIVE_READ.contains(&v)) => None,
+        Some(s) => Some(
+            format!("aterm {s} {}", verb.unwrap_or(""))
+                .trim()
+                .to_string(),
+        ),
+        None => Some("aterm (opens a session)".to_string()),
+    }
+}
+
+/// The arguments of `aterm ctl`: its own flags (`--sock P`, `--pid N`,
+/// `--timeout S`), an optional `@<target>`, then the verb.
+fn aterm_ctl_read(args: &[String]) -> Option<String> {
+    let mut k = 0;
+    while let Some(t) = args.get(k).map(String::as_str) {
+        match t {
+            "--sock" | "--pid" | "--timeout" => k += 2,
+            "-h" | "--help" | "-V" | "--version" => return None,
+            _ if t.starts_with("--sock=") || t.starts_with("--pid=") => k += 1,
+            _ if t.starts_with("--timeout=") => k += 1,
+            _ => break,
+        }
+    }
+    if args.get(k).is_some_and(|t| t.starts_with('@')) {
+        k += 1;
+    }
+    let verb = args.get(k).map(String::as_str);
+    let tail = args.get(k + 1..).unwrap_or(&[]);
+    let first = tail.first().map(String::as_str);
+    let reads = match verb {
+        Some(v) if ATERM_CTL_READ.contains(&v) => true,
+        // `<verb> --help` describes the verb and never runs it.
+        Some(_) if tail.iter().all(|t| t == "--help" || t == "-h") && !tail.is_empty() => true,
+        Some("meta") => tail.is_empty(),
+        Some("inbox") => first.is_none() || (first == Some("get") && tail.len() == 2),
+        _ => false,
+    };
+    (!reads).then(|| {
+        format!("aterm ctl {} {}", verb.unwrap_or(""), first.unwrap_or(""))
+            .trim()
+            .to_string()
+    })
 }
 
 /// The programs a line hands to awk and sed, read from the RAW words (quotes
@@ -1344,6 +2256,24 @@ impl WordScan<'_> {
                     self.end_word();
                     self.i += 1;
                 }
+                '>' | '<' => {
+                    // Where [`split_segments`] detaches a redirect from the
+                    // word before it, so does this reader: `awk>/dev/null`
+                    // is `awk` and a redirect.
+                    if self.in_word
+                        && self
+                            .cur
+                            .chars()
+                            .last()
+                            .is_some_and(|l| !matches!(l, '>' | '<'))
+                        && !self.cur.chars().all(|d| d.is_ascii_digit())
+                    {
+                        self.end_word();
+                    }
+                    self.cur.push(c);
+                    self.in_word = true;
+                    self.i += 1;
+                }
                 _ => {
                     self.cur.push(c);
                     self.in_word = true;
@@ -1411,7 +2341,9 @@ mod tests {
             ),
             (
                 "timeout 120 python3 scripts/sat2026_standing.py 2>&1 | tail -40",
-                true,
+                // A script is not a read by default (DEFAULT_PYTHON_ALLOW is
+                // empty); `the_python_allowlist_is_opt_in` pins it opted in.
+                false,
             ),
             (
                 "find ~ -maxdepth 5 -name 'x.sh' -not -path '*/Library/*' 2>/dev/null | head",
@@ -1491,7 +2423,11 @@ mod tests {
             classify_command("find . -exec rm {} \\;").reason,
             "find -exec rm"
         );
-        assert_eq!(classify_command("./run.sh").reason, "run.sh");
+        assert_eq!(
+            classify_command("./run.sh").reason,
+            "./run.sh (a program named by path)"
+        );
+        assert_eq!(classify_command("run.sh").reason, "run.sh");
         assert_eq!(classify_command("git").reason, "git without a subcommand");
         assert_eq!(classify_command("git stash").reason, "git stash");
         assert_eq!(
@@ -1570,7 +2506,7 @@ mod tests {
         assert!(ro("VAR=1 OTHER=2 ls"));
         assert!(ro("timeout 5 ls; timeout -k 1 5 git status"));
         assert!(ro("git -C ~/x --no-pager log -1"));
-        assert!(ro("git --git-dir=.git status"));
+        assert!(!ro("git --git-dir=.git status"));
         assert!(ro("git worktree list; git stash list"));
         assert!(!ro("git worktree"));
         assert!(!ro("git branch -D old"));
@@ -1587,7 +2523,7 @@ mod tests {
         assert!(!ro("tmutil deletelocalsnapshots 2026-01-01"));
         assert!(!ro("tmutil"));
         assert!(!ro("python3 scripts/wipe.py"));
-        assert!(ro("python3 scripts/sat_score_table.py"));
+        assert!(!ro("python3 scripts/sat_score_table.py"));
         assert!(!ro("python3 -m http.server"));
         assert!(!ro("python3"));
         // The caller's allowlist replaces the default.
@@ -1614,7 +2550,7 @@ mod tests {
         assert_eq!(classify_command("ls | xargs touch").reason, "touch");
         assert_eq!(
             classify_command("find . -name '*.log' | xargs -n1 ./deploy.sh").reason,
-            "deploy.sh"
+            "./deploy.sh (a program named by path)"
         );
         assert!(!ro("echo x | xargs python3 evil.py"));
         assert!(!ro("ls | xargs -I {} sh -c 'cat {}'"));
@@ -1623,7 +2559,7 @@ mod tests {
         assert!(ro("ls | xargs"));
         assert_eq!(
             classify_command("env FOO=1 ./deploy.sh").reason,
-            "deploy.sh"
+            "./deploy.sh (a program named by path)"
         );
         assert_eq!(classify_command("env touch /tmp/x").reason, "touch");
         assert!(!ro("env -S 'rm x'"));
@@ -1636,7 +2572,10 @@ mod tests {
 
     #[test]
     fn a_backgrounded_command_is_a_head_and_a_redirect_ampersand_is_not() {
-        assert_eq!(classify_command("ls & ./deploy.sh").reason, "deploy.sh");
+        assert_eq!(
+            classify_command("ls & ./deploy.sh").reason,
+            "./deploy.sh (a program named by path)"
+        );
         assert_eq!(classify_command("ls & touch /tmp/x").reason, "touch");
         assert!(ro("ls & wc -l x"));
         assert!(ro("ls >/dev/null 2>&1 & echo done"));
@@ -1697,6 +2636,118 @@ mod tests {
         assert!(ro("git remote get-url origin"));
     }
 
+    /// Lane B's review (2026-09-23), measured with a harmless `touch` under
+    /// zsh and bash 3.2: the shell's ARITHMETIC expands an array subscript
+    /// held in a variable's value, and runs the substitution inside it, from
+    /// behind a quote this reader treats as opaque. Every form that
+    /// evaluates arithmetic on a non-literal is refused; the literal forms
+    /// a read uses stay reads (the negative controls).
+    #[test]
+    fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
+        for line in [
+            "let 'x=a[$(touch M)]'",
+            "local -i x=1",
+            "[[ 'a[$(touch M)]' -eq 1 ]]",
+            "x='a[$(touch M)]'; [[ $x -lt 1 ]]",
+            "if [[ $n -ge 2 ]]; then echo big; fi",
+            "[[ -v a[x] ]]",
+            "[ -v 'a[$(touch M)]' ]",
+            "test -v 'a[$(touch M)]'",
+            "x='a[$(touch M)]'; echo ${a[x]}",
+            "x='a[$(touch M)]'; echo ${#a[x]}",
+            "x='a[$(touch M)]'; echo \"${a[$x]}\"",
+            "x='a[$(touch M)]'; echo ${y:x}",
+            "x='a[$(touch M)]'; echo ${y:0:x}",
+            "x='a[$(touch M)]'; echo ${a[@]:x}",
+            "x='a[$(touch M)]'; echo $[x]",
+            "x='a[$(touch M)]'; echo \"$[x]\"",
+            "x='a[$(touch M)]'; a=(1 2); echo $a[x]",
+            "echo ${(e)x}",
+            "cat <<EOF\n${a[x]}\nEOF",
+            "cat <<EOF\n$a[x]\nEOF",
+        ] {
+            let v = classify_command(line);
+            assert!(!v.read_only, "{line:?} read-only ({})", v.reason);
+        }
+        // Negative controls: literal subscripts and offsets, the default
+        // forms, the pattern forms, `[`/`test` comparing integers, `[[`
+        // comparing strings, and a quoted here-document body.
+        for line in [
+            "echo ${PIPESTATUS[0]} ${X[@]} ${#X[*]} ${a[-1]}",
+            "echo ${y:1} ${y: -2} ${y:1:3} ${a[@]:1:2}",
+            "echo ${X:-default} ${X:+set} ${X:?unset} ${#X} ${#} ${!}",
+            "echo ${f%.rs} ${f##*/} ${f/a/b} ${!pre*}",
+            "[ \"$n\" -eq 1 ] && echo one; test $n -gt 2",
+            "[[ $a == b* ]] && echo match",
+            "cat <<'EOF'\n${a[x]} $[x]\nEOF",
+            "cat <<EOF\n${HOME} and $USER\nEOF",
+            "echo 'a[$x]' \"$HOME\"",
+        ] {
+            let v = classify_command(line);
+            assert!(v.read_only, "{line:?} refused: {}", v.reason);
+        }
+    }
+
+    /// Git reads honour the repository's config and `.gitattributes`
+    /// (`core.fsmonitor`, `diff.external`, a textconv driver), and a
+    /// worker in accept-edits can write both — the residual gap the
+    /// approval rule's doc names. What IS refused: a repository named on
+    /// the line (`--git-dir`, `--work-tree`) and the flags that run the
+    /// filter and textconv drivers on purpose. `-C` stays a read: `cd X &&
+    /// git status` reaches the same repository.
+    #[test]
+    fn git_reads_of_a_chosen_repository_or_through_its_drivers_are_refused() {
+        for line in [
+            "git --git-dir=/tmp/evil status",
+            "git --git-dir /tmp/evil log",
+            "git --work-tree=/tmp/x diff",
+            "git cat-file --filters HEAD:x",
+            "git cat-file --textconv HEAD:x",
+            "git log -p --textconv -1",
+        ] {
+            assert!(!ro(line), "{line}");
+        }
+        assert!(ro("git -C /tmp/x status"));
+        assert!(ro("git cat-file -p HEAD:x; git log -p -1"));
+    }
+
+    /// The read tools' write forms (lane B's review, each measured or read
+    /// from the tool's manual): `git branch -v <name>` creates the branch,
+    /// `sysctl` sets with `=`/`-w`, `hostname` sets with an operand or
+    /// `-F`, `file -C` writes `magic.mgc`, `tree -R` writes `00Tree.html`,
+    /// and `<>` opens a file read-write, creating it.
+    #[test]
+    fn the_write_forms_of_system_reads_are_refused() {
+        for line in [
+            "git branch -v newb1",
+            "git branch --verbose newb2",
+            "git branch -vv nb6",
+            "sysctl kern.maxfiles=1",
+            "sysctl -w kern.maxfiles=1",
+            "hostname evil",
+            "hostname -F /tmp/name",
+            "file -C -m /tmp/magic",
+            "file -bC x",
+            "tree -R -H . -L 1",
+            "cat <>new.txt",
+            "exec 3<>/tmp/x",
+        ] {
+            assert!(!ro(line), "{line}");
+        }
+        // Negative controls: the list and query forms.
+        for line in [
+            "git branch -v; git branch -vv; git branch -av; git branch -v --list 'f*'",
+            "sysctl -n hw.ncpu; sysctl kern.maxfiles",
+            "hostname; hostname -s 2>/dev/null",
+            "file -b x; file --mime-type x",
+            "tree -L 2 -a",
+            "cat < in.txt",
+        ] {
+            let v = classify_command(line);
+            assert!(v.read_only, "{line} refused: {}", v.reason);
+        }
+    }
+
     #[test]
     fn output_file_flags_of_the_read_tools_are_writes() {
         assert_eq!(
@@ -1735,9 +2786,15 @@ mod tests {
                 .reason
                 .contains("`..`")
         );
-        assert!(!ro("python3 scripts/x/../wipe_report.py"));
-        assert!(ro("python3 scripts/sat_score_table.py"));
-        assert!(ro("python3 scripts/sub/report_x.py"));
+        let allow: Vec<String> = ["scripts/*score*.py", "scripts/*report*.py"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ro_with = |cmd: &str| classify_command_with(cmd, &allow).read_only;
+        assert!(!ro_with("python3 scripts/../../tmp/evil_score.py"));
+        assert!(!ro_with("python3 scripts/x/../wipe_report.py"));
+        assert!(ro_with("python3 scripts/sat_score_table.py"));
+        assert!(ro_with("python3 scripts/sub/report_x.py"));
     }
 
     /// The awk program and the sed script are read from the raw words: what
@@ -1824,6 +2881,197 @@ mod tests {
         assert_eq!(
             raw_words("echo \"a \\\" b\" 'c\\d'"),
             vec![vec!["echo", "a \" b", "c\\d"]]
+        );
+    }
+
+    /// Every line the 2026-09-23 audit (APR-4) measured the shipped
+    /// classifier calling read-only, each a write or a program of the line's
+    /// choosing. `⏎` in the audit is a newline here. The `rm_policy` corpus
+    /// pins the same shapes for an `rm` verdict.
+    #[test]
+    fn the_measured_bypasses_are_not_read_only() {
+        let bypasses = [
+            "git log --oneline -3 # what's new\ngit push --force",
+            "ls # don't worry\nmv a b",
+            "ls # don't\nrm -rf \"$S/x\"",
+            "ls # it's\nrm -rf / # '",
+            "cat <<EOF\necho '\nEOF\nrm -rf /",
+            "echo $'a\\'b'\nrm -rf /\necho '",
+            "rm>/dev/null -rf /",
+            "ls >&out.txt",
+            "git diff --output=/Users//_owner/.zshrc",
+            "git log --output=/tmp/x",
+            "git -c core.fsmonitor='touch /tmp/pwn' status",
+            "git -c core.pager='sh -c \"rm -rf ~\"' log",
+            "git -C ~/x -c core.pager=cat log",
+            "git grep -O\"touch /tmp/x\" foo",
+            "git diff --ext-diff",
+            "rg --pre ./x.sh foo",
+            "rg --pre=./x.sh foo",
+            "sort --compress-program=./x.sh f",
+            "/tmp/evil/ls",
+            "./ls",
+            "env -i PATH=/tmp/evil ls",
+            "printf -v PATH /evil",
+            "export PATH=/tmp/evil:$PATH; ls",
+            "PATH=/tmp/evil ls",
+            "GIT_EXTERNAL_DIFF=./x.sh git diff",
+            "HOME=/tmp/evil git log",
+            "less +!touch\\ x file",
+            "less -o copy.txt file",
+            "date -s 12:00",
+            "date 0101120026",
+            "python3 scripts/purge_report.py --delete-all",
+            "ls $'x\\ny'",
+            "echo ${x:-$(rm -rf y)}",
+            "echo \"unterminated",
+            "cat <<EOF\n$(rm -rf x)\nEOF",
+            "cat <<EOF",
+            "awk>/dev/null 'BEGIN{system(\"rm x\")}'",
+        ];
+        for cmd in bypasses {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+    }
+
+    /// The negative controls for the pre-pass: the shapes it READS rather than
+    /// refuses stay reads, so the refusals above are about the hazard and not
+    /// about the construct.
+    #[test]
+    fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
+        assert!(ro("git log --oneline -3 # what's new"));
+        assert!(ro("ls # don't worry\ncat x"));
+        assert!(ro("cat <<'EOF'\n$(this is data)\nEOF"));
+        assert!(ro("cat <<EOF\nplain body with 'quote\nEOF\nls"));
+        assert!(ro("grep -c x <<-EOF\n\tbody\n\tEOF"));
+        assert!(ro("cat <<< 'here string'"));
+        assert!(ro("echo $'plain'; echo $\"x\""));
+        assert!(ro("echo ${HOME} ${x:-y} ${#x}"));
+        assert!(ro("echo \"#not a comment\" x#y $#"));
+        assert!(ro("ls >&2; ls 2>&1; ls >&-"));
+        assert!(ro("ls>/dev/null"));
+        // A body under a quoted terminator is never expanded.
+        assert_eq!(
+            prelex("cat <<'EOF'\n$(rm x)\nEOF\nls").as_deref(),
+            Ok("cat <<'EOF'\nls")
+        );
+        assert_eq!(prelex("ls # a 'b\ncat").as_deref(), Ok("ls \ncat"));
+        assert!(prelex("cat <<EOF\n$(rm x)\nEOF").is_err());
+        // A here-document still feeds an interpreter its program.
+        assert!(!ro("python3 <<'EOF'\nprint(1)\nEOF"));
+        assert!(!ro("bash <<'EOF'\nls\nEOF"));
+    }
+
+    /// A program word is judged where it runs: as an argument it is data
+    /// (APR-7's false escalations), at a head — also behind a wrapper, a
+    /// keyword or a substitution — it is the program.
+    #[test]
+    fn a_program_word_is_judged_only_at_a_head() {
+        assert!(ro("grep -rn open src"));
+        assert!(ro("rg -n make Cargo.toml"));
+        assert!(ro("grep -c kill crates"));
+        assert!(ro("git log --author make"));
+        assert!(ro("echo rm; grep 'rm -rf' notes.md"));
+        assert!(!ro("open src"));
+        assert!(!ro("ls; make"));
+        assert!(!ro("ls | xargs kill"));
+        assert!(!ro("timeout 5 rm x"));
+        assert!(!ro("env rm x"));
+        assert!(!ro("for f in *; do make; done"));
+        assert!(!ro("echo $(make)"));
+        assert!(!ro("ls & open ."));
+        assert_eq!(classify_command("ls; make").reason, "make");
+    }
+
+    #[test]
+    fn the_added_reads_are_reads_and_their_neighbours_are_not() {
+        assert!(ro(
+            "pgrep -f aterm; sleep 5; strings /bin/ls | head; lsof -p 1"
+        ));
+        assert!(ro("uname -a; whoami; id; sw_vers; fold -w 80 f"));
+        assert!(ro("trustc -vV; rustc --version; trustc --print sysroot"));
+        assert!(!ro("trustc x.rs"));
+        assert!(!ro("trustc -vV x.rs"));
+        assert!(!ro("trustc"));
+        assert!(!ro("pkill aterm"));
+        assert!(ro("env -i PATH=/bin:/usr/bin ls"));
+        assert!(ro(
+            "date +%s; date -u; date -r 1700000000; date -j -f %s 1 +%Y"
+        ));
+        assert!(ro("less -R f; more f; printf '%s\\n' x"));
+        assert!(ro("git log -3 --format=%h; git -C ~/x --no-pager log -1"));
+        assert!(ro("rg --pre-glob '*.gz' x; sort -rn f"));
+        assert!(ro("/bin/ls; /usr/bin/wc -l f"));
+        assert!(!ro("/bin/x/ls"));
+        assert!(ro("FOO=1 ls; LC_ALL=C sort f"));
+        assert!(ro("date 2>/dev/null; date +%s 2> /dev/null"));
+        assert!(!ro("date 2>/dev/null 0101120026"));
+        // `time` is seen through like `timeout`, and an assignment after a
+        // keyword is an assignment.
+        assert!(ro("time ls; time -p git status"));
+        assert!(!ro("time rm x"));
+        assert!(ro("for d in *; do n=$(ls $d | wc -l); echo $n; done"));
+        assert!(!ro("for d in *; do n=$(rm $d); done"));
+    }
+
+    /// `aterm ctl` is read-only by verb AND form: `meta` reads and `meta set`
+    /// writes the owner's badge; `inbox` reads and `inbox seen` writes.
+    #[test]
+    fn aterm_forms_are_judged_by_their_full_subform() {
+        for read in [
+            "aterm ctl status",
+            "aterm ctl @s-1 status",
+            "aterm ctl --sock /tmp/a.sock @s-1 text",
+            "aterm ctl ls",
+            "aterm ctl windows",
+            "aterm ctl help",
+            "aterm ctl @s-1 meta",
+            "aterm ctl @s-1 inbox",
+            "aterm ctl @s-1 inbox get 3",
+            "aterm ctl turn --help",
+            "aterm-ctl status",
+            "aterm --version",
+            "aterm help introspection",
+            "aterm pkg list",
+            "aterm pkg which claude",
+            "aterm pkg doctor",
+            "aterm drive phase",
+            "aterm drive classify -- 'ls'",
+        ] {
+            assert!(ro(read), "{read:?}: {:?}", classify_command(read));
+        }
+        for write in [
+            "aterm ctl @s-1 meta set attention hi",
+            "aterm ctl @s-1 meta unset attention",
+            "aterm ctl @s-1 inbox seen 3 handled",
+            "aterm ctl @s-1 key 1",
+            "aterm ctl @s-1 send x",
+            "aterm ctl @s-1 turn 'go'",
+            "aterm ctl @s-1 image /tmp/x.png",
+            "aterm ctl @s-1 post to=@s-2 kind=note hi",
+            "aterm ctl",
+            "aterm pkg install x",
+            "aterm pkg repair",
+            "aterm drive watch",
+            "aterm",
+            "aterm ctl status > /tmp/out",
+        ] {
+            assert!(!ro(write), "{write:?} must not be read-only");
+        }
+    }
+
+    #[test]
+    fn the_python_allowlist_is_opt_in() {
+        assert!(DEFAULT_PYTHON_ALLOW.is_empty());
+        assert!(!ro("python3 scripts/x_report.py"));
+        let allow = ["scripts/*standing*.py".to_string()];
+        assert!(
+            classify_command_with(
+                "timeout 120 python3 scripts/sat2026_standing.py 2>&1 | tail -40",
+                &allow
+            )
+            .read_only
         );
     }
 

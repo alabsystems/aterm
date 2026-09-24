@@ -41,11 +41,12 @@
 //! measured; a test that fails for it is a test that is right about the
 //! machine and wrong about the instant.
 //!
-//! A SHARED HELPER WOULD BE BETTER THAN FIVE SPELLINGS OF THE LOOP — this
-//! workspace now has four (`atpkg::lock`'s inline loop, `aterm-link`'s
-//! `wait_until_abandoned`, `aterm-gui`'s `settle_busy`, `pinned_dir`'s inline
-//! loop) — and it belongs in a dev-only crate both `atpkg` and `aterm-update`
-//! can take as a path `[dev-dependencies]`. It is NOT what stops the next site
+//! A SHARED HELPER WOULD BE BETTER THAN SEVERAL SPELLINGS OF THE LOOP — this
+//! workspace now has three (`aterm-link`'s `wait_until_abandoned`, `aterm-gui`'s
+//! `settle_busy`, `pinned_dir`'s inline loop; `atpkg::lock`'s went on
+//! 2026-09-23, when its guards took the first spelling) — and it belongs in a
+//! dev-only crate both `atpkg` and `aterm-update` can take as a path
+//! `[dev-dependencies]`. It is NOT what stops the next site
 //! landing, though: a helper only helps whoever already knows to reach for it.
 //! This tripwire is what makes the next one impossible to land unnoticed, so it
 //! comes first.
@@ -74,10 +75,11 @@ const REGISTERED: &[(&str, &str)] = &[
     ),
     (
         "crates/atpkg/src/lock.rs",
-        "each of these re-acquires through `lock_store_waiting`, whose whole subject is \
-         waiting: the patience is a 10 s / 20 s budget inside the callee rather than in \
-         the window this scan reads. The one site in this file that sampled ONCE was \
-         repaired on 2026-09-17 and now polls.",
+        "every lock released here is a `StoreLock` or a `Flock`, whose drop is `LOCK_UN` — \
+         the deterministic release, pinned by \
+         `a_dropped_store_lock_is_free_while_a_copy_of_its_descriptor_lives` with a live \
+         duplicate of the descriptor — so a drop then one sample is sound (2026-09-23). \
+         The waits re-acquire through `lock_store_waiting`, whose whole subject is waiting.",
     ),
     (
         "crates/aterm-ctl/src/lib.rs",
@@ -85,7 +87,10 @@ const REGISTERED: &[(&str, &str)] = &[
          paths before it probes, and the probe is `connect` on the unlinked path expecting \
          ENOENT — an inherited descriptor keeps the old inode accepting, but there is no \
          path left to reach it by, so the answer cannot depend on the spawn window. The \
-         same reasoning as the `aterm-uds` roundtrip row.",
+         same reasoning as the `aterm-uds` roundtrip row. Every crash-state corpse in the \
+         file (the dead-alias test's, the refused-socket probe's), dropped and deliberately \
+         NOT unlinked, goes through `abandon_socket`, which polls (bounded) until it \
+         refuses before anything is judged over it.",
     ),
 ];
 
@@ -126,7 +131,9 @@ fn tracked_rs(root: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// `true` when `line` names a lock-ish or listener-ish binding being dropped.
+/// `true` when `line` names a lock-ish or listener-ish binding being dropped, or
+/// drops a listener in the expression that binds it (`drop(X::bind(..))`, the
+/// socket file a crashed instance leaves).
 fn releases(line: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with("//") || t.starts_with('*') {
@@ -139,6 +146,9 @@ fn releases(line: &str) -> bool {
         return false;
     };
     let name = name.trim();
+    if name.contains("Listener::bind(") {
+        return true;
+    }
     !name.is_empty()
         && name.chars().all(|c| c.is_alphanumeric() || c == '_')
         && ["lock", "listen", "guard", "lease", "held", "holder"]
@@ -157,6 +167,8 @@ fn probes(text: &str) -> bool {
         "build_in_progress",
         "acquire_within",
         "FileLock::acquire",
+        // aterm-ctl's discovery dial: a `connect` behind a name.
+        "probe_lines(",
     ]
     .iter()
     .any(|p| text.contains(p))
@@ -301,5 +313,14 @@ fn the_scan_finds_the_defect_and_clears_both_repairs() {
     assert!(
         !judge("        drop(rows);\n        assert!(try_lock().is_ok());\n"),
         "a drop of something that is not a lock is not this shape"
+    );
+    // A listener dropped in the expression that bound it, then dialed once: the
+    // shape `aterm-ctl`'s refused-socket probe carried until 2026-09-23.
+    let bound_and_dropped = "        drop(aterm_uds::CtlListener::bind(&stale).expect(\"x\"));\n        \
+                             let stale_s = stale.to_str().unwrap();\n        \
+                             assert!(matches!(probe_lines(stale_s, \"v\", 0), Probe::Refused { .. }));\n";
+    assert!(
+        judge(bound_and_dropped),
+        "a listener dropped where it was bound must be found"
     );
 }

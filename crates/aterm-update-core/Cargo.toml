@@ -16,6 +16,13 @@ description = "aterm — artifact-agnostic, portable POSIX update primitives (so
 # Same constraint (and comment) as crates/atpkg: bare `cargo test` must be able to pass.
 doctest = false
 
+[features]
+# Development seams in an optimized build (`aterm_types::dev_seam!`: ATERM_UPDATE_ROOT;
+# `source::REPOINT_IS_A_DEV_SEAM`: the `[update]` owner/repo repoint). Debug builds
+# compile them anyway; the release cutter never enables this — aterm-release's
+# buildplan pins that.
+dev-seams = []
+
 [dependencies]
 # Reuse the single source-of-truth private-dir ownership predicate (no drift with
 # the control socket's Application Support hardening).
@@ -28,6 +35,7 @@ aterm-log = { workspace = true }
 # so field agreement is compiler-enforced rather than hand-synced.
 serde = { workspace = true }
 aterm-toml = { workspace = true }
+aterm-json = { workspace = true }
 # Ed25519 verification of the master-signed MACHINE ROSTER (src/roster.rs). The chain
 # lives here rather than in aterm-update because BOTH sides need it: the client verifies
 # it, and the owner-side minting tool emits and signs it through the very same type. Two

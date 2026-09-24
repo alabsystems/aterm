@@ -350,8 +350,9 @@ pub(crate) struct ToneStatus {
     /// that was MISSING while a load-shed frame and macOS `Reduce Motion`
     /// silenced typing with `audio=live` on the row.
     pub(crate) engine_sound: bool,
-    /// `GlowConfig::enabled` — the master knob AND serious mode AND a style
-    /// that resolves, i.e. the gate the engine itself reads.
+    /// [`crate::sound_seam::trail_on`]: `GlowConfig::enabled` — the master
+    /// knob AND serious mode AND a style that resolves, the gate the engine
+    /// itself reads — AND a nonzero brightness knob, the person's own off.
     pub(crate) trail: bool,
     /// The cursor-effect focus fold, the SAME value `trail status` prints as
     /// `focused=`, so the two verbs cannot contradict each other.

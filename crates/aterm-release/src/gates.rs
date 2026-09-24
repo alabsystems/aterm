@@ -230,9 +230,11 @@ pub struct GateReport {
 }
 
 /// Run every gate, in the transcript's order, first failure wins. Cheap and
-/// side-effect-free by construction (the one network touch is a fetch): this
-/// is the always-on preflight — the optional deep gate (`--gate` →
-/// tools/verify.sh --full) layers on top in chunk C, never replaces this.
+/// side-effect-free by construction (the one network touch is a fetch) with one
+/// exception, a repair: [`provenance_gate`] clears `com.apple.provenance` from the
+/// toolchain before it judges it. This is the always-on preflight — the optional
+/// deep gate (`--gate` → tools/verify.sh --full) layers on top in chunk C, never
+/// replaces this.
 pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<GateReport> {
     host_gate()?;
     clean_tree(git)?;
@@ -1301,13 +1303,29 @@ pub fn launchd_qos_verdict(tier: &SpawnTier, paint_smoke_will_run: bool) -> Resu
 /// * the cutter's own binary — AND, separately, whether this PROCESS is tracked, which
 ///   the binary's attribute cannot tell (a clean cutter under a tracked parent — a shell
 ///   inside aterm.app, an agent started from a tagged `claude` — is tracked too). That is
-///   MEASURED by writing a probe file and reading the attribute back; `xattr -d` cannot
-///   remove the tag, so nothing this gate could do would fix it, and it says what does.
+///   MEASURED by writing a probe file and reading the attribute back; nothing this gate
+///   could do would untrack a running process, and it says what does.
+///
+/// THE TOOLCHAIN IS HEALED FIRST ([`heal_toolchain`]): a tagged trustc, targo or dylib is
+/// cleared in place by the same launchd job `aterm pkg` uses
+/// (`atpkg::provenance::heal`), and only what is STILL tagged afterwards is refused. A
+/// cut used to stop here and send the maintainer off to re-seed a bundle whose tag one
+/// job clears in well under a second.
 ///
 /// A path this gate cannot inspect is a refusal, not a pass: the tag's whole failure mode
 /// is being invisible until after the claim.
 pub fn provenance_gate(trustc: &Path) -> Result<()> {
-    let targo = trust_stage2_bin()?.join("targo");
+    provenance_gate_with(trustc, atpkg::provenance::heal)
+}
+
+/// [`provenance_gate`] with the toolchain heal explicit ([`atpkg::provenance::Healer`]).
+/// A cut passes `atpkg::provenance::heal`; a test that runs the gate over this machine's
+/// INSTALLED toolchain passes one that changes nothing, so a test run never rewrites the
+/// store (the heal itself is tested on a scratch toolchain).
+pub fn provenance_gate_with(trustc: &Path, heal: atpkg::provenance::Healer) -> Result<()> {
+    let stage2 = trust_stage2_bin()?;
+    let healed = heal_toolchain(trustc, &stage2, heal);
+    let targo = stage2.join("targo");
     let cutter = env::current_exe().and_then(fs::canonicalize).map_err(|e| {
         Error::new(format!(
             "provenance gate: cannot resolve the cutter's own binary: {e}"
@@ -1374,14 +1392,72 @@ pub fn provenance_gate(trustc: &Path) -> Result<()> {
             scratch.display()
         ))
     })?;
-    provenance_verdict(&carriers, tracked)
+    provenance_verdict(&carriers, tracked, healed.why())
+}
+
+/// The toolchain directories [`heal_toolchain`] clears: the real `bin/` that holds
+/// `trustc`, the bundle's `lib/` beside it (the dylibs trustc loads — a tagged one tracks
+/// the compiler as surely as a tagged `trustc`), and the real directory holding `targo`
+/// when it is a different one. Every path is resolved first: the store reaches the
+/// bundle through its `current` link, and the heal never follows a link.
+fn toolchain_heal_roots(trustc: &Path, stage2: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut add = |dir: PathBuf| {
+        if dir.is_dir() && !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    };
+    if let Some(bin) = fs::canonicalize(trustc)
+        .ok()
+        .and_then(|real| real.parent().map(Path::to_path_buf))
+    {
+        if let Some(bundle) = bin.parent() {
+            add(bundle.join("lib"));
+        }
+        add(bin);
+    }
+    if let Some(targo_dir) = fs::canonicalize(stage2.join("targo"))
+        .ok()
+        .and_then(|real| real.parent().map(Path::to_path_buf))
+    {
+        add(targo_dir);
+    }
+    roots.sort();
+    roots
+}
+
+/// Clear `com.apple.provenance` from the toolchain this cut is about to run
+/// ([`toolchain_heal_roots`]) before [`provenance_gate`] reads it, and say so on the
+/// transcript when it cleared something. `heal` is `atpkg::provenance::heal` in a cut: one
+/// launchd job made only of platform binaries, untracked whatever this process is, that
+/// removes that ONE attribute and re-measures. It runs without the store lock — it
+/// changes no byte of any file, and the gate's own read afterwards is the verdict, so a
+/// pass that moves the store underneath can only make it refuse, never pass wrongly.
+fn heal_toolchain(
+    trustc: &Path,
+    stage2: &Path,
+    heal: atpkg::provenance::Healer,
+) -> atpkg::provenance::HealOutcome {
+    let outcome = heal(&toolchain_heal_roots(trustc, stage2), &env::temp_dir());
+    if let atpkg::provenance::HealOutcome::Healed { cleared } = outcome {
+        println!(
+            "==> provenance gate: cleared com.apple.provenance from {} in the toolchain",
+            atpkg::provenance::count_of(cleared, "file")
+        );
+    }
+    outcome
 }
 
 /// The decision behind [`provenance_gate`], without the filesystem: `carriers` are the
-/// `(label, path)` pairs found tagged, `cutter_tracked` is the probe-write measurement.
-/// Clean on both counts passes silently; anything else is the one refusal, naming every
-/// carrier, what the tag does, and the two ways out.
-pub fn provenance_verdict(carriers: &[(&str, PathBuf)], cutter_tracked: bool) -> Result<()> {
+/// `(label, path)` pairs found tagged, `cutter_tracked` is the probe-write measurement,
+/// and `heal_left` is why the toolchain heal left files tagged, when it did. Clean on
+/// both counts passes silently; anything else is the one refusal, naming every carrier,
+/// what the tag does, and the ways out.
+pub fn provenance_verdict(
+    carriers: &[(&str, PathBuf)],
+    cutter_tracked: bool,
+    heal_left: Option<&str>,
+) -> Result<()> {
     if carriers.is_empty() && !cutter_tracked {
         return Ok(());
     }
@@ -1393,6 +1469,14 @@ pub fn provenance_verdict(carriers: &[(&str, PathBuf)], cutter_tracked: bool) ->
         msg.push_str(&format!(
             "  {label}: {} carries com.apple.provenance\n",
             path.display()
+        ));
+    }
+    if !carriers.is_empty()
+        && let Some(why) = heal_left
+    {
+        msg.push_str(&format!(
+            "  the gate cleared the toolchain through a launchd job first, and the tag \
+             stayed: {why}\n"
         ));
     }
     if cutter_tracked {
@@ -1981,7 +2065,7 @@ mod provenance_gate_tests {
     /// Clean toolchain, untracked cutter: silent pass.
     #[test]
     fn a_clean_toolchain_under_an_untracked_cutter_passes() {
-        assert!(provenance_verdict(&[], false).is_ok());
+        assert!(provenance_verdict(&[], false, None).is_ok());
     }
 
     /// The v0.83.0 shape: a tagged trustc. The refusal names the path, the attribute,
@@ -1991,7 +2075,7 @@ mod provenance_gate_tests {
         let trustc = PathBuf::from(
             "/Users//me/Library/Application Support/aterm/pkg/store/trust/8590/bin/trustc",
         );
-        let err = provenance_verdict(&[("trustc", trustc.clone())], false)
+        let err = provenance_verdict(&[("trustc", trustc.clone())], false, None)
             .expect_err("a tagged compiler must not cut");
         let msg = err.to_string();
         assert!(msg.contains(&trustc.display().to_string()), "{msg}");
@@ -2026,7 +2110,7 @@ mod provenance_gate_tests {
     /// parent too, and the probe write is what shows it.
     #[test]
     fn a_tracked_cutter_process_is_refused_even_with_a_clean_toolchain() {
-        let err = provenance_verdict(&[], true).expect_err("a tracked cutter must not cut");
+        let err = provenance_verdict(&[], true, None).expect_err("a tracked cutter must not cut");
         let msg = err.to_string();
         assert!(
             msg.contains("cutter PROCESS is provenance-tracked"),
@@ -2047,6 +2131,7 @@ mod provenance_gate_tests {
                 ("the cutter's own binary", PathBuf::from("/t/cargo-ship")),
             ],
             true,
+            None,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -2056,6 +2141,109 @@ mod provenance_gate_tests {
             .find("the cutter's own binary: /t/cargo-ship")
             .expect("cutter named");
         assert!(a < b && b < c, "{msg}");
+    }
+
+    /// A tag the heal could not clear is still refused — the refusal stays for every
+    /// carrier left — and the refusal says the heal ran and why it did not take.
+    #[test]
+    fn a_tag_the_heal_left_is_refused_and_says_the_heal_ran() {
+        let trustc = PathBuf::from("/s/bin/trustc");
+        let err = provenance_verdict(&[("trustc", trustc.clone())], false, Some("xattr exited 1"))
+            .expect_err("a tag that survived the heal must not cut");
+        let msg = err.to_string();
+        assert!(msg.contains("trustc: /s/bin/trustc carries"), "{msg}");
+        assert!(
+            msg.contains("launchd job first, and the tag stayed: xattr exited 1"),
+            "{msg}"
+        );
+        assert!(msg.contains("BEFORE the claim"), "{msg}");
+        // With nothing left tagged the heal's reason is not a carrier: a tracked cutter
+        // is refused for itself alone.
+        let msg = provenance_verdict(&[], true, Some("xattr exited 1"))
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.contains("tag stayed"), "{msg}");
+    }
+
+    /// A store-shaped toolchain: `store/trust/current -> 9192`, the gate handed the
+    /// `current/bin` spelling. The heal covers the REAL `bin/` and `lib/` — never the link
+    /// (the heal does not follow one) — and a `targo` in the same `bin/` adds nothing,
+    /// while one in another directory adds that directory.
+    #[cfg(unix)]
+    #[test]
+    fn the_toolchain_heal_covers_the_real_bin_and_lib() {
+        let d = env::temp_dir().join(format!("aterm-release-heal-roots-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let build = d.join("store/trust/9192");
+        fs::create_dir_all(build.join("bin")).unwrap();
+        fs::create_dir_all(build.join("lib")).unwrap();
+        fs::write(build.join("bin/trustc"), b"x").unwrap();
+        fs::write(build.join("bin/targo"), b"x").unwrap();
+        std::os::unix::fs::symlink(&build, d.join("store/trust/current")).unwrap();
+        let stage2 = d.join("store/trust/current/bin");
+        let real = fs::canonicalize(&build).unwrap();
+        assert_eq!(
+            toolchain_heal_roots(&stage2.join("trustc"), &stage2),
+            [real.join("bin"), real.join("lib")]
+        );
+        let elsewhere = d.join("targo-bin");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("targo"), b"x").unwrap();
+        assert_eq!(
+            toolchain_heal_roots(&stage2.join("trustc"), &elsewhere),
+            [
+                real.join("bin"),
+                real.join("lib"),
+                fs::canonicalize(&elsewhere).unwrap()
+            ]
+        );
+        // A bundle with no lib/ heals its bin/ alone; nothing resolvable heals nothing.
+        fs::remove_dir_all(build.join("lib")).unwrap();
+        assert_eq!(
+            toolchain_heal_roots(&stage2.join("trustc"), &stage2),
+            [real.join("bin")]
+        );
+        assert!(toolchain_heal_roots(&d.join("absent/trustc"), &d.join("absent")).is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// THE REAL HEAL, on a scratch toolchain. A file this test process writes carries
+    /// `com.apple.provenance` exactly when the process is tracked (an agent's shell, a
+    /// shell inside a tracked aterm.app) — the shape a tagged trust bundle has. The heal
+    /// clears it in place through the launchd job, and the gate's own read afterwards
+    /// finds nothing. Under an untracked test process nothing is tagged, no job runs,
+    /// and the answer is `Clean` — vacuous, and said so on stderr.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tagged_scratch_toolchain_is_healed_before_the_gate_reads_it() {
+        let d = env::temp_dir().join(format!("aterm-release-heal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::create_dir_all(d.join("lib")).unwrap();
+        let trustc = d.join("bin/trustc");
+        let dylib = d.join("lib/libstd-x.dylib");
+        for file in [&trustc, &d.join("bin/targo"), &dylib] {
+            fs::write(file, b"not a compiler").unwrap();
+        }
+        let tracked = atpkg::provenance::carries_provenance(&trustc);
+        let outcome = heal_toolchain(&trustc, &d.join("bin"), atpkg::provenance::heal);
+        eprintln!("this test process tracked={tracked}; heal: {outcome:?}");
+        assert_eq!(
+            outcome,
+            if tracked {
+                atpkg::provenance::HealOutcome::Healed { cleared: 3 }
+            } else {
+                atpkg::provenance::HealOutcome::Clean
+            }
+        );
+        for file in [&trustc, &d.join("bin/targo"), &dylib] {
+            assert!(
+                !atpkg::provenance::carries_provenance(file),
+                "{} still tagged",
+                file.display()
+            );
+        }
+        let _ = fs::remove_dir_all(&d);
     }
 
     /// The predicate the gate reads, on a real file with a synthetic attribute: listed

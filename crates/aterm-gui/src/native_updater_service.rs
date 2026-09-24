@@ -57,6 +57,9 @@ pub(crate) struct UpdaterWorkTicket {
 /// staged bundle inside `aterm_update` to close the time-of-check/time-of-use gap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DurableUpdateStatus {
+    /// Native host context is separate from enrollment/installation facts.
+    pub(crate) linux_host: bool,
+    pub(crate) linux: Option<aterm_update::LinuxUpdateStatus>,
     pub(crate) enabled: bool,
     pub(crate) current_build: u64,
     pub(crate) staged_build: Option<u64>,
@@ -119,6 +122,10 @@ pub(crate) struct DurableUpdateStatus {
     /// surface keyed on that field alone reads "up to date" at a machine that
     /// will never update (round-11 audit).
     pub(crate) channel_unreadable: bool,
+    /// When the last check completed (Unix seconds; [`aterm_update::UpdateStatus::
+    /// updated_at`]), `None` when none has: Settings ▸ Software Update says "Checked 12
+    /// min ago" from it.
+    pub(crate) checked_at: Option<i64>,
 }
 
 /// Verified artifact identity retained across Settings-view close/reopen.
@@ -289,6 +296,9 @@ impl InstalledUpdate {
 /// consume this same value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdaterSnapshot {
+    pub(crate) linux_host: bool,
+    /// Read-only Linux disk facts, never macOS staged/apply authority.
+    pub(crate) linux: Option<aterm_update::LinuxUpdateStatus>,
     pub(crate) revision: u64,
     pub(crate) generation: u64,
     pub(crate) phase: UpdaterPhase,
@@ -329,6 +339,8 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) installable: bool,
     /// See [`DurableUpdateStatus::channel_unreadable`].
     pub(crate) channel_unreadable: bool,
+    /// See [`DurableUpdateStatus::checked_at`].
+    pub(crate) checked_at: Option<i64>,
 }
 
 impl UpdaterSnapshot {
@@ -695,6 +707,8 @@ impl NativeUpdaterService {
     ) -> Self {
         Self {
             snapshot: UpdaterSnapshot {
+                linux_host: false,
+                linux: None,
                 revision: 0,
                 generation: 0,
                 phase: if enabled {
@@ -722,6 +736,7 @@ impl NativeUpdaterService {
                 apply_failures_for_target: 0,
                 installable: true,
                 channel_unreadable: false,
+                checked_at: None,
             },
             next_operation: 1,
             work_generation: 0,
@@ -744,7 +759,10 @@ impl NativeUpdaterService {
     ) -> Self {
         let enabled = status.enabled;
         let mut service = Self::new(current_build, current_version, enabled);
+        service.snapshot.linux_host = status.linux_host || status.linux.is_some();
+        service.snapshot.linux = bounded_linux_status(status.linux.clone());
         service.snapshot.outcome = bounded(status.outcome.clone(), MAX_MESSAGE_BYTES);
+        service.snapshot.checked_at = status.checked_at;
         if !enabled {
             // A leftover ready marker is not apply authority when this build/machine
             // has disabled updates. Keep it invisible and non-actionable.
@@ -852,6 +870,21 @@ impl NativeUpdaterService {
         self.record(action, before);
         self.publish();
         CheckStart::Start(ticket)
+    }
+
+    /// Take a newer "last check completed" time from a reconcile: the window's own
+    /// background checks write only the ledger, so this is how "Checked 12 min ago"
+    /// stays true between the checks this reducer runs. Never moves backwards. Returns
+    /// whether it changed — the caller republishes on `true`.
+    pub(crate) fn note_checked_at(&mut self, checked_at: Option<i64>) -> bool {
+        match checked_at {
+            Some(at) if self.snapshot.checked_at.is_none_or(|held| at > held) => {
+                self.snapshot.checked_at = Some(at);
+                self.publish();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Reduce the exact result of one `aterm_update::check_now` worker.
@@ -990,6 +1023,8 @@ impl NativeUpdaterService {
 
         self.snapshot.outcome = bounded(status.outcome.clone(), MAX_MESSAGE_BYTES);
         self.snapshot.enabled = status.enabled;
+        self.snapshot.linux_host = status.linux_host || status.linux.is_some();
+        self.snapshot.linux = bounded_linux_status(status.linux.clone());
         // The persistent-failure verdict rides every reduced check: it is what the
         // update screen shows instead of "You're up to date" while the ledger says
         // this Mac cannot update. A staged or up-to-date reduction clears it below.
@@ -1011,6 +1046,9 @@ impl NativeUpdaterService {
         // unreadable (round-11 audit — the state records zero ledger failures,
         // so failing_persistent alone can never say it).
         self.snapshot.channel_unreadable = status.enabled && status.channel_unreadable;
+        if status.checked_at.is_some() {
+            self.snapshot.checked_at = status.checked_at;
+        }
         if !status.enabled {
             let before = self.model_state();
             self.snapshot.active = None;
@@ -1194,9 +1232,7 @@ impl NativeUpdaterService {
             self.pending_preflight = None;
             self.close_preflight_ready = false;
             self.publish();
-            return ApplyDecision::Blocked(vec![
-                "Automatic updates are disabled on this build".to_string(),
-            ]);
+            return ApplyDecision::Blocked(vec!["aterm updates itself on macOS only".to_string()]);
         }
         let Some(staged) = self.snapshot.staged.as_ref() else {
             self.pending_preflight = None;
@@ -1599,11 +1635,31 @@ pub(crate) fn usable_commit_identity(commit: &str) -> bool {
     (7..=40).contains(&commit.len()) && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn bounded_linux_status(
+    linux: Option<aterm_update::LinuxUpdateStatus>,
+) -> Option<aterm_update::LinuxUpdateStatus> {
+    linux.map(|mut status| {
+        status.staged_version = status
+            .staged_version
+            .map(|value| bounded(value, MAX_SHORT_TEXT_BYTES));
+        status.staged_commit = status
+            .staged_commit
+            .map(|value| bounded(value, MAX_SHORT_TEXT_BYTES));
+        status.trial_phase = status
+            .trial_phase
+            .map(|value| bounded(value, MAX_SHORT_TEXT_BYTES));
+        status
+    })
+}
+
 fn staged_from_status(
     running_build: u64,
     generation: u64,
     status: &DurableUpdateStatus,
 ) -> Option<StagedUpdate> {
+    if status.linux_host || status.linux.is_some() {
+        return None;
+    }
     if !status.enabled {
         return None;
     }
@@ -1737,8 +1793,34 @@ mod tests {
         );
     }
 
+    /// "Checked 12 min ago" rides every completed check this reducer runs AND every
+    /// reconcile (the window's background checks write only the ledger), and never
+    /// moves backwards: an older read must not make a fresh check look stale.
+    #[test]
+    fn the_last_check_time_follows_checks_and_reconciles_forward_only() {
+        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+        assert_eq!(service.snapshot().checked_at, None);
+        let CheckStart::Start(ticket) = service.request_check() else {
+            panic!("an idle service starts a check");
+        };
+        let mut checked = status(None);
+        checked.checked_at = Some(1_000);
+        service.finish_check(ticket, checked);
+        assert_eq!(service.snapshot().checked_at, Some(1_000));
+        assert!(service.note_checked_at(Some(2_000)));
+        assert_eq!(service.snapshot().checked_at, Some(2_000));
+        assert!(
+            !service.note_checked_at(Some(1_500)),
+            "an older read is not news"
+        );
+        assert!(!service.note_checked_at(None));
+        assert_eq!(service.snapshot().checked_at, Some(2_000));
+    }
+
     fn status(staged_build: Option<u64>) -> DurableUpdateStatus {
         DurableUpdateStatus {
+            linux_host: false,
+            linux: None,
             enabled: true,
             current_build: 10,
             staged_build,
@@ -1760,7 +1842,36 @@ mod tests {
             apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
+            checked_at: None,
         }
+    }
+
+    #[test]
+    fn linux_update_status_survives_reduction_without_macos_apply_authority() {
+        let mut durable = status(Some(12));
+        durable.linux_host = true;
+        durable.linux = Some(aterm_update::LinuxUpdateStatus {
+            installed_build: 10,
+            staged_build: Some(12),
+            staged_version: Some("1.0.12".into()),
+            staged_commit: Some(TEST_COMMIT.into()),
+            trial_phase: None,
+            trial_starts: 0,
+            trial_healthy: false,
+        });
+        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+        let CheckStart::Start(ticket) = service.request_check() else {
+            panic!("check admitted")
+        };
+        assert_eq!(
+            service.finish_check(ticket, durable.clone()),
+            CheckCompletion::Reduced
+        );
+        assert_eq!(service.snapshot().linux, durable.linux);
+        assert!(service.snapshot().linux_host);
+        assert!(service.snapshot().staged.is_none());
+        assert!(!service.install_when_safe());
+        assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
     }
 
     fn installed(
@@ -2045,6 +2156,8 @@ mod tests {
         // A DOWNLOAD marker (a real DMG digest) with a short sha still mints nothing:
         // the short-sha allowance is bound to the activation digest and only it.
         let mut download = DurableUpdateStatus {
+            linux_host: false,
+            linux: None,
             enabled: true,
             current_build: 11,
             staged_build: Some(12),
@@ -2062,6 +2175,7 @@ mod tests {
             apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
+            checked_at: None,
         };
         assert!(staged_from_status(11, 0, &download).is_none());
         download.staged_commit = Some("0".repeat(40));
@@ -2081,6 +2195,8 @@ mod tests {
         assert!(stage.is_installed_activation());
         // …and the durable import accepts exactly what the activation constructed.
         let status = DurableUpdateStatus {
+            linux_host: false,
+            linux: None,
             enabled: true,
             current_build: 11,
             staged_build: Some(12),
@@ -2098,6 +2214,7 @@ mod tests {
             apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
+            checked_at: None,
         };
         let imported = staged_from_status(11, 0, &status).expect("the import must accept it");
         assert_eq!(imported.commit, stage.commit);

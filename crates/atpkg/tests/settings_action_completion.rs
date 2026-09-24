@@ -40,7 +40,6 @@ fn run_with_deadline(
         // compiled-in paper-master keyset (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`
         // via `atpkg::PKG_TRUST_ANCHORS`) and nothing ambient can supply or swap it.
         .env("ATPKG_REGISTRY", format!("dir:{}", registry.display()))
-        .env_remove("ATPKG_DISABLE")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -149,7 +148,6 @@ fn run_capture(home: &Path, config_home: &Path, registry: &Path, args: &[&str]) 
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config_home)
         .env("ATPKG_REGISTRY", format!("dir:{}", registry.display()))
-        .env_remove("ATPKG_DISABLE")
         .output()
         .expect("run dev atpkg child");
     (

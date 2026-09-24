@@ -113,11 +113,11 @@ pub(crate) enum MotionEffect {
     /// inactive — timers disarm) — bypass-to-final-state (the drained-empty
     /// frame), not a freeze.
     MatrixRain,
-    /// The transient update NOTICE card's slide (`notice::layout` scales
-    /// `TransientNotice::rise` by this amplitude): 0 ⇒ the card holds its rest
-    /// position for its whole life and only the alpha ramp remains. The pill
-    /// still SHOWS under reduced motion — it is information, like the scroll
-    /// pill — it simply stops travelling.
+    /// Robi's tip BUBBLE's slide (`robi_bubble::layout` scales
+    /// `RobiBubble::rise` by this amplitude; the name is the retired
+    /// transient notice's, whose widget the bubble is): 0 ⇒ the bubble holds
+    /// its rest position for its whole life and only the alpha ramp remains.
+    /// It still SHOWS under reduced motion — it simply stops travelling.
     NoticePill,
     /// ROBI the helper robot's show (`aterm_effects::robi`, gated in the
     /// redraw's Robi block): 0 ⇒ no show STARTS and a live one is stopped —
@@ -145,6 +145,14 @@ pub(crate) enum MotionEffect {
     /// image, byte for byte (the information, "driven", is the rim itself and
     /// the band's words; the flash is decoration).
     PresenceRipple,
+    /// The MESSAGE BAND's live indicator (design §10.8, ruling 140): a busy
+    /// row's braille spinner and whole-row comet (`aterm_messages::Meter::busy`
+    /// — main's `BandBusy`, folded in on the merge: one effect, one gate), the
+    /// determinate bar's glide and glint, the completion echo's glow and fade.
+    /// 0 ⇒ `Pace::Still`: a bar that moves only with its data, a busy row's own
+    /// glyph over its unlit track, a still ✓ on completion. The information
+    /// stays; the movement goes (the notice pill's rule).
+    BandProgress,
 }
 
 impl MotionEffect {
@@ -154,7 +162,7 @@ impl MotionEffect {
     /// cannot silently skip the reduced-motion invariant. Test-only, like
     /// `seq`: production consumers gate per-effect via [`MotionPolicy`].
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SettingsDemo,
@@ -167,6 +175,7 @@ impl MotionEffect {
         Self::OutputStreak,
         Self::UpgradeSurge,
         Self::PresenceRipple,
+        Self::BandProgress,
     ];
 
     /// Stable index of each variant (0..ALL.len()). EXHAUSTIVE match on purpose:
@@ -188,6 +197,7 @@ impl MotionEffect {
             Self::OutputStreak => 9,
             Self::UpgradeSurge => 10,
             Self::PresenceRipple => 11,
+            Self::BandProgress => 12,
         }
     }
 
@@ -216,7 +226,8 @@ impl MotionEffect {
             | Self::Robi
             | Self::OutputStreak
             | Self::UpgradeSurge
-            | Self::PresenceRipple => false,
+            | Self::PresenceRipple
+            | Self::BandProgress => false,
         }
     }
 }
@@ -255,11 +266,16 @@ pub(crate) enum SeriousEffect {
     /// The presence rim's turn-submit ripple: decoration on a rim that
     /// otherwise moves only with a fact.
     PresenceRipple,
+    /// The message band's live indicator MOTION (STATUS-SURFACE.md:739-741:
+    /// Serious Mode retires motion) — the busy spinner and comet included
+    /// (main's `BandBusy`, folded in on the merge). The band and its words
+    /// stay; the indicator takes its still form.
+    BandProgress,
 }
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -273,6 +289,7 @@ impl SeriousEffect {
         Self::GpuPostFx,
         Self::Robi,
         Self::PresenceRipple,
+        Self::BandProgress,
     ];
 
     #[cfg(test)]
@@ -291,6 +308,7 @@ impl SeriousEffect {
             Self::GpuPostFx => 10,
             Self::Robi => 11,
             Self::PresenceRipple => 12,
+            Self::BandProgress => 13,
         }
     }
 }
@@ -325,7 +343,8 @@ impl SeriousModePolicy {
             | SeriousEffect::SettingsPreview
             | SeriousEffect::GpuPostFx
             | SeriousEffect::Robi
-            | SeriousEffect::PresenceRipple => !self.serious,
+            | SeriousEffect::PresenceRipple
+            | SeriousEffect::BandProgress => !self.serious,
         }
     }
 }
@@ -371,7 +390,8 @@ impl MotionPolicy {
                 | MotionEffect::Robi
                 | MotionEffect::OutputStreak
                 | MotionEffect::UpgradeSurge
-                | MotionEffect::PresenceRipple => 0.0,
+                | MotionEffect::PresenceRipple
+                | MotionEffect::BandProgress => 0.0,
             },
         }
     }
@@ -460,15 +480,18 @@ mod tests {
             for system_reduce in [false, true] {
                 for focused in [false, true] {
                     let p = MotionPolicy::resolve(mode, system_reduce, focused);
-                    // EXACTLY the host's fold in `tick_cursor_fx`: the motion
-                    // amplitude scales the VISUAL scalar, and `audible` is
-                    // focus and the user's own brightness knob (nonzero here)
-                    // — it reads nothing from `p`.
-                    let cfg = GlowConfig {
-                        intensity: base.intensity * p.amplitude(MotionEffect::CursorGlow),
-                        audible: focused,
-                        ..base
-                    };
+                    // THE host's fold, called rather than transcribed: the
+                    // motion amplitude scales the VISUAL scalar, and
+                    // `audible` is focus and the user's own brightness knob
+                    // (nonzero here) — it reads nothing from `p`. No load
+                    // shed in this domain (envelope 1.0).
+                    let mut cfg = base;
+                    crate::sound_seam::fold_window_audibility(
+                        &mut cfg,
+                        p.amplitude(MotionEffect::CursorGlow),
+                        1.0,
+                        focused,
+                    );
                     let mut glow = CursorGlow::default();
                     let mut out = Vec::new();
                     glow.tick(Some((2, 0)), t0, &base, geom, &mut out);

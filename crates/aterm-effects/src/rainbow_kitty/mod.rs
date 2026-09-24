@@ -1880,10 +1880,11 @@ impl Engine {
     }
 
     /// **THE ROWS THE WITNESS WANTS** — the distinct rows the resident
-    /// ribbon occupies, then (2026-09-21, the band follows its text) the
-    /// row ABOVE and BELOW each of them, written into `out` (at most
-    /// `out.len()`, ribbon rows first so a full array drops neighbours, not
-    /// ribbon rows; deduped; no row past the grid); returns how many. The
+    /// ribbon occupies and (2026-09-21, the band follows its text) the
+    /// row ABOVE and BELOW each of them. The hand's run and its two possible
+    /// one-row follow destinations go first, then other resident rows and
+    /// their neighbours, up to `out.len()` (deduped, no row past the grid).
+    /// Returns how many. The
     /// host samples exactly these rows under its terminal lock before the
     /// tick and hands them to [`Engine::follow_rows`] and
     /// [`Engine::witness_rows`]; a grid scan of anything else would be a
@@ -1896,36 +1897,50 @@ impl Engine {
     /// a row whose cells are all retired-but-resident is still sampled for up
     /// to `RETIRE_MELT_S` (harmless — one `row_cols_into` on a row the melt is
     /// about to empty), and past `out.len()` rows the surplus is dropped, the
-    /// unsampled rows keeping their own clocks.
+    /// unsampled rows keeping their own clocks. The focused row is a cohort
+    /// on the caret's row when present, otherwise the most recently alive
+    /// cohort: its potential landing row must not lose to older bands when
+    /// the fixed row budget fills.
     pub fn ribbon_rows(&self, out: &mut [u16]) -> usize {
         if !self.engaged {
             return 0;
         }
         let mut n = 0usize;
-        for coh in self.ribbon.cohorts() {
-            if n == out.len() {
-                break;
+        let add = |out: &mut [u16], n: &mut usize, row: u16| {
+            if row < self.grid_rows && *n < out.len() && !out[..*n].contains(&row) {
+                out[*n] = row;
+                *n += 1;
             }
-            if !out[..n].contains(&coh.row) {
-                out[n] = coh.row;
-                n += 1;
+        };
+        if let Some(focus) = self
+            .ribbon
+            .cohorts()
+            .iter()
+            .max_by_key(|coh| (self.caret_known && coh.row == self.caret.0, coh.alive_at))
+        {
+            add(out, &mut n, focus.row);
+            for row in [focus.row.checked_sub(1), focus.row.checked_add(1)]
+                .into_iter()
+                .flatten()
+            {
+                add(out, &mut n, row);
             }
         }
-        let rows = n;
-        for i in 0..rows {
-            let row = out[i];
-            for nb in [row.checked_sub(1), row.checked_add(1)] {
+        for coh in self.ribbon.cohorts() {
+            add(out, &mut n, coh.row);
+            if n == out.len() {
+                return n;
+            }
+        }
+        for coh in self.ribbon.cohorts() {
+            for nb in [coh.row.checked_sub(1), coh.row.checked_add(1)] {
                 if n == out.len() {
                     return n;
                 }
                 let Some(nb) = nb else {
                     continue;
                 };
-                if nb >= self.grid_rows || out[..n].contains(&nb) {
-                    continue;
-                }
-                out[n] = nb;
-                n += 1;
+                add(out, &mut n, nb);
             }
         }
         n
@@ -5576,6 +5591,77 @@ mod tests {
             "the window's tally survives a reset"
         );
         assert!(eng.witness.is_empty());
+    }
+
+    /// Three short, disjoint typed runs need nine distinct content samples:
+    /// each run's own row and both possible one-row landing rows. The third
+    /// run is the one under the hand. If the fixed sample budget drops its
+    /// lower neighbor, a composer rewrite that moves its text down one row
+    /// leaves the ribbon on the old row instead of carrying it with the text.
+    #[test]
+    fn three_disjoint_cohorts_keep_the_hands_lower_follow_row_in_the_witness() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+        tick_at(&mut eng, t0);
+        let mut t = t0;
+        for row in [3u16, 7, 11] {
+            if row != 3 {
+                eng.observe_caret((row, 2));
+                tick_at(&mut eng, t);
+                assert_eq!(eng.caret_mirror(), (row, 2));
+            }
+            for col in 2..4u16 {
+                t += ms(12);
+                eng.on_event(typed(1), t);
+                tick_at(&mut eng, t);
+                let echo = t + ms(1);
+                eng.on_event(
+                    Event::Sweep {
+                        row,
+                        col0: col,
+                        col1: col + 1,
+                    },
+                    t,
+                );
+                eng.on_event(mv((row, col), (row, col + 1), Licence::Typed), echo);
+                tick_at(&mut eng, echo);
+                t = echo;
+            }
+            assert!(
+                eng.field_at(row, 2).is_some() && eng.field_at(row, 3).is_some(),
+                "fixture: two typed ribbon cells on row {row}"
+            );
+        }
+        let text: Vec<char> = "  ab".chars().collect();
+        let blank: Vec<char> = "    ".chars().collect();
+        let original = [3u16, 7, 11].map(|row| RowSample { row, cols: &text });
+        assert_eq!(eng.witness_rows(&original, t), 0, "arm the three runs");
+        let mut wanted = [0u16; witness::WITNESS_ROWS];
+        let n = eng.ribbon_rows(&mut wanted);
+        assert!(
+            wanted[..n].contains(&12),
+            "the hand's run on row 11 needs row 12 to follow its text; requested {:?}",
+            &wanted[..n]
+        );
+        let moved = wanted[..n]
+            .iter()
+            .map(|&row| RowSample {
+                row,
+                cols: if row == 12 || row == 3 || row == 7 {
+                    &text
+                } else {
+                    &blank
+                },
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(eng.follow_rows(&moved, t + ms(5)), 2);
+        tick_at(&mut eng, t + ms(5));
+        assert!(
+            eng.field_at(12, 2).is_some() && eng.field_at(12, 3).is_some(),
+            "the lit run followed its text onto row 12"
+        );
     }
 
     /// §12, §8.1 no. 1 and §6.7 at the seam: a licensed nav jump mints

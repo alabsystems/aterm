@@ -1,0 +1,23 @@
+# claude-code 2.1.281 · MEASURED 2026-09-24, the live E2E recorder (`aterm ctl text` every 0.12 s; it drops blank rows and keeps the last 22) of a private headless aterm; the scratch path shortened to /private/tmp/claude-502/scratch/e2e, rows otherwise as read · bypass mode, the rm circuit-breaker box with 2.1.281's auto-deny countdown row
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    /private/tmp/claude-502/scratch/e2e/work
+▎ ※ You've been granted a $250 bonus credit for cloud sessions, on top of your plan limits · /claim-credit
+  1 more notice hidden
+❯ Use the Bash tool to run exactly this one line, verbatim, as one call:
+  S=/private/tmp/claude-502/scratch/e2e/work/tmp; for
+  p in a b; do set -- $p; rm -rf $S/$1; done
+⏺ Deleting temporary directories
+  ⎿  $ S=/private/tmp/claude-502/scratch/e2e/work/tmp;
+     for p in a b; do set -- $p; rm -rf $S/$1; done
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+   │ S=/private/tmp/claude-502/scratch/e2e/work/tmp;
+   │ for p in a b; do set -- $p; rm -rf $S/$1; done
+   Delete temporary directories
+ │ Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1` (bind $1 and rewrite its $S as
+ │ "${S:?}" or use a literal path)
+ ⚠ Claude Code will automatically deny this request in 1:59, to avoid blocking progress on an unattended session
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+ Esc to cancel · Tab to amend

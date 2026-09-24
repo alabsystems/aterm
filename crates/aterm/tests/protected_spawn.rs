@@ -42,8 +42,9 @@ const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 /// lane reads the machine's atpkg prefix under `$HOME` and may spawn a DETACHED
 /// `aterm pkg update` against it; run as-is from `cargo test`, that pass rewrote
 /// the owner's REAL `<prefix>/status.toml`. Every launch therefore gets private
-/// HOME/config/data/update roots and explicit opt-outs for package, reroute and
-/// native-update work. `ATPKG_DISABLE` alone does not gate the latter two seams.
+/// HOME/config/data roots whose `aterm.toml` switches the package and native-update
+/// lanes off (`launch_isolation::CONFIG_OFF` — settings, since the environment vetoes
+/// are gone), and `--no-reroute`, so nothing is laid for the upstream Rust names.
 /// `/bin/sh` is the shell, and piped stdio still routes to the SESSION.
 #[cfg(unix)]
 fn session_command(test: &str) -> Command {
@@ -54,7 +55,7 @@ fn session_command(test: &str) -> Command {
     launch_isolation::prepare(&root).expect("prepare private session state");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, &root);
-    cmd.arg("--session");
+    cmd.args(["--session", launch_isolation::NO_REROUTE]);
     cmd
 }
 

@@ -32,7 +32,7 @@ aterm-update = { path = "../aterm-update" }
 # be updated yet, and spawns the one-shot pass, without reaching into atpkg's
 # internals beyond the file.
 aterm-update-core = { path = "../aterm-update-core" }
-aterm-log = { path = "../aterm-log" }    # stderr logger for the headless update lane
+aterm-log = { path = "../aterm-log" }    # the log facade (the update verb records to aterm.log)
 # THE compiler gate (crates/trust-gate): a build script with no dependencies
 # that refuses any non-Trust rustc FIRST, with the one message naming the fix
 # (`aterm pkg doctor`, or the installer), instead of letting an upstream
@@ -83,6 +83,20 @@ aterm-link = { path = "../aterm-link" }
 # the host that serves it, build with `-p aterm --features sealed`. It forwards
 # to a unix-only dependency, so on other targets it enables nothing.
 sealed = ["aterm-link/sealed"]
+# DEVELOPMENT SEAMS in an optimized build: every `aterm_types::dev_seam!` read (the
+# `ATPKG_REGISTRY` fetch source, the `ATERM_UPDATE_ROOT` ledger, the handoff deadlines,
+# the `ATERM_DEBUG_*` screenshot seams, …) and the development settings (`[update]`
+# owner/repo, `[packages]` prefix/account/repo links). A debug build compiles them
+# anyway; an optimized QA build asks for them with `-p aterm --features dev-seams`.
+# The release cutter NEVER enables it — `aterm-release`'s buildplan pins that — so a
+# shipped binary reads none of them (owner, 2026-09-22: "NOT ENV VARS those are for
+# development").
+dev-seams = [
+    "aterm-cli/dev-seams",
+    "aterm-gui/dev-seams",
+    "aterm-update/dev-seams",
+    "atpkg/dev-seams",
+]
 
 [dev-dependencies]
 # The front-door verb-routing test drives the binary under a REAL pty: the

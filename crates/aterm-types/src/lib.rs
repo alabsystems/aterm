@@ -28,6 +28,9 @@ mod trust_fmt;
 
 pub mod sync;
 
+// `dev_seam!` — the one reader of a development-only environment variable.
+pub mod dev_seam;
+
 pub mod verification;
 
 pub mod ordered_map;

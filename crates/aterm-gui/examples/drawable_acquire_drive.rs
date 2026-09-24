@@ -173,8 +173,9 @@ while True:
             }
             command
                 .env("ATERM_CONTROL_SOCK", phase.join("ctl.sock"))
+                // A scratch HOME keeps every lane off the machine: the reroute stubs
+                // and the package store live under it (no environment veto exists).
                 .env("HOME", phase.join("home"))
-                .env("ATERM_NO_REROUTE", "1")
                 .env("XDG_RUNTIME_DIR", phase.join("run"))
                 .env("XDG_CONFIG_HOME", phase.join("cfg"))
                 .env("XDG_STATE_HOME", phase.join("state"))

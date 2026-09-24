@@ -28,7 +28,7 @@ use crate::{App, FONT_ZOOM_STEP, Wake, WindowId, keybinding, keymap, menu, pane,
 /// typist's inter-key gap, so a burst never drops the bypass mid-word; short enough
 /// that a key which never echoes releases it within a couple of frames. Every key
 /// re-arms it, so this is a tail after the LAST key, not a per-key budget.
-const INPUT_HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+pub(crate) const INPUT_HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How far AHEAD of its event-loop arrival a key enqueued on the per-session
 /// ordering FIFO stamps the word engine's typed-edit witness — the projected
@@ -137,21 +137,20 @@ pub(crate) struct DeliveryReceipt {
 }
 
 /// How many delivery receipts the tracker keeps for the render prelude: a
-/// paste and every key typed behind it drain back to back and complete
-/// inside one frame, and the prelude reads them in one batch — this is a
-/// FRAME's worth of receipts. The FIFO writer drains a paste and the keys
-/// behind it inside one frame and is not the thing that stalls (the app
-/// is), so it is not sized to the engine's press bank, which is deeper
-/// (`TYPED_STAMP_DEPTH`, 128 since 2026-09-12) because presses wait on the
-/// APP; 32 was the two numbers' shared value when the register was
-/// reviewed, and it stays here. Older receipts are dropped, newest kept,
-/// and a drop is LOUD: [`Deliveries::evicted`] counts the receipts a reader
-/// missed, so `latest` never jumps past one silently.
-pub(crate) const DELIVERY_RING: usize = 32;
+/// paste and every key typed behind it can drain back to back before one
+/// frame reads them. The cursor engine can hold 128 unpaid typed presses;
+/// the delivery register must also hold the paste that preceded that whole
+/// run, plus room for other ticketed chords and multi-file inserts. At 32,
+/// the first paste's receipt was overwritten after 33 queued keys, leaving
+/// its first visible echo without its insert licence. Two press-bank depths
+/// cover that full run and its preceding ticketed work without adding a
+/// per-delivery allocation. Beyond this bound, [`Deliveries::evicted`]
+/// reports the lost receipts; `latest` never jumps past them silently.
+pub(crate) const DELIVERY_RING: usize = 2 * aterm_effects::cursor_glow::TYPED_STAMP_DEPTH;
 
 /// The deliveries a window has not yet applied, in serial order
 /// ([`OutputEchoTracker::deliveries_after`]).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Deliveries {
     /// The newest resolved serial — what the window records as seen.
     pub(crate) latest: u64,
@@ -166,9 +165,18 @@ pub(crate) struct Deliveries {
     pub(crate) evicted: u64,
 }
 
+impl Default for Deliveries {
+    fn default() -> Self {
+        Self {
+            latest: 0,
+            items: [None; DELIVERY_RING],
+            evicted: 0,
+        }
+    }
+}
+
 /// Acceptance-ordered echo evidence. The sink token, timestamps, and spill mode
 /// move under one tiny lock so a renderer can never combine different writes.
-#[derive(Default)]
 struct OutputEchoPublished {
     order: Option<AcceptedOrder>,
     last_accepted_us: u64,
@@ -184,6 +192,20 @@ struct OutputEchoPublished {
     deliveries: [Option<DeliveryReceipt>; DELIVERY_RING],
     delivery_head: usize,
     delivery_serial: u64,
+}
+
+impl Default for OutputEchoPublished {
+    fn default() -> Self {
+        Self {
+            order: None,
+            last_accepted_us: 0,
+            last_boundary_us: 0,
+            spill_debt: None,
+            deliveries: [None; DELIVERY_RING],
+            delivery_head: 0,
+            delivery_serial: 0,
+        }
+    }
 }
 
 impl OutputEchoPublished {
@@ -943,7 +965,7 @@ mod output_echo_tracker_tests {
     /// THE RING HOLDS A FRAME'S WORTH (2026-09-11): a paste's receipt and
     /// the receipts of every key typed behind it complete inside one frame
     /// (the FIFO drains them back to back), and the prelude reads them in
-    /// one batch. The register keeps a frame's worth (`DELIVERY_RING`, 32);
+    /// one batch. The register keeps a frame's worth (`DELIVERY_RING`);
     /// an eight-slot ring lost the paste under nine completions and
     /// `latest` jumped past it silently. Past the depth the loss is LOUD:
     /// the read reports how many it missed.
@@ -2046,23 +2068,23 @@ const fn native_binding_allowed(action: keybinding::Action) -> bool {
 /// the writer thread (no encoder duplication, so the Human/Controller byte
 /// invariant is untouched — only WHERE the write runs moves).
 ///
-/// The keystroke HOT PATH is unchanged in the common case: [`is_ordering`] first
-/// reads ONE process-wide relaxed atomic (`ACTIVE`) and, while no paste is in
-/// flight ANYWHERE, returns immediately with no registry lock. All of `App::input`
-/// runs on the single UI thread, so a session's `pending` count is only ever
-/// raised by that thread and lowered by its writer: a keystroke that observes
-/// `pending == 0` knows the paste already landed and can safely go inline.
+/// The keystroke hot path reads only its own sink's pending-job atomic, with
+/// no process-wide registry lock even while a different session pastes. All of
+/// `App::input` runs on the single UI thread, so a session's count is raised
+/// before the next key can choose inline delivery and lowered by its writer
+/// only after the preceding write completes.
 pub(crate) mod paste_order {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
     use std::sync::{Arc, LazyLock, Mutex, Weak};
+    use std::time::Duration;
 
     use super::{
-        DeliveryTicket, InputEvent, OutputEchoTracker, SinkWriter, Terminal,
+        DeliveryTicket, InputEvent, OutputEchoTracker, SinkWriter, Terminal, Wake,
         tracked_egress_ticketed,
     };
     use aterm_core::terminal::ModeMirror;
+    use winit::event_loop::EventLoopProxy;
 
     /// A deferred egress: run `seam_egress(term, sink, ev)` on the writer thread.
     struct Job {
@@ -2071,7 +2093,6 @@ pub(crate) mod paste_order {
         sink: Arc<SinkWriter>,
         echo: Arc<OutputEchoTracker>,
         ev: InputEvent,
-        pending: Arc<AtomicUsize>,
         /// What this write's completion re-stamps on the cursor engines
         /// (the delivery edge, 2026-09-10) — `None` for a write nobody's
         /// licence waits on.
@@ -2081,37 +2102,59 @@ pub(crate) mod paste_order {
         /// bytes actually leave. `0` when no keystroke is behind this job (a paste
         /// body, a control verb).
         key_ns: u64,
+        /// A visible press queued behind this sink's paste, never the paste or
+        /// a key release. Kernel delivery renews the short echo-present window.
+        hot_key: Option<(u64, Option<EventLoopProxy<Wake>>)>,
     }
 
-    /// One session's serializer: the FIFO sender, its outstanding-job count, and a
-    /// `Weak` to the session sink so a closed tab's entry can be pruned.
+    /// One session's serializer: the FIFO sender and a `Weak` to the session
+    /// sink so a closed tab's entry can be pruned. The pending-job count lives
+    /// on that sink, which the hot path already holds.
     struct Serializer {
         tx: Sender<Job>,
-        pending: Arc<AtomicUsize>,
         sink: Weak<SinkWriter>,
     }
 
-    /// Outstanding jobs across ALL sessions. The keystroke hot path reads only
-    /// this; while it is 0 (no paste in flight anywhere) keys go inline, no lock.
-    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
     /// session master key -> serializer. Created lazily on the first paste, pruned
     /// once the session's sink is gone.
     static REG: LazyLock<Mutex<HashMap<i32, Serializer>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    /// A queued key is the only completed write that can renew echo-present
+    /// priority. Only a full, non-empty DIRECT receipt qualifies: a spill
+    /// receipt is FIFO admission, and waiting for its whole-sink drain would
+    /// hold the session's sole ordered writer behind unrelated later input.
+    pub(super) fn completed_queued_key_wake(
+        receipt: crate::input::EgressReceipt,
+        session: Option<u64>,
+    ) -> Option<Wake> {
+        let session =
+            session.filter(|_| receipt.fully_accepted_nonempty() && receipt.is_direct())?;
+        Some(Wake::QueuedKeyDelivered {
+            session,
+            at: std::time::Instant::now(),
+        })
+    }
+
     /// The writer thread body: drain jobs in FIFO order, writing each through the
-    /// SAME seam the inline path uses. Exits when the sender drops (session gone).
-    fn run(rx: Receiver<Job>) {
-        while let Ok(job) = rx.recv() {
+    /// SAME seam the inline path uses. The registry retains its sender until a
+    /// later paste prunes it, so also retire an idle writer after its sink dies.
+    /// A queued job owns the sink, and a live sink always keeps this worker.
+    fn run(rx: Receiver<Job>, sink: Weak<SinkWriter>, idle_check: Duration) {
+        loop {
+            let job = match rx.recv_timeout(idle_check) {
+                Ok(job) => job,
+                Err(RecvTimeoutError::Timeout) if sink.strong_count() == 0 => break,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             // The egress-order writer thread is expendable: block under SPILL_CAP so
             // a wedged foreground applies backpressure HERE, not by growing the spill.
-            // The bytes are on the wire when this returns: the write's finish
-            // publishes the job's delivery ticket with the acceptance (the
-            // cursor engines' delivered-insert / delivered-key stamps, applied
-            // by the render prelude), then the slice the UI thread could not
-            // book: hardware key arrival → completed write, including the
-            // time this job spent queued behind the paste ahead of it.
-            tracked_egress_ticketed(
+            // The write's finish publishes its delivery ticket at sink
+            // acceptance (direct kernel write or bounded spill admission).
+            // The metric then books the slice the UI thread could not: hardware
+            // key arrival → completed write, including time queued behind paste.
+            let receipt = tracked_egress_ticketed(
                 &job.term,
                 &job.modes,
                 &job.sink,
@@ -2121,23 +2164,33 @@ pub(crate) mod paste_order {
                 job.ticket,
             );
             crate::metrics::note_pty_write_at(job.key_ns);
-            job.pending.fetch_sub(1, Ordering::AcqRel);
-            ACTIVE.fetch_sub(1, Ordering::AcqRel);
+            if let Some((session, proxy)) = job.hot_key
+                && let Some(wake) = completed_queued_key_wake(receipt, Some(session))
+                && let Some(proxy) = proxy
+            {
+                // A reader can post the echo wake before this writer returns.
+                // Reconsider a content frame already deferred at the full,
+                // pre-key interval. A spill merely retires its FIFO job and
+                // preserves the original bounded arrival-time priority.
+                let _ = proxy.send_event(wake);
+            }
+            job.sink.retire_ordered_egress();
         }
     }
 
-    /// The FIFO sender + pending counter for `master`, spawning the writer thread
+    /// The FIFO sender for `master`, spawning the writer thread
     /// on first use. `None` iff the thread could not be spawned (caller writes
     /// inline — best effort, never wedged).
     fn writer_for(
         reg: &mut HashMap<i32, Serializer>,
         master: i32,
         sink: &Arc<SinkWriter>,
-    ) -> Option<(Sender<Job>, Arc<AtomicUsize>)> {
+    ) -> Option<Sender<Job>> {
         if let Some(s) = reg.get(&master) {
-            return Some((s.tx.clone(), s.pending.clone()));
+            return Some(s.tx.clone());
         }
         let (tx, rx) = channel::<Job>();
+        let weak_sink = Arc::downgrade(sink);
         std::thread::Builder::new()
             .name("aterm-egress-order".into())
             .spawn(move || {
@@ -2151,32 +2204,44 @@ pub(crate) mod paste_order {
                 // E-core-parked thread, and the deferred write is exactly the case
                 // the arrival stamp exists to measure.
                 crate::qos::set_self(crate::qos::Role::Interactive);
-                run(rx);
+                run(rx, weak_sink, Duration::from_secs(30));
             })
             .ok()?;
-        let pending = Arc::new(AtomicUsize::new(0));
         reg.insert(
             master,
             Serializer {
                 tx: tx.clone(),
-                pending: pending.clone(),
                 sink: Arc::downgrade(sink),
             },
         );
-        Some((tx, pending))
+        Some(tx)
     }
 
-    /// Whether egress for `master` must currently be ORDERED behind an in-flight
-    /// paste. One relaxed atomic in the common (no-paste) case; the registry lock
-    /// is taken only while some paste is draining.
-    pub(crate) fn is_ordering(master: i32) -> bool {
-        if ACTIVE.load(Ordering::Acquire) == 0 {
-            return false;
-        }
+    /// Whether this sink's egress must be ordered behind a submitted paste or
+    /// key. One acquire load, independent of every other session's queue.
+    pub(crate) fn is_ordering(sink: &SinkWriter) -> bool {
+        sink.ordered_egress_count() > 0
+    }
+
+    /// The update handoff's cold drain gate still needs the master-keyed
+    /// registry: its live-master list can outlast a session's pool entry while
+    /// a queued Job keeps the sink alive. Keep that conservative check without
+    /// charging every unrelated keystroke for the registry mutex.
+    #[cfg(unix)]
+    pub(crate) fn is_master_ordering_for_handoff(master: i32) -> bool {
         REG.lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&master)
-            .is_some_and(|s| s.pending.load(Ordering::Acquire) > 0)
+            .and_then(|serializer| serializer.sink.upgrade())
+            .is_some_and(|sink| sink.ordered_egress_count() > 0)
+    }
+
+    /// Test seam: keep the cold writer registry locked while another session
+    /// makes its hot-path ordering decision. The returned guard is deliberately
+    /// opaque so tests cannot inspect or mutate the registry's private state.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hold_registry_for_test() -> impl Drop {
+        REG.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Enqueue `ev` onto `master`'s FIFO so it reaches the PTY in submission order.
@@ -2189,9 +2254,10 @@ pub(crate) mod paste_order {
         echo: &Arc<OutputEchoTracker>,
         ev: InputEvent,
         ticket: Option<DeliveryTicket>,
+        hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
     ) -> Result<(), InputEvent> {
         let master = sink.master();
-        let (tx, pending) = {
+        let tx = {
             let mut reg = REG.lock().unwrap_or_else(|p| p.into_inner());
             // Prune sessions whose sink is gone (closed tabs): dropping the stored
             // Sender lets their idle writer thread exit. Cold path (paste only).
@@ -2203,8 +2269,7 @@ pub(crate) mod paste_order {
         };
         // Claim the FIFO slot BEFORE releasing to the writer: a later keystroke on
         // this same (UI) thread then observes pending > 0 and queues behind us.
-        pending.fetch_add(1, Ordering::AcqRel);
-        ACTIVE.fetch_add(1, Ordering::AcqRel);
+        sink.claim_ordered_egress();
         // Claim the arrival here so the UI thread's `note_pty_write` cannot
         // consume it on the way out and book a channel push as the write.
         //
@@ -2227,9 +2292,9 @@ pub(crate) mod paste_order {
             sink: sink.clone(),
             echo: echo.clone(),
             ev,
-            pending,
             key_ns,
             ticket,
+            hot_key: hot_key.map(|(session, proxy)| (session, proxy.cloned())),
         };
         match tx.send(job) {
             Ok(()) => Ok(()),
@@ -2238,8 +2303,7 @@ pub(crate) mod paste_order {
                 // counters and hand the event back for an inline write. Give the
                 // arrival stamp back too, or the inline fallback would measure
                 // nothing — the deferral we claimed it for never happened.
-                job.pending.fetch_sub(1, Ordering::AcqRel);
-                ACTIVE.fetch_sub(1, Ordering::AcqRel);
+                job.sink.retire_ordered_egress();
                 crate::metrics::restore_key_arrival(job.key_ns);
                 Err(job.ev)
             }
@@ -2261,20 +2325,36 @@ pub(crate) mod paste_order {
         sink: &Arc<SinkWriter>,
         echo: &Arc<OutputEchoTracker>,
         ev: &InputEvent,
-        mode: crate::input::EgressMode,
         ticket: Option<DeliveryTicket>,
+        hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
     ) -> (crate::input::EgressReceipt, bool) {
-        if is_ordering(sink.master()) {
-            match enqueue(term, modes, sink, echo, ev.clone(), ticket) {
+        if is_ordering(sink) {
+            match enqueue(term, modes, sink, echo, ev.clone(), ticket, hot_key) {
                 Ok(()) => (crate::input::EgressReceipt::deferred_full(), false),
                 Err(ev) => (
-                    tracked_egress_ticketed(term, modes, sink, echo, &ev, mode, None),
+                    tracked_egress_ticketed(
+                        term,
+                        modes,
+                        sink,
+                        echo,
+                        &ev,
+                        crate::input::EgressMode::Interactive,
+                        None,
+                    ),
                     true,
                 ),
             }
         } else {
             (
-                tracked_egress_ticketed(term, modes, sink, echo, ev, mode, None),
+                tracked_egress_ticketed(
+                    term,
+                    modes,
+                    sink,
+                    echo,
+                    ev,
+                    crate::input::EgressMode::Interactive,
+                    None,
+                ),
                 true,
             )
         }
@@ -2285,40 +2365,494 @@ pub(crate) mod paste_order {
     /// while a paste is still draining" without having to wedge a real PTY.
     ///
     /// It claims exactly what a real in-flight job claims (one slot on the
-    /// session's `pending` counter and one on `ACTIVE`) through the SAME
+    /// session's sink-local pending counter) through the SAME
     /// `writer_for` registry the paste path uses, so `is_ordering` answers for
     /// the real reason and the key that follows is enqueued by the real
-    /// `enqueue`. The pin is per-MASTER, so a test must hold a sink with its own
-    /// fd (`app_observing_pty`) or it will steer other tests' sessions too, and
-    /// the guard releases the slots on drop.
+    /// `enqueue`. The pin is per-sink, and the guard releases its slot on drop.
     #[cfg(test)]
     pub(crate) struct OrderingPin {
-        pending: Arc<AtomicUsize>,
+        sink: Arc<SinkWriter>,
     }
 
     #[cfg(test)]
     impl Drop for OrderingPin {
         fn drop(&mut self) {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
-            ACTIVE.fetch_sub(1, Ordering::AcqRel);
+            self.sink.retire_ordered_egress();
         }
     }
 
     #[cfg(test)]
     pub(crate) fn pin_ordering_for_test(sink: &Arc<SinkWriter>) -> OrderingPin {
         let master = sink.master();
-        let (_tx, pending) = {
+        {
             let mut reg = REG.lock().unwrap_or_else(|p| p.into_inner());
             // Test pipes reuse raw fd numbers aggressively. Mirror `enqueue`'s
             // stale-session pruning before resolving by that number, or a pin
             // can attach to a dead serializer from the previous fixture while
             // the real enqueue creates a fresh unpinned one.
             reg.retain(|_, s| s.sink.strong_count() > 0);
-            writer_for(&mut reg, master, sink).expect("egress-order writer thread")
+            writer_for(&mut reg, master, sink).expect("egress-order writer thread");
         };
-        pending.fetch_add(1, Ordering::AcqRel);
-        ACTIVE.fetch_add(1, Ordering::AcqRel);
-        OrderingPin { pending }
+        sink.claim_ordered_egress();
+        OrderingPin { sink: sink.clone() }
+    }
+
+    #[test]
+    fn closed_sink_retires_idle_writer_without_another_paste() {
+        let (tx, rx) = channel::<Job>();
+        let sink = Arc::new(SinkWriter::new(-1));
+        let weak_sink = Arc::downgrade(&sink);
+        let writer = std::thread::spawn(move || run(rx, weak_sink, Duration::from_millis(10)));
+
+        // The registry still owns `tx`, exactly as it does when the final pasted
+        // tab closes. A blocking recv would leave this thread alive forever.
+        drop(sink);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !writer.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let exited_with_sender_live = writer.is_finished();
+        drop(tx);
+        writer.join().expect("idle egress writer");
+        assert!(exited_with_sender_live);
+    }
+}
+
+#[cfg(test)]
+mod paste_order_sink_isolation_tests {
+    use super::paste_order;
+    use aterm_session::sink::SinkWriter;
+    use aterm_spec::derive::{paste_order_sink_isolation_model, queued_key_kernel_delivery_model};
+
+    #[cfg(unix)]
+    fn fill_socket_to_backpressure(writer: &mut std::os::unix::net::UnixStream) -> usize {
+        use std::io::Write;
+
+        writer.set_nonblocking(true).unwrap();
+        let mut wedged = 0usize;
+        loop {
+            match writer.write(&[b'.'; 4096]) {
+                Ok(n) if n > 0 => wedged += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected socket fill result: {other:?}"),
+            }
+        }
+        writer.set_nonblocking(false).unwrap();
+        assert!(wedged > 0);
+        wedged
+    }
+
+    /// Tier-1: the model's Begin/Complete actions drive the real sink counter,
+    /// and each Read action is compared with the shipping GUI decision. The
+    /// negative control is A pending while B is idle: a process-wide ACTIVE
+    /// decision would queue B, but B's own sink answers inline.
+    #[test]
+    fn a_sink_reads_only_its_own_ordered_input_jobs() {
+        let model = paste_order_sink_isolation_model();
+        for (a_jobs, b_jobs) in [
+            (0usize, 0usize),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (2, 0),
+            (0, 2),
+            (2, 1),
+            (1, 2),
+            (2, 2),
+        ] {
+            let a = SinkWriter::new(-1);
+            let b = SinkWriter::new(-2);
+            let mut state = model.init_state();
+            for _ in 0..a_jobs {
+                a.claim_ordered_egress();
+                assert!(model.fire("BeginA", &mut state));
+            }
+            for _ in 0..b_jobs {
+                b.claim_ordered_egress();
+                assert!(model.fire("BeginB", &mut state));
+            }
+            assert_eq!(a.ordered_egress_count() as i64, state["pending_a"]);
+            assert_eq!(b.ordered_egress_count() as i64, state["pending_b"]);
+
+            for (action, sink) in [("ReadA", &a), ("ReadB", &b)] {
+                let mut read = state.clone();
+                assert!(model.fire(action, &mut read));
+                assert_eq!(
+                    i64::from(paste_order::is_ordering(sink)),
+                    read["decision"],
+                    "{action} after A={a_jobs}, B={b_jobs}"
+                );
+            }
+            if a_jobs > 0 && b_jobs == 0 {
+                assert!(a.ordered_egress_count() + b.ordered_egress_count() > 0);
+                assert!(
+                    !paste_order::is_ordering(&b),
+                    "global ACTIVE is the caught cross-session mutant"
+                );
+            }
+            for _ in 0..a_jobs {
+                a.retire_ordered_egress();
+                assert!(model.fire("CompleteA", &mut state));
+                let mut read = state.clone();
+                assert!(model.fire("ReadA", &mut read));
+                assert_eq!(
+                    i64::from(paste_order::is_ordering(&a)),
+                    read["decision"],
+                    "A after a partial drain"
+                );
+            }
+            for _ in 0..b_jobs {
+                b.retire_ordered_egress();
+                assert!(model.fire("CompleteB", &mut state));
+                let mut read = state.clone();
+                assert!(model.fire("ReadB", &mut read));
+                assert_eq!(
+                    i64::from(paste_order::is_ordering(&b)),
+                    read["decision"],
+                    "B after a partial drain"
+                );
+            }
+            assert_eq!(a.ordered_egress_count() as i64, state["pending_a"]);
+            assert_eq!(b.ordered_egress_count() as i64, state["pending_b"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unrelated_key_decides_while_the_cold_registry_is_locked() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (app_a, a, pipe_a) = super::typed_kitty_summon_tests::app_with_private_pty();
+        let (app_b, b, pipe_b) = super::typed_kitty_summon_tests::app_with_private_pty();
+        let pin_a = paste_order::pin_ordering_for_test(&a);
+        let held = paste_order::hold_registry_for_test();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(paste_order::is_ordering(&b)).unwrap());
+        let decision = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().expect("ordering decision thread");
+        assert!(!decision.expect("an unrelated key never waits for REG"));
+        drop(app_a);
+        drop(a);
+        assert!(
+            paste_order::is_master_ordering_for_handoff(pipe_a[1]),
+            "the ordered slot still holds the sink after its pool entry is gone"
+        );
+        drop(pin_a);
+        assert!(!paste_order::is_master_ordering_for_handoff(pipe_a[1]));
+        drop(app_b);
+        unsafe {
+            libc::close(pipe_a[0]);
+            libc::close(pipe_a[1]);
+            libc::close(pipe_b[0]);
+            libc::close(pipe_b[1]);
+        }
+    }
+
+    /// Two real, independent input sinks: A submits a paste and a following
+    /// key to its writer while B submits many keys to its own PTY. Holding A's
+    /// ordering pin makes this interleaving independent of worker scheduling;
+    /// every B receipt must be an inline acceptance, and A's bytes must keep
+    /// their own FIFO order.
+    #[cfg(unix)]
+    #[test]
+    fn a_paste_in_one_session_does_not_queue_another_sessions_keys() {
+        use super::{InputEvent, Source, WindowId};
+        use crate::input::PasteFraming;
+        use std::time::Duration;
+
+        fn read_exact_pipe(fd: i32, count: usize) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(count);
+            for _ in 0..5000 {
+                if bytes.len() == count {
+                    break;
+                }
+                let mut chunk = [0u8; 256];
+                let len = (count - bytes.len()).min(chunk.len());
+                let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), len) };
+                if n > 0 {
+                    bytes.extend_from_slice(&chunk[..n as usize]);
+                } else if n == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                } else {
+                    panic!("pipe read returned {n} after {} bytes", bytes.len());
+                }
+            }
+            assert_eq!(bytes.len(), count, "the writer delivered every byte");
+            bytes
+        }
+
+        let (mut app_a, sink_a, pipe_a) = super::typed_kitty_summon_tests::app_with_private_pty();
+        let (app_b, sink_b, pipe_b) = super::typed_kitty_summon_tests::app_with_private_pty();
+        let wid = WindowId(0);
+        let pin_a = paste_order::pin_ordering_for_test(&sink_a);
+        assert!(paste_order::is_ordering(&sink_a));
+        assert!(!paste_order::is_ordering(&sink_b));
+        assert!(paste_order::is_master_ordering_for_handoff(pipe_a[1]));
+        assert!(!paste_order::is_master_ordering_for_handoff(pipe_b[1]));
+
+        assert_eq!(
+            app_a.input(
+                wid,
+                InputEvent::Paste("P".into(), PasteFraming::AtDrain),
+                Source::Human
+            ),
+            crate::input::InputOutcome::Ok
+        );
+        let a = app_a.front_terminal_mirror(wid).expect("A terminal");
+        let a_session = app_a.pool.get(a.session).expect("A session");
+        let (receipt_a, inline_a) = paste_order::ordered_or_inline(
+            &a.term,
+            &a_session.ctx.modes,
+            &a.sink,
+            &a_session.ctx.output_echo,
+            &InputEvent::Text("a".into()),
+            None,
+            None,
+        );
+        assert!(!inline_a, "A's later key must queue behind its paste");
+        assert!(matches!(
+            receipt_a.egress,
+            crate::input::Egress::Reported(_)
+        ));
+
+        let b = app_b.front_terminal_mirror(wid).expect("B terminal");
+        let b_session = app_b.pool.get(b.session).expect("B session");
+        for _ in 0..128 {
+            let (receipt, wrote_inline) = paste_order::ordered_or_inline(
+                &b.term,
+                &b_session.ctx.modes,
+                &b.sink,
+                &b_session.ctx.output_echo,
+                &InputEvent::Text("b".into()),
+                None,
+                None,
+            );
+            assert!(wrote_inline, "B's key must never join A's FIFO");
+            assert!(
+                receipt.accepted_order().is_some(),
+                "B has a real PTY receipt"
+            );
+            assert_eq!(sink_b.ordered_egress_count(), 0);
+        }
+        assert_eq!(read_exact_pipe(pipe_b[0], 128), vec![b'b'; 128]);
+        assert_eq!(read_exact_pipe(pipe_a[0], 2), b"Pa");
+        for _ in 0..5000 {
+            if sink_a.ordered_egress_count() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sink_a.ordered_egress_count(), 1, "only the pin remains");
+        drop(pin_a);
+        assert_eq!(sink_a.ordered_egress_count(), 0);
+        assert!(!paste_order::is_master_ordering_for_handoff(pipe_a[1]));
+        drop(a);
+        drop(b);
+        drop(app_a);
+        drop(app_b);
+        drop(sink_a);
+        drop(sink_b);
+        unsafe {
+            libc::close(pipe_a[0]);
+            libc::close(pipe_a[1]);
+            libc::close(pipe_b[0]);
+            libc::close(pipe_b[1]);
+        }
+    }
+    /// Tier-1 conformance: a real wedged sink accepts the whole key into its
+    /// spill, but the GUI's production decision returns without a wake or a
+    /// wait. Draining later cannot relabel that old receipt as direct.
+    #[cfg(unix)]
+    #[test]
+    fn spilled_queued_key_never_grants_a_direct_delivery_wake() {
+        use crate::input::{Delivery, EgressReceipt};
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+        let wedged = fill_socket_to_backpressure(&mut writer);
+
+        let write = sink.write_frame_nonparking_with_receipt(b"k").unwrap();
+        assert_eq!(write.accepted(), 1);
+        assert!(!write.is_direct(), "the wedged key entered the spill");
+        let receipt = EgressReceipt::from_reported_delivery(Delivery::Full, write.order());
+        let model = queued_key_kernel_delivery_model();
+        let mut state = model.init_state();
+        assert!(model.fire("AcceptSpill", &mut state));
+        assert!(!model.action_enabled("PostWake", &state));
+
+        let failed_prefix = EgressReceipt::from_reported_delivery(Delivery::Failed, write.order());
+        assert!(
+            paste_order::completed_queued_key_wake(failed_prefix, Some(7)).is_none(),
+            "a failed event's earlier accepted prefix cannot mint a key wake"
+        );
+        assert!(
+            paste_order::completed_queued_key_wake(receipt, None).is_none(),
+            "a paste receipt cannot mint a key wake"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(paste_order::completed_queued_key_wake(receipt, Some(7)))
+                .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("spill decision never waits for whole-sink drain")
+                .is_none()
+        );
+        worker.join().unwrap();
+
+        let mut received = Vec::with_capacity(wedged + 1);
+        let mut chunk = [0u8; 65536];
+        while received.len() < wedged + 1 {
+            let n = reader.read(&mut chunk).expect("drain accepted bytes");
+            assert!(n > 0, "peer closed before the queued key");
+            received.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(received.len(), wedged + 1);
+        assert_eq!(received[wedged], b'k');
+        assert!(model.fire("DrainSuccess", &mut state));
+        assert!(!model.action_enabled("PostWake", &state));
+        assert!(paste_order::completed_queued_key_wake(receipt, Some(7)).is_none());
+        assert!(model.check_invariant("WakeRequiresDirectReceipt", &state));
+    }
+
+    /// A hot key admitted behind an existing spill must retire its FIFO job
+    /// immediately. Holding the sole writer on a whole-sink drain would leave
+    /// both keys outstanding while the peer is wedged.
+    #[cfg(unix)]
+    #[test]
+    fn spilled_key_does_not_hold_later_queued_keys() {
+        use super::{InputEvent, WindowId};
+        use std::os::fd::AsRawFd;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let (app, _app_sink, app_pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
+        let mirror = app.front_terminal_mirror(WindowId(0)).expect("terminal");
+        let session = app.pool.get(mirror.session).expect("session");
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+        fill_socket_to_backpressure(&mut writer);
+        let seed = sink.write_frame_nonparking_with_receipt(b"s").unwrap();
+        assert!(!seed.is_direct(), "seed makes a real undrained spill");
+
+        for key in ["a", "b"] {
+            paste_order::enqueue(
+                &mirror.term,
+                &session.ctx.modes,
+                &sink,
+                &session.ctx.output_echo,
+                InputEvent::Text(key.into()),
+                None,
+                Some((mirror.session, None)),
+            )
+            .expect("enqueue key behind the spill");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.ordered_egress_count() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            sink.ordered_egress_count(),
+            0,
+            "a spilled hot key cannot hold the sole FIFO writer"
+        );
+        assert!(
+            !sink.egress_drained_to_kernel(),
+            "the backlog is still wedged: retirement did not wait for drain"
+        );
+
+        drop(reader);
+        drop(writer);
+        drop(sink);
+        drop(mirror);
+        drop(app);
+        unsafe {
+            libc::close(app_pipe[0]);
+            libc::close(app_pipe[1]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_queued_key_receipt_can_post_delivery_wake() {
+        use super::{InputEvent, WindowId};
+        use crate::input::EgressMode;
+
+        let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
+        let mirror = app.front_terminal_mirror(WindowId(0)).expect("terminal");
+        let session = app.pool.get(mirror.session).expect("session");
+        let receipt = crate::input::seam_egress_receipt(
+            &mirror.term,
+            &session.ctx.modes,
+            &sink,
+            &InputEvent::Text("d".into()),
+            EgressMode::Interactive,
+        );
+        assert!(receipt.fully_accepted_nonempty());
+        assert!(receipt.is_direct(), "the unwedged write reached the kernel");
+
+        let model = queued_key_kernel_delivery_model();
+        let mut state = model.init_state();
+        assert!(model.fire("AcceptDirect", &mut state));
+        assert!(model.action_enabled("PostWake", &state));
+        assert!(matches!(
+            paste_order::completed_queued_key_wake(receipt, Some(mirror.session)),
+            Some(super::Wake::QueuedKeyDelivered { session, .. }) if session == mirror.session
+        ));
+        assert!(model.fire("PostWake", &mut state));
+        assert!(model.check_invariant("WakeRequiresDirectReceipt", &state));
+
+        let mut delivered = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(pipe[0], delivered.as_mut_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(&delivered, b"d");
+        drop(mirror);
+        drop(app);
+        drop(sink);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// A dead peer discards spilled bytes; the old spill receipt remains
+    /// ineligible for a direct-delivery wake even after the queue empties.
+    #[cfg(unix)]
+    #[test]
+    fn peer_death_cannot_post_a_queued_key_delivery_wake() {
+        use crate::input::{Delivery, EgressReceipt};
+        use std::os::fd::AsRawFd;
+
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        fill_socket_to_backpressure(&mut writer);
+        let write = sink.write_frame_nonparking_with_receipt(b"k").unwrap();
+        assert!(!write.is_direct());
+        let receipt = EgressReceipt::from_reported_delivery(Delivery::Full, write.order());
+        let model = queued_key_kernel_delivery_model();
+        let mut state = model.init_state();
+        assert!(model.fire("AcceptSpill", &mut state));
+
+        drop(reader);
+        assert!(paste_order::completed_queued_key_wake(receipt, Some(7)).is_none());
+        assert!(model.fire("DrainFailure", &mut state));
+        assert!(!model.action_enabled("PostWake", &state));
+        assert!(model.check_invariant("WakeRequiresDirectReceipt", &state));
     }
 }
 
@@ -2757,9 +3291,8 @@ fn is_plain_enter(ev: &InputEvent) -> bool {
 }
 
 /// How many terminals are currently in vi (keyboard copy-mode) — the GUI-side
-/// mirror the two per-keystroke vi gates ([`App::vi_repeat_action`] and
-/// [`App::on_key_vi_mode`]) consult INSTEAD of the engine. Neither needs the
-/// terminal to answer, and the terminal mutex is the ONE lock a keystroke shares
+/// global zero check before the key path reads its focused session's own mirror.
+/// Neither check needs the terminal. Its mutex is the ONE lock a keystroke shares
 /// with the PTY reader: under heavy output an acquisition queues behind the
 /// reader's `process()` holds. `Terminal::vi_toggle` is the sole writer of the
 /// engine's `vi.active` anywhere in the workspace (`ViMode::activate`/
@@ -2767,9 +3300,10 @@ fn is_plain_enter(ev: &InputEvent) -> bool {
 /// file on the GUI thread, so the GUI can simply COUNT what it toggled.
 ///
 /// A COUNT, not a flag: two windows can hold two terminals in copy-mode at once.
-/// It is only ever consulted as "is it zero?", and every update is made under the
+/// It is only ever consulted as "is it zero?". The engine state is read under the
 /// SAME `term_lock` that performed the toggle (reading back `vi_is_active` there
-/// costs nothing), so the mirror cannot disagree with the engine. A terminal
+/// costs nothing), then both GUI mirrors are published on the event-loop thread.
+/// A terminal
 /// destroyed while still in copy-mode retires its `+1` through
 /// [`vi_note_terminal_gone`].
 static VI_ACTIVE_TERMINALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2807,8 +3341,7 @@ pub(crate) fn vi_note_terminal_gone(was_active: bool) {
 }
 
 /// Whether ANY terminal is in vi (keyboard copy-mode). One relaxed load; `false`
-/// is the common path and proves no key can need vi handling, so the two vi gates
-/// take ZERO terminal locks while nobody is in copy-mode.
+/// is the common path and proves no key can need vi handling.
 fn vi_any_active() -> bool {
     VI_ACTIVE_TERMINALS.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
@@ -4177,16 +4710,21 @@ impl App {
         let serious_sound = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::TerminalSound);
-        let inputs = crate::sound_seam::SeamInputs {
-            sounds_on: self.config.trail_sounds_or_default(),
-            volume: self.config.trail_sound_volume(),
-            trail_on: glow.enabled,
-            serious_allows: serious_sound,
-            focused,
-            resize_quiet: ws.resize_sound_quiet(now),
-            host,
-            engine_sound_live: ws.cursor_glow.sound_seam_open(),
-        };
+        // Built by the ONE constructor the `TrailSoundSeam` conformance's
+        // verb reader also calls, from the RESOLVED config (never the folded
+        // one: a shed or motion-reduced trail is still `trail_on`).
+        let inputs = crate::sound_seam::verb_seam_inputs(
+            &glow,
+            &ws.cursor_glow,
+            crate::sound_seam::HostSoundTerms {
+                sounds_on: self.config.trail_sounds_or_default(),
+                volume: self.config.trail_sound_volume(),
+                serious_allows: serious_sound,
+                focused,
+                resize_quiet: ws.resize_sound_quiet(now),
+                host,
+            },
+        );
         Ok(crate::tone_infer::ToneStatus {
             tone: ws.tone_tracker.current(),
             effective: ws.tone_tracker.effective(knob),
@@ -4837,15 +5375,8 @@ impl App {
             let mut terminal = term_lock(&term);
             let _ = apply_press_custody(&mut terminal, press_kind);
         }
-        let (receipt, _) = paste_order::ordered_or_inline(
-            &term,
-            &modes,
-            &sink,
-            &echo,
-            &ev,
-            input::EgressMode::Interactive,
-            None,
-        );
+        let (receipt, _) =
+            paste_order::ordered_or_inline(&term, &modes, &sink, &echo, &ev, None, None);
         egress_to_outcome(receipt.egress)
     }
 
@@ -5777,12 +6308,24 @@ impl App {
                                 // Taken below, once the write has landed.
                                 swallowed_press = true;
                             } else {
-                                ws.cursor_glow.note_typed_glyph(
-                                    input_now,
-                                    typed_cells,
-                                    glyph_shifted && !spacebar,
-                                    typed_class_for(typed),
-                                );
+                                if let Some(ch) =
+                                    typed.filter(|_| ime.is_none() && typed_cells == 1)
+                                {
+                                    ws.cursor_glow.note_typed_expected(
+                                        input_now,
+                                        typed_cells,
+                                        glyph_shifted && !spacebar,
+                                        typed_class_for(typed),
+                                        ch,
+                                    );
+                                } else {
+                                    ws.cursor_glow.note_typed_glyph(
+                                        input_now,
+                                        typed_cells,
+                                        glyph_shifted && !spacebar,
+                                        typed_class_for(typed),
+                                    );
+                                }
                                 // …and the widths BEHIND that one price, per
                                 // grapheme, for the Backspace that erases one
                                 // of them (`ErasePriceMemory`): an IME run
@@ -6290,8 +6833,9 @@ impl App {
                     &sink,
                     &output_echo,
                     &ev,
-                    input::EgressMode::Interactive,
                     delivery_ticket,
+                    (!inert_modifier && !is_release && !tty_swallows)
+                        .then_some((session, self.proxy.as_ref())),
                 );
                 let outcome = egress_to_outcome(receipt.egress);
                 // THE SWALLOWED-PRESS TALLY, at the write: a press the tty
@@ -7270,6 +7814,30 @@ impl App {
         precise: Option<f64>,
     ) {
         let now = std::time::Instant::now();
+        self.scroll_wheel_animated_at(wid, term, delta_rows, viewport, precise, now);
+    }
+
+    /// [`Self::scroll_wheel_animated_with`] at an explicit `now`: the reducer's
+    /// ONE clock read, lifted to a parameter (2026-09-23). Production reads
+    /// the clock in the wrapper above, exactly as before. The glide tests
+    /// serve ticks at SYNTHETIC instants (the first arm's anchor plus a
+    /// lateness), so a chained notch that read the wall clock after a real
+    /// `sleep(5 ms)` sat on a different timeline: on a loaded gate the sleep
+    /// overran past the served instant, the tick was served BEFORE the
+    /// retarget it followed — an order the production loop, which serves every
+    /// tick at a fresh `Instant::now()`, cannot produce — and the parked-band
+    /// branch of `apply_scroll_glide_sample` answered the retarget's start
+    /// (measured: `next` 5.09 ms early, the chained notch 11.6 ms after the
+    /// arm). A test places its notches on the ticks' timeline through here.
+    fn scroll_wheel_animated_at(
+        &mut self,
+        wid: WindowId,
+        term: &Arc<Mutex<Terminal>>,
+        delta_rows: i32,
+        viewport: Option<input::WheelViewport>,
+        precise: Option<f64>,
+        now: std::time::Instant,
+    ) {
         // W12: the glide's pixel domain belongs to the window that received the
         // wheel event, not whichever different-DPI window most recently activated
         // the shared renderer.  The render-side residual consumes this same
@@ -7895,7 +8463,7 @@ impl App {
         // loop) AND any keystroke submitted while it drains queues BEHIND it, so
         // the child sees the paste before that later input. Falls back to a
         // detached write only if the FIFO writer thread could not be spawned.
-        match paste_order::enqueue(term, modes, sink, echo, ev, ticket) {
+        match paste_order::enqueue(term, modes, sink, echo, ev, ticket, None) {
             Ok(()) => {}
             Err(ev) => {
                 let term = term.clone();
@@ -8858,7 +9426,7 @@ impl App {
                         &session.ctx.sink,
                         &session.ctx.output_echo,
                         &event,
-                        input::EgressMode::Interactive,
+                        None,
                         None,
                     )
                     .0
@@ -8981,7 +9549,11 @@ impl App {
             return true;
         }
 
-        let km_mods = keymap::modifiers_from_winit(mods) | (self.lock_modifiers)();
+        // A native page never emits a Kitty modifier byte. Its reducers use
+        // Ctrl/Alt/Super/Shift and winit's resolved key, not Caps/Num Lock, so
+        // querying IOKit here made every native editor keystroke pay for a
+        // synchronous HID lookup that no consumer could observe.
+        let km_mods = keymap::modifiers_from_winit(mods);
         if let Some((key, km_mods, base_layout)) = keymap::build_key_input(ev, km_mods) {
             let input = InputEvent::Key {
                 key,
@@ -9461,8 +10033,9 @@ impl App {
         // the built-in chords + the PTY encoder, so `h`/`j`/`k`/`l`/… drive the vi cursor
         // and never leak to the shell. Modified (⌃/⌘/⌥) keys pass through so ⌘C / paste /
         // pane chords still work on the vi selection. A no-op when vi mode is inactive.
-        let vi_repeat = self.vi_repeat_action(wid, mods, &ev);
-        if self.on_key_vi_mode(wid, mods, &ev) {
+        let target_vi_active = self.vi_target_active(wid);
+        let vi_repeat = self.vi_repeat_action(wid, mods, &ev, target_vi_active);
+        if self.on_key_vi_mode(wid, mods, &ev, target_vi_active) {
             self.note_press_disposition(
                 wid,
                 &ev,
@@ -10412,9 +10985,9 @@ impl App {
     /// starts at the live terminal cursor; on exit it clears. Resets the two-key pending
     /// state and repaints (the vi-cursor render override keys off `vi_is_active`).
     pub(crate) fn toggle_vi_mode(&mut self, wid: WindowId) {
-        let Some(term) = self
+        let Some((term, vi_active)) = self
             .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
+            .map(|terminal| (terminal.term.clone(), terminal.vi_active.clone()))
         else {
             return;
         };
@@ -10424,13 +10997,14 @@ impl App {
         ws.vi_pending_g = false;
         ws.vi_pending_inline = None;
         // Read the resulting state back under the SAME lock and mirror it: the two
-        // per-keystroke vi gates answer from `vi_any_active()` and never touch the
-        // terminal while copy-mode is off (see `VI_ACTIVE_TERMINALS`).
+        // per-keystroke vi gates read the focused session's bit and never touch
+        // the terminal while its copy-mode is off (see `VI_ACTIVE_TERMINALS`).
         let now_active = {
             let mut t = term_lock(&term);
             t.vi_toggle();
             t.vi_is_active()
         };
+        vi_active.store(now_active, std::sync::atomic::Ordering::Relaxed);
         vi_note_toggled(now_active);
         if let Some(w) = ws.os_window.as_ref() {
             w.request_redraw();
@@ -10460,22 +11034,29 @@ impl App {
         }
     }
 
+    /// One focused-session query for both vi gates in this key dispatch. A vi
+    /// session in another tab keeps the global zero check open, but cannot make
+    /// typing here wait for this terminal's busy PTY-reader mutex.
+    fn vi_target_active(&self, wid: WindowId) -> bool {
+        vi_any_active()
+            && self.front_terminal(wid).is_some_and(|terminal| {
+                terminal
+                    .vi_active
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+    }
+
     fn vi_repeat_action(
         &self,
         wid: WindowId,
         mods: ModifiersState,
         ev: &KeyEvent,
+        target_vi_active: bool,
     ) -> Option<(u64, crate::vi_keys::ViAction)> {
-        // Copy-mode is off for every terminal ⇒ no key can be a vi repeat. Answered
-        // from the GUI-side mirror so the common keystroke takes NO terminal lock
-        // here (which would queue behind the PTY reader during a flood).
-        if !vi_any_active() {
+        if !target_vi_active {
             return None;
         }
         let terminal = self.front_terminal(wid)?;
-        if !term_lock(&terminal.term).vi_is_active() {
-            return None;
-        }
         let ws = self.windows.get(&wid)?;
         if ws.vi_pending_g || ws.vi_pending_inline.is_some() {
             return None;
@@ -10494,23 +11075,22 @@ impl App {
     /// (`g` prefix, and `f`/`F`/`t`/`T` awaiting a target char) use the per-window pending
     /// state. Called from `on_key` right after the keybinding block, so `toggle_vi_mode`'s
     /// own chord is handled before this gate ever sees a key.
-    fn on_key_vi_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
-        // The SECOND of the two per-keystroke `vi_is_active` gates (this one also
-        // clones the terminal `Arc`). Same mirror, same reason: with copy-mode off
-        // the gate must cost nothing, least of all a mutex shared with the PTY
-        // reader's output bursts.
-        if !vi_any_active() {
+    fn on_key_vi_mode(
+        &mut self,
+        wid: WindowId,
+        mods: ModifiersState,
+        ev: &KeyEvent,
+        target_vi_active: bool,
+    ) -> bool {
+        if !target_vi_active {
             return false;
         }
-        let Some(term) = self
+        let Some((term, vi_active)) = self
             .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
+            .map(|terminal| (terminal.term.clone(), terminal.vi_active.clone()))
         else {
             return false;
         };
-        if !term_lock(&term).vi_is_active() {
-            return false;
-        }
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
@@ -10584,6 +11164,7 @@ impl App {
                     t.vi_toggle();
                     t.vi_is_active()
                 };
+                vi_active.store(now_active, std::sync::atomic::Ordering::Relaxed);
                 vi_note_toggled(now_active);
             }
         }
@@ -11962,6 +12543,15 @@ impl App {
             crate::native_app::AppKind::Editor => ("Open File in Editor", "Open"),
             crate::native_app::AppKind::Settings | crate::native_app::AppKind::Recovery => return,
         };
+        // The palette row is already disabled headless (`palette_live`); this
+        // is the belt to that brace, for any future caller: a `Prohibited`
+        // process cannot present the panel, so the modal would never return.
+        if self.headless {
+            crate::logging::stderr_line!(
+                "aterm-gui: {title} needs a window; a headless instance has no file picker"
+            );
+            return;
+        }
         let Some(path) = menu::choose_local_file(title, prompt) else {
             return;
         };
@@ -12360,6 +12950,11 @@ impl App {
             MenuAction::Packages => {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Packages);
             }
+            // …and AT the Messages route — the menu-bar path to the log
+            // behind the message band (design §4.1).
+            MenuAction::Messages => {
+                self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
+            }
             // Toggle the own-rendered, cross-platform command palette.
             MenuAction::OpenPalette => self.toggle_palette(),
             // Window ----------------------------------------------------------
@@ -12615,11 +13210,9 @@ impl App {
     /// never leave the renderer/audio policy ahead of `aterm.toml`.
     pub(crate) fn user_toggle_serious_mode(&mut self) {
         if let Err(error) = self.queue_serious_mode_toggle() {
-            self.config_notice = crate::config_notice::ConfigNotice::new(
-                vec![format!("Serious Mode was not changed: {error}")],
-                std::time::Instant::now(),
-            );
-            self.request_redraw_all_windows();
+            self.post_message(crate::message_reporters::serious_mode_feedback(&format!(
+                "Serious Mode was not changed: {error}"
+            )));
         }
     }
 
@@ -12755,6 +13348,7 @@ mod forwarded_release_handoff_activity_tests {
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
             park_at: std::time::Instant::now(),
             proof_ready_at: None,
+            #[cfg(target_os = "macos")]
             activate_at_commit: false,
             attempt_id: 1,
             nonce: None,
@@ -12941,10 +13535,7 @@ mod serious_mode_command_tests {
             "a failed preflight must not leave a command that can apply later"
         );
         assert!(
-            app.config_notice.as_ref().is_some_and(|notice| notice
-                .lines
-                .iter()
-                .any(|line| line.contains("Serious Mode was not changed"))),
+            app.has_live_message("Serious Mode not changed"),
             "Finder-launched users need visible failure feedback"
         );
     }
@@ -13056,6 +13647,7 @@ mod menu_only_action_dispatch_tests {
 #[cfg(test)]
 mod native_keyboard_boundary_tests {
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::native_binding_allowed;
     use crate::input::{InputEvent, InputOutcome, Source};
@@ -13071,6 +13663,52 @@ mod native_keyboard_boundary_tests {
             base_layout: None,
             event_type: KeyEventType::Press,
         }
+    }
+
+    #[test]
+    fn native_text_key_skips_the_terminal_lock_state_rpc() {
+        use winit::event::{ElementState, KeyEvent};
+        use winit::keyboard::{Key as WinitKey, KeyCode, KeyLocation, PhysicalKey, SmolStr};
+
+        static RPC: AtomicUsize = AtomicUsize::new(0);
+        fn counting_lock_modifiers() -> Modifiers {
+            RPC.fetch_add(1, Ordering::Relaxed);
+            Modifiers::CAPS_LOCK
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(SettingsRoute::Appearance));
+        app.dispatch_native_event(
+            wid,
+            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("settings/search"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        app.lock_modifiers = counting_lock_modifiers;
+        RPC.store(0, Ordering::Relaxed);
+
+        app.on_key(
+            wid,
+            KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::KeyA),
+                WinitKey::Character(SmolStr::new("a")),
+                Some(SmolStr::new("a")),
+                KeyLocation::Standard,
+                ElementState::Pressed,
+                false,
+            ),
+        );
+
+        assert_eq!(RPC.load(Ordering::Relaxed), 0);
+        let (_, view) = app.active_native_view(wid).expect("Settings view");
+        assert!(matches!(
+            app.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Settings(state))
+                if state.search_input.value() == "a"
+        ));
     }
 
     fn file_uri(path: &std::path::Path) -> String {
@@ -16014,7 +16652,17 @@ mod smooth_scroll_tests {
     /// one served more than a period late re-phases from `now`); and a PRECISE
     /// delta parks the band, so the one wake it then owes is its rest-settle
     /// start. Against the retired law (`now + interval` re-derived on every
-    /// park) the chained notch's re-arm moved the deadline by the 5 ms slept.
+    /// park) the chained notch's re-arm moved the deadline by the 5 ms between
+    /// the notches.
+    ///
+    /// ONE TIMELINE (2026-09-23). Every instant here is synthetic, the notches'
+    /// included (`scroll_wheel_animated_at`). The chained notch used to read the
+    /// wall clock after a real `sleep(5 ms)` while the ticks were served at
+    /// `tick + 2 ms`, derived from the first arm; on a loaded merge-contract
+    /// gate the sleep ran to 11.6 ms, so the tick was served BEFORE the retarget
+    /// began — `now < settle_start()`, the parked-band arm, rightly — and
+    /// `next` came back as the retarget's start, 5.09 ms early. The law was
+    /// never wrong; the fixture's order depended on how long a sleep took.
     #[test]
     fn a_chained_notch_leaves_the_anchored_tick_alone_and_a_precise_delta_parks_it() {
         use crate::scroll_motion::TRACK_REST_MS;
@@ -16031,9 +16679,9 @@ mod smooth_scroll_tests {
                 .expect("a glide is armed")
         };
 
-        app.scroll_wheel_animated(wid, &term, 1);
+        let t0 = std::time::Instant::now();
+        app.scroll_wheel_animated_at(wid, &term, 1, None, None, t0);
         let (tick, deadline, end) = tick_of(&app);
-        let t0 = end - Duration::from_millis(crate::scroll_motion::GLIDE_MS);
         assert_eq!(
             tick,
             t0 + interval,
@@ -16043,8 +16691,9 @@ mod smooth_scroll_tests {
             deadline, tick,
             "…and it is the wake the glide owes (its end is far later)"
         );
-        std::thread::sleep(Duration::from_millis(5));
-        app.scroll_wheel_animated(wid, &term, 1);
+        // The chained notch lands 5 ms after the arm, before the slot fires.
+        let chained_at = t0 + Duration::from_millis(5);
+        app.scroll_wheel_animated_at(wid, &term, 1, None, None, chained_at);
         let (tick_after, deadline_after, end_after) = tick_of(&app);
         assert!(end_after > end, "a notch chain retargets: a fresh ease");
         assert_eq!(
@@ -16073,17 +16722,14 @@ mod smooth_scroll_tests {
         );
 
         // A precise delta PARKS the band: its one wake is the rest boundary.
-        let before = std::time::Instant::now();
-        app.scroll_wheel_animated_with(wid, &term, 0, None, Some(3.0));
+        let precise_at = late + Duration::from_millis(1);
+        app.scroll_wheel_animated_at(wid, &term, 0, None, Some(3.0), precise_at);
         let (parked_tick, parked_deadline, _) = tick_of(&app);
         assert_eq!(parked_tick, parked_deadline);
-        assert!(
-            parked_tick >= before + Duration::from_millis(TRACK_REST_MS),
+        assert_eq!(
+            parked_tick,
+            precise_at + Duration::from_millis(TRACK_REST_MS),
             "a parked band owes one wake at its rest-settle start, not a frame cadence"
-        );
-        assert!(
-            parked_tick < before + Duration::from_millis(TRACK_REST_MS) + Duration::from_secs(1),
-            "…and that wake is not lost in the future"
         );
     }
 
@@ -19298,7 +19944,7 @@ mod pet_console_input_tests {
 
     #[test]
     fn a_paste_and_queued_key_each_commit_one_intent_without_drain_replay() {
-        let (mut app, fds) = observing_app();
+        let (mut app, _fds) = observing_app();
         let wid = WindowId(0);
         let sink = app.front_terminal(wid).unwrap().sink.clone();
         let pin = super::paste_order::pin_ordering_for_test(&sink);
@@ -19330,12 +19976,12 @@ mod pet_console_input_tests {
         assert_eq!(observed(&app), (before + 2, Some(PetInputKind::Text)));
         drop(pin);
         for _ in 0..200 {
-            if !super::paste_order::is_ordering(fds[1].as_raw_fd()) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!super::paste_order::is_ordering(fds[1].as_raw_fd()));
+        assert!(!super::paste_order::is_ordering(&sink));
         assert_eq!(observed(&app), (before + 2, Some(PetInputKind::Text)));
     }
 }
@@ -19361,7 +20007,6 @@ mod paste_cursor_gesture_tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let sink = Arc::new(SinkWriter::new(pipe[1]));
-        let master = sink.master();
         let mut app = App::headless_for_test_with_sink(sink.clone());
         let wid = WindowId(0);
         let ordering_pin =
@@ -19414,12 +20059,12 @@ mod paste_cursor_gesture_tests {
         // Let the tiny ordered write release its registry key before closing
         // this fixture's descriptors.
         for _ in 0..200 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!super::paste_order::is_ordering(master));
+        assert!(!super::paste_order::is_ordering(&sink));
         unsafe {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
@@ -19533,7 +20178,6 @@ mod paste_cursor_gesture_tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let sink = Arc::new(SinkWriter::new(pipe[1]));
-        let master = sink.master();
         let mut app = App::headless_for_test_with_sink(sink.clone());
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
@@ -19570,12 +20214,12 @@ mod paste_cursor_gesture_tests {
         // The FIFO drains: the writer thread's completed write is the
         // delivery edge.
         for _ in 0..400 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!super::paste_order::is_ordering(master));
+        assert!(!super::paste_order::is_ordering(&sink));
         let now = Instant::now();
         let session = app.front_terminal(wid).unwrap().session;
         let ctx = &app.pool.get(session).unwrap().ctx;
@@ -19686,7 +20330,6 @@ mod paste_cursor_gesture_tests {
                 let mut pipe = [0; 2];
                 assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
                 let sink = Arc::new(SinkWriter::new(pipe[1]));
-                let master = sink.master();
                 let mut app = App::headless_for_test_with_sink(sink.clone());
                 app.recompute_sparkle();
                 app.config.motion = Some("full".into());
@@ -19723,12 +20366,12 @@ mod paste_cursor_gesture_tests {
                 );
                 drop(pin);
                 for _ in 0..400 {
-                    if !super::paste_order::is_ordering(master) {
+                    if !super::paste_order::is_ordering(&sink) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                assert!(!super::paste_order::is_ordering(master));
+                assert!(!super::paste_order::is_ordering(&sink));
                 let now = Instant::now();
                 let mut live = CursorFxInputs::sample_for_test(now);
                 live.cur = Some((2, 2));
@@ -19778,7 +20421,7 @@ mod paste_cursor_gesture_tests {
                 );
                 drop(pin);
                 for _ in 0..400 {
-                    if !super::paste_order::is_ordering(master) {
+                    if !super::paste_order::is_ordering(&sink) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(1));
@@ -19813,7 +20456,7 @@ mod paste_cursor_gesture_tests {
                     crate::input::InputOutcome::Ok
                 );
                 for _ in 0..400 {
-                    if !super::paste_order::is_ordering(master) {
+                    if !super::paste_order::is_ordering(&sink) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(1));
@@ -19964,7 +20607,6 @@ mod paste_cursor_gesture_tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let sink = Arc::new(SinkWriter::new(pipe[1]));
-        let master = sink.master();
         let mut app = App::headless_for_test_with_sink(sink.clone());
         let wid = WindowId(0);
         app.config.motion = Some("full".into());
@@ -19997,12 +20639,12 @@ mod paste_cursor_gesture_tests {
             crate::input::InputOutcome::Ok
         );
         for _ in 0..400 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!super::paste_order::is_ordering(master));
+        assert!(!super::paste_order::is_ordering(&sink));
         // The frame that first observes the echo: the prelude reads the
         // receipt, arms the engine, and the tick judges the hop.
         let mut live = CursorFxInputs::sample_for_test(Instant::now());
@@ -20058,6 +20700,284 @@ mod paste_cursor_gesture_tests {
             Some((session, 1)),
             "…and it baselines at the newest serial all the same"
         );
+    }
+
+    /// A paste followed by a loaded frame's worth of queued typing must keep
+    /// the paste's oldest receipt. The glow engine already holds 128 unpaid
+    /// keys, but the former 32-receipt host register lost the paste after key
+    /// 32. Drive real App input, the ordered writer, and the production render
+    /// prelude; its first observed echo must stay visible and the paste's
+    /// insert receipt must survive and own its own first echo.
+    #[cfg(unix)]
+    #[test]
+    fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
+        use crate::app_render::CursorFxInputs;
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        for queued_keys in [33, aterm_effects::cursor_glow::TYPED_STAMP_DEPTH] {
+            let mut pipe = [0; 2];
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            let sink = Arc::new(SinkWriter::new(pipe[1]));
+            let mut app = App::headless_for_test_with_sink(sink.clone());
+            let wid = WindowId(0);
+            app.config.motion = Some("full".into());
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            app.config.trail_sounds = Some(false);
+            app.windows.get_mut(&wid).unwrap().focused = true;
+            app.frontmost_window = Some(wid);
+            let session = app.front_terminal(wid).unwrap().session;
+            let mut seed = CursorFxInputs::sample_for_test(Instant::now());
+            seed.cur = Some((2, 2));
+            app.tick_cursor_fx(wid, seed).expect("baseline and seed");
+            assert_eq!(app.windows[&wid].delivery_seen, Some((session, 0)));
+
+            let pin = super::paste_order::pin_ordering_for_test(&sink);
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Paste("foo bar ".to_string(), crate::input::PasteFraming::AtDrain),
+                    Source::Human,
+                ),
+                crate::input::InputOutcome::Ok,
+            );
+            for _ in 0..queued_keys {
+                assert_eq!(
+                    app.input(
+                        wid,
+                        InputEvent::Key {
+                            key: Key::Character('k'),
+                            mods: Modifiers::empty(),
+                            base_layout: None,
+                            event_type: KeyEventType::Press,
+                        },
+                        Source::Human,
+                    ),
+                    crate::input::InputOutcome::Ok,
+                );
+            }
+            drop(pin);
+            for _ in 0..400 {
+                if !super::paste_order::is_ordering(&sink) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!super::paste_order::is_ordering(&sink));
+            let now = Instant::now();
+            let ctx = &app.pool.get(session).unwrap().ctx;
+            let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
+            assert_eq!(
+                (batch.latest, batch.evicted),
+                (queued_keys as u64 + 1, 0),
+                "{queued_keys} queued keys may not evict the preceding paste"
+            );
+            assert_eq!(
+                batch.items[0].and_then(|(_, t)| t.insert),
+                Some(InsertWidth::Cells(8)),
+                "the oldest receipt is the paste"
+            );
+
+            let mut live = CursorFxInputs::sample_for_test(now);
+            live.cur = Some((2, 10));
+            app.tick_cursor_fx(wid, live).expect("first echoed frame");
+            let ws = &app.windows[&wid];
+            assert_eq!(
+                ws.cursor_glow.insert_tally().delivered,
+                1,
+                "{queued_keys} keys: the prelude must apply the paste receipt"
+            );
+            assert_eq!(
+                ws.cursor_glow.insert_tally().lit,
+                1,
+                "{queued_keys} later keys cannot steal the paste's own echo"
+            );
+            assert_eq!(ws.cursor_glow.spawns(), 1);
+            assert!(
+                !ws.glow_scratch.is_empty(),
+                "{queued_keys} keys: the licensed sweep must emit visible light"
+            );
+            assert_eq!(
+                ws.delivery_seen,
+                Some((session, queued_keys as u64 + 1)),
+                "the prelude consumed the whole ordered batch"
+            );
+            drop(app);
+            drop(sink);
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+        }
+    }
+
+    /// The FIFO can finish a paste and its queued keys before the child
+    /// repaints. The child may then expose the paste in one output frame and
+    /// the keys in a second. Replaying those two actual terminal writes must
+    /// not spend the later keys' press credits on the earlier paste's cells:
+    /// otherwise the second 33-cell echo falls below the typed share floor
+    /// and the rainbow has a dark gap despite every receipt being present.
+    #[cfg(unix)]
+    #[test]
+    fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
+        use crate::app_render::CursorFxInputs;
+        use crate::cursor_glow::ProbeTrust;
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let sink = Arc::new(SinkWriter::new(pipe[1]));
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        let wid = WindowId(0);
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.trail_sounds = Some(false);
+        app.windows.get_mut(&wid).unwrap().focused = true;
+        app.frontmost_window = Some(wid);
+        let mut seed = CursorFxInputs::sample_for_test(Instant::now());
+        seed.cur = Some((2, 2));
+        app.tick_cursor_fx(wid, seed).expect("baseline and seed");
+
+        let pin = super::paste_order::pin_ordering_for_test(&sink);
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Paste("p".repeat(33), crate::input::PasteFraming::AtDrain),
+                Source::Human,
+            ),
+            crate::input::InputOutcome::Ok,
+        );
+        for _ in 0..33 {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Key {
+                        key: Key::Character('k'),
+                        mods: Modifiers::empty(),
+                        base_layout: None,
+                        event_type: KeyEventType::Press,
+                    },
+                    Source::Human,
+                ),
+                crate::input::InputOutcome::Ok,
+            );
+        }
+        drop(pin);
+        for _ in 0..400 {
+            if !super::paste_order::is_ordering(&sink) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!super::paste_order::is_ordering(&sink));
+
+        let present_output = |app: &mut App, bytes: &[u8]| {
+            let mut row = Vec::new();
+            let (cur, print_anchor) = {
+                let front = app.front_terminal(wid).unwrap();
+                let mut term = crate::term_lock(&front.term);
+                term.process(bytes);
+                let cursor = term.cursor();
+                term.row_cols_into(usize::from(cursor.row), &mut row);
+                ((cursor.row, cursor.col), term.print_anchor())
+            };
+            let now = Instant::now();
+            app.windows.get_mut(&wid).unwrap().poof_row_buf = row;
+            let mut frame = CursorFxInputs::sample_for_test(now);
+            frame.cur = Some(cur);
+            frame.row_probe = Some((cur.0, cur.1, ProbeTrust::Full));
+            frame.print_anchor = print_anchor;
+            app.tick_cursor_fx(wid, frame).expect("output frame");
+            cur
+        };
+
+        let paste_output = [b"\x1b[3;3H".as_slice(), b"p".repeat(33).as_slice()].concat();
+        assert_eq!(present_output(&mut app, &paste_output), (2, 35));
+        let ws = &app.windows[&wid];
+        assert_eq!(ws.cursor_glow.insert_tally().delivered, 1);
+        assert_eq!(
+            ws.cursor_glow.insert_tally().lit,
+            1,
+            "the paste's first frame must use its own delivered insert licence"
+        );
+        assert_eq!(
+            ws.cursor_glow.in_flight_tally().credits,
+            33,
+            "later queued keys have not echoed yet"
+        );
+
+        // Tier 1: one model credit represents this 33-key batch. Project the
+        // shipping engine's first-frame decision onto the derived licence
+        // transition; the old typed-class verdict (insert still armed, keys
+        // spent) is the refused negative control.
+        let model = aterm_spec::derive::cursor_hint_license_model();
+        let mut before = model.init_state();
+        for action in [
+            "PasteEnqueues",
+            "PressBehindQueuedInsert",
+            "WriteCompletesArmsInsertLicence",
+        ] {
+            assert!(model.fire(action, &mut before), "{action}");
+        }
+        let key_credit = i64::from(ws.cursor_glow.in_flight_tally().credits == 33);
+        let insert_lit = i64::try_from(ws.cursor_glow.insert_tally().lit).unwrap();
+        let licensed = i64::try_from(ws.cursor_glow.admission_tally().licensed).unwrap();
+        let spawns = i64::try_from(ws.cursor_glow.spawns()).unwrap();
+        let mut observed = before.clone();
+        observed.insert("insert_hint", 1 - insert_lit);
+        observed.insert("hint", key_credit);
+        observed.insert("later_key_credit", key_credit);
+        observed.insert("spent", 1 - key_credit);
+        observed.insert("consumed", licensed);
+        observed.insert("admissions", licensed);
+        observed.insert("spawns", spawns);
+        observed.insert("births", licensed);
+        observed.insert("resident", i64::from(ws.cursor_glow.is_active()));
+        observed.insert("licensed_tally", licensed);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &before,
+            &observed,
+            Some("DelayedInsertEchoPrecedesLaterKey"),
+            "real delayed paste frame before queued keys",
+        );
+        assert!(ok, "real cursor classifier rejected by model: {why}");
+        let mut stolen = observed.clone();
+        stolen.insert("insert_hint", 1);
+        stolen.insert("hint", 0);
+        stolen.insert("later_key_credit", 0);
+        stolen.insert("spent", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &before,
+            &stolen,
+            Some("DelayedInsertEchoPrecedesLaterKey"),
+            "paste frame steals later keys negative control",
+        );
+        assert!(!ok, "the old typed-class verdict must be refused");
+
+        assert_eq!(present_output(&mut app, &b"k".repeat(33)), (2, 68));
+        let ws = &app.windows[&wid];
+        assert_eq!(ws.cursor_glow.in_flight_tally().credits, 0);
+        let ribbon = ws.cursor_glow.v2_ribbon().expect("rainbow kitty engaged");
+        for col in 35..68 {
+            assert!(
+                ribbon
+                    .cells()
+                    .iter()
+                    .any(|cell| cell.row == 2 && cell.col == col && !cell.leaving()),
+                "queued key at col {col} left a gap in the live ribbon"
+            );
+        }
+        drop(app);
+        drop(sink);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
     }
 
     /// TIER 1 for the delivery edge: the host's two decisions project onto
@@ -20428,6 +21348,9 @@ mod vi_dispatch_tests {
     use crate::{App, WindowId, term_lock};
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
 
     /// `VI_ACTIVE_TERMINALS` is process-wide (it must be: a stray cross-thread
     /// toggle has to be visible to the key path, which a thread-local would hide).
@@ -20453,6 +21376,61 @@ mod vi_dispatch_tests {
         assert!(active(&app), "toggle turns vi mode on");
         app.dispatch_action(wid, Action::ToggleViMode);
         assert!(!active(&app), "a second toggle turns it off");
+    }
+
+    /// A copy-mode tab elsewhere used to open BOTH vi gates on every key and
+    /// take this focused terminal's mutex twice, queueing ordinary typing
+    /// behind its PTY reader. Hold that mutex across both gates: the unrelated
+    /// vi tab must remain active, yet these gates must answer without waiting.
+    #[test]
+    fn another_sessions_vi_mode_does_not_lock_the_typing_terminal() {
+        let _serial = VI_MIRROR_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let mut app = App::headless_for_test();
+        let typing_wid = WindowId(0);
+        let vi_wid = WindowId(7);
+        app.install_window_state(vi_wid, crate::stub_session(7), 24, 80);
+        app.toggle_vi_mode(vi_wid);
+        assert!(vi_any_active());
+        assert!(app.vi_target_active(vi_wid));
+
+        let typing_term = app.front_terminal(typing_wid).unwrap().term.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = term_lock(&typing_term);
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let ev = KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(KeyCode::KeyL),
+            Key::Character(SmolStr::new("l")),
+            Some(SmolStr::new("l")),
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+        );
+        let mods = ModifiersState::empty();
+        let started = Instant::now();
+        let active = app.vi_target_active(typing_wid);
+        let repeat = app.vi_repeat_action(typing_wid, mods, &ev, active);
+        let swallowed = app.on_key_vi_mode(typing_wid, mods, &ev, active);
+        let elapsed = started.elapsed();
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(!active);
+        assert!(repeat.is_none());
+        assert!(!swallowed, "an ordinary key still reaches its PTY");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the vi gates waited {elapsed:?} for the typing terminal's mutex"
+        );
+        let vi_active = app.vi_target_active(vi_wid);
+        assert!(app.vi_repeat_action(vi_wid, mods, &ev, vi_active).is_some());
+        assert!(app.on_key_vi_mode(vi_wid, mods, &ev, vi_active));
+        app.toggle_vi_mode(vi_wid);
     }
 
     /// Native focus cannot inherit terminal authority from a still-live hidden
@@ -20531,6 +21509,7 @@ mod vi_dispatch_tests {
             "entering copy-mode must open the gate"
         );
         assert!(vi_any_active());
+        assert!(app.vi_target_active(wid));
 
         app.dispatch_action(wid, Action::ToggleViMode);
         assert!(!engine_active(&app));
@@ -20539,6 +21518,7 @@ mod vi_dispatch_tests {
             base,
             "leaving copy-mode must close the gate again"
         );
+        assert!(!app.vi_target_active(wid));
     }
 
     /// The mirror is a COUNT (two windows can hold two terminals in copy-mode),
@@ -21175,7 +22155,6 @@ mod typed_kitty_summon_tests {
     fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
         let (mut app, sink, pipe) = app_with_private_pty();
         let wid = WindowId(0);
-        let master = sink.master();
         let session = app.front_terminal(wid).unwrap().session;
 
         // CONTROL — THE INLINE PATH IS UNCHANGED. Nothing is in flight, so this
@@ -21183,7 +22162,7 @@ mod typed_kitty_summon_tests {
         // its witness dies on the engine's bare budget. Asserted first so the
         // queued case below cannot pass by the witness simply never expiring.
         assert!(
-            !super::paste_order::is_ordering(master),
+            !super::paste_order::is_ordering(&sink),
             "PRECONDITION: a fresh session has no paste draining"
         );
         let inline_at = Instant::now();
@@ -21206,7 +22185,7 @@ mod typed_kitty_summon_tests {
         // and its bytes leave on the writer thread, not here.
         let pin = super::paste_order::pin_ordering_for_test(&sink);
         assert!(
-            super::paste_order::is_ordering(master),
+            super::paste_order::is_ordering(&sink),
             "PRECONDITION: the key path must see this session as ordering"
         );
         let queued_at = Instant::now();
@@ -21258,13 +22237,13 @@ mod typed_kitty_summon_tests {
         // the pipe is closed with nothing still writing into it.
         drop(pin);
         for _ in 0..400 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
-            !super::paste_order::is_ordering(master),
+            !super::paste_order::is_ordering(&sink),
             "the ordered egress must drain once the pin is released"
         );
         unsafe {
@@ -21287,7 +22266,6 @@ mod typed_kitty_summon_tests {
 
         let (mut app, sink, pipe) = app_with_private_pty();
         let wid = WindowId(0);
-        let master = sink.master();
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some("rainbow kitty".to_string());
         let glow_cfg = app.glow_config();
@@ -21311,7 +22289,7 @@ mod typed_kitty_summon_tests {
             &mut out,
         );
         let pin = super::paste_order::pin_ordering_for_test(&sink);
-        assert!(super::paste_order::is_ordering(master));
+        assert!(super::paste_order::is_ordering(&sink));
         type_word(&mut app, wid, "k");
         {
             let ws = app.windows.get(&wid).unwrap();
@@ -21322,12 +22300,12 @@ mod typed_kitty_summon_tests {
         }
         drop(pin);
         for _ in 0..400 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(!super::paste_order::is_ordering(master));
+        assert!(!super::paste_order::is_ordering(&sink));
         let now = Instant::now();
         let session = app.front_terminal(wid).unwrap().session;
         let ctx = &app.pool.get(session).unwrap().ctx;
@@ -21438,7 +22416,6 @@ mod typed_kitty_summon_tests {
                 for queued in [false, true] {
                     let (mut app, sink, pipe) = app_with_private_pty();
                     let wid = WindowId(0);
-                    let master = sink.master();
                     app.config.motion = Some("full".into());
                     app.config.cursor_trail = Some(true);
                     app.config.cursor_trail_style = Some(style.to_string());
@@ -21457,6 +22434,9 @@ mod typed_kitty_summon_tests {
                     seed.cur = Some((2, 2));
                     app.tick_cursor_fx(wid, seed).expect("seed");
                     let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
+                    if queued {
+                        assert!(super::paste_order::is_ordering(&sink));
+                    }
                     assert_eq!(
                         app.input(wid, ev.clone(), Source::Human),
                         crate::input::InputOutcome::Ok,
@@ -21464,23 +22444,41 @@ mod typed_kitty_summon_tests {
                     );
                     drop(pin);
                     for _ in 0..400 {
-                        if !super::paste_order::is_ordering(master) {
+                        if !super::paste_order::is_ordering(&sink) {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    assert!(!super::paste_order::is_ordering(master));
+                    assert!(!super::paste_order::is_ordering(&sink));
                     if queued {
                         let ctx = &app.pool.get(session).unwrap().ctx;
-                        let batch =
+                        // A finished FIFO job can still leave a receipt held
+                        // until its spill reaches the kernel. The render
+                        // prelude sees it only after that drain; wait for the
+                        // same visible delivery before checking its class.
+                        let mut batch =
                             ctx.output_echo
                                 .deliveries_after(&ctx.sink, Some(0), Instant::now());
+                        for _ in 0..200 {
+                            if batch.items.iter().flatten().next().is_some() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                            batch = ctx.output_echo.deliveries_after(
+                                &ctx.sink,
+                                Some(0),
+                                Instant::now(),
+                            );
+                        }
                         let classes: Vec<_> =
                             batch.items.iter().flatten().map(|(_, t)| t.key).collect();
                         assert_eq!(
                             classes,
                             vec![Some(class)],
-                            "{label}: the queued key's receipt carries its class"
+                            "{label}: the queued key's receipt carries its class (latest={}, evicted={}, spill_drained={})",
+                            batch.latest,
+                            batch.evicted,
+                            ctx.sink.egress_drained_to_kernel()
                         );
                     }
                     let now = Instant::now();
@@ -21637,7 +22635,6 @@ mod typed_kitty_summon_tests {
     fn a_queued_key_release_publishes_no_receipt() {
         let (mut app, sink, pipe) = app_with_private_pty();
         let wid = WindowId(0);
-        let master = sink.master();
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some("rainbow kitty".to_string());
         let session = app.front_terminal(wid).unwrap().session;
@@ -21650,7 +22647,7 @@ mod typed_kitty_summon_tests {
             event_type: KeyEventType::Release,
         };
         let pin = super::paste_order::pin_ordering_for_test(&sink);
-        assert!(super::paste_order::is_ordering(master));
+        assert!(super::paste_order::is_ordering(&sink));
         assert_eq!(
             app.input(wid, release(Key::Character('a')), Source::Human),
             crate::input::InputOutcome::Ok
@@ -21661,12 +22658,12 @@ mod typed_kitty_summon_tests {
         );
         drop(pin);
         for _ in 0..400 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(!super::paste_order::is_ordering(master));
+        assert!(!super::paste_order::is_ordering(&sink));
         let now = Instant::now();
         let ctx = &app.pool.get(session).unwrap().ctx;
         let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
@@ -21705,12 +22702,11 @@ mod typed_kitty_summon_tests {
 
         let (mut app, sink, pipe) = app_with_private_pty();
         let wid = WindowId(0);
-        let master = sink.master();
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some("rainbow kitty".to_string());
         let session = app.front_terminal(wid).unwrap().session;
         let pin = super::paste_order::pin_ordering_for_test(&sink);
-        assert!(super::paste_order::is_ordering(master));
+        assert!(super::paste_order::is_ordering(&sink));
         let before = Instant::now();
         assert_eq!(
             app.input(wid, named(NamedKey::Tab), Source::Human),
@@ -21728,12 +22724,12 @@ mod typed_kitty_summon_tests {
         let paste_dispatched = Instant::now();
         drop(pin);
         for _ in 0..400 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(!super::paste_order::is_ordering(master));
+        assert!(!super::paste_order::is_ordering(&sink));
         let now = Instant::now();
         let ctx = &app.pool.get(session).unwrap().ctx;
         let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
@@ -21796,7 +22792,6 @@ mod typed_kitty_summon_tests {
 
         let (mut app, sink, pipe) = app_with_private_pty();
         let wid = WindowId(0);
-        let master = sink.master();
         app.config.motion = Some("full".into());
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some("rainbow kitty".to_string());
@@ -21824,19 +22819,19 @@ mod typed_kitty_summon_tests {
         // The Tab, queued behind the ordering FIFO so its receipt reaches
         // the prelude late, carrying the dispatch instant.
         let pin = super::paste_order::pin_ordering_for_test(&sink);
-        assert!(super::paste_order::is_ordering(master));
+        assert!(super::paste_order::is_ordering(&sink));
         assert_eq!(
             app.input(wid, named(NamedKey::Tab), Source::Human),
             crate::input::InputOutcome::Ok
         );
         drop(pin);
         for _ in 0..400 {
-            if !super::paste_order::is_ordering(master) {
+            if !super::paste_order::is_ordering(&sink) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!super::paste_order::is_ordering(master));
+        assert!(!super::paste_order::is_ordering(&sink));
         // The prelude reads the receipt; the caret has not moved since the
         // refused hop, so anything lit now is the pre-dispatch hop.
         let now = Instant::now();
@@ -22106,15 +23101,12 @@ mod typed_kitty_summon_tests {
                 ok
             );
             for _ in 0..400 {
-                if !super::paste_order::is_ordering(master) {
+                if !super::paste_order::is_ordering(&sink) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            assert!(
-                !super::paste_order::is_ordering(master),
-                "the paste drained"
-            );
+            assert!(!super::paste_order::is_ordering(&sink), "the paste drained");
         };
         assert_eq!(
             app.input(wid, InputEvent::Text("日本".to_string()), Source::Human),
@@ -22346,15 +23338,12 @@ mod typed_kitty_summon_tests {
                 ok
             );
             for _ in 0..400 {
-                if !super::paste_order::is_ordering(master) {
+                if !super::paste_order::is_ordering(&sink) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            assert!(
-                !super::paste_order::is_ordering(master),
-                "the paste drained"
-            );
+            assert!(!super::paste_order::is_ordering(&sink), "the paste drained");
         };
 
         type_word(&mut app, wid, "abc");
@@ -22482,17 +23471,15 @@ mod typed_kitty_summon_tests {
             "a press that never reached the tty was not swallowed by it"
         );
         assert!(!ws.cursor_glow.move_licensed(Instant::now()));
-        // SAFETY: the three descriptors are ours and still open.
+        drop(app);
+        drop(sink);
+        // SAFETY: the three descriptors are ours and still open — the borrowed-fd sink
+        // closed none — and each is closed exactly once: a second close could hit the fd
+        // number a concurrently running test was just given, and std aborts the process
+        // when that test's own `OwnedFd` finds it already closed.
         unsafe {
             libc::close(read_only);
             libc::close(slave);
-            libc::close(master);
-        }
-        drop(app);
-        drop(sink);
-        // SAFETY: the master is ours and open; the borrowed-fd sink did not
-        // close it.
-        unsafe {
             libc::close(master);
         }
     }
@@ -22557,13 +23544,13 @@ mod typed_kitty_summon_tests {
             // The FIFO drains: the writer thread's completed write is the
             // delivery edge.
             for _ in 0..400 {
-                if !super::paste_order::is_ordering(master) {
+                if !super::paste_order::is_ordering(&sink) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(
-                !super::paste_order::is_ordering(master),
+                !super::paste_order::is_ordering(&sink),
                 "{label}: the FIFO drained"
             );
             let now = Instant::now();
@@ -22689,19 +23676,19 @@ mod typed_kitty_summon_tests {
             // the delivery edge, and it must carry no insert for a Tab the
             // tty swallows.
             let pin = super::paste_order::pin_ordering_for_test(&sink);
-            assert!(super::paste_order::is_ordering(master));
+            assert!(super::paste_order::is_ordering(&sink));
             assert_eq!(
                 app.input(wid, named(NamedKey::Tab), Source::Human),
                 crate::input::InputOutcome::Ok
             );
             drop(pin);
             for _ in 0..400 {
-                if !super::paste_order::is_ordering(master) {
+                if !super::paste_order::is_ordering(&sink) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            assert!(!super::paste_order::is_ordering(master), "{label}: drained");
+            assert!(!super::paste_order::is_ordering(&sink), "{label}: drained");
             let now = Instant::now();
             let session = app.front_terminal(wid).unwrap().session;
             let ctx = &app.pool.get(session).unwrap().ctx;
@@ -26876,6 +27863,70 @@ mod tone_status_tests {
             line.contains(&format!("window_chars={}", secret.len())),
             "only the count is reported: {line}",
         );
+    }
+
+    /// One real frame through `tick_cursor_fx`, then the real verb. The
+    /// window's seam is only resolved by a tick, so every seam reading below
+    /// is taken after one.
+    fn seam_row_after_one_frame(app: &mut App) -> String {
+        let wid = WindowId(0);
+        let fx = crate::app_render::CursorFxInputs::sample_for_test(std::time::Instant::now());
+        app.tick_cursor_fx(wid, fx).expect("one cursor frame");
+        app.tone_status().expect("the fixture window is focused")
+    }
+
+    /// A trail-on, sounds-on window on a live audio host, before any
+    /// per-test knob.
+    fn audible_app(style: &str) -> App {
+        let mut app = App::headless_for_test();
+        app.trail_audio = TrailAudio::capturing_for_test();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some(style.into());
+        app.config.trail_sounds = Some(true);
+        app
+    }
+
+    /// THE VERB'S CALL SITE, bound. A person who dimmed the aurora to zero
+    /// is silent by decision C, and the verb must name that gate. Reading
+    /// `trail_on` as `GlowConfig::enabled` alone (the pre-fix line in
+    /// `tone_status`) printed `seam=closed:engine-silent trail=on` here — the
+    /// alarm reserved for a regression. The `TrailSoundSeam` conformance
+    /// drives the verb's constructor; THIS drives the verb.
+    #[test]
+    fn a_dimmed_aurora_reads_trail_off_never_engine_silent() {
+        let mut app = audible_app("rainbow kitty");
+        app.config.cursor_trail_intensity = Some(0.0);
+        let line = seam_row_after_one_frame(&mut app);
+        assert!(line.contains("seam=closed:trail-off"), "{line}");
+        assert!(line.contains("trail=off"), "{line}");
+        assert!(line.contains("engine_sound=closed"), "{line}");
+        assert!(!line.contains("engine-silent"), "{line}");
+    }
+
+    /// …and the verb reads the RESOLVED config, never the folded one: a trail
+    /// dark only because of macOS Reduce Motion is still `trail=on`, and a
+    /// key sounds. Handing the verb the folded config would say `trail-off`
+    /// while the key clicked.
+    #[test]
+    fn a_reduce_motion_trail_is_dark_but_on_and_heard() {
+        let mut app = audible_app("rainbow kitty");
+        app.system_reduce_motion = true;
+        let line = seam_row_after_one_frame(&mut app);
+        assert!(line.contains("seam=open"), "{line}");
+        assert!(line.contains("trail=on"), "{line}");
+        assert!(line.contains("engine_sound=open"), "{line}");
+    }
+
+    /// THE CLASSIC WAKE, through the real frame and the real verb. Its tick
+    /// used to return above every writer of the engine's seam, so a fresh
+    /// `classic` window never clicked and the verb read `engine-silent`.
+    #[test]
+    fn a_classic_window_is_heard_and_the_verb_says_so() {
+        let mut app = audible_app("classic");
+        let line = seam_row_after_one_frame(&mut app);
+        assert!(line.contains("seam=open"), "{line}");
+        assert!(line.contains("engine_sound=open"), "{line}");
+        assert!(line.contains("trail=on"), "{line}");
     }
 }
 

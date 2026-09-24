@@ -13,7 +13,9 @@
 //! A stub is a tiny `/bin/sh` file at `<prefix>/bin/<tool>` (the same seam
 //! [`crate::flow`]'s tombstone shims use — no parallel machinery) that execs
 //! `atpkg __pending <tool>`: a short honest message with the LIVE install state, plus
-//! a bump of that program to the front of the install queue. It grants nothing —
+//! a bump of that program to the front of the install queue — and, for a person at a
+//! terminal while a pass installs it, a wait under the progress meter that runs the
+//! program the moment it lands. It grants nothing —
 //! the authoritative roster stays the signed index — and it is replaced by the real
 //! shim the moment the program installs, atomically: `platform::install_shim`
 //! already lands via temp+`rename(2)` (see `activate.rs`), so the name resolves to
@@ -404,9 +406,8 @@ fn cmd_stub_name_safe(name: &str) -> bool {
 /// `~/.local/bin` symlink resolves to the real bundle before the sibling join.
 ///
 /// On Windows `canonicalize` answers the VERBATIM spelling (`\\?\C:\…`), and this path
-/// is embedded in `.cmd` files — the pending stub's, the `agents/` twin's landing
-/// prelude — where `cmd.exe`'s `if exist` and its command launch do not reliably accept
-/// it; the prefix is taken off there ([`crate::platform::strip_verbatim_prefix`],
+/// is embedded in `.cmd` files — the pending stub's — where `cmd.exe`'s `if exist` and
+/// its command launch do not reliably accept it; the prefix is taken off there ([`crate::platform::strip_verbatim_prefix`],
 /// review finding 2026-09-17; no Windows box has rendered a real one).
 pub(crate) fn embedded_atpkg_path() -> std::path::PathBuf {
     // `EXE_SUFFIX` (".exe" on Windows, "" elsewhere): a bare `atpkg` join
@@ -548,11 +549,13 @@ pub fn write_pending_stub_with(
     }
 }
 
-/// Whether a stub of OURS that is byte-identical to the body this pass renders must
-/// nevertheless be re-laid. There is exactly one reason to: to clear
-/// `com.apple.provenance`, which a tagged shim passes on to every tool it `exec`s (law
-/// m21, `crate::lay`). So the tag alone is not the question — a rewrite that would land
-/// tagged again clears nothing, and re-lays identical bytes forever.
+/// Whether a shim or twin of OURS that is byte-identical to the body this pass renders
+/// must nevertheless be re-laid — the `bin/` aliases and `agents/` twins (the pending and
+/// reroute stubs are rewritten only when their bytes differ; `repair` clears their tag).
+/// There is exactly one reason to: to clear `com.apple.provenance`, which a tagged shim
+/// passes on to every tool it `exec`s (law m21, `crate::lay`). So the tag alone is not
+/// the question — a rewrite that would land tagged again clears nothing, and re-lays
+/// identical bytes forever.
 ///
 /// That shape is not hypothetical: a provenance-tracked process with NO untracked lane
 /// at all ([`crate::lay::Lane::Unavailable`] — a test harness, a foreign embedding of
@@ -609,54 +612,19 @@ pub(crate) fn pending_stub_executable_at(
     requires: &[String],
     shim: std::path::PathBuf,
 ) -> io::Result<Option<crate::lay::Executable>> {
-    let measured = shim.clone();
-    pending_stub_executable_at_with(
-        layout,
-        tool,
-        kind,
-        requires,
-        shim,
-        move || crate::provenance::carries_provenance(&measured),
-        crate::lay::lay_clears_provenance,
-    )
-}
-
-/// [`pending_stub_executable_at`] with its two environment measurements handed in — the
-/// stub's own `com.apple.provenance`, and whether a lay from this process would land clean
-/// — so both halves of the re-lay rule are exercisable on a machine that can produce only
-/// one of them. Both stay lazy: the xattr is read only for a byte-identical stub, the lane
-/// probe only when that stub is tagged.
-pub(crate) fn pending_stub_executable_at_with(
-    layout: &Layout,
-    tool: &ToolName,
-    kind: StubKind,
-    requires: &[String],
-    shim: std::path::PathBuf,
-    tagged: impl FnOnce() -> bool,
-    lay_clears_tag: impl FnOnce() -> bool,
-) -> io::Result<Option<crate::lay::Executable>> {
     let body = stub_content_with(tool, &embedded_atpkg_path(), kind, requires);
     match std::fs::symlink_metadata(&shim) {
         Err(_) => {} // absent: ours to claim
         Ok(_) if is_pending_stub(&shim) => {
-            // Ours already. Byte-identical and needing no re-lay: nothing to lay — the
-            // reroute stubs' rule (`reroute::lay`, audit 2026-09-14). Every seed runs
-            // the adoption lay and every install pass reconciles twice, so a name that
-            // stays wanted-and-absent (a disk-gated tuple, a deferred member) re-laid
-            // identical bytes each time: from a tracked app, a launchd job and a
-            // whole-bundle copy per call. A body that differs — the embedded atpkg
-            // path, the kind or the requires changed — is rewritten.
-            //
-            // A tagged stub is rewritten only when the rewrite would clear the tag
-            // ([`identical_stub_needs_relay`]): a tracked process with no untracked lane
-            // ([`crate::lay::Lane::Unavailable`]) lays every byte tagged, so re-laying its
-            // own tagged stub converges on nothing. One that has a lane still re-lays,
-            // because the lane writes the file clean.
-            if stub_is_current(
-                &shim,
-                &body,
-                identical_stub_needs_relay(tagged, lay_clears_tag),
-            ) {
+            // Ours already, and byte-identical: nothing to lay — the reroute stubs' rule
+            // (`reroute::lay`). Every seed runs the adoption lay and every install pass
+            // reconciles twice, so a name that stays wanted-and-absent re-laid identical
+            // bytes each time. A body that differs — the embedded atpkg path, the kind or
+            // the requires changed — is rewritten. A TAG is not a difference (Phase 3,
+            // 2026-09-22): re-laying identical bytes to clear one is `aterm pkg repair`'s
+            // ([`relay_tagged`]), because a pass that did it re-laid for ever whenever the
+            // lane's own file came back tagged.
+            if stub_is_current(&shim, &body) {
                 return Ok(None);
             }
         }
@@ -668,16 +636,57 @@ pub(crate) fn pending_stub_executable_at_with(
     Ok(Some(crate::lay::Executable::new(shim, body)))
 }
 
-/// Whether the pending stub at `shim` is CURRENT — the exact bytes this pass would
-/// render (`body`), and not in need of a re-lay. `needs_relay` is the caller's answer to
-/// "must a byte-identical stub be written again anyway?"
-/// ([`identical_stub_needs_relay`]): a stub carrying `com.apple.provenance` tracks every
-/// program it runs (law m21, [`crate::lay`]) and wants replacing, but only by a pass that
-/// can lay it clean — a rewrite that lands tagged again repairs nothing. Handed in rather
-/// than measured here so both halves of the rule are testable on a machine whose own writes
-/// are tagged; the tag can be neither minted nor removed by hand.
-fn stub_is_current(shim: &Path, body: &str, needs_relay: bool) -> bool {
-    !needs_relay && std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
+/// Whether the pending stub at `shim` is CURRENT: exactly the bytes this pass would
+/// render (`body`).
+fn stub_is_current(shim: &Path, body: &str) -> bool {
+    std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
+}
+
+/// `aterm pkg repair`'s half of the pending stubs: re-lay every pending stub in `bin/` and
+/// `agents/` that carries `com.apple.provenance`, byte for byte, when a lay from this
+/// process would come back clean ([`crate::lay::lay_clears_provenance`]) — the one reason
+/// to rewrite identical bytes. Returns how many.
+///
+/// # Errors
+/// The lay's own.
+pub fn relay_tagged(layout: &Layout) -> io::Result<usize> {
+    relay_tagged_where(layout, |_| crate::lay::lay_clears_provenance())
+}
+
+/// The passes' half: [`relay_tagged`] once per file ([`crate::lay::relay_worth_trying`]).
+///
+/// # Errors
+/// The lay's own.
+pub fn relay_tagged_once(layout: &Layout) -> io::Result<usize> {
+    relay_tagged_where(layout, |path| crate::lay::relay_worth_trying(layout, path))
+}
+
+/// Re-lay every tagged pending stub `worth` admits, then remember which came back tagged
+/// ([`crate::lay::note_relayed`]).
+fn relay_tagged_where(layout: &Layout, worth: impl Fn(&Path) -> bool) -> io::Result<usize> {
+    let mut tagged = Vec::new();
+    for dir in [layout.bin_dir(), layout.agents_dir()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_pending_stub(&path)
+                && crate::provenance::carries_provenance(&path)
+                && worth(&path)
+                && let Ok(body) = std::fs::read(&path)
+            {
+                tagged.push(crate::lay::Executable::new(path, body));
+            }
+        }
+    }
+    if tagged.is_empty() {
+        return Ok(0);
+    }
+    crate::lay::lay_executables(&tagged)?;
+    let paths: Vec<std::path::PathBuf> = tagged.iter().map(|e| e.path.clone()).collect();
+    crate::lay::note_relayed(layout, &paths);
+    Ok(tagged.len())
 }
 
 /// Remove `program`'s stub iff the name still resolves to a pending stub — the
@@ -1299,80 +1308,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A tagged but identical stub is rewritten only when the rewrite would clear the tag.
-    /// Passing the raw `com.apple.provenance` measurement as the "not current" input made a
-    /// tracked process with no untracked lane ([`crate::lay::Lane::Unavailable`]) rewrite
-    /// and fsync the same stub on every pass for ever; this pins that the pending stubs
-    /// read [`identical_stub_needs_relay`] instead.
-    #[cfg(unix)]
-    #[test]
-    fn a_tagged_identical_stub_is_relaid_only_when_the_relay_would_clear_the_tag() {
-        let l = layout("tagged-identical");
-        let t = tool("trust");
-        write_pending_stub_with(&l, &t, StubKind::DefaultSet, &[]).unwrap();
-        assert!(
-            is_pending_stub(&l.shim(&t)),
-            "the stub this test judges is ours"
-        );
-        let plan = |kind: StubKind, tagged: bool, clears: bool| {
-            pending_stub_executable_at_with(
-                &l,
-                &t,
-                kind,
-                &[],
-                l.shim(&t),
-                move || tagged,
-                move || clears,
-            )
-            .unwrap()
-        };
-        assert!(
-            plan(StubKind::DefaultSet, false, false).is_none(),
-            "identical and untagged: nothing to lay"
-        );
-        assert!(
-            plan(StubKind::DefaultSet, false, true).is_none(),
-            "identical and untagged: nothing to lay, whatever this process's lane"
-        );
-        assert!(
-            plan(StubKind::DefaultSet, true, false).is_none(),
-            "tagged, but a lay from here would land tagged again: the rewrite repairs \
-             nothing and must not happen"
-        );
-        assert!(
-            plan(StubKind::DefaultSet, true, true).is_some(),
-            "tagged, and this pass can lay it CLEAN: a real repair"
-        );
-        assert!(
-            plan(StubKind::Extra, false, false).is_some(),
-            "a changed body is laid whatever the tag says"
-        );
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// A stub already on disk with the exact bytes the pass would render AND clean is not
-    /// re-laid: `pending_stub_executable` answers `Ok(None)` (the reconcile keeps the
-    /// name), so a steady-state seed or install pass hands `lay_executables` an empty
-    /// list — no launchd job and no bundle copy from a tracked app. A stub whose body
-    /// changed (kind flip, new requires) is still rewritten — and so is one that carries
-    /// `com.apple.provenance` when this pass could lay it clean, which is how the untracked
-    /// lane replaces a tagged stub ([`stub_is_current`], [`identical_stub_needs_relay`]).
-    ///
-    /// THE TAG IS AN ENVIRONMENT FACT, NOT A CHOICE (audit 2026-09-15). Every file this
-    /// test writes inherits the tag when the session running it is provenance-tracked (an
-    /// agent's shell, a shell inside aterm.app — [`crate::provenance`]), and the tag can
-    /// be neither minted nor removed by hand (`xattr -w` is refused, `xattr -d` exits 0
-    /// and removes nothing). Asserting only the untagged outcome asserted something this
-    /// machine cannot produce. So the test splits:
-    ///
-    /// * the RULE is asserted BOTH ways on every machine, by handing `stub_is_current`
-    ///   the measurement instead of letting it take one — identical-and-clean is current,
-    ///   identical-but-tagged is not, a changed body is never current;
-    /// * the END TO END half (a real file through the reconcile and the adoption lay)
-    ///   asserts the full outcome for what this session actually produces, reading the same
-    ///   two measurements the rule reads: the inode is kept when this session's writes come
-    ///   back clean, and kept when they come back tagged with no lane that could clean them;
-    ///   the stub is re-laid only when it is tagged and a lay of ours would clear it.
+    /// A stub already on disk with the exact bytes the pass would render is NEVER re-laid,
+    /// tagged or not (Phase 3, 2026-09-22): `pending_stub_executable` answers `Ok(None)`, so
+    /// a steady-state seed or install pass hands `lay_executables` an empty list — no
+    /// launchd job, no bundle copy from a tracked app, no new inode. A stub whose body
+    /// changed (kind flip, new requires) is still rewritten. The tag rule this replaced
+    /// re-laid an identical tagged stub whenever this process had a lane, and a lane whose
+    /// file came back tagged too made that a re-lay on every pass for ever (the reroute
+    /// marker, measured 2026-09-19..22); clearing a tag is `repair`'s ([`relay_tagged`]).
     #[cfg(unix)]
     #[test]
     fn an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten() {
@@ -1390,83 +1333,30 @@ mod tests {
             body.as_bytes(),
             "the writer lays exactly the bytes the renderer renders"
         );
-        // The rule itself, both ways, whatever this session's own writes carry.
-        assert!(
-            stub_is_current(&shim, &body, false),
-            "byte-identical and clean: nothing to lay"
-        );
-        assert!(
-            !stub_is_current(&shim, &body, true),
-            "byte-identical but needing a re-lay (tagged, and this pass can lay it clean): \
-             rewritten on purpose, so the untracked lane can put a clean file there"
-        );
+        assert!(stub_is_current(&shim, &body), "byte-identical: current");
         let flipped = stub_content_with(&t, &embedded_atpkg_path(), StubKind::Extra, &[]);
         assert!(
-            !stub_is_current(&shim, &flipped, false),
-            "a changed body is never current, tag or no tag"
+            !stub_is_current(&shim, &flipped),
+            "a changed body is never current"
         );
-        // End to end through the reconcile and the adoption lay, against the tag this
-        // session really produces: an untracked one keeps the inode (temp+rename would
-        // give it a new one), a tracked one re-lays the same bytes.
-        let tagged = crate::provenance::carries_provenance(&shim);
-        // The rule reads two measurements, so this half must read both: a tagged identical
-        // stub is re-laid only when a lay from this process would come back clean. A tracked
-        // binary with no untracked lane lays every byte tagged, so the stub is left alone.
-        let clean_lay = crate::lay::lay_clears_provenance();
-        eprintln!(
-            "an_identical_stub_is_left_alone: this session writes {} files and a lay from it \
-             comes back {}, so the {} case is the one exercised end to end",
-            if tagged { "TAGGED" } else { "clean" },
-            if clean_lay { "CLEAN" } else { "tagged" },
-            if tagged && clean_lay {
-                "re-lay"
-            } else {
-                "skip"
-            }
-        );
+        // End to end through the reconcile and the adoption lay: whatever tag this
+        // session's writes carry, the identical stub keeps its inode.
         let ino = std::fs::metadata(&shim).unwrap().ino();
         let wanted: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
         reconcile(&l, &wanted, &BTreeSet::new(), &BTreeMap::new());
         lay_adoption_stubs(&l);
         assert!(pending_stub_exists(&l, "trust"), "the reconcile keeps it");
-        assert_eq!(
-            std::fs::read(&shim).unwrap(),
-            body.as_bytes(),
-            "the bytes are the rendered ones either way"
+        assert!(
+            pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
+                .unwrap()
+                .is_none(),
+            "byte-identical: nothing to lay, tag or no tag"
         );
-        let after = std::fs::metadata(&shim).unwrap().ino();
-        if tagged && clean_lay {
-            assert!(
-                pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
-                    .unwrap()
-                    .is_some(),
-                "a tagged stub a clean lay can repair is re-laid even byte-identical"
-            );
-            assert_ne!(
-                after, ino,
-                "a tagged stub a clean lay can repair is re-laid: temp+rename, new inode"
-            );
-        } else if tagged {
-            assert!(
-                pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
-                    .unwrap()
-                    .is_none(),
-                "a tagged stub NO lay of ours can clean is left alone: re-laying it would \
-                 land tagged again, every pass for ever"
-            );
-            assert_eq!(
-                after, ino,
-                "left alone means left alone: the inode is kept, no temp+rename"
-            );
-        } else {
-            assert!(
-                pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
-                    .unwrap()
-                    .is_none(),
-                "byte-identical clean stub: nothing to lay"
-            );
-            assert_eq!(after, ino, "an identical stub is never re-laid");
-        }
+        assert_eq!(
+            std::fs::metadata(&shim).unwrap().ino(),
+            ino,
+            "an identical stub is never re-laid"
+        );
         // A changed body is still a rewrite: the requires line and the kind.
         let requires = vec!["ay".to_string()];
         assert!(
@@ -1475,16 +1365,6 @@ mod tests {
                 .is_some(),
             "new requires: rewrite"
         );
-        assert!(
-            pending_stub_executable(&l, &t, StubKind::Extra, &[])
-                .unwrap()
-                .is_some(),
-            "kind flip: rewrite"
-        );
-        // Measured HERE, not before the reconcile above: under a tracked session that
-        // reconcile already re-laid the file, and comparing against the older inode would
-        // pass without the kind flip changing anything.
-        let before_flip = std::fs::metadata(&shim).unwrap().ino();
         let extras: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
         reconcile(&l, &BTreeSet::new(), &extras, &BTreeMap::new());
         assert_eq!(pending_stub_kind(&l, "trust"), Some(StubKind::Extra));
@@ -1495,9 +1375,19 @@ mod tests {
         );
         assert_ne!(
             std::fs::metadata(&shim).unwrap().ino(),
-            before_flip,
+            ino,
             "a changed stub is re-laid"
         );
+        // `repair`'s half: a clean stub is not re-laid by it either.
+        if !crate::provenance::carries_provenance(&shim) {
+            let before = std::fs::metadata(&shim).unwrap().ino();
+            assert_eq!(
+                relay_tagged(&l).unwrap(),
+                0,
+                "nothing tagged: nothing re-laid"
+            );
+            assert_eq!(std::fs::metadata(&shim).unwrap().ino(), before);
+        }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

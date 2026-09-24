@@ -329,15 +329,16 @@ fn the_shipped_bundle_requires_native_execution() {
     );
 }
 
-/// The shipped bundle must let a dual-GPU Mac's graphics mux switch.
+/// The shipped bundle must carry NSSupportsAutomaticGraphicsSwitching=true.
 ///
-/// Per Apple's documentation (not measured on any aterm build), an app whose
-/// Info.plist lacks NSSupportsAutomaticGraphicsSwitching keeps a dual-GPU
-/// MacBook Pro's discrete chip powered for the app's whole life, whichever
-/// MTLDevice the renderer picks, so crates/aterm-gpu's low-power pick
-/// (`Device::preferred`) is only half the fix; the key is the other half. This
-/// test is the gate: delete the key from apps/aterm-mac/Info.plist and it goes
-/// red.
+/// crates/aterm-gpu renders on a dual-GPU Mac's low-power chip
+/// (`Device::preferred`), and the key is set so the graphics mux may stay
+/// there. That a Metal app without it keeps the discrete chip powered for its
+/// whole life, whichever MTLDevice it picks, is an expectation: Apple's current
+/// reference does not state it (the key's own page says only "A Boolean value
+/// indicating whether an OpenGL app may utilize the integrated GPU"), and no
+/// aterm build was measured with or without the key. This test is the gate:
+/// delete the key from apps/aterm-mac/Info.plist and it goes red.
 ///
 /// Asserted on the STAMPED output too, for the reason
 /// [`the_shipped_bundle_requires_native_execution`] gives, and this key sits
@@ -349,8 +350,8 @@ fn the_shipped_bundle_supports_automatic_graphics_switching() {
     assert!(
         template.contains("<key>NSSupportsAutomaticGraphicsSwitching</key>\n\t<true/>"),
         "apps/aterm-mac/Info.plist must carry NSSupportsAutomaticGraphicsSwitching=true \
-         — without it a dual-GPU Mac keeps its discrete GPU powered for as long as \
-         aterm runs, whichever device the renderer picks: {template}"
+         — it is set so a dual-GPU Mac's mux may stay on the low-power GPU aterm \
+         renders on (see this test's doc): {template}"
     );
     let out = stamp_real(Some("aterm"));
     assert!(

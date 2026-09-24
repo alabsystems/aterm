@@ -63,12 +63,16 @@ fn an_apply_lane_ledger_write_is_not_a_completed_check() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     crate::status::clear_check_note();
     let s = Staging::scratch("coord-apply-stamp");
-    // The last CHECK completed 25 minutes ago — past the 21-minute window — so
-    // this cycle owes the channel a check.
-    write_check_ledger(&s, 25 * 60, "up to date (channel head v0.85.0)");
+    // The last CHECK completed 80 % of an interval ago — past the 70 % freshness
+    // window — so this cycle owes the channel a check.
+    write_check_ledger(
+        &s,
+        WEB_BASE.as_secs() * 8 / 10,
+        "up to date (channel head v0.85.0)",
+    );
     assert!(
         checker_skip(&s, WEB_BASE).is_none(),
-        "precondition: a 25-minute-old check stamp does not defer"
+        "precondition: a check stamp past the window does not defer"
     );
 
     // The apply lane records a failed attempt NOW — byte-for-byte the record
@@ -82,7 +86,7 @@ fn an_apply_lane_ledger_write_is_not_a_completed_check() {
     assert!(
         checker_skip(&s, WEB_BASE).is_none(),
         "an apply FAILURE is not a completed check: the sibling checkers must not \
-         hold off the channel for another 21 minutes because of it"
+         hold off the channel for another window because of it"
     );
 
     // …and the boot swap's own post-apply record (`install::record_activating_status`),

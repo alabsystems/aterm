@@ -49,8 +49,11 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Pid liveness via `kill(pid, 0)`: delivery permission is checked without
-/// sending anything, so 0 and `EPERM` both mean "alive". Pids that cannot be
-/// real (0, or wider than `pid_t`) are dead — files naming them are garbage.
+/// sending anything, and only `ESRCH` — no such process — means "dead"; 0,
+/// `EPERM` and any other answer mean "alive", because a sweep that removes a
+/// live instance's files breaks it while one that keeps a dead one's costs a
+/// file. Pids that cannot be real (0, or wider than `pid_t`) are dead — files
+/// naming them are garbage.
 pub(crate) fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -58,7 +61,7 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
         return true;
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Atomically (re)point the `latest` symlink at this instance's socket:

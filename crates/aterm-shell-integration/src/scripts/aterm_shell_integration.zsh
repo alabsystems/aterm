@@ -305,7 +305,7 @@ __aterm_reroute_path_front
 # watch; a fork of /usr/bin/true costs ~1400 µs.
 #
 # $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
-# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $ATERM_NO_REROUTE is
+# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $__ATERM_REROUTE_PASSTHROUGH is
 # not engaged (set, non-empty and not "0": atpkg::reroute::engaged) — so the final
 # order is reroute, agents, everything else, bin/ last (the hook appends it).
 #
@@ -346,7 +346,7 @@ fi
 __aterm_managed_derive_reroute() {
     emulate -L zsh
     [[ -z "${ATERM_REROUTE_DIR:-}" && -n "${ATPKG_AGENTS:-}" ]] || return 1
-    case "${ATERM_NO_REROUTE:-}" in
+    case "${__ATERM_REROUTE_PASSTHROUGH:-}" in
         ''|0) ;;
         *) return 1 ;;
     esac

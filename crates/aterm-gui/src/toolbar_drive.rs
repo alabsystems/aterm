@@ -125,16 +125,17 @@ mod macos {
     /// The site that replaces it for the life of the drive process.
     ///
     /// NO MENU EVER TRACKS IN THIS PROCESS. The module header promised that
-    /// by entering the strip's IMPs directly, and it held on macOS 14+, where
-    /// `[NSApp sendEvent:]` does not route a synthesized ctrl-left or right
-    /// mouse into the titlebar's view tree. On macOS 13 it does route them
-    /// (measured 2026-09-08 on an Intel Mac running 13.7.8): the real
-    /// `rightMouseDown:` ran, `popUpContextMenu:` opened a real menu, its
-    /// synchronous tracking loop never read the ESC the drive had queued, and
-    /// the watchdog fired — exit 3, at the same line, every run. The pop site
-    /// is therefore replaced before stage 5 with a stub that RECORDS the pop
-    /// (count and item count) and returns; the stage's checks read the strip's
-    /// own `TabContextMenuOpening` wake and this record, and the tracking loop
+    /// by entering the strip's IMPs directly, on the premise that
+    /// A synthesized ctrl-left or right mouse may route into the titlebar's
+    /// view tree. The old premise that it did not was recorded as
+    /// measured, with no macOS version. On one x86_64 Mac running macOS 13.7.8
+    /// (measured 2026-09-08; OS version and arch were not separated) it routes
+    /// both: the real `rightMouseDown:` ran, `popUpContextMenu:` opened a real
+    /// menu, its synchronous tracking loop did not return, and the watchdog
+    /// fired — exit 3, at the same line, every run. The pop site is therefore
+    /// replaced before stage 5 with a stub that RECORDS the pop (count and
+    /// item count) and returns; the stage's checks read the strip's own
+    /// `TabContextMenuOpening` wake and this record, and the tracking loop
     /// that no drive can survive is never entered, on any macOS.
     static POP_UP_CONTEXT_MENU: aterm_objc::swizzle::SwizzleSite<PopUpContextMenu> =
         aterm_objc::swizzle::SwizzleSite::new();
@@ -964,7 +965,11 @@ mod macos {
             std::process::exit(HUNG);
         });
 
-        let mut el = match EventLoop::<Wake>::with_user_event().build() {
+        // The quiet builder starts inactive. Stages 3 and 4 dispatch to the
+        // hit view/window without stealing a foreground app's focus. Stage 5
+        // activates for its AppKit-routing and later keyboard checks: on Darwin
+        // 27 an inactive app's NSApp click is consumed as an activation click.
+        let mut el = match crate::quiet_driver_event_loop_builder::<Wake>().build() {
             Ok(el) => el,
             Err(e) => {
                 crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no event loop: {e}");
@@ -1101,12 +1106,13 @@ mod macos {
         }
 
         // ---------------------------------------------------------- stage 3
-        println!("\n-- stage 3: a real left click on each chip, through [NSApp sendEvent:]");
-        // SAFETY: `+sharedApplication` on a linked class.
+        println!("\n-- stage 3: a left click on each hit-tested chip view");
+        // SAFETY: `+sharedApplication` on a linked class; later keyboard
+        // events still enter through NSApp's event dispatch.
         let app = unsafe { s_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
-            // SAFETY: `c` and `strip` are live views, `app` the live NSApp;
+            // SAFETY: `c` and `strip` are live views, `ns_window` is live;
             // the synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
                 let b = s_rect(*c, sel!(bounds));
@@ -1118,15 +1124,11 @@ mod macos {
                 let lp = s_point_point_id(*c, sel!(convertPoint:toView:), mid, strip);
                 let hit = s_id_point(strip, sel!(hitTest:), lp);
                 s_v_id(
-                    app,
-                    sel!(sendEvent:),
+                    hit,
+                    sel!(mouseDown:),
                     mouse_event(LEFT_DOWN, wp, 0, win_no, 1),
                 );
-                s_v_id(
-                    app,
-                    sel!(sendEvent:),
-                    mouse_event(LEFT_UP, wp, 0, win_no, 1),
-                );
+                s_v_id(hit, sel!(mouseUp:), mouse_event(LEFT_UP, wp, 0, win_no, 1));
                 println!("  --  chip{i} hitTest -> {}", name_of(hit));
             }
             pump(&mut d, &mut el, 120);
@@ -1139,7 +1141,7 @@ mod macos {
         // ---------------------------------------------------------- stage 4
         println!("\n-- stage 4: drag chip0 across chip2 (down, 6 drags, up)");
         d.wakes.clear();
-        // SAFETY: live views and NSApp, as stage 3.
+        // SAFETY: live views and NSWindow, as stage 3.
         unsafe {
             let b0 = s_rect(cs[0], sel!(bounds));
             let p0 = s_point_point_id(
@@ -1162,7 +1164,7 @@ mod macos {
                 Id::NIL,
             );
             s_v_id(
-                app,
+                ns_window,
                 sel!(sendEvent:),
                 mouse_event(LEFT_DOWN, p0, 0, win_no, 1),
             );
@@ -1173,13 +1175,13 @@ mod macos {
                     y: p0.y,
                 };
                 s_v_id(
-                    app,
+                    ns_window,
                     sel!(sendEvent:),
                     mouse_event(LEFT_DRAG, p, 0, win_no, 0),
                 );
             }
             s_v_id(
-                app,
+                ns_window,
                 sel!(sendEvent:),
                 mouse_event(LEFT_UP, p2, 0, win_no, 1),
             );
@@ -1229,6 +1231,50 @@ mod macos {
         for l in &menus {
             println!("      {l}");
         }
+        // NSApp's real event routing needs the application active and this
+        // window key on Darwin 27: otherwise the first click is consumed as
+        // an activation click and no chip receives it. Keep that activation
+        // here, after the quiet view/window checks in stages 3 and 4.
+        // SAFETY: the live NSApp and the drive's own window.
+        unsafe {
+            s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
+            s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
+        }
+        pump(&mut d, &mut el, 250);
+        // Exercise real NSApp dispatch for every chip as well as stage 3's
+        // direct-responder checks. These are plain left clicks; context-menu
+        // dispatch below remains guarded by a successful pop-site replacement.
+        for (i, c) in cs.iter().enumerate() {
+            d.wakes.clear();
+            // SAFETY: `c` is a live view, `app` is the live NSApp, and the
+            // synthesized events are +0 autoreleased `NSEvent`s.
+            unsafe {
+                let b = s_rect(*c, sel!(bounds));
+                let mid = CGPoint {
+                    x: b.size.width * 0.35,
+                    y: b.size.height * 0.5,
+                };
+                let wp = s_point_point_id(*c, sel!(convertPoint:toView:), mid, Id::NIL);
+                s_v_id(
+                    app,
+                    sel!(sendEvent:),
+                    mouse_event(LEFT_DOWN, wp, 0, win_no, 1),
+                );
+                s_v_id(
+                    app,
+                    sel!(sendEvent:),
+                    mouse_event(LEFT_UP, wp, 0, win_no, 1),
+                );
+            }
+            pump(&mut d, &mut el, 120);
+            cx.check(
+                d.wakes.iter().any(|w| w == &format!("SelectTab({i})")),
+                format!(
+                    "chip{i} NSApp click posted SelectTab({i}); saw {:?}",
+                    d.wakes
+                ),
+            );
+        }
         // The block below enters the strip's menu, through AppKit's routing
         // and straight at the IMPs, so it runs only over the stub. Over the
         // REAL pop site any of those entries can start the tracking loop the
@@ -1254,12 +1300,8 @@ mod macos {
                     name_of(s_id_point(strip, sel!(hitTest:), lp))
                 );
 
-                // The app is made ACTIVE and the window KEY first: titlebar event
-                // routing depends on both, and a probe that skips them measures its
-                // own setup rather than the strip.
-                s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
-                s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
-                pump(&mut d, &mut el, 250);
+                // App and window are active/key for the real NSApp routing
+                // control below; the view's responder was checked in stage 3.
                 println!(
                     "  --  app active={} window key={} main={}",
                     s_bool(app, sel!(isActive)),
@@ -1267,17 +1309,10 @@ mod macos {
                     s_bool(ns_window, sel!(isMainWindow))
                 );
 
-                // THE CONTROL, and it is the reason the two lines below are an
-                // observation and not a failure: a plain left click through the
-                // SAME routing does arrive. On macOS 14+ `[NSApp sendEvent:]` does
-                // not deliver a synthesized ctrl-left or right-mouse into the
-                // titlebar's view tree — measured, on both this branch and
-                // origin/main — so the menu is entered at its IMP instead. On
-                // macOS 13 it DOES deliver them (measured 2026-09-08 on an Intel
-                // Mac running 13.7.8), which is why the pop site above is a stub:
-                // whichever way the routing goes, the pop is recorded and the
-                // drive continues. The swallow count after each send says whether
-                // this OS routed it.
+                // THE CONTROL: a plain click through the same NSApp routing
+                // as the context clicks must select before those observations
+                // count. The pop site is stubbed, so whichever context route
+                // this host takes cannot enter a modal tracking loop.
                 d.wakes.clear();
                 s_v_id(
                     app,
@@ -1291,11 +1326,10 @@ mod macos {
                 );
                 pump(&mut d, &mut el, 200);
                 let control_arrived = d.wakes.iter().any(|w| w == "SelectTab(1)");
-                println!("  --  [NSApp sendEvent:] plain left   -> {:?}", d.wakes);
+                println!("  --  [NSApp sendEvent:] plain left -> {:?}", d.wakes);
                 cx.check(
                     control_arrived,
-                    "the CONTROL arrived: NSApp routes a plain left click into the strip"
-                        .to_owned(),
+                    "the CONTROL arrived: NSApp routes a plain left click".to_owned(),
                 );
 
                 d.wakes.clear();

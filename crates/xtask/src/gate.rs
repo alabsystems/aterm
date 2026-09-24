@@ -537,9 +537,11 @@
 //!   BROKEN"; it never degrades to a pass. Skips only when NEITHER a stage2
 //!   `trustc` nor a rustup `trust` toolchain exists.
 //! - `help-surfaces`: every CLI help surface in the workspace (a source file
-//!   carrying usage/help text, discovered mechanically) has a dated row saying it
-//!   was READ against its handler, and a surface that appears or changes after
-//!   that read is refused until it is read again. Roster and rules in
+//!   carrying usage/help text, discovered mechanically, or a markdown asset a
+//!   surface embeds) has a dated row saying it was READ against its handler,
+//!   and a surface that appears or changes after that read is refused until it
+//!   is read again — a Rust file by its string literals and doc comments, a
+//!   markdown file by its whole text. Roster and rules in
 //!   `crates/xtask/src/help_surfaces.rs`.
 //! - `citations`: A CLAIM WITH NO WITNESS. Prose on the release + packaging
 //!   surface that CITES something by name — a repo path, or a test-shaped

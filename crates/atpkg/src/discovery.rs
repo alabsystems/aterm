@@ -15,26 +15,13 @@
 
 use crate::manifest::INDEX_REPO;
 
-/// The env override for the account (owner) the index lives under. Precedence is
-/// **env > config > default**, mirroring the updater's source resolution but on a
-/// package-manager-specific key so the two never cross-talk.
-const ACCOUNT_ENV: &str = "ATPKG_ACCOUNT";
-
-/// The env override for which repo hosts the signed index.
-const INDEX_REPO_ENV: &str = "ATPKG_INDEX_REPO";
-
-/// The repository (under the resolved account) that hosts the signed index, with the
-/// `ATPKG_INDEX_REPO` env override falling back to [`INDEX_REPO`] (the `aterm` repo). The
-/// override is URL-safety-validated so a malformed value can never redirect the fetch off
-/// the GitHub API; an invalid value falls back to the default. Repointing the *host* is
-/// never an authenticity change — the index is still verified against the pinned root key.
+/// The repository (under the resolved account) that hosts the signed index: always
+/// [`INDEX_REPO`] (the `aterm` repo). The `ATPKG_INDEX_REPO` override is gone
+/// (2026-09-23, R2: one true path, no env alternatives) — it had no config twin and
+/// contradicted this module's own rule that only the account is configurable.
 #[must_use]
 pub fn index_repo() -> String {
-    std::env::var(INDEX_REPO_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| aterm_update_core::is_valid_slug(s))
-        .unwrap_or_else(|| INDEX_REPO.to_string())
+    INDEX_REPO.to_string()
 }
 
 /// The resolved index location: `github.com/<owner>/aterm`. `repo` is
@@ -62,11 +49,13 @@ impl IndexRepo {
     }
 }
 
-/// Resolve the index account by precedence **env (`ATPKG_ACCOUNT`) > config > default
-/// (`alabsystems`)**, validated by the shared URL-safety allowlist so a malformed
-/// value can never redirect fetches at a different host/path (it falls through to the
-/// next source). `cfg_account` is the value the GUI threads in from `[packages].account`
-/// (`None` when unset).
+/// Resolve the index account: `cfg_account` — the `[packages].account` value, which
+/// only a DEVELOPMENT build ever hands over (`config::admit_packages` drops it from a
+/// shipped binary's table, like every repoint) — else the compiled
+/// [`aterm_update_core::ATPKG_INDEX_OWNER`] (`alabsystems`). Validated by the shared
+/// URL-safety allowlist so a malformed value can never redirect fetches at a different
+/// host/path (it falls through to the default). The `ATPKG_ACCOUNT` env override is gone
+/// (2026-09-23).
 ///
 /// Repointing the account is **not** an authenticity downgrade: the install gate is the
 /// root/release signature (§8), not where the bytes come from — and pointing at a
@@ -74,15 +63,6 @@ impl IndexRepo {
 /// account-bound trust), so a bare repoint is same-owner mirror/relocation only.
 #[must_use]
 pub fn resolve_account(cfg_account: Option<&str>) -> IndexRepo {
-    let env = std::env::var(ACCOUNT_ENV).ok();
-    resolve_account_with(env.as_deref(), cfg_account)
-}
-
-/// Pure core of [`resolve_account`]: precedence + URL-safety validation over an
-/// already-read `env` value, so the env-override branch is unit-testable without
-/// mutating the process environment (which is `unsafe`/UB-prone under edition 2024).
-#[must_use]
-pub fn resolve_account_with(env: Option<&str>, cfg_account: Option<&str>) -> IndexRepo {
     // ATPKG_INDEX_OWNER — the package index's OWN tracked key
     // (`[workspace.metadata.atpkg] account`), neither of the updater's slugs:
     //   * not DEFAULT_OWNER — that is the APP update channel; following it would
@@ -96,8 +76,7 @@ pub fn resolve_account_with(env: Option<&str>, cfg_account: Option<&str>) -> Ind
     // Repointing the compiled default is a HOST decision only: the index still
     // verifies against the pinned root key wherever it is fetched from.
     let owner = aterm_update_core::pick_slug(
-        ACCOUNT_ENV,
-        env,
+        "[packages] account",
         cfg_account,
         aterm_update_core::ATPKG_INDEX_OWNER,
     );
@@ -113,16 +92,14 @@ mod tests {
 
     #[test]
     fn defaults_to_the_public_alabsystems_index_repo() {
-        // With no env override and no config, the default account + fixed index repo.
-        // (ATPKG_ACCOUNT is atpkg-specific and unset in dev/CI shells.)
-        if std::env::var_os(ACCOUNT_ENV).is_none() {
-            let r = resolve_account(None);
-            assert_eq!(r.owner, aterm_update_core::ATPKG_INDEX_OWNER);
-            assert_eq!(r.owner, "alabsystems");
-            assert_eq!(r.repo, INDEX_REPO);
-            assert_eq!(r.repo, "aterm"); // the index rides the aterm repo itself (§16)
-            assert_eq!(r.slug(), "alabsystems/aterm");
-        }
+        // With no config, the default account + fixed index repo — on every machine:
+        // no environment is read.
+        let r = resolve_account(None);
+        assert_eq!(r.owner, aterm_update_core::ATPKG_INDEX_OWNER);
+        assert_eq!(r.owner, "alabsystems");
+        assert_eq!(r.repo, INDEX_REPO);
+        assert_eq!(r.repo, "aterm"); // the index rides the aterm repo itself (§16)
+        assert_eq!(r.slug(), "alabsystems/aterm");
     }
 
     /// The index account is its OWN tracked key (`[workspace.metadata.atpkg]
@@ -142,13 +119,11 @@ mod tests {
     /// makes this a tripwire: it keeps failing if either binding comes back.
     #[test]
     fn index_account_is_its_own_knob() {
-        if std::env::var_os(ACCOUNT_ENV).is_none() {
-            assert_eq!(
-                resolve_account(None).owner,
-                aterm_update_core::ATPKG_INDEX_OWNER,
-                "the index account must be the dedicated package-index owner"
-            );
-        }
+        assert_eq!(
+            resolve_account(None).owner,
+            aterm_update_core::ATPKG_INDEX_OWNER,
+            "the index account must be the dedicated package-index owner"
+        );
         // The compiled default is the PUBLIC package org in BOTH trees: this tree
         // spells `alabsystems` in the metadata key verbatim, and `publish/` exports
         // a PUBLIC source snapshot that rewrites the private staging owner's name
@@ -185,61 +160,30 @@ mod tests {
     }
 
     #[test]
-    fn index_repo_defaults_to_aterm_when_unset() {
-        // No env mutation (process-global): assert only the default branch, which is what
-        // ships. The override path reuses the shared, separately-tested `is_valid_slug`.
-        if std::env::var_os(INDEX_REPO_ENV).is_none() {
-            assert_eq!(index_repo(), INDEX_REPO);
-            assert_eq!(index_repo(), "aterm");
-        }
+    fn index_repo_is_always_aterm() {
+        assert_eq!(index_repo(), INDEX_REPO);
+        assert_eq!(index_repo(), "aterm");
     }
 
     #[test]
     fn config_account_overrides_default_but_is_validated() {
-        if std::env::var_os(ACCOUNT_ENV).is_none() {
-            // A valid config account is used.
-            assert_eq!(resolve_account(Some("my-org")).owner, "my-org");
-            // An invalid (URL-metacharacter) account is rejected → falls back to default,
-            // so it can never redirect the index fetch off api.github.com.
-            assert_eq!(
-                resolve_account(Some("evil.com/x")).owner,
-                aterm_update_core::ATPKG_INDEX_OWNER
-            );
-            assert_eq!(
-                resolve_account(Some("a b")).owner,
-                aterm_update_core::ATPKG_INDEX_OWNER
-            );
-        }
-    }
-
-    // The env-override branch, exercised through the pure split (no process-env mutation):
-    // env wins over config when valid; an invalid env value is skipped (falls through to
-    // config, then default) — it can never redirect the index fetch.
-    #[test]
-    fn env_override_precedence_and_validation() {
-        // env beats config.
+        // A valid config account is used (only a development build hands one over).
+        assert_eq!(resolve_account(Some("my-org")).owner, "my-org");
+        assert_eq!(resolve_account(Some("my-org")).repo, INDEX_REPO);
+        // An invalid (URL-metacharacter) account is rejected → falls back to default,
+        // so it can never redirect the index fetch off api.github.com.
         assert_eq!(
-            resolve_account_with(Some("env-org"), Some("cfg-org")).owner,
-            "env-org"
-        );
-        // env present but config absent.
-        assert_eq!(resolve_account_with(Some("env-org"), None).owner, "env-org");
-        // invalid env → skip to config.
-        assert_eq!(
-            resolve_account_with(Some("bad/env"), Some("cfg-org")).owner,
-            "cfg-org"
-        );
-        // invalid env AND no/invalid config → trusted default (never an attacker slug).
-        assert_eq!(
-            resolve_account_with(Some("e v i l"), Some("c/d")).owner,
+            resolve_account(Some("evil.com/x")).owner,
             aterm_update_core::ATPKG_INDEX_OWNER
         );
-        // blank env is treated as absent.
         assert_eq!(
-            resolve_account_with(Some("   "), Some("cfg-org")).owner,
-            "cfg-org"
+            resolve_account(Some("a b")).owner,
+            aterm_update_core::ATPKG_INDEX_OWNER
         );
-        // the index repo is always the fixed well-known name.
-        assert_eq!(resolve_account_with(Some("env-org"), None).repo, INDEX_REPO);
+        // Blank is absent.
+        assert_eq!(
+            resolve_account(Some("   ")).owner,
+            aterm_update_core::ATPKG_INDEX_OWNER
+        );
     }
 }

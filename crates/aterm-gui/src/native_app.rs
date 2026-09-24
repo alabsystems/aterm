@@ -1765,6 +1765,13 @@ pub(crate) enum AppEvent {
     PackagesChanged {
         revision: u64,
     },
+    /// The Settings ▸ Messages projection advanced (a row posted, restated,
+    /// retired or pressed; or the 60 s tick that moves the relative times);
+    /// every Settings view repaints from the shared controller snapshot
+    /// (design §4.2, the `PackagesChanged` twin).
+    MessagesChanged {
+        revision: u64,
+    },
     DocumentChanged {
         document: DocumentId,
         revision: u64,
@@ -1794,6 +1801,12 @@ pub(crate) enum AppEvent {
     PackagesFinished {
         operation: OperationId,
         outcome: PackagesOutcome,
+    },
+    /// The host performed (or refused) a Settings ▸ Messages entry's button
+    /// (`AppEffect::MessageAct`); the page words its feedback from it.
+    MessageActFinished {
+        operation: OperationId,
+        outcome: MessageActOutcome,
     },
     ClipboardFinished {
         operation: OperationId,
@@ -2042,9 +2055,9 @@ pub(crate) enum PackagesRequest {
     UninstallAll,
     /// `atpkg machine apply` — the `[machine]` host settings (Universal Control off
     /// for this host, cargo build output hidden from Spotlight), applied NOW from
-    /// the Security page's "This Mac" card. The exact pass every package pass runs
-    /// first; a local verb (no store lock, no network) that works with the package
-    /// manager switched off. macOS only.
+    /// the Security page's "This Mac" card — the verb that keeps them applied (a pass
+    /// carries only an edit to the table); a local verb (no store lock, no network) that
+    /// works with the package manager switched off. macOS only.
     MachineApply,
 }
 
@@ -2061,6 +2074,18 @@ pub(crate) enum PackagesOutcome {
     Failed {
         message: String,
     },
+}
+
+/// What came of an [`AppEffect::MessageAct`] — the host's answer, already in
+/// the words the page shows (`messages_host::act_feedback`): the intent was
+/// performed, it was refused (a path that is no crash log, a pane that did
+/// not open), or the entry no longer offers that button (a decision row
+/// that retired under the press, an id the ring has evicted).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MessageActOutcome {
+    Performed { feedback: String },
+    Refused { feedback: String },
+    Gone,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2164,6 +2189,16 @@ pub(crate) enum AppEffect {
         request: PackagesRequest,
         reply: ReplyToken<PackagesOutcome>,
     },
+    /// Press button `action` of message `id` from Settings ▸ Messages
+    /// (design §4.4). The reducer supplies IDENTITY only — an id and an
+    /// index, never a path or a route (the `OpenConfigEditor` rule): the host
+    /// re-resolves both against the center and the log and performs the
+    /// intent in the pressing window.
+    MessageAct {
+        id: u64,
+        action: u8,
+        reply: ReplyToken<MessageActOutcome>,
+    },
     Clipboard {
         request: ClipboardRequest,
         reply: ReplyToken<ClipboardOutcome>,
@@ -2182,6 +2217,15 @@ pub(crate) enum AppEffect {
     /// versioned config lane (which re-decodes the image), so no reply is
     /// needed — the view converges via the ordinary config-change projection.
     ChooseWallpaperImage,
+    /// Open atpkg's `packages.log` (Settings ▸ Packages' "Open Log", Phase 4). The host
+    /// resolves the path itself — the reducer supplies none — and opens it through
+    /// NSWorkspace: no shell, no Terminal.
+    OpenPackagesLog,
+    /// Open the log directory (Settings ▸ Messages' "Open Log Folder") — `aterm.log`,
+    /// `messages.log`, `packages.log` and the crash reports side by side. The host
+    /// resolves the directory itself and opens it through NSWorkspace: no shell, no
+    /// Terminal, no path from the view.
+    OpenLogFolder,
     RequestCloseSelf,
     InvalidateOwnPresentation,
     RepaintSelf(DamageRegion),
@@ -2324,6 +2368,16 @@ impl UpdateCx<'_> {
         operation
     }
 
+    /// Press button `action` of message `id` (an [`AppEffect::MessageAct`]);
+    /// the completion returns to THIS view as `MessageActFinished`.
+    pub(crate) fn message_act(&mut self, id: u64, action: u8) -> OperationId {
+        let reply = self.view_reply();
+        let operation = reply.operation;
+        self.effects
+            .push(AppEffect::MessageAct { id, action, reply });
+        operation
+    }
+
     pub(crate) fn open_external(&mut self, request: ExternalOpenRequest) -> OperationId {
         let reply = self.view_reply();
         let operation = reply.operation;
@@ -2354,6 +2408,14 @@ impl UpdateCx<'_> {
 
     pub(crate) fn choose_wallpaper_image(&mut self) {
         self.effects.push(AppEffect::ChooseWallpaperImage);
+    }
+
+    pub(crate) fn open_packages_log(&mut self) {
+        self.effects.push(AppEffect::OpenPackagesLog);
+    }
+
+    pub(crate) fn open_log_folder(&mut self) {
+        self.effects.push(AppEffect::OpenLogFolder);
     }
 
     pub(crate) fn clipboard(&mut self, request: ClipboardRequest) -> OperationId {
@@ -2577,6 +2639,23 @@ impl NativeRuntime {
             return false;
         };
         settings.replace_packages(packages, revision);
+        true
+    }
+
+    /// Replace the process-global Settings ▸ Messages projection (the
+    /// messages analogue of [`Self::replace_settings_packages`]).
+    pub(crate) fn replace_settings_messages(
+        &mut self,
+        messages: crate::messages_host::MessagesState,
+        revision: u64,
+    ) -> bool {
+        let Some(settings) = self.instances.values_mut().find_map(|app| match app {
+            NativeApp::Settings(settings) => Some(settings),
+            NativeApp::Markdown(_) | NativeApp::Editor(_) | NativeApp::Recovery(_) => None,
+        }) else {
+            return false;
+        };
+        settings.replace_messages(messages, revision);
         true
     }
 

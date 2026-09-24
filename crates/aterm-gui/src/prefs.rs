@@ -406,26 +406,45 @@ pub(crate) const EDIT_SHOW_BUILD_BADGE: &str = "show_build_badge";
 /// session ends.
 pub(crate) const EDIT_MATRIX_RAIN_ENABLED: &str = "matrix_rain.enabled";
 
-/// The `[packages]` toolchain-manager maintenance switches, addressed as
-/// dotted keys (the same nested writer as [`EDIT_MATRIX_RAIN_ENABLED`]). All
-/// are Bools. The background-service master and `auto_update` default ON (the
-/// pre-config 6h `atpkg update` cadence), `auto_install` defaults OFF —
-/// installing the multi-GB default toolset needs explicit consent, and this
-/// Settings switch IS the consent click (`docs/TOOLCHAIN-PACKAGE-MANAGER.md`
-/// §11). Housed in the search-only Packages section: the rows render on the
-/// special Settings ▸ Packages page (which no `section()` registry page owns),
+/// The `[packages]` toolchain-manager switches a person has, addressed as dotted keys
+/// (the same nested writer as [`EDIT_MATRIX_RAIN_ENABLED`]). Both are Bools, both
+/// default ON (2026-09-23, the one-path collapse): `enabled` is Automatic updates —
+/// THE switch, which folded in the retired `auto_update` — and
+/// [`EDIT_PACKAGES_AUTO_INSTALL`] is the ONE install consent, which folded in the
+/// retired `seed_install`. Writing either drops its retired spelling from the file
+/// ([`apply_prefs_edits`]). Housed in the search-only Packages section: the rows render
+/// on the special Settings ▸ Packages page (which no `section()` registry page owns),
 /// while Search and Modified still find them through the ordinary registry.
 pub(crate) const EDIT_PACKAGES_ENABLED: &str = "packages.enabled";
-/// See [`EDIT_PACKAGES_ENABLED`]; default ON.
-pub(crate) const EDIT_PACKAGES_AUTO_UPDATE: &str = "packages.auto_update";
-/// See [`EDIT_PACKAGES_AUTO_UPDATE`]; default OFF (consent-gated).
+/// `[packages] auto_install` — may atpkg install ALab toolset members nobody named (the
+/// first-run fill, new members of the signed set)? Default ON, batteries included; the
+/// explicit opt-outs (`uninstall`, `exclude`, `enabled = false`) always win.
 pub(crate) const EDIT_PACKAGES_AUTO_INSTALL: &str = "packages.auto_install";
-/// `[packages] seed_install` — lay the BUNDLED toolchain down on first launch.
-/// Default ON: those bytes already shipped inside the app, so installing the app is
-/// the consent and the remaining cost is extraction, not download. Off turns the
-/// first run into an announced offer instead. Distinct from
-/// [`EDIT_PACKAGES_AUTO_INSTALL`], which governs NETWORK installs.
-pub(crate) const EDIT_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
+/// The retired `[packages]` spellings and the key that replaced each: still honoured
+/// by the resolvers, dropped from the file whenever Settings writes the new key, and
+/// named as retired by the config language service and Settings ▸ Modified — where each
+/// is resettable, and Reset All removes it with the rest.
+pub(crate) const RETIRED_PACKAGES_SPELLINGS: &[(&str, &str)] = &[
+    (RETIRED_PACKAGES_AUTO_UPDATE, EDIT_PACKAGES_ENABLED),
+    (RETIRED_PACKAGES_SEED_INSTALL, EDIT_PACKAGES_AUTO_INSTALL),
+];
+/// The retired `[packages] auto_update`: folded into [`EDIT_PACKAGES_ENABLED`] — a `false`
+/// keeps Automatic updates off whatever `enabled` says.
+pub(crate) const RETIRED_PACKAGES_AUTO_UPDATE: &str = "packages.auto_update";
+/// The retired `[packages] seed_install`: read as [`EDIT_PACKAGES_AUTO_INSTALL`] while that
+/// is unset.
+pub(crate) const RETIRED_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
+/// `[update] enabled` — "Check for updates automatically" (Settings ▸ Software Update's
+/// Automatic updates card, Settings ▸ Terminal ▸ Updates, and Search), default ON. It
+/// replaces `$ATERM_NO_AUTO_UPDATE` (2026-09-23): off stops the background checker only
+/// (Check for Updates and Update Now still work), read once per process, so it applies
+/// from the next launch.
+pub(crate) const EDIT_UPDATE_ENABLED: &str = "update.enabled";
+/// `[reroute] announce` — whether a rerouted upstream Rust tool (`cargo`, `rustc`,
+/// `tlc`) prints its signpost before it runs, default ON. The owner's 2026-09-08 ask
+/// ("a printed message … that could be suppressed with a flag") made a setting on
+/// 2026-09-23, replacing `$ATERM_REROUTE_QUIET`; the co-located atpkg reads it.
+pub(crate) const EDIT_REROUTE_ANNOUNCE: &str = "reroute.announce";
 /// The aterm WRAPPER's durable master switch — the `[harness]` table's
 /// `enabled` key (design `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2).
 /// A Bool, default ON, registered through [`NESTED_LEAVES`] like the other
@@ -439,9 +458,10 @@ pub(crate) const EDIT_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
 pub(crate) const EDIT_HARNESS_ENABLED: &str = "harness.enabled";
 
 /// `[machine] universal_control` — `"off"` (default) disables macOS Universal Control
-/// for this host on every package pass; `"leave"` never touches it. Applied by the
-/// CO-LOCATED atpkg, which reads the same table; the Security page shows the measured
-/// state beside the switch.
+/// for this host whenever the `[machine]` settings are applied (`aterm pkg machine apply`,
+/// run as the window opens and by a terminal session once a day, and a pass after an
+/// edit); `"leave"` never touches it. Applied by the CO-LOCATED atpkg, which reads the same
+/// table; the Security page shows the measured state beside the switch.
 pub(crate) const EDIT_MACHINE_UNIVERSAL_CONTROL: &str = "machine.universal_control";
 /// `[machine] spotlight_noindex` — rename cargo target dirs under `$HOME` to
 /// `.noindex` (with a `target` symlink left in place) so Spotlight never indexes
@@ -672,20 +692,23 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Net: server key path",
         kind: EditKind::Text,
     },
-    // [update] — the self-update channel + apply policy.
+    // [update] — whether the self-updater runs, and its apply policy. The channel
+    // (`owner`/`repo`) and `require_team_id` are DEVELOPMENT settings since 2026-09-23:
+    // a shipped build reads its compiled channel and pin, so they are not rows here.
     NestedLeaf {
-        key: "update.owner",
-        label: "Update: GitHub owner",
-        kind: EditKind::Text,
-    },
-    NestedLeaf {
-        key: "update.repo",
-        label: "Update: GitHub repo",
-        kind: EditKind::Text,
+        key: EDIT_UPDATE_ENABLED,
+        label: "Update: check for updates automatically",
+        kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "update.auto_apply",
         label: "Update: apply immediately",
+        kind: EditKind::Bool,
+    },
+    // [reroute] — the upstream-Rust signpost line (atpkg reads it).
+    NestedLeaf {
+        key: EDIT_REROUTE_ANNOUNCE,
+        label: "Toolchain: announce upstream cargo/rustc",
         kind: EditKind::Bool,
     },
     // [harness] — the aterm wrapper's ONE durable master switch. Everything
@@ -1716,9 +1739,11 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         // matrix_rain.* leaves are typed by their NESTED_LEAVES rows before this
         // match is consulted).
         | EDIT_PACKAGES_ENABLED
-        | EDIT_PACKAGES_AUTO_UPDATE
         | EDIT_PACKAGES_AUTO_INSTALL
-        | EDIT_PACKAGES_SEED_INSTALL
+        // And their RETIRED spellings: Settings removes one (a Modified row's Reset, Reset
+        // All), and Undo writes it back — as the Bool atpkg's serde reads, never a string.
+        | RETIRED_PACKAGES_AUTO_UPDATE
+        | RETIRED_PACKAGES_SEED_INSTALL
         // CRITICAL for the same reason: `[machine]` is a table the CO-LOCATED atpkg
         // parses too, and a Text write would hand its serde `Option<bool>` a string.
         | EDIT_MACHINE_SPOTLIGHT_NOINDEX
@@ -1824,6 +1849,16 @@ pub(crate) fn apply_prefs_edits(
                 Some(raw) => {
                     let item = typed_item(key, raw)?;
                     set_nested_key(&mut doc, &parts, item)?;
+                }
+            }
+            // A key that replaced a retired spelling takes it out of the file: the
+            // new key now decides, and a stale `auto_update = false` left beside a
+            // freshly written `enabled = true` would still read as off (the resolvers
+            // honour the retired spelling, 2026-09-23).
+            for (retired, current) in RETIRED_PACKAGES_SPELLINGS {
+                if current == key {
+                    let retired: Vec<&str> = retired.split('.').collect();
+                    remove_nested_key(&mut doc, &retired);
                 }
             }
             continue;
@@ -2357,15 +2392,9 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         // `[workspace.metadata.aterm] update_channel` landed. A hard-coded owner here
         // silently became a lie the moment the channel was repointed, telling the
         // user their updates come from a repo they are not actually reading.
-        "update.owner" => txt(
-            upd.and_then(|u| u.owner.as_deref()),
-            &format!("{} (default)", aterm_update_core::DEFAULT_OWNER),
-        ),
-        "update.repo" => txt(
-            upd.and_then(|u| u.repo.as_deref()),
-            &format!("{} (default)", aterm_update_core::DEFAULT_REPO),
-        ),
+        EDIT_UPDATE_ENABLED => boolean(upd.and_then(|u| u.enabled), true),
         "update.auto_apply" => boolean(upd.and_then(|u| u.auto_apply), true),
+        EDIT_REROUTE_ANNOUNCE => boolean(cfg.reroute.as_ref().and_then(|r| r.announce), true),
         // Seeded through the RESOLVER that owns the default, never a literal
         // `true` re-typed here — the streak pip's rule, so the switch and the
         // harness can never start in different positions.
@@ -2659,10 +2688,11 @@ pub(crate) fn section_of(key: &str) -> Section {
         // The [packages] maintenance switches live on the special Packages page;
         // this section keeps them findable (Search/Modified) without also
         // duplicating them onto an ordinary registry page.
-        EDIT_PACKAGES_ENABLED
-        | EDIT_PACKAGES_AUTO_UPDATE
-        | EDIT_PACKAGES_AUTO_INSTALL
-        | EDIT_PACKAGES_SEED_INSTALL => Section::Packages,
+        // …and the reroute's announcement: the rerouted toolchain names are the package
+        // manager's (atpkg lays and reads them), so the switch rides the same page.
+        EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_INSTALL | EDIT_REROUTE_ANNOUNCE => {
+            Section::Packages
+        }
         // The [machine] host settings live on the Security page, beside the
         // permissions they resemble: each is a switch about what this Mac lets
         // happen to it, and the page's "This Mac" card confirms the measured state.
@@ -2885,15 +2915,10 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_OPTION_AS_META | EDIT_PREDICTIVE_ECHO => ("Keyboard", 1),
         // Performance › focus-linked QoS, launch-time renderer choice, and replay.
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => ("System", 1),
-        // Packages › the toolchain-manager maintenance switches ride together.
-        // `seed_install` groups here too even though the Packages page does not
-        // render a fourth switch row (a fourth row overruns the compact card's
-        // height budget); Search and `settings set` still reach it, and a key with
-        // no group at all fails the grouping-table coherence test.
-        EDIT_PACKAGES_ENABLED
-        | EDIT_PACKAGES_AUTO_UPDATE
-        | EDIT_PACKAGES_AUTO_INSTALL
-        | EDIT_PACKAGES_SEED_INSTALL => ("Toolchain Packages", 0),
+        // Packages › the ALab tools switches ride together.
+        EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_INSTALL | EDIT_REROUTE_ANNOUNCE => {
+            ("ALab Tools", 0)
+        }
         EDIT_SCROLLBACK | EDIT_SEARCH_HISTORY_LINES => ("Scrollback", 0),
         EDIT_BIDI | EDIT_AMBIGUOUS_WIDTH => ("Text direction & width", 1),
         // Terminal › which program runs in the pane.
@@ -2997,8 +3022,16 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         "Matrix rain" => {
             "Rain follows activity and drains when idle. View ▸ Matrix Rain overrides one session. Serious Mode and Reduce Motion disable it."
         }
-        "Toolchain Packages" => {
-            "Maintenance controls the background service. It and the toolset's auto-update apply next launch. Auto-install runs next package operation and may fetch multiple GB. First launch installs the ALab toolset: from bytes sealed inside a full install, or as a multi-GB download on lean installs; [packages] seed_install = false in aterm.toml turns that into an offer."
+        // LIVE, and says so (review of Phase 4, 2026-09-23): the window's package loop reads
+        // `[packages] enabled` (the retired `auto_update` folded in) before every pass and
+        // every few seconds of a park. This caption said it applied "next launch" — and
+        // Search and Modified render it under exactly the row it was wrong about.
+        // Install ALab tools has ONE lane (2026-09-24 post-push review): Phase 5 deleted
+        // the sealed seed, so no install ships a copy to install from, and the offer an
+        // off switch used to turn the first launch into (R20) is retired — nothing posts
+        // it. Off, nothing installs that nobody asked for (`PackagesConfig::auto_install`).
+        "ALab Tools" => {
+            "Automatic updates keeps the installed ALab tools up to date in the background and applies at once — off stops it, on starts it again; typed aterm pkg commands work either way. Install ALab tools lets aterm download them (several GB) and add new tools later; it applies at the next package check, and off installs nothing you did not ask for. Announce upstream cargo/rustc prints one line before a rerouted Rust tool runs."
         }
         "Smart Titles" => {
             "Activity is a generated fallback when a session has no authored Description. Built-in stays on-device. On macOS, aterm auto-starts Ollama only after every file in its bounded runtime code closure passes pinned structural-signature, Apple Developer-ID Team, code-identifier, ownership, permission, and stable-identity checks; it repeats the closure check before terminal context is sent, clears inherited environment, disables cloud integration, and uses direct loopback. A pre-existing localhost service and every custom service remain untrusted network providers and require explicit consent. Other platforms never auto-execute a managed runtime without a platform attestation anchor. Environment proxy honors HTTP(S)_PROXY and NO_PROXY; Direct bypasses them. For HTTPS OpenAI-compatible endpoints, an explicit CA bundle replaces platform roots. Recent terminal text may be sent. Credential filtering is conservative but heuristic and cannot identify every secret; use Built-in or managed local Ollama when terminal context must stay on-device. Credentials and certificates are path-only—never stored here."
@@ -3014,6 +3047,11 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
     })
 }
 
+/// [`application_timing`] of the Harness row: supervision is live, the
+/// launcher follows at the next session.
+pub(crate) const HARNESS_TIMING: &str =
+    "Supervision starts or stops when saved; the agent launcher changes for new sessions";
+
 /// When an authored value becomes effective. Most preferences are projected
 /// live. Keep this metadata beside the complete preference schema so Advanced,
 /// Modified, and the Manual language service cannot disagree about a saved
@@ -3023,35 +3061,34 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
         EDIT_COLUMNS | EDIT_LINES => Some(
             "Applies on a fresh launch; an authenticated update handoff preserves the live size",
         ),
-        EDIT_GPU
-        | EDIT_PACKAGES_ENABLED
-        | EDIT_PACKAGES_AUTO_UPDATE
-        | "net.listen"
-        | "net.cert"
-        | "net.key" => Some("Applies next launch"),
-        // Turning the harness off re-renders the launcher twin without the
-        // prelude, so the NEXT launch is plain; sessions already running keep
-        // what they launched with until they exit (design §4.6.2).
-        EDIT_ALLOW_KITTY_FILE_TRANSFER
-        | EDIT_TEMPORAL_RECORDING
-        | EDIT_SHELL
-        | EDIT_SHELL_ARGS
-        | EDIT_HARNESS_ENABLED => Some("Applies to new sessions"),
+        // NOT `packages.enabled` (Phase 4): the window's package loop re-reads it (the
+        // retired `auto_update` folded in) before every pass and every few seconds of a
+        // park, so it is live — no timing to disclose. `[update] enabled` is read once per
+        // process, so it applies next launch.
+        EDIT_GPU | EDIT_UPDATE_ENABLED | "net.listen" | "net.cert" | "net.key" => {
+            Some("Applies next launch")
+        }
+        EDIT_ALLOW_KITTY_FILE_TRANSFER | EDIT_TEMPORAL_RECORDING | EDIT_SHELL | EDIT_SHELL_ARGS => {
+            Some("Applies to new sessions")
+        }
+        // The switch is two things (2026-09-23): the in-GUI supervisor, which
+        // starts or stops on every Claude session the moment the file is
+        // saved (`harness_host`, on the config reload), and the launcher twin,
+        // re-rendered without the prelude so the NEXT launch is plain.
+        EDIT_HARNESS_ENABLED => Some(HARNESS_TIMING),
         EDIT_HDR_GLOW => Some("Disabling applies now; enabling may require a new window"),
         EDIT_RESTORE_SESSION => Some("Applies when closing or next launch"),
-        EDIT_PACKAGES_AUTO_INSTALL
-        | EDIT_PACKAGES_SEED_INSTALL
-        | "packages.account"
-        | "packages.channel"
-        | "packages.include"
-        | "packages.exclude"
-        | "packages.links" => Some("Applies on the next package operation"),
+        EDIT_REROUTE_ANNOUNCE => Some("Applies to the next rerouted command"),
+        EDIT_PACKAGES_AUTO_INSTALL | "packages.account" | "packages.exclude" | "packages.links" => {
+            Some("Applies on the next package operation")
+        }
         EDIT_MACHINE_UNIVERSAL_CONTROL | EDIT_MACHINE_SPOTLIGHT_NOINDEX => {
             Some("Applies on the next package pass, or Apply now")
         }
-        "update.owner" | "update.repo" => {
-            Some("Manual checks use this now; automatic checks use it next launch")
-        }
+        "update.owner" | "update.repo" => Some(
+            "A development build only: applies on the next manual or automatic update \
+             check; a shipped build reads its compiled channel",
+        ),
         "update.auto_apply" => Some("Applies on the next update transition"),
         EDIT_MATRIX_RAIN_ENABLED => {
             Some("Applies live unless this session has a View menu override")
@@ -3076,7 +3113,7 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
 pub(crate) fn application_has_live_effect(key: &str) -> bool {
     matches!(
         key,
-        EDIT_AMBIGUOUS_WIDTH | EDIT_MATRIX_RAIN_ENABLED | EDIT_HDR_GLOW
+        EDIT_AMBIGUOUS_WIDTH | EDIT_MATRIX_RAIN_ENABLED | EDIT_HDR_GLOW | EDIT_HARNESS_ENABLED
     ) || application_timing(key).is_none()
 }
 
@@ -3106,16 +3143,9 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
         "net.listen" => "$ATERM_NET_LISTEN overrides this value",
         "net.cert" => "$ATERM_NET_CERT overrides this value",
         "net.key" => "$ATERM_NET_KEY overrides this value",
-        "update.owner" => "$ATERM_UPDATE_OWNER overrides this value",
-        "update.repo" => "$ATERM_UPDATE_REPO overrides this value",
-        "update.auto_apply" => "$ATERM_NO_AUTO_APPLY forces this off for the launch",
-        EDIT_HARNESS_ENABLED => {
-            "$ATERM_NO_HARNESS bypasses the harness for one session without writing anything"
-        }
-        "packages.account" => "$ATPKG_ACCOUNT overrides this value for package operations",
-        EDIT_PACKAGES_AUTO_UPDATE => {
-            "$ATPKG_UPDATE_INTERVAL_SECS controls cadence only (default 21600 seconds; 0 runs once — a pass queued behind another aterm's install is retried on a short backoff until it runs, or given up on for this launch once that install has sat through three waits with no visible progress); it never overrides packages.enabled or packages.auto_update"
-        }
+        // No `update.*`, `packages.*`, `reroute.*` or `harness.*` key has an
+        // environment override (2026-09-23, owner: "NOT ENV VARS those are for
+        // development"): the setting is the one spelling.
         EDIT_FALLBACK_FONTS => "when unset, deprecated $ATERM_FALLBACK_FONT supplies the fallback",
         EDIT_SYMBOL_FONT => "when unset, deprecated $ATERM_SYMBOL_FONT supplies the fallback",
         EDIT_EMOJI_FONT => "when unset, deprecated $ATERM_EMOJI_FONT supplies the fallback",
@@ -3476,16 +3506,57 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "screensaver",
             "green",
         ],
+        // The retired spellings a person may still HAVE in a file find the switch that
+        // reads them (`auto_update` → this one, `seed_install` → the install consent).
         EDIT_PACKAGES_ENABLED => &[
             "packages",
             "toolchain",
             "atpkg",
             "tools",
             "automatic",
+            "updates",
             "maintenance",
             "master",
+            "claude",
+            "codex",
+            "alab",
+            "auto_update",
+            "auto-update",
         ],
-        EDIT_PACKAGES_AUTO_UPDATE => &["packages", "toolchain", "atpkg", "tools", "alab"],
+        // The two switches of Software Update's Automatic updates card, findable by the
+        // words that card paints at any width ("Auto-check updates", "Install").
+        EDIT_UPDATE_ENABLED => &[
+            "update",
+            "updates",
+            "check",
+            "auto-check",
+            "automatic",
+            "automatically",
+            "background",
+            "software",
+            "release",
+        ],
+        "update.auto_apply" => &[
+            "update",
+            "updates",
+            "install",
+            "auto-install",
+            "automatic",
+            "automatically",
+            "apply",
+            "software",
+            "release",
+        ],
+        EDIT_REROUTE_ANNOUNCE => &[
+            "reroute",
+            "cargo",
+            "rustc",
+            "signpost",
+            "announce",
+            "quiet",
+            "toolchain",
+            "trust",
+        ],
         EDIT_MACHINE_UNIVERSAL_CONTROL => &[
             "machine",
             "universal control",
@@ -3505,24 +3576,17 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "index",
             "host",
         ],
-        EDIT_PACKAGES_SEED_INSTALL => &[
-            "packages",
-            "toolchain",
-            "atpkg",
-            "seed",
-            "bundled",
-            "batteries",
-            "offline",
-            "first run",
-            "alab",
-        ],
         EDIT_PACKAGES_AUTO_INSTALL => &[
             "packages",
             "toolchain",
             "atpkg",
             "install",
             "bootstrap",
+            "seed",
+            "batteries",
+            "first run",
             "alab",
+            "seed_install",
         ],
         EDIT_FONT_FAMILY | EDIT_FONT_PX => &["typeface", "size", "text"],
         EDIT_FONT_FAMILY_BOLD | EDIT_FONT_FAMILY_ITALIC | EDIT_FONT_FAMILY_BOLD_ITALIC => {
@@ -4822,53 +4886,32 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            // `[packages] enabled`: the visible master for the background
-            // updater thread. Explicit Check/Install actions remain available.
-            label: "Automatic package maintenance",
+            // `[packages] enabled`: "Automatic updates" — THE one switch for the
+            // background package lane (the retired `auto_update` folded in, seeded
+            // RESOLVED), applied LIVE: the window's package loop re-reads it before every
+            // pass and stands down or resumes without a relaunch. Explicit Update Now /
+            // Install actions remain available.
+            label: "Automatic updates",
             key: EDIT_PACKAGES_ENABLED,
             kind: EditKind::Bool,
             seed: Some(cfg.packages_enabled().to_string()),
             placeholder: String::new(),
         },
         EditField {
-            // `[packages] auto_update` (dotted key): keep installed ALab tools
-            // current on the background cadence. Seeded RESOLVED (default ON —
-            // today's behavior); the switch renders on the special Packages
-            // page and through Search/Modified, never on an ordinary page.
-            label: "Auto-update ALab tools",
-            key: EDIT_PACKAGES_AUTO_UPDATE,
-            kind: EditKind::Bool,
-            seed: Some(cfg.packages_auto_update().to_string()),
-            placeholder: String::new(),
-        },
-        EditField {
-            // `[packages] auto_install` (dotted key): ALSO install missing
-            // default-set members. Default OFF — flipping this switch is the
-            // explicit multi-GB consent (§11); the co-located atpkg reads the
-            // same bit from the same table.
-            label: "Auto-install ALab toolset",
+            // `[packages] auto_install` (dotted key): THE install consent — the
+            // first-run fill and new members of the signed set. Default ON, batteries
+            // included (the retired `seed_install` folded in, seeded RESOLVED); the
+            // co-located atpkg reads the same bit from the same table.
+            label: "Install ALab tools",
             key: EDIT_PACKAGES_AUTO_INSTALL,
             kind: EditKind::Bool,
             seed: Some(cfg.packages_auto_install().to_string()),
             placeholder: String::new(),
         },
         EditField {
-            // `[packages] seed_install` (dotted key): lay down the toolchain
-            // sealed INSIDE the app on first launch. Default ON — those bytes
-            // already shipped, so the cost is extraction rather than download.
-            // It is here, and not only in aterm.toml, because the documented way
-            // to decline used to require editing a config file that does not
-            // exist until the app has already run once and installed everything.
-            label: "Install bundled ALab toolset on first launch",
-            key: EDIT_PACKAGES_SEED_INSTALL,
-            kind: EditKind::Bool,
-            seed: Some(cfg.packages_seed_install().to_string()),
-            placeholder: String::new(),
-        },
-        EditField {
             // `[machine] universal_control` (dotted key): the co-located atpkg
-            // disables macOS Universal Control for this host at the top of every
-            // package pass unless this says "leave". Enum rows seed the CONFIGURED
+            // disables macOS Universal Control for this host whenever it applies the
+            // `[machine]` settings, unless this says "leave". Enum rows seed the CONFIGURED
             // raw value (blank when unset) with the effective default in the
             // placeholder — the same law as every other non-Bool row.
             label: "Universal Control on this Mac",
@@ -6602,9 +6645,10 @@ mod edit_tests {
         for word in ["harness", "claude", "off"] {
             assert!(keywords_of(key).contains(&word), "{word}");
         }
-        assert!(
-            super::environment_precedence(key).is_some_and(|n| n.contains("ATERM_NO_HARNESS")),
-            "the per-session bypass must be disclosed on the row"
+        assert_eq!(
+            super::environment_precedence(key),
+            None,
+            "no environment variable bypasses the harness (2026-09-23): the row is the switch"
         );
 
         // The row seeds its RESOLVED state, and an absent key is ON: a fresh
@@ -6627,6 +6671,13 @@ mod edit_tests {
         );
         let off: Config = aterm_toml::from_str(&written).expect("re-parses as Config");
         assert!(!off.harness_enabled());
+        // …and the row REALLY switches supervision: the same file's policy is
+        // off, and it says so as live (the host follows the reload), not as
+        // "Applies to new sessions" (2026-09-23).
+        assert!(!off.harness_policy().0.enabled);
+        assert!(Config::default().harness_policy().0.enabled, "absent is ON");
+        assert_eq!(super::application_timing(key), Some(super::HARNESS_TIMING));
+        assert!(super::application_has_live_effect(key));
         assert_eq!(
             editable_fields(&off)
                 .into_iter()
@@ -6667,91 +6718,130 @@ mod edit_tests {
         );
     }
 
-    /// The `[packages]` maintenance switches: Bool-typed dotted keys, sectioned in
-    /// the search-only Packages section (which NO ordinary route owns — the
-    /// special page renders them), grouped and searchable, seeded with the
-    /// DIFFERING resolved defaults (auto_update ON, auto_install OFF).
+    /// The `[packages]` switches (2026-09-23: TWO, Automatic updates and the one install
+    /// consent): Bool-typed dotted keys, sectioned in the search-only Packages section
+    /// (which NO ordinary route owns — the special page renders them), grouped and
+    /// searchable, seeded RESOLVED — both default ON, and the retired spellings
+    /// (`auto_update`, `seed_install`) fold in. Neither retired key is a row.
     #[test]
     fn packages_consent_rows_surface_in_the_settings_model() {
         for key in [
             super::EDIT_PACKAGES_ENABLED,
-            super::EDIT_PACKAGES_AUTO_UPDATE,
             super::EDIT_PACKAGES_AUTO_INSTALL,
         ] {
             assert_eq!(super::edit_kind(key), EditKind::Bool, "{key} types Bool");
             assert_eq!(super::section_of(key), super::Section::Packages);
-            assert_eq!(super::group_of(key), ("Toolchain Packages", 0));
+            assert_eq!(super::group_of(key), ("ALab Tools", 0));
             assert!(!keywords_of(key).is_empty());
             assert!(
                 !super::VISUAL_PREVIEW_KEYS.contains(&key),
                 "Packages rows carry no preview obligation"
             );
         }
-        assert!(super::group_footnote("Toolchain Packages").is_some());
+        assert!(super::group_footnote("ALab Tools").is_some());
 
         let fields = editable_fields(&Config::default());
+        for (retired, _) in super::RETIRED_PACKAGES_SPELLINGS {
+            assert!(
+                fields.iter().all(|f| f.key != *retired),
+                "{retired} is retired: no row writes it"
+            );
+        }
         let enabled = fields
             .iter()
             .find(|f| f.key == super::EDIT_PACKAGES_ENABLED)
-            .expect("background-service master row exists");
-        assert_eq!(enabled.seed.as_deref(), Some("true"), "master defaults ON");
-        let auto_update = fields
-            .iter()
-            .find(|f| f.key == super::EDIT_PACKAGES_AUTO_UPDATE)
-            .expect("auto_update row exists");
-        assert_eq!(auto_update.seed.as_deref(), Some("true"), "default ON");
+            .expect("Automatic updates row exists");
+        assert_eq!(enabled.seed.as_deref(), Some("true"), "default ON");
         let auto_install = fields
             .iter()
             .find(|f| f.key == super::EDIT_PACKAGES_AUTO_INSTALL)
-            .expect("auto_install row exists");
+            .expect("install consent row exists");
         assert_eq!(
             auto_install.seed.as_deref(),
-            Some("false"),
-            "consent-gated default OFF"
+            Some("true"),
+            "batteries included: default ON"
         );
 
-        let configured: Config = aterm_toml::from_str(
-            "[packages]\nenabled = false\nauto_update = false\nauto_install = true\n",
-        )
-        .unwrap();
-        let fields = editable_fields(&configured);
-        assert_eq!(
-            fields
-                .iter()
-                .find(|f| f.key == super::EDIT_PACKAGES_ENABLED)
+        let seed = |text: &str, key: &str| {
+            editable_fields(&aterm_toml::from_str::<Config>(text).unwrap())
+                .into_iter()
+                .find(|f| f.key == key)
                 .unwrap()
                 .seed
-                .as_deref(),
-            Some("false")
+        };
+        assert_eq!(
+            seed(
+                "[packages]\nauto_update = false\n",
+                super::EDIT_PACKAGES_ENABLED
+            )
+            .as_deref(),
+            Some("false"),
+            "the retired auto_update = false seeds the switch off"
         );
         assert_eq!(
-            fields
-                .iter()
-                .find(|f| f.key == super::EDIT_PACKAGES_AUTO_UPDATE)
-                .unwrap()
-                .seed
-                .as_deref(),
-            Some("false")
+            seed(
+                "[packages]\nseed_install = false\n",
+                super::EDIT_PACKAGES_AUTO_INSTALL
+            )
+            .as_deref(),
+            Some("false"),
+            "the retired seed_install = false seeds the consent off"
         );
         assert_eq!(
-            fields
-                .iter()
-                .find(|f| f.key == super::EDIT_PACKAGES_AUTO_INSTALL)
-                .unwrap()
-                .seed
-                .as_deref(),
-            Some("true")
+            seed(
+                "[packages]\nenabled = false\nauto_install = true\n",
+                super::EDIT_PACKAGES_ENABLED
+            )
+            .as_deref(),
+            Some("false")
         );
     }
 
+    /// `[update] enabled` and `[reroute] announce` (2026-09-23): the settings that
+    /// replaced `$ATERM_NO_AUTO_UPDATE` and `$ATERM_REROUTE_QUIET` are ordinary Bool rows,
+    /// default ON, with no environment precedence to disclose — and the development
+    /// settings `[update]` owner/repo are NOT rows.
+    #[test]
+    fn the_update_and_reroute_switches_are_rows_and_the_repoint_is_not() {
+        let fields = editable_fields(&Config::default());
+        for key in [super::EDIT_UPDATE_ENABLED, super::EDIT_REROUTE_ANNOUNCE] {
+            assert_eq!(super::edit_kind(key), EditKind::Bool, "{key}");
+            let row = fields.iter().find(|f| f.key == key).expect("a row");
+            assert_eq!(row.seed.as_deref(), Some("true"), "{key} defaults ON");
+            assert_eq!(super::environment_precedence(key), None, "{key}");
+        }
+        assert_eq!(
+            super::application_timing(super::EDIT_UPDATE_ENABLED),
+            Some("Applies next launch")
+        );
+        for key in [
+            "update.owner",
+            "update.repo",
+            "update.require_team_id",
+            "packages.account",
+        ] {
+            assert!(fields.iter().all(|f| f.key != key), "{key} is not a row");
+            assert_eq!(super::environment_precedence(key), None, "{key}");
+        }
+        let off: Config =
+            aterm_toml::from_str("[update]\nenabled = false\n[reroute]\nannounce = false\n")
+                .unwrap();
+        let fields = editable_fields(&off);
+        for key in [super::EDIT_UPDATE_ENABLED, super::EDIT_REROUTE_ANNOUNCE] {
+            let row = fields.iter().find(|f| f.key == key).unwrap();
+            assert_eq!(row.seed.as_deref(), Some("false"), "{key}");
+        }
+    }
+
     /// Dotted writes into `[packages]` are NON-DESTRUCTIVE around the keys the
-    /// CO-LOCATED atpkg consumes from the same table (account/channel/links):
-    /// the switch flips only its own child, and a blank-revert of the last GUI
-    /// key keeps the atpkg-owned siblings (an emptied table is retained too —
-    /// the nested writer never deletes a parent table).
+    /// CO-LOCATED atpkg consumes from the same table (account/exclude/links): the
+    /// switch flips only its own child — and the RETIRED spelling it replaced, which
+    /// would otherwise go on deciding (2026-09-23) — and a blank-revert of the last GUI
+    /// key keeps the atpkg-owned siblings (an emptied table is retained too — the nested
+    /// writer never deletes a parent table).
     #[test]
     fn packages_dotted_writes_preserve_the_atpkg_owned_siblings() {
-        let existing = "# consent ledger\n[packages]\naccount = \"alabsystems\" # index owner\nchannel = \"stable\"\n\n[packages.links]\nay = \"~/ay\"\n";
+        let existing = "# consent ledger\n[packages]\naccount = \"alabsystems\" # index owner\nexclude = [\"trust\"]\nseed_install = false\nauto_update = false\n\n[packages.links]\nay = \"~/ay\"\n";
         let out = apply_prefs_edits(
             existing,
             &[(super::EDIT_PACKAGES_AUTO_INSTALL, set("true"))],
@@ -6764,11 +6854,27 @@ mod edit_tests {
         );
         assert!(out.contains("[packages.links]") && out.contains("ay = \"~/ay\""));
         assert!(out.contains("auto_install = true"));
+        assert!(
+            !out.contains("seed_install"),
+            "writing the consent drops its retired spelling: {out:?}"
+        );
+        assert!(
+            out.contains("auto_update = false"),
+            "an unrelated retired key is left for its own switch: {out:?}"
+        );
         let config: Config = aterm_toml::from_str(&out).expect("round-trips through serde");
         assert!(config.packages_auto_install());
         assert!(
-            config.packages_auto_update(),
-            "unrelated flag keeps its default"
+            !config.packages_enabled(),
+            "auto_update = false still reads as off"
+        );
+        let on = apply_prefs_edits(&out, &[(super::EDIT_PACKAGES_ENABLED, set("true"))])
+            .expect("the switch");
+        assert!(!on.contains("auto_update"), "{on:?}");
+        let config: Config = aterm_toml::from_str(&on).unwrap();
+        assert!(
+            config.packages_enabled(),
+            "the switch decides once it is written"
         );
 
         // Blank = revert removes only the child; the table (with atpkg keys)
@@ -6782,13 +6888,13 @@ mod edit_tests {
         );
         let config: Config = aterm_toml::from_str(&reverted).unwrap();
         assert!(
-            !config.packages_auto_install(),
-            "back to the consent default"
+            config.packages_auto_install(),
+            "back to the batteries-included default"
         );
 
         // Bad value never reaches the file (typed_item fail-closed).
         assert!(matches!(
-            apply_prefs_edits("", &[(super::EDIT_PACKAGES_AUTO_UPDATE, set("yes"))]),
+            apply_prefs_edits("", &[(super::EDIT_PACKAGES_ENABLED, set("yes"))]),
             Err(PrefsEditError::BadValue { .. })
         ));
     }
@@ -7422,14 +7528,22 @@ listen = \"127.0.0.1:7777\" # local only
         }
         for key in [
             super::EDIT_GPU,
-            super::EDIT_PACKAGES_AUTO_UPDATE,
-            super::EDIT_PACKAGES_ENABLED,
+            super::EDIT_UPDATE_ENABLED,
             "net.listen",
             "net.cert",
             "net.key",
         ] {
             assert_eq!(super::application_timing(key), Some("Applies next launch"));
         }
+        // Phase 4: the package loop re-reads `[packages]` live, so Automatic updates (the
+        // retired `auto_update` folded in) discloses no timing — it takes effect at once.
+        assert_eq!(
+            super::application_timing(super::EDIT_PACKAGES_ENABLED),
+            None
+        );
+        assert!(super::application_has_live_effect(
+            super::EDIT_PACKAGES_ENABLED
+        ));
         // The [machine] rows are applied by the co-located atpkg — on its next
         // pass, or on the Security page's Apply now — so they are NOT in the
         // "Applies next launch" set and never will be.
@@ -7462,11 +7576,13 @@ listen = \"127.0.0.1:7777\" # local only
             super::application_timing(super::EDIT_RESTORE_SESSION),
             Some("Applies when closing or next launch")
         );
+        assert_eq!(
+            super::application_timing(super::EDIT_REROUTE_ANNOUNCE),
+            Some("Applies to the next rerouted command")
+        );
         for key in [
             super::EDIT_PACKAGES_AUTO_INSTALL,
             "packages.account",
-            "packages.channel",
-            "packages.include",
             "packages.exclude",
             "packages.links",
         ] {
@@ -7482,7 +7598,10 @@ listen = \"127.0.0.1:7777\" # local only
         );
         assert_eq!(
             super::application_timing("update.owner"),
-            Some("Manual checks use this now; automatic checks use it next launch")
+            Some(
+                "A development build only: applies on the next manual or automatic update \
+                 check; a shipped build reads its compiled channel"
+            )
         );
         assert_eq!(
             super::application_timing("update.auto_apply"),
@@ -7572,9 +7691,30 @@ listen = \"127.0.0.1:7777\" # local only
             field(super::EDIT_ALLOW_PALETTE_RECONFIGURE).label,
             "Allow programs to set indexed colors (OSC 4/21)"
         );
-        let packages = super::group_footnote("Toolchain Packages").unwrap();
-        assert!(packages.contains("auto-update apply next launch"));
-        assert!(packages.contains("Auto-install runs next package operation"));
+        // The two switches and the reroute row, each by its own label and timing — never
+        // the retired `seed_install` / "Maintenance" / "Auto-install" model (2026-09-23).
+        let packages = super::group_footnote("ALab Tools").unwrap();
+        assert!(packages.contains("Automatic updates keeps the installed ALab tools"));
+        assert!(packages.contains("applies at once"));
+        assert!(
+            !packages.contains("next launch"),
+            "the switch is live (Phase 4): {packages}"
+        );
+        assert!(packages.contains("Install ALab tools"));
+        assert!(packages.contains("applies at the next package check"));
+        assert!(packages.contains("Announce upstream cargo/rustc"));
+        // …nor the lanes Phase 5 and R20's retirement took away: a full install's own
+        // copy, and an offer at first launch (2026-09-24 post-push review).
+        for retired in [
+            "seed_install",
+            "Maintenance",
+            "Auto-install",
+            "auto-update",
+            "own copy",
+            "offer",
+        ] {
+            assert!(!packages.contains(retired), "{retired}: {packages}");
+        }
     }
 
     /// P1.4c enum-domain keys: cursor_style/window_theme/bidi/ambiguous_width classify as

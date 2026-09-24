@@ -35,19 +35,27 @@ path = "src/main.rs"
 name = "index_resolve"
 harness = false
 
+[features]
+# Development seams in an optimized build (`aterm_types::dev_seam!`: ATPKG_REGISTRY,
+# ATPKG_STAGE_DISK_REVERIFY; `config::DEV_SEAMS`: `[packages]`
+# prefix/account and the owner/repo form of `[packages.links]`). Debug builds compile
+# them anyway; the release cutter never enables this — aterm-release's buildplan pins it.
+dev-seams = ["aterm-update-core/dev-seams"]
+
 [dependencies]
-# THE load-bearing crypto root. atpkg's two-tier signature anchor
-# (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13) verifies every manifest with
-# `ring::signature::UnparsedPublicKey::new(&ED25519, pk).verify(msg, sig)`. ring is
+# THE load-bearing crypto root, for both signatures atpkg checks: Ed25519 over every
+# signed index and manifest (the anchor, docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13), and
+# RSA-4096 PKCS#1 v1.5 over SHA-512 for a vendor's OpenPGP-signed digest document
+# (`openpgp`, docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md §1.2). ring is
 # already in the compiled tree TRANSITIVELY (via rustls), but promoting it to a HARD
 # DIRECT dependency is a deliberate supply-chain decision: it pins the verify
 # primitive to an explicit floor so a future rustls bump that switches its backend to
 # aws-lc-rs (dropping ring) cannot silently break the only crypto we depend on. The
 # matching `deny.toml` [bans] floor blocks drift BELOW this version; presence is
-# guaranteed structurally by this direct edge. `default-features = false` drops
-# alloc/std/RNG from atpkg's own edge — Ed25519 VERIFICATION needs none of them — so
-# atpkg does not rely on rustls keeping those features enabled.
-ring = { version = "0.17.14", default-features = false }
+# guaranteed structurally by this direct edge. `alloc` is the one feature atpkg's edge
+# enables, because ring gates all of RSA behind it (the shipped binary already compiles
+# it through rustls); `std` and the RNG fallback stay off — verification needs neither.
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
 # Decode the base64 root + release Ed25519 public keys (32 raw bytes each).
 # Standard padded Base64 — first-party, zero-dependency, and held byte-identical
 # to the retired `base64` package's `general_purpose::STANDARD` engine by
@@ -100,6 +108,9 @@ aterm-digest = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+# Tier-1 conformance drives the real index-probe stamp/lock against the derived
+# bounded model; this edge exists only while compiling tests, never in atpkg.
+aterm-spec = { workspace = true }
 # ORACLE ONLY — never in the shipped graph. The retired compressor, kept so the
 # extraction tests keep building their `tar-gz` and `zip` fixtures with the very
 # encoder the first-party reader replaced: `src/extract.rs`'s `gzip_bytes` /
@@ -118,12 +129,11 @@ flate2 = { version = "1.1.9", default-features = false, features = ["rust_backen
 # with it — writing tar is a TEST-only need, which is exactly why the writer had
 # no business in the shipped binary.
 tar = "0.4.44"
-# Test fixtures must SIGN deterministic manifests
-# (Ed25519KeyPair::from_seed_unchecked + .sign), which needs ring's `alloc` feature.
-# Re-declaring ring here with DEFAULT features pulls alloc into the TEST build only
-# (feature unification across normal+dev within this leaf package). The normal build
-# (`cargo build -p atpkg`) still uses the default-features=false edge above and so
-# proves the no-alloc verify path compiles on its own.
+# Test fixtures SIGN: deterministic Ed25519 manifests (Ed25519KeyPair::from_seed_unchecked
+# + .sign) and the `openpgp` RSA vectors (RsaKeyPair::sign under a committed test key).
+# Re-declaring ring here with DEFAULT features adds the rest of ring's defaults to the
+# TEST build only (feature unification across normal+dev within this leaf package); the
+# normal build keeps the minimal edge above.
 ring = { version = "0.17.14" }
 
 # The shim pricing instrument. `bin/<tool>` is the only route from a typed command to a

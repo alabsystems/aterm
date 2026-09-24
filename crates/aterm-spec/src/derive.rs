@@ -859,6 +859,14 @@ impl Model {
 // ---- The model catalog: the *_model() data constructors, split by family ----
 // (pure code motion). The `pub use` re-exports keep every existing
 // `crate::derive::*_model` path — and the xref registry — compiling unchanged.
+mod models_atpkg_full_pass;
+mod models_atpkg_index_probe;
+mod models_atpkg_pending_wait;
+mod models_atpkg_published_spacing;
+mod models_atpkg_tag_record;
+mod models_atpkg_vendor_pending;
+mod models_broadcast_checkpoint;
+mod models_broadcast_head;
 mod models_console_life;
 mod models_control_bind_retry;
 mod models_control_preparation;
@@ -866,20 +874,26 @@ mod models_core;
 mod models_cursor_input;
 mod models_effects;
 mod models_fabric_enable;
+mod models_fabric_outbox_wake;
 mod models_fx;
 mod models_glyphs;
 mod models_gui;
 mod models_harness;
+mod models_harness_host;
 mod models_misc;
 mod models_native;
 mod models_operator;
+mod models_paste_order;
 mod models_pet_observation_admission;
+mod models_rainbow_continuity;
 mod models_release;
 mod models_render;
 mod models_ribbon_release_restoration;
 mod models_ribbon_row_hold;
+mod models_same_caret_echo;
+mod models_screen_generation;
 mod models_session;
-mod models_tcc_identity;
+mod models_supervise;
 mod models_title_summary;
 mod models_update;
 mod models_update_activation_observation;
@@ -888,6 +902,17 @@ mod models_update_environment_repair;
 mod models_update_retired_intent;
 mod models_update_web_cache;
 
+pub use models_atpkg_full_pass::atpkg_full_pass_rule_model;
+pub use models_atpkg_index_probe::{
+    atpkg_index_pending_park_model, atpkg_index_probe_cooldown_model,
+    atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
+};
+pub use models_atpkg_pending_wait::atpkg_pending_wait_model;
+pub use models_atpkg_published_spacing::atpkg_published_spacing_model;
+pub use models_atpkg_tag_record::atpkg_tag_record_model;
+pub use models_atpkg_vendor_pending::atpkg_vendor_pending_check_model;
+pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
+pub use models_broadcast_head::broadcast_head_subscription_model;
 pub use models_console_life::*;
 pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
 pub use models_control_preparation::native_update_control_preparation_model;
@@ -895,20 +920,28 @@ pub use models_core::*;
 pub use models_cursor_input::*;
 pub use models_effects::*;
 pub use models_fabric_enable::*;
+pub use models_fabric_outbox_wake::{fabric_outbox_wake_model, fabric_reconnect_backoff_model};
 pub use models_fx::*;
 pub use models_glyphs::*;
 pub use models_gui::*;
 pub use models_harness::*;
+pub use models_harness_host::harness_worker_lifecycle_model;
 pub use models_misc::*;
 pub use models_native::*;
 pub use models_operator::*;
+pub use models_paste_order::*;
 pub use models_pet_observation_admission::*;
+pub use models_rainbow_continuity::*;
 pub use models_release::*;
 pub use models_render::*;
 pub use models_ribbon_release_restoration::*;
 pub use models_ribbon_row_hold::*;
+pub use models_same_caret_echo::*;
+pub use models_screen_generation::observation_screen_generation_model;
 pub use models_session::*;
-pub use models_tcc_identity::*;
+pub use models_supervise::{
+    supervisor_claim_model, supervisor_focus_choice_model, supervisor_turn_end_model,
+};
 pub use models_title_summary::*;
 pub use models_update::*;
 pub use models_update_activation_observation::native_update_activation_observation_model;

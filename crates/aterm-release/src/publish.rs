@@ -67,6 +67,9 @@ pub struct CutOptions {
     pub rehearse: Option<String>,
     /// Ship a single-arch build (explicit opt-out of universal, decision 18).
     pub arm64_only: bool,
+    /// Both native Linux workers' handoff directory, fixed before claim.
+    pub linux_artifacts: Option<PathBuf>,
+    pub linux_targets: Vec<String>,
     /// `--no-paint-smoke`: skip the self-check's paint smoke (the 29-keystroke
     /// pixel proof against the just-built bundle). An EMERGENCY escape, refused
     /// on a notarized real cut unless [`NO_PAINT_SMOKE_ACK_VAR`] carries the
@@ -2365,7 +2368,7 @@ const STEPS_V7: [&str; 12] = [
     "unlock",
 ];
 
-pub const JOURNAL_FORMAT: u32 = 8;
+pub const JOURNAL_FORMAT: u32 = 9;
 
 const fn legacy_journal_format() -> u32 {
     1
@@ -2390,6 +2393,8 @@ pub struct Journal {
     pub min_build: Option<u64>,
     #[serde(default)]
     pub arm64_only: bool,
+    #[serde(default)]
+    pub linux: Option<buildplan::linux::Handoff>,
     /// Whether this cut's uploaded channel manifest has a detached signature.
     /// Persisted so archive resume enforces the same paired-head invariant.
     #[serde(default)]
@@ -2595,6 +2600,17 @@ impl Journal {
     /// [`effective_min_build`]; this also protects journals written by older
     /// binaries or edited by hand.
     fn validate(&self) -> Result<()> {
+        if let Some(linux) = &self.linux {
+            if self.format < 9 {
+                return Err(Error::new("Linux handoff requires journal format9"));
+            }
+            linux.validate_identity(
+                &self.version,
+                self.build_number,
+                &self.commit,
+                self.is_done("build"),
+            )?;
+        }
         if !(1..=JOURNAL_FORMAT).contains(&self.format) {
             return Err(Error::new(format!(
                 "unsupported release journal format {} (this cutter accepts completed formats 1–{}, refuses unfinished legacy formats, and writes {})",
@@ -5077,8 +5093,14 @@ pub fn resume_provenance_gate(journal: &Journal, gate: impl FnOnce() -> Result<(
 /// ([`gates::trust_stage2_bin`] — the same resolution `buildplan` performs) and its own
 /// binary: the production `gate` of [`resume_provenance_gate`].
 pub fn toolchain_provenance_gate() -> Result<()> {
+    toolchain_provenance_gate_with(atpkg::provenance::heal)
+}
+
+/// [`toolchain_provenance_gate`] with the toolchain heal explicit
+/// ([`gates::provenance_gate_with`]).
+pub fn toolchain_provenance_gate_with(heal: atpkg::provenance::Healer) -> Result<()> {
     let trustc = gates::trust_stage2_bin()?.join("trustc");
-    gates::provenance_gate(&trustc)
+    gates::provenance_gate_with(&trustc, heal)
 }
 
 const MAX_SMALL_RELEASE_ASSET_BYTES: u64 = 256 * 1024;
@@ -6355,6 +6377,7 @@ pub fn validate_draft_asset_set(
     dsym_name: Option<&str>,
 ) -> Result<()> {
     let roster_attached = manifest.machine_id.is_some();
+    let linux_assets = buildplan::linux::manifest_asset_names(manifest)?;
     let count = |name: &str| {
         names
             .iter()
@@ -6384,6 +6407,7 @@ pub fn validate_draft_asset_set(
         (roster::ROSTER_ASSET, usize::from(roster_attached)),
         (roster::ROSTER_SIG_ASSET, usize::from(roster_attached)),
     ];
+    exact_counts.extend(linux_assets.iter().map(|name| (name.as_str(), 1usize)));
     if let Some(zip) = manifest.zip.as_deref() {
         exact_counts.push((zip, 1usize));
     }
@@ -6418,6 +6442,7 @@ pub fn validate_draft_asset_set(
         dmg_sidecar.as_str(),
         provenance_name,
     ];
+    allowed.extend(linux_assets.iter().map(String::as_str));
     if let Some(zip) = manifest.zip.as_deref() {
         allowed.push(zip);
     }
@@ -7039,8 +7064,13 @@ pub fn stage_manifest(
     dist: &Path,
     inputs: &manifest_out::ManifestInputs<'_>,
     who: Option<&roster::Attribution>,
+    linux: Option<&buildplan::linux::Handoff>,
 ) -> Result<PathBuf> {
     let mut manifest = manifest_out::build(inputs);
+    if let Some(linux) = linux {
+        linux.verify_staged(dist, inputs.version, inputs.build_number, inputs.commit)?;
+        linux.stamp(&mut manifest)?;
+    }
     // With an unpinned paper master `who` is `None` on every cut, both keys stay
     // absent, and the emitted bytes are identical to what this cutter has always
     // produced. That is the fleet-safety requirement, not a nicety.
@@ -7293,6 +7323,7 @@ pub struct CutCtx {
     /// Effective carried channel floor, already validated against `build`.
     pub min_build: Option<u64>,
     pub arm64_only: bool,
+    pub linux: Option<buildplan::linux::Handoff>,
     /// Restored from the journal after build; false for legacy journals.
     pub manifest_signed: bool,
     /// Frozen pre-claim channel-signature ratchet and its actual public key.
@@ -7349,6 +7380,40 @@ pub struct CutCtx {
 }
 
 impl CutCtx {
+    fn linux_asset_names(&self) -> Vec<String> {
+        self.linux.as_ref().map_or_else(Vec::new, |handoff| {
+            handoff
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.asset.clone())
+                .collect()
+        })
+    }
+    fn linux_asset_paths(&self) -> Vec<PathBuf> {
+        self.linux.as_ref().map_or_else(Vec::new, |handoff| {
+            handoff
+                .artifacts
+                .iter()
+                .map(|artifact| self.dist.join(&artifact.asset))
+                .collect()
+        })
+    }
+
+    fn mirror_asset_names(&self) -> Vec<String> {
+        let mut names = mirror::required_asset_names(
+            &self.version,
+            self.signature_required,
+            self.attaches_roster(),
+        );
+        names.extend(self.linux_asset_paths().iter().filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        }));
+        names.sort();
+        names
+    }
+
     fn dmg_path(&self) -> PathBuf {
         self.dist.join(mirror::dmg_asset_name(&self.version))
     }
@@ -7366,9 +7431,7 @@ impl CutCtx {
             .or(self.signature_pubkey.as_deref())
     }
 
-    /// THIS CUT'S bundle — under `dist/cut-app/`, never the dev install at
-    /// `dist/aterm.app`. See [`bundle::staged_app_path`] for the release the live
-    /// updater ate when these were the same path.
+    /// THIS CUT'S bundle, under `dist/cut-app.noindex/` (see [`bundle::staged_app_path`]).
     fn app_path(&self) -> PathBuf {
         bundle::staged_app_path(&self.dist)
     }
@@ -7629,14 +7692,10 @@ impl CutCtx {
     /// remote listing is checked against, so the upload set and the acceptance
     /// rule cannot drift apart.
     fn mirror_asset_paths(&self) -> Vec<PathBuf> {
-        mirror::required_asset_names(
-            &self.version,
-            self.signature_required,
-            self.attaches_roster(),
-        )
-        .into_iter()
-        .map(|name| self.dist.join(name))
-        .collect()
+        self.mirror_asset_names()
+            .into_iter()
+            .map(|name| self.dist.join(name))
+            .collect()
     }
 
     /// Does this cut publish the machine roster?
@@ -7680,6 +7739,7 @@ impl CutCtx {
             self.provenance_path(),
         ];
         files.extend(self.roster_asset_paths());
+        files.extend(self.linux_asset_paths());
         files
     }
 
@@ -7702,6 +7762,7 @@ impl CutCtx {
             files.push(self.manifest_path().with_extension("toml.sig"));
         }
         files.extend(self.roster_asset_paths());
+        files.extend(self.linux_asset_paths());
         files
     }
 
@@ -8901,6 +8962,11 @@ fn recover_published_cut(
         signature_policy.required,
         recovered_pubkey.as_deref(),
     )?;
+    if !buildplan::linux::manifest_asset_names(&manifest)?.is_empty() {
+        return Err(Error::new(
+            "published Linux recovery requires the original cut journal and frozen native handoff; do not reconstruct worker provenance from remote filenames",
+        ));
+    }
     let names: Vec<String> = release_asset_inventory_for_release_id(slug, release_object.id)?
         .into_iter()
         .map(|asset| asset.name)
@@ -9034,6 +9100,7 @@ fn recover_published_cut(
         commit: owner.to_string(),
         min_build: manifest.min_build,
         arm64_only: false,
+        linux: None,
         manifest_signed: signature_policy.required,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
@@ -9104,6 +9171,7 @@ fn recover_published_cut(
         min_build: manifest.min_build,
         arm64_only: false,
         manifest_signed: signature_policy.required,
+        linux: None,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
         verify_pubkey: recovered_pubkey.clone(),
@@ -9305,6 +9373,11 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // fail must fail before the ledger claim burns a build number
     // (docs/RELEASE-KEYS.md's ordering rule); this is a fresh cut, so `build`
     // will certainly run and the tier is certainly needed.
+    let linux = opts
+        .linux_artifacts
+        .as_deref()
+        .map(|directory| buildplan::linux::Handoff::new(directory, &opts.linux_targets))
+        .transpose()?;
     let apple = resolve_apple_tier(aterm_update_core::pins::APPLE_TEAM_ID, credentials)?;
 
     // ---- decide the version (fresh vs remote-derived recut, spec §5) ------
@@ -9687,6 +9760,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         commit,
         min_build,
         arm64_only: opts.arm64_only,
+        linux,
         manifest_signed: false,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey,
@@ -9716,6 +9790,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             commit: ctx.commit.clone(),
             min_build: ctx.min_build,
             arm64_only: ctx.arm64_only,
+            linux: ctx.linux.clone(),
             manifest_signed: ctx.manifest_signed,
             signature_required: ctx.signature_required,
             signature_pubkey: ctx.signature_pubkey.clone(),
@@ -9913,6 +9988,7 @@ fn resume_cut(
         commit: journal.commit.clone(),
         min_build: journal.min_build,
         arm64_only: journal.arm64_only,
+        linux: journal.linux.clone(),
         manifest_signed: journal.manifest_signed,
         signature_required: journal.signature_required,
         signature_pubkey: journal.signature_pubkey.clone(),
@@ -9944,9 +10020,40 @@ fn resume_cut(
     run_pipeline(&mut ctx, t0)
 }
 
+/// Remove the staged bundle after a finished cut, so no launchable copy of the
+/// app under the release's bundle id is left in dist/. A failure only warns: the
+/// release is already published.
+fn discard_staged(ctx: &CutCtx) {
+    match bundle::discard_staged_app(&ctx.dist) {
+        Ok(()) => step(
+            "tidy",
+            "removed dist/cut-app.noindex/aterm.app (the DMG and zip carry it)",
+        ),
+        Err(error) => step("tidy", &format!("WARNING: kept the staged bundle: {error}")),
+    }
+}
+
 /// Execute the journaled steps in order, skipping completed ones. THE one
 /// pipeline all cut flavors share.
 fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
+    // A resume may begin after selfcheck/upload. Every suffix, including a
+    // mirror-only retry, must bind its native bytes to the frozen journal and
+    // signed appcast before any publication operation is reachable.
+    if ctx.linux.is_some()
+        && ctx
+            .journal
+            .as_ref()
+            .is_some_and(|journal| journal.is_done("build"))
+    {
+        if let Some(handoff) = &ctx.linux {
+            handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
+        }
+        let manifest = Manifest::parse(
+            &fs::read_to_string(ctx.manifest_path())
+                .map_err(|e| Error::new(format!("read resumed appcast: {e}")))?,
+        )?;
+        buildplan::linux::verify_manifest_handoff(&manifest, ctx.linux.as_ref())?;
+    }
     // Resume re-proves/reacquires exact ownership even when `lock` was already
     // journaled. The exceptions: an unlock-only resume (absence may mean the
     // delete landed and the journal mark crashed, so reacquiring would undo
@@ -10053,31 +10160,7 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
 
     match ctx.kind {
         CutKind::Real => {
-            // THE DEV INSTALL TAKES ITS OWN RELEASE — last, and only now. This
-            // machine runs `dist/aterm.app` and its updater watches it, so placing
-            // the bundle any earlier hands a live process something unfinished; that
-            // is exactly how a cut got its sealed toolchain deleted mid-package
-            // (see `bundle::staged_app_path`). A failure here costs nothing that
-            // matters: the release is already live, verified and mirrored, and the
-            // only casualty is this machine's convenience, so it warns rather than
-            // failing a completed cut.
-            match bundle::place_finished_bundle(&ctx.dist, &ctx.version, ctx.build) {
-                Ok(bytes) => step(
-                    "place",
-                    &format!(
-                        "dist/aterm.app \u{2190} this cut's verified bundle ({}) \u{2014} the dev \
-                         install updates into it",
-                        atpkg::human_bytes(bytes)
-                    ),
-                ),
-                Err(error) => step(
-                    "place",
-                    &format!(
-                        "WARNING: the release is live, but dist/aterm.app was not updated to it \
-                         ({error}); this machine keeps running the older bundle"
-                    ),
-                ),
-            }
+            discard_staged(ctx);
             step(
                 "DONE",
                 &format!(
@@ -10089,6 +10172,7 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             );
         }
         CutKind::Rehearse => {
+            discard_staged(ctx);
             step(
                 "DONE",
                 &format!(
@@ -10641,6 +10725,15 @@ pub fn notarize_and_package(
 /// notarize hook → provenance → manifest + notes. One re-enterable unit whose
 /// outputs are all functions of (version, build_number, claim commit).
 fn step_build(ctx: &mut CutCtx) -> Result<()> {
+    if let Some(handoff) = &mut ctx.linux {
+        handoff.import(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
+        // Freeze before any signing or upload. A resume cannot exchange one
+        // worker's bytes or provenance for another under an old proof.
+        if let Some(journal) = &mut ctx.journal {
+            journal.linux = Some(handoff.clone());
+            journal.save(&ctx.journal_path)?;
+        }
+    }
     // No ambient credentials, and no trust anchors injected into the child build.
     // Both anchors are committed constants (`aterm_update_core::pins`) that the
     // child compiles in directly, so exporting them here would only create a second
@@ -10923,7 +11016,12 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         min_build: ctx.min_build,
         changelog: &body,
     };
-    let mpath = stage_manifest(&ctx.dist, &inputs, ctx.attribution.as_ref())?;
+    let mpath = stage_manifest(
+        &ctx.dist,
+        &inputs,
+        ctx.attribution.as_ref(),
+        ctx.linux.as_ref(),
+    )?;
     // The roster assets are staged from the bytes the PRE-CLAIM gate authorized, and
     // staged BEFORE the signature below for no cryptographic reason at all — they are
     // separately master-signed and the appcast signature does not cover them. It is
@@ -11377,6 +11475,9 @@ pub fn selfcheck_paint_then_signing(
 /// (binary == plist == manifest == n), DMG digest, codesign, the shared +
 /// vendored-v0.25 manifest proof, and the client-rule monotonic check.
 fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
+    if let Some(handoff) = &ctx.linux {
+        handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
+    }
     // A resume may skip `step_build`, and dist/ is intentionally mutable. Re-read
     // the artifact itself before any publication-facing step can trust the
     // historical packager result journaled by the original process.
@@ -11505,6 +11606,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         .map_err(|e| Error::new(format!("read {}: {e}", ctx.manifest_path().display())))?;
     let manifest = Manifest::parse(&mtext)
         .map_err(|e| Error::new(format!("self-check: manifest re-parse failed: {e}")))?;
+    buildplan::linux::verify_manifest_handoff(&manifest, ctx.linux.as_ref())?;
     if manifest.build_number != ctx.build
         || manifest.version != ctx.version
         || manifest.commit.as_deref() != Some(ctx.commit.as_str())
@@ -12919,11 +13021,7 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
                 .into_iter()
                 .map(|asset| asset.name)
                 .collect();
-            let elected = mirror::required_asset_names(
-                &ctx.version,
-                ctx.signature_required,
-                ctx.attaches_roster(),
-            );
+            let elected = ctx.mirror_asset_names();
             // The roster pair is BOTH elected and legitimately pub-uploaded
             // (the source publish re-attaches it), so it cannot discriminate;
             // only a binary/appcast asset proves a flip happened here.
@@ -13477,9 +13575,7 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    for name in
-        mirror::required_asset_names(&ctx.version, ctx.signature_required, ctx.attaches_roster())
-    {
+    for name in ctx.mirror_asset_names() {
         if !body.contains(&format!("\"name\":\"{name}\"")) {
             return Err(Error::new(format!(
                 "the anonymous view of {slug} {} does not list the required asset \
@@ -13698,11 +13794,12 @@ fn prove_mirror_draft_assets(
         .iter()
         .map(|asset| asset.name.clone())
         .collect();
-    mirror::validate_mirror_asset_set(
+    mirror::validate_mirror_asset_set_with_linux(
         &names,
         &ctx.version,
         ctx.signature_required,
         ctx.attaches_roster(),
+        &ctx.linux_asset_names(),
     )?;
     for file in ctx.mirror_asset_paths() {
         let name = file
@@ -13736,11 +13833,12 @@ fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         .into_iter()
         .map(|asset| asset.name)
         .collect();
-    mirror::validate_mirror_asset_set(
+    mirror::validate_mirror_asset_set_with_linux(
         &names,
         &ctx.version,
         ctx.signature_required,
         ctx.attaches_roster(),
+        &ctx.linux_asset_names(),
     )?;
 
     // `stop_early: true` IS the client's replay: canonical tags only, exact
@@ -14260,6 +14358,7 @@ mod roster_wiring_tests {
             commit: "a".repeat(40),
             min_build: None,
             arm64_only: false,
+            linux: None,
             manifest_signed: true,
             signature_required: true,
             signature_pubkey: None,

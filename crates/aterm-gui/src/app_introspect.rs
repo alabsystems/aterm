@@ -4635,12 +4635,15 @@ impl App {
                 // STAR-LANDING NEIGHBORS — the windowed LOCK A capture's
                 // twin, so a headless capture licenses (or forbids) the
                 // displaced rainbow kitty stars exactly as a windowed present would.
-                if cpos.row > 0 {
-                    term.row_cols_into(cpos.row as usize - 1, &mut ws.poof_row_above_buf);
-                }
-                if (cpos.row as usize) + 1 < rows {
-                    term.row_cols_into(cpos.row as usize + 1, &mut ws.poof_row_below_buf);
-                }
+                let (neighbor_above, neighbor_below) =
+                    crate::app_render::capture_cursor_neighbor_rows(
+                        &term,
+                        usize::from(cpos.row),
+                        rows,
+                        ws.cursor_glow.v2_owns_frame(),
+                        &mut ws.poof_row_above_buf,
+                        &mut ws.poof_row_below_buf,
+                    );
                 // THE CONTENT WITNESS's rows — the windowed LOCK A capture's
                 // twin, so this helper retires an abandoned band exactly as
                 // a windowed present would.
@@ -4650,8 +4653,17 @@ impl App {
                 let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
                 for &r in &ribbon_rows[..n] {
                     if usize::from(r) < rows && r != cpos.row {
-                        term.row_cols_into(usize::from(r), &mut ws.witness_row_buf);
-                        ws.cursor_glow.observe_ribbon_row(r, &ws.witness_row_buf);
+                        let cols = crate::app_render::witness_row_cols(
+                            r,
+                            cpos.row,
+                            neighbor_above.then_some(ws.poof_row_above_buf.as_slice()),
+                            neighbor_below.then_some(ws.poof_row_below_buf.as_slice()),
+                            &mut ws.witness_row_buf,
+                            |r, out| {
+                                term.row_cols_into(usize::from(r), out);
+                            },
+                        );
+                        ws.cursor_glow.observe_ribbon_row(r, cols);
                     }
                 }
                 Some((cpos.row, cpos.col, probe_trust))
@@ -4973,6 +4985,9 @@ impl App {
                     // glass present. The advancing headless arm consumes exactly
                     // the damage paired with this explicit present-real capture.
                     let capture_now = Instant::now();
+                    // The band's motion at the capture instant (design §10.8):
+                    // a capture is a pure function of the center and `capture_now`.
+                    self.prepare_band_motion(front, capture_now);
                     let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
                     let prepared = if let Some(plan) = frame_plan.take() {
                         self.prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
@@ -4999,7 +5014,7 @@ impl App {
                     self.splice_find_bar(front);
                     self.splice_settings_panel(front);
                     self.splice_build_badge(front);
-                    self.splice_notice(front);
+                    self.splice_robi_bubble(front);
                     self.splice_level_up(front);
                     frame_plan = Some(capture_plan);
                 }
@@ -5014,7 +5029,7 @@ impl App {
                     }
                     self.splice_find_bar(front);
                     self.splice_build_badge(front);
-                    self.splice_notice(front);
+                    self.splice_robi_bubble(front);
                     self.splice_level_up(front);
                     if !self.compose_native_route_card(front) {
                         return;
@@ -5039,14 +5054,13 @@ impl App {
                     }
                     self.splice_find_bar(front);
                     self.splice_build_badge(front);
-                    self.splice_notice(front);
+                    self.splice_robi_bubble(front);
                     self.splice_level_up(front);
                     if !self.compose_native_route_card(front) {
                         return;
                     }
                 }
             }
-            self.splice_config_notice(front);
             self.splice_paste_banner(front);
             // A capture that omitted the link caption would tell a driving AI a
             // hyperlink is undisclosed while a human is reading its destination.
@@ -5114,7 +5128,7 @@ impl App {
         // capture samples current host policy, once before the disjoint borrow.
         let visuals =
             presented_visuals.unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
-        let tray_floor_y = self.config_notice_tray_floor_y(front);
+        let tray_floor_y = self.paste_banner_tray_floor_y(front);
         self.bind_window_renderer_state(front);
         // Disjoint borrows: `self.backend` (renderer), the introspection GPU
         // scratch, and the front window's input_scratch are separate fields.
@@ -5134,14 +5148,14 @@ impl App {
         // builder application-present uses). The GPU arm bakes it into the offscreen so
         // app-present and capture share composition; the CPU arm ignores it here
         // (composited below, gated on !is_gpu).
-        // Modal card FIRST, else the transient update notice, else the build/version badge.
+        // Modal card FIRST, else Robi's tip bubble, else the build/version badge.
         let tray_arg = ws
             .route_card
             .as_ref()
             .or(ws.settings_card.as_ref())
             .or(ws.conn_wire_card.as_ref())
             .or(ws.level_up_card.as_ref())
-            .or(ws.notice_card.as_ref())
+            .or(ws.bubble_card.as_ref())
             .or(ws.badge_card.as_ref())
             .and_then(|card| tray_quad_below_y(card, tray_floor_y));
         let destination_height = ws.win_px.map(|size| size.height.max(1) as usize);
@@ -5164,7 +5178,7 @@ impl App {
                 .or(ws.settings_card.as_ref())
                 .or(ws.conn_wire_card.as_ref())
                 .or(ws.level_up_card.as_ref())
-                .or(ws.notice_card.as_ref())
+                .or(ws.bubble_card.as_ref())
                 .or(ws.badge_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y))
         {
@@ -5357,15 +5371,14 @@ impl App {
             }
             self.splice_find_bar(front);
             self.splice_build_badge(front);
-            self.splice_notice(front);
+            self.splice_robi_bubble(front);
             self.splice_level_up(front);
             if !self.compose_native_route_card(front) {
                 let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
                 return;
             }
             // Native preparation leaves the semantic surface in the tray. Paint
-            // diagnostic cells afterward, exactly like the application-present path.
-            self.splice_config_notice(front);
+            // the paste question afterward, exactly like the application-present path.
             self.splice_paste_banner(front);
             if let Some((plan, _)) = resolved_layout.as_ref() {
                 self.splice_link_target_from_plan(front, plan);
@@ -5401,7 +5414,7 @@ impl App {
             // renderer or host state here would corrupt exact-present semantics.
             frame
         } else {
-            let tray_floor_y = self.config_notice_tray_floor_y(front);
+            let tray_floor_y = self.paste_banner_tray_floor_y(front);
             self.bind_window_renderer_state(front);
             let render_t0 = Instant::now();
             let App {
@@ -5419,7 +5432,7 @@ impl App {
                 settings_card,
                 conn_wire_card,
                 level_up_card,
-                notice_card,
+                bubble_card,
                 badge_card,
                 win_px,
                 ..
@@ -5429,7 +5442,7 @@ impl App {
                 .or(settings_card.as_ref())
                 .or(conn_wire_card.as_ref())
                 .or(level_up_card.as_ref())
-                .or(notice_card.as_ref())
+                .or(bubble_card.as_ref())
                 .or(badge_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y));
             let destination_height = win_px.map(|size| size.height.max(1) as usize);
@@ -6223,6 +6236,8 @@ impl App {
             // application-present artifact. Its explicit image is the one
             // present-real tick, built from current terminals.
             let capture_now = Instant::now();
+            // The band's motion at the capture instant (design §10.8).
+            self.prepare_band_motion(front, capture_now);
             let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
             let prepared = if request_layout_authoritative {
                 self.prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
@@ -6262,9 +6277,8 @@ impl App {
             self.splice_find_bar(front);
             self.splice_settings_panel(front);
             self.splice_build_badge(front);
-            self.splice_notice(front);
+            self.splice_robi_bubble(front);
             self.splice_level_up(front);
-            self.splice_config_notice(front);
             self.splice_paste_banner(front);
             self.splice_link_target_from_plan(front, &capture_plan);
             // C5 — topmost chrome; see the `chrome`-capture route above.
@@ -6284,7 +6298,7 @@ impl App {
                 overlay: presented.overlay,
             })
             .unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
-        let tray_floor_y = self.config_notice_tray_floor_y(front);
+        let tray_floor_y = self.paste_banner_tray_floor_y(front);
         let theme_fingerprint = presented_authority.map_or_else(
             || self.image_theme_fingerprint(),
             |presented| presented.theme_fingerprint,
@@ -6334,7 +6348,7 @@ impl App {
         // builder application-present uses). The GPU arm bakes it into the
         // offscreen so capture and application-present share composition; the
         // CPU arm ignores it here (composited below, gated on !is_gpu).
-        // Modal card FIRST, else the transient update notice, else the build/version badge.
+        // Modal card FIRST, else Robi's tip bubble, else the build/version badge.
         let tray_arg = ws
             .present_card()
             .and_then(|card| tray_quad_below_y(card, tray_floor_y));
@@ -14337,8 +14351,10 @@ mod window_render_context_capture_tests {
             cancel: crate::control::CaptureCancellation::new(),
             reply: tx,
         });
+        // This test checks render-context rebinding, not capture latency. A
+        // full-suite run can deschedule the image worker behind other CPU work.
         let mut retained = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .expect("image worker reply")
             .expect("image capture succeeds");
         retained

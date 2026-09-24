@@ -1064,17 +1064,21 @@ impl<'s> FrameEncoder<'s> {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu { enc, .. } => {
-                let FrameView::Wgpu(view) = view else {
-                    panic!(
+                let view = match view {
+                    FrameView::Wgpu(view) => view,
+                    #[cfg(target_os = "macos")]
+                    FrameView::Metal(_) => panic!(
                         "device layer: a METAL pass target reached the WGPU frame \
                          encoder — the caller mixed handles across backends"
-                    );
+                    ),
                 };
-                let FrameUniforms::Wgpu(uniform_bg) = uniforms else {
-                    panic!(
+                let uniform_bg = match uniforms {
+                    FrameUniforms::Wgpu(uniform_bg) => uniform_bg,
+                    #[cfg(target_os = "macos")]
+                    FrameUniforms::Metal { .. } => panic!(
                         "device layer: METAL frame uniforms reached the WGPU frame \
                          encoder — the caller mixed handles across backends"
-                    );
+                    ),
                 };
                 let load = match load {
                     FrameLoad::Clear(c) => wgpu::LoadOp::Clear(c.wgpu()),
@@ -1171,11 +1175,13 @@ impl<'s> FrameEncoder<'s> {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu { enc, .. } => {
-                let (FrameCopyTexture::Wgpu(src), FrameCopyTexture::Wgpu(dst)) = (src, dst) else {
-                    panic!(
+                let (src, dst) = match (src, dst) {
+                    (FrameCopyTexture::Wgpu(src), FrameCopyTexture::Wgpu(dst)) => (src, dst),
+                    #[cfg(target_os = "macos")]
+                    (FrameCopyTexture::Metal(_), _) | (_, FrameCopyTexture::Metal(_)) => panic!(
                         "device layer: a METAL copy texture reached the WGPU frame \
                          encoder — the caller mixed handles across backends"
-                    );
+                    ),
                 };
                 enc.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {

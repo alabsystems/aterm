@@ -278,6 +278,78 @@ impl SavedCursorRepr {
     }
 }
 
+/// The shell-integration capability nonce an adopted shell keeps emitting
+/// (`ATERM_SHELL_NONCE`, injected once at its first spawn). Carried ONLY by the
+/// seamless-handoff projection ([`Terminal::checkpoint_carry`]), so the successor
+/// can authorize the value the running shell already signs its OSC 133/633 marks
+/// with. A capability, not buffer state: `Debug` never prints it, and the
+/// in-memory projections ([`Terminal::checkpoint`]) never capture it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ShellIntegrationNonce(pub [u8; 32]);
+
+impl std::fmt::Debug for ShellIntegrationNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShellIntegrationNonce(..)")
+    }
+}
+
+impl ShellIntegrationNonce {
+    /// Lowercase hex, the wire form the shell's `id=` parameter uses.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        use std::fmt::Write as _;
+        self.0.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
+    /// Parse exactly 64 hex digits; anything else is `None` (a malformed carry
+    /// degrades to "no nonce", never to a partial one).
+    #[must_use]
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let bytes = hex.as_bytes();
+        if bytes.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+            let hi = char::from(pair[0]).to_digit(16)?;
+            let lo = char::from(pair[1]).to_digit(16)?;
+            out[i] = u8::try_from(hi * 16 + lo).ok()?;
+        }
+        Some(Self(out))
+    }
+}
+
+/// Whether a terminal's OSC 133/633 marks can reach it, as the host reports it
+/// (`status integration=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellIntegrationPosture {
+    /// No nonce is required: marks dispatch unauthenticated (integration off,
+    /// or a `-e` session).
+    Off,
+    /// A nonce is required and one is authorized.
+    On,
+    /// A nonce is required and NONE is authorized, so every mark is dropped —
+    /// an adopted shell whose handoff did not carry its nonce. The requirement
+    /// is kept (clearing it would let any program's output forge marks); this
+    /// posture is how the loss is said instead of hidden.
+    Degraded,
+}
+
+impl ShellIntegrationPosture {
+    /// The wire word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
 /// A scoped, round-trippable projection of a live [`Terminal`] (B.3.2).
 ///
 /// Equality is *structural*: `checkpoint() == from_checkpoint(&c).checkpoint()`
@@ -334,9 +406,30 @@ pub struct TerminalCheckpoint {
     pub current_working_directory: Option<String>,
     /// Parser was in Ground state at capture time (B.3.3 invariant).
     pub parser_ground: bool,
+    /// The authorized shell-integration nonce — set ONLY by
+    /// [`Terminal::checkpoint_carry`], the seamless-handoff projection, and
+    /// `None` in every in-memory checkpoint. Never installed by a restore: the
+    /// adopting host authorizes it explicitly (auth is a host binding, see the
+    /// EXCLUDED block).
+    pub shell_integration_nonce: Option<ShellIntegrationNonce>,
 }
 
 impl Terminal {
+    /// Whether OSC 133/633 marks can reach this terminal
+    /// ([`ShellIntegrationPosture`]): required-and-authorized, required with no
+    /// nonce (every mark dropped), or not required.
+    #[must_use]
+    pub fn shell_integration_posture(&self) -> ShellIntegrationPosture {
+        match (
+            self.modes.require_shell_integration_nonce,
+            self.shell_integration_auth.nonce().is_some(),
+        ) {
+            (false, _) => ShellIntegrationPosture::Off,
+            (true, true) => ShellIntegrationPosture::On,
+            (true, false) => ShellIntegrationPosture::Degraded,
+        }
+    }
+
     /// Capture a [`TerminalCheckpoint`] — a pure read, no host effects, no fs.
     ///
     /// The parser MUST be in Ground state (B.3.3): a checkpoint taken
@@ -369,10 +462,20 @@ impl Terminal {
     /// Restore needs no counterpart: `restore_grid` already reads the last `rows`
     /// lines as the visible grid and pushes everything before them into an
     /// unlimited scrollback.
+    ///
+    /// This is also the one projection that carries the authorized
+    /// shell-integration nonce ([`TerminalCheckpoint::shell_integration_nonce`]):
+    /// the adopted shell keeps signing its marks with it across the update.
     #[must_use]
     pub fn checkpoint_carry(&self, max_history: usize) -> Option<TerminalCheckpoint> {
-        self.parser_is_ground()
-            .then(|| self.checkpoint_bounded(max_history, 0))
+        self.parser_is_ground().then(|| {
+            let mut c = self.checkpoint_bounded(max_history, 0);
+            c.shell_integration_nonce = self
+                .shell_integration_auth
+                .nonce()
+                .map(ShellIntegrationNonce);
+            c
+        })
     }
 
     fn checkpoint_with_scrollback(&self, include_scrollback: bool) -> TerminalCheckpoint {
@@ -460,6 +563,7 @@ impl Terminal {
             secure_keyboard_entry: self.secure_keyboard_entry,
             current_working_directory: self.current_working_directory.clone(),
             parser_ground: self.parser_is_ground(),
+            shell_integration_nonce: None,
         }
     }
 
@@ -706,6 +810,14 @@ pub struct CheckpointMeta {
     /// Current working directory (OSC 7).
     #[serde(default)]
     pub current_working_directory: Option<String>,
+    /// The authorized shell-integration nonce as 64 hex digits
+    /// ([`TerminalCheckpoint::shell_integration_nonce`]). ADDITIVE and absent
+    /// when there is none, so a parent without the field, and a session without
+    /// integration, write the wire they always wrote; a value that is not 64
+    /// hex digits reassembles as `None` (the successor reports the session
+    /// `integration=degraded` rather than trusting a partial nonce).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_integration_nonce: Option<String>,
 }
 
 #[cfg(feature = "serde")]
@@ -739,6 +851,7 @@ impl CheckpointMeta {
             // Always true by checkpoint()'s B.3.3 precondition; re-imposed on
             // reassembly rather than trusted from the wire.
             parser_ground: _,
+            shell_integration_nonce,
         } = c;
         Self {
             rows: *rows,
@@ -759,6 +872,7 @@ impl CheckpointMeta {
             taskbar_progress: *taskbar_progress,
             secure_keyboard_entry: *secure_keyboard_entry,
             current_working_directory: current_working_directory.clone(),
+            shell_integration_nonce: shell_integration_nonce.map(|n| n.to_hex()),
         }
     }
 
@@ -797,6 +911,10 @@ impl CheckpointMeta {
             secure_keyboard_entry: self.secure_keyboard_entry,
             current_working_directory: self.current_working_directory,
             parser_ground: true,
+            shell_integration_nonce: self
+                .shell_integration_nonce
+                .as_deref()
+                .and_then(ShellIntegrationNonce::from_hex),
         }
     }
 }
@@ -1352,5 +1470,72 @@ mod tests {
         }
         assert_eq!(t.cursor().row, 55);
         assert_eq!(restored.cursor(), t.cursor());
+    }
+
+    /// The handoff projection carries the authorized shell-integration nonce;
+    /// the in-memory one never does; the meta wire round-trips it; and a
+    /// malformed value reassembles as no nonce. `Debug` never prints it.
+    #[test]
+    fn only_the_carry_projection_takes_the_shell_integration_nonce() {
+        let nonce = [0xA5u8; 32];
+        let mut t = Terminal::new(4, 20);
+        assert_eq!(t.shell_integration_posture(), ShellIntegrationPosture::Off);
+        t.authorize_shell_integration(nonce);
+        t.set_require_shell_integration_nonce(true);
+        assert_eq!(t.shell_integration_posture(), ShellIntegrationPosture::On);
+
+        assert_eq!(t.checkpoint().shell_integration_nonce, None);
+        let carry = t.checkpoint_carry(0).expect("Ground");
+        assert_eq!(
+            carry.shell_integration_nonce,
+            Some(ShellIntegrationNonce(nonce))
+        );
+        assert!(!format!("{carry:?}").contains("a5a5"), "Debug redacts it");
+
+        #[cfg(feature = "serde")]
+        {
+            let meta = CheckpointMeta::from_checkpoint(&carry);
+            assert_eq!(
+                meta.shell_integration_nonce.as_deref(),
+                Some("a5".repeat(32).as_str())
+            );
+            let back = meta.clone().into_checkpoint(carry.grid.clone(), None);
+            assert_eq!(back.shell_integration_nonce, carry.shell_integration_nonce);
+            let mut bad = meta;
+            bad.shell_integration_nonce = Some("a5".repeat(31));
+            assert_eq!(
+                bad.into_checkpoint(carry.grid.clone(), None)
+                    .shell_integration_nonce,
+                None,
+                "a short nonce is no nonce"
+            );
+        }
+
+        // An adopt that restores the modes (require = true) without the nonce
+        // is DEGRADED, and says so; authorizing the carried value heals it.
+        let mut adopted = Terminal::new(4, 20);
+        adopted.restore_checkpoint(&carry);
+        assert_eq!(
+            adopted.shell_integration_posture(),
+            ShellIntegrationPosture::Degraded
+        );
+        adopted.authorize_shell_integration(carry.shell_integration_nonce.expect("carried").0);
+        assert_eq!(
+            adopted.shell_integration_posture(),
+            ShellIntegrationPosture::On
+        );
+    }
+
+    #[test]
+    fn shell_integration_nonce_hex_round_trips_and_refuses_malformed() {
+        let n = ShellIntegrationNonce(core::array::from_fn(|i| i as u8));
+        assert_eq!(ShellIntegrationNonce::from_hex(&n.to_hex()), Some(n));
+        assert_eq!(
+            ShellIntegrationNonce::from_hex(&n.to_hex().to_uppercase()),
+            Some(n)
+        );
+        assert_eq!(ShellIntegrationNonce::from_hex(""), None);
+        assert_eq!(ShellIntegrationNonce::from_hex(&"g".repeat(64)), None);
+        assert_eq!(ShellIntegrationNonce::from_hex(&"0".repeat(66)), None);
     }
 }

@@ -147,15 +147,21 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
     );
 
     // REACH. The first scrolled-back frame finds a cold memo and must pay for
-    // the whole viewport. A number below ROWS here means the fixture is not
-    // reading history — and would make the zeros below prove nothing.
+    // the whole viewport PLUS ONE: the M1b incoming-row apron (the row just
+    // below the viewport, `Terminal::apron_row_into`) is read once per offset
+    // change so a sub-row glide can show it in the strip it exposes — and that
+    // read lands in the memo, which is why the wheel notch below still pays
+    // only for the rows that scrolled in. A number below ROWS + 1 here means
+    // the fixture is not reading history — and would make the zeros below
+    // prove nothing.
     term.scroll_display(DEPTH);
     frame(&mut term, &mut scratch);
     assert_eq!(
         take_viewport_row_materialize(),
-        usize::from(ROWS),
-        "the first scrolled-back frame must materialize the whole viewport from \
-         the tiers — if it does not, this workload never reached the SCR-1 path"
+        usize::from(ROWS) + 1,
+        "the first scrolled-back frame must materialize the whole viewport (plus \
+         the apron row) from the tiers — if it does not, this workload never \
+         reached the SCR-1 path"
     );
 
     // THE CLAIM. Every repaint after that, with the viewport motionless, is

@@ -28,10 +28,10 @@ struct Status<'a> {
     /// no generic status writer may manufacture a completed check.
     #[serde(skip_serializing_if = "Option::is_none")]
     checked_at: Option<String>,
-    /// Whether the updater is configured to act: a macOS installed `.app` and not
-    /// opted out via `ATERM_NO_AUTO_UPDATE`. No pinned anchor is required (the
-    /// default Tier REPO); inertness on unsigned/repo builds comes from
-    /// `bundle::resolve`, not from this flag.
+    /// Whether the updater runs on this platform ([`crate::enabled`]: macOS). Not the
+    /// Settings switch — `[update] enabled = false` stops only the background checker
+    /// ([`crate::automatic`]). No pinned anchor is required (the default Tier REPO);
+    /// inertness on unsigned/repo builds comes from `bundle::resolve`, not from this flag.
     enabled: bool,
     /// The running build number.
     current_build: u64,

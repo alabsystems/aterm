@@ -186,7 +186,7 @@ impl Layout {
     /// `reroute/`). It holds ONLY the shims of the agent programs
     /// ([`crate::stub::AGENT_PROGRAMS`]), each forwarding exactly where its `bin/` twin
     /// does with the same exported environment ([`crate::activate::reconcile_agents`];
-    /// since 2026-09-16 the twin also carries the landing prelude, [`crate::landing`]),
+    /// the twin also carries the self-update block, [`crate::selfupdate`]),
     /// so `claude`/`codex` run the managed copy
     /// ahead of a vendor's native install or a brew cask — the rule-1 exception (owner
     /// decision 2026-09-10: aterm is the version manager for the coding agents;
@@ -204,19 +204,15 @@ impl Layout {
         self.agents_dir().join(tool.shim_file())
     }
 
-    /// `landing/` — the LANDING MARKERS ([`crate::landing`], 2026-09-16): one file per
-    /// agent program whose NEWER pinned build a pass is fetching/staging/activating right
-    /// now. The `agents/` twin tests for its marker with one `[ -f ]` before it execs,
-    /// and hands over to `atpkg __landing` while the marker stands, so a `claude` typed
-    /// mid-update waits for the new build instead of silently running the old one. Its
-    /// own directory, not a dotfile under `agents/`: [`crate::activate::sweep_agents_dir`]
-    /// removes everything in `agents/` that is not a live twin.
+    /// `landing/` — where passes from 2026-09-16 to 2026-09-22 wrote LANDING MARKERS,
+    /// which a twin those clients laid still tests for ([`crate::landing`]). No pass
+    /// writes one now; every pass removes the directory ([`crate::landing::sweep`]).
     #[must_use]
     pub fn landing_dir(&self) -> PathBuf {
         self.prefix.join("landing")
     }
 
-    /// `landing/<tool>` — the landing marker of one agent program ([`Self::landing_dir`]).
+    /// `landing/<tool>` — the path an older twin tests for ([`Self::landing_dir`]).
     #[must_use]
     pub fn landing_marker(&self, tool: &ToolName) -> PathBuf {
         self.landing_dir().join(tool.as_str())
@@ -332,6 +328,30 @@ impl Layout {
         self.prefix.join("status.toml")
     }
 
+    /// `machine-apply.stamp` — when a terminal session last started the detached `aterm pkg
+    /// machine apply` (unix seconds, one line): the session lane claims it once a day
+    /// ([`aterm_update_core::pkg_check::claim`]) instead of walking `$HOME` at every launch.
+    #[must_use]
+    pub fn machine_apply_stamp(&self) -> PathBuf {
+        self.prefix.join("machine-apply.stamp")
+    }
+
+    /// `session-pass.stamp` — when a terminal session last spawned its detached `aterm pkg
+    /// update` (unix seconds, one line): claimed before the spawn, so tabs opened together
+    /// start one pass, not one each.
+    #[must_use]
+    pub fn session_pass_stamp(&self) -> PathBuf {
+        self.prefix.join("session-pass.stamp")
+    }
+
+    /// `listing-headers.tmp` — where the full pass's metered index listing dumps its
+    /// response headers, read back for a rate limit's reset and removed after each listing.
+    /// One file serves: only the full pass asks for it, and it holds the store lock.
+    #[must_use]
+    pub fn listing_headers(&self) -> PathBuf {
+        self.prefix.join("listing-headers.tmp")
+    }
+
     /// `progress.json` — the LIVE install-progress snapshot ([`crate::progress`]), the
     /// in-flight complement to [`Self::status`]'s durable per-pass record. Written only
     /// by the process holding the store flock (via `--progress-file`); read by the GUI
@@ -359,15 +379,15 @@ impl Layout {
     /// "Install ALab toolset" button). NOT written by `install <program>` — asking for one
     /// tool is not adopting the suite.
     ///
-    /// It exists because one config bit was doing two unrelated jobs. `[packages].auto_install`
-    /// answers "may atpkg pull a multi-GB toolchain onto a machine that has never had one?",
-    /// which is a genuine consent question and rightly defaults FALSE. But the update pass
-    /// was ALSO reading it to answer "should a machine that already runs this toolset keep
-    /// that set complete?" — and with the default answer being no, a program published to
-    /// the index AFTER a user installed simply never arrived. Their toolchain quietly stopped
-    /// being the whole toolchain as the suite grew, which is the opposite of what a
-    /// distribution channel is for. Adoption separates the two: consent is asked once, and
-    /// alignment thereafter is not a new consent event.
+    /// It exists because one config bit was once doing two unrelated jobs: a default-OFF
+    /// `[packages].auto_install` answered "may atpkg pull a multi-GB toolchain onto a
+    /// machine that has never had one?", and the update pass ALSO read it to answer "should
+    /// a machine that already runs this toolset keep that set complete?" — so a program
+    /// published to the index AFTER a user installed simply never arrived. Adoption
+    /// separates the two: consent is given once, and alignment thereafter is not a new
+    /// consent event. Since 2026-09-23 the consent is ONE default-on key
+    /// (`auto_install`, which folded in `seed_install`), and the update pass completes the
+    /// set of an ADOPTED machine while it holds (`cli::should_complete_set`).
     ///
     /// CLEARED by `uninstall` (see `crate::ops::uninstall`'s caller): removing a managed
     /// program is an explicit act, and set-completion must never fight it by reinstalling on
@@ -384,21 +404,12 @@ impl Layout {
     /// `adopted-by-seed` — who adopted: present only when `atpkg seed`, the first launch's
     /// bootstrap, created the [`Self::adopted`] marker itself. Existence only. It gates one
     /// sentence: only beside this record may an update pass say "installing aterm is the
-    /// consent" and name `[packages].seed_install = false` as the switch that would have
+    /// consent" and name `[packages].auto_install = false` as the switch that would have
     /// stopped it. Cleared with `adopted`; `install --default-set` never writes one, so a
     /// marker without a record claims no consent beyond the uninstall.
     #[must_use]
     pub fn adopted_by_seed(&self) -> PathBuf {
         self.prefix.join("adopted-by-seed")
-    }
-
-    /// `provisional` — build numbers the batteries-included seed laid down that GC
-    /// must not retain as a rollback target once superseded
-    /// ([`crate::provisional`]). Absent means "nothing provisional", which is the
-    /// pre-existing retention behaviour.
-    #[must_use]
-    pub fn provisional(&self) -> PathBuf {
-        self.prefix.join("provisional")
     }
 
     /// `removed` — programs the user uninstalled INDIVIDUALLY, one name per line.
@@ -1207,13 +1218,13 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
     }
 }
 
-/// The record a provenance-tracked installer leaves when it staged `build_dir` IN-PROCESS
-/// because its untracked lane could not run — the default; `ATPKG_REFUSE_TRACKED_INSTALL=1`
-/// refuses instead — or kept an untracked lane's tree that came back tagged: a SIBLING
-/// file `store/<program>/<build>.tracked-install`, outside the hashed tree like `.ready`.
-/// It is the CAUSE `aterm pkg doctor` reports beside its "carries com.apple.provenance"
-/// line, and what `aterm pkg repair` names as needing a re-seed — the archive is
-/// reclaimed after every stage, so no local re-stage exists.
+/// The record a provenance-tracked installer leaves when the tree it staged came out
+/// carrying `com.apple.provenance` and the heal could not clear it
+/// ([`crate::install::verify_and_stage_with`]): a SIBLING file
+/// `store/<program>/<build>.tracked-install`, outside the hashed tree like `.ready`, whose
+/// `why=` line says how. For the log and a person debugging, never for glass. The store
+/// heal removes it once the build measures clean or is no longer active
+/// ([`crate::provenance::heal_store`]); `aterm pkg doctor` reads the files, not this.
 fn tracked_install_marker_path(build_dir: &Path) -> Option<PathBuf> {
     let name = crate::call1(std::path::Path::file_name, build_dir)?;
     let name = crate::call1(std::ffi::OsStr::to_str, name)?;
@@ -1335,6 +1346,10 @@ pub struct StageRefusal {
     pub at: i64,
     /// How many consecutive attempts have failed on these digests (>= 1).
     pub attempts: u32,
+    /// The platform signer check refused bytes that MATCHED these digests
+    /// ([`crate::install::StageError::SignerRefused`]): a re-download can only fetch the
+    /// same bytes, so the memo binds until the digests change, with no cooldown to lapse.
+    pub signer: bool,
 }
 
 impl StageRefusal {
@@ -1373,12 +1388,14 @@ impl StageRefusal {
     /// this memo must not hide), or one whose cooldown has lapsed binds nothing, and a
     /// clock that cannot be read (`i64::MAX`) makes every memo look lapsed. The only
     /// thing a memo can do is skip a download that would fail again.
+    ///
+    /// A [`StageRefusal::signer`] memo has no cooldown: it binds while the digests hold.
     #[must_use]
     pub fn binds(&self, sha256: &str, tree_root: &str, now_unix: i64) -> bool {
         !self.sha256.is_empty()
             && self.sha256.eq_ignore_ascii_case(sha256)
             && self.tree_root.eq_ignore_ascii_case(tree_root)
-            && now_unix < self.retry_after()
+            && (self.signer || now_unix < self.retry_after())
     }
 }
 
@@ -1413,6 +1430,31 @@ pub fn record_stage_refusal(
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
+    write_stage_refusal(build_dir, sha256, tree_root, why, now_unix, false)
+}
+
+/// [`record_stage_refusal`] for a platform signer refusal ([`StageRefusal::signer`]).
+///
+/// # Errors
+/// As [`record_stage_refusal`].
+pub(crate) fn record_signer_refusal(
+    build_dir: &Path,
+    sha256: &str,
+    tree_root: &str,
+    why: &str,
+    now_unix: i64,
+) -> std::io::Result<()> {
+    write_stage_refusal(build_dir, sha256, tree_root, why, now_unix, true)
+}
+
+fn write_stage_refusal(
+    build_dir: &Path,
+    sha256: &str,
+    tree_root: &str,
+    why: &str,
+    now_unix: i64,
+    signer: bool,
+) -> std::io::Result<()> {
     let dest = stage_refusal_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;
@@ -1438,6 +1480,10 @@ pub fn record_stage_refusal(
     body.push_str(&crate::dec_u64(u64::from(attempts)));
     body.push_str("\nat=");
     body.push_str(&crate::dec_u64(u64::try_from(now_unix).unwrap_or(0)));
+    // Only when set: a reader that predates it sees a digest memo, which fails open.
+    if signer {
+        body.push_str("\nsigner=1");
+    }
     // One line: the reader takes the `why=` line whole.
     body.push_str("\nwhy=");
     let one_line: String = why
@@ -1495,7 +1541,7 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
         return None;
     }
     let (mut sha256, mut tree_root, mut why) = (None, None, None);
-    let (mut at, mut attempts) = (None, None);
+    let (mut at, mut attempts, mut signer) = (None, None, false);
     for line in lines {
         if let Some(v) = line.strip_prefix("sha256=") {
             sha256 = Some(v.to_string());
@@ -1507,6 +1553,8 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
             at = v.trim().parse::<i64>().ok();
         } else if let Some(v) = line.strip_prefix("attempts=") {
             attempts = v.trim().parse::<u32>().ok().filter(|n| *n >= 1);
+        } else if let Some(v) = line.strip_prefix("signer=") {
+            signer = v.trim() == "1";
         }
     }
     Some(StageRefusal {
@@ -1515,6 +1563,7 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
         why: why.unwrap_or_default(),
         at: at?,
         attempts: attempts?,
+        signer,
     })
 }
 
@@ -1523,6 +1572,64 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
 pub fn clear_stage_refusal(build_dir: &Path) {
     if let Some(marker) = stage_refusal_path(build_dir) {
         let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// The suffix of a vendor-direct build's record (`store/<program>/<build>.vendor`): what
+/// was verified, against which anchor, written by the stage before `.ready`.
+pub(crate) const VENDOR_SIDECAR_SUFFIX: &str = ".vendor";
+
+/// The sidecars a stage may write through [`crate::install::StageHooks::sidecars`]:
+/// exactly those [`discard_build`] removes and `gc` sweeps once their build is gone, so a
+/// sidecar can never outlive its tree.
+pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] =
+    &[VENDOR_SIDECAR_SUFFIX, crate::shim_env::SIDECAR_SUFFIX];
+
+/// `<build><suffix>` beside `build_dir`, or `None` for a path with no UTF-8 file name.
+pub(crate) fn sidecar_path(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
+    let name = crate::call1(std::path::Path::file_name, build_dir)?;
+    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let mut sidecar = String::from(name);
+    sidecar.push_str(suffix);
+    Some(build_dir.with_file_name(sidecar))
+}
+
+/// Write `<build><suffix>` durably: temp + fsync + rename, mode `0644` like `.ready` so a
+/// system prefix's readers can read it. The caller flushes the directory afterwards.
+///
+/// # Errors
+/// The temp file cannot be written or flushed, or the rename fails; no temp is left.
+pub(crate) fn write_sidecar_durably(
+    build_dir: &Path,
+    suffix: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let dest = sidecar_path(build_dir, suffix).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
+    })?;
+    let parent = dest.parent().unwrap_or(build_dir);
+    let mut tmp_name = String::from(suffix);
+    tmp_name.push_str(".tmp-");
+    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    let tmp = parent.join(tmp_name);
+    let written = (|| {
+        use std::io::Write as _;
+        let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
+        f.write_all(bytes)?;
+        sync_contents_or_accept_refusal(&f)?;
+        drop(f);
+        std::fs::rename(&tmp, &dest)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Remove the vendor record beside `build_dir`, if any.
+pub(crate) fn clear_vendor_sidecar(build_dir: &Path) {
+    if let Some(sidecar) = sidecar_path(build_dir, VENDOR_SIDECAR_SUFFIX) {
+        let _ = std::fs::remove_file(sidecar);
     }
 }
 
@@ -1762,7 +1869,7 @@ pub(crate) fn sync_dir(dir: &Path) {
 /// toolchain the user cannot have. A REAL error (`EIO`, `ENOSPC`) still propagates —
 /// those are the answers that say the bytes are not on disk, which is the whole question
 /// being asked.
-fn sync_contents_or_accept_refusal(f: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn sync_contents_or_accept_refusal(f: &std::fs::File) -> std::io::Result<()> {
     match crate::platform::sync_file_contents(f) {
         Ok(()) => Ok(()),
         Err(e)
@@ -1928,11 +2035,9 @@ pub(crate) fn discard_build(build_dir: &Path) {
     // a pin named, and a later reinstall under this build number must start from the
     // signed manifest, never from a verdict about a tree that is gone.
     clear_stage_refusal(build_dir);
-    // And the rendered-shim sidecar (`<build>.harness`, the wrapper design §1.3): it
-    // describes a prelude for a tree that no longer exists, and a later build reusing
-    // this number would otherwise inherit it. Added with the suffix rather than after
-    // the first leak.
-    crate::harness::clear_sidecar(build_dir);
+    // And the vendor record (`<build>.vendor`): it vouches for a verified tree, and the
+    // tree is gone.
+    clear_vendor_sidecar(build_dir);
 }
 
 /// The default prefix under `home`. On macOS `…/Library/Application Support/aterm/pkg`
@@ -1994,9 +2099,17 @@ pub fn resolve(configured: Option<&Path>) -> Option<Layout> {
 /// (2026-08-20 round-8 audit).
 #[must_use]
 pub fn resolve_configured() -> Option<Layout> {
+    resolve_from(&crate::config::load())
+}
+
+/// [`resolve_configured`] over a `[packages]` table already read. The terminal session
+/// reads `aterm.toml` ONCE ([`crate::config::cached`]) and resolves from that: re-reading
+/// it per consumer repeated every complaint about the file once per read. The window keeps
+/// [`resolve_configured`]: it lives for days, and re-reads so an edited prefix is seen.
+#[must_use]
+pub fn resolve_from(cfg: &crate::config::PackagesConfig) -> Option<Layout> {
     resolve(
-        crate::config::load()
-            .prefix_path(aterm_types::dirs::home_dir().as_deref())
+        cfg.prefix_path(aterm_types::dirs::home_dir().as_deref())
             .as_deref(),
     )
 }
@@ -2039,15 +2152,17 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
         // violation, and it is the safe direction: the default prefix is
         // `$HOME`-owned and needs no privilege, so a config that would otherwise
         // brick the install degrades to a working one. Say so out loud — silence
-        // is what made the original failure survive.
+        // is what made the original failure survive — as an unasked notice: a typed
+        // verb's stderr, a host's log ([`crate::notice`]) — once per process, since every
+        // layout resolution vets the prefix again.
         if !caller_can_use_prefix(p) {
-            eprintln!(
-                "atpkg: configured prefix {} is not writable by this user — \
-                 using the default {} instead (set [packages].prefix only for a \
-                 shared multi-user store this user can write)",
+            crate::notice::say_once(&format!(
+                "configured prefix {} is not writable by this user — using the default {} \
+                 instead (set [packages].prefix only for a shared multi-user store this user \
+                 can write)",
                 p.display(),
                 default.display()
-            );
+            ));
             return default;
         }
         return p.to_path_buf();
@@ -2569,6 +2684,7 @@ mod tests {
             why: "asset sha256 mismatch: expected aa, got cc".into(),
             at: 1_000,
             attempts,
+            signer: false,
         };
         // THE FIRST RETRY IS FREE: one mismatch can be a truncated transfer, and the next
         // pass must still be able to find the publisher's repair. From the second
@@ -2619,6 +2735,61 @@ mod tests {
             .binds("", "bb", 1_000),
             "a memo with no digest binds nothing"
         );
+    }
+
+    /// A SIGNER refusal judged bytes that matched their digests, so a re-download can only
+    /// fetch the same verdict: its memo binds from the first attempt and never lapses —
+    /// but only while the digests hold, and never with no digest at all.
+    #[test]
+    fn a_signer_refusal_binds_until_the_digests_move() {
+        let m = StageRefusal {
+            sha256: "AA".into(),
+            tree_root: "bb".into(),
+            why: "signer refused: bin/claude is not signed by Developer ID team X".into(),
+            at: 1_000,
+            attempts: 1,
+            signer: true,
+        };
+        assert!(
+            m.binds("aa", "BB", 1_000),
+            "the first refusal already binds"
+        );
+        assert!(m.binds("aa", "bb", i64::MAX), "no cooldown to lapse");
+        assert!(
+            !m.binds("dd", "bb", 1_000),
+            "a new sha256 is a new question"
+        );
+        assert!(
+            !m.binds("aa", "dd", 1_000),
+            "a new tree_root is a new question"
+        );
+        assert!(
+            !StageRefusal {
+                sha256: String::new(),
+                ..m
+            }
+            .binds("", "bb", 1_000)
+        );
+    }
+
+    /// The signer kind survives the disk round trip, a digest memo stays a digest memo,
+    /// and the clears take a signer memo exactly as they take any other.
+    #[test]
+    fn the_signer_refusal_memo_round_trips() {
+        let h = temp_home("signer-refusal");
+        let l = Layout { prefix: h.clone() };
+        let build = l.build_dir("claude", 1_000_002_000_001_000_280);
+        record_signer_refusal(&build, "aa", "bb", "signer refused: x", 1_000).unwrap();
+        let m = stage_refusal(&build).unwrap();
+        assert!(m.signer);
+        assert_eq!((m.attempts, m.why.as_str()), (1, "signer refused: x"));
+        assert!(m.binds("aa", "bb", i64::MAX));
+        record_stage_refusal(&build, "aa", "bb", "asset sha256 mismatch", 2_000).unwrap();
+        assert!(!stage_refusal(&build).unwrap().signer);
+        record_signer_refusal(&build, "aa", "bb", "signer refused: x", 3_000).unwrap();
+        clear_stage_refusals(&l, "claude");
+        assert_eq!(stage_refusal(&build), None);
+        let _ = std::fs::remove_dir_all(&h);
     }
 
     /// The refusal memo on disk: written beside the build like `.ready`/`.shim-env`, read

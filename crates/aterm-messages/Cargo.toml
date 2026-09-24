@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-messages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; the host paints cells, appends the file and performs intents."
+
+[dependencies]
+# The engine-wide injected-clock idiom (the aterm-predict shape): EXACTLY
+# std::time::Instant on native, a JS clock on wasm32. Every method that reads
+# time takes `now: Instant`; the crate itself never samples a clock (its own
+# test greps its sources for `::now()` and asserts zero hits). This is the
+# crate's ONLY dependency: no aterm-types, no serde — the carry and the log
+# are plain data plus a line codec owned here, so the crate is wasm-clean by
+# construction and links nothing the wasm canary would have to pin.
+aterm-time = { workspace = true }
+
+[lints]
+workspace = true

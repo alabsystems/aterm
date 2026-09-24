@@ -165,11 +165,12 @@ pub fn shim_executable_env(
 /// after the line in the OLD file is not looked for in the NEW one. A bare `exit /b`
 /// returns with the ERRORLEVEL the program left, which is what `cmd /c` exits with;
 /// `exit /b %errorlevel%` on the same line would be expanded when the line is PARSED,
-/// before the program ran. The one string the renderers ([`cmd_shim_content_env`],
-/// [`cmd_landing_prelude`]) write and the reader ([`parse_cmd_shim_target`]) keys on.
+/// before the program ran. The one string the renderer ([`cmd_shim_content_env`])
+/// writes and the reader ([`parse_cmd_shim_target`]) keys on.
 /// A file from BEFORE this tail IS read again after its program returns — at the old
 /// file's end offset — which is what the frame ([`CMD_FRAME_HEAD`], 2026-09-18) makes
 /// harmless. Written to the documented `cmd` rules; no Windows host has run it.
+#[cfg(any(windows, test))]
 pub(crate) const CMD_FORWARD_TAIL: &str = " %* & @exit /b";
 
 /// The tail a `.cmd` shim from BEFORE 2026-09-17 carries: `@"<target>" %*` alone, on its
@@ -415,9 +416,8 @@ pub(crate) fn parse_cmd_shim_env(content: &str) -> crate::shim_env::ShimEnv {
 /// this is defense-in-depth, fail-closed: a `"` closes the quote (command injection),
 /// a `%` triggers `%VAR%` expansion (path substitution), and CR/LF/NUL inject extra
 /// batch lines. The bin shim can't safely ESCAPE a `"` inside `@"…"`, so the I/O site
-/// REFUSES an unsafe target rather than emit an injectable `.cmd`. Compiled on every
-/// platform: [`cmd_landing_prelude`] (rendered everywhere through [`landing_prelude`])
-/// guards its four paths with it.
+/// REFUSES an unsafe target rather than emit an injectable `.cmd`.
+#[cfg(any(windows, test))]
 pub(crate) fn cmd_target_is_injection_safe(target: &Path) -> bool {
     !target
         .to_string_lossy()
@@ -463,13 +463,14 @@ fn cmd_echo_escape(s: &str) -> String {
 ///
 /// Keyed on the forward line's EXACT shape — `@"`, the target, then [`CMD_FORWARD_TAIL`]
 /// and nothing else (or, for a shim laid before 2026-09-17 and not yet re-laid,
-/// [`CMD_LEGACY_FORWARD_TAIL`]) — not on any line that starts with `@"`: the `agents/`
-/// twin's landing prelude ([`cmd_landing_prelude`]) runs the embedded `atpkg` as
-/// `@"<atpkg>" __landing "<program>" "<prefix>" -- %* & @exit /b`, whose closing quote is
-/// followed by ` __landing`, so the one reader of the target walks past it to the twin's
-/// real forward. (The first cut kept the hand-over off `@"` with a second `if exist` on
-/// the same path instead — a stat that, when the file vanished between the two, skipped
-/// the hand-over and exited 0 with the tool never run; review finding, 2026-09-17.) The
+/// [`CMD_LEGACY_FORWARD_TAIL`]) — not on any line that starts with `@"`: a twin laid
+/// from 2026-09-17 to 2026-09-22 carries the landing prelude ([`crate::landing`]), which
+/// runs the embedded `atpkg` as `@"<atpkg>" __landing "<program>" "<prefix>" -- %* &
+/// @exit /b`, whose closing quote is followed by ` __landing`, so the one reader of the
+/// target walks past it to the twin's real forward until the next pass re-lays it. (The
+/// first cut kept the hand-over off `@"` with a second `if exist` on the same path
+/// instead — a stat that, when the file vanished between the two, skipped the hand-over
+/// and exited 0 with the tool never run; review finding, 2026-09-17.) The
 /// frame's lines ([`CMD_FRAME_HEAD`], the colon labels, `@exit /b`, `:main`; 2026-09-18)
 /// start with neither `@"` nor `@set "`, so this reader and [`parse_cmd_shim_env`] walk
 /// past them the same way and answer the same over a framed file and a legacy one.
@@ -511,9 +512,9 @@ pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 }
 
 /// [`cmd_shim_content_env`] with `prelude` (empty for every `bin/` shim; an `agents/`
-/// twin's [`cmd_landing_prelude`]) ahead of the `@set` lines and the forward line, the
-/// whole behind the same frame ([`CMD_FRAME_HEAD`]) — the `.cmd` twin of
-/// [`sh_shim_content_twin`]. The prelude ends on its `:store` label, so its `goto store`
+/// twin's [`twin_prelude`], empty on Windows today) ahead of the `@set` lines and the
+/// forward line, the whole behind the same frame ([`CMD_FRAME_HEAD`]) — the `.cmd` twin
+/// of [`sh_shim_content_twin`]. A prelude ends on a `:store` label, so its `goto store`
 /// lands exactly on the exports the store forward needs.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_shim_content_twin(
@@ -526,18 +527,19 @@ pub(crate) fn cmd_shim_content_twin(
     cmd_framed(&s)
 }
 
-/// The note ahead of the `.cmd` landing prelude — the `rem` twin of [`SH_LANDING_NOTE`].
-/// No backtick, no `%`, no `^`: a `rem` line is still parsed for `%` expansion.
+/// The note line of the LEGACY `.cmd` landing prelude ([`cmd_landing_prelude`]).
+#[cfg(test)]
 const CMD_LANDING_NOTE: &str = "@rem atpkg agents twin: while a newer build of this program is landing, atpkg __landing \
      waits for it and then runs the new one (aterm help pkg).\r\n";
 
-/// The label the prelude jumps to when there is nothing to wait for: the line right
-/// ahead of the twin's own `@set` exports and `@"<target>" %* & @exit /b` forward.
+/// The label the LEGACY `.cmd` landing prelude jumps to past its hand-over.
+#[cfg(test)]
 const CMD_LANDING_LABEL: &str = "store";
 
-/// THE `.cmd` LANDING PRELUDE of an `agents/` twin (2026-09-17, closing residual R4 of
-/// [`crate::landing`]): the Windows twin of [`sh_landing_prelude`], designed for
-/// `cmd.exe` line by line —
+/// THE LEGACY `.cmd` LANDING PRELUDE — the bytes a Windows `agents\` twin laid from
+/// 2026-09-17 to 2026-09-22 carries ahead of its exports, rendered here ONLY so the
+/// tests can lay such a twin: no twin is rendered with it any more (Phase 2,
+/// [`crate::landing`]), and the next pass re-lays one that carries it.
 ///
 /// ```text
 /// @rem atpkg agents twin: while a newer build of this program is landing, atpkg __landing waits for it and then runs the new one (aterm help pkg).
@@ -547,82 +549,13 @@ const CMD_LANDING_LABEL: &str = "store";
 /// :store
 /// ```
 ///
-/// * ONE `if exist` on the marker — the `stat` the Unix `[ -f ]` is — and `goto` past
-///   the whole prelude when it is absent, which is every run outside an update pass.
-/// * A `goto`/label shape, NO PARENTHESISED BLOCK: inside `if … ( … )` a `)` in a quoted
-///   path — `C:\Program Files (x86)\…` — closes the block early; on a single-line `if`
-///   the quoted path is one token whatever it contains.
-/// * The hand-over runs the embedded co-located `atpkg` DIRECTLY (a `.exe`, so no `call`
-///   — `call` re-parses the line and a `%` in the user's arguments would be expanded a
-///   second time), forwarding `%*` verbatim, after ONE `if exist` on it. Its closing
-///   quote is followed by ` __landing`, never by the forward tail, which is the shape
-///   [`parse_cmd_shim_target`] keys on — so `resolve_shim`, `sweep_agents_dir`'s
-///   keep-predicate and every reader of the target still answer the store target off the
-///   twin's real forward line. (The first cut prefixed this line with a SECOND `if exist`
-///   on the same path so no line started with `@"`; an `atpkg.exe` replaced between the
-///   two stats skipped the hand-over and exited 0 with the tool never run — review
-///   finding, 2026-09-17. Now a launch that fails in that window is `cmd`'s own `9009`
-///   with its message, the same class of ending the Unix twin's failed `exec` has.) It
-///   falls through to the store forward when the embedded `atpkg` is gone — never
-///   `where atpkg`: an older `atpkg` on PATH answers `__landing` with exit 2 `unknown
-///   verb`, and the tool would never run (the Unix rule, review 2026-09-16).
-/// * **The batch ends on the line that runs the program** — `… %* & @exit /b` on the
-///   hand-over and on the twin's own forward ([`CMD_FORWARD_TAIL`]), never an exit line
-///   of its own (review, 2026-09-17). `cmd.exe` executes a batch file by re-reading it at
-///   a remembered BYTE OFFSET after every line, and the twin is RE-LAID while it may be
-///   executing: `reconcile_agents` re-lays a twin whose bytes changed, and activation
-///   re-lays `bin/` and the twin while a landing marker stands — the very moment a
-///   `claude` is inside the hand-over. The first cut's `@exit /b %errorlevel%` on a line
-///   of its own was reached by offset: a re-lay from an `atpkg` whose path is a different
-///   length (a relocated app, a per-user install beside a system one) moved that offset
-///   into the middle of some other line of the new file — a fragment run as a command,
-///   then `:store`, then the tool a SECOND time. A line is parsed whole before any of it
-///   runs and nothing is read after `exit /b`, so the steady state — a twin of THIS shape
-///   re-laid while it runs, in the hand-over or in the forward — is closed. A bare
-///   `exit /b` returns with the ERRORLEVEL the program left, which is what `cmd /c` exits
-///   with; `exit /b %errorlevel%` on the same line would be expanded when the line is
-///   PARSED, before the program ran — the rule that had put the exit on its own line.
-///   **What the same-line exit could not close, and the frame does** (2026-09-18): a
-///   twin from BEFORE 2026-09-17 — `@"<target>" %*` alone on its last line, the plain
-///   shim under the twin's name, which every Windows twin was until then — that is
-///   executing at the moment of its ONE re-lay. When its agent exits, `cmd` resumes at
-///   the OLD file's end-of-file offset inside the NEW file; laid bare behind this
-///   prelude, that offset landed in the prelude, and with the marker gone, `goto store`
-///   ran the agent a SECOND time with the same arguments. Every `.cmd` this crate writes
-///   now starts with the frame ([`CMD_FRAME_HEAD`]): `@goto :main`, 4080 bytes of
-///   colon-only label lines, `@exit /b`, `:main`, and only then this prelude and the
-///   body — so that resume, at any offset a legacy file can end at
-///   ([`CMD_LEGACY_FILE_BOUND_BYTES`], from the old writer's own caps), reads a label,
-///   an empty line or the bare `@exit /b`, prints nothing and returns with the agent's
-///   own ERRORLEVEL. Closed by construction; the rendered text and a simulation of the
-///   resume at every offset of a legacy file are pinned by the tests; `cmd.exe`'s reading
-///   of it is unverified on a Windows host like all of this. (The gaps between two
-///   consecutive line reads of the prelude carry the same offset hazard, microseconds
-///   wide, as every batch file rewritten in place does; the program's whole run was the
-///   window that lasted minutes.)
-/// * `@set` lines: none — [`parse_cmd_shim_env`] reads only those, so the exports it
-///   reads off the twin are the twin's own, laid after the label.
-/// * Every path is embedded with its VERBATIM prefix taken off ([`strip_verbatim_prefix`])
-///   — the embedded `atpkg` comes from `canonicalize`, which spells `\\?\C:\…` on
-///   Windows, a spelling `cmd`'s `if exist` and its command launch do not reliably accept
-///   — and its TRAILING SEPARATORS trimmed ([`cmd_embedded_path`]): a prefix configured
-///   as `C:\…\pkg\` rendered `"C:\…\pkg\" -- %*`, and `\"` is an escaped quote to the
-///   launched exe's argv parser (the `CommandLineToArgvW` rule), so the prefix operand
-///   fused with the user's arguments and the tool never ran (review, 2026-09-17). A path
-///   that is nothing but separators, or a bare drive once trimmed (`C:\` → `C:`, which
-///   `cmd` reads relative to that drive's current directory), renders the EMPTY prelude.
-///
-/// Fail-closed like every `.cmd` body this crate writes: when the marker, the `atpkg`
-/// path, the prefix or the program could break out of `"…"` or trigger `%` expansion
-/// ([`cmd_target_is_injection_safe`]), or a path cannot be embedded at all, the prelude
-/// is EMPTY — the twin is the plain shim and runs the store build with no wait, never an
-/// injectable batch line and never a stranded tool. Pure string building, rendered and
-/// unit-tested on every platform.
-///
-/// **No Windows host has run this.** The rendered text is pinned by tests on this
-/// crate's Unix suite; the runtime behaviour (`cmd.exe`'s `goto`, `%*`, the same-line
-/// `exit /b` and the ERRORLEVEL it returns with, the offset rule above) is written to
-/// the documented `cmd` rules and is UNVERIFIED on Windows, like the rest of [`windows`].
+/// Every reader still answers over those bytes: the hand-over's closing quote is followed
+/// by ` __landing`, never by [`CMD_FORWARD_TAIL`], so [`parse_cmd_shim_target`] walks
+/// past it to the twin's real forward, and it carries no `@set` line for
+/// [`parse_cmd_shim_env`]. Each line that runs a program ends the batch on that same line,
+/// so the re-lay that retires it is safe while it runs. Empty when a path cannot be
+/// embedded ([`cmd_embedded_path`]) or the program could break out of `"…"`.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn cmd_landing_prelude(
     program: &str,
@@ -666,18 +599,18 @@ pub(crate) fn cmd_landing_prelude(
 }
 
 /// THE `.cmd` SELF-UPDATE BLOCK — TARGET, NOT RENDERED (2026-09-19). The Windows twin of
-/// [`sh_selfupdate_prelude`] would sit ahead of [`cmd_landing_prelude`] and read:
+/// [`sh_selfupdate_prelude`] would sit ahead of the twin's exports and read:
 ///
 /// ```text
 /// @rem atpkg agents twin: claude update, upgrade and install are answered by atpkg __selfupdate (aterm help pkg).
 /// @if /I "%~1"=="update" goto selfupdate
 /// @if /I "%~1"=="upgrade" goto selfupdate
 /// @if /I "%~1"=="install" goto selfupdate
-/// @goto landing
+/// @goto store
 /// :selfupdate
-/// @if not exist "<atpkg>" goto landing
+/// @if not exist "<atpkg>" goto store
 /// @"<atpkg>" __selfupdate "claude" "<prefix>" -- %* & @exit /b
-/// :landing
+/// :store
 /// ```
 ///
 /// It answers the EMPTY string on every input, so the `.cmd` twin is byte for byte what
@@ -687,10 +620,8 @@ pub(crate) fn cmd_landing_prelude(
 /// unbalanced one) can make `cmd.exe` report a syntax error and END the batch with the
 /// tool never run: exactly the strand the Unix rule forbids (the `exec` is the
 /// guarantee), on a platform no machine of this repo runs. Every added line that runs a
-/// program would also have to end the batch on that line (the offset-resume rule of
-/// [`cmd_landing_prelude`]), and the counts pinned by
-/// `cmd_agents_twin_carries_the_landing_prelude_and_still_resolves_to_the_store` would
-/// move with it. Rendering it is a decision for a Windows host that has measured `%~1`
+/// program would also have to end the batch on that line ([`CMD_FORWARD_TAIL`]'s
+/// offset-resume rule). Rendering it is a decision for a Windows host that has measured `%~1`
 /// with `"`, `%` and `^` in the argument; until then the block is fail-closed, like every
 /// `.cmd` path this crate refuses to embed. The Rust half (`cli::cmd_selfupdate`) is
 /// platform-neutral and needs nothing when that day comes. The arguments are taken so the
@@ -706,13 +637,11 @@ pub(crate) fn cmd_selfupdate_prelude(
     String::new()
 }
 
-/// A path as the `.cmd` landing prelude embeds it, or `None` when it cannot be
-/// (2026-09-17): the verbatim prefix off ([`strip_verbatim_prefix`]), trailing `\` and
-/// `/` trimmed — a quoted operand ending in `\"` is an escaped quote to the launched
-/// exe's argv parser, and `if exist` wants none either — then the injection guard
-/// ([`cmd_target_is_injection_safe`]). `None` for a path that is only separators, for a
-/// bare drive once trimmed (`C:` is drive-relative to `cmd`), and for one the guard
-/// refuses; the caller renders no prelude for any of them.
+/// A path as the LEGACY `.cmd` landing prelude embedded it, or `None` when it could not:
+/// the verbatim prefix off ([`strip_verbatim_prefix`]), trailing `\` and `/` trimmed (a
+/// quoted operand ending in `\"` is an escaped quote to the launched exe's argv parser),
+/// then the injection guard ([`cmd_target_is_injection_safe`]).
+#[cfg(test)]
 fn cmd_embedded_path(path: &Path) -> Option<String> {
     let stripped = strip_verbatim_prefix(path);
     let trimmed = stripped
@@ -728,11 +657,10 @@ fn cmd_embedded_path(path: &Path) -> Option<String> {
     Some(trimmed)
 }
 
-/// THE LANDING PRELUDE of the `agents/` twin this platform lays — what
-/// [`crate::activate::reconcile_agents`] renders and hands to [`install_twin_to_env`] /
-/// [`twin_executable_to_env`]: the `sh` prelude ([`sh_landing_prelude`]) on Unix, the
-/// `.cmd` prelude ([`cmd_landing_prelude`]) on Windows. Both renderers are pure and
-/// compiled everywhere; only the dispatch is per platform.
+/// The LEGACY landing prelude in this platform's dialect: [`sh_landing_prelude`] on
+/// Unix, [`cmd_landing_prelude`] on Windows — what a twin laid from 2026-09-16 to
+/// 2026-09-22 carries, for the tests that lay one.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn landing_prelude(program: &str, prefix: &Path, marker: &Path, atpkg: &Path) -> String {
     if cfg!(windows) {
@@ -742,33 +670,22 @@ pub(crate) fn landing_prelude(program: &str, prefix: &Path, marker: &Path, atpkg
     }
 }
 
-/// THE WHOLE PRELUDE of the `agents/` twin (2026-09-19) — what
-/// [`crate::activate::reconcile_agents`] renders now: the self-update block
-/// ([`sh_selfupdate_prelude`] on Unix; [`cmd_selfupdate_prelude`], empty, on Windows) and
-/// THEN the landing prelude ([`landing_prelude`], unchanged). In that order on purpose: a
-/// `claude update` typed while a landing marker stands must hand over to `__selfupdate`,
-/// whose child update queues on the store lock the landing pass holds (the standard
-/// update), and never to `__landing`, which would wait out the landing and then run
-/// `bin/claude update` — `bin/` carries neither block, so the vendor's own updater would
-/// run ([`crate::selfupdate`]). `verbs` is the program's row ([`crate::selfupdate::verbs_of`]):
-/// empty renders no block, and the twin is byte for byte the landing-only twin of
-/// 2026-09-16. A twin laid before this block existed compares unequal on the next pass
-/// and is re-laid once (temp + rename; a running `sh` keeps the old inode).
+/// THE PRELUDE of the `agents/` twin — what [`crate::activate::reconcile_agents`] renders:
+/// the self-update block alone ([`sh_selfupdate_prelude`] on Unix;
+/// [`cmd_selfupdate_prelude`], empty, on Windows). No landing prelude since Phase 2
+/// (2026-09-22, [`crate::landing`]): nothing waits in a shell for an update, and a twin
+/// that still carries one compares unequal on the next pass and is re-laid once (temp +
+/// rename; a running `sh` keeps the old inode, a running `.cmd` ends its batch on the
+/// line that runs the program). `verbs` is the program's row
+/// ([`crate::selfupdate::verbs_of`]): empty renders nothing, and the twin is the plain
+/// shim under the twin's name.
 #[must_use]
-pub(crate) fn twin_prelude(
-    program: &str,
-    prefix: &Path,
-    marker: &Path,
-    atpkg: &Path,
-    verbs: &[&str],
-) -> String {
-    let mut s = if cfg!(windows) {
+pub(crate) fn twin_prelude(program: &str, prefix: &Path, atpkg: &Path, verbs: &[&str]) -> String {
+    if cfg!(windows) {
         cmd_selfupdate_prelude(program, prefix, atpkg, verbs)
     } else {
         sh_selfupdate_prelude(program, prefix, atpkg, verbs)
-    };
-    s.push_str(&landing_prelude(program, prefix, marker, atpkg));
-    s
+    }
 }
 
 /// The Unix `bin/` shim body: a `/bin/sh` stub that EXECs the store binary.
@@ -806,10 +723,11 @@ pub(crate) fn sh_shim_content(target: &Path) -> String {
 }
 
 /// The marker comment ahead of the `export` lines of a shim that carries an
-/// environment — a human reading `bin/claude` sees where the variables come from.
+/// environment — a human reading `bin/claude` sees where the variables come from: the
+/// program's policy (compiled for a vendor-direct program, signed for an index one).
 #[cfg(any(unix, test))]
 const SH_SHIM_ENV_NOTE: &str =
-    "# shim_env from the signed manifest: only this managed copy runs with it.\n";
+    "# shim_env is aterm's policy for this program: only this managed copy runs with it.\n";
 
 /// [`sh_shim_content`] with the shim's exported environment ahead of the `exec`
 /// (design S7, [`crate::shim_env`]): the note, then one `export NAME='VALUE'` per entry
@@ -879,52 +797,20 @@ pub(crate) fn sh_shim_content_routed(
     sh_shim_body(target, env, route, "")
 }
 
-/// The note ahead of the landing prelude of an `agents/` twin — what a human reading
-/// `agents/claude` learns about the lines before the exports, and where to ask.
+/// The note line of the LEGACY `sh` landing prelude ([`sh_landing_prelude`]).
+#[cfg(test)]
 const SH_LANDING_NOTE: &str = "# atpkg agents twin: while a newer build of this program is landing, `atpkg __landing` \
      waits for it and then runs the new one (aterm help pkg).\n";
 
-/// THE LANDING PRELUDE of an `agents/` twin ([`crate::landing`], 2026-09-16): one `[ -f
-/// <marker> ]` — a single `stat` — and, only while the marker stands, a hand-over to
-/// `atpkg __landing <program> '<prefix>' -- "$@"` through a VARIABLE naming the embedded
-/// co-located `atpkg` (the one this process runs as); when that binary is not executable
-/// the prelude falls through to the twin's own exports and store `exec`. The PREFIX
-/// rides along as an operand so the verb finds the store with no `HOME` (an `env -i`
-/// wrapper, a launchd job) and never exits without running the tool — the twin's own
-/// `exec` line would have run it, so the hand-over must too (review, 2026-09-16). Pure
-/// string building, so it is rendered on every platform and unit-tested everywhere; the
-/// Unix twin carries it, and the `.cmd` twin carries [`cmd_landing_prelude`], its
-/// `cmd.exe` twin (2026-09-17).
-///
-/// NO `command -v atpkg` FALLBACK (review, 2026-09-16). The pending stub's chain tries
-/// whatever `atpkg` PATH finds when the embedded one is gone, and for `__pending` that
-/// is right: with no tool installed there is nothing else to run. Here there is — the
-/// store build the twin's own `exec` line runs — and an OLDER `atpkg` on PATH (a
-/// `~/.local/bin` alias from before this verb, a stale bundle) answers `__landing` with
-/// exit 2 `unknown verb`, so the user's `claude` would never run. The wait is a courtesy;
-/// the `exec` is the guarantee. A twin whose embedded path dangles (the app relocated)
-/// runs the old build silently until the next pass re-lays it with the live path
-/// ([`crate::activate::reconcile_agents`] compares the rendered bytes) — the pre-prelude
-/// behaviour, never a stranded tool.
-///
-/// NO LINE HERE IS A LITERAL `exec '`. `parse_sh_shim_target` takes the first trimmed
-/// line that starts with `exec '` as the target; both `exec`s below are `exec "$…"` on a
-/// line that starts with `if`, so every reader keyed on the target — `resolve_shim`,
-/// `sweep_agents_dir`'s keep-predicate, `active_builds`, gc's witnesses — still answers
-/// the store target off the twin's real `exec` line. `parse_sh_shim_env` reads only
-/// `export ` lines, of which the prelude has none. `is_pending_stub` reads line 2, which
-/// stays the shim comment.
-///
-/// THE SELF-UPDATE BLOCK PRECEDES THIS ONE (2026-09-19, [`sh_selfupdate_prelude`],
-/// [`crate::selfupdate`]): the twin's prelude is that block and then this one
-/// ([`twin_prelude`]), so a `claude update` typed while a landing marker stands hands
-/// over to `atpkg __selfupdate` — whose child update QUEUES on the store lock the
-/// landing pass holds, which is the standard update — and never to `__landing`, which
-/// would wait out the landing and then run `bin/claude update`: `bin/` carries no block,
-/// and the vendor's own updater would run. That block keeps every rule above — no literal
-/// `exec '`, no `export `, every embedded string through [`sh_quote_str`] — and repeats
-/// the `__atpkg=` assignment rather than hoisting it, so this function's bytes, and every
-/// test pinning them, are untouched.
+/// THE LEGACY `sh` LANDING PRELUDE — the bytes a Unix `agents/` twin laid from 2026-09-16
+/// to 2026-09-22 carries after its self-update block, rendered here ONLY so the tests can
+/// lay such a twin: no twin is rendered with it any more (Phase 2, [`crate::landing`]),
+/// and the next pass re-lays one that carries it. One `[ -f <marker> ]`, and while the
+/// marker stands a hand-over to `atpkg __landing <program> '<prefix>' -- "$@"` through a
+/// variable naming the embedded `atpkg` — which now `exec`s `bin/<program>` at once. No
+/// line of it is a literal `exec '` and none an `export `, so every reader of the twin's
+/// target and env answers over those bytes as over today's.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn sh_landing_prelude(
     program: &str,
@@ -951,14 +837,14 @@ pub(crate) fn sh_landing_prelude(
 /// The invariant tail of the self-update block's note line — what follows the program,
 /// its verbs and the verb name, which are rendered per row: a human reading
 /// `agents/claude` learns what the `case` ahead of the exports does, and where to ask.
-const SH_SELFUPDATE_NOTE: &str = "` — aterm's package manager keeps this copy at the vendor's latest through the signed \
-     index (aterm help pkg).\n";
+const SH_SELFUPDATE_NOTE: &str =
+    "` — aterm updates this copy from its vendor and verifies every build here (aterm help pkg).\n";
 
-/// THE SELF-UPDATE BLOCK of an `agents/` twin ([`crate::selfupdate`], 2026-09-19),
-/// rendered AHEAD of [`sh_landing_prelude`] by [`twin_prelude`]:
+/// THE SELF-UPDATE BLOCK of an `agents/` twin ([`crate::selfupdate`], 2026-09-19), the
+/// whole of [`twin_prelude`] on Unix:
 ///
 /// ```text
-/// # atpkg agents twin: `claude update|upgrade|install` is answered by `atpkg __selfupdate` — aterm's package manager keeps this copy at the vendor's latest through the signed index (aterm help pkg).
+/// # atpkg agents twin: `claude update|upgrade|install` is answered by `atpkg __selfupdate` — aterm updates this copy from its vendor and verifies every build here (aterm help pkg).
 /// case "$1" in
 ///   update|upgrade|install)
 ///     __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'
@@ -972,16 +858,16 @@ const SH_SELFUPDATE_NOTE: &str = "` — aterm's package manager keeps this copy 
 ///   [`crate::selfupdate::is_shell_safe_verb`] at render; an unset `$1` is the empty
 ///   string and matches nothing; `"$@"` is verbatim. No user byte is ever parsed as
 ///   shell, which is why the classification of everything past `$1` lives in Rust.
-/// * THE EXEC IS THE GUARANTEE (the landing rule, review 2026-09-16): when `$__atpkg` is
-///   not executable — the app relocated, the bundle gone — the arm falls through `;;` to
-///   the landing check, the twin's own exports and the store `exec`, so the vendor's verb
-///   runs exactly as it did before this block existed; never `command -v atpkg`, which
-///   would exec an OLDER `atpkg` into `unknown verb` exit 2 with the tool never run.
+/// * THE EXEC IS THE GUARANTEE (review 2026-09-16): when `$__atpkg` is not executable —
+///   the app relocated, the bundle gone — the arm falls through `;;` to the twin's own
+///   exports and the store `exec`, so the vendor's verb runs exactly as it did before
+///   this block existed; never `command -v atpkg`, which would exec an OLDER `atpkg` into
+///   `unknown verb` exit 2 with the tool never run.
 /// * NO LINE HERE IS A LITERAL `exec '` (the one `exec` is `exec "$__atpkg"` on a line
 ///   starting with `if`), NO `export ` line, no pending-stub marker; every embedded
 ///   string goes through [`sh_quote_str`] — so `parse_sh_shim_target`, `resolve_shim`,
 ///   `sweep_agents_dir`'s keep-predicate and `parse_sh_shim_env` all answer as before.
-/// * FAIL-CLOSED RENDER: the EMPTY string — the twin is the landing-only twin — when
+/// * FAIL-CLOSED RENDER: the EMPTY string — the twin is the plain shim — when
 ///   `verbs` is empty (a member with no self-updater, or a program with no row), when any
 ///   verb fails the word rule (it would break the `case` pattern — including `esac`, the
 ///   one regex-shaped word `sh` reserves where a pattern list starts: measured 2026-09-19,
@@ -991,9 +877,7 @@ const SH_SELFUPDATE_NOTE: &str = "` — aterm's package manager keeps this copy 
 ///   (it lands in the note line and in a quoted operand). Never an injectable line, never
 ///   a stranded tool.
 ///
-/// The `__atpkg=` assignment is repeated here rather than hoisted above both blocks so
-/// [`sh_landing_prelude`]'s bytes, and every test pinning them, stay untouched. Pure
-/// string building, rendered and pinned on every platform; the `.cmd` twin renders
+/// Pure string building, rendered and pinned on every platform; the `.cmd` twin renders
 /// nothing yet ([`cmd_selfupdate_prelude`]).
 #[must_use]
 pub(crate) fn sh_selfupdate_prelude(
@@ -1034,9 +918,9 @@ pub(crate) fn sh_selfupdate_prelude(
 }
 
 /// [`sh_shim_content_routed`] with `prelude` (empty for every `bin/` shim; an `agents/`
-/// twin's [`sh_landing_prelude`]) inserted right after the header comment — ahead of the
-/// exports, so a hand-over to `atpkg __landing` inherits nothing the store `exec` would
-/// have set (the verb execs `bin/<program>`, which exports them itself).
+/// twin's [`twin_prelude`]) inserted right after the header comment — ahead of the
+/// exports, so a hand-over to `atpkg __selfupdate` inherits nothing the store `exec`
+/// would have set.
 #[cfg(any(unix, test))]
 pub(crate) fn sh_shim_content_twin(
     target: &Path,
@@ -1136,7 +1020,7 @@ pub(crate) fn sh_shim_quote(target: &Path) -> String {
 }
 
 /// [`sh_shim_quote`] over a string: the one quoting rule the shim body uses for its
-/// target AND its exported values (and, on every platform, the landing prelude's).
+/// target AND its exported values (and, on every platform, the self-update block's).
 fn sh_quote_str(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -1361,22 +1245,19 @@ mod tests {
         assert_eq!(CMD_LEGACY_FORWARD_TAIL, " %*");
     }
 
-    /// THE `.cmd` AGENTS TWIN (2026-09-17, residual R4 closed): its rendered text, exact,
-    /// over a prefix with a space and a `)` in it — the `Program Files (x86)` shape that
-    /// breaks a parenthesised `if` block, which is why the prelude is `goto`-shaped. The
-    /// prelude sits ahead of the exports; its hand-over line is `@"<atpkg>" __landing …`,
-    /// not a `@"<target>" %* & @exit /b` forward, so the Windows target parser still
-    /// resolves the twin to the STORE target and the env parser still reads the twin's
-    /// own exports; every line that runs a program ends the batch on that SAME line (a
-    /// re-laid twin is never re-read at an offset once the program returns; review
-    /// finding, 2026-09-17); a prefix with a trailing separator is embedded without it
-    /// (`\"` would be an escaped quote to the exe's argv parser); a `bin/` shim carries
-    /// none of it; an empty prelude is the plain shim byte for byte; a `\\?\`-verbatim
-    /// path (what `canonicalize` answers on Windows) is embedded without the prefix.
-    /// RENDERED TEXT ONLY: no Windows box ran this — `cmd.exe`'s reading of it is
-    /// unverified here.
+    /// A LEGACY `.cmd` AGENTS TWIN — laid from 2026-09-17 to 2026-09-22 with the landing
+    /// prelude — still resolves to the store: its prelude's text, exact (the bytes on disk
+    /// the readers must keep walking past until the next pass re-lays the twin), over a
+    /// prefix with a space and a `)` in it; the hand-over line is `@"<atpkg>" __landing …`,
+    /// not a `@"<target>" %* & @exit /b` forward, so the target parser still resolves the
+    /// twin to the STORE target and the env parser reads the twin's own exports; every line
+    /// that runs a program ends the batch on that SAME line, so the re-lay that retires it
+    /// is safe while it runs. Until 2026-09-22 this test also pinned the renderer's own
+    /// hygiene (trailing separators, verbatim prefixes, injection-shaped paths) because the
+    /// pass rendered it; no pass does now ([`crate::landing`]). RENDERED TEXT ONLY: no
+    /// Windows box ran this.
     #[test]
-    fn cmd_agents_twin_carries_the_landing_prelude_and_still_resolves_to_the_store() {
+    fn a_legacy_cmd_twin_with_the_landing_prelude_still_resolves_to_the_store() {
         // Literal `\` paths: what `Layout` joins on Windows (`Path::join` on this Mac
         // would put a `/` in, which is not what a Windows twin carries).
         let prefix = Path::new("C:\\Program Files (x86)\\aterm\\pkg");
@@ -1474,66 +1355,15 @@ mod tests {
             None,
             "a quoted program with no forward tail is not the shim's forward"
         );
-        // A prefix configured with a trailing separator — `C:\…\pkg\`, or several, or a
-        // `/` — is embedded without it: `"C:\…\pkg\" -- %*` would hand the exe
-        // `C:\…\pkg" -- …` as ONE operand (review, 2026-09-17). The rendered text is the
-        // same twin, byte for byte.
-        for trailing in [
-            "C:\\Program Files (x86)\\aterm\\pkg\\",
-            "C:\\Program Files (x86)\\aterm\\pkg\\\\",
-            "C:\\Program Files (x86)\\aterm\\pkg/",
-        ] {
-            assert_eq!(
-                cmd_landing_prelude("claude", Path::new(trailing), marker, atpkg),
-                prelude,
-                "{trailing}"
-            );
-        }
-        assert_eq!(
-            cmd_landing_prelude(
-                "claude",
-                prefix,
-                Path::new("C:\\Program Files (x86)\\aterm\\pkg\\landing\\claude\\"),
-                Path::new("C:\\Program Files (x86)\\aterm\\app\\atpkg.exe\\"),
-            ),
-            prelude
-        );
-        // A path that is nothing but separators, or a bare drive once trimmed (`C:` is
-        // drive-relative to cmd), cannot be embedded: no prelude, the plain shim.
-        for bad in ["C:\\", "\\", "/", "\\\\", "C:", "\\\\?\\C:\\"] {
-            assert_eq!(
-                cmd_landing_prelude("claude", Path::new(bad), marker, atpkg),
-                "",
-                "{bad}"
-            );
-            assert_eq!(
-                cmd_landing_prelude("claude", prefix, marker, Path::new(bad)),
-                "",
-                "{bad}"
-            );
-        }
-        assert_eq!(
-            cmd_embedded_path(Path::new("C:\\x\\pkg\\")),
-            Some("C:\\x\\pkg".into())
-        );
-        assert_eq!(
-            cmd_embedded_path(Path::new("\\\\srv\\share\\pkg\\")),
-            Some("\\\\srv\\share\\pkg".into())
-        );
-        assert_eq!(cmd_embedded_path(Path::new("C:\\")), None);
-        // The verbatim spelling `canonicalize` answers on Windows is embedded without its
-        // prefix (`if exist "\\?\C:\…"` is not a spelling cmd reliably accepts).
-        let verbatim = cmd_landing_prelude(
-            "claude",
-            Path::new("\\\\?\\C:\\Program Files (x86)\\aterm\\pkg"),
-            Path::new("\\\\?\\C:\\Program Files (x86)\\aterm\\pkg\\landing\\claude"),
-            Path::new("\\\\?\\C:\\Program Files (x86)\\aterm\\app\\atpkg.exe"),
-        );
-        assert_eq!(verbatim, prelude);
-        assert!(!verbatim.contains("\\\\?\\"));
+        // The verbatim spelling `canonicalize` answers on Windows loses its prefix before
+        // any path is embedded in a `.cmd` (the pending stub's too).
         assert_eq!(
             strip_verbatim_prefix(Path::new("\\\\?\\UNC\\srv\\share\\aterm\\atpkg.exe")),
             PathBuf::from("\\\\srv\\share\\aterm\\atpkg.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new("\\\\?\\C:\\aterm\\atpkg.exe")),
+            PathBuf::from("C:\\aterm\\atpkg.exe")
         );
         assert_eq!(
             strip_verbatim_prefix(Path::new("/usr/local/aterm/atpkg")),
@@ -1557,56 +1387,23 @@ mod tests {
         assert_eq!(read_cmd_shim_target(&path), Some(target.to_path_buf()));
         assert_eq!(read_cmd_shim_env(&path), env);
         std::fs::remove_dir_all(root).unwrap();
-        // Fail-closed: a path that could break out of `"…"` or expand renders NO
-        // prelude — the plain shim runs the store build; nothing injectable is written.
-        for bad in [
-            "C:\\x\\\"&calc.exe\"\\landing\\claude",
-            "C:\\x\\%APPDATA%\\landing\\claude",
-            "C:\\x\\landing\\claude\r\n@calc",
-        ] {
-            assert_eq!(
-                cmd_landing_prelude("claude", prefix, Path::new(bad), atpkg),
-                ""
-            );
-            assert_eq!(
-                cmd_landing_prelude("claude", Path::new(bad), marker, atpkg),
-                ""
-            );
-            assert_eq!(
-                cmd_landing_prelude("claude", prefix, marker, Path::new(bad)),
-                ""
-            );
-        }
-        assert_eq!(cmd_landing_prelude("cla%ude", prefix, marker, atpkg), "");
-        // The per-platform dispatch hands each backend its own dialect.
-        let dispatched = landing_prelude("claude", prefix, marker, atpkg);
-        if cfg!(windows) {
-            assert_eq!(dispatched, prelude);
-        } else {
-            assert_eq!(
-                dispatched,
-                sh_landing_prelude("claude", prefix, marker, atpkg)
-            );
-        }
     }
 
-    /// THE `.cmd` TWIN IS UNCHANGED BY THE SELF-UPDATE INTERCEPT (2026-09-19, TARGET):
-    /// [`cmd_selfupdate_prelude`] answers the empty string on every input — a verb list of
-    /// any shape, an injection-shaped path — so the composed prelude is byte for byte the
-    /// landing prelude pinned above, the count assertions of that test hold over the
-    /// composed twin, no `%~1` and no `__selfupdate` reach a batch line, and on the Windows
-    /// arm [`twin_prelude`] IS [`cmd_landing_prelude`]. The renderers are called directly,
+    /// THE `.cmd` TWIN RENDERS NO PRELUDE (Phase 2, 2026-09-22): [`cmd_selfupdate_prelude`]
+    /// answers the empty string on every input (2026-09-19, TARGET) — a verb list of any
+    /// shape, an injection-shaped path — and the landing prelude is no longer composed
+    /// after it, so [`twin_prelude`]'s Windows arm is empty and the `.cmd` twin is the
+    /// framed `.cmd` shim byte for byte: no `%~1`, no `__selfupdate`, no `__landing`, one
+    /// forward ending its batch on its own line. Until 2026-09-22 this test pinned the
+    /// composed prelude equal to the landing prelude. The renderers are called directly,
     /// cfg-free, so this pins the Windows bytes from the Unix suite like every `.cmd` test.
     #[test]
-    fn the_cmd_twin_is_unchanged_by_the_self_update_intercept() {
+    fn the_cmd_twin_renders_no_prelude_and_is_the_plain_framed_shim() {
         let prefix = Path::new("C:\\Program Files (x86)\\aterm\\pkg");
-        let marker = Path::new("C:\\Program Files (x86)\\aterm\\pkg\\landing\\claude");
         let atpkg = Path::new("C:\\Program Files (x86)\\aterm\\app\\atpkg.exe");
         let target = Path::new(
             "C:\\Program Files (x86)\\aterm\\pkg\\store\\claude\\2026091601\\bin\\claude.exe",
         );
-        let landing = cmd_landing_prelude("claude", prefix, marker, atpkg);
-        assert!(!landing.is_empty());
         for verbs in [
             &[][..],
             &["update"],
@@ -1620,9 +1417,6 @@ mod tests {
                 "",
                 "{verbs:?}"
             );
-            let mut composed = cmd_selfupdate_prelude("claude", prefix, atpkg, verbs);
-            composed.push_str(&landing);
-            assert_eq!(composed, landing, "{verbs:?}");
         }
         assert_eq!(
             cmd_selfupdate_prelude(
@@ -1639,26 +1433,24 @@ mod tests {
         );
         if cfg!(windows) {
             assert_eq!(
-                twin_prelude(
-                    "claude",
-                    prefix,
-                    marker,
-                    atpkg,
-                    &["update", "upgrade", "install"]
-                ),
-                landing,
-                "on Windows the whole prelude is the landing prelude"
+                twin_prelude("claude", prefix, atpkg, &["update", "upgrade", "install"]),
+                "",
+                "on Windows the twin carries no prelude"
             );
         }
         let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
-        let mut prelude = cmd_selfupdate_prelude("claude", prefix, atpkg, &["update"]);
-        prelude.push_str(&landing);
+        let prelude = cmd_selfupdate_prelude("claude", prefix, atpkg, &["update"]);
         let twin = cmd_shim_content_twin(target, &env, &prelude);
-        assert_eq!(twin, cmd_shim_content_twin(target, &env, &landing));
-        assert_eq!(twin.matches(" & @exit /b").count(), 2, "{twin}");
+        assert_eq!(
+            twin,
+            cmd_shim_content_env(target, &env),
+            "the plain framed shim"
+        );
+        assert_eq!(twin.matches(" & @exit /b").count(), 1, "{twin}");
         assert_eq!(twin.matches("\r\n@exit /b\r\n").count(), 1, "{twin}");
         assert!(!twin.contains("%~1"), "{twin}");
         assert!(!twin.contains(crate::selfupdate::HIDDEN_VERB), "{twin}");
+        assert!(!twin.contains(crate::landing::HIDDEN_VERB), "{twin}");
         assert_eq!(parse_cmd_shim_target(&twin), Some(target.to_path_buf()));
         assert_eq!(parse_cmd_shim_env(&twin), env);
     }
@@ -2095,7 +1887,7 @@ mod sh_shim_tests {
             body,
             "#!/bin/sh\n\
              # atpkg shim — exec so the tool authenticates at its real path.\n\
-             # shim_env from the signed manifest: only this managed copy runs with it.\n\
+             # shim_env is aterm's policy for this program: only this managed copy runs with it.\n\
              export DISABLE_AUTOUPDATER='1'\n\
              export B='it'\\''s two words'\n\
              exec '/prefix/store/claude/2026082701/bin/claude' \"$@\"\n"
@@ -2217,7 +2009,7 @@ mod sh_shim_tests {
             body,
             "#!/bin/sh\n\
              # atpkg shim — exec so the tool authenticates at its real path.\n\
-             # shim_env from the signed manifest: only this managed copy runs with it.\n\
+             # shim_env is aterm's policy for this program: only this managed copy runs with it.\n\
              export DISABLE_AUTOUPDATER='1'\n\
              # atpkg exec root: this build ships bin/rustc as a separate copy of trustc, which \
              its tippy refuses; the same tools run from a clone of the build where rustc holds \
@@ -2380,15 +2172,15 @@ mod sh_shim_tests {
     /// and `"$@"` verbatim, `;;`, `esac`. Empty for an empty verb list, for a verb that
     /// would break the `case` pattern, for a program with a quote in it and for a name the
     /// tool-name gate refuses; a quote in the prefix or the atpkg path is POSIX-escaped in
-    /// every slot. [`twin_prelude`] is this block and then the landing prelude, in that
-    /// order, and the whole twin still reads as before: exactly one literal `exec '` line
-    /// (the store target), no `export ` in either block, the target and the env parse back,
-    /// no pending-stub marker, the block ahead of the exports, and the `bin/` shim carries
-    /// none of it.
+    /// every slot. On Unix [`twin_prelude`] IS this block — no landing prelude after it
+    /// since Phase 2 (2026-09-22, [`crate::landing`]; this test pinned the block followed
+    /// by the landing prelude until then) — and the whole twin still reads as before:
+    /// exactly one literal `exec '` line (the store target), no `export `, the target and
+    /// the env parse back, no pending-stub marker, the block ahead of the exports, and the
+    /// `bin/` shim carries none of it.
     #[test]
-    fn the_self_update_block_is_exact_precedes_the_landing_block_and_breaks_no_reader() {
+    fn the_self_update_block_is_exact_is_the_whole_prelude_and_breaks_no_reader() {
         let prefix = Path::new("/Users//u/Library/Application Support/aterm/pkg");
-        let marker = Path::new("/Users//u/Library/Application Support/aterm/pkg/landing/claude");
         let atpkg = Path::new("/Applications/aterm.app/Contents/MacOS/atpkg");
         let target = Path::new(
             "/Users//u/Library/Application Support/aterm/pkg/store/claude/2026091902/bin/claude",
@@ -2398,8 +2190,8 @@ mod sh_shim_tests {
         assert_eq!(
             block,
             "# atpkg agents twin: `claude update|upgrade|install` is answered by `atpkg \
-             __selfupdate` — aterm's package manager keeps this copy at the vendor's latest \
-             through the signed index (aterm help pkg).\n\
+             __selfupdate` — aterm updates this copy from its vendor and verifies every build \
+             here (aterm help pkg).\n\
              case \"$1\" in\n\
              \x20 update|upgrade|install)\n\
              \x20   __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'\n\
@@ -2412,9 +2204,9 @@ mod sh_shim_tests {
             sh_selfupdate_prelude("codex", prefix, atpkg, crate::selfupdate::verbs_of("codex"));
         assert_eq!(
             codex,
-            "# atpkg agents twin: `codex update` is answered by `atpkg __selfupdate` — aterm's \
-             package manager keeps this copy at the vendor's latest through the signed index \
-             (aterm help pkg).\n\
+            "# atpkg agents twin: `codex update` is answered by `atpkg __selfupdate` — aterm \
+             updates this copy from its vendor and verifies every build here (aterm help \
+             pkg).\n\
              case \"$1\" in\n\
              \x20 update)\n\
              \x20   __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'\n\
@@ -2469,27 +2261,20 @@ mod sh_shim_tests {
             "{quoted}"
         );
         assert!(!quoted.contains("/it's/"), "{quoted}");
-        // The whole prelude: the block, then the landing prelude, in that order.
-        let landing = sh_landing_prelude("claude", prefix, marker, atpkg);
-        let mut want = block.clone();
-        want.push_str(&landing);
-        let twin_pre = twin_prelude("claude", prefix, marker, atpkg, verbs);
+        // The whole prelude is the block: no landing check, no marker, no `__landing`.
+        let want = block.clone();
+        let twin_pre = twin_prelude("claude", prefix, atpkg, verbs);
         if cfg!(windows) {
-            assert_eq!(
-                twin_pre,
-                cmd_landing_prelude("claude", prefix, marker, atpkg)
-            );
+            assert_eq!(twin_pre, "", "the .cmd twin renders no prelude");
         } else {
             assert_eq!(twin_pre, want);
         }
-        assert!(
-            want.find("case \"$1\" in").unwrap() < want.find("while a newer build").unwrap(),
-            "the block precedes the landing note: {want}"
-        );
+        assert!(!want.contains(crate::landing::HIDDEN_VERB), "{want}");
+        assert!(!want.contains("landing"), "{want}");
         assert_eq!(
-            twin_prelude("claude", prefix, marker, atpkg, &[]),
-            landing_prelude("claude", prefix, marker, atpkg),
-            "no verbs: the landing-only twin, byte for byte"
+            twin_prelude("claude", prefix, atpkg, &[]),
+            "",
+            "no verbs: no prelude — the twin is the plain shim"
         );
         // The full twin, read by every parser as before.
         let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();

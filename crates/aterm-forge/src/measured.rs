@@ -640,6 +640,26 @@ pub struct Baseline {
 //     the crate did not touch this file, and the six baseline tests were red
 //     at origin/main from its merge until this note.
 //
+// RE-MEASURED 2026-09-23 — `aterm-messages` ENTERED EVERY NATIVE CELL, one
+//     workspace crate and nothing else. The unified message system
+//     (docs/DESIGN-unified-messages-2026-09-21.md) put its platform-neutral
+//     model — the message center, the band's width law, the log codec — in
+//     `crates/aterm-messages`, and `aterm-gui` depends on it, so every cell
+//     that ships the window moves by one. Measured with `cargo forge survey`
+//     over all six native cells on this tree, not inferred from the edge:
+//
+//       mac-arm   122 -> 123 resolved, 75 -> 76 workspace
+//       linux     272 -> 273, 77 -> 78
+//       win       162 -> 163, 71 -> 72
+//       mac-x64, linux-arm, win-arm: identical to their siblings, as always
+//
+//     Nothing else moves by a line on any cell: the crate's only dependency is
+//     `aterm-time` (already in every graph), so third-party packages, LOC,
+//     build scripts, proc macros and duplicate names all stand, and
+//     `tools/forge-budget.tsv`, which ratchets only those, does not move. The
+//     browser modules never reach `aterm-gui`, so [`WASM_CPU`] and
+//     [`WASM_GPU`] are untouched.
+//
 // RE-MEASURED 2026-09-15 — THE winit FORK GREW BY 610 LINES, and nothing else
 //     moved anywhere. Two commits landed in `vendor/winit` after the round-13
 //     re-pin (dd444ac8b, the commit these constants were last measured at), and
@@ -740,8 +760,8 @@ pub struct Baseline {
 //     column.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 122,
-    workspace: 75,
+    resolved: 123,
+    workspace: 76,
     third_party: 47,
     third_party_loc: 441_498,
     build_scripts: 10,
@@ -751,8 +771,8 @@ pub const MAC_ARM: Baseline = Baseline {
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 272,
-    workspace: 77,
+    resolved: 273,
+    workspace: 78,
     third_party: 195,
     third_party_loc: 2_789_707,
     build_scripts: 32,
@@ -762,8 +782,8 @@ pub const LINUX: Baseline = Baseline {
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 162,
-    workspace: 71,
+    resolved: 163,
+    workspace: 72,
     third_party: 91,
     third_party_loc: 3_588_067,
     build_scripts: 19,
@@ -841,8 +861,8 @@ pub const WASM_GPU: Baseline = Baseline {
 /// every field.
 pub const MAC_X64: Baseline = Baseline {
     cell: "mac-x64",
-    resolved: 122,
-    workspace: 75,
+    resolved: 123,
+    workspace: 76,
     third_party: 47,
     third_party_loc: 441_498,
     build_scripts: 10,
@@ -854,8 +874,8 @@ pub const MAC_X64: Baseline = Baseline {
 /// Identical to [`LINUX`] in every field.
 pub const LINUX_ARM: Baseline = Baseline {
     cell: "linux-arm",
-    resolved: 272,
-    workspace: 77,
+    resolved: 273,
+    workspace: 78,
     third_party: 195,
     third_party_loc: 2_789_707,
     build_scripts: 32,
@@ -867,8 +887,8 @@ pub const LINUX_ARM: Baseline = Baseline {
 /// ARM64 host. Identical to [`WIN`] in every field.
 pub const WIN_ARM: Baseline = Baseline {
     cell: "win-arm",
-    resolved: 162,
-    workspace: 71,
+    resolved: 163,
+    workspace: 72,
     third_party: 91,
     third_party_loc: 3_588_067,
     build_scripts: 19,

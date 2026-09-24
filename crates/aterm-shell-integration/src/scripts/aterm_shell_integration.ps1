@@ -101,7 +101,7 @@ __aterm_reroute_path_front
 # hook ~/.aterm/shell.d/00-atpkg.ps1 (crates/atpkg/src/hooks.rs) dot-sourced when
 # $env:ATPKG_AGENTS is unset or its LastWriteTimeUtc moved since it was last
 # sourced (a .NET call, no process), $env:ATERM_REROUTE_DIR derived as the
-# sibling <dir of ATPKG_AGENTS>/reroute unless ATERM_NO_REROUTE is engaged
+# sibling <dir of ATPKG_AGENTS>/reroute unless __ATERM_REROUTE_PASSTHROUGH is engaged
 # (non-empty and not '0'), a dir that was absent when the front was last laid
 # re-probed until it appears, and PATH re-fronted only when its head is not
 # already reroute, agents. Gated on being inside an aterm session (ATERM_CHILD=1 or
@@ -116,7 +116,7 @@ if ($Global:__aterm_managed_live -and $env:ATPKG_AGENTS -and $Global:__aterm_atp
 
 function Global:__aterm_managed_derive_reroute {
     if ($env:ATERM_REROUTE_DIR -or -not $env:ATPKG_AGENTS) { return }
-    if ($env:ATERM_NO_REROUTE -and ($env:ATERM_NO_REROUTE -ne '0')) { return }
+    if ($env:__ATERM_REROUTE_PASSTHROUGH -and ($env:__ATERM_REROUTE_PASSTHROUGH -ne '0')) { return }
     $__aterm_parent = Split-Path -Parent $env:ATPKG_AGENTS
     if (-not $__aterm_parent) { return }
     $__aterm_dir = Join-Path $__aterm_parent 'reroute'

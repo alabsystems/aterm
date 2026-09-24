@@ -155,8 +155,8 @@ pub(crate) const OUTBOX_BYTES_MAX: usize = 4 * 1024 * 1024;
 /// caller and the endpoint MEET on, and it is enforced where the reply is built
 /// so no caller can disagree with it. Sized at one session's full queue: large
 /// enough that the common case (a handful of sessions, small bodies) is still one
-/// round trip, and the drain is resumed by the bridge's next idle tick because
-/// `outbox` retires nothing.
+/// round trip, and a partial drain is resumed by the bridge's two-second roster
+/// backstop because `outbox` retires nothing.
 const OUTBOX_DRAIN_BYTES_MAX: usize = OUTBOX_BYTES_MAX;
 
 /// How many RETIRED posts (landed or undeliverable) a session keeps after the
@@ -183,13 +183,23 @@ const DEDUP_CAP: usize = 2 * RING_CAP;
 /// for a human, not a document.
 const REASON_MAX: usize = 128;
 
-/// The five session-timeline record kinds the fabric writes, which are ALSO their
+/// The seven session-timeline record kinds the fabric writes, which are ALSO their
 /// wire names on the `events` digest (`EVENT <local> inbox <id> …`). One list, read
 /// by `subscribe`'s `timeline_wire_kind`, so the recorder and the digest cannot
 /// disagree about which rows leave the process. NONE of them carries a body — that
-/// is the discipline the digest exists to keep.
-pub(crate) const FABRIC_EVENT_KINDS: &[&str] =
-    &["inbox", "inbox-seen", "post", "post-landed", "hold"];
+/// is the discipline the digest exists to keep. `topic` is the endpoint telling
+/// its bridge a broadcast opt-in moved (`topic add <t> since=<s>` / `topic drop
+/// <t>`), on the lane the bridge already holds, so it acts at once instead of
+/// sampling `topic ls` on a timer.
+pub(crate) const FABRIC_EVENT_KINDS: &[&str] = &[
+    "inbox",
+    "inbox-seen",
+    "post",
+    "fetch",
+    "post-landed",
+    "hold",
+    "topic",
+];
 
 /// The `events` wire name for a timeline record kind the fabric wrote, or `None`.
 pub(crate) fn fabric_event_wire_kind(kind: &str) -> Option<&'static str> {
@@ -229,13 +239,10 @@ pub(crate) const KINDS: &[&str] = &[
 /// only `task` and `control` — so it lands in a peer's inbox undemoted, as
 /// itself, and the peer abandons a request that is still in flight.
 ///
-/// The file plane already had this right, and said why (`POSTABLE` in
-/// `aterm-link/src/mirror.rs`: "`expired` and `undeliverable` are verdicts a
-/// bridge records, never something a sender may claim"); this is the socket
-/// plane's half of the same rule, and it is what [`POST_USAGE`] and the `post`
-/// verb row have said all along. `post_may_not_claim_a_verdict_a_bridge_records`
-/// pins the difference, so a kind added to `deliver` cannot silently become
-/// postable.
+/// `expired` and `undeliverable` are verdicts a bridge records, never something
+/// a sender may claim — what [`POST_USAGE`] and the `post` verb row have said all
+/// along. `post_may_not_claim_a_verdict_a_bridge_records` pins the difference, so
+/// a kind added to `deliver` cannot silently become postable.
 const POSTABLE: &[&str] = &["ask", "answer", "task", "report", "note", "ack", "control"];
 
 /// The trust labels the RECEIVING bridge computes (§4.3) — the endpoint stores
@@ -255,8 +262,8 @@ const VERDICTS: &[&str] = &["handled", "refused", "deferred"];
 
 /// How many `inbox get @<off>` reads one session may have PARKED for the
 /// bridge at once, and how long one waits. The bridge answers each with one
-/// bounded `Fetch` on its next drain (the idle tick, 250 ms; the roster
-/// backstop, 2 s, under load), so ten seconds is a hang detector, never a
+/// bounded `Fetch` on its next drain (prompted by the `fetch` timeline event,
+/// with the two-second roster round as a backstop), so ten seconds is a hang detector, never a
 /// synchronisation sleep — and a slot is one offset and one bounded body.
 const FETCH_SLOTS: usize = 8;
 const FETCH_WAIT_MS: u64 = 10_000;
@@ -540,7 +547,7 @@ impl PostRow {
     /// different, quieter kind of wrong answer. The rule is "every field a caller
     /// can make big", not "every field".
     ///
-    /// `to` IS in that second list ONLY BECAUSE [`cmd_post`] BOUNDS IT. It is a
+    /// `to` IS in that second list ONLY BECAUSE [`cmd_post_waking`] BOUNDS IT. It is a
     /// caller-typed token like the other two, and its grammar check used to
     /// begin `to.trim_start_matches('@')` — which strips a RUN of `@`, so
     /// `@@@…@s-b` validated as `s-b` and was stored, and retired, verbatim. See
@@ -551,7 +558,7 @@ impl PostRow {
 }
 
 /// [`PostRow::caller_sized_bytes`] BEFORE THE ROW EXISTS — the same fold, over
-/// the same two fields, for the post [`cmd_post`] is deciding whether to admit.
+/// the same two fields, for the post [`cmd_post_waking`] is deciding whether to admit.
 ///
 /// ONE FUNCTION BECAUSE IT IS ONE QUANTITY. The door and the fold are the two
 /// ends of [`OUTBOX_BYTES_MAX`], and they were computing different numbers: the
@@ -811,16 +818,12 @@ impl Inbox {
 }
 
 /// ONE BROADCAST OPT-IN as the session holds it: what the caller asked to
-/// resume from, and which `topic add` it was.
+/// resume from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TopicEntry {
     /// The `since=` TOKEN the add carried: `head` or `@<off>`. An intent, not
     /// a position — only the bridge knows where the bus is.
     pub since: String,
-    /// The add's per-session serial, printed as `serial=` on the `topic ls` row.
-    /// The bridge keys its cursor on (topic, serial), so a `drop` and an `add`
-    /// under the same name are two entries and the second's `since=` is read.
-    pub serial: u64,
 }
 
 /// The per-session fabric state, hung on [`crate::SessionCtx`].
@@ -830,7 +833,7 @@ pub(crate) struct TopicEntry {
 /// append to the ring in one order and record their `EVENT`s in the other. The
 /// condvar is signalled under the same guard, which is what makes `await inbox`
 /// and `post --wait` event-driven instead of polled — no sleep anywhere in this
-/// module.
+/// module. `topics` nests the same way ([`SessionFabric::topic_add`]).
 #[derive(Default)]
 pub struct SessionFabric {
     inbox: Mutex<Inbox>,
@@ -851,25 +854,18 @@ pub struct SessionFabric {
     /// that did not want it. Empty by default, and an empty set receives
     /// NOTHING.
     ///
-    /// Its own lock, not the ring's: the bridge reads it on every roster round
-    /// and the ring is a leaf taken under `deliver`, so sharing one would put a
-    /// poll in the path of every delivery.
+    /// Its own lock, not the ring's: the bridge reads it (`topic ls`) once per
+    /// session and after a `GAP`, and the ring is a leaf taken under `deliver`,
+    /// so sharing one would put that read in the path of every delivery. The
+    /// `topic` timeline record is written under this lock, so two connections
+    /// cannot change the set in one order and record it in the other.
     /// Keyed by topic, valued by the `since=` TOKEN the add asked for (`head`
-    /// or `@<off>`) and the SERIAL of the add that created it — the bridge
-    /// resolves the token to an offset once, when it first learns the entry,
-    /// and remembers that resolution in its own state, so a bridge restart
-    /// resumes the topic instead of re-reading `head`.
-    ///
-    /// The serial is what makes `drop` then `add` work: the bridge keys its
-    /// cursor on (topic, serial), so a re-add is a new entry even inside one
-    /// roster round.
+    /// or `@<off>`) — the bridge resolves the token to an offset once, when it
+    /// first learns the entry, and remembers that resolution in its own state,
+    /// so a bridge restart resumes the topic instead of re-reading `head`.
+    /// Every change is pushed to the bridge as a `topic` event, so a `drop`
+    /// then an `add` are two events in order and the second's `since=` is read.
     topics: Mutex<std::collections::BTreeMap<String, TopicEntry>>,
-    /// The next `topic add` serial for this session. Monotone for the
-    /// session's life, never reused, and not persisted: the bridge compares it
-    /// with what it last sampled, so the only property it needs is that a new
-    /// add never looks like an old one within one bridge's memory. A restart
-    /// of either side re-resolves from the `since=` token anyway.
-    topic_serial: std::sync::atomic::AtomicU64,
 }
 
 impl SessionFabric {
@@ -914,8 +910,8 @@ impl SessionFabric {
         }
     }
 
-    /// The topics this session opted into with each one's `since=` token and
-    /// add serial, in topic order.
+    /// The topics this session opted into with each one's `since=` token, in
+    /// topic order.
     pub(crate) fn topics(&self) -> Vec<(String, TopicEntry)> {
         self.topics
             .lock()
@@ -933,7 +929,15 @@ impl SessionFabric {
     /// delivered from it: re-arming `since=@0` on a topic already running would
     /// replay the whole backlog into a ring that has already seen it. `drop`
     /// then `add` is how a caller asks for that on purpose.
-    pub(crate) fn topic_add(&self, t: &str, since: &str) -> bool {
+    ///
+    /// A change is recorded on `timeline` under the topics lock — the push the
+    /// bridge acts on, in the order the set changed.
+    pub(crate) fn topic_add(
+        &self,
+        t: &str,
+        since: &str,
+        timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    ) -> bool {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         // `entry`, not `insert`: `insert` REPLACES, so a repeated
         // `topic add t since=@0` would rewind a running topic to the start of
@@ -944,38 +948,38 @@ impl SessionFabric {
             added = true;
             TopicEntry {
                 since: since.to_string(),
-                // STAMPED UNDER THE SAME LOCK the map is taken under, so two
-                // adds racing on one session cannot be handed one serial.
-                serial: self
-                    .topic_serial
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    .wrapping_add(1),
             }
         });
+        if added {
+            timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record("topic", format!("add {t} since={since}"));
+        }
         added
     }
 
-    /// Drop a topic. `true` when it was there.
-    pub(crate) fn topic_drop(&self, t: &str) -> bool {
-        self.topics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(t)
-            .is_some()
+    /// Drop a topic. `true` when it was there; recorded like [`Self::topic_add`].
+    pub(crate) fn topic_drop(
+        &self,
+        t: &str,
+        timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    ) -> bool {
+        let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
+        let dropped = set.remove(t).is_some();
+        if dropped {
+            timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record("topic", format!("drop {t}"));
+        }
+        dropped
     }
 
     /// Replace the whole set — the handoff's carry, and nothing else.
-    ///
-    /// The serial counter is moved past every carried entry, so the first
-    /// `topic add` in the adopted session cannot mint a serial a carried entry
-    /// already wears — which would make a genuinely new entry look to the
-    /// bridge like the one it is holding a cursor for.
     pub(crate) fn set_topics(&self, topics: impl IntoIterator<Item = (String, TopicEntry)>) {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         *set = topics.into_iter().collect();
-        let high = set.values().map(|e| e.serial).max().unwrap_or(0);
-        self.topic_serial
-            .fetch_max(high, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// This session's PTY idempotency marks (A6).
@@ -2235,7 +2239,7 @@ pub(crate) fn is_topic(t: &str) -> bool {
 /// sentence into a `from=` field an agent reads as identity. On the OUTBOUND side
 /// a sender DOES choose `to=` and `via=`, and this is the whole grammar those are
 /// held to.
-fn valid_principal(p: &str) -> bool {
+pub(crate) fn valid_principal(p: &str) -> bool {
     let ok_one = |s: &str| {
         let mut it = s.splitn(2, '-');
         let (Some(class), Some(name)) = (it.next(), it.next()) else {
@@ -3177,8 +3181,8 @@ pub(crate) fn cmd_outbox_verb(store: &Store, rest: &str) -> String {
 /// the trade [`PostRow::body`] says this verb pair exists to refuse.
 /// [`OUTBOX_DRAIN_BYTES_MAX`] now stops the walk, and A PARTIAL DRAIN IS SAFE
 /// PRECISELY BECAUSE THIS IS A PEEK: nothing was retired, the remaining posts are
-/// still queued in the same order, and the bridge's idle tick calls `outbox`
-/// again. The bound is enforced HERE, where the reply is built, rather than by
+/// still queued in the same order, and the bridge's two-second roster backstop
+/// calls `outbox` again. The bound is enforced HERE, where the reply is built, rather than by
 /// asking every caller to remember a number — the two sides of a bound must meet
 /// in one place.
 pub(crate) fn cmd_outbox(store: &Store, rest: &str) -> String {
@@ -3509,30 +3513,29 @@ fn evict_for(inbox: &mut Inbox) {
 ///
 /// Owner scope: adding a topic changes what reaches an agent's inbox, which is
 /// the same authority class as the halt, not a read.
-pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> String {
+///
+/// Returns the reply and whether the set changed — the caller's cue to wake
+/// the session's `events` watchers for the record just written.
+pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> (String, bool) {
     let mut words = rest.split_whitespace();
     match words.next() {
         Some("ls") | None => {
             if words.next().is_some() {
-                return TOPIC_USAGE.to_string();
+                return (TOPIC_USAGE.to_string(), false);
             }
             let topics = ctx.fabric.topics();
             let mut out = format!("OK {}\n", topics.len());
             for (t, e) in topics {
-                // `serial=` is the add's serial, for the bridge's cursor key.
-                out.push_str(&format!(
-                    "topic {t} since={} serial={}\n",
-                    e.since, e.serial
-                ));
+                out.push_str(&format!("topic {t} since={}\n", e.since));
             }
-            out
+            (out, false)
         }
         Some("add") => {
             let Some(t) = words.next() else {
-                return TOPIC_USAGE.to_string();
+                return (TOPIC_USAGE.to_string(), false);
             };
             if !is_topic(t) {
-                return TOPIC_USAGE.to_string();
+                return (TOPIC_USAGE.to_string(), false);
             }
             let since = match words.next() {
                 None => "head".to_string(),
@@ -3540,28 +3543,34 @@ pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> String {
                 // validator, so the two cannot disagree about what `@+5` is.
                 Some(tok) => match tok.strip_prefix("since=") {
                     Some(v) if valid_since(v) => v.to_string(),
-                    _ => return TOPIC_USAGE.to_string(),
+                    _ => return (TOPIC_USAGE.to_string(), false),
                 },
             };
             if words.next().is_some() {
-                return TOPIC_USAGE.to_string();
+                return (TOPIC_USAGE.to_string(), false);
             }
-            let added = ctx.fabric.topic_add(t, &since);
+            // THE BRIDGE HEARS IT NOW, on the event lane it already holds:
+            // nothing on the bus announces the change — the set is this
+            // endpoint's, and only its bridge needs it.
+            let added = ctx.fabric.topic_add(t, &since, &ctx.timeline);
             ctx.fabric.changed.notify_all();
-            format!("OK {t} since={since} added={}\n", u8::from(added))
+            (
+                format!("OK {t} since={since} added={}\n", u8::from(added)),
+                added,
+            )
         }
         Some("drop") => {
             let Some(t) = words.next() else {
-                return TOPIC_USAGE.to_string();
+                return (TOPIC_USAGE.to_string(), false);
             };
             if words.next().is_some() || !is_topic(t) {
-                return TOPIC_USAGE.to_string();
+                return (TOPIC_USAGE.to_string(), false);
             }
-            let dropped = ctx.fabric.topic_drop(t);
+            let dropped = ctx.fabric.topic_drop(t, &ctx.timeline);
             ctx.fabric.changed.notify_all();
-            format!("OK {t} dropped={}\n", u8::from(dropped))
+            (format!("OK {t} dropped={}\n", u8::from(dropped)), dropped)
         }
-        Some(_) => TOPIC_USAGE.to_string(),
+        Some(_) => (TOPIC_USAGE.to_string(), false),
     }
 }
 
@@ -3570,7 +3579,7 @@ pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> String {
 pub(crate) fn render_topics(topics: &[(String, TopicEntry)]) -> Vec<String> {
     topics
         .iter()
-        .map(|(t, e)| format!("{t} {} {}", e.since, e.serial))
+        .map(|(t, e)| format!("{t} {}", e.since))
         .collect()
 }
 
@@ -3588,13 +3597,13 @@ pub(crate) fn parse_topics(rows: &[String]) -> Vec<(String, TopicEntry)> {
             let mut words = row.split(' ');
             let t = words.next()?;
             let since = words.next()?;
-            // A two-field row is what a build before the serial wrote; it
-            // reads as generation 0, which is stable, so a carry through a
-            // downgrade does not look to the bridge like a fresh add.
-            let serial = match words.next() {
-                Some(g) => g.parse().ok()?,
-                None => 0,
-            };
+            // A 0.90.x manifest carried a third field (the add serial that
+            // release keyed on); it is read past and dropped.
+            if let Some(extra) = words.next()
+                && (extra.is_empty() || !extra.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return None;
+            }
             if words.next().is_some() || !is_topic(t) || !valid_since(since) {
                 return None;
             }
@@ -3602,7 +3611,6 @@ pub(crate) fn parse_topics(rows: &[String]) -> Vec<(String, TopicEntry)> {
                 t.to_string(),
                 TopicEntry {
                     since: since.to_string(),
-                    serial,
                 },
             ))
         })
@@ -3873,7 +3881,7 @@ pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
 ///
 /// THE ENDPOINT HAS NO BUS ACCESS — that is its point — so the read is
 /// PARKED: a `fetch sid=<sid> off=<n>` line rides the bridge's next `outbox`
-/// peek (the idle tick, 250 ms; the roster backstop under load), the bridge
+/// peek (prompted by the `fetch` event, with the roster round as a backstop), the bridge
 /// answers with `deliver <sid> fetched=<off> …` after one bounded `Fetch` on
 /// THIS session's own lane, and the wait wakes on the condvar every other
 /// parked verb uses. The bridge's filter is the authority on "yours": another
@@ -3922,6 +3930,13 @@ fn inbox_get_at(ctx: &SessionCtx, off: u64) -> String {
                 return format!("ERR busy: {FETCH_SLOTS} reads already parked\n");
             }
             inbox.fetches.push_back((off, FetchSlot::Pending));
+            // The bridge's idle outbox poll is gone. A parked fetch is work
+            // owed now, so announce it through the same push lane that wakes
+            // posts and receipts. The roster round still finds a lost event.
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record("fetch", format!("off={off}"));
         }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(FETCH_WAIT_MS);
@@ -3992,9 +4007,9 @@ fn fetch_failure(why: &str, off: u64) -> String {
 /// side effect. `listed` is what the per-peer quota counts and what makes a row
 /// the first eviction candidate, so acknowledging a row also RELEASES its
 /// sender's quota and lets the ring drop it. Without this, an agent that reads
-/// through a `--peek` listing — the file-plane mirror does exactly that, and
-/// never runs a bare `inbox` — could acknowledge all of its mail and still be
-/// refused the next message with `ERR quota` forever. The `inbox seen` verb row
+/// only through `--peek` listings and never runs a bare `inbox` could
+/// acknowledge all of its mail and still be refused the next message with
+/// `ERR quota` forever. The `inbox seen` verb row
 /// says so; a change here that stopped touching `listed` would silently reinstate
 /// that deadlock, so `an_ack_releases_the_senders_quota` pins it.
 ///
@@ -4109,7 +4124,19 @@ const WAIT_MAX_MS: u64 = 600_000;
 ///
 /// `body` is `Some` only for the length-prefixed frame form, whose bytes the
 /// serve loop has already read off the stream.
-pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> String {
+///
+/// `wake` runs once for an accepted post, right after its `post` timeline
+/// record and BEFORE any `--wait` parks: the control seam passes the session's
+/// subscriber notify (`meta`'s and `topic`'s rule), so the push lane's `EVENT
+/// <sid> post` — the bridge's prompt trigger to drain the outbox — leaves now
+/// rather than on the push loop's 250 ms tick. After the wait would be too
+/// late: a `--wait` post is waiting for exactly the drain that trigger starts.
+pub(crate) fn cmd_post_waking(
+    ctx: &SessionCtx,
+    rest: &str,
+    body: Option<Vec<u8>>,
+    wake: &dyn Fn(),
+) -> String {
     let mut to: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut re: Option<u64> = None;
@@ -4323,6 +4350,7 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     note_work_owed();
     ctx.fabric.changed.notify_all();
     crate::presence::post_fabric_changed(&ctx.self_id);
+    wake();
 
     let Some(wait) = wait else {
         return format!("OK {id}\n");
@@ -4359,6 +4387,13 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     }
     .min(WAIT_MAX_MS);
     wait_receipt(ctx, id, off, dup, bound)
+}
+
+/// [`cmd_post_waking`] with nothing to wake — the unit tests' spelling. A
+/// production seam must name its wake, so this exists only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> String {
+    cmd_post_waking(ctx, rest, body, &|| {})
 }
 
 /// Park until the post `id` LANDS: `Ok((off, " dup=1" | ""))`, or the reply to
@@ -4700,39 +4735,39 @@ mod topic_tests {
     /// for under a name nobody typed.
     #[test]
     fn the_carry_round_trips_and_a_malformed_row_invents_nothing() {
-        let entry = |since: &str, serial: u64| TopicEntry {
+        let entry = |since: &str| TopicEntry {
             since: since.to_string(),
-            serial,
         };
         let live = vec![
-            ("build.failed".to_string(), entry("head", 7)),
-            ("sat-comp".to_string(), entry("@42", 9)),
+            ("build.failed".to_string(), entry("head")),
+            ("sat-comp".to_string(), entry("@42")),
         ];
         let wire = render_topics(&live);
-        assert_eq!(wire, ["build.failed head 7", "sat-comp @42 9"]);
+        assert_eq!(wire, ["build.failed head", "sat-comp @42"]);
         assert_eq!(parse_topics(&wire), live);
-        // A two-field row from a build before the serial reads as generation 0.
+        // A 0.90.x manifest's third field (that release's add serial) is read
+        // past.
         assert_eq!(
-            parse_topics(&["old.topic @3".to_string()]),
-            vec![("old.topic".to_string(), entry("@3", 0))]
+            parse_topics(&["old.topic @3 7".to_string()]),
+            vec![("old.topic".to_string(), entry("@3"))]
         );
 
         let hostile: Vec<String> = [
-            "Build head",          // not a topic
-            "a/b head",            // a subject segment
-            "ok yesterday",        // not a `since` token
-            "ok @notanumber",      // nor is this
-            "ok @+5",              // an offset has no sign
-            "ok head x",           // a serial that is not a number
-            "noseparator",         // no `since` at all
-            "build.failed head 2", // …and one good row, so the drop is selective
+            "Build head",        // not a topic
+            "a/b head",          // a subject segment
+            "ok yesterday",      // not a `since` token
+            "ok @notanumber",    // nor is this
+            "ok @+5",            // an offset has no sign
+            "ok head x",         // a third field that is not a number
+            "noseparator",       // no `since` at all
+            "build.failed head", // …and one good row, so the drop is selective
         ]
         .iter()
         .map(|s| (*s).to_string())
         .collect();
         assert_eq!(
             parse_topics(&hostile),
-            vec![("build.failed".to_string(), entry("head", 2))],
+            vec![("build.failed".to_string(), entry("head"))],
         );
     }
 }
@@ -6696,6 +6731,75 @@ mod inbox_hold {
         });
     }
 
+    /// **AN ACCEPTED POST WAKES ITS WATCHERS ONCE, BEFORE ITS `--wait` PARKS;
+    /// A REFUSED ONE NEVER.** The control seam's `wake` is the session's
+    /// subscriber notify, and the bridge's push lane is one of those
+    /// subscribers: `EVENT <sid> post` is what makes it drain the outbox. A
+    /// wake that came after the wait would come after the landing the wait is
+    /// waiting for, so the parked post here receives its wake while it is still
+    /// parked, and only then is its landing reported.
+    #[test]
+    fn an_accepted_post_wakes_before_its_wait_parks_and_a_refused_one_never() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            let wakes = AtomicUsize::new(0);
+            let count = || {
+                wakes.fetch_add(1, Ordering::SeqCst);
+            };
+            assert!(
+                cmd_post_waking(&ctx, "to=@s-b kind=shout hi", None, &count)
+                    .starts_with("ERR usage")
+            );
+            assert_eq!(
+                wakes.load(Ordering::SeqCst),
+                0,
+                "a refused post wakes nobody"
+            );
+            assert_eq!(
+                cmd_post_waking(&ctx, "to=h-andrew kind=note hi", None, &count),
+                "OK 1\n"
+            );
+            assert_eq!(
+                wakes.load(Ordering::SeqCst),
+                1,
+                "an accepted post wakes once"
+            );
+
+            let (woke, heard) = std::sync::mpsc::channel();
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post_waking(
+                        &ctx,
+                        "to=h-andrew kind=task --wait=30000 ship it",
+                        None,
+                        &move || {
+                            let _ = woke.send(());
+                        },
+                    )
+                })
+            };
+            // Inside the wait's own life: an unanswered post turns the link
+            // `stale` at STALE_AFTER, which ends a parked wait — so a wake that
+            // came only after the wait would come only after that.
+            heard
+                .recv_timeout(STALE_AFTER / 2)
+                .expect("the wake arrives while the post's wait is parked");
+            assert!(
+                !poster.is_finished(),
+                "nothing has landed, so the post is still parked in its wait"
+            );
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} landed=2 off=42")),
+                "OK\n"
+            );
+            assert_eq!(poster.join().expect("the poster finished"), "OK 2 off=42\n");
+        });
+    }
+
     /// **`post key=` IS BOUNDED AT THE DOOR, RIDES EVERY `outbox` DRAIN, AND A
     /// `dup=1` RETIREMENT REACHES THE PARKED WAIT AS `OK <id> off=<n> dup=1`.**
     ///
@@ -6881,7 +6985,8 @@ mod inbox_hold {
                 .map(|e| (e.kind.to_string(), e.payload.clone()))
                 .collect();
             // The lifecycle kinds a registered session already records (`spawned`)
-            // are not this test's subject; the FABRIC five are, in order.
+            // are not this test's subject; the FABRIC kinds this scenario writes
+            // are, in order (`topic` is written by `cmd_topic`, not here).
             let kinds: Vec<&str> = events
                 .iter()
                 .map(|(k, _)| k.as_str())
@@ -6890,7 +6995,7 @@ mod inbox_hold {
             assert_eq!(
                 kinds,
                 ["inbox", "inbox-seen", "post", "post-landed", "hold"],
-                "the five fabric kinds, in the order they happened"
+                "the fabric kinds this scenario writes, in the order they happened"
             );
             for (kind, payload) in &events {
                 assert!(
@@ -8526,11 +8631,10 @@ mod inbox_hold {
     /// AN ACK RELEASES THE SENDER'S QUOTA, which is why `inbox seen` lists the
     /// rows at or below its argument as well as advancing the handled watermark.
     ///
-    /// Undocumented until now, and LOAD-BEARING: the file-plane mirror lists with
-    /// `--peek` and never runs a bare `inbox`, so this side of `inbox seen` is the
-    /// only thing that keeps a mirrored session reachable past its 64th message.
-    /// A change that (reasonably, per the old help) stopped touching `listed`
-    /// would reinstate that deadlock silently.
+    /// LOAD-BEARING: a reader that lists only with `--peek` and never runs a bare
+    /// `inbox` is kept reachable past its 64th message by this side of `inbox
+    /// seen` alone. A change that stopped touching `listed` would reinstate that
+    /// deadlock silently.
     #[test]
     fn an_ack_releases_the_senders_quota() {
         let store = new_store();
@@ -8543,7 +8647,7 @@ mod inbox_hold {
             "ERR quota\n",
             "the quota is full"
         );
-        // A PEEK moves nothing — the mirror's listing shape.
+        // A PEEK moves nothing.
         cmd_inbox(&ctx, "--peek");
         assert_eq!(
             deliver(&store, &sid, 101, "s-p@n-peer", "note", "x"),
@@ -8841,9 +8945,9 @@ mod inbox_hold {
             ("hover", "toggles the drop-target highlight"),
             (
                 "appnotice",
-                "posts a text row on the pull-down status bars (chrome, not the \
-                 grid); it puts no bytes on a PTY and retires no session, and it is \
-                 Owner-only at the socket besides",
+                "posts a text row on the pull-down status bars, or a note to their \
+                 record (chrome, not the grid); it puts no bytes on a PTY and retires \
+                 no session, and it is Owner-only at the socket besides",
             ),
             (
                 "story",

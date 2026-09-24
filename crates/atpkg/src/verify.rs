@@ -11,6 +11,11 @@
 //! what was signed — it is NEVER a self-generated `files.sha256` (aterm-pkg's dropped
 //! mistake). Read-only: no parse path, no filesystem mutation.
 //!
+//! A vendor-direct build is attested by its `.vendor` record instead, and a vendor program
+//! rolled back to the legacy index build its first vendor install replaced — whose row
+//! that install overwrote — by the signed root the program's stamp kept for that build.
+//! Neither asks an index.
+//!
 //! `status.toml` shares the store's trust boundary (both under the 0700 hardened prefix), so
 //! `verify` defends against accidental corruption / non-privileged drift, NOT against an
 //! adversary who already owns the prefix (they could rewrite both). A future
@@ -63,6 +68,16 @@ pub enum VerifyOutcome {
         /// The active build.
         build: u64,
     },
+    /// A vendor-direct build, attested against the root folded when it was staged from its
+    /// vendor's authenticated digest (its `.vendor` record) — no index signed this root.
+    VendorRoot {
+        /// The active build audited.
+        build: u64,
+        /// Who published it (`Anthropic`).
+        vendor: String,
+        /// `None` when the tree matches; the recomputed root when it drifted.
+        drift: Option<String>,
+    },
     /// The active build differs from the build the recorded root is for (e.g. post-rollback),
     /// so the recorded root cannot attest the live tree.
     BuildMismatch {
@@ -77,7 +92,8 @@ pub enum VerifyOutcome {
 /// Fail-closed, IN ORDER: not-installed ⇒ [`VerifyOutcome::NotInstalled`]; no recorded root ⇒
 /// [`VerifyOutcome::NoSignedRoot`] (NOT a pass); recorded root is for a different build ⇒
 /// [`VerifyOutcome::BuildMismatch`]; then recompute + compare (case-insensitive, mirroring
-/// the install-time re-verify).
+/// the install-time re-verify). A vendor program's legacy build the row does not attest is
+/// judged against the root its stamp kept for it ([`kept_legacy_root`]) before those two.
 #[must_use]
 pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     let active = crate::ops::active_builds(layout).get(program).copied();
@@ -89,6 +105,16 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     let Some(build) = active else {
         return VerifyOutcome::NotInstalled;
     };
+    if crate::vendor_direct::is_vendor_build(build) {
+        return verify_vendor_build(layout, program, build);
+    }
+    // A vendor program's retained legacy build, once the recorded row no longer carries
+    // its root: the signed root the program's stamp kept for exactly that build.
+    let (recorded_build, recorded_root) =
+        match kept_legacy_root(layout, program, build, recorded_build, &recorded_root) {
+            Some(root) => (Some(build), root),
+            None => (recorded_build, recorded_root),
+        };
     // No signed record means no assurance: fail closed. A source-build provenance
     // sidecar used to be consulted here first, reporting a lower-assurance
     // SourceBuilt outcome; the source-build lane is gone, so an unsigned build is
@@ -121,6 +147,43 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
             build,
             expected: recorded_root,
             got,
+        },
+        Err(e) => VerifyOutcome::Unreadable {
+            build,
+            error: e.to_string(),
+        },
+    }
+}
+
+/// The signed root a vendor program's stamp kept for its legacy index `build`, when the
+/// recorded row does not attest that build itself; `None` for every other program.
+fn kept_legacy_root(
+    layout: &Layout,
+    program: &str,
+    build: u64,
+    recorded_build: Option<u64>,
+    recorded_root: &str,
+) -> Option<String> {
+    if recorded_build == Some(build) && !recorded_root.is_empty() {
+        return None;
+    }
+    crate::vendor_direct::ProgramStamp::read(layout, program)?
+        .legacy_root_of(build)
+        .map(str::to_string)
+}
+
+/// A vendor-direct build against its `.vendor` record's root; no record beside a complete
+/// build means no assurance ([`VerifyOutcome::NoSignedRoot`]).
+fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutcome {
+    let build_dir = layout.build_dir(program, build);
+    let Some(record) = crate::vendor_direct::complete_record(&build_dir) else {
+        return VerifyOutcome::NoSignedRoot { build: Some(build) };
+    };
+    match crate::tree::tree_root(&build_dir) {
+        Ok(got) => VerifyOutcome::VendorRoot {
+            build,
+            vendor: record.vendor,
+            drift: (!got.eq_ignore_ascii_case(&record.tree_root)).then_some(got),
         },
         Err(e) => VerifyOutcome::Unreadable {
             build,
@@ -235,6 +298,57 @@ mod tests {
             !matches!(o, VerifyOutcome::Match { .. }),
             "empty root is fail-closed, not a pass"
         );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A vendor program rolled back to the legacy index build its first vendor install
+    /// replaced: the row names another build (or that build with no root), and the root its
+    /// stamp kept for exactly that build attests it — a match, and drift when the tree moves.
+    /// A root kept for another legacy build attests nothing.
+    #[test]
+    fn a_vendor_programs_legacy_build_is_attested_by_its_kept_root() {
+        let l = layout("legacy-kept");
+        let legacy = 2_026_091_901;
+        let dir = install(&l, "claude", legacy);
+        let root = crate::tree::tree_root(&dir).unwrap();
+        let vendor = crate::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        record(&l, "claude", Some(vendor), &"b".repeat(64));
+        assert_eq!(
+            verify_program(&l, "claude"),
+            VerifyOutcome::BuildMismatch {
+                active: legacy,
+                recorded: Some(vendor)
+            },
+            "nothing kept: the row cannot attest the legacy build"
+        );
+        crate::vendor_direct::ProgramStamp::record_legacy_root(&l, "claude", legacy - 1, &root)
+            .unwrap();
+        assert!(
+            matches!(
+                verify_program(&l, "claude"),
+                VerifyOutcome::BuildMismatch { .. }
+            ),
+            "a root kept for another build attests nothing"
+        );
+        crate::vendor_direct::ProgramStamp::record_legacy_root(&l, "claude", legacy, &root)
+            .unwrap();
+        assert_eq!(
+            verify_program(&l, "claude"),
+            VerifyOutcome::Match { build: legacy }
+        );
+        record(&l, "claude", Some(legacy), "");
+        assert_eq!(
+            verify_program(&l, "claude"),
+            VerifyOutcome::Match { build: legacy },
+            "a rollback row recorded with no root"
+        );
+        std::fs::write(dir.join("bin/claude"), b"tampered").unwrap();
+        assert!(matches!(
+            verify_program(&l, "claude"),
+            VerifyOutcome::Drift { build, .. } if build == legacy
+        ));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

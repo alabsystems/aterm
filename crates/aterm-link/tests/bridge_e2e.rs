@@ -103,8 +103,8 @@ fn a_task_from_an_unlisted_principal_arrives_demoted() {
 
     // THE STRANGER IS AN AGENT, not a human. `--accept-from` is the allowlist
     // for principals a node has no other reason to trust; a HUMAN principal is
-    // accepted beside whatever it lists (§6.6 row 1, §8.4's `h-*`), exactly as
-    // `hook::accepted` has always had it, so a human could never have been the
+    // accepted beside whatever it lists (§6.6 row 1, §8.4's `h-*`), so a human
+    // could never have been the
     // subject of this test. See `r1_bridge_wound.rs` for the human's half.
     let mut god = w.god();
     for (who, text) in [("a-stranger", "unlisted"), ("a-orchestrator", "listed")] {

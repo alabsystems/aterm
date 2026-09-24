@@ -14,8 +14,8 @@
 //! must stay gone. A bystander of our shape under a live pid must survive the same pass —
 //! stopping it would widen the sweep.
 //!
-//! Its own test binary, for `orphan_lane_sweep.rs`'s reason: the fixture is a launchd job
-//! with a dead owner pid, and every sweep here stops exactly those. macOS only.
+//! Its own test binary, for `orphan_lane_sweep.rs`'s reason: the fixture becomes a launchd
+//! job with a dead owner pid, and every sweep here stops exactly those. macOS only.
 
 #![cfg(target_os = "macos")]
 
@@ -52,16 +52,39 @@ fn fake_store(prefix: &Path, build: u64) -> PathBuf {
     dir
 }
 
-/// A pid nothing runs under (macOS pids stay below 99999), found without spawning: a
-/// fork here would hand the child a copy of every fd this binary holds open.
-fn a_dead_pid() -> u32 {
-    (90_000..99_999u32)
-        .rev()
-        .find(|pid| {
-            let rc = unsafe { libc::kill(*pid as libc::pid_t, 0) };
-            rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        })
-        .expect("some pid below 99999 is unused")
+/// The pid the orphan's label and scratch carry: a child of ours, ALIVE while the fixture
+/// is armed and DEAD, reaped, once the helper is proven writing. Every atpkg on this
+/// machine stops a dead-owner job it finds — a parallel suite's sweep, this machine's own
+/// passes — so an orphan registered under a pid that was already dead could be stopped
+/// before it wrote anything (measured: "never started writing", 2026-09-23). While the
+/// owner lives the job is nobody's to stop; its death is the moment it becomes the orphan
+/// under test.
+struct Owner(std::process::Child);
+
+impl Owner {
+    fn spawn() -> Self {
+        Self(
+            Command::new("/bin/sleep")
+                .arg("600")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("/bin/sleep runs"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+/// Killed and reaped: from here `kill(pid, 0)` answers ESRCH, as for a killed pass.
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Whether launchd still lists `label`.
@@ -88,8 +111,10 @@ fn a_launchd_helper_outliving_a_killed_view_pass_is_stopped_before_its_debris_is
 
     // The orphan: the debris of a view pass that is gone, with a launchd job still writing
     // into it. The label carries the view lane's own shape (`view-helper` is one of
-    // `JOB_STEMS`) under a pid that does not exist — what a killed pass leaves registered.
-    let dead = a_dead_pid();
+    // `JOB_STEMS`) under the pid of an owner that dies before the refresh — what a killed
+    // pass leaves registered.
+    let owner = Owner::spawn();
+    let dead = owner.pid();
     let me = std::process::id();
     let debris = view.join(format!(".bin.old-{dead}"));
     let label = format!("systems.alab.atpkg.view-helper-{dead}-0-{me:x}");
@@ -121,6 +146,8 @@ fn a_launchd_helper_outliving_a_killed_view_pass_is_stopped_before_its_debris_is
         std::thread::sleep(Duration::from_millis(50));
     }
     let was_writing = debris.join("bin").join("trustc").exists();
+    // Its owner dies only now, with the helper proven writing: the orphan from here on.
+    drop(owner);
 
     // The successor: a refresh whose view already matches, so `sweep_view_debris` is the
     // whole of what it does.

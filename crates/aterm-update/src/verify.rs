@@ -316,9 +316,9 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
         return Err(format!("no executable at {}", exe.display()));
     }
     let out = output_bounded(
-        Command::new(&exe)
-            .arg("--version")
-            .env("ATERM_NO_AUTO_UPDATE", "1"),
+        // `--version` answers before any lane starts, so the candidate never reaches
+        // its updater: no switch is needed to keep the probe inert.
+        Command::new(&exe).arg("--version"),
         "candidate --version probe",
     )?;
     if !out.status.success() {
@@ -354,6 +354,29 @@ pub fn probe_bundle_starts(_app: &Path, _expected_build: u64) -> Result<(), Stri
     Ok(())
 }
 
+/// Whichever ceiling binds first: a helper's own [`HELPER_TIMEOUT`], or what is left of
+/// the apply's aggregate budget; `true` when the budget is the one that binds. Outside an
+/// apply there is no budget and the helper timeout stands alone.
+fn helper_deadline() -> (Instant, bool) {
+    let own = Instant::now() + HELPER_TIMEOUT;
+    match APPLY_DEADLINE.with(|d| d.get()) {
+        Some(b) if b < own => (b, true),
+        _ => (own, false),
+    }
+}
+
+/// The rejection a helper that outran [`helper_deadline`] reports.
+fn timed_out(what: &str, bound_by_budget: bool) -> String {
+    if bound_by_budget {
+        format!("{what} ran past this apply's verification budget; treating as a rejection")
+    } else {
+        format!(
+            "{what} did not finish within {}s; treating as a rejection",
+            HELPER_TIMEOUT.as_secs()
+        )
+    }
+}
+
 fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
     use std::process::Stdio;
     let mut child = cmd
@@ -362,15 +385,7 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn {what}: {e}"))?;
-    // Whichever ceiling binds first: this helper's own, or what is left of the
-    // apply's aggregate budget. Outside an apply there is no budget and the
-    // helper timeout stands alone, exactly as before.
-    let own = Instant::now() + HELPER_TIMEOUT;
-    let budget = APPLY_DEADLINE.with(|d| d.get());
-    let (deadline, bound_by_budget) = match budget {
-        Some(b) if b < own => (b, true),
-        _ => (own, false),
-    };
+    let (deadline, bound_by_budget) = helper_deadline();
     let mut poll = HELPER_POLL_MIN;
     loop {
         match child.try_wait() {
@@ -381,17 +396,7 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
                     // holding the bundle open across the swap.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(if bound_by_budget {
-                        format!(
-                            "{what} ran past this apply's verification budget; \
-                             treating as a rejection"
-                        )
-                    } else {
-                        format!(
-                            "{what} did not finish within {}s; treating as a rejection",
-                            HELPER_TIMEOUT.as_secs()
-                        )
-                    });
+                    return Err(timed_out(what, bound_by_budget));
                 }
                 // Clamp the sleep to the remaining budget so the 30s ceiling
                 // stays exact, then back off toward the steady-state tick.
@@ -543,45 +548,29 @@ pub fn bundle_git_commit(app: &Path) -> Result<String, String> {
 }
 
 /// `codesign --verify --deep --strict` PLUS a `-R` designated requirement that pins
-/// the **Apple anchor + Developer-ID chain + our Team ID**. The requirement makes
-/// codesign itself reject anything not signed by a genuine Apple-issued Developer-ID
-/// Application cert whose Team (OU) equals `expected_team` — the authenticity anchor
-/// no longer rests solely on `spctl`/Gatekeeper, which a Gatekeeper-disabled machine
-/// turns into a no-op (F1). Without this, `--verify` only proves the seal is
-/// internally consistent, so a self-signed bundle with a spoofed `TeamIdentifier`
-/// string would pass. Fails CLOSED on any codesign error.
+/// the **Apple anchor + Developer-ID chain + our Team ID** — the one requirement text,
+/// [`aterm_update_core::codesign`]. The requirement makes codesign itself reject anything
+/// not signed by a genuine Apple-issued Developer-ID Application cert whose Team (OU)
+/// equals `expected_team`, so the authenticity anchor does not rest solely on
+/// `spctl`/Gatekeeper, which a Gatekeeper-disabled machine turns into a no-op (F1).
+/// Fails CLOSED on any codesign error, bounded like every helper here.
 fn codesign_verify(app: &Path, expected_team: &str) -> Result<(), String> {
-    // The team is our compiled-in pin (10 alnum chars). Refuse to build a requirement
-    // from a non-alphanumeric value — both a fail-closed guard for an unset/garbage pin
-    // and a defense against injecting `"`/metacharacters into the requirement text.
-    if expected_team.is_empty() || !expected_team.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return Err(format!(
-            "refusing to verify: pinned team id {expected_team:?} is not alphanumeric"
-        ));
-    }
-    // Apple's Developer-ID designated requirement, team-pinned. Leading `=` marks the
-    // argument as inline requirement source text (not a file). The two marker OIDs are
-    // the Developer-ID intermediate CA (…6.2.6) and the Developer-ID Application leaf
-    // (…6.1.13); `anchor apple generic` requires the chain to Apple's root.
-    let req = format!(
-        "=anchor apple generic \
-         and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
-         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
-         and certificate leaf[subject.OU] = \"{expected_team}\""
-    );
-    let out = output_bounded(
-        Command::new("/usr/bin/codesign")
-            .args(["--verify", "--deep", "--strict", "--verbose=2", "-R", &req])
-            .arg(app),
-        "codesign --verify (team-pinned)",
-    )?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    use aterm_update_core::codesign::{CodesignError, verify_developer_id_until};
+    const WHAT: &str = "codesign --verify (team-pinned)";
+    let (deadline, bound_by_budget) = helper_deadline();
+    match verify_developer_id_until(app, expected_team, true, deadline) {
+        Ok(()) => Ok(()),
+        Err(CodesignError::InvalidTeam(team)) => Err(format!(
+            "refusing to verify: pinned team id {team:?} is not alphanumeric"
+        )),
+        Err(CodesignError::Refused { stderr, .. }) => Err(format!(
             "codesign --verify (team-pinned requirement) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+            stderr.trim()
+        )),
+        Err(CodesignError::TimedOut) => Err(timed_out(WHAT, bound_by_budget)),
+        Err(CodesignError::Spawn(e)) => Err(format!("spawn {WHAT}: {e}")),
+        Err(CodesignError::Wait(e)) => Err(format!("wait for {WHAT}: {e}")),
+        Err(e @ CodesignError::Unsupported) => Err(format!("{WHAT}: {e}")),
     }
 }
 
@@ -901,5 +890,25 @@ mod tests {
         // no line at all → reject (not silently accept).
         assert!(parse_team_id("Identifier=com.aterm.aterm\n").is_err());
         assert!(parse_team_id("TeamIdentifier=\n").is_err());
+    }
+
+    /// The shared requirement kept this gate's own sentences: a garbage pin is refused by
+    /// name before anything runs, and a bundle of another signer is refused with
+    /// codesign's words under the team-pinned prefix.
+    #[test]
+    fn codesign_verify_keeps_its_refusal_wording() {
+        assert_eq!(
+            codesign_verify(Path::new("/nonexistent"), "AB\"CD").unwrap_err(),
+            "refusing to verify: pinned team id \"AB\\\"CD\" is not alphanumeric"
+        );
+        let refused = codesign_verify(Path::new("/bin/ls"), "ABCDE12345").unwrap_err();
+        assert!(
+            refused.starts_with("codesign --verify (team-pinned requirement) failed: "),
+            "{refused}"
+        );
+        assert!(
+            refused.ends_with("failed to satisfy specified code requirement(s)"),
+            "{refused}"
+        );
     }
 }

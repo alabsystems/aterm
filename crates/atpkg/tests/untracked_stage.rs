@@ -6,9 +6,9 @@
 //! the hidden verb answers through the result file
 //! with the same `tree_root` the in-process lane folds over the same bytes; the whole
 //! launchd round trip lays down an identical tree; a helper that cannot speak the verb
-//! is detected inside the exit grace and leaves the destination empty for the caller's
-//! policy to act on (an in-process stage, recorded, by default; a refusal under
-//! `ATPKG_REFUSE_TRACKED_INSTALL=1`); a tagged BUNDLE executable — the shipped app's
+//! is detected inside the exit grace and leaves the destination empty for the caller to
+//! stage in-process and clear the tag (`atpkg::provenance::heal`); a tagged BUNDLE
+//! executable — the shipped app's
 //! shape — serves BOTH hidden verbs from a whole-bundle fixture; and — when the test
 //! process happens
 //! to be provenance-tracked, which is the case that matters and the one this lane exists
@@ -37,6 +37,19 @@ use atpkg::stage_helper::{
 // artifact lock; an explicit test override names the artifact actually exercised.
 #[path = "../../aterm-conformance/tests/support/mod.rs"]
 mod current_artifact;
+
+/// Every test here that prepares a launchd job SWEEPS dead-pid `systems.alab.atpkg.*`
+/// labels as it does (`Job::prepare`), and the orphan test's label is dead by design: run
+/// beside it, any other test's prepare can remove the orphan before the fixture ever sees
+/// it listed ("the fixture never stood", two gate runs on 2026-09-23/24). So the orphan
+/// test holds this exclusively and every other test shares it.
+static LAUNCHD_JOBS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn shared_jobs() -> std::sync::RwLockReadGuard<'static, ()> {
+    LAUNCHD_JOBS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn current_aterm_exe() -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -141,6 +154,7 @@ fn helper_exe() -> PathBuf {
 /// in-process lane folds; the spec it read decodes to what was encoded.
 #[test]
 fn the_hidden_verb_answers_with_the_in_process_root() {
+    let _jobs = shared_jobs();
     let d = scratch("verb");
     let archive = bundle_archive(&d);
     let reference = d.join("reference");
@@ -182,6 +196,7 @@ fn the_hidden_verb_answers_with_the_in_process_root() {
 /// tracked test process writes tagged files, the launchd job writes clean ones.
 #[test]
 fn the_launchd_lane_lays_an_identical_tree_and_a_clean_one_when_the_caller_is_tracked() {
+    let _jobs = shared_jobs();
     let d = scratch("lane");
     let archive = bundle_archive(&d);
     let reference = d.join("reference");
@@ -264,6 +279,7 @@ fn the_launchd_lane_lays_an_identical_tree_and_a_clean_one_when_the_caller_is_tr
 /// it in-process and records the fact; a refusal removes it).
 #[test]
 fn a_helper_that_cannot_answer_is_detected_and_the_destination_is_left_empty() {
+    let _jobs = shared_jobs();
     let d = scratch("noanswer");
     let archive = bundle_archive(&d);
     let dest = d.join("incoming");
@@ -338,6 +354,7 @@ fn launchd_cat(src: &Path, dst: &Path, dir: &Path) {
 /// hand, so this test says which case it exercised.
 #[test]
 fn the_helper_runs_in_place_when_clean_and_is_copied_when_tagged() {
+    let _jobs = shared_jobs();
     let d = scratch("plan");
     let exe = helper_exe();
     let tagged = carries_provenance(&exe);
@@ -392,6 +409,7 @@ fn the_helper_runs_in_place_when_clean_and_is_copied_when_tagged() {
 /// 2026-09-13). The destination is left empty for the caller's policy.
 #[test]
 fn a_helper_killed_at_exec_is_reported_by_its_signal() {
+    let _jobs = shared_jobs();
     use std::os::unix::fs::PermissionsExt as _;
     let d = scratch("killed");
     let archive = bundle_archive(&d);
@@ -426,6 +444,9 @@ fn a_helper_killed_at_exec_is_reported_by_its_signal() {
 /// removes it.
 #[test]
 fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
+    let _exclusive = LAUNCHD_JOBS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let d = scratch("sweep");
     // A pid nothing runs under. macOS pids stay below 99999, but under a full test
     // sweep's process churn a fixed 99998 WAS alive once (2026-09-18: the one red in an
@@ -509,6 +530,7 @@ fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
 /// install.
 #[test]
 fn the_current_one_binary_bundle_serves_both_hidden_verbs() {
+    let _jobs = shared_jobs();
     let current = current_aterm_exe();
     let d = scratch("bundle-copy");
     let bundle = d.join("fake.app");
@@ -578,8 +600,9 @@ fn the_current_one_binary_bundle_serves_both_hidden_verbs() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// The shipped app itself, when it is installed on this Mac and carries the tag — which a
-/// self-updated or browser-downloaded `aterm.app` does — is the helper: the lane runs its
+/// The shipped app itself, when it is installed on this Mac and tainted — the tag on the
+/// executable or on the bundle directory (an app placed by a tracked v0.86.0–v0.89.0 updater
+/// has the second), or the quarantine attribute of a browser download — is the helper: the lane runs its
 /// hidden verb from a copy of the whole notarized bundle (the copy keeps its seal; a lone
 /// copy of the executable is killed at exec) and the file it lays is CLEAN. This is the
 /// measurement of 2026-09-14 kept as an OPT-IN installed-artifact smoke, separate
@@ -594,15 +617,23 @@ fn the_current_one_binary_bundle_serves_both_hidden_verbs() {
 #[test]
 #[ignore = "installed tagged/notarized artifact smoke; current-source coverage runs above"]
 fn the_shipped_app_bundle_when_tagged_lays_clean_files_from_a_whole_bundle_copy() {
+    let _jobs = shared_jobs();
     let app = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
     assert!(
         app.is_file(),
         "installed-artifact smoke requires {}",
         app.display()
     );
+    // An app placed by a tracked v0.86.0–v0.89.0 updater has a CLEAN executable under a
+    // stamped bundle directory, so asking the executable alone failed this precondition on exactly
+    // the shape the smoke exists for. The precondition is now the plan's own question.
     assert!(
-        carries_provenance(app),
-        "installed-artifact smoke requires a tagged bundle at {}; the tag cannot be minted by hand",
+        atpkg::provenance::provenance_carrier(app)
+            .expect("the installed app can be inspected")
+            .is_some()
+            || atpkg::provenance::quarantined_carrier(app).is_some(),
+        "installed-artifact smoke requires a tainted app at {} (the tag or the quarantine \
+         attribute on the executable or its bundle); the tag cannot be minted by hand",
         app.display()
     );
     let d = scratch("shipped-app");

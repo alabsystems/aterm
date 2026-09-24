@@ -165,7 +165,7 @@ pub enum MenuAction {
     /// details. Replaces the old floating top-right badge as the primary version surface.
     Version,
     /// ONE-CLICK UPDATE (`App::apply_update_or_details`): the Version menu's
-    /// "⬆️ Update to v<staged> — apply now, shells keep running" item / the palette's
+    /// "⬆️ Install aterm v<staged> now" item / the palette's
     /// Version row / the
     /// "Update ready" notice pill / the off-macOS tab-strip ↻ all fire this. A
     /// strictly-newer STAGED build applies immediately (the same re-exec path
@@ -294,6 +294,11 @@ pub enum MenuAction {
     /// The app-menu Packages… item beneath Settings… — the menu-bar path to the
     /// same page the seed notice pill points at.
     Packages,
+    /// Open Settings AT the Messages route (docs/DESIGN-unified-messages-2026-09-21.md
+    /// §4): everything aterm told the person, newest first. The app-menu
+    /// Messages… item beneath Packages… — the menu-bar path to the page the
+    /// band's `Details ›` opens.
+    Messages,
     /// Toggle the own-rendered, cross-platform command PALETTE overlay
     /// (`App::toggle_palette`).
     OpenPalette,
@@ -469,6 +474,8 @@ impl MenuAction {
             MenuAction::SetRole => 66,
             MenuAction::TogglePresenceBand => 67,
             MenuAction::TogglePresenceRim => 68,
+            // Phase 2 of the unified message system (2026-09-22).
+            MenuAction::Messages => 69,
         }
     }
 
@@ -542,6 +549,7 @@ impl MenuAction {
             66 => MenuAction::SetRole,
             67 => MenuAction::TogglePresenceBand,
             68 => MenuAction::TogglePresenceRim,
+            69 => MenuAction::Messages,
             _ => return None,
         })
     }
@@ -746,6 +754,66 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
 #[cfg(test)]
 pub(crate) static MENU_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
+mod headless_os_ui_tests {
+    /// Every function in this file that parks the watchdog for a modal
+    /// (`park_modal`) or asks `NSWorkspace` to open something (`openURL:`)
+    /// consults [`super::os_ui_refused`] before it — a SOURCE pin, because the
+    /// refusal only bites in a real headless process on the main thread, which
+    /// a unit test cannot be. A new modal or open helper added without the
+    /// check fails here by name.
+    #[test]
+    fn every_modal_and_workspace_open_asks_the_headless_refusal_first() {
+        let src = include_str!("menu.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let is_fn = |l: &str| {
+            let t = l.trim_start();
+            t.starts_with("fn ") || t.starts_with("pub fn ") || t.starts_with("pub(crate) fn ")
+        };
+        let mut sites = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            // Spelled in pieces so this scan never matches its own needles — and
+            // split before `!(`, so the crate's selector census
+            // (aterm-objc tests/gui_sent_prototypes.rs) never reads one either.
+            let parks = code.contains(concat!("park_", "modal()"));
+            let opens = code.contains(concat!("sel", "!(openURL:)"));
+            if !(parks || opens) {
+                continue;
+            }
+            sites += 1;
+            let start = (0..i)
+                .rev()
+                .find(|&j| is_fn(lines[j]))
+                .unwrap_or_else(|| panic!("menu.rs:{}: no enclosing fn", i + 1));
+            let asked = lines[start..i].iter().any(|l| {
+                l.split("//")
+                    .next()
+                    .unwrap_or("")
+                    .contains(concat!("os_ui_", "refused("))
+            });
+            assert!(
+                asked,
+                "menu.rs:{}: `{}` presents OS UI without asking `os_ui_refused` first \
+                 (enclosing fn at menu.rs:{})",
+                i + 1,
+                line.trim(),
+                start + 1
+            );
+        }
+        // choose_local_file, confirm, notify park; open_in_workspace and its
+        // delayed twin open. Fewer means the scan went blind.
+        assert!(sites >= 5, "found only {sites} modal/open sites");
+    }
+
+    /// The refusal is off until `main_entry` marks the process headless — a
+    /// unit-test process never is, so windowed behaviour is untouched here.
+    #[test]
+    fn a_process_not_marked_headless_is_never_refused() {
+        assert!(!super::os_ui_refused("a probe"));
+    }
+}
+
 fn native_menu_action_enabled(action: MenuAction) -> bool {
     if matches!(action, MenuAction::RenameSession | MenuAction::SetRole)
         && !rename_surface_available()
@@ -831,11 +899,12 @@ impl MenuAction {
             | MenuAction::CopySessionId
             | MenuAction::CopyCwd => ClipboardWrite,
             // Durable `aterm.toml` writes / the security-knob config surface.
-            // `Packages` raises the SAME durable-config Settings tab as
-            // `ToggleSettings`, just at the /packages route — same fence.
+            // `Packages` and `Messages` raise the SAME durable-config Settings
+            // tab as `ToggleSettings`, just at their routes — same fence.
             MenuAction::Preferences
             | MenuAction::ToggleSettings
             | MenuAction::Packages
+            | MenuAction::Messages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
             // Gateway to every action + the staged-update re-exec twins.
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
@@ -993,6 +1062,7 @@ impl MenuAction {
             }
             MenuAction::ToggleSettings => "Open Settings.",
             MenuAction::Packages => "Open Settings at Packages: the ALab toolchain.",
+            MenuAction::Messages => "Open Settings at Messages: everything aterm told you.",
             MenuAction::OpenPalette => "Open the command palette: every command, by name.",
             MenuAction::CopySessionId => "Copy this session's id, the handle `aterm ctl` takes.",
             MenuAction::CopyCwd => "Copy this session's working directory.",
@@ -1089,6 +1159,7 @@ impl MenuAction {
             "ToggleSeriousMode" => Some(MenuAction::ToggleSeriousMode),
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "Packages" => Some(MenuAction::Packages),
+            "Messages" => Some(MenuAction::Messages),
             "RenameSession" => Some(MenuAction::RenameSession),
             "OpenPalette" => Some(MenuAction::OpenPalette),
             "Minimize" => Some(MenuAction::Minimize),
@@ -1234,6 +1305,14 @@ const APP_MENU: &[MenuEntry] = &[
     Item {
         label: "Packages…",
         action: MenuAction::Packages,
+        key: "",
+        mods: MenuMods::None,
+    },
+    // Settings at the /messages route — the log behind the message band
+    // (design §4.1); the band's `Details ›` opens the same page at an entry.
+    Item {
+        label: "Messages…",
+        action: MenuAction::Messages,
         key: "",
         mods: MenuMods::None,
     },
@@ -1643,7 +1722,7 @@ const HELP_MENU: &[MenuEntry] = &[Item {
 /// static model), then About.
 const VERSION_MENU: &[MenuEntry] = &[
     Item {
-        label: "↑ Update — apply now",
+        label: "↑ Install update now",
         action: MenuAction::ApplyUpdate,
         key: "",
         mods: MenuMods::None,
@@ -1660,7 +1739,7 @@ const VERSION_MENU: &[MenuEntry] = &[
 /// `attention` holds. The live caller ([`update_version_menu`]) sets `attention` for a
 /// STAGED update ONLY — the always-visible bar badge means "an update is waiting, act
 /// on it", so an apply that re-execs into that build clears it at once. The post-update
-/// REALIZED celebration is NOT a bar badge; it lives in the menu's "Updated to v… just
+/// REALIZED celebration is NOT a bar badge; it lives in the menu's "Updated to aterm v… just
 /// now" row and the transient LEVEL-UP notice / palette twin (self-dismissing after
 /// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]). The color emoji is safe HERE:
 /// AppKit renders NSMenu titles/items with the system font + Apple Color Emoji
@@ -1716,24 +1795,26 @@ pub(crate) fn version_menu_bar_title(attention: bool) -> String {
 /// So: name the version when it actually differs, and fall back to the build number
 /// — the thing the updater is really comparing — when it does not.
 ///
-/// # The tail is not always "apply now"
+/// # The words are the update row's (2026-09-23)
 ///
-/// The clean tail says what pressing the row does and what it costs: "apply now,
-/// shells keep running" — the apply is the in-session overlap handoff, which hands
-/// every window, tab, split and live shell to the successor, so the row never asks
-/// for a restart (it read "restart now" over exactly that mechanism until
-/// 2026-08-30).
+/// "Install aterm vX now": the verb the status bar's row uses ("Updating to aterm
+/// vX", "click to install"), so one update is described in one vocabulary on every
+/// surface. The install is the in-session overlap handoff, which hands every
+/// window, tab, split and live shell to the successor, so the row never asks for a
+/// restart (it read "restart now" over exactly that mechanism until 2026-08-30),
+/// and it no longer repeats "shells keep running" either — the row said it on every
+/// surface of one flow.
 ///
 /// `trouble` is the apply lane's standing failure for this exact build
-/// (`App::apply_trouble_for`). While one is present the call-to-action tail is
-/// REPLACED by [`crate::update_apply_trouble::ApplyTrouble::row_tail`], because a
-/// clean "apply now" beside a build that has already refused to start twice is an
-/// instruction the machine has no reason to believe. On 2026-08-21 this row read
-/// "⬆️ Update to v0.56.0 — restart now" for hours while `aterm ctl update status`
-/// carried `failing_applies=2` and the reason both attempts died — the whole defect,
-/// in one label. The tail still ends on what the row DOES, so a manual-only latch
-/// keeps "apply now to retry" and a scheduled retry says so instead of demanding
-/// an action that is already queued.
+/// (`App::apply_trouble_for`). While one is present the bare "now" is REPLACED by
+/// [`crate::update_apply_trouble::ApplyTrouble::row_tail`], because a clean "install
+/// now" beside a build that has already refused to start twice is an instruction
+/// the machine has no reason to believe. On 2026-08-21 this row read "⬆️ Update to
+/// v0.56.0 — restart now" for hours while `aterm ctl update status` carried
+/// `failing_applies=2` and the reason both attempts died — the whole defect, in one
+/// label. The tail still ends on what the row DOES, so a manual-only latch says
+/// "try again now" and a scheduled retry says it will, instead of demanding an
+/// action that is already on its way.
 #[must_use]
 pub(crate) fn staged_apply_label(
     arrow: &str,
@@ -1741,21 +1822,21 @@ pub(crate) fn staged_apply_label(
     version: &str,
     trouble: Option<&ApplyTrouble>,
 ) -> String {
-    let tail = trouble.map_or_else(
-        || "apply now, shells keep running".to_string(),
-        ApplyTrouble::row_tail,
-    );
-    if version == crate::build_info::version_display() {
-        format!("{arrow} Update to build {build} — {tail}")
+    let what = if version == crate::build_info::version_display() {
+        format!("build {build}")
     } else {
-        format!("{arrow} Update to v{version} — {tail}")
+        format!("aterm v{version}")
+    };
+    match trouble {
+        None => format!("{arrow} Install {what} now"),
+        Some(trouble) => format!("{arrow} Install {what} — {}", trouble.row_tail()),
     }
 }
 
 /// Whether the always-visible menu-bar Version arrow should show. It tracks a STAGED
 /// update ONLY (action needed) — deliberately NOT the post-update `realized`
 /// celebration. The celebration is carried by self-dismissing surfaces (the menu's
-/// "Updated to v… just now" row, the LEVEL-UP notice, the palette twin), so an apply
+/// "Updated to aterm v… just now" row, the LEVEL-UP notice, the palette twin), so an apply
 /// that re-execs into the staged build (`staged` → `None`) clears the persistent bar
 /// badge the instant it lands, instead of leaving an arrow up for the full realized
 /// TTL that reads as "the update never resolved".
@@ -1863,9 +1944,52 @@ fn chrome_lines_for(title: &str, entries: &[MenuEntry]) -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    MenuHandle, choose_local_file, confirm, defer_quit_for_terminate, install, notify,
-    open_help_url, update_version_menu,
+    MenuHandle, choose_local_file, confirm, confirm_owner, defer_quit_for_terminate, install,
+    notify, open_file_in_workspace, open_help_url, update_version_menu,
 };
+
+/// Whether this process was launched `--headless`, published ONCE by
+/// `main_entry` the moment the mode is decided ([`mark_process_headless`]).
+///
+/// A process-wide fact rather than an `App` field because the helpers that
+/// read it are free functions every subsystem calls, and because the fact it
+/// guards is process-wide too: a headless launch is `Prohibited`
+/// (`launch_posture` in `lib.rs`), so AppKit will not present a window for it
+/// at all. A modal it tried to run (`choose_local_file`, `confirm`, `notify`)
+/// would park the main thread in a nested run loop nothing can see or dismiss,
+/// and an `NSWorkspace` open (`open_in_workspace`: Open Log, Help, a Privacy
+/// pane) would bring ANOTHER app to the front — the focus theft the posture
+/// exists to stop, through a different door. Guarding here covers every caller,
+/// including ones written later; the per-caller guards (the palette's picker
+/// rows, the document-open path) stay as the honest "disabled" answer.
+static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that this process is headless. Called once, by `main_entry`.
+pub(crate) fn mark_process_headless() {
+    PROCESS_HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a helper about to present OS UI (a modal, or an open that fronts
+/// another app) must refuse because this process is headless — saying so on
+/// stderr, which is the only surface a headless instance has. Every such
+/// helper in the macOS module asks this FIRST; a unit test pins that.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn os_ui_refused(what: &str) -> bool {
+    let refused = PROCESS_HEADLESS.load(std::sync::atomic::Ordering::Relaxed);
+    if refused {
+        crate::logging::stderr_line!(
+            "aterm-gui: {what} needs a window; a headless instance presents no OS UI"
+        );
+    }
+    refused
+}
+
+/// Off macOS there is no NSWorkspace, and "Open Log" spawns nothing in its place: the
+/// Settings page names the file's path in the log's feedback instead. `false`.
+#[cfg(not(target_os = "macos"))]
+pub fn open_file_in_workspace(_path: &std::path::Path) -> bool {
+    false
+}
 
 /// Non-macOS no-op handle: there is no platform menu off macOS. Held by `App` in
 /// the same field on every target so the struct shape is platform-independent.
@@ -2338,14 +2462,14 @@ mod macos {
     /// sweep call (`App::refresh_version_menu`). `staged` is the strictly-newer
     /// `(build, version)` ready to apply; `realized` marks the freshly-updated arrow
     /// window. Rebuilding the submenu (rather than toggling item hidden-flags) keeps the
-    /// item set an exact function of the state — no stale "apply now" rows. Best-effort:
+    /// item set an exact function of the state — no stale "install now" rows. Best-effort:
     /// off the main thread it is a no-op (never a panic), like every AppKit helper here.
     ///
     /// The persistent MENU-BAR arrow tracks `staged` ONLY — it means "an update is
     /// waiting, act on it". After an apply re-execs into that build `staged` is `None`,
     /// so the bar arrow clears the instant the update lands (no 10-min lingering badge
     /// that reads as "the update never resolved"). The freshly-REALIZED celebration
-    /// still lives INSIDE the menu — its "Updated to v… just now" row — and in the
+    /// still lives INSIDE the menu — its "Updated to aterm v… just now" row — and in the
     /// transient LEVEL-UP notice / palette twin, both of which self-dismiss; only the
     /// always-visible bar badge is gated to the action-needed state.
     pub fn update_version_menu(
@@ -2381,11 +2505,11 @@ mod macos {
 
     /// The Version submenu for the given update state. Mirrors [`super::VERSION_MENU`]
     /// in the portable model (whose ApplyUpdate row the palette rewrites the same way):
-    ///   * STAGED: "⬆️ Update to v<staged> — apply now, shells keep running" (ONE click
-    ///     applies in place — the owner's "click-upgrade" ask), then About, then
+    ///   * STAGED: "⬆️ Install aterm v<staged> now" (ONE click installs in place — the
+    ///     owner's "click-upgrade" ask), then About, then
     ///     "Update details…" (the
     ///     Software Update route stays reachable as the DETAILS surface).
-    ///   * REALIZED (fresh post-update, no new stage): "⬆️ Updated to v<current> just
+    ///   * REALIZED (fresh post-update, no new stage): "⬆️ Updated to aterm v<current> just
     ///     now" (fires About — the celebration row is informative, not destructive),
     ///     then About.
     ///   * NEITHER: just About — the quiet steady-state badge menu.
@@ -2411,7 +2535,7 @@ mod macos {
                 &menu,
                 target,
                 &format!(
-                    "\u{2B06}\u{FE0F} Updated to v{} just now",
+                    "\u{2B06}\u{FE0F} Updated to aterm v{} just now",
                     crate::build_info::version_display()
                 ),
                 MenuAction::Version,
@@ -2600,6 +2724,9 @@ mod macos {
     /// still canonicalizes, bounds, UTF-8-validates, and mints the process-local
     /// document grant before reading the file.
     pub fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+        if super::os_ui_refused(title) {
+            return None;
+        }
         let _main_thread = MainThread::new()?;
         // `-runModal` below spins a nested run loop for as long as the panel is
         // up; park the main-thread watchdog for exactly that long.
@@ -2685,8 +2812,27 @@ mod macos {
     /// Escape clicks Cancel, everything else passes through. The watch is a LOCAL whose
     /// scope ends with the blocking call, so it cannot outlive the alert.
     pub fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
-        if MainThread::new().is_none() {
-            return true;
+        // Headless never shows a confirm: proceed, as `confirm_destructive_close`
+        // already does for a headless instance. Every other case where no alert
+        // could be shown proceeds too: a quit that cannot ask must not wedge.
+        ask(title, body, proceed_label).unwrap_or(true)
+    }
+
+    /// [`confirm`] for an owner gesture that changes this Mac — the Security
+    /// panel's reset, warm-up and *Move to Trash*. It fails CLOSED: with no
+    /// window, off the main thread, or with no alert built, the answer is no.
+    /// Control input arrives as a `Wake`, which is queued while `runModal` spins
+    /// and never becomes an event the alert receives, so no control verb can
+    /// answer it.
+    pub fn confirm_owner(title: &str, body: &str, proceed_label: &str) -> bool {
+        ask(title, body, proceed_label) == Some(true)
+    }
+
+    /// The alert behind [`confirm`] and [`confirm_owner`]: `None` when none
+    /// could be shown, else whether the user chose to proceed.
+    fn ask(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
+        if super::os_ui_refused(title) || MainThread::new().is_none() {
+            return None;
         }
         // `-runModal` below spins a nested run loop until the user answers;
         // park the main-thread watchdog for exactly that long.
@@ -2697,22 +2843,15 @@ mod macos {
             appkit::nsstring(proceed_label),
             appkit::nsstring("Cancel"),
         ) else {
-            // Foundation refused a string, so no alert can be built. FAIL OPEN,
-            // exactly as the off-main-thread arm above does and for the same
-            // reason: a quit that cannot ask must not wedge.
-            return true;
+            // Foundation refused a string, so no alert can be built.
+            return None;
         };
-        // FAIL OPEN ON A MISSING ALERT TOO. The `objc2` form could not reach this
-        // case — `msg_send_id![…, new]` panicked on nil — so the decision is new
-        // and is stated rather than defaulted: `true` is "proceed", which is what
-        // an unanswerable confirmation has to mean for ⌘Q.
-        let Some(alert) = (
-            // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init),
-            // which is what `Obj::from_owned` adopts.
-            unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) }
-        ) else {
-            return true;
-        };
+        // A missing alert is "could not ask" too. The `objc2` form could not
+        // reach this case — `msg_send_id![…, new]` panicked on nil.
+        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init),
+        // which is what `Obj::from_owned` adopts.
+        let alert =
+            unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) }?;
         // SAFETY: standard `NSAlert` setters + `runModal`, all on the main thread
         // (`MainThread::new()` above proves it). `-setMessageText:` and
         // `-setInformativeText:` are `-(void)(NSString *)` and COPY their argument,
@@ -2753,7 +2892,7 @@ mod macos {
                 _ => None,
             };
             let response = appkit::send_isize(alert.id(), sel!(runModal));
-            response == NS_ALERT_FIRST_BUTTON_RETURN
+            Some(response == NS_ALERT_FIRST_BUTTON_RETURN)
         }
     }
 
@@ -2763,7 +2902,7 @@ mod macos {
     /// main thread it does nothing. `runModal` is the same nested-modal pattern `confirm`
     /// uses, safe to call straight from the winit event handler.
     pub fn notify(title: &str, body: &str) {
-        if MainThread::new().is_none() {
+        if super::os_ui_refused(title) || MainThread::new().is_none() {
             return;
         }
         // `-runModal` below spins a nested run loop until the user dismisses
@@ -2854,7 +2993,7 @@ mod macos {
     /// so a caller that reads the answer cannot mistake "not attempted" for
     /// "opened".
     fn open_in_workspace(s: &str, is_file: bool) -> bool {
-        if MainThread::new().is_none() {
+        if super::os_ui_refused(&format!("opening {s}")) || MainThread::new().is_none() {
             return false;
         }
         let Some(ns) = appkit::nsstring(s) else {
@@ -2884,6 +3023,15 @@ mod macos {
             }
             appkit::send_bool_id(ws, sel!(openURL:), url)
         })
+    }
+
+    /// Open a LOCAL FILE aterm itself names — Settings ▸ Packages' "Open Log", for the
+    /// package log atpkg resolved (Phase 4) — through `NSWorkspace openURL:` with a
+    /// `file://` URL: macOS opens it in the app that owns the type (Console for a `.log`).
+    /// No shell and no Terminal are spawned, and nothing a program printed can reach this
+    /// (the link path's allowlist stays closed). Main thread only; `false` when refused.
+    pub fn open_file_in_workspace(path: &std::path::Path) -> bool {
+        path.to_str().is_some_and(|s| open_in_workspace(s, true))
     }
 
     /// How long after the first open the same URL is issued again. The anchor
@@ -2965,7 +3113,7 @@ mod macos {
     /// tracking ends rather than on the second. That only ever makes the second
     /// issue LATE; it cannot lose it, and the first open has already happened.
     fn open_in_workspace_after_delay(s: &str, secs: f64) {
-        if MainThread::new().is_none() {
+        if super::os_ui_refused(&format!("opening {s}")) || MainThread::new().is_none() {
             return;
         }
         let Some(ns) = appkit::nsstring(s) else {
@@ -3497,9 +3645,8 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::{
-        MENU_MODEL, MenuAction, MenuEntry, local_file_picker_available, menu_chrome_lines,
-        native_menu_action_enabled, set_active_tab_is_terminal, staged_apply_label,
-        version_menu_bar_title,
+        MENU_MODEL, MenuAction, MenuEntry, menu_chrome_lines, native_menu_action_enabled,
+        set_active_tab_is_terminal, staged_apply_label, version_menu_bar_title,
     };
 
     /// Both document runtimes already worked on Windows — the socket can drive
@@ -3510,13 +3657,14 @@ mod tests {
     #[test]
     fn a_platform_with_a_picker_says_so() {
         assert!(
-            local_file_picker_available(),
+            super::local_file_picker_available(),
             "macOS has NSOpenPanel and Windows has IFileOpenDialog"
         );
     }
 
     /// REGRESSION: the menu bar badged "v0.14.0 ⬆️" over a row reading "Update to
-    /// v0.14.0 — apply now", which reads as an offer to update a build to itself.
+    /// v0.14.0 — apply now" (today "Install aterm v0.14.0 now"), which reads as an
+    /// offer to update a build to itself.
     ///
     /// Nothing was wrong with the update. The updater orders by BUILD NUMBER (the
     /// display version is documented as never affecting an update comparison), so a
@@ -3559,16 +3707,14 @@ mod tests {
     /// died. A row that tells you to apply, over a build that has already refused to
     /// start twice, is not merely incomplete — it is instructing you to repeat
     /// something the program privately knows has not worked. And the clean row says
-    /// what the apply IS — in place, shells keep running — never a restart.
+    /// what pressing it does in the update row's own words — install, now — never a
+    /// restart.
     #[test]
     fn the_apply_row_admits_when_applying_has_already_been_tried() {
         use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
 
         let clean = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None);
-        assert_eq!(
-            clean,
-            "\u{2191} Update to v9.9.9 \u{2014} apply now, shells keep running"
-        );
+        assert_eq!(clean, "\u{2191} Install aterm v9.9.9 now");
 
         let trouble = ApplyTrouble::new(
             2,
@@ -3594,8 +3740,8 @@ mod tests {
             "never the proof-outcome enum name: {troubled}"
         );
         assert!(
-            !troubled.contains("apply now"),
-            "a scheduled retry must not demand an action that is already queued: \
+            !troubled.contains(" now") && troubled.ends_with("will try again"),
+            "a scheduled retry must not demand an action that is already on its way: \
              {troubled}"
         );
 
@@ -3604,7 +3750,7 @@ mod tests {
             .expect("two failed applies");
         let latched = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&latched));
         assert!(
-            latched.contains("apply now to retry"),
+            latched.ends_with("try again now"),
             "a lane that has stopped names the action that resumes it: {latched}"
         );
         // …and none of them asks for a restart: the apply is in place.
@@ -3660,6 +3806,7 @@ mod tests {
         MenuAction::NextKitty,
         MenuAction::ToggleSettings,
         MenuAction::Packages,
+        MenuAction::Messages,
         MenuAction::OpenPalette,
         MenuAction::Help,
         MenuAction::Version,
@@ -4223,7 +4370,7 @@ mod tests {
         let lines = menu_chrome_lines();
         let expected = [
             "menu \"aterm\": About aterm, Check for Updates…, Settings…, Packages…, \
-             Open aterm.toml, Quit aterm",
+             Messages…, Open aterm.toml, Quit aterm",
             "menu \"File\": New Window, New Terminal Tab, Driving ▸, Open Markdown…, \
              Open File in Editor…, Reopen Closed Tab, Reopen Closed View, \
              Move Tab to New Window, Move Tab to Next Window, Open Session in New Window, \
@@ -4242,7 +4389,7 @@ mod tests {
             "menu \"Window\": Minimize, Zoom, Show Next Tab, Show Previous Tab, \
              Rename Session…, Set Role…",
             "menu \"Help\": aterm Help",
-            "menu \"Version\": ↑ Update — apply now, About aterm — build & version…",
+            "menu \"Version\": ↑ Install update now, About aterm — build & version…",
         ];
         assert_eq!(
             lines, expected,

@@ -17,18 +17,21 @@ vertex VsOut vs_blit(uint vi [[vertex_id]]) {
 }
 
 // std140 twin of the Rust `BlitUniform` — 96 bytes, member for member:
-//   flag 0, overlay 4, border_px 8, encode_srgb 12, accent 16, dims 32,
-//   wash_a 40, border_a 44, band 48, content_off 64, hdr 72, translucent 76,
-//   sdr_white_scale 80, visible_y 84, visible_h 88, premult 92.
+//   flag 0, overlay 4, border_px 8, encode_srgb 12, accent 16, chrome_y1 28,
+//   dims 32, wash_a 40, border_a 44, band 48, content_off 64, hdr 72,
+//   translucent 76, sdr_white_scale 80, visible_y 84, visible_h 88, premult 92.
 // Every float4 lands on a 16-byte boundary in BOTH layouts, so MSL's natural
 // constant layout is byte-identical to std140 here and the Rust struct is
-// UNCHANGED from the WGSL era.
+// UNCHANGED from the WGSL era. The accent is a `packed_float3` (12 bytes,
+// 4-aligned) so `chrome_y1` takes the slot the old float4's unused alpha held —
+// the WGSL `vec3<f32>` + `f32` pair lands at the same 16 and 28.
 struct Blit {
     uint flag;          // bell-flash invert
     uint overlay;       // drop-target highlight enabled
     float border_px;    // inset border thickness, device px
     float encode_srgb;  // !=0: re-encode linear->sRGB (downlevel WebGL2 blit)
-    float4 accent;      // overlay accent rgb (a unused), normalized 0..1
+    packed_float3 accent; // overlay accent rgb, normalized 0..1
+    float chrome_y1;    // source rows [0, chrome_y1) are host chrome: their bands continue the frame's edge pixels
     float2 dims;        // OFFSCREEN frame width,height in px
     float wash_a;       // interior wash alpha 0..1
     float border_a;     // border alpha 0..1
@@ -67,6 +70,14 @@ fragment float4 fs_blit(VsOut in [[stage_in]],
     // scaling ever.
     float2 p = in.pos.xy - b.content_off;
     float visible_y1 = b.visible_y + b.visible_h;
+    // CHROME REACHES THE WINDOW EDGE (the WGSL twin's words): beside a
+    // host-chrome source row the horizontal remainder bands continue the
+    // frame's own edge pixel; still a band pixel — never inverted or washed.
+    bool chrome_edge = false;
+    if ((p.x < 0.0 || p.x >= b.dims.x) && p.y >= b.visible_y && p.y < min(visible_y1, b.chrome_y1)) {
+        p.x = clamp(p.x, 0.0, b.dims.x - 1.0);
+        chrome_edge = true;
+    }
     if (p.x < 0.0 || p.y < b.visible_y || p.x >= b.dims.x || p.y >= visible_y1) {
         // M5: on a translucent window the remainder bands take the bg-quad
         // alpha too; the opaque default forces 1.0 (byte-identical chrome).
@@ -87,12 +98,12 @@ fragment float4 fs_blit(VsOut in [[stage_in]],
     // exact twin of the WGSL vec2<i32> conversion (both truncate toward zero).
     float4 c = src_tex.read(uint2(p), 0);
     float3 rgb = c.rgb;
-    if (b.flag != 0u) {
+    if (b.flag != 0u && !chrome_edge) {
         rgb = float3(1.0) - rgb;
     }
     // Drag-and-drop drop-target highlight: faint accent wash + inset accent
     // border, relative to the CONTENT frame.
-    if (b.overlay != 0u) {
+    if (b.overlay != 0u && !chrome_edge) {
         float2 visible_p = float2(p.x, p.y - b.visible_y);
         float edge = min(
             min(visible_p.x, b.dims.x - visible_p.x),
@@ -100,7 +111,7 @@ fragment float4 fs_blit(VsOut in [[stage_in]],
         );
         float a = b.wash_a;
         if (edge < b.border_px) { a = b.border_a; }
-        rgb = mix(rgb, b.accent.rgb, a);
+        rgb = mix(rgb, float3(b.accent), a);
     }
     // Downlevel: re-encode linear->sRGB for the non-sRGB swapchain.
     if (b.encode_srgb != 0.0) {

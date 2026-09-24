@@ -25,6 +25,27 @@ use super::*;
 /// platform while enqueuing, blocks and omits drop accounting on a full queue,
 /// and a cue applied to an already-running device retains the pre-cue silence
 /// threshold.
+///
+/// THE REOPEN LADDER IS A SIBLING MACHINE. Since D5 (2026-09-22) the shipping
+/// worker no longer treats one device fault as terminal: a failed open, a
+/// failed start/enqueue, a faulted callback, a stalled one or a queue
+/// AudioToolbox stopped under us (the `kAudioQueueProperty_IsRunning`
+/// listener, which feeds the same fault verdict) spends one of
+/// `REOPEN_BUDGET` device reopens, and only EXHAUSTION latches
+/// `STATE_FAILED` and seals ingress. In THIS machine that whole ladder is
+/// abstracted as its end: `WorkerStartFails` is the exhausting fault, and
+/// `StartFailureIsExplicitAndTerminal` stays true of the shipping code
+/// because the state it names is still reached and still terminal. What
+/// happens between the first fault and exhaustion — the budget, the backoff
+/// window, the reset that only a device which PLAYED for a healthy window
+/// earns — is [`trail_audio_reopen_ladder_model`], whose
+/// `RecoveryIsBounded`, `ReopensLeftIsTruthful` and
+/// `SilenceIsPermanentOnlyWhenTheBudgetIsSpent` each carry a replayed
+/// historical defect as their `Buggy=1` counterexample and whose Tier-1
+/// conformance drives the real `RetryState`, `reopen_after_fault` and
+/// `worker_loop`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
 /// KNOWN PARTIAL, 2026-09-22. The shipping worker no longer treats one
 /// device fault as terminal: a failed open, a failed start/enqueue, a faulted
 /// callback or a stalled one now spends one of `REOPEN_BUDGET` device
@@ -36,16 +57,11 @@ use super::*;
 /// between, so a green run here says nothing about whether the budget is
 /// respected. The reopen ladder is covered at Tier-1 instead, by
 /// `worker_device_failure_is_retried_with_backoff_then_terminal_at_budget`
-/// `reopen_attempts_respect_their_backoff_window` and
-/// `a_device_that_opens_but_never_plays_spends_the_budget_and_stops` (the
-/// ladder resets on a device that PLAYED for a healthy window, never on one
-/// that merely opened). Extending this
+/// and `reopen_attempts_respect_their_backoff_window`. Extending this
 /// machine with `DeviceFaults` / `ReopenSucceeds` / `ReopenExhausted` and a
 /// `RecoveryIsBounded` invariant is the outstanding work; per the recorded
 /// vacuous-guard-conjunct lesson, `ReopenSucceeds`'s guard must leave
 /// `ReopenExhausted` reachable or the new invariant proves nothing.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_lifecycle_model() -> Model {
     crate::ty_model! {
         TrailAudioLifecycle {
@@ -291,6 +307,381 @@ pub fn trail_audio_start_latency_model() -> Model {
                     idle_wakes == 0
                 };
             invariant PhaseBounded: phase <= 8;
+        }
+    }
+}
+
+/// The typing-sound SEAM: which ticks leave a keystroke HEARD, and whether
+/// the `tone` verb's answer agrees with the key path.
+///
+/// Two writers and two readers share one bit. The WRITER is
+/// `CursorGlow::tick`, which leaves `sound_live` open or closed on every
+/// frame; the READERS are the key path (`keystroke_click_audible` then
+/// `CursorGlow::cue_keystroke_shifted`, which records nothing unless the
+/// seam is open) and the `aterm ctl tone` verb (`sound_seam`, which names the
+/// gate that closed it). Each tick action is one CLASS of host config, as
+/// `tick_cursor_fx` folds it (`sound_seam::fold_window_audibility`):
+///
+/// * `TickLit` — master on, the window focused, amplitude nonzero.
+/// * `TickDarkMotion` — dark ONLY because of a motion policy: macOS Reduce
+///   Motion / `motion = "reduced"` (D2) or the load-shed envelope (D1).
+///
+/// A tick class is the HOST's config class, whatever the engine then does
+/// with it: every style (the classic wake included) and every grid (a
+/// degenerate one included, whose tick draws nothing) must answer each
+/// class the same way, and the Tier-1 conformance drives them all.
+/// * `TickDarkUnfocused` — dark because the key belongs to another window.
+/// * `TickDarkUserOff` — dark because the person set the aurora's own
+///   brightness knob to zero (binding decision C: their explicit off).
+/// * `TickMasterOff` — `cursor_trail = false` or serious mode.
+///
+/// `key` and `tone` are what the two readers answered SINCE the last tick
+/// (`0` not asked, `1` heard / `open`, `2` refused / `closed:<named gate>`,
+/// `3` `closed:engine-silent`); every tick clears them, so each invariant
+/// relates a reader's answer to the config class of the tick it read.
+///
+/// The owner's rulings, as invariants: a key pressed while the ONLY
+/// darkness is a motion or performance policy is heard
+/// (`FocusedKeyIsHeard`); a key in an unfocused window, with the aurora
+/// dimmed to zero, or with the master off is not (`ForeignKeyIsSilent`);
+/// the verb and the key path never disagree (`ToneAgreesWithTheKey`); and
+/// `closed:engine-silent` — the sensor for a FUTURE policy re-subordinating
+/// audio — is unreachable while every closed gate has a name
+/// (`EngineSilentIsUnreachable`). That last one is a claim about a window
+/// that has run a frame: the model's `Tone` is only ever asked after a tick
+/// in the conformance, and before a window's first frame the real verb
+/// does say `engine-silent` (no config gate explains a seam no tick has
+/// resolved), which the conformance pins as a separate reading rather than
+/// substituting one.
+///
+/// There are NO action guards: every tick class and both readers are
+/// enabled in every state, so no invariant can hold merely because a guard
+/// made its counterexample unreachable (the recorded vacuous-guard-conjunct
+/// gap). Every decision lives in an update, which is what the Tier-1
+/// conformance binds.
+///
+/// `Buggy=1` combines three defects, each on its own action so none masks
+/// another: the ORIGINAL D1/D2 law (`TickDarkMotion` closes the seam, as the
+/// zero-amplitude return did unconditionally before 2026-09-22), the naive
+/// over-correction (`TickDarkUnfocused` opens it — `sound_live = true` on
+/// every dark return), and the verb's pre-fix read of `trail_on` as
+/// `GlowConfig::enabled` alone, which reports a user-dimmed aurora as
+/// `closed:engine-silent`.
+///
+/// Tier-1: `aterm-gui/src/sound_seam_conformance.rs` drives the real
+/// resolver, the real `MotionPolicy::resolve`, the real host fold, the real
+/// `CursorGlow::tick` on all eleven styles and four grids, the real key
+/// seam, and the verb's own input constructor into the real `sound_seam`
+/// table, over the whole host input domain; it rejects replays of the
+/// pre-fix fold, the pre-fix verb, the pre-fix classic wake (it wrote no
+/// seam at all) and the pre-fix empty grid (it closed the seam like the
+/// master switch). `app_input`'s `tone_status_tests` bind the verb's call
+/// site. NOT modelled: the host's own sound knobs (`trail_sounds`, volume,
+/// resize-quiet, the audio host), which `Key` pins open and the
+/// `sound_seam` table tests cover.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn trail_sound_seam_model() -> Model {
+    crate::ty_model! {
+        TrailSoundSeam {
+            const Buggy = 0;
+            // The last tick's config class, as the engine and the verb saw it.
+            var master = 0;
+            var amplitude = 0;
+            // 0 none (lit, or master off), 1 motion or shed, 2 unfocused,
+            // 3 the user's brightness knob at zero.
+            var dark_cause = 0;
+            // `CursorGlow::sound_seam_open()`.
+            var seam = 0;
+            // What each reader answered since the last tick.
+            var key = 0;
+            var tone = 0;
+
+            action TickLit {
+                master = 1;
+                amplitude = 1;
+                dark_cause = 0;
+                seam = 1;
+                key = 0;
+                tone = 0;
+            }
+            action TickDarkMotion {
+                master = 1;
+                amplitude = 0;
+                dark_cause = 1;
+                seam = if Buggy == 1 { 0 } else { 1 };
+                key = 0;
+                tone = 0;
+            }
+            action TickDarkUnfocused {
+                master = 1;
+                amplitude = 0;
+                dark_cause = 2;
+                seam = if Buggy == 1 { 1 } else { 0 };
+                key = 0;
+                tone = 0;
+            }
+            action TickDarkUserOff {
+                master = 1;
+                amplitude = 0;
+                dark_cause = 3;
+                seam = 0;
+                key = 0;
+                tone = 0;
+            }
+            action TickMasterOff {
+                master = 0;
+                amplitude = 0;
+                dark_cause = 0;
+                seam = 0;
+                key = 0;
+                tone = 0;
+            }
+            // The key path, with the host's own sound knobs open: it records
+            // a click exactly when the engine's seam is open.
+            action Key {
+                key = if seam == 1 { 1 } else { 2 };
+            }
+            // The verb, in `sound_seam`'s precedence: what the user SET
+            // (`trail_on`), then where the user IS (`focused`), then the
+            // engine's bare refusal last.
+            action Tone {
+                tone = if master == 0 {
+                    2
+                } else {
+                    if dark_cause == 3 {
+                        if Buggy == 1 {
+                            if seam == 1 { 1 } else { 3 }
+                        } else {
+                            2
+                        }
+                    } else {
+                        if dark_cause == 2 {
+                            2
+                        } else {
+                            if seam == 1 { 1 } else { 3 }
+                        }
+                    }
+                };
+            }
+
+            invariant FocusedKeyIsHeard:
+                if key > 0 && master == 1 && dark_cause <= 1 {
+                    key == 1
+                } else {
+                    key <= 2
+                };
+            invariant ForeignKeyIsSilent:
+                if key > 0 && (master == 0 || dark_cause > 1) {
+                    key == 2
+                } else {
+                    key <= 2
+                };
+            invariant ToneAgreesWithTheKey:
+                if key > 0 && tone > 0 {
+                    if key == 1 { tone == 1 } else { tone > 1 }
+                } else {
+                    tone <= 3
+                };
+            invariant EngineSilentIsUnreachable: tone <= 2;
+        }
+    }
+}
+
+/// The audio host's bounded DEVICE-REOPEN ladder (D5): a fault spends one
+/// reopen, a device that genuinely PLAYS through a healthy window hands the
+/// budget back, and only exhaustion is terminal.
+///
+/// The sibling of [`trail_audio_lifecycle_model`], which models ingress, the
+/// idle pause and the terminal failed state; this machine models what
+/// happens BETWEEN a fault and that terminal state — the part the lifecycle
+/// machine abstracts as its single `WorkerStartFails` step. It is the
+/// finite-state projection of `RetryState` + `reopen_after_fault` and the
+/// `worker_loop` call sites that drive them (`aterm-gui/src/trail_audio.rs`):
+///
+/// * `attempts` is `RetryState::attempts` (the wire's `reopens_left` is
+///   `Budget - attempts`); `Budget` is `REOPEN_BACKOFF.len()`.
+/// * `spent` is the SPEC's own count — reopens scheduled since a device last
+///   delivered after playing through a healthy window — kept independently
+///   of `attempts` so the code's counter can be checked against it. Its
+///   reset law reads `evidence`, never `played`: sharing the code's reset
+///   condition would make `attempts == spent` true of any reset law.
+/// * `evidence` is the SPEC's own record of what the device did since the
+///   last scheduled reopen, kept apart from the code's `played` clock: `0`
+///   nothing delivered, `1` delivered, `2` delivered and then the window
+///   elapsed (also the value before any fault, when nothing is owed). The
+///   code's `played` clock and this record agree on the committed machine;
+///   a change to the code's reset law, or to what may start or finish its
+///   clock, makes them disagree, and `ResetOnlyOnPlayedWindow` says so.
+/// * `waiting` is "inside the backoff window" (`!RetryState::ready`). The
+///   schedule's first step is zero and the rest strictly increase, so the
+///   first reopen is immediate, later ones wait, and the LAST wait is the
+///   longest step — which is also the healthy window.
+/// * `played` is the healthy window's clock: WALL time from the first
+///   delivery after the last fault (`RetryState::played_since`), with no
+///   fault detected in between — `0` no delivery since the last fault, `1`
+///   the window is running, `2` it has run out. A delivery is a successful
+///   enqueue and start (`Delivery::Sounded`). A device that stops its queue
+///   without flagging a fault is not seen as a fault here, so the window can
+///   run over time the device was idle; the IsRunning-listener lane is what
+///   would make it true play time.
+/// * `stale` is the clock the pre-fix reset read instead: time since the
+///   last fault has reached the window's length.
+///
+/// Actions: `Cue` (a cue reaches a worker holding no device: it opens one,
+/// or is dropped and counted inside the window or against sealed ingress),
+/// `CueSounds` (a delivery — `RetryState::delivered`), `DeviceFaults` (a
+/// failed open, a failed start or enqueue, a faulted or stalled callback:
+/// the ONE handler, which schedules a reopen or reports exhaustion), and
+/// the three clock actions. Every DECISION the invariants depend on lives
+/// in an UPDATE: the reason is the recorded vacuous-guard-conjunct gap, and
+/// the Tier-0 guard-conjunct audit (`derived_trail_sound_ty.rs`) refused two
+/// guards the first draft of this machine had, each of which carried
+/// `SilenceIsPermanentOnlyWhenTheBudgetIsSpent` by premise. What guards
+/// remain are ENVIRONMENT facts — a clock can only run out once it started,
+/// a worker that exited touches no platform — and the audit lists each one
+/// with what it carries; the Tier-1 conformance binds every guard to the
+/// real predicate (`Model::action_enabled` against the real ladder, in
+/// every visited configuration).
+///
+/// `Buggy=1` replays three defects, scoped so none masks another: an OPEN
+/// failure is terminal on the spot (the pre-D5 law, "one fault is
+/// forever"); a successful open inside the window resets the ladder (the
+/// first draft of D5, which a device that constructs and never plays
+/// defeated); and a delivery once the FAULT is stale resets it (the shipped
+/// D5 law until this machine's conformance found it: the window was
+/// measured from the fault, and since the last wait IS the window, the
+/// first delivery after the final reopen handed the whole budget back, so a
+/// device that plays one block and stalls cycled the ladder forever).
+///
+/// Tier-1: `aterm-gui/src/trail_audio_reopen_conformance.rs` drives the
+/// real `RetryState`/`reopen_after_fault` exhaustively on a fabricated
+/// clock with the SHIPPING schedule (two-way: every model state is reached),
+/// and validates traces of the real `worker_loop` against this machine,
+/// with replays of each defect as negative controls.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn trail_audio_reopen_ladder_model() -> Model {
+    crate::ty_model! {
+        TrailAudioReopenLadder {
+            const Buggy = 0;
+            const Budget = 2;
+            var attempts = 0;
+            var spent = 0;
+            var device = 0;
+            var waiting = 0;
+            var played = 0;
+            // No fault has happened yet, so nothing is recent.
+            var stale = 1;
+            var failed = 0;
+            // Nothing is owed before the first fault.
+            var evidence = 2;
+
+            // A cue after exhaustion meets SEALED ingress and opens nothing.
+            // That law is in the update, not in a `failed == 0` guard: as a
+            // guard it carried `SilenceIsPermanentOnlyWhenTheBudgetIsSpent`
+            // by premise, and a premise is not something the conformance can
+            // refute.
+            action Cue when (device == 0) {
+                device = if failed == 1 || waiting == 1 { 0 } else { 1 };
+                attempts = if Buggy == 1 && waiting == 0 && failed == 0 && stale == 0 {
+                    0
+                } else {
+                    attempts
+                };
+            }
+            // THE RESET LAW, stated in the update: the ladder is handed back
+            // only on evidence that a device PLAYED through the window. As a
+            // `device == 1` guard it too carried the terminal law by premise,
+            // so the action is unguarded and a delivery with no device
+            // changes nothing.
+            action CueSounds {
+                attempts = if device == 1 && played == 2 {
+                    0
+                } else {
+                    if Buggy == 1 && device == 1 && stale == 1 { 0 } else { attempts }
+                };
+                // THE SPEC'S reset law: on evidence, not on the code's clock.
+                spent = if device == 1 && evidence == 2 { 0 } else { spent };
+                evidence = if device == 1 && evidence == 0 { 1 } else { evidence };
+                played = if device == 1 && played == 2 {
+                    0
+                } else {
+                    if device == 1 && played == 0 && attempts > 0 { 1 } else { played }
+                };
+            }
+            action DeviceFaults when (failed == 0 && (device == 1 || waiting == 0)) {
+                failed = if Buggy == 1 && device == 0 {
+                    1
+                } else {
+                    if attempts <= Budget - 1 { 0 } else { 1 }
+                };
+                attempts = if Buggy == 1 && device == 0 {
+                    attempts
+                } else {
+                    if attempts <= Budget - 1 { attempts + 1 } else { attempts }
+                };
+                spent = if Buggy == 1 && device == 0 {
+                    spent
+                } else {
+                    if attempts <= Budget - 1 {
+                        if spent <= Budget { spent + 1 } else { spent }
+                    } else {
+                        spent
+                    }
+                };
+                waiting = if Buggy == 1 && device == 0 {
+                    waiting
+                } else {
+                    if attempts <= Budget - 1 {
+                        if attempts == 0 { 0 } else { 1 }
+                    } else {
+                        waiting
+                    }
+                };
+                // A SCHEDULED reopen restarts both clocks; exhaustion returns
+                // before touching either (`reopen_after_fault`).
+                played = if Buggy == 1 && device == 0 {
+                    played
+                } else {
+                    if attempts <= Budget - 1 { 0 } else { played }
+                };
+                stale = if Buggy == 1 && device == 0 {
+                    stale
+                } else {
+                    if attempts <= Budget - 1 { 0 } else { stale }
+                };
+                // A scheduled reopen owes new evidence.
+                evidence = if Buggy == 1 && device == 0 {
+                    evidence
+                } else {
+                    if attempts <= Budget - 1 { 0 } else { evidence }
+                };
+                device = 0;
+            }
+            action BackoffElapses when (waiting == 1) {
+                waiting = 0;
+                // The LAST wait is the schedule's longest step: the window.
+                stale = if attempts == Budget { 1 } else { stale };
+            }
+            action StaleElapses when (stale == 0) {
+                stale = 1;
+                waiting = 0;
+            }
+            action HealthyWindowElapses when (played == 1) {
+                played = 2;
+                stale = 1;
+                evidence = if evidence == 1 { 2 } else { evidence };
+            }
+
+            invariant RecoveryIsBounded: spent <= Budget;
+            invariant ReopensLeftIsTruthful: attempts == spent;
+            invariant SilenceIsPermanentOnlyWhenTheBudgetIsSpent:
+                if failed == 1 { attempts == Budget } else { failed == 0 };
+            // The ladder is only ever handed back on evidence the device
+            // PLAYED through a healthy window since the last reopen.
+            invariant ResetOnlyOnPlayedWindow:
+                if attempts == 0 { evidence == 2 } else { evidence <= 2 };
         }
     }
 }
@@ -6488,6 +6879,132 @@ pub fn shared_budget_model() -> Model {
             // A departed pane holds no share.
             invariant DepartedHoldsNothing:
                 if live2 == 0 { a2 == 0 } else { 0 <= 1 };
+        }
+    }
+}
+
+/// `aterm.log` rotation shared by several writing processes — the GUI, every
+/// `aterm --session`, an update's successor (`aterm-gui/src/logging.rs`,
+/// `RotatingFile`).
+///
+/// Each writer holds the file open with `O_APPEND`. Before a write it looks at
+/// the path again once `Step` lines (64 KiB) or one `Tick` (30 s) have passed
+/// since its last look: if the path names another file it reopens it (another
+/// writer rotated), and if the live file is over `Cap` it renames it to
+/// `aterm.log.1`, replacing the older copy, and starts a fresh one. That
+/// rename runs under a sibling lock taken without waiting and looks at the
+/// file again under it, which is what lets the model treat a look as one step.
+/// A process that starts (`RestartB`) rotates an oversized file the same way.
+///
+/// Writer handles: 0 = `aterm.log`, 1 = `aterm.log.1`, 2 = a deleted older
+/// copy (a line written there is gone). `aged` counts lines retired with an
+/// older copy — the retention limit, not a loss. `ea`/`eb`/`er` are ticks since
+/// each writer's last look and since the last rotation, saturating at `Window`.
+///
+/// ENVIRONMENT ASSUMPTION: `aterm.log` fills more slowly than one whole file
+/// per check interval (4 MiB in 30 s), stated as the guard on a write into it:
+/// `live <= Cap - 1 || Window <= er`. Under it no writer falls two files behind
+/// before its time check comes due, so no line lands in a deleted file.
+///
+/// PROVES `EveryLineOnce` (every line written is in `aterm.log`, in
+/// `aterm.log.1`, or was retired with an older copy — none lost, none
+/// duplicated) and `FilesBounded` (each file stays within the cap plus the
+/// writers' slack between looks). `Buggy=1` is the code this replaced: no look
+/// while running, so the file grows without limit, and a start that TRUNCATES
+/// an oversized file, erasing lines other writers put there. Tier-1:
+/// `aterm-gui/src/logging.rs` `rotation_conformance` drives two real writers on
+/// one path through rotation, a follow and a restart.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn log_rotation_model() -> Model {
+    crate::ty_model! {
+        LogRotation {
+            const Cap = 1;       // lines one file may hold before rotation
+            const Step = 1;      // lines a writer adds between looks
+            const Window = 1;    // ticks in one check interval
+            const MaxLines = 4;  // run bound
+            const Buggy = 0;     // 1 = no look while running, truncate at start
+
+            var live = 0;     // lines in aterm.log
+            var old = 0;      // lines in aterm.log.1
+            var aged = 0;     // lines retired with a replaced older copy
+            var written = 0;  // lines logged by any writer
+            var ga = 0;       // writer A's handle (0 live, 1 older copy, 2 deleted)
+            var gb = 0;       // writer B's handle
+            var na = 0;       // lines A wrote since its last look
+            var nb = 0;
+            var ea = 0;       // ticks since A's last look
+            var eb = 0;
+            var er = 1;       // ticks since the last rotation (none yet: saturated)
+
+            // Time passes.
+            action Tick when (ea <= Window - 1 || eb <= Window - 1 || er <= Window - 1) {
+                ea = if ea <= Window - 1 { ea + 1 } else { ea };
+                eb = if eb <= Window - 1 { eb + 1 } else { eb };
+                er = if er <= Window - 1 { er + 1 } else { er };
+            }
+
+            // One line into the file A holds, while no look is due.
+            action WriteA when (
+                written <= MaxLines - 1
+                && (ga > 0 || live <= Cap - 1 || Window <= er)
+                && (Buggy == 1 || (na <= Step - 1 && ea <= Window - 1))
+            ) {
+                live = if ga == 0 { live + 1 } else { live };
+                old = if ga == 1 { old + 1 } else { old };
+                written = written + 1;
+                na = if na <= Step - 1 { na + 1 } else { na };
+            }
+            action WriteB when (
+                written <= MaxLines - 1
+                && (gb > 0 || live <= Cap - 1 || Window <= er)
+                && (Buggy == 1 || (nb <= Step - 1 && eb <= Window - 1))
+            ) {
+                live = if gb == 0 { live + 1 } else { live };
+                old = if gb == 1 { old + 1 } else { old };
+                written = written + 1;
+                nb = if nb <= Step - 1 { nb + 1 } else { nb };
+            }
+
+            // A's look: follow another writer's rotation, then rotate the
+            // live file if it is oversized — the same look does both.
+            action CheckA when (Buggy == 0 && (Step <= na || Window <= ea)) {
+                aged = if live > Cap { aged + old } else { aged };
+                old = if live > Cap { live } else { old };
+                live = if live > Cap { 0 } else { live };
+                gb = if live > Cap { if gb == 0 { 1 } else { 2 } } else { gb };
+                er = if live > Cap { 0 } else { er };
+                ga = 0;
+                na = 0;
+                ea = 0;
+            }
+            action CheckB when (Buggy == 0 && (Step <= nb || Window <= eb)) {
+                aged = if live > Cap { aged + old } else { aged };
+                old = if live > Cap { live } else { old };
+                live = if live > Cap { 0 } else { live };
+                ga = if live > Cap { if ga == 0 { 1 } else { 2 } } else { ga };
+                er = if live > Cap { 0 } else { er };
+                gb = 0;
+                nb = 0;
+                eb = 0;
+            }
+
+            // B's process exits and a new one opens the log: an oversized
+            // file is rotated (Buggy: truncated).
+            action RestartB {
+                aged = if live > Cap && Buggy == 0 { aged + old } else { aged };
+                old = if live > Cap && Buggy == 0 { live } else { old };
+                live = if live > Cap { 0 } else { live };
+                ga = if live > Cap && Buggy == 0 { if ga == 0 { 1 } else { 2 } } else { ga };
+                er = if live > Cap && Buggy == 0 { 0 } else { er };
+                gb = 0;
+                nb = 0;
+                eb = 0;
+            }
+
+            invariant EveryLineOnce: live + old + aged == written;
+            invariant FilesBounded:
+                live <= Cap + Step + Step && old <= Cap + Step + Step + Step;
         }
     }
 }

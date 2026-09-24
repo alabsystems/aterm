@@ -1613,12 +1613,16 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
 ///   The model is clockless: the patience's BOUND (`PatienceElapses`) is a
 ///   forget like any other here, and its number is pinned by the engine's
 ///   own tests, not by `ty`.
+/// * A delivered insert's echo cannot spend a key dispatched behind it on
+///   the FIFO. A delayed output frame may see both receipts, but the paste
+///   bytes still precede the key bytes. The mutant takes that first frame as
+///   typed, leaving the insert armed and the later key credit stolen.
 /// * The slimmed diagnosis ring cannot lie to `ctl trail`: every spawn scores
 ///   exactly one of `licensed`/`declined`, and a `licensed` row means light was
 ///   actually minted.
 ///
-/// Tier-1 (`cursor_glow.rs`) drives the REAL `CursorGlow` through press, echo,
-/// cold echo and expiry against these transitions.
+/// Tier-1 (`cursor_glow.rs`, `app_input.rs`) drives the REAL `CursorGlow`
+/// through press, echo, cold echo, expiry and delayed paste/key frames.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_hint_license_model() -> Model {
@@ -1687,6 +1691,11 @@ pub fn cursor_hint_license_model() -> Model {
             var insert_undelivered = 0;
             // Witness: an insert echo admitted on an arm minted before delivery.
             var undelivered_admitted = 0;
+            // A typed press dispatched AFTER the queued insert. Its credit
+            // cannot own an earlier paste echo just because both receipts
+            // have reached the renderer before the first output frame.
+            var later_key_credit = 0;
+            var later_key_stolen = 0;
 
             // A press arms the licence and banks one cell credit. The stamp is
             // ONE SLOT: a press over a live stamp supersedes it (the older arm
@@ -1737,6 +1746,38 @@ pub fn cursor_hint_license_model() -> Model {
                 insert_hint = 1;
                 insert_undelivered = 0;
                 arms = arms + 1;
+            }
+            action PressBehindQueuedInsert when (
+                write_pending == 1 && later_key_credit == 0 && arms <= ArmCap - 1
+            ) {
+                superseded = if hint == 1 { superseded + 1 } else { superseded };
+                hint = 1;
+                arms = arms + 1;
+                credit_arms = credit_arms + 1;
+                later_key_credit = 1;
+                swallowed = 0;
+                just_forgot = 0;
+            }
+            // The FIFO's paste bytes echo first. The historical classifier
+            // counted ALL banked key credits, so a same-width paste frame
+            // spent the later key's credit as typed and left its insert arm
+            // waiting. The fixed class spends the insert arm and preserves
+            // the key for the next frame.
+            action DelayedInsertEchoPrecedesLaterKey when (
+                insert_hint == 1 && later_key_credit == 1
+                    && hint == 1 && spawns <= MoveCap - 1
+            ) {
+                insert_hint = if Buggy == 1 { 1 } else { 0 };
+                hint = if Buggy == 1 { 0 } else { 1 };
+                later_key_credit = if Buggy == 1 { 0 } else { 1 };
+                later_key_stolen = if Buggy == 1 { 1 } else { later_key_stolen };
+                spent = if Buggy == 1 { spent + 1 } else { spent };
+                consumed = consumed + 1;
+                admissions = admissions + 1;
+                spawns = spawns + 1;
+                births = births + 1;
+                resident = 1;
+                licensed_tally = licensed_tally + 1;
             }
             // The insert window elapses: set, no longer fresh.
             action InsertLicenceExpires when (insert_hint == 1) {
@@ -2067,6 +2108,7 @@ pub fn cursor_hint_license_model() -> Model {
             // on an arm from before the bytes landed.
             invariant AnInsertLicenceIsMintedOnlyByACompletedWrite:
                 undelivered_admitted == 0;
+            invariant LaterKeysCannotOwnAnEarlierInsertEcho: later_key_stolen == 0;
             invariant EveryArmReachesExactlyOneDisposition:
                 arms == consumed + expired + cleared + superseded
                     + (if hint == 1 { 1 } else { 0 })

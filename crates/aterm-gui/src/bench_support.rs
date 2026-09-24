@@ -171,8 +171,8 @@ impl BenchApp {
     /// EVERY cursor effect off: master switch off AND the style token "off"
     /// (belt and braces — either alone already resolves `enabled: false`, and
     /// "off" also blanks the style so no style-matched body can tick). This is
-    /// the CF-6 target state: `tick_cursor_fx` still runs its whole driver —
-    /// including the TypingCadence triple + `ignite` — on such a frame.
+    /// the CF-6 target state: `tick_cursor_fx` still runs its driver, but
+    /// skips the cadence decay and gives `ignite` its identity stamp.
     pub fn effects_all_off(&mut self) {
         self.app.config.cursor_trail = Some(false);
         self.app.config.cursor_trail_style = Some("off".into());

@@ -2125,12 +2125,13 @@ impl AppRt for AppRtWindows {
                     // a pointless relaunch. The latch is the same first-writer
                     // rule; this reads it so the BANNER obeys it too.
                     if client_backdrop_decline().is_none() {
-                        crate::config_notice::queue_deferred(
-                            "background_material is styling the title bar only: the \
-                             client-area backdrop is chosen at launch. Relaunch aterm with \
-                             the material set (and hdr_glow off) to see it in the window \
-                             padding."
-                                .to_string(),
+                        crate::message_inbox::queue_message(
+                            crate::message_reporters::backdrop_declined(
+                                "background_material is styling the title bar only",
+                                "the client-area backdrop is chosen at launch; start aterm \
+                                 with the material set (and hdr_glow off) to see it in the \
+                                 window padding",
+                            ),
                         );
                         note_client_backdrop_declined(ClientBackdropDecline::NotAtLaunch);
                     }

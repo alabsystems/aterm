@@ -133,7 +133,7 @@ pub(crate) struct PaletteRow {
     pub section: Cow<'static, str>,
     /// The command label, exactly as the native menu item reads. `Cow` because ONE row is
     /// dynamic: the Version section's ApplyUpdate row carries the LIVE staged/realized
-    /// version ("↑ Update to v0.26 — apply now, shells keep running"), rewritten by
+    /// version ("↑ Install aterm v0.26 now"), rewritten by
     /// [`PaletteState::resolve`];
     /// every other row keeps its static model label.
     pub label: Cow<'static, str>,
@@ -220,18 +220,17 @@ pub(crate) struct PaletteLive {
     /// The View ▸ Presence Rim checkmark.
     pub presence_rim: bool,
     /// A strictly-newer `(build, version)` is STAGED (the `App.relaunch` nudge): the
-    /// Version section shows the one-click "↑ Update to v<staged> — apply now, shells
-    /// keep running" row.
+    /// Version section shows the one-click "↑ Install aterm v<staged> now" row.
     pub staged: Option<(u64, String)>,
     /// The apply lane's STANDING failure for that staged build, when there is one
-    /// (`App::apply_trouble_for`). It replaces the row's "apply now" tail with the
+    /// (`App::apply_trouble_for`). It replaces the row's "now" with the
     /// attempt count, the cause in human words, and whether the automatic lane is
     /// still going to try — the palette twin of the Version menu's row, kept in
     /// lockstep by construction because both render the same value through
     /// [`crate::menu::staged_apply_label`].
     pub staged_trouble: Option<crate::update_apply_trouble::ApplyTrouble>,
     /// The post-update REALIZED arrow is live: `(new version, its spawn instant)` — the
-    /// Version section shows the TIME-FADED "↑ Updated to v<new>" row (alpha decays over
+    /// Version section shows the TIME-FADED "↑ Updated to aterm v<new>" row (alpha decays over
     /// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]). Ignored while `staged` is `Some`
     /// (a newer staged build supersedes the celebration).
     pub realized: Option<(String, Instant)>,
@@ -383,9 +382,9 @@ impl PaletteState {
     /// The Version section's ApplyUpdate row is additionally DYNAMIC — the one place the
     /// palette diverges from the static model, mirroring the live macOS Version menu
     /// (`menu::update_version_menu`):
-    ///   * STAGED: "↑ Update to v<staged> — apply now, shells keep running" — ONE Enter
-    ///     applies in place (the owner's "click-upgrade" ask);
-    ///   * REALIZED (fresh post-update): the TIME-FADED "↑ Updated to v<new>" arrow
+    ///   * STAGED: "↑ Install aterm v<staged> now" — ONE Enter installs in place (the
+    ///     owner's "click-upgrade" ask), the words the update row and the Version menu use;
+    ///   * REALIZED (fresh post-update): the TIME-FADED "↑ Updated to aterm v<new>" arrow
     ///     (activating it takes ApplyUpdate's nothing-staged fallback: the details
     ///     overlay — informative, never a blind restart);
     ///   * NEITHER: the row is REMOVED (a dead "update" command would be noise).
@@ -412,7 +411,7 @@ impl PaletteState {
             )))
         } else if let Some((v, since)) = &live.realized {
             self.realized_since = Some(*since);
-            Some(Cow::Owned(format!("\u{2191} Updated to v{v}")))
+            Some(Cow::Owned(format!("\u{2191} Updated to aterm v{v}")))
         } else {
             None
         };
@@ -580,7 +579,7 @@ impl PaletteState {
     }
 
     /// The paint alpha for `row` at `now`: `1.0` for every ordinary row; the REALIZED
-    /// "↑ Updated to v<new>" row fades per `relaunch_notice::realized_alpha` — computed
+    /// "↑ Updated to aterm v<new>" row fades per `relaunch_notice::realized_alpha` — computed
     /// at PAINT time (not snapshotted) so an OPEN palette steps down as the fingerprint's
     /// elapsed bucket advances. Frozen at full under `MotionPolicy::Reduced`.
     pub(crate) fn row_alpha(&self, row: &PaletteRow, now: Instant) -> f32 {
@@ -588,7 +587,7 @@ impl PaletteState {
             return 1.0;
         }
         let Some(since) = self.realized_since else {
-            return 1.0; // the staged "apply now" row never fades
+            return 1.0; // the staged "install now" row never fades
         };
         if self.realized_frozen {
             return 1.0;
@@ -2260,8 +2259,7 @@ mod tests {
     }
 
     /// STAGED (complaint 2, "click-upgrade"): resolve adds the one-click
-    /// "↑ Update to v<staged> — apply now, shells keep running" row at the HEAD of the
-    /// Version section,
+    /// "↑ Install aterm v<staged> now" row at the HEAD of the Version section,
     /// enabled, full-alpha, and activatable straight to `ApplyUpdate`.
     #[test]
     fn resolve_staged_adds_one_click_update_row() {
@@ -2282,10 +2280,7 @@ mod tests {
             .expect("staged resolve keeps the ApplyUpdate row");
         let row = &s.rows[i];
         assert_eq!(row.section, "Version");
-        assert_eq!(
-            row.label,
-            "\u{2191} Update to v9.9 \u{2014} apply now, shells keep running"
-        );
+        assert_eq!(row.label, "\u{2191} Install aterm v9.9 now");
         assert!(!row.label.contains("restart"), "{}", row.label);
         assert!(row.enabled, "one click must work");
         // It sits directly BEFORE the About row (head of the Version section).
@@ -2293,7 +2288,7 @@ mod tests {
         // The staged row never fades (it is not the realized arrow).
         assert_eq!(s.row_alpha(&s.rows[i], Instant::now()), 1.0);
         // Filtering to it and pressing Enter dispatches ApplyUpdate.
-        for c in "apply now".chars() {
+        for c in "install aterm".chars() {
             s.push_char(c);
         }
         assert_eq!(s.selected_action(), Some(MenuAction::ApplyUpdate));
@@ -2304,7 +2299,7 @@ mod tests {
         assert!(
             s.controls_lines()
                 .iter()
-                .any(|l| l.contains("action=ApplyUpdate") && l.contains("Update to v9.9")),
+                .any(|l| l.contains("action=ApplyUpdate") && l.contains("Install aterm v9.9")),
             "controls menu shows the staged row"
         );
     }
@@ -2350,7 +2345,7 @@ mod tests {
             .iter()
             .find(|r| r.action == MenuAction::ApplyUpdate)
             .expect("realized resolve keeps the row");
-        assert_eq!(row.label, "\u{2191} Updated to v9.9");
+        assert_eq!(row.label, "\u{2191} Updated to aterm v9.9");
         assert_eq!(s.row_alpha(row, now), 1.0, "full at spawn");
         let mid = s.row_alpha(row, now + REALIZED_ARROW_TTL / 2);
         assert!(mid > 0.0 && mid < 1.0, "mid-TTL alpha {mid}");
@@ -2385,7 +2380,7 @@ mod tests {
             .iter()
             .find(|r| r.action == MenuAction::ApplyUpdate)
             .unwrap();
-        assert!(row.label.contains("Update to v10.0"), "{:?}", row.label);
+        assert!(row.label.contains("Install aterm v10.0"), "{:?}", row.label);
     }
 
     /// The realized fade re-presents an OPEN palette: the fingerprint folds the ~30s

@@ -191,7 +191,9 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
 pub fn run_redraw_conformance() -> i32 {
     // First, because everything below is meaningless without a proxy — and because
     // the honest SKIP lives on this one error.
-    let mut event_loop = match EventLoop::<Wake>::with_user_event().build() {
+    // The quiet builder: this harness owns no window and must never take the
+    // keyboard from the developer the gate is running beside.
+    let mut event_loop = match crate::quiet_driver_event_loop_builder::<Wake>().build() {
         Ok(event_loop) => event_loop,
         Err(err) => {
             eprintln!("aterm-redraw-conformance: NOT RUN — no event loop here: {err}");

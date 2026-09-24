@@ -147,7 +147,7 @@
 //! * `ls`              — every session of every live instance, one line each:
 //!   `<pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
 //!   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
-//!   identity=<name|->[ *]` (the server's
+//!   identity=<name|-> path=<frozen|live>[ *]` (the server's
 //!   `sessions` line prefixed with the instance pid; `*` marks the calling
 //!   terminal's own session, from `$ATERM_PARENT_SESSION_ID`; the title is
 //!   pct-encoded and often mirrors the cwd via shell integration). The
@@ -331,9 +331,9 @@ PUSH FRAMES (subscribe):
       EVENT <local> <kind> ...   a lifecycle digest line — `turn <id> submitted=
                                  status= dur_ms=`, `block-complete <id> exit=<code|->`,
                                  `meta`, `title`, `bell total=<n>`, the fabric kinds
-                                 (`inbox`, `inbox-seen`, `post`, `post-landed`, `hold`),
+                                 (`inbox`, `inbox-seen`, `post`, `post-landed`, `hold`, `topic`),
                                  `closing reason= by=`, then `exited`; the `sessions`
-                                 stream adds `EVENT * session-created|session-exited`.
+                                 stream adds `EVENT * session-created|session-exited|fabric-retire`.
                                  `subscribe --help` prints the full contract.
       BYTES <local> <len>        then <len> RAW PTY bytes + a trailing newline.
       GAP <local> ...            a discontinuity marker: `bytes-dropped=<n>`
@@ -342,7 +342,9 @@ PUSH FRAMES (subscribe):
                                  snapshot / re-read with `screen`), or
                                  `events-resync=<floor>` (a `since-turn=` anchor
                                  older than the retained turn ledger; records
-                                 below <floor> are gone).
+                                 below <floor> are gone), or `events-dropped=<n>` (the
+                                 session's timeline evicted <n> records this watch
+                                 had not been shown).
 
 VERBS (generated from the protocol verb table — always current, cannot drift):
 ";
@@ -380,7 +382,7 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     ls            every session of every live instance, one per line:
                   <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
-                  identity=<name|->[ *]
+                  identity=<name|-> path=<frozen|live>[ *]
                   (* = the calling terminal's own session; window= is the
                   hosting window — a headless instance reports its one logical
                   window 0; none = a session no window holds; - = the instance
@@ -392,7 +394,13 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   before typing into a peer; identity= the agent identity the
                   session was spawned under (`spawn identity=<name>`: its
                   agents' own login, kept apart from the human's), - for the
-                  human's own agent config — `identities` lists them).
+                  human's own agent config — `identities` lists them; path=
+                  whether that session's shell fronts aterm's managed agents/
+                  on PATH: frozen = a shell adopted from a build older than
+                  2026-09-16 that never sourced the atpkg hook, so `claude`
+                  and `codex` typed there run the FOREIGN copies until
+                  `. ~/.aterm/shell.d/00-atpkg.zsh` is typed in it — an upper
+                  bound, since sourcing the hook is not reported back).
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
@@ -1024,14 +1032,12 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 /// THE FLAGLESS RESOLUTION, AS A LIBRARY ENTRY — for the other clients in this
 /// one binary that must find aterm the way `aterm ctl` does.
 ///
-/// `aterm link hook run` used to try `$ATERM_CONTROL_SOCK` and then
+/// aterm-link's clients used to try `$ATERM_CONTROL_SOCK` and then
 /// `$XDG_RUNTIME_DIR/aterm/aterm.sock`, and nothing else. An aterm child on
 /// macOS has NEITHER: it has `$ATERM_PARENT_SESSION_ID`, and the instance that
 /// hosts it is found through that session's graph entry in the rendezvous
-/// directory — the step this client has always taken and the hooks never did,
-/// so every hook installed on 2026-09-14 answered "no aterm control socket"
-/// from inside a live aterm session. One resolver, called by both, so the two
-/// cannot disagree again.
+/// directory — the step this client has always taken. One resolver, called by
+/// every client, so no two can disagree.
 ///
 /// The order is [`resolve_path`]'s: `$ATERM_CONTROL_SOCK` when it names a path
 /// (its `0`/`off` forms and `$ATERM_NO_CONTROL_SOCK` are a refusal, not a
@@ -1039,8 +1045,8 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 /// probed for a listener — [`self_instance_sock`]), then the `latest` alias
 /// `<dir>/aterm.sock` — and, when that alias is dead, the newest instance
 /// socket in the same directory that accepts a connect ([`flagless_target`]),
-/// so a hook inside a session whose own instance has gone is pointed at a live
-/// window rather than at nothing. Nothing is cached: a self-update relaunches aterm under
+/// so a client inside a session whose own instance has gone is pointed at a
+/// live window rather than at nothing. Nothing is cached: a self-update relaunches aterm under
 /// a new pid and a new socket name, and a caller that resolves on every run
 /// follows it.
 ///
@@ -1620,8 +1626,8 @@ fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
 /// The socket path [`resolve_target`] resolves, without how it was chosen. Two
 /// callers: the front door's resolution ([`front_door_instance`]), which
 /// forwards to the one instance its probe answers and so dials it as pinned
-/// ([`front_door_send`]), and the public [`resolve_sock_for`], which is what
-/// aterm-link's hooks resolve through.
+/// ([`front_door_send`]), and the public [`resolve_sock_for`], which the
+/// harness (`aterm harness`) resolves through.
 fn resolve_path(
     sock: Option<String>,
     pid: Option<u32>,
@@ -1718,10 +1724,11 @@ fn resolve_target(
 
 /// THE DEAD-`latest` FALLBACK: the flagless target when nothing pins one.
 ///
-/// `latest` (`<dir>/aterm.sock`) is the newest instance's alias, and the server
-/// maintains it in the FORWARD direction only: a newer instance repoints it at
-/// itself, and nothing ever hands it back to a survivor. When the instance it
-/// names goes away, the alias is dead in one of two ways:
+/// `latest` (`<dir>/aterm.sock`) is the newest instance's alias: a newer
+/// instance repoints it at itself, and apart from an update-handoff rollback,
+/// whose cleanup (aterm-gui's `HandoffWorkerCleanup::complete`) republishes the
+/// surviving parent, nothing hands it back to an older survivor. When the
+/// instance it names goes away, the alias is dead in one of two ways:
 ///
 /// * a graceful exit — `cleanup_socket` removes the link outright, so
 ///   `connect` on the alias reports `ENOENT`;
@@ -1850,23 +1857,46 @@ struct ProbeIo<'a> {
 
 impl Read for ProbeIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream
-            .set_read_timeout(Some(self.deadline.remaining()?))?;
+        armed(
+            self.stream
+                .set_read_timeout(Some(self.deadline.remaining()?)),
+        )?;
         Read::read(&mut self.stream, buf)
     }
 }
 
 impl Write for ProbeIo<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream
-            .set_write_timeout(Some(self.deadline.remaining()?))?;
+        armed(
+            self.stream
+                .set_write_timeout(Some(self.deadline.remaining()?)),
+        )?;
         Write::write(&mut self.stream, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stream
-            .set_write_timeout(Some(self.deadline.remaining()?))?;
+        armed(
+            self.stream
+                .set_write_timeout(Some(self.deadline.remaining()?)),
+        )?;
         Write::flush(&mut self.stream)
+    }
+}
+
+/// The outcome of arming a probe socket's timeout. macOS refuses every socket option
+/// (`EINVAL`) once the peer has closed the connection, though the bytes it sent are still
+/// buffered and nothing on the socket can block any more: there the syscall goes ahead
+/// unarmed, and reads the reply (or the end) instead of failing over it.
+fn armed(set: io::Result<()>) -> io::Result<()> {
+    match set {
+        Err(e)
+            if cfg!(target_vendor = "apple")
+                && e.kind() == io::ErrorKind::InvalidInput
+                && e.raw_os_error().is_some() =>
+        {
+            Ok(())
+        }
+        other => other,
     }
 }
 
@@ -1989,7 +2019,7 @@ fn shared_probe_connector() -> io::Result<&'static ProbeConnector> {
 /// found". Under Codex CLI's seatbelt that claim was FALSE: readdir found the
 /// sockets and `connect()` was refused with `EPERM` (finding F8). An agent that
 /// reads "empty" stops looking; one that reads "could not reach: Operation not
-/// permitted" asks for the socket allowance. So the probe classifies, and
+/// permitted" reports the sandbox and stops retrying. So the probe classifies, and
 /// [`discovery_report`] says which.
 #[derive(Debug)]
 enum Probe {
@@ -2925,7 +2955,7 @@ fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String
         msg.push_str("  ");
         msg.push_str(&probe_cause(*pid, probe));
     }
-    if let Some(hint) = dominant_hint(probes, in_dir) {
+    if let Some(hint) = dominant_hint(probes) {
         msg.push_str("\n  hint: ");
         msg.push_str(&hint);
     }
@@ -3045,46 +3075,15 @@ fn dominant_cause(probes: &[(u32, String, Probe)]) -> Option<Cause> {
     best.map(|(_, cause)| cause)
 }
 
-/// The ONE hint block for the dominant cause. For a denied connect the
-/// directories to allow are the parents of the sockets that were actually
-/// refused — each named once, in probe order — so the Codex flag can be pasted
-/// as printed and covers every refused socket: an explicit-`$ATERM_CONTROL_SOCK`
-/// instance publishes its socket outside the fleet directory (discovery finds it
-/// through `graph/<sid>`), and a hint that always named the fleet directory left
-/// that socket refused after the paste. The fleet directory is only the fallback
-/// for a socket path with no parent to name.
-fn dominant_hint(probes: &[(u32, String, Probe)], in_dir: Option<&Path>) -> Option<String> {
+/// The ONE hint block for the dominant cause. A denied connect is a sandbox
+/// doing its job: the hint names it and offers nothing to configure — no
+/// directory, no flag, no escalation (owner decision, 2026-09-22).
+fn dominant_hint(probes: &[(u32, String, Probe)]) -> Option<String> {
     let hint = match dominant_cause(probes)? {
-        Cause::Denied => {
-            let mut dirs: Vec<String> = Vec::new();
-            for (_, sock, probe) in probes {
-                if !matches!(probe, Probe::Denied(_)) {
-                    continue;
-                }
-                let Some(parent) = Path::new(sock)
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                else {
-                    continue;
-                };
-                let shown = parent.display().to_string();
-                if !dirs.contains(&shown) {
-                    dirs.push(shown);
-                }
-            }
-            if dirs.is_empty() {
-                dirs.push(in_dir.map(|d| d.display().to_string()).unwrap_or_default());
-            }
-            let flags: Vec<String> = dirs
-                .iter()
-                .map(|d| format!("--allow-unix-socket \"{d}\""))
-                .collect();
-            format!(
-                "inside Codex CLI run with {} or ask for the command to be escalated;\n        \
-                 `aterm ctl --sock <path> sessions` shows one socket's own answer",
-                flags.join(" ")
-            )
-        }
+        Cause::Denied => "the control socket is refused by this sandbox; aterm drives such a \
+                          session from outside and it takes no part in messaging — nothing \
+                          to configure"
+            .to_string(),
         Cause::NoToken => "the token beside a socket must be readable by THIS user (it is \
                            mode 0600); another user's instance cannot be driven"
             .to_string(),
@@ -4537,8 +4536,8 @@ fn oversized_reply_error() -> io::Error {
 /// The most continuation lines a refusal may carry past its first.
 ///
 /// A refusal is a HELP surface, so a handful of lines is the shape; the bound
-/// is here because the reply is peer-supplied and this is a terminal. Each line
-/// is already bounded by [`read_bounded_line`].
+/// is here because the reply is peer-supplied and this is a terminal. The drain
+/// checks each buffered line against [`MAX_LINE_BYTES`] before printing it.
 const REFUSAL_TAIL_MAX_LINES: usize = 16;
 
 /// Print whatever a refusal wrote after its first line — verbatim and
@@ -5155,6 +5154,32 @@ mod tests {
 
     #[cfg(unix)]
     static PROBE_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Leave at `path` what a crashed instance leaves: a socket FILE nobody accepts on —
+    /// bound, then dropped — and wait, bounded, until it refuses. A child another test is
+    /// spawning holds a copy of the dropped listener until it execs, and a listener has no
+    /// `LOCK_UN`: the file ACCEPTS until that copy goes (measured under a spawn storm,
+    /// 2026-09-23), and nothing may be judged over a crash state that is not real yet.
+    fn abandon_socket(path: &Path) {
+        drop(aterm_uds::CtlListener::bind(path).expect("bind then abandon"));
+        // The refusal is what the unix tests judge; elsewhere nothing waits for it.
+        if cfg!(not(unix)) {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let answer = CtlStream::connect(path).map(drop).map_err(|e| e.kind());
+            if answer == Err(io::ErrorKind::ConnectionRefused) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned socket {} still answers {answer:?} after 10 s",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn operator_proposal_limit_matches_the_server_protocol_bound() {
@@ -6558,6 +6583,14 @@ mod tests {
             help.contains("window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->"),
             "ls trailing columns documented"
         );
+        // `path=` (2026-09-22) is the LAST column and says which tab still runs
+        // the foreign `claude`/`codex` — the one fact the managed-current row's
+        // tab COUNT could not name.
+        assert!(
+            help.contains("identity=<name|-> path=<frozen|live>[ *]")
+                && help.contains("frozen = a shell adopted from a build older than"),
+            "ls documents path=frozen|live and what frozen means"
+        );
         assert!(
             help.contains("<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]"),
             "windows output shape documented"
@@ -6989,10 +7022,18 @@ mod tests {
         assert!(windows.contains("could not say"), "{windows}");
         let ls = client_help_reply(&strings(&["help", "ls"])).unwrap();
         assert!(ls.contains("detail=<pct|->"), "{ls}");
-        // The identity column (session identities) is the LAST one, before the
-        // self mark, and its meaning is spelled beside the others.
-        assert!(ls.contains("identity=<name|->[ *]"), "{ls}");
+        // The identity column (session identities) sits before `path=`
+        // (2026-09-22), which is the LAST one before the self mark; both
+        // meanings are spelled beside the others.
+        assert!(
+            ls.contains("identity=<name|-> path=<frozen|live>[ *]"),
+            "{ls}"
+        );
         assert!(ls.contains("`spawn identity=<name>`"), "{ls}");
+        assert!(
+            ls.contains("frozen = a shell adopted from a build older than"),
+            "{ls}"
+        );
         assert!(!ls.contains("instances     one line per"), "{ls}");
     }
 
@@ -7050,15 +7091,12 @@ mod tests {
         );
     }
 
-    /// The Codex allowance names the directory of every socket that was actually
-    /// refused, once each and in probe order — never a blanket fleet directory:
-    /// an explicit-`$ATERM_CONTROL_SOCK` instance publishes its socket elsewhere,
-    /// and a hint the agent pastes must cover that socket too.
+    /// A denied connect is named as the sandbox's refusal and nothing more: no
+    /// directory, no flag, no escalation — the sandbox is not worked around.
     #[test]
-    fn the_codex_hint_names_each_denied_directory_once() {
+    fn a_denied_connect_is_named_and_not_worked_around() {
         let probes = vec![
             (1, fleet_sock(1), Probe::Denied(eperm())),
-            (2, fleet_sock(2), Probe::Denied(eperm())),
             (
                 3,
                 "/private/tmp/agent/aterm-3.sock".to_string(),
@@ -7072,27 +7110,26 @@ mod tests {
                 },
             ),
         ];
-        let hint = dominant_hint(&probes, Some(Path::new(FLEET))).expect("denied dominates");
-        assert!(
-            hint.contains(&format!(
-                "--allow-unix-socket \"{FLEET}\" --allow-unix-socket \"/private/tmp/agent\""
-            )),
-            "{hint}"
+        let hint = dominant_hint(&probes).expect("denied dominates");
+        assert_eq!(
+            hint,
+            "the control socket is refused by this sandbox; aterm drives such a session from \
+             outside and it takes no part in messaging — nothing to configure"
         );
-        assert_eq!(hint.matches("--allow-unix-socket").count(), 2, "{hint}");
-        assert!(
-            !hint.contains("/elsewhere"),
-            "a refused (not denied) socket's dir is not offered: {hint}"
-        );
-        // A scoped probe (no fleet dir) names the denied socket's own parent.
+        for forbidden in [
+            "--allow-unix-socket",
+            "escalat",
+            "/private/tmp/agent",
+            FLEET,
+        ] {
+            assert!(!hint.contains(forbidden), "{forbidden}: {hint}");
+        }
         let scoped = vec![(
             6,
             "/tmp/run/aterm-6.sock".to_string(),
             Probe::Denied(eacces()),
         )];
-        let hint = dominant_hint(&scoped, None).unwrap();
-        assert!(hint.contains("--allow-unix-socket \"/tmp/run\""), "{hint}");
-        assert_eq!(hint.matches("--allow-unix-socket").count(), 1, "{hint}");
+        assert_eq!(dominant_hint(&scoped), Some(hint));
     }
 
     fn eperm() -> io::Error {
@@ -7215,11 +7252,14 @@ mod tests {
                     "found 2 control sockets in /Users//someone/Library/Application Support/aterm but could not reach any:",
                     "\n  aterm-10718.sock  connect: Operation not permitted (os error 1) — a sandbox is refusing AF_UNIX connect()",
                     "\n  aterm-10274.sock  connect: Connection refused — stale, pid 10274 is not running",
-                    "hint: inside Codex CLI run with --allow-unix-socket \"/Users//someone/Library/Application Support/aterm\"",
-                    "ask for the command to be escalated",
-                    "`aterm ctl --sock <path> sessions` shows one socket's own answer",
+                    "hint: the control socket is refused by this sandbox; aterm drives such a session from outside and it takes no part in messaging — nothing to configure",
                 ],
-                never_says: &[FLEET_CLAIM, "aterm isn't running"],
+                never_says: &[
+                    FLEET_CLAIM,
+                    "aterm isn't running",
+                    "--allow-unix-socket",
+                    "escalated",
+                ],
             },
             Row {
                 name: "token file unreadable → the server answers ERR auth",
@@ -7412,7 +7452,7 @@ mod tests {
                 never_says: &[FLEET_CLAIM],
             },
             Row {
-                name: "tie for the hint: one denied, one stale → the Codex allowance wins",
+                name: "tie for the hint: one denied, one stale → the sandbox refusal wins",
                 dir: DirOutcome::Scoped,
                 probes: vec![
                     (
@@ -7431,9 +7471,9 @@ mod tests {
                 code: EXIT_UNREACHABLE,
                 says: &[
                     "\n  /tmp/run/aterm-6.sock  connect: Permission denied (os error 13) — another user's socket, or a sandbox refusing AF_UNIX connect()",
-                    "hint: inside Codex CLI run with --allow-unix-socket \"/tmp/run\"",
+                    "hint: the control socket is refused by this sandbox;",
                 ],
-                never_says: &[FLEET_CLAIM, LAUNCH_REMEDY],
+                never_says: &[FLEET_CLAIM, LAUNCH_REMEDY, "--allow-unix-socket"],
             },
         ];
         for row in rows {
@@ -7697,8 +7737,9 @@ mod tests {
             let mut w = conn;
             w.write_all(reply).expect("write reply");
             w.flush().expect("flush");
-            w.shutdown(std::net::Shutdown::Write)
-                .expect("finish mock reply");
+            // The probe may already have read the whole reply and closed: then the
+            // half-close is ENOTCONN, and there is nothing left to finish.
+            let _ = w.shutdown(std::net::Shutdown::Write);
             let mut sink = Vec::new();
             let _ = r.read_to_end(&mut sink);
             line
@@ -7725,7 +7766,7 @@ mod tests {
         // Refused: a socket FILE with nobody accepting — bind, then drop the
         // listener; the file stays behind exactly like a crashed instance's.
         let stale = dir.join(control_socket::instance_sock_name(DEAD_PID));
-        drop(aterm_uds::CtlListener::bind(&stale).expect("bind then abandon"));
+        abandon_socket(&stale);
         let stale_s = stale.to_str().expect("utf8").to_string();
         assert!(matches!(
             probe_lines(&stale_s, "sessions", DEAD_PID),
@@ -7807,6 +7848,40 @@ mod tests {
         }
         srv.join().expect("mock");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reply the peer sent before it hung up is read, not lost: macOS refuses the
+    /// probe's per-read timeout (`EINVAL`) on a socket whose peer has closed, and the
+    /// probe reported that `Invalid argument` over the buffered answer — an `ERR auth`
+    /// then a close, or a hang-up read as InvalidInput rather than the end.
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_sent_before_the_peer_hung_up_is_read() {
+        use std::io::{BufRead, Write};
+        let _serial = PROBE_SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-hungup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("private dir");
+        let sock = dir.join("mock.sock");
+        let listener = aterm_uds::CtlListener::bind(&sock).expect("bind mock instance");
+        let srv = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            conn.write_all(b"ERR auth\n").expect("write reply");
+        });
+        let stream = CtlStream::connect(&sock).expect("connect");
+        srv.join().expect("the peer wrote and hung up");
+        let mut reader = BufReader::new(ProbeIo {
+            stream: &stream,
+            deadline: ProbeDeadline::after(std::time::Duration::from_secs(5)),
+        });
+        let mut line = String::new();
+        assert_eq!(reader.read_line(&mut line).expect("the buffered reply"), 9);
+        assert_eq!(line, "ERR auth\n");
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).expect("then the end"), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8040,7 +8115,7 @@ mod tests {
         // the file, exactly as after a crash — so the alias now names a socket
         // that refuses. Beside it, a live instance, and a live explicit-name
         // socket that must never be chosen.
-        drop(aterm_uds::CtlListener::bind(&corpse).expect("bind then abandon"));
+        abandon_socket(&corpse);
         #[cfg(unix)]
         assert_eq!(
             CtlStream::connect(&alias).map(drop).map_err(|e| e.kind()),

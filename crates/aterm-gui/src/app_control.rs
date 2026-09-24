@@ -232,6 +232,20 @@ impl App {
         if node.state.is_some_and(|state| !state.enabled) {
             return Err("semantic action is disabled".to_string());
         }
+        // The Security panel's buttons open System Settings, raise consent
+        // dialogs, clear saved answers and move copies of the app to the Trash.
+        // They are the owner's, pressed in the window; a program in a session
+        // must not be able to press them for the owner.
+        if node_action
+            .as_str()
+            .starts_with(crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX)
+        {
+            return Err(
+                "the macOS access buttons in Settings ▸ Security are owner gestures and are not \
+                 reachable from the control surface"
+                    .to_string(),
+            );
+        }
         let value = semantic_input(&node.role, &node.value, request.value.as_deref())?;
         let result = self.dispatch_native_view_event(
             wid,
@@ -1622,6 +1636,119 @@ mod tests {
             })
             .unwrap_err()
             .contains("does not match")
+        );
+    }
+
+    /// The Security panel's buttons are the owner's. `app act` refuses every
+    /// one of them before the reducer runs, while the same action dispatched as
+    /// a press still works, so the refusal is the fence and not an absent
+    /// button.
+    #[test]
+    fn the_security_panels_owner_gestures_are_refused_on_the_control_surface() {
+        use crate::native_settings::{
+            MACOS_ACCESS_ASK_AGAIN, MACOS_ACCESS_TRASH, MacosAccess, SettingsRoute,
+        };
+        use aterm_containment::consent::{Claimant, Claimants, DrClass, Enumeration, Folder};
+        let copy = |path: &str, dr_text: &str, running: bool| Claimant {
+            path: std::path::PathBuf::from(path),
+            dr: aterm_containment::consent::classify_dr(dr_text),
+            dr_text: dr_text.to_string(),
+            signing: if running { "developer-id" } else { "adhoc" },
+            team: None,
+            running,
+        };
+        let access = MacosAccess {
+            enabled: true,
+            dr: DrClass::Identity,
+            bundle_id: Some("com.example.fixture".to_string()),
+            tccutil: aterm_containment::TccutilPresence::Executable,
+            warmup_rows: vec![(Folder::Documents, crate::consent_warmup::WarmupRow::Denied)],
+            claimants: Some(Claimants {
+                found: vec![
+                    copy(
+                        "/A/x.app",
+                        "designated => identifier \"x\" and anchor apple generic and \
+                         certificate leaf[subject.OU] = \"T\"",
+                        true,
+                    ),
+                    copy("/A/x.app.rollback", "designated => cdhash H\"aa\"", false),
+                ],
+                enumeration: Enumeration::Complete,
+            }),
+            trash_tool: true,
+            ..MacosAccess::default()
+        };
+        let mut app = App::headless_for_test();
+        if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+            window.cols = 140;
+            window.rows = 100;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Security));
+        fn state(app: &mut App, view: ViewId) -> &mut crate::native_settings::SettingsViewState {
+            match app.native_runtime.view_state_mut(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => state,
+                _ => panic!("the Settings view is live"),
+            }
+        }
+        let wid = WindowId(0);
+        let (_, view) = app.active_native_view(wid).unwrap();
+        state(&mut app, view).replace_macos_access(access);
+
+        let controls = app
+            .inspect_app(InspectRequest::View {
+                view,
+                projection: InspectionProjection::Controls,
+            })
+            .unwrap();
+        for action in [MACOS_ACCESS_ASK_AGAIN, MACOS_ACCESS_TRASH] {
+            assert!(
+                controls
+                    .iter()
+                    .any(|line| line.contains(&format!("action={action}"))),
+                "the button is on the page, so the refusal is not vacuous: {controls:#?}"
+            );
+            let refused = app
+                .act_app(ActRequest {
+                    view,
+                    ui_key: action.to_string(),
+                    action: action.to_string(),
+                    value: None,
+                })
+                .unwrap_err();
+            assert!(refused.contains("owner gestures"), "{refused}");
+        }
+        let panel = state(&mut app, view);
+        assert!(
+            panel
+                .macos_access_for_test()
+                .is_some_and(|access| access.reset.is_none()),
+            "the refused Ask Again cleared nothing"
+        );
+        assert_eq!(panel.take_claimant_retire_request(), None);
+
+        // The owner's press, confirmed, reaches the same reducer.
+        state(&mut app, view)
+            .arm_consent_gestures(crate::native_settings::ConsentGestures::confirming());
+        for action in [MACOS_ACCESS_ASK_AGAIN, MACOS_ACCESS_TRASH] {
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(action),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        }
+        let panel = state(&mut app, view);
+        assert!(
+            panel
+                .macos_access_for_test()
+                .is_some_and(|access| access.reset.is_some())
+        );
+        assert_eq!(
+            panel.take_claimant_retire_request(),
+            Some(vec![std::path::PathBuf::from("/A/x.app.rollback")])
         );
     }
 

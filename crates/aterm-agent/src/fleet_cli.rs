@@ -150,15 +150,13 @@ fn ctl_bin() -> String {
     if let Ok(p) = std::env::var("ATERM_CTL") {
         return p;
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let sib = dir.join("aterm-ctl");
-        if sib.exists() {
-            return sib.to_string_lossy().into_owned();
-        }
-    }
-    "aterm-ctl".to_string()
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| crate::drive_cli::sibling_ctl(&exe))
+        .map_or_else(
+            || "aterm-ctl".to_string(),
+            |sib| sib.to_string_lossy().into_owned(),
+        )
 }
 
 /// A live session from the fleet listing — the `<pid> <local> <sid> …` row of

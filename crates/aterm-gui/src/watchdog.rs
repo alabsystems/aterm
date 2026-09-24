@@ -672,10 +672,14 @@ pub enum Phase {
     /// `App::ensure_pixel_backend` — a headless run's FIRST pixel demand
     /// redeeming, on the main thread, what the launch deferred: the font seal
     /// (three font files read and parsed; Apple Color Emoji is 190 MB of it
-    /// on macOS), the CPU face fork, and `GpuRenderer::new_with_family`. That
-    /// last leg is NOT just the device: `new_with_family` spawns a font
-    /// thread (`Renderer::from_system_with_family` — font resolution, file
-    /// read, parse — then `prewarm_ascii`), builds the GPU context on the
+    /// on macOS), the chrome re-sync that follows it (`sync_chrome_fonts`:
+    /// the chrome rasterizer's faces handed over again and its semantic
+    /// surface re-forked from the sealed generation — not those three files,
+    /// so the redemption's line times it as a leg of its own), the CPU face
+    /// fork, and `GpuRenderer::new_with_family`. That last leg is NOT just
+    /// the device: `new_with_family` spawns a font thread
+    /// (`Renderer::from_system_with_family` — font resolution, file read,
+    /// parse — then `prewarm_ascii`), builds the GPU context on the
     /// calling thread, JOINS the font thread, and only then calls
     /// `from_parts`, so the leg costs max(context, font thread) plus
     /// `from_parts`. On the wgpu arms the context is the instance, the
@@ -701,13 +705,14 @@ pub enum Phase {
     /// 14:29:40.7 (the file's last write; that line is written AFTER
     /// `new_with_family` returns) and whose capture PNG was created at
     /// 14:29:41.7. So the last heartbeat (14:29:31.4) and the whole reported
-    /// window lie BEFORE that device line: in the seal, the fork and the
-    /// `new_with_family` legs, ~9 s in all, of a ~10 s capture. Which of the
-    /// three, and inside the third whether the device name or the font
-    /// thread, is what the log line's legs exist to say next time. That
-    /// instance predates `Device::preferred`: its `GpuContext::new` and its
-    /// `MetalArmLive::new` both took `MTLCreateSystemDefaultDevice`, the
-    /// call Apple documents as switching a dual-GPU Mac to the discrete GPU.
+    /// window lie BEFORE that device line: in the seal, the chrome re-sync,
+    /// the fork and the `new_with_family` legs, ~9 s in all, of a ~10 s
+    /// capture. Which of them, and inside the last whether the device name
+    /// or the font thread, is what the log line's legs exist to say next
+    /// time. That instance predates `Device::preferred`: its
+    /// `GpuContext::new` and its `MetalArmLive::new` both took
+    /// `MTLCreateSystemDefaultDevice`, the call Apple documents as switching
+    /// a dual-GPU Mac to the discrete GPU.
     /// So aterm's first call that could set off a switch to the Radeon was
     /// here, in the device leg; the first-frame mint made a second one, in
     /// the 945 ms tail (see [`Phase::ImageCapture`]), after `GpuContext::new`
@@ -717,8 +722,10 @@ pub enum Phase {
     /// other one is inside `NewEvents`). The surviving re-measurements
     /// (that evening, debug build, on the Intel HD Graphics
     /// 630, with a test build running alongside) put the redemption at
-    /// 509-533 ms: font seal 488-510 ms, fork 0, `new_with_family` 21-22 ms,
-    /// install 0.
+    /// 509-533 ms: 488-510 ms in the seal and the chrome re-sync together
+    /// (that build's line timed the two as one `font seal` leg, so how the
+    /// figure divides between them is not known), fork 0, `new_with_family`
+    /// 21-22 ms, install 0.
     PixelBackendRedeem = 1,
     /// `App::render_image` — the `image` verb's capture on the main thread,
     /// the control verb the 2026-09-06 stall was inside. Not the only verb
@@ -726,10 +733,11 @@ pub enum Phase {
     /// loop and the SIGUSR1 `snapshot` path render on the main thread too,
     /// and announce nothing but the redemption they nest — but the one that
     /// finding named. Headless, when a capture is the run's first pixel
-    /// demand, the redemption above is nested in it, and on macOS that
-    /// capture also mints the Metal device, its command queue and
-    /// `cell.metal`, then demand-builds the three pipelines the first frame
-    /// binds — the shader-cache-sensitive work. The device is
+    /// demand, the redemption above is nested in it, and on macOS, when the
+    /// run has a GPU intent (not `--cpu`), that capture also mints the Metal
+    /// device, its command queue and `cell.metal`, then demand-builds the
+    /// three pipelines the first frame binds — the shader-cache-sensitive
+    /// work. The device is
     /// `Device::preferred`'s pick: the low-power GPU of a dual-GPU Mac,
     /// unless `ATERM_GPU_POWER=high` asks for the system default, which on
     /// such a Mac is the discrete GPU. On that pick the naming in
@@ -752,7 +760,8 @@ pub enum Phase {
     /// timed the mint alone, and the stall line's wording cites no figure.
     /// The surviving in-situ line from this phase is the debug watchdog's
     /// 504 ms `in an \`image\` capture` on the Intel GPU that evening — a
-    /// 509 ms redemption (font seal 488 ms) with the capture around it,
+    /// 509 ms redemption (488 ms of it the seal and the chrome re-sync, timed
+    /// as one) with the capture around it,
     /// under a concurrent test build, named as the capture because the
     /// phase is read at the report and the redemption had logged its own
     /// line 166 ms earlier. Nothing was building at 14:29 (the release
@@ -777,12 +786,12 @@ impl Phase {
         match self {
             Phase::None => "",
             Phase::PixelBackendRedeem => {
-                "the headless pixel-backend redemption (the deferred font seal, the face \
-                 fork, and the GPU context with its font thread)"
+                "the headless pixel-backend redemption (the deferred font seal and its chrome \
+                 re-sync, the face fork, and the GPU context with its font thread)"
             }
             Phase::ImageCapture => {
-                "an `image` capture (headless, the first one also mints the GPU device and \
-                 compiles its shaders)"
+                "an `image` capture (headless with a GPU intent, the capture that is the run's \
+                 first pixel demand also mints the GPU device and compiles its shaders)"
             }
         }
     }
@@ -1180,6 +1189,10 @@ mod tests {
             line.contains("the GPU context with its font thread)"),
             "{line}"
         );
+        assert!(
+            line.contains("(the deferred font seal and its chrome re-sync, the face fork,"),
+            "the re-sync is named, not folded into the seal: {line}"
+        );
         let bare = stall_message(
             1,
             Duration::from_secs(1),
@@ -1199,15 +1212,19 @@ mod tests {
         assert!(
             again.starts_with(
                 "MAIN-THREAD STALL CONTINUES: still no heartbeat after 103s inside \
-                 `NewEvents`, in an `image` capture (headless, the first one also mints \
-                 the GPU device"
+                 `NewEvents`, in an `image` capture (headless with a GPU intent, the capture \
+                 that is the run's first pixel demand"
             ),
-            "{again}"
+            "only the run's first pixel demand, and only with a device to mint: {again}"
         );
         assert!(
-            again.ends_with("compiles its shaders) — this is a wedge, not a slow frame."),
+            again.ends_with(
+                "first pixel demand also mints the GPU device and compiles its shaders) — this \
+                 is a wedge, not a slow frame."
+            ),
             "the mechanism, and no figure: {again}"
         );
+        assert!(!again.contains("the first one"), "{again}");
         assert!(!again.contains("up to a second"), "{again}");
     }
 

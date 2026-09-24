@@ -27,7 +27,9 @@ use crate::{SessionCtx, term_lock};
 
 /// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per
 /// session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0>
-/// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> identity=<name|->`.
+/// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> identity=<name|->
+/// path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|->
+/// agent_rev=<n> agent_since_ms=<ms>`.
 /// On a single-session window this is exactly one line == the lone session (the
 /// zero-regression base case). The store snapshot is cloned out before formatting,
 /// so this never holds the registry lock across a `Terminal` lock.
@@ -50,13 +52,35 @@ use crate::{SessionCtx, term_lock};
 /// the same [`crate::session_status::executing_detail`] the `status` record
 /// carries, read under a per-session `try_lock` (`-` when contended or idle).
 ///
-/// `identity=<name|->` (session identities, 2026-09-17) is the LAST column: the
-/// agent identity the session was spawned under (`SessionHandle::identity`,
-/// spawn-time and immutable — `spawn identity=<name>`), `-` for the human's own
-/// agent config, and for a shell adopted from a build without the field, which
-/// keeps its env and drops the label. Additive like every column before it:
-/// aterm-ctl's `roster_tail` reads the tail by key back to `meta=`, so `ls` and
-/// `windows` need no change, and the `identities` verb explains the names.
+/// `identity=<name|->` (session identities, 2026-09-17): the agent identity the
+/// session was spawned under (`SessionHandle::identity`, spawn-time and
+/// immutable — `spawn identity=<name>`), `-` for the human's own agent config,
+/// and for a shell adopted from a build without the field, which keeps its env
+/// and drops the label. Additive like every column before it: aterm-ctl's
+/// `roster_tail` reads the tail by key back to `meta=`, so `ls` and `windows`
+/// need no change, and the `identities` verb explains the names.
+///
+/// `program= agent= agent_detail= agent_rev= agent_since_ms=` (2026-09-23) come
+/// LAST, after `path=`: the argv[0] basename of the PTY's foreground group
+/// leader and the server's agent verdict on the screen, exactly as `status`
+/// prints them (see the `status` catalog row) — read from the session
+/// timeline the status sweep publishes to, so `-` until the sweep has seen the
+/// session and `agent=-` for anything that is not an identified agent.
+///
+/// `path=<frozen|live>` (2026-09-22) was the last column until then: whether the session's
+/// shell fronts aterm's managed `agents/` on PATH. `frozen` is the registry's
+/// adoption mark ([`crate::session_store::SessionStore::has_frozen_path`]): a
+/// shell spawned by a build before the self-healing sessions (2026-09-16) and
+/// carried across every update since, so `claude`/`codex` typed in it run the
+/// foreign copies until `. ~/.aterm/shell.d/00-atpkg.zsh` is typed there. It is
+/// an UPPER BOUND, the same one the managed-current row's "N tab(s) from before
+/// this update" count is: sourcing the hook is not reported back by the shell,
+/// so the mark leaves with the tab. Until this column, that count named no tab —
+/// an agent reading the roster could not tell WHICH session still ran the
+/// native `claude` without running `pkg doctor` inside each one (measured
+/// 2026-09-22: a tab from 2026-09-10, adopted through six updates, had run the
+/// foreign copy for twelve days with every roster surface green). Read under
+/// the same registry guard the snapshot is taken under, so the two agree.
 pub(crate) fn cmd_sessions(
     _self_ctx: &SessionCtx,
     store: &Store,
@@ -70,9 +94,17 @@ pub(crate) fn cmd_sessions(
 /// only where there is no event loop to ask (a worker-thread test): the window
 /// columns then read `-`, never a guess.
 pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
-    let snapshot = {
+    // The frozen-path marks are read under the SAME guard as the snapshot, so a
+    // session cannot be listed with a mark taken from a different registry state.
+    let (snapshot, frozen) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
-        g.snapshot()
+        let snapshot = g.snapshot();
+        let frozen: std::collections::HashSet<u64> = snapshot
+            .iter()
+            .filter(|h| g.has_frozen_path(h.local_id))
+            .map(|h| h.local_id)
+            .collect();
+        (snapshot, frozen)
     };
     // An empty roster needs no window rows; skipping the hop keeps `OK 0` as
     // cheap as it was, and answerable before the event loop is up.
@@ -81,7 +113,20 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
     } else {
         session_window_rows(proxy)
     };
-    sessions_lines(&snapshot, rows.as_deref().map_err(|e| *e))
+    sessions_lines(&snapshot, rows.as_deref().map_err(|e| *e), |id| {
+        frozen.contains(&id)
+    })
+}
+
+/// `sessions status`: a Lines-framed roster of the status fields the Fabric
+/// bridge consumes, including the server's agent verdict. One wake replaces one
+/// wake per hosted session on each bridge roster round. The bridge validates
+/// every row's sid and launch nonce against its own preceding `sessions` read.
+pub(crate) fn cmd_sessions_status(proxy: &EventLoopProxy<Wake>) -> String {
+    match super::control_media::call_main(proxy, |reply| Wake::ReadSessionStatuses { reply }) {
+        Ok(rows) => rows,
+        Err(e) => format!("ERR {e}\n"),
+    }
 }
 
 /// The placement hop's deadline: SHORT on purpose. `sessions`/`ls` is read by
@@ -141,10 +186,13 @@ fn session_detail(h: &SessionHandle) -> Option<String> {
 /// The `sessions` wire body for `snapshot`: the store columns, then the
 /// placement columns from `rows` — or `-` for all three window columns when the
 /// rows could not be read (`Err`), with every line still printed. `detail=` is
-/// the engine's, so it is answered either way.
+/// the engine's, so it is answered either way. `frozen_path` answers the
+/// registry's adoption mark per local id (`path=frozen` when true) — a
+/// registry fact, so it is answered either way too.
 pub(crate) fn sessions_lines(
     snapshot: &[SessionHandle],
     rows: Result<&[SessionWindowRow], &str>,
+    frozen_path: impl Fn(u64) -> bool,
 ) -> String {
     let mut out = format!("OK {}\n", snapshot.len());
     for h in snapshot {
@@ -188,9 +236,35 @@ pub(crate) fn sessions_lines(
             .identity
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
+        let path = if frozen_path(h.local_id) {
+            "frozen"
+        } else {
+            "live"
+        };
+        // THE PROGRAM AND THE AGENT VERDICT, after `path=`: the status sweep's
+        // publication on the session timeline (a leaf lock, no hop), the same
+        // five fields `status` prints — so a fleet read names every agent tab
+        // and what it waits on, adopted tabs included.
+        let agent = h
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent()
+            .wire_fields();
+        // `supervisor=<holder|->` LAST: the live supervisor claim, so a fleet
+        // read shows which agent tabs something is answering for.
+        let supervisor = h
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_supervisor(crate::metrics::now_us())
+            .map_or_else(|| "-".to_string(), pct_encode);
         out.push_str(&format!(
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
-             wfocus={wfocus} detail={detail} identity={identity}\n",
+             wfocus={wfocus} detail={detail} identity={identity} path={path} {agent} \
+             supervisor={supervisor}\n",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -205,8 +279,12 @@ pub(crate) fn sessions_lines(
 /// `who` -> the PRESENCE readout for the whole instance: one line per session
 /// naming who is DRIVING it and how many peers are WATCHING it, so a human or an
 /// orchestrator can always see the hand and the eye on a fleet. Framed `OK <n>`
-/// then one `<local> <sid> driving=<turn-id|-> watchers=<n> turns=<n> <state>`
-/// line per session (sorted by local id, like `sessions`). `driving` is the
+/// then one `<local> <sid> driving=<turn-id|-> watchers=<n> turns=<n> <state>
+/// nonce=<hex32> fgpgid=<pid|->` line per session (sorted by local id, like
+/// `sessions`). The
+/// public launch nonce comes from the SAME registry snapshot as the sid, so a
+/// client that keys on a launch can read it here without asking the
+/// `sessions` roster for a window-placement hop. `driving` is the
 /// session's live TURN LEASE (`Some(id)` while a `turn` is mid-flight, `-` when
 /// idle — the one-driver-per-session mutex); `watchers` is the live `subscribe`
 /// count on that session; `turns` is its ledger depth. Owner-only + self-scoped
@@ -217,14 +295,30 @@ pub(crate) fn sessions_lines(
 /// session's OWN in-flight `turn` (it registers a settle-watcher while running),
 /// so a session being driven reads `driving=<id> watchers>=1`. That is honest —
 /// the driver is watching for the reply — not double-counting an external peer.
+/// `fgpgid` is the PTY master's foreground process group, or `-` when the
+/// kernel cannot read it. The harness's upgrade sweep (`upgrade_drive`'s host
+/// roster) pairs it with a Claude process's own
+/// group and controlling-terminal foreground group; unlike the process's
+/// environment, these kernel identities remain readable on macOS.
 pub(crate) fn cmd_who(store: &Store, subscribers: &crate::subscribe::Subscribers) -> String {
     let snapshot = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         g.snapshot()
     };
+    // An OS probe must never hold the registry or subscriber mutex. Masters
+    // belong to the cloned handles; a concurrently closed one simply reads -.
+    let foreground_groups: Vec<i32> = snapshot
+        .iter()
+        .map(|h| crate::quit_safety::foreground_pgrp(h.master))
+        .collect();
     let subs = subscribers.lock().unwrap_or_else(|p| p.into_inner());
     let mut out = format!("OK {}\n", snapshot.len());
-    for h in &snapshot {
+    for (h, fgpgid) in snapshot.iter().zip(foreground_groups) {
+        let fgpgid = if fgpgid > 0 {
+            fgpgid.to_string()
+        } else {
+            "-".to_string()
+        };
         let driving = h
             .ctx
             .turn_lease
@@ -236,10 +330,11 @@ pub(crate) fn cmd_who(store: &Store, subscribers: &crate::subscribe::Subscribers
         let watchers = subs.watchers(h.local_id);
         let turns = h.ctx.turns.lock().unwrap_or_else(|p| p.into_inner()).len();
         out.push_str(&format!(
-            "{} {} driving={driving} watchers={watchers} turns={turns} {}\n",
+            "{} {} driving={driving} watchers={watchers} turns={turns} {} nonce={nonce} fgpgid={fgpgid}\n",
             h.local_id,
             h.sid.as_str(),
             h.state.as_str(),
+            nonce = h.nonce.to_hex(),
         ));
     }
     out
@@ -794,7 +889,8 @@ pub(crate) fn cmd_await(
     use crate::subscribe::SubscriberSet;
 
     const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|\
-                         gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>]> \
+                         gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>]|\
+                         agent <word>[,<word>...]> \
                          [timeout <ms>] | await consent [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
 
     // Split off an optional `timeout <ms>` anywhere in the args; the rest is the
@@ -829,6 +925,17 @@ pub(crate) fn cmd_await(
     // because that arm arms its watcher UNDER the terminal lock.
     if kind == "inbox" {
         return crate::fabric::cmd_await_inbox(ctx, &args[1..], timeout_ms);
+    }
+
+    // `await agent <word>[,<word>…]` parks on the SERVER'S published agent
+    // verdict (`status agent=`), not on the screen: no watcher is armed and no
+    // terminal lock is taken. LATCHED — a verdict already in the set answers at
+    // once — and woken by the sweep's own notify when the verdict moves.
+    if kind == "agent" {
+        let Some(words) = args.get(1).and_then(|w| parse_agent_words(w)) else {
+            return USAGE.to_string();
+        };
+        return await_agent(store, session, ctx, &words, timeout_ms, subscribers);
     }
 
     let now0 = Instant::now();
@@ -962,6 +1069,129 @@ pub(crate) fn cmd_await(
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
         let _ = sub.wait(dur);
+    }
+}
+
+/// The words `await agent` accepts — `status agent=`'s vocabulary, the walls
+/// aside.
+const AGENT_WORDS: [&str; 7] = [
+    "busy", "prompt", "question", "idle", "survey", "unknown", "-",
+];
+
+/// One `await agent` word: a verdict of [`AGENT_WORDS`], or a WALL —
+/// `wall` for any `wall:<kind>` verdict, `wall:<kind>` for that one (the
+/// kinds are `aterm_phase::WallKind::name`'s: `usage-session`,
+/// `usage-weekly`, `model-bucket`, `spend`, `context`, `auth`, `api-error`,
+/// `overloaded`). A `<kind>` of the right shape that no wall carries parks to
+/// its timeout rather than being refused: a newer reader may name one this
+/// build does not. `limited` is kept as a DEPRECATED alias for the limit
+/// walls ([`crate::presence::wall_kind_is_limit`]: the usage windows, a model
+/// bucket, spend) — the verdict word it awaited before the walls were named,
+/// so a script written against it still latches where it used to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentWord {
+    /// One of [`AGENT_WORDS`].
+    Verdict(&'static str),
+    /// `wall` (`None`) or `wall:<kind>`.
+    Wall(Option<String>),
+    /// The deprecated `limited`: any limit wall.
+    Limited,
+}
+
+impl AgentWord {
+    fn matches(&self, word: &str) -> bool {
+        match self {
+            Self::Verdict(w) => *w == word,
+            Self::Wall(None) => word.starts_with("wall:"),
+            Self::Wall(Some(kind)) => word.strip_prefix("wall:") == Some(kind.as_str()),
+            Self::Limited => word
+                .strip_prefix("wall:")
+                .is_some_and(crate::presence::wall_kind_is_limit),
+        }
+    }
+}
+
+/// `prompt,question,wall:rate` → the words, each checked against
+/// [`AGENT_WORDS`] or the wall shape (a `<kind>` of 1..=32 bytes of
+/// `[a-z0-9_-]`); `None` for an empty list or an unknown word (a typo must
+/// not wait out the timeout).
+fn parse_agent_words(list: &str) -> Option<Vec<AgentWord>> {
+    let mut out = Vec::new();
+    for w in list.split(',') {
+        let word = if w == "wall" {
+            AgentWord::Wall(None)
+        } else if w == "limited" {
+            AgentWord::Limited
+        } else if let Some(kind) = w.strip_prefix("wall:") {
+            let ok = (1..=32).contains(&kind.len())
+                && kind.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                });
+            if !ok {
+                return None;
+            }
+            AgentWord::Wall(Some(kind.to_string()))
+        } else {
+            AgentWord::Verdict(AGENT_WORDS.iter().find(|k| **k == w)?)
+        };
+        out.push(word);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `await agent`: answer `OK agent <word> rev=<n>` the moment the session's
+/// published verdict is one of `words` (at once if it already is), `OK
+/// timeout` at the deadline, `ERR exited` when the session ends. Parks on the
+/// session's subscriber slot, which the status sweep notifies when it
+/// publishes a new verdict.
+fn await_agent(
+    store: &Store,
+    session: u64,
+    ctx: &SessionCtx,
+    words: &[AgentWord],
+    timeout_ms: u64,
+    subscribers: &crate::subscribe::Subscribers,
+) -> String {
+    use std::time::{Duration, Instant};
+
+    use crate::session_store::SessionState;
+    use crate::subscribe::SubscriberSet;
+
+    let overall = Instant::now() + Duration::from_millis(timeout_ms);
+    let sub = SubscriberSet::register(subscribers, &[session]);
+    let was_registered = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_local(session)
+        .is_some();
+    loop {
+        let (word, rev) = {
+            let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (tl.agent().word, tl.agent().rev)
+        };
+        if words.iter().any(|w| w.matches(word)) {
+            return format!("OK agent {word} rev={rev}\n");
+        }
+        let gone = {
+            let g = store.read().unwrap_or_else(|p| p.into_inner());
+            match g.by_local(session).map(|h| h.state) {
+                Some(SessionState::Exited) => true,
+                None => was_registered,
+                _ => false,
+            }
+        };
+        if gone {
+            return "ERR exited\n".to_string();
+        }
+        let now = Instant::now();
+        if now >= overall {
+            return "OK timeout\n".to_string();
+        }
+        let _ = sub.wait(
+            overall
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1)),
+        );
     }
 }
 
@@ -1383,7 +1613,7 @@ pub(crate) fn cmd_await_momentum(
     }
 }
 
-/// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>|gone:<re>]
+/// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>]
 /// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>]
 /// [yield=<floor>] <text>` — one complete HUMAN
 /// TURN against the target session: type `<text>`, submit it with a real keypress,
@@ -1461,6 +1691,20 @@ pub(crate) fn cmd_await_momentum(
 /// chip already sitting in the target's editor); `submit=none` skips the press
 /// (type-only). `ERR exited` if the target dies at any phase.
 ///
+/// THE GUARDED SUBMIT. `submit=guarded:<re>` submits with Enter, and presses it
+/// only while the row holding the CURSOR still matches `<re>` — checked and
+/// written under ONE terminal lock hold, the `key if=` delivery — so a driver
+/// that typed into a composer does not submit into whatever replaced it (an
+/// approval box that arrived during the paste settle). The cursor row because
+/// that is where a submit lands: a transcript row above the box can match the
+/// composer's pattern too (see [`guarded_submit`]). A miss on the FIRST press
+/// types the text and submits nothing: `OK 0 turn skipped reason=guard
+/// submitted=0 seq=<n> id=<n>`, zero rows, the verb's Lines framing. A miss on
+/// a RE-press ends the presses and the turn reports the first press by its
+/// verification, as ever. A guarded turn's verdict also carries `pressed=<n>`,
+/// the Enters actually written: `submitted=0 pressed=1` is an Enter that WAS
+/// written and not verified — not "no Enter", and not a turn to retry blindly.
+///
 /// THE EVEN HAND (RAINBOW-KITTY-V2.md §28). A plain turn is a PASTE: one
 /// event, no keystroke behind any cell, so it lays no ribbon, earns no
 /// stardust and steps no melody — every light has a keystroke behind it, and
@@ -1505,6 +1749,72 @@ pub(crate) fn cmd_turn(
     )
 }
 
+/// What one `submit=guarded:<re>` press decided.
+enum GuardedSubmit {
+    /// The guard matched and Enter was written in full.
+    Pressed,
+    /// The cursor's row did not match the guard: nothing was written.
+    Missed,
+    /// The write itself failed — the verb's reply, already worded.
+    Failed(String),
+}
+
+/// One guarded submit press: Enter, only while the CURSOR's row matches
+/// `guard`, through [`super::control_input::input_if_fenced`] (check and write
+/// under one terminal lock hold, the immediate non-parking write). The cursor
+/// row, not any row: Claude Code draws every earlier prompt in its transcript
+/// with the composer's `❯` at column 0, so an any-row `^❯` still matched with
+/// an approval box up and its Enter chose the focused `❯ 1. Yes` (measured live
+/// on a private headless aterm). A composer holds the cursor; the box does not.
+/// A sink that takes zero bytes right now (the typed text's own paste still
+/// draining ahead of it) is retried every few milliseconds until `window` — the
+/// press has not happened yet, so a retry cannot double it; the guard is asked
+/// again each time.
+///
+/// ORDERING, stated rather than enforced: the text went through the App input
+/// seam (`PasteFraming::AtDrain`) and this Enter goes straight to the target's
+/// sink on the control thread. It follows the text because the caller presses
+/// only after the echo settled (the text was on screen, so its bytes were
+/// written), and because the immediate write refuses — `BusyZero`, retried
+/// here — while any spilled frame is still queued ahead of it. The one gap is
+/// the echo CAP: a target that never goes echo-quiet within it is pressed
+/// anyway, and if the seam had not yet written the text by then, this Enter
+/// would precede it. The guard still decides on the live screen either way.
+fn guarded_submit(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    guard: &dyn aterm_core::terminal::RowMatch,
+    window: std::time::Instant,
+) -> GuardedSubmit {
+    use super::control_input::GuardedInput;
+    use crate::input::Delivery;
+    const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+    loop {
+        let Some(enter) = crate::control::parse_key("enter") else {
+            return GuardedSubmit::Failed("ERR internal: `enter` did not parse\n".to_string());
+        };
+        let fence = super::control_input::InputFence {
+            guard: Some(guard),
+            guard_at_cursor: true,
+            ..super::control_input::InputFence::default()
+        };
+        match super::control_input::input_if_fenced(term, ctx, enter, &fence) {
+            GuardedInput::Pressed(Delivery::Full | Delivery::FullAt { .. }) => {
+                return GuardedSubmit::Pressed;
+            }
+            GuardedInput::Skipped | GuardedInput::Changed => return GuardedSubmit::Missed,
+            GuardedInput::Pressed(Delivery::BusyZero | Delivery::ConflictZero)
+                if std::time::Instant::now() < window =>
+            {
+                std::thread::sleep(BUSY_RETRY);
+            }
+            decision @ GuardedInput::Pressed(_) => {
+                return GuardedSubmit::Failed(super::control_input::guarded_input_reply(decision));
+            }
+        }
+    }
+}
+
 /// `turn` with last-moment validation hooks. `preflight` runs after the exclusive
 /// turn lease is held and before any watcher is armed or input is emitted.
 /// `pre_submit` runs after paste echo-settle and immediately before every submit
@@ -1531,7 +1841,7 @@ pub(crate) fn cmd_turn_guarded(
     use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [yield=<floor>] <text>\n";
+    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [yield=<floor>] <text>\n";
     /// Echo-settle window: the paste burst has been ingested and painted.
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
     /// Echo phase cap — a busy app (spinner mid-turn) may never go echo-quiet;
@@ -1542,6 +1852,11 @@ pub(crate) fn cmd_turn_guarded(
     let mut idle_ms = 1_500u64;
     let mut timeout_ms = 240_000u64;
     let mut submit = "enter".to_string();
+    // `submit=guarded:<re>`: the submit is Enter, pressed only while the
+    // cursor's row still matches `<re>` — checked and written under one
+    // terminal lock hold (`control_input::input_if_fenced`). None => an
+    // ordinary press.
+    let mut submit_guard: Option<String> = None;
     // Submit-verification knobs: `submit_window` is how long one press has to move
     // `content_seq` before a re-press; `presses` is the max total presses.
     // `presses=1` disables re-press for slow/high-latency links where a duplicate
@@ -1590,7 +1905,17 @@ pub(crate) fn cmd_turn_guarded(
                 Ok(ms) => timeout_ms = ms,
                 Err(_) => return USAGE.to_string(),
             },
-            "submit" => submit = v.to_string(),
+            "submit" => match v.strip_prefix("guarded:") {
+                Some("") => return USAGE.to_string(),
+                Some(pat) => {
+                    submit = "enter".to_string();
+                    submit_guard = Some(pat.to_string());
+                }
+                None => {
+                    submit = v.to_string();
+                    submit_guard = None;
+                }
+            },
             "submit_window" => match v.parse::<u64>() {
                 Ok(ms) => submit_window_ms = ms.clamp(1, 600_000),
                 Err(_) => return USAGE.to_string(),
@@ -1648,6 +1973,12 @@ pub(crate) fn cmd_turn_guarded(
             Err(_) => return "ERR badregex\n".to_string(),
         },
         None => None,
+    };
+    // The `submit=guarded:<re>` guard, compiled on the same terms and for the
+    // same reason: a bad pattern must fail before anything is typed.
+    let submit_matcher = match super::control_input::compile_guard(submit_guard.as_deref()) {
+        Ok(m) => m,
+        Err(reply) => return reply,
     };
 
     // ── turn LEASE: one driver per session at a time. Acquire-or-busy under the
@@ -1838,6 +2169,8 @@ pub(crate) fn cmd_turn_guarded(
     // `submitted` reports "a press VERIFIABLY landed": with `submit=none` there
     // is no press, so it stays 0 (honest) while the settle phase still runs.
     let mut submitted = false;
+    // Enters the guarded submit actually wrote (`pressed=` on its verdict).
+    let mut guarded_presses = 0u32;
     if submit != "none" {
         // EFFECTIVE verification mode. Explicit `submit_verify=` wins; otherwise AUTO:
         // `block` when the target is at a shell prompt (a submit will start a command,
@@ -1864,7 +2197,7 @@ pub(crate) fn cmd_turn_guarded(
                 .filter(|b| matches!(b.state, BlockState::Executing | BlockState::Complete))
                 .count()
         };
-        for _ in 0..presses {
+        for press_no in 0..presses {
             let base_block = commands_started(&term_lock(term));
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
             // Arm BEFORE the press so the press's own content change latches it
@@ -1882,7 +2215,36 @@ pub(crate) fn cmd_turn_guarded(
                 let error = error.trim_end_matches(['\r', '\n']);
                 return format!("ERR {error}\n");
             }
-            if !(io.press)(&submit) {
+            if let Some(guard) = submit_matcher.as_deref() {
+                // THE GUARDED SUBMIT: Enter only while `<re>` still matches,
+                // decided and written under one terminal lock hold, on the
+                // control thread against this target's own `(term, sink)` —
+                // the `key if=` arm's delivery, whichever route typed the text.
+                match guarded_submit(term, ctx, guard, window) {
+                    GuardedSubmit::Pressed => guarded_presses += 1,
+                    GuardedSubmit::Missed => {
+                        term_lock(term).watch_disarm(id);
+                        if press_no == 0 {
+                            // Nothing was submitted: the text sits in the
+                            // composer, and the driver is told so in the
+                            // verb's own Lines framing.
+                            let seq = term_lock(term).content_seq();
+                            return format!(
+                                "OK 0 turn skipped reason=guard submitted=0 seq={seq} \
+                                 id={turn_id}\n"
+                            );
+                        }
+                        // A RE-press whose guard no longer matches: the screen
+                        // moved on, so the first press is judged by the
+                        // verification below, never by a second Enter.
+                        break;
+                    }
+                    GuardedSubmit::Failed(reply) => {
+                        term_lock(term).watch_disarm(id);
+                        return reply;
+                    }
+                }
+            } else if !(io.press)(&submit) {
                 term_lock(term).watch_disarm(id);
                 return USAGE.to_string();
             }
@@ -2073,6 +2435,12 @@ pub(crate) fn cmd_turn_guarded(
         use std::fmt::Write as _;
         let _ = write!(verdict, " yielded_ms={ms}");
     }
+    // A guarded turn says how many Enters it wrote, so `submitted=0` after a
+    // written-but-unverified press cannot read as "nothing was pressed".
+    if submit_matcher.is_some() {
+        use std::fmt::Write as _;
+        let _ = write!(verdict, " pressed={guarded_presses}");
+    }
     super::control_query::frame_rows_reply(&screen, rows, &verdict, trim, 0)
 }
 
@@ -2193,6 +2561,23 @@ pub(crate) fn cmd_meta(
                 .split_once("set")
                 .and_then(|(_, r)| r.trim_start().split_once(char::is_whitespace))
                 .map_or("", |(_, v)| v);
+            // KEYED ATTENTION: `meta set attention owner=<k> <text>` writes only
+            // owner `<k>`'s entry. The owner LEADS, like every option on this
+            // wire, so a bare text that merely contains `owner=` stays text.
+            if typed == MetaField::Attention
+                && let Some((owner, text)) = leading_attention_owner(value)
+            {
+                return match owner {
+                    Ok(owner) => {
+                        attention_owned_reply(crate::session_timeline::write_attention_owned(
+                            ctx,
+                            owner,
+                            MetaEdit::Set(text),
+                        ))
+                    }
+                    Err(refusal) => (refusal, false),
+                };
+            }
             match write_session_meta(ctx, typed, MetaEdit::Set(value)) {
                 Ok(changed) => ("OK\n".to_string(), changed),
                 // On the wire `meta set title ""` is a USAGE ERROR, never a
@@ -2223,6 +2608,26 @@ pub(crate) fn cmd_meta(
                     false,
                 );
             };
+            // `meta unset attention owner=<k>` clears only owner `<k>`'s entry;
+            // the bare form clears the bare owner's, and a keyed owner's
+            // escalation outlives it.
+            if field == MetaField::Attention
+                && let Some(tail) = rest.split_once("attention").map(|(_, tail)| tail)
+                && let Some((owner, extra)) = leading_attention_owner(tail)
+            {
+                if !extra.trim().is_empty() {
+                    return (
+                        "ERR usage: meta unset attention [owner=<k>]\n".to_string(),
+                        false,
+                    );
+                }
+                return match owner {
+                    Ok(owner) => attention_owned_reply(
+                        crate::session_timeline::write_attention_owned(ctx, owner, MetaEdit::Clear),
+                    ),
+                    Err(refusal) => (refusal, false),
+                };
+            }
             // A clear has no validation ladder to run, so it applies directly.
             let changed = apply_meta_value(ctx, field, None);
             ("OK\n".to_string(), changed)
@@ -2231,6 +2636,137 @@ pub(crate) fn cmd_meta(
             "ERR usage: meta [set <field> <text...> | unset <field>]\n".to_string(),
             false,
         ),
+    }
+}
+
+/// A LEADING `owner=<k>` token on an attention value, and the text after it.
+/// `None` when the value does not lead with one (the bare form). `Err` carries
+/// the refusal for a malformed key — named before anything is stored.
+fn leading_attention_owner(value: &str) -> Option<(Result<&str, String>, &str)> {
+    let value = value.trim_start();
+    let (head, text) = value.split_once(char::is_whitespace).unwrap_or((value, ""));
+    let owner = head.strip_prefix("owner=")?;
+    if crate::session_timeline::valid_owner_token(owner) {
+        Some((Ok(owner), text))
+    } else {
+        Some((
+            Err(format!(
+                "ERR usage: owner=<k> is one token of 1..{} bytes from [A-Za-z0-9._:@/-]\n",
+                crate::session_timeline::META_OWNER_MAX
+            )),
+            text,
+        ))
+    }
+}
+
+/// The reply for a keyed attention write, worded like the bare field's.
+fn attention_owned_reply(
+    result: Result<bool, crate::session_timeline::AttentionWriteError>,
+) -> (String, bool) {
+    use crate::session_timeline::AttentionWriteError;
+    match result {
+        Ok(changed) => ("OK\n".to_string(), changed),
+        Err(AttentionWriteError::Meta(MetaWriteError::Empty)) => (
+            "ERR usage: meta set attention owner=<k> <text...>\n".to_string(),
+            false,
+        ),
+        Err(AttentionWriteError::Meta(MetaWriteError::ForbiddenFormatting)) => (
+            "ERR attention must be single-line and contain no control, bidi, or invisible formatting characters\n"
+                .to_string(),
+            false,
+        ),
+        Err(AttentionWriteError::Meta(MetaWriteError::TooLong { cap })) => {
+            (format!("ERR attention too long (max {cap} bytes)\n"), false)
+        }
+        Err(AttentionWriteError::OwnersFull) => (
+            format!(
+                "ERR attention owners full (max {}): unset one first\n",
+                crate::session_timeline::ATTENTION_OWNERS_MAX
+            ),
+            false,
+        ),
+    }
+}
+
+/// `meta set supervisor <holder> [ttl=<ms>]` / `meta unset supervisor
+/// [holder=<holder>]` — the OWNER-writable key that makes a running supervisor visible (`status`,
+/// `sessions`, `meta` print `supervisor=<holder|->`). `None` when `rest` is not
+/// a supervisor write, so the caller falls through to [`cmd_meta`].
+///
+/// Owner-class only: a supervisor answers the session's prompts, and an edge
+/// token (even a write edge) must not be able to claim to be one or hide the
+/// real one. Without `ttl=` the claim is bound to `conn`, the connection this
+/// request arrived on, and is cleared when it stops serving; with `ttl=<ms>`
+/// (1..=600000) it is a lease a one-shot client renews. A different holder's
+/// live claim answers `ERR busy supervisor=<holder>`; the same holder renews.
+/// A bare unset clears any holder's claim; `holder=<h>` clears it only while
+/// `<h>` holds it (`OK` either way). Returns `(reply, changed)` like
+/// [`cmd_meta`].
+pub(crate) fn cmd_meta_supervisor(
+    ctx: &SessionCtx,
+    scope: Scope,
+    conn: Option<u64>,
+    rest: &str,
+) -> Option<(String, bool)> {
+    const USAGE: &str = "ERR usage: meta set supervisor <holder> [ttl=<ms>] | meta unset supervisor \
+                         [holder=<holder>]\n";
+    let mut toks = rest.split_whitespace();
+    let sub = toks.next()?;
+    if !matches!(sub, "set" | "unset") || toks.next() != Some("supervisor") {
+        return None;
+    }
+    if !scope.is_owner_class() {
+        return Some(("ERR denied\n".to_string(), false));
+    }
+    let now = crate::metrics::now_us();
+    if sub == "unset" {
+        let holder = match toks.next() {
+            None => None,
+            Some(tok) => match tok.strip_prefix("holder=") {
+                Some(h) if crate::session_timeline::valid_owner_token(h) => Some(h),
+                _ => return Some((USAGE.to_string(), false)),
+            },
+        };
+        if toks.next().is_some() {
+            return Some((USAGE.to_string(), false));
+        }
+        let changed = match holder {
+            Some(h) => crate::session_timeline::release_supervisor_held_by(ctx, h, now),
+            None => crate::session_timeline::release_supervisor(ctx, None, now),
+        };
+        return Some(("OK\n".to_string(), changed));
+    }
+    let Some(holder) = toks.next() else {
+        return Some((USAGE.to_string(), false));
+    };
+    if holder == "-" || !crate::session_timeline::valid_owner_token(holder) {
+        return Some((USAGE.to_string(), false));
+    }
+    let ttl_ms = match toks.next() {
+        None => None,
+        Some(tok) => match tok.strip_prefix("ttl=").map(str::parse::<u64>) {
+            Some(Ok(ms)) if (1..=600_000).contains(&ms) => Some(ms),
+            _ => return Some((USAGE.to_string(), false)),
+        },
+    };
+    if toks.next().is_some() {
+        return Some((USAGE.to_string(), false));
+    }
+    let (bound, expires_us) = match ttl_ms {
+        Some(ms) => (None, Some(now.saturating_add(ms.saturating_mul(1000)))),
+        None => (conn, None),
+    };
+    match crate::session_timeline::claim_supervisor(ctx, holder, bound, expires_us, now) {
+        Ok(changed) => {
+            if bound.is_some() {
+                super::note_connection_claim();
+            }
+            Some(("OK\n".to_string(), changed))
+        }
+        Err(other) => Some((
+            format!("ERR busy supervisor={}\n", pct_encode(&other)),
+            false,
+        )),
     }
 }
 
@@ -2270,8 +2806,12 @@ fn meta_status(
         Some("-") => "%2D".to_string(),
         Some(v) => pct_encode(v),
     };
+    // After `state=`, additive: which owner's entry `attention=` shows (the bare
+    // owner prints `%2D` by the rule above), how many owners hold one, and the
+    // live supervisor.
     format!(
-        "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state}\n",
+        "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
+         attention_owner={} attention_owners={} supervisor={}\n",
         pct_encode(&title),
         opt(meta.user_title.as_deref()),
         opt(meta.description.as_deref()),
@@ -2279,7 +2819,31 @@ fn meta_status(
         opt(meta.role.as_deref()),
         opt(meta.attention.as_deref()),
         opt(cwd.as_deref()),
+        opt(attention_owner(&meta)),
+        attention_owners(&meta),
+        opt(meta.live_supervisor(crate::metrics::now_us())),
     )
+}
+
+/// The owner of the entry `attention=` shows. A meta whose attention was
+/// seeded as a value (a restore) and never keyed has one implicit entry, the
+/// bare owner's.
+fn attention_owner(meta: &crate::session_timeline::SessionMeta) -> Option<&str> {
+    match meta.attention_owners.effective_owner() {
+        Some(owner) => Some(owner),
+        None => meta
+            .attention
+            .as_ref()
+            .map(|_| crate::session_timeline::BARE_ATTENTION_OWNER),
+    }
+}
+
+/// How many owners hold an attention entry (the implicit bare one counted).
+fn attention_owners(meta: &crate::session_timeline::SessionMeta) -> usize {
+    match meta.attention_owners.len() {
+        0 => usize::from(meta.attention.is_some()),
+        n => n,
+    }
 }
 
 /// `timeline [<n>] [since=<id>]` -> the session's EVENT TIMELINE, oldest-first,
@@ -3248,10 +3812,25 @@ mod tests {
         }
     }
 
+    /// The published program / agent columns and `supervisor=` (2026-09-23), elided by
+    /// [`tail`] and pinned on their own by
+    /// [`the_roster_carries_the_published_program_and_agent_verdict`].
+    const AGENT_COLUMNS: [&str; 8] = [
+        "program=",
+        "agent=",
+        "agent_detail=",
+        "agent_rev=",
+        "agent_since_ms=",
+        "agent_gen=",
+        "agent_fp=",
+        "supervisor=",
+    ];
+
     /// The tail every line carries, after the sid and with the per-launch
     /// `nonce=` elided — both are minted per run, so neither can be pinned by
     /// value. The nonce's PRESENCE is pinned separately, by
-    /// [`the_roster_carries_each_sessions_public_launch_nonce`].
+    /// [`the_roster_carries_each_sessions_public_launch_nonce`]. The agent
+    /// columns after `path=` are elided too ([`AGENT_COLUMNS`]).
     fn tail(line: &str) -> String {
         let mut f = line.splitn(3, ' ');
         let local = f.next().unwrap();
@@ -3260,9 +3839,103 @@ mod tests {
         let rest = rest
             .split_whitespace()
             .filter(|t| !t.starts_with("nonce="))
+            .filter(|t| !AGENT_COLUMNS.iter().any(|k| t.starts_with(k)))
             .collect::<Vec<_>>()
             .join(" ");
         format!("{local} {rest}")
+    }
+
+    /// `await agent` takes the verdict words and, for lane A's walls, `wall`
+    /// (any wall) and `wall:<kind>`; a typo or a malformed kind is refused
+    /// rather than parked until the timeout.
+    #[test]
+    fn await_agent_words_take_walls_and_refuse_typos() {
+        let words = parse_agent_words("prompt,wall,wall:usage-session,unknown").expect("valid");
+        assert_eq!(
+            words,
+            vec![
+                AgentWord::Verdict("prompt"),
+                AgentWord::Wall(None),
+                AgentWord::Wall(Some("usage-session".to_string())),
+                AgentWord::Verdict("unknown"),
+            ]
+        );
+        // Against the words the server really publishes.
+        let overloaded = crate::presence::wall_word(aterm_phase::WallKind::Overloaded);
+        let session = crate::presence::wall_word(aterm_phase::WallKind::UsageSession);
+        assert!(words[1].matches(overloaded));
+        assert!(words[2].matches(session));
+        assert!(!words[2].matches(overloaded));
+        // NEGATIVE CONTROL: `wall` is not a prefix match on everything.
+        assert!(!words[1].matches("prompt") && !words[1].matches("wallpaper"));
+        // `limited`, the word before the walls were named, is a deprecated
+        // alias for the limit walls: a usage window latches it, a 529 does
+        // not (it never read `limited`).
+        let limited = parse_agent_words("limited").expect("the deprecated alias");
+        assert!(limited[0].matches(session));
+        assert!(limited[0].matches("wall:model-bucket") && limited[0].matches("wall:spend"));
+        assert!(!limited[0].matches(overloaded) && !limited[0].matches("wall:api-error"));
+        assert!(!limited[0].matches("limited") && !limited[0].matches("idle"));
+        for bad in [
+            "",
+            "promt",
+            "limitd",
+            "wall:",
+            "wall:Rate",
+            "wall:a b",
+            "prompt,,idle",
+        ] {
+            assert_eq!(parse_agent_words(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The five published columns ride every row LAST, after `path=`, read
+    /// from the session timeline the status sweep writes (`-` until it has).
+    #[test]
+    fn the_roster_carries_the_published_program_and_agent_verdict() {
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let h = handle(0, &t0);
+        let out = sessions_lines(std::slice::from_ref(&h), Ok(&[]), |_| false);
+        let line = out.lines().nth(1).unwrap();
+        let (_, cols) = line.split_once(" path=live ").expect("after path=");
+        assert!(
+            cols.starts_with("program=- agent=- agent_detail=- agent_rev=0 agent_since_ms="),
+            "{line}"
+        );
+        assert!(
+            cols.contains(" agent_gen=- agent_fp=- "),
+            "no read yet, no stamp: {line}"
+        );
+        {
+            let mut tl = h.ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some("claude".into()));
+            tl.publish_agent(
+                "prompt",
+                Some("bash:not-read-only".into()),
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 2, seq: 40 },
+                    fp: 0xab,
+                },
+            );
+        }
+        let out = sessions_lines(std::slice::from_ref(&h), Err("no event loop"), |_| false);
+        let line = out.lines().nth(1).unwrap();
+        assert!(
+            line.contains(
+                " path=live program=claude agent=prompt agent_detail=bash:not-read-only \
+                 agent_rev=1 agent_since_ms="
+            ),
+            "the failed-hop arm carries them too: {line}"
+        );
+        assert!(
+            line.contains(" agent_gen=2.40 agent_fp=00000000000000ab "),
+            "the verdict's stamp rides the row: {line}"
+        );
+        // `supervisor=` closes the row.
+        assert!(line.ends_with(" supervisor=-"), "{line}");
     }
 
     /// With rows present, each line names its window, active-tab and front
@@ -3275,20 +3948,20 @@ mod tests {
         let t2 = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let snapshot = vec![handle(0, &t0), handle(1, &t1), handle(2, &t2)];
         let rows = vec![row(0, 0, true, false), row(1, 3, false, true)];
-        let out = sessions_lines(&snapshot, Ok(&rows));
+        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "OK 3");
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=0 detail=- identity=-"
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=0 detail=- identity=- path=live"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=3 active=0 wfocus=1 detail=- identity=-"
+            "1 - alive tab-1 meta=0 window=3 active=0 wfocus=1 detail=- identity=- path=live"
         );
         assert_eq!(
             tail(lines[3]),
-            "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=- identity=-"
+            "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=- identity=- path=live"
         );
     }
 
@@ -3306,16 +3979,17 @@ mod tests {
         let out = sessions_lines(
             &snapshot,
             Err("main-thread reply did not arrive within 30s"),
+            |_| false,
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "OK 2");
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=- active=- wfocus=- detail=- identity=-"
+            "0 - alive tab-0 meta=0 window=- active=- wfocus=- detail=- identity=- path=live"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep identity=-"
+            "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep identity=- path=live"
         );
     }
 
@@ -3333,7 +4007,7 @@ mod tests {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let h = handle(0, &term);
         let expect = h.nonce.to_hex();
-        let out = sessions_lines(&[h], Err("no event loop"));
+        let out = sessions_lines(&[h], Err("no event loop"), |_| false);
         let row = out.lines().nth(1).expect("one session row");
         assert!(
             row.contains(&format!(" nonce={expect} ")),
@@ -3359,9 +4033,9 @@ mod tests {
         );
         let snapshot = vec![handle(0, &term)];
         let rows = vec![row(0, 0, true, true)];
-        let out = sessions_lines(&snapshot, Ok(&rows));
+        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
         assert!(
-            out.ends_with(" window=0 active=1 wfocus=1 detail=targo%20test identity=-\n"),
+            out.contains(" window=0 active=1 wfocus=1 detail=targo%20test identity=- path=live "),
             "{out}"
         );
         assert!(
@@ -3370,17 +4044,17 @@ mod tests {
         );
 
         let held = term.lock().unwrap();
-        let out = sessions_lines(&snapshot, Ok(&rows));
+        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
         assert!(
-            out.ends_with(" detail=- identity=-\n"),
-            "contended reads `-`: {out}"
+            out.contains(" detail=- identity=- path=live "),
+            "contended reads `-` (and the published columns need no terminal lock): {out}"
         );
         drop(held);
 
         term.lock().unwrap().process(b"done\n\x1b]133;D;0\x07");
-        let out = sessions_lines(&snapshot, Ok(&rows));
+        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
         assert!(
-            out.ends_with(" detail=- identity=-\n"),
+            out.contains(" detail=- identity=- path=live "),
             "complete reads `-`: {out}"
         );
     }
@@ -3399,16 +4073,16 @@ mod tests {
         worker.identity = Some(Arc::from("worker"));
         let snapshot = vec![worker, handle(1, &t1)];
         let rows = vec![row(0, 0, true, true), row(1, 0, false, true)];
-        let out = sessions_lines(&snapshot, Ok(&rows));
+        let out = sessions_lines(&snapshot, Ok(&rows), |_| false);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "OK 2");
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=1 detail=- identity=worker"
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=1 detail=- identity=worker path=live"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- identity=-"
+            "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- identity=- path=live"
         );
         for line in &lines[1..] {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -3420,21 +4094,78 @@ mod tests {
                 fields[detail_at + 1].starts_with("identity="),
                 "identity= sits right after detail=: {line}"
             );
+            assert!(
+                fields[detail_at + 2].starts_with("path="),
+                "path= sits right after identity=: {line}"
+            );
             assert_eq!(
                 fields.len(),
-                detail_at + 2,
-                "identity= is the LAST column: {line}"
+                detail_at + 3 + AGENT_COLUMNS.len(),
+                "only the published agent columns follow path=: {line}"
             );
+            for (i, key) in AGENT_COLUMNS.iter().enumerate() {
+                assert!(fields[detail_at + 3 + i].starts_with(key), "{line}");
+            }
         }
         // The failed-hop arm carries it too: the label is a handle field, not
         // a main-thread answer.
-        let out = sessions_lines(&snapshot, Err("no event loop"));
+        let out = sessions_lines(&snapshot, Err("no event loop"), |_| false);
         assert!(
             out.lines()
                 .nth(1)
                 .unwrap()
-                .ends_with(" detail=- identity=worker"),
+                .contains(" detail=- identity=worker path=live program=-"),
             "{out}"
+        );
+    }
+
+    /// `path=` (2026-09-22): the registry's frozen-path mark, per session, as the
+    /// LAST column — `frozen` for the shell the store marked at adoption, `live`
+    /// for every other — on both arms, since it is a registry fact and not a
+    /// main-thread answer. Through the verb over a real store, so the mark the
+    /// managed-current row COUNTS is the mark the roster NAMES.
+    #[test]
+    fn sessions_lines_name_the_frozen_path_tab_as_the_last_column() {
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let t1 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let snapshot = vec![handle(0, &t0), handle(1, &t1)];
+        let rows = vec![row(0, 0, true, true), row(1, 0, false, true)];
+        let out = sessions_lines(&snapshot, Ok(&rows), |id| id == 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            tail(lines[1]),
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=1 detail=- identity=- path=frozen"
+        );
+        assert_eq!(
+            tail(lines[2]),
+            "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- identity=- path=live"
+        );
+        let out = sessions_lines(&snapshot, Err("no event loop"), |id| id == 0);
+        assert!(
+            out.lines()
+                .nth(1)
+                .unwrap()
+                .contains(" detail=- identity=- path=frozen program=-"),
+            "the failed-hop arm carries the mark too: {out}"
+        );
+        // Through the verb: the store's own mark, read under the snapshot's guard.
+        let store = crate::session_store::new_store();
+        {
+            let mut g = store.write().unwrap();
+            g.register(handle(7, &t0));
+            g.register(handle(8, &t1));
+            g.mark_frozen_path(7);
+        }
+        let out = cmd_sessions_store(&store, None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "OK 2");
+        assert!(
+            tail(lines[1]).ends_with(" detail=- identity=- path=frozen"),
+            "the marked session reads frozen: {out}"
+        );
+        assert!(
+            tail(lines[2]).ends_with(" detail=- identity=- path=live"),
+            "an unmarked session reads live: {out}"
         );
     }
 
@@ -3452,7 +4183,7 @@ mod tests {
         assert_eq!(lines[0], "OK 1");
         assert_eq!(
             tail(lines[1]),
-            "4 - alive tab-4 meta=0 window=- active=- wfocus=- detail=- identity=-"
+            "4 - alive tab-4 meta=0 window=- active=- wfocus=- detail=- identity=- path=live"
         );
         // The placement fold agrees with the line: no row is DETACHED.
         let p = placement_of(&handle(4, &term), &[]);

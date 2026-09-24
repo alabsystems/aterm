@@ -64,6 +64,55 @@ pub const VENDOR_HOSTS: &[&str] = &[
     "emacsformacosx.com",
 ];
 
+/// Whether `url` may be fetched on the vendor-direct lane for `program`: an admissible
+/// `https` URL ([`https_host`]) whose path carries no `.`/`..` segment in any spelling
+/// (percent-encoded included — curl collapses them), and which starts with one of THAT
+/// program's compiled prefixes ([`crate::vendor_direct::VendorSpec::url_prefixes`]) with a
+/// remainder of non-empty `/`-separated segments of `[A-Za-z0-9._-]`. No query, fragment,
+/// percent-escape, backslash or empty segment: none of the pinned documents or payloads
+/// needs one, and each is a way to re-point the path.
+#[must_use]
+pub fn vendor_direct_url_allowed(program: &str, url: &str) -> bool {
+    let Some(host) = https_host(url) else {
+        return false;
+    };
+    let Some(spec) = crate::vendor_direct::spec(program) else {
+        return false;
+    };
+    let path = &url["https://".len() + host.len()..];
+    if path.split('/').any(is_dot_segment) {
+        return false;
+    }
+    spec.url_prefixes.iter().any(|prefix| {
+        url.strip_prefix(prefix).is_some_and(|rest| {
+            !rest.is_empty()
+                && rest.split('/').all(|seg| {
+                    !seg.is_empty()
+                        && seg
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                })
+        })
+    })
+}
+
+/// `.` or `..`, spelled plainly or with any `%2e`/`%2E` in place of a dot.
+fn is_dot_segment(seg: &str) -> bool {
+    let decoded = seg.to_ascii_lowercase().replace("%2e", ".");
+    decoded == "." || decoded == ".."
+}
+
+/// Whether `program`'s vendor-direct DIGEST document requested at `requested` may be
+/// trusted having ended at `effective` (curl's effective URL): `requested` passes
+/// [`vendor_direct_url_allowed`] for `program`, and the compiled table admits the landing
+/// ([`crate::vendor_direct::VendorSpec::digest_doc_admitted`]).
+#[must_use]
+pub fn digest_effective_url_ok(program: &str, requested: &str, effective: &str) -> bool {
+    vendor_direct_url_allowed(program, requested)
+        && crate::vendor_direct::spec(program)
+            .is_some_and(|spec| spec.digest_doc_admitted(requested, effective))
+}
+
 /// The staging lanes an `https` row may name in `payload`. The stage side
 /// (`install::verify_and_stage`) implements each; a row naming anything else is refused
 /// here, before download. `dmg` is the `kind = "app-bundle"` lane; the other four are
@@ -996,13 +1045,16 @@ fn first_foreign_on_path(
                 // Only the managed `bin/` ends the shadow walk unconditionally ("the
                 // managed copy — or its stub — answers from here; everything after
                 // loses"). Every OTHER prefix-owned entry — `reroute/`, which an aterm
-                // session puts FIRST and which carries only `cargo`/`rustc`/… stubs;
+                // session puts FIRST and which carries the `cargo`/`rustc`/… stubs;
                 // `agents/`, first too and carrying only `claude`/`codex`; a store dir
                 // someone put on PATH — is TRANSPARENT unless it actually holds the
                 // name: then the managed copy runs (Stop), else the walk goes on. Before
                 // this (2026-09-10 audit) the reroute dir at PATH[0] made every
                 // `which`/doctor/reconcile run inside a session blind to the foreign
-                // `~/.local/bin/claude` that was what really ran.
+                // `~/.local/bin/claude` that was what really ran. Since 2026-09-23
+                // `reroute/` holds `claude`/`codex` stubs too, which decide at exec time
+                // and may pass through: the surfaces that name what runs ask
+                // `cli::shadow_in_shell`, which walks the stub's own PATH when it does.
                 AtManaged::Stop => {
                     if is_managed_bin_dir(prefix, &prefix_real, &dir)
                         || lookup_candidates(&dir, bin)
@@ -1137,7 +1189,7 @@ pub fn system_binary_on_path(
 /// bare file name, WITHOUT the [`ToolName`] deny-list. Two callers, both needing a
 /// deny-listed name: the `system-pm` lane's manager lookup (`cargo` is (rightly) a name
 /// no shim may take, and it is also a package manager the table names), and
-/// `reroute::exec_upstream` — the `ATERM_NO_REROUTE` escape execs the first upstream
+/// `reroute::exec_upstream` — the `--no-reroute` escape execs the first upstream
 /// `cargo`/`rustc`/… this finds, and because the reroute dir sits UNDER the prefix the
 /// walk skips it, which is exactly why a stub can never find itself. Never a
 /// satisfaction or shadow probe — those keep the deny-list, so a `git` on `PATH` still
@@ -2101,6 +2153,255 @@ mod tests {
         assert_eq!(https_host("https://a@github.com/"), None);
         assert_eq!(https_host("http://github.com/"), None);
         assert_eq!(https_host("HTTPS://github.com/"), None);
+    }
+
+    // ---- the vendor-direct URL pins ----
+
+    /// The documents and payloads the vendor-direct lane really fetches (design §1.1),
+    /// by program.
+    const VENDOR_DIRECT_URLS: &[(&str, &str)] = &[
+        (
+            "claude",
+            "https://downloads.claude.ai/claude-code-releases/latest",
+        ),
+        (
+            "claude",
+            "https://downloads.claude.ai/claude-code-releases/2.1.280/manifest.json",
+        ),
+        (
+            "claude",
+            "https://downloads.claude.ai/claude-code-releases/2.1.280/manifest.json.sig",
+        ),
+        (
+            "claude",
+            "https://downloads.claude.ai/claude-code-releases/2.1.280/darwin-arm64/claude",
+        ),
+        (
+            "claude",
+            "https://downloads.claude.ai/claude-code-releases/2.1.280/win32-x64/claude.exe",
+        ),
+        ("codex", "https://releases.openai.com/codex/channels/latest"),
+        (
+            "codex",
+            "https://releases.openai.com/codex/releases/0.156.0/argument-comment-lint",
+        ),
+        (
+            "codex",
+            "https://github.com/openai/codex/releases/download/rust-v0.156.0/codex-package_SHA256SUMS",
+        ),
+        (
+            "codex",
+            "https://github.com/openai/codex/releases/download/rust-v0.156.0/\
+             codex-package-aarch64-apple-darwin.tar.gz",
+        ),
+    ];
+
+    #[test]
+    fn the_vendor_direct_pins_admit_the_real_urls() {
+        for (program, url) in VENDOR_DIRECT_URLS {
+            assert!(vendor_direct_url_allowed(program, url), "{program} {url}");
+        }
+    }
+
+    /// The pin is per program: neither vendor's URLs are admitted for the other's
+    /// program, and a program with no row is admitted nowhere.
+    #[test]
+    fn a_vendor_direct_url_is_admitted_only_for_its_own_program() {
+        for (program, url) in VENDOR_DIRECT_URLS {
+            for other in ["claude", "codex", "ay", "", "CLAUDE"] {
+                if other != *program {
+                    assert!(
+                        !vendor_direct_url_allowed(other, url),
+                        "{url} admitted for {other:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pins are the compiled table's, so the programs admitted anywhere are exactly
+    /// the agent programs, in the same order.
+    #[test]
+    fn the_vendor_direct_programs_are_the_agent_programs() {
+        let pinned: Vec<&str> = crate::vendor_direct::VENDORS
+            .iter()
+            .map(|s| s.program)
+            .collect();
+        assert_eq!(pinned, crate::stub::AGENT_PROGRAMS);
+        for (_, url) in VENDOR_DIRECT_URLS {
+            assert!(!vendor_direct_url_allowed("ay", url), "{url}");
+        }
+    }
+
+    /// Lookalike hosts, other schemes, userinfo, ports, case and trailing-dot spellings,
+    /// traversal and escapes, queries and fragments, and anything off the three prefixes.
+    #[test]
+    fn the_vendor_direct_pins_refuse_everything_else() {
+        for bad in [
+            // lookalike and neighbouring hosts
+            "https://downloads.claude.ai.evil.com/claude-code-releases/latest",
+            "https://evil.downloads.claude.ai/claude-code-releases/latest",
+            "https://downloads.claude.ai.evil.com/",
+            "https://releases.openai.com.evil.com/codex/channels/latest",
+            "https://objects.githubusercontent.com/openai/codex/releases/download/x",
+            "https://api.github.com/repos/openai/codex/releases/latest",
+            // scheme
+            "http://downloads.claude.ai/claude-code-releases/latest",
+            "HTTPS://downloads.claude.ai/claude-code-releases/latest",
+            "ftp://downloads.claude.ai/claude-code-releases/latest",
+            // userinfo and port
+            "https://user@downloads.claude.ai/claude-code-releases/latest",
+            "https://downloads.claude.ai@evil.com/claude-code-releases/latest",
+            "https://downloads.claude.ai:443/claude-code-releases/latest",
+            // case and trailing dot on the host
+            "https://DOWNLOADS.CLAUDE.AI/claude-code-releases/latest",
+            "https://Downloads.claude.ai/claude-code-releases/latest",
+            "https://downloads.claude.ai./claude-code-releases/latest",
+            "https://github.com./openai/codex/releases/download/rust-v0.156.0/x",
+            // off the prefix on a pinned host
+            "https://downloads.claude.ai/other/latest",
+            "https://downloads.claude.ai/claude-code-releases",
+            "https://downloads.claude.ai/claude-code-releases/",
+            "https://github.com/openai/codex-evil/releases/download/x/y",
+            "https://github.com/evil/codex/releases/download/rust-v0.156.0/x",
+            "https://github.com/openai/codex/releases/latest/download",
+            "https://releases.openai.com/codexx/channels/latest",
+            "https://releases.openai.com/other/codex/x",
+            // traversal and escapes, dot segments in any spelling, wherever they sit
+            "https://downloads.claude.ai/claude-code-releases/../../evil",
+            "https://downloads.claude.ai/claude-code-releases/%2E%2E/evil",
+            "https://downloads.claude.ai/claude-code-releases/.%2e/evil",
+            "https://downloads.claude.ai/claude-code-releases/%2e/latest",
+            "https://downloads.claude.ai/./claude-code-releases/latest",
+            "https://github.com/openai/codex/releases/download/../../x/y/releases/download/z",
+            "https://github.com/openai/codex/releases/download/rust-v0.156.0/%2e%2e/x",
+            "https://releases.openai.com/codex/../codex/channels/latest",
+            "https://downloads.claude.ai/claude-code-releases/2.1.280/../../../x",
+            "https://downloads.claude.ai/claude-code-releases/./latest",
+            "https://downloads.claude.ai/claude-code-releases/%2e%2e/evil",
+            "https://downloads.claude.ai/claude-code-releases/a%2Fb",
+            "https://downloads.claude.ai/claude-code-releases/a\\..\\b",
+            "https://downloads.claude.ai/claude-code-releases//latest",
+            "https://downloads.claude.ai/claude-code-releases/latest/",
+            // query strings and fragments
+            "https://downloads.claude.ai/claude-code-releases/latest?x=1",
+            "https://downloads.claude.ai/claude-code-releases/latest#f",
+            "https://releases.openai.com/codex/channels/latest?redirect=https://evil",
+            // whitespace and control bytes
+            "https://downloads.claude.ai/claude-code-releases/lat est",
+            "https://downloads.claude.ai/claude-code-releases/latest\n",
+            "",
+        ] {
+            for program in ["claude", "codex"] {
+                assert!(!vendor_direct_url_allowed(program, bad), "{bad:?}");
+            }
+        }
+    }
+
+    /// Each pinned prefix's host, and each host a digest document may land on, is a
+    /// first-hop host the `download_url` lane (`check_https_row`) already admits.
+    #[test]
+    fn every_vendor_direct_host_is_an_allow_listed_vendor_host() {
+        for spec in crate::vendor_direct::VENDORS {
+            for prefix in spec.url_prefixes {
+                let host = https_host(prefix).expect("a prefix is an admissible https URL");
+                assert!(VENDOR_HOSTS.contains(&host), "{host}");
+            }
+            for pin in spec.digest_docs {
+                for to in pin.redirect_hosts {
+                    assert!(VENDOR_HOSTS.contains(to), "{to}");
+                }
+            }
+        }
+    }
+
+    /// OpenAI's release JSON and Anthropic's documents are taken only unredirected (the
+    /// compiled table's rule, measured 2026-09-22); a GitHub release download may end on
+    /// GitHub's release-asset storage and nowhere else; and the request must be pinned
+    /// for the program it serves.
+    #[test]
+    fn a_digest_document_lands_only_where_its_host_allows() {
+        const CLAUDE: &str =
+            "https://downloads.claude.ai/claude-code-releases/2.1.280/manifest.json";
+        const OPENAI: &str = "https://releases.openai.com/codex/channels/latest";
+        const SUMS: &str = "https://github.com/openai/codex/releases/download/rust-v0.156.0/codex-package_SHA256SUMS";
+        // Measured final hop for SUMS (2026-09-22), signed query and all.
+        const STORAGE: &str = "https://release-assets.githubusercontent.com/\
+                               github-production-release-asset/965415649/ce906d71?sp=r&sig=x%3D";
+        assert!(digest_effective_url_ok("claude", CLAUDE, CLAUDE));
+        assert!(digest_effective_url_ok("codex", OPENAI, OPENAI));
+        assert!(digest_effective_url_ok("codex", SUMS, SUMS));
+        assert!(digest_effective_url_ok("codex", SUMS, STORAGE));
+        assert!(digest_effective_url_ok(
+            "codex",
+            SUMS,
+            "https://objects.githubusercontent.com/github-production-release-asset/1/2"
+        ));
+
+        // The request must be pinned for the program it serves.
+        assert!(!digest_effective_url_ok("claude", OPENAI, OPENAI));
+        assert!(!digest_effective_url_ok("codex", CLAUDE, CLAUDE));
+        assert!(!digest_effective_url_ok("claude", SUMS, STORAGE));
+
+        for (requested, effective) in [
+            // any redirect of Anthropic's documents or OpenAI's JSON, even on their own
+            // host: the table pins both to "answered in place"
+            (
+                CLAUDE,
+                "https://downloads.claude.ai/claude-code-releases/2.1.280/other.json",
+            ),
+            (
+                OPENAI,
+                "https://releases.openai.com/codex/releases/0.156.0/release.json",
+            ),
+            (OPENAI, "https://releases.openai.com/codex/channels/latest/"),
+            // off-host redirects
+            (
+                OPENAI,
+                "https://github.com/openai/codex/releases/download/x/y",
+            ),
+            (OPENAI, STORAGE),
+            (CLAUDE, STORAGE),
+            (CLAUDE, "https://storage.googleapis.com/claude-code-dist/x"),
+            (
+                SUMS,
+                "https://raw.githubusercontent.com/openai/codex/main/x",
+            ),
+            (SUMS, "https://evil.example/x"),
+            (
+                SUMS,
+                "https://release-assets.githubusercontent.com.evil.com/x",
+            ),
+            // the effective URL must itself be an admissible https URL
+            (OPENAI, "http://releases.openai.com/codex/channels/latest"),
+            (
+                OPENAI,
+                "https://releases.openai.com:8443/codex/channels/latest",
+            ),
+            (
+                OPENAI,
+                "https://x@releases.openai.com/codex/channels/latest",
+            ),
+            (OPENAI, "https://RELEASES.OPENAI.COM/codex/channels/latest"),
+            (OPENAI, "https://releases.openai.com./codex/channels/latest"),
+            (SUMS, ""),
+            // the request itself must be pinned
+            (
+                "https://releases.openai.com/other/x",
+                "https://releases.openai.com/other/x",
+            ),
+            (
+                "https://github.com/evil/repo/releases/download/t/a",
+                STORAGE,
+            ),
+        ] {
+            for program in ["claude", "codex"] {
+                assert!(
+                    !digest_effective_url_ok(program, requested, effective),
+                    "{program}: {requested} -> {effective}"
+                );
+            }
+        }
     }
 
     // ---- the system-satisfaction probe ----

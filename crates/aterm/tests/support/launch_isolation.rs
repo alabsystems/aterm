@@ -2,9 +2,33 @@
 // Copyright 2026 Andrew Yates
 
 //! Private host state for tests that launch the real window or session entry.
+//!
+//! ISOLATION IS A SCRATCH HOME AND A SCRATCH CONFIG, never an environment veto
+//! (2026-09-23). The update system's user-facing environment knobs are gone
+//! (`ATPKG_DISABLE`, `ATERM_NO_AUTO_UPDATE`, `ATERM_NO_AUTO_APPLY`, `ATERM_NO_REROUTE`;
+//! owner: "NOT ENV VARS those are for development"), so a launch is kept off the
+//! machine the way a person keeps it off theirs: `$HOME` is private (so the package
+//! prefix, its reroute stubs and the `Updates/` ledger all live under it), and
+//! `$XDG_CONFIG_HOME/aterm/aterm.toml` switches every automatic lane off —
+//! [`CONFIG_OFF`]. The reroute's escape is the `--no-reroute` FLAG ([`NO_REROUTE`]),
+//! which a caller adds to its window/session argv (before any `-e`/`--` payload).
 
 use std::path::Path;
 use std::process::Command;
+
+/// The flag that starts a window or session with the upstream Rust names restored
+/// — nothing laid under the scratch prefix, no launchd lane. A caller that does not
+/// study the reroute adds it; the environment can no longer say it.
+#[allow(dead_code)]
+pub const NO_REROUTE: &str = "--no-reroute";
+
+/// The automatic lanes, switched off the way Settings switches them off: `[update]
+/// enabled = false` (Check for updates automatically) with `auto_apply = false`,
+/// `[packages] enabled = false` (Automatic updates), and the `[machine]` settings left
+/// alone.
+pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
+                              [packages]\nenabled = false\n\
+                              [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
 
 pub fn prepare(root: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -19,7 +43,6 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
         "cache",
         "data",
         "state",
-        "updates",
     ] {
         let path = root.join(relative);
         std::fs::create_dir_all(&path)?;
@@ -27,8 +50,7 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
     }
     std::fs::write(
         root.join("cfg/aterm/aterm.toml"),
-        "agents_auto_prime = false\n[packages]\nenabled = false\n\
-         [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n",
+        format!("agents_auto_prime = false\n{CONFIG_OFF}"),
     )
 }
 
@@ -42,7 +64,10 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .collect();
     for name in names {
         let text = name.to_string_lossy();
-        if text.starts_with("ATERM_") || text.starts_with("ATPKG_") {
+        // `__ATERM_` covers the internal protocol markers (the reroute passthrough), whose
+        // leading underscores say "not a user knob" and would otherwise slip the filter.
+        if text.starts_with("ATERM_") || text.starts_with("ATPKG_") || text.starts_with("__ATERM_")
+        {
             cmd.env_remove(name);
         }
     }
@@ -56,12 +81,7 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_STATE_HOME", root.join("state"))
-        .env("ATERM_UPDATE_ROOT", root.join("updates"))
         .env("ATERM_CONTROL_SOCK", root.join("run/aterm/aterm.sock"))
-        .env("ATERM_NO_REROUTE", "1")
-        .env("ATERM_NO_AUTO_UPDATE", "1")
-        .env("ATERM_NO_AUTO_APPLY", "1")
-        .env("ATPKG_DISABLE", "1")
         .env("ATERM_LOG", "off")
         .env("SHELL", "/bin/sh");
 }

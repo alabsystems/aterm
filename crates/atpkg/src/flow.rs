@@ -67,12 +67,50 @@ fn verify_and_stage(
     artifact: &crate::manifest::Artifact,
     archive: &Path,
     build_dir: &Path,
-) -> Result<(), StageError> {
-    let staged = crate::install::verify_and_stage(artifact, archive, build_dir);
+    hooks: &crate::install::StageHooks<'_>,
+) -> Result<String, StageError> {
+    let staged = crate::install::verify_and_stage(artifact, archive, build_dir, hooks);
     if staged.is_err() && !build_dir.exists() {
         crate::shim_env::remove_sidecar(build_dir);
     }
     staged
+}
+
+/// What [`Fetcher::vendor_get`] came back with (mirrors `aterm_update_core::VendorResponse`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VendorGet {
+    /// HTTP 200: the whole body (at most the cap), the response's ETag when it carried a
+    /// well-formed one, and the URL the fetch ended on after redirects — the caller checks
+    /// it with [`crate::vendor::digest_effective_url_ok`] for a digest document.
+    Body {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+        effective_url: String,
+    },
+    /// HTTP 304 to a conditional request: unchanged. `etag` is the validator to keep for
+    /// the next poll (the 304's own, else the one sent).
+    NotModified { etag: String },
+}
+
+/// Why a vendor-direct fetch produced nothing, split the way the lane must treat it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VendorFetchError {
+    /// The vendor host was not reached or is not serving now — the network, a timeout, a
+    /// 408/429/5xx that outlived the retries, or a fetcher with no network leg. Keep what
+    /// is installed, quietly; the next poll asks again.
+    Unreachable(String),
+    /// A verdict about the request or the document — a URL outside the program's pins, a
+    /// body over its cap, a hop off https, a certificate that does not verify, any other
+    /// status, an unreadable answer. Refuse it; asking again gets the same answer.
+    Refused(String),
+}
+
+impl std::fmt::Display for VendorFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(message) | Self::Refused(message) => f.write_str(message),
+        }
+    }
 }
 
 /// The network operations the install flow needs, abstracted so the orchestration is
@@ -139,31 +177,79 @@ pub trait Fetcher {
                 .to_string(),
         )
     }
+    /// GET a small vendor-direct document for `program` (a release head, a manifest, a
+    /// signature, a SHA256SUMS), at most `cap` bytes, conditionally on `if_none_match` when
+    /// given.
+    ///
+    /// DEFAULT: [`VendorFetchError::Unreachable`] — a fetcher with no network leg (a test
+    /// fetcher, the `dir:` registry) never reaches a vendor host. Only the production
+    /// network fetcher opts in, anonymously and only for a URL that passes
+    /// [`crate::vendor::vendor_direct_url_allowed`] for `program`.
+    fn vendor_get(
+        &self,
+        program: &str,
+        url: &str,
+        cap: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<VendorGet, VendorFetchError> {
+        let _ = (program, url, cap, if_none_match);
+        Err(VendorFetchError::Unreachable(
+            "this fetcher cannot fetch vendor documents (the vendor-direct lane is network-only)"
+                .to_string(),
+        ))
+    }
+    /// [`Fetcher::vendor_get`] for a release HEAD read inside a pass or a door: the same
+    /// pins, cap and anonymity in one short attempt, because an unreached head keeps the
+    /// installed build and the next pass or head-watch check is the retry. The documents
+    /// behind a head that was read, and the payload, stay on the patient `vendor_get`.
+    ///
+    /// DEFAULT: [`Fetcher::vendor_get`] — a fetcher with no network leg has no attempt
+    /// budget to shorten.
+    fn vendor_head(
+        &self,
+        program: &str,
+        url: &str,
+        cap: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<VendorGet, VendorFetchError> {
+        self.vendor_get(program, url, cap, if_none_match)
+    }
+    /// The final `Content-Length` (never zero) of `program`'s pinned vendor-direct URL
+    /// after redirects — the exact byte cap for a payload no signed document sizes (codex).
+    ///
+    /// DEFAULT: [`VendorFetchError::Unreachable`], as [`Fetcher::vendor_get`].
+    fn vendor_content_length(&self, program: &str, url: &str) -> Result<u64, VendorFetchError> {
+        let _ = (program, url);
+        Err(VendorFetchError::Unreachable(
+            "this fetcher cannot size vendor payloads (the vendor-direct lane is network-only)"
+                .to_string(),
+        ))
+    }
+    /// Download `program`'s vendor-direct PAYLOAD at `url` to `dest`, capped at exactly
+    /// `cap` bytes, resumably, under the same pins, anonymity and CA-trust scrub as
+    /// [`Fetcher::vendor_get`]. The bytes are trusted only after the caller's sha256 check
+    /// against an authenticated digest.
+    ///
+    /// DEFAULT: [`VendorFetchError::Unreachable`], as [`Fetcher::vendor_get`].
+    fn vendor_download(
+        &self,
+        program: &str,
+        url: &str,
+        dest: &Path,
+        cap: u64,
+    ) -> Result<(), VendorFetchError> {
+        let _ = (program, url, dest, cap);
+        Err(VendorFetchError::Unreachable(
+            "this fetcher cannot download vendor payloads (the vendor-direct lane is network-only)"
+                .to_string(),
+        ))
+    }
     /// Canonical identity of this fetcher's source (`github:<owner>/<repo>` or `dir:<path>`),
     /// tagging the index cache so a cache from one source never satisfies a failed fetch from
     /// another (the same-source guard, §14). The default is a non-matching sentinel, so a test
     /// fetcher opts out of cross-run cache reuse.
     fn source_id(&self) -> String {
         "fetcher:unspecified".to_string()
-    }
-    /// The §14 last-good-index cache key this fetcher's candidates are stored under AND
-    /// loaded from on a failed/empty fetch. Default: [`Fetcher::source_id`]. A chained
-    /// fetcher ([`crate::net::ChainFetcher`]) narrows it to its PRIMARY (network) leg's
-    /// key, so the cache identity is the same whether or not a seed leg happens to be
-    /// chained: the bootstrap-time cache must serve the post-bootstrap plain-network
-    /// path, and a `dir:` seed cache must never satisfy it (the same-source guard).
-    fn cache_source_id(&self) -> String {
-        self.source_id()
-    }
-    /// The subset of `resolved` — THIS call's just-returned [`Fetcher::index_candidates`]
-    /// success — the §14 cache may persist, or `None` to skip the write. Default: all of
-    /// it (a single-source fetcher IS its network leg). [`crate::net::ChainFetcher`]
-    /// overrides this to the primary (network) leg's own candidates: a seed-leg success
-    /// must neither mask a network failure into a cache refresh nor overwrite the
-    /// last-good network candidates with sealed-seed bytes (the CACHE-MASKING tooth,
-    /// adversarial review 2026-07-30).
-    fn cacheable_candidates(&self, resolved: &[Candidate]) -> Option<Vec<Candidate>> {
-        Some(resolved.to_vec())
     }
     /// A CHEAP fingerprint of each candidate [`Fetcher::index_candidates`] would return
     /// THIS pass, in the SAME order — or `None` (the default) when this fetcher cannot
@@ -202,17 +288,27 @@ pub trait Fetcher {
     ///   equality only decides whether to re-download bytes that face every trust gate
     ///   either way.
     /// * `None` or an empty vector means "no cheap answer", which is always safe: the
-    ///   caller then takes the historical download path.
-    ///
-    /// # Why the default is `None` — and why [`crate::net::ChainFetcher`] keeps it
-    ///
-    /// A fetcher that opts in is telling the resolver it may skip `index_candidates`
-    /// entirely. For a chained fetcher that would skip the SEED leg too, because the §14
-    /// cache holds only the network leg's candidates ([`Fetcher::cacheable_candidates`]) —
-    /// and the seed union is exactly what the 2026-07-30 cache-masking review put there.
-    /// The chain is joined only on an EMPTY store (one bootstrap pass), so opting it in
-    /// would trade the crate's most adversarially-reviewed property for nothing.
+    ///   caller then takes the historical download path. A fetcher that opts in is telling
+    ///   the resolver it may skip `index_candidates` entirely, so the default is `None`.
     fn index_identities(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Whether this fetcher's last FAILED [`Fetcher::index_candidates`] failed on the LINK
+    /// — no host answered (DNS, a refused or timed-out connect, a TLS failure) — rather
+    /// than on a host that answered with a refusal (a rate limit, an auth answer, a 404, a
+    /// 5xx). Only the first is an offline machine ([`ResolveProvenance::answered`]): a
+    /// revoked token or a rate-limited address is a failure to surface, never a quiet
+    /// "offline" retried soon. DEFAULT `false` — offline is a claim that needs evidence.
+    fn index_link_down(&self) -> bool {
+        false
+    }
+
+    /// The unix second a RATE-LIMITED metered listing said to come back at (`retry-after`,
+    /// or `x-ratelimit-reset` with the window spent), when this fetcher was refused one and
+    /// the answer named a time — what the full pass records as the machine's hold
+    /// ([`crate::status::MeteredHold`]). DEFAULT `None`: no fetcher claims a hold unasked.
+    fn metered_hold_until(&self) -> Option<i64> {
         None
     }
 }
@@ -256,6 +352,20 @@ pub struct InstallReport {
     /// caller records the outcome's canonical state ([`ProtocolOutcome::state`]) rather
     /// than `managed <build>`. `None` for every store-managed install.
     pub protocol: Option<ProtocolOutcome>,
+    /// `Some` when the program is vendor-direct: what the vendor lane did, in its own
+    /// words. `index_build`/`roster_seq` are then `0` (no index was consulted).
+    pub vendor: Option<VendorReport>,
+}
+
+/// What the vendor-direct lane did for an `install`/`update` of one of its programs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorReport {
+    /// The version now active, when one is.
+    pub version: Option<String>,
+    /// The vendor, as its row names it (`Anthropic`).
+    pub vendor: String,
+    /// The verdict line (`atpkg: claude 2.1.278 → 2.1.280 (Anthropic latest)`).
+    pub line: String,
 }
 
 /// What an OS-installer lane did for a member — the three states such a member can be
@@ -428,12 +538,12 @@ pub enum FlowError {
     /// The artifact's `kind` is not installable by this tool path — an unrecognized kind.
     /// Fail-closed (§16.4 dispatch).
     UnsupportedKind(String),
-    /// An `app-bundle` member was refused by the two-anchor app-apply gate
-    /// ([`crate::appgate::app_apply_allowed`], §16.2/§16.4). The app is applied in-session by
-    /// its own updater (aterm-gui's overlap handoff), a topology the CLI tool-install path
-    /// deliberately does not carry, so the gate's unconditional notarization AND-anchor is
-    /// unproven here and the decision fails closed. atpkg never swaps the app (see
-    /// `app_apply_gate_refused` for the deferral rule).
+    /// An `app-bundle` member over `github-release` — the aterm app itself (§16.4). atpkg
+    /// never installs, stages or swaps it: the app updates itself in-session through its
+    /// own notarization-gated updater (aterm-update + aterm-gui's overlap handoff), a
+    /// topology the tool-install path does not carry. So this pair is refused, always,
+    /// before any byte moves. No live index names such a member; the day one does, staging
+    /// it for the app's own lane is new work (docs/TOOLCHAIN-PACKAGE-MANAGER.md §16.4).
     AppBundleRefused(String),
     /// An artifact row failed per-protocol admission ([`crate::vendor::check_row`]) BEFORE
     /// any byte moved: for `https`, a non-https or non-allow-listed `url`, an unknown
@@ -473,6 +583,9 @@ pub enum FlowError {
     /// The program is dev-linked (linkmode, §13) — `update`/`apply` HARD-SKIPS it until
     /// `atpkg unlink`.
     Linked(String),
+    /// The vendor-direct lane did not install a vendor program: its verdict line
+    /// (unreachable, refused, failed, or a head it will not move to), versions only.
+    Vendor(String),
 }
 
 // Hand-rendered through `Formatter::write_str` + direct `Display::fmt`/`Debug::fmt`
@@ -609,6 +722,7 @@ impl std::fmt::Display for FlowError {
                 f.write_str(p)?;
                 f.write_str("` to manage it from the registry")
             }
+            FlowError::Vendor(line) => f.write_str(line),
         }
     }
 }
@@ -779,6 +893,10 @@ fn install_inner(
     if crate::linkmode::is_linked(layout, program) {
         return Err(FlowError::Linked(program.to_string()));
     }
+    // A vendor-direct program never waits on the index resolve below (design §1.5).
+    if let Some(spec) = crate::vendor_direct::spec(program) {
+        return install_vendor(fetcher, layout, anchor, floor, req, spec, now_unix);
+    }
     seen.insert(program.to_string(), None);
     // 1–2. Resolve + verify-select the index + freshness (§8 gate 2) — the shared
     // [`resolve_verified_index`] prologue (cached-fallback, §14) — then reachability.
@@ -823,6 +941,7 @@ fn install_inner(
                 tree_root: String::new(),
                 dependencies: vec![],
                 protocol: None,
+                vendor: None,
             });
         }
         ApplyDecision::Tombstone => {
@@ -838,9 +957,10 @@ fn install_inner(
     }
 
     // 4. Fetch + verify + parse the per-build manifest; bind program + build (anti-replay).
-    let (raw, sig) = fetcher
-        .pkg_manifest(&repo, program, pinned)
-        .map_err(FlowError::PkgFetch)?;
+    let (raw, sig) = fetcher.pkg_manifest(&repo, program, pinned).map_err(|e| {
+        note_fetch_fault();
+        FlowError::PkgFetch(e)
+    })?;
     let verified = index
         .verify_pkg(raw, &sig)
         .map_err(|_| FlowError::PkgVerify)?;
@@ -1001,7 +1121,7 @@ fn install_inner(
     // a failure past activation UNWINDS ([`abort_activated_install`]) so a broken
     // toolchain is neither reported SUCCESS nor left live reading as 'already current'.
     // `app-bundle` over `github-release` (the aterm self-update, applied in-session by the
-    // app's own updater) keeps its own two-anchor gate and is NEVER the vendor-app lane.
+    // app's own updater) is refused here, always, and is NEVER the vendor-app lane.
     // The OS-INSTALLER lanes — `pkg` ([`apply_pkg`]), `softwareupdate`
     // ([`apply_softwareupdate`]) and `system-pm`
     // ([`apply_system_pm`]) — return HERE with a [`ProtocolOutcome`] and never reach the
@@ -1019,11 +1139,8 @@ fn install_inner(
         | crate::dispatch::ApplyStrategy::SysrootBundle
         | crate::dispatch::ApplyStrategy::VendorApp => {}
         crate::dispatch::ApplyStrategy::AppBundle => {
-            // Drive the two-anchor app-apply gate for the app's in-session apply topology and
-            // fail closed (atpkg never swaps the app; see the helper for the deferral rule).
-            return Err(app_apply_gate_refused(
-                ch, program, pinned, artifact, installed,
-            ));
+            // The app updates itself; atpkg never swaps it ([`FlowError::AppBundleRefused`]).
+            return Err(FlowError::AppBundleRefused(program.to_string()));
         }
         crate::dispatch::ApplyStrategy::Pkg
         | crate::dispatch::ApplyStrategy::SoftwareUpdate
@@ -1095,8 +1212,175 @@ fn install_inner(
         }
     }
 
-    // 6. Download → verify-and-stage (sha256 → extract → tree_root re-verify).
-    //
+    // 6–7. Download → verify-and-stage → activate → shim, the steps both lanes share.
+    let shim_env = pkg.shim_env();
+    let landed = land_artifact(
+        layout,
+        &Landing {
+            channel,
+            program,
+            build: pinned,
+            artifact,
+            exposes: &pkg.exposes,
+            shim_env: &shim_env,
+            // ALab's own tools get their `alab-<tool>` aliases; a vendor extra or a
+            // system-satisfiable member does not (`activate.rs` module doc).
+            aliases: Aliases::for_program(program, index.program(program)),
+            installed,
+            strategy,
+            hooks: &crate::install::StageHooks::NONE,
+        },
+        &|dl| fetch_artifact(fetcher, program, &repo, artifact, dl),
+    )?;
+    Ok(InstallReport {
+        program: program.to_string(),
+        build: pinned,
+        index_build: index.index_build,
+        roster_seq: index.roster_seq(),
+        already_current: false,
+        shimmed: landed.shimmed,
+        refused_shims: landed.refused,
+        tree_root: artifact.tree_root.clone(),
+        dependencies,
+        protocol: None,
+        vendor: None,
+    })
+}
+
+/// `install_inner` for a vendor-direct program: [`vendor_install_outcome`] under the
+/// compiled anchors, as the flow's report.
+fn install_vendor(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    floor: BuildFloor,
+    req: &InstallRequest,
+    spec: &'static crate::vendor_direct::VendorSpec,
+    now_unix: i64,
+) -> Result<InstallReport, FlowError> {
+    vendor_install_outcome(
+        fetcher,
+        layout,
+        anchor,
+        floor,
+        req,
+        spec,
+        &crate::vendor_direct::lane::Trust::PRODUCTION,
+        now_unix,
+    )
+    .into_install(layout)
+}
+
+/// An install of a vendor-direct program (`req.program`, whose row is `spec`): the vendor
+/// lane under `trust` and the door's yanks ([`door_vendor_policy`], the index `anchor` and
+/// `floor` verify), as a person's own act — no local-pin hold, and an unread legacy build
+/// above the ceiling is replaced. The outcome, so the CLI edge records the program's row
+/// from the lane's own verdict.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the install request plus the index gate the door's yank refresh verifies under"
+)]
+pub(crate) fn vendor_install_outcome(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    floor: BuildFloor,
+    req: &InstallRequest,
+    spec: &'static crate::vendor_direct::VendorSpec,
+    trust: &crate::vendor_direct::lane::Trust,
+    now_unix: i64,
+) -> crate::vendor_direct::lane::Outcome {
+    let policy = door_vendor_policy(fetcher, layout, anchor, floor, now_unix);
+    let lane = crate::vendor_direct::lane::Lane {
+        layout,
+        fetcher,
+        channel: req.channel,
+        triple: req.triple,
+        policy: &policy,
+        trust,
+        legacy_index: None,
+        asked: true,
+        now: now_unix,
+    };
+    crate::vendor_direct::lane::install_one(&lane, spec, false)
+}
+
+/// The signed yanks a targeted vendor door decides under (design §1.4–§1.5) — a person's
+/// `update <program>` or `install <program>`, `claude update`/`codex update`, the head
+/// watch's `--head-watch`. When the latch is absent or more than an hour old
+/// ([`crate::vendor_direct::policy::YankLatch::is_current`]), the index is verified first,
+/// live (no cached fallback), which refreshes the latch, and its yanks bind: a yank
+/// published since the last pass binds this door. That resolve never blocks or fails the
+/// door — unreached, stale or refused, the door decides on the latch as it stands.
+pub(crate) fn door_vendor_policy(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    floor: BuildFloor,
+    now_unix: i64,
+) -> crate::vendor_direct::policy::Policy {
+    use crate::vendor_direct::policy::{Policy, YankLatch};
+    if let Some(latch) = YankLatch::read(layout)
+        && latch.is_current(now_unix)
+    {
+        return latch.policy;
+    }
+    let fresh = resolve_candidates_live(fetcher, layout)
+        .and_then(|candidates| verify_select_fresh(layout, anchor, candidates, floor, now_unix));
+    Policy::current(layout, fresh.as_ref().ok().map(|index| &**index))
+}
+
+/// One store landing: the admitted row, the build it becomes, and what its shims carry —
+/// the inputs [`land_artifact`] shares between the index lane and the vendor lane.
+pub(crate) struct Landing<'a> {
+    /// The channel whose `current` link names the build.
+    pub channel: &'a str,
+    /// The program.
+    pub program: &'a str,
+    /// The store build the row becomes.
+    pub build: u64,
+    /// The admitted row.
+    pub artifact: &'a crate::manifest::Artifact,
+    /// The tool names the build exposes (admitted here).
+    pub exposes: &'a [String],
+    /// What the shims export, recorded beside the build before it is staged.
+    pub shim_env: &'a crate::shim_env::ShimEnv,
+    /// Whether the tools get `alab-<tool>` aliases.
+    pub aliases: Aliases,
+    /// The active build the caller decided against.
+    pub installed: Option<u64>,
+    /// How the row applies ([`crate::dispatch::strategy_for`]).
+    pub strategy: crate::dispatch::ApplyStrategy,
+    /// The caller's gate and sidecars inside the stage.
+    pub hooks: &'a crate::install::StageHooks<'a>,
+}
+
+/// What a landing laid.
+pub(crate) struct Landed {
+    /// The tools that got a shim.
+    pub shimmed: Vec<String>,
+    /// The exposed names refused a shim.
+    pub refused: Vec<String>,
+    /// The `tree_root` the stage folded.
+    pub root: String,
+}
+
+/// Fetch the row's bytes with `fetch`, verify and stage them, activate the build and lay
+/// its shims (install steps 6–7). Every failure past activation unwinds, and a stage
+/// failure leaves the previous build live.
+pub(crate) fn land_artifact(
+    layout: &Layout,
+    l: &Landing<'_>,
+    fetch: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<Landed, FlowError> {
+    let (channel, program, pinned, artifact, installed, strategy) = (
+        l.channel,
+        l.program,
+        l.build,
+        l.artifact,
+        l.installed,
+        l.strategy,
+    );
     // 6a. THE DIGEST-REFUSAL MEMO first, because it is the one gate that can spare the
     // download entirely: a recent attempt at THIS build's signed digests already proved
     // the published asset does not match them, and nothing about that verdict changes
@@ -1142,28 +1426,9 @@ fn install_inner(
     // is a sibling `.part` poller against the SIGNED size. Every hook is a no-op
     // unless a `--progress-file` pass is live.
     crate::progress::note_build(program, pinned);
-    // THE LANDING MARKER ([`crate::landing`], 2026-09-16): for an AGENT program whose
-    // active build differs from `pinned`, `<prefix>/landing/<program>` stands from here —
-    // inside the store lock, before the first byte moves — until this function returns,
-    // whichever way (the guard's drop). Activation below re-lays `bin/` and the `agents/`
-    // twin onto the new build before that drop, so a `claude` that handed over to
-    // `atpkg __landing` on the marker runs the new build the moment `bin/` resolves into
-    // it — and the verb reads the marker going WITHOUT that as the failed landing every
-    // early `return Err` below is (the drop is the same on every exit; the verb never
-    // takes "marker gone" for "landed").
-    let landing_from =
-        installed.or_else(|| crate::ops::active_builds(layout).get(program).copied());
-    let landing_from_version = landing_from
-        .filter(|&b| b != pinned && crate::stub::is_agent_program(program))
-        .and_then(|b| version_of_build(fetcher, &index, &repo, program, b));
-    let _landing = crate::landing::LandingGuard::begin(
-        layout,
-        program,
-        landing_from,
-        pinned,
-        &pkg.version,
-        landing_from_version.as_deref(),
-    );
+    // No landing marker (Phase 2, 2026-09-22): a `claude` typed during the transfer runs
+    // the build it has, silently, and activation's atomic flip below makes the next one
+    // run this build ([`crate::landing`]).
     let download_watch = crate::progress::watch_download(program, &dl, artifact.size);
     if reusable {
         println!(
@@ -1171,7 +1436,7 @@ fn install_inner(
              ({})",
             artifact.asset
         );
-    } else if let Err(e) = fetch_artifact(fetcher, program, &repo, artifact, &dl) {
+    } else if let Err(e) = fetch(&dl) {
         // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
         // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
         // absent or complete. The part is deliberately LEFT for the next attempt to
@@ -1179,6 +1444,7 @@ fn install_inner(
         // reclaimed on this exit exactly as on the stage exit below, because a `dir:`
         // registry's copy lane writes there directly.
         let _ = std::fs::remove_file(&dl);
+        note_fetch_fault();
         return Err(FlowError::Download(e));
     }
     // The transfer is over either way — stop the poller before the phase moves on.
@@ -1216,20 +1482,23 @@ fn install_inner(
     // manifest — the transaction's rollback, `rollback`, `unlink`'s restore — re-lay this
     // build's shims from it. Before the stage, so a build the sidecar could not be
     // written for is never marked ready with shims that would lack their environment.
-    if let Err(e) = crate::shim_env::write_sidecar(&build_dir, &pkg.shim_env()) {
+    if let Err(e) = crate::shim_env::write_sidecar(&build_dir, l.shim_env) {
         let _ = std::fs::remove_file(&dl);
         let mut why = String::from("shim_env sidecar: ");
         why.push_str(&e.to_string());
         return Err(FlowError::Activate(why));
     }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
-    let staged = verify_and_stage(artifact, &dl, &build_dir);
+    let staged = verify_and_stage(artifact, &dl, &build_dir, l.hooks);
     drop(extract_scope);
-    if let Err(e) = staged {
-        record_digest_refusal(&build_dir, artifact, &e);
-        reclaim_after_failed_stage(&dl, &e);
-        return Err(FlowError::Stage(e));
-    }
+    let root = match staged {
+        Ok(root) => root,
+        Err(e) => {
+            record_digest_refusal(&build_dir, artifact, &e);
+            reclaim_after_failed_stage(&dl, &e);
+            return Err(FlowError::Stage(e));
+        }
+    };
     let _ = std::fs::remove_file(&dl);
     // This build's bytes are good, whatever an earlier pass recorded about them — a
     // publisher who repaired the asset under the same pin is exactly the case the
@@ -1246,16 +1515,14 @@ fn install_inner(
     crate::progress::note_phase(program, crate::progress::Phase::Link);
     activate_channel(layout, channel, &build_dir)
         .map_err(|e| FlowError::Activate(e.to_string()))?;
-    let (tools, refused) = crate::store::split_exposed(&pkg.exposes);
+    let (tools, refused) = crate::store::split_exposed(l.exposes);
     // Past activation a failure leaves the broken build LIVE — channel `current`,
     // per-program witness, any shims already written — AND carrying its `.ready`
     // marker, so `active_builds` reports it, `decide` calls it UpToDate, and a retry
     // prints 'already current' with nothing working (the wedge `flip_member` rolls
     // back on the transactional path). Capture the same rollback input here so both
     // error arms below unwind identically. (audit: resolve-failure left-active wedge.)
-    // ALab's own tools get their `alab-<tool>` aliases; a vendor extra or a
-    // system-satisfiable member does not (`activate.rs` module doc).
-    let aliases = Aliases::for_program(program, index.program(program));
+    let aliases = l.aliases;
     let staged = Staged {
         build: pinned,
         build_dir: build_dir.clone(),
@@ -1268,7 +1535,7 @@ fn install_inner(
     };
     // The shims export the signed manifest's `shim_env` (design S7) — a managed vendor
     // tool runs with its own updater off; a system copy never runs through a shim.
-    if let Err(e) = install_tools_env(layout, &build_dir, &tools, aliases, &pkg.shim_env()) {
+    if let Err(e) = install_tools_env(layout, &build_dir, &tools, aliases, l.shim_env) {
         abort_activated_install(layout, channel, program, &staged);
         return Err(FlowError::Activate(e.to_string()));
     }
@@ -1285,17 +1552,10 @@ fn install_inner(
     // NOT here — writing ~/.aterm from flow's synthetic-layout unit tests would pollute the
     // developer's real home (identical hermeticity reasoning as the GC-after-activate edge).
     let shimmed: Vec<String> = tools.iter().map(|t| t.as_str().to_string()).collect();
-    Ok(InstallReport {
-        program: program.to_string(),
-        build: pinned,
-        index_build: index.index_build,
-        roster_seq: index.roster_seq(),
-        already_current: false,
+    Ok(Landed {
         shimmed,
-        refused_shims: refused,
-        tree_root: artifact.tree_root.clone(),
-        dependencies,
-        protocol: None,
+        refused,
+        root,
     })
 }
 
@@ -1319,6 +1579,7 @@ fn protocol_report(
         tree_root: String::new(),
         dependencies,
         protocol: Some(outcome),
+        vendor: None,
     }
 }
 
@@ -1501,6 +1762,7 @@ fn download_pkg(
     let download_watch = crate::progress::watch_download(program, &dl, artifact.size);
     if let Err(e) = fetch_artifact(fetcher, program, "", artifact, &dl) {
         let _ = std::fs::remove_file(&dl);
+        note_fetch_fault();
         return Err(FlowError::Download(e));
     }
     drop(download_watch);
@@ -1575,6 +1837,33 @@ fn fetch_artifact(
             Err(m)
         }
     }
+}
+
+/// Re-point `program` at its retained build `to` — the vendor lane's signed-yank
+/// rollback: the `current` flip, then shims for `exposes` alone under the build's own
+/// `.shim-env`, exactly as a vendor landing lays them. Never the build's `bin/` listing
+/// ([`rollback_member`]'s restore set): a vendor's exposes come only from the table.
+///
+/// # Errors
+/// The flip or the shims could not be written; a later pass decides the rollback again.
+pub(crate) fn roll_back_to(
+    layout: &Layout,
+    channel: &str,
+    program: &str,
+    to: u64,
+    exposes: &[String],
+) -> std::io::Result<()> {
+    let build_dir = layout.build_dir(program, to);
+    activate_channel(layout, channel, &build_dir)?;
+    let (tools, _) = crate::store::split_exposed(exposes);
+    let env = crate::shim_env::read_sidecar(&build_dir);
+    install_tools_env(layout, &build_dir, &tools, Aliases::Off, &env)
+}
+
+/// [`install_tombstone_shims`] for the vendor lane: `program`'s active build is yanked
+/// and no admissible build exists.
+pub(crate) fn tombstone_program(layout: &Layout, program: &str, installed: Option<u64>) {
+    install_tombstone_shims(layout, program, installed);
 }
 
 /// Install a failing tombstone shim (§7) over EVERY tool `program`'s currently-active build
@@ -1659,61 +1948,6 @@ fn abort_activated_install(layout: &Layout, channel: &str, program: &str, staged
         return;
     }
     crate::store::discard_build(&staged.build_dir);
-}
-
-/// Drive the two-anchor app-apply gate ([`crate::appgate::app_apply_allowed`], §16.2/§16.4)
-/// for an `app-bundle` member met on the tool-install path, and return the fail-closed refusal.
-///
-/// `aterm.app` is a NOTARIZED DMG the running app applies to itself IN-SESSION (aterm-gui's
-/// overlap handoff: a successor is spawned and every PTY is handed across, so the shells keep
-/// running; the cold-launch swap in aterm-update is only the fallback) — a distinct topology
-/// from the `bin/` symlink flip. The atpkg CLI tool-install path does not carry it, so Apple
-/// **notarization is unproven here** — and because notarization is the gate's UNCONDITIONAL
-/// AND-anchor, the decision fails closed regardless of the index conjunct. We still evaluate
-/// the REAL gate (with the fresh-index conjunct built from the signed channel `min_build` +
-/// per-build yank state) so the refusal is the gate's decision, not a blanket reject.
-///
-/// NOTE(app-bundle): atpkg must never swap, re-exec, or ask the user to reopen the app. If the
-/// `aterm` member is ever added to the index, atpkg's whole job is refuse-and-defer plus a
-/// stage handoff to the app's own in-session lane (also recorded in
-/// docs/TOOLCHAIN-PACKAGE-MANAGER.md §16.4):
-///   (a) verify the DMG through [`crate::appgate::app_apply_allowed`] with a REAL notarization
-///       result — call aterm-update's `verify_bundle`, never reimplement codesign/spctl;
-///   (b) stage by calling aterm-update's own publish routine so the bundle lands at
-///       `aterm_update::paths::Staging::staged_app` (`<updates_root>/staged/aterm.app`) with
-///       `ready.toml` written last under `stage.lock`;
-///   (c) release the seal-read marker (`Updates/toolchain-install`, [`crate::net`]'s
-///       `SealReadGuard`) before returning — while it is held the GUI's apply is vetoed by
-///       `aterm_update::is_toolchain_install_active()`, so an app stage must not go through
-///       a DirFetcher on the sealed seed;
-///   (d) poke the running GUI with `aterm ctl update check` (Owner-only), whose `check` arm
-///       must post `Wake::UpdateStaged` for a strictly-newer stage so the App's reconcile
-///       arms automatic apply after validating the durable stage;
-///   (e) the only user-visible sentence is "staged for aterm to apply in-session" — never
-///       spawn, exec, or prompt.
-fn app_apply_gate_refused(
-    ch: &Channel,
-    program: &str,
-    pinned: u64,
-    _artifact: &crate::manifest::Artifact,
-    installed: Option<u64>,
-) -> FlowError {
-    let gate = crate::appgate::AppIndexGate {
-        // No staged DMG to hash on this path, so the sha256 conjunct cannot be satisfied (see
-        // the NOTE above); the notarization anchor already fails the gate closed.
-        sha256_match: false,
-        min_build: ch.min_build_for(program),
-        yanked: crate::gate::is_yanked(ch, program, pinned),
-    };
-    // notarized = false: the CLI install path proves no Apple notarization and never applies
-    // the app itself, so the unconditional AND-anchor refuses the apply.
-    let allowed =
-        crate::appgate::app_apply_allowed(false, pinned, installed.unwrap_or(0), Some(&gate));
-    debug_assert!(
-        !allowed,
-        "notarization is unproven on the CLI path — the gate must fail closed"
-    );
-    FlowError::AppBundleRefused(program.to_string())
 }
 
 /// A member staged (verified + extracted) but NOT yet flipped, plus what `flip`/`rollback`
@@ -1950,6 +2184,15 @@ pub fn apply_channel_with(
 /// One `live_builds` scan and one `bin/` scan per call, on the path that was otherwise
 /// about to skip the group.
 fn any_member_tombstoned_in_place(layout: &Layout, group: &Group) -> bool {
+    tombstoned_in_place(layout, group.members.iter().map(String::as_str))
+}
+
+/// [`any_member_tombstoned_in_place`] over `programs`: whether any is installed here but
+/// disabled — the one test both lanes use to revisit a tombstone their shim view hides.
+pub(crate) fn tombstoned_in_place<'a>(
+    layout: &Layout,
+    programs: impl IntoIterator<Item = &'a str>,
+) -> bool {
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
         return false;
     };
@@ -1964,7 +2207,7 @@ fn any_member_tombstoned_in_place(layout: &Layout, group: &Group) -> bool {
         return false;
     }
     let live = crate::gc::live_builds(layout);
-    group.members.iter().any(|m| {
+    programs.into_iter().any(|m| {
         live.get(m).is_some_and(|witness| {
             let build_bin = layout.build_dir(m, witness.build()).join("bin");
             // `presence`, not `exists`: an EACCES/EPERM on the build dir is not proof the
@@ -2626,10 +2869,10 @@ fn carried_archive(dl: &Path, artifact: &crate::manifest::Artifact) -> bool {
     if !meta.is_file() {
         return false;
     }
-    // A hard link into the sealed registry (a `dir:` registry's stale staging entry) is
-    // never carried: it is the app bundle's own inode, and reading it as the download
-    // would be right while any later write through the name would be into the bundle
-    // (2026-09-15) — one link, one owner, or it is fetched afresh.
+    // A hard link into a `dir:` registry (its stale staging entry) is never carried: it
+    // is the registry's own inode, and reading it as the download would be right while
+    // any later write through the name would be into the registry (2026-09-15) — one
+    // link, one owner, or it is fetched afresh.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -2754,13 +2997,17 @@ fn sweep_foreign_partials(dl: &Path) {
 
 /// What a FAILED stage leaves in `staging/`: nothing for a digest failure (the bytes
 /// are wrong — the archive and any `.part` that would seed the next attempt go, see
-/// [`discard_sibling_partial`]); the verified archive, kept in place, for every other
-/// failure, so the next attempt stages it again without the download
+/// [`discard_sibling_partial`]) or a signer refusal (the bytes are refused, and the memo
+/// keeps them from being fetched again); the verified archive, kept in place, for every
+/// other failure, so the next attempt stages it again without the download
 /// ([`carried_archive`]). One archive per program at most survives —
 /// [`sweep_foreign_partials`] removes the others — so a member that keeps failing keeps
 /// one copy, never one per attempt.
 fn reclaim_after_failed_stage(dl: &Path, e: &StageError) {
-    if matches!(e, StageError::Sha256Mismatch { .. }) {
+    if matches!(
+        e,
+        StageError::Sha256Mismatch { .. } | StageError::SignerRefused(_)
+    ) {
         let _ = std::fs::remove_file(dl);
         discard_sibling_partial(dl);
     }
@@ -2775,6 +3022,10 @@ fn reclaim_after_failed_stage(dl: &Path, e: &StageError) {
 /// and its sibling partial: the bytes are wrong, and a poisoned prefix must never seed the
 /// next attempt, so the next attempt starts from byte 0.
 ///
+/// A signer refusal ([`StageError::SignerRefused`]) is recorded too, as a signer memo that
+/// binds until the digests move: its bytes MATCHED them, so a re-download can only fetch
+/// the same refusal, and its archive is deleted with the verdict.
+///
 /// A `tree_root` mismatch is deliberately NOT recorded, though it is just as
 /// deterministic: its archive passed the signed digest and is KEPT, so the next attempt
 /// re-stages it with no download at all ([`carried_archive`], pinned by
@@ -2783,12 +3034,17 @@ fn reclaim_after_failed_stage(dl: &Path, e: &StageError) {
 /// failure is a fact about THIS MACHINE (a full disk, an unreadable store, a refused
 /// installer lane), keeps its verified archive for the same reason, and retries freely.
 fn record_digest_refusal(build_dir: &Path, artifact: &crate::manifest::Artifact, e: &StageError) {
-    if !matches!(e, StageError::Sha256Mismatch { .. }) || artifact.sha256.is_empty() {
+    if artifact.sha256.is_empty() {
         return;
     }
+    let record = match e {
+        StageError::Sha256Mismatch { .. } => crate::store::record_stage_refusal,
+        StageError::SignerRefused(_) => crate::store::record_signer_refusal,
+        _ => return,
+    };
     // Best-effort: a store this process cannot write is a machine fault, and the pass
     // that could not record the refusal still reports the stage failure itself.
-    let _ = crate::store::record_stage_refusal(
+    let _ = record(
         build_dir,
         &artifact.sha256,
         &artifact.tree_root,
@@ -2826,10 +3082,21 @@ fn digest_refusal_note(
     // Built by hand rather than wrapped into one `format!` string: the sentence is long,
     // and a continuation inside a string literal is how it grows a run of spaces nobody
     // sees until it is printed at an operator.
-    let mut note = String::from(program);
-    note.push_str(" build ");
-    note.push_str(&crate::dec_u64(build));
+    let mut note = crate::vendor_direct::display_build(program, build);
     note.push_str(": ");
+    if memo.signer {
+        note.push_str("the published ");
+        note.push_str(&artifact.asset);
+        note.push_str(" matched its signed digests and failed the platform signer check (");
+        note.push_str(&memo.why);
+        note.push_str(") — not refetching ");
+        note.push_str(&crate::cost::human_bytes(artifact.size));
+        note.push_str(" to reach the same verdict. The next attempt is due when the pin or ");
+        note.push_str("its signed digests change; `aterm pkg install ");
+        note.push_str(program);
+        note.push_str("` retries now.");
+        return Some(note);
+    }
     note.push_str(&crate::dec_u64(u64::from(memo.attempts)));
     note.push_str(" attempts over the identical signed digests proved the published ");
     note.push_str(&artifact.asset);
@@ -2927,7 +3194,8 @@ pub fn resolve_verified_index(
     now_unix: i64,
 ) -> Result<TrustedIndex, FlowError> {
     let candidates = resolve_candidates(fetcher, layout)?;
-    verify_select_fresh(layout, anchor, candidates, floor, now_unix)
+    let live = last_resolve().is_some_and(|r| r.reached);
+    verify_select_fresh_from(layout, anchor, candidates, floor, now_unix, live)
 }
 
 /// The verify-select + freshness half of [`resolve_verified_index`], over caller-supplied
@@ -2961,12 +3229,40 @@ fn verify_select_fresh(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<TrustedIndex, FlowError> {
+    verify_select_fresh_from(layout, anchor, candidates, floor, now_unix, true)
+}
+
+/// [`verify_select_fresh`] over candidates that came `live` off the source, or from the
+/// §14 cache when it was not reached (`live == false`).
+fn verify_select_fresh_from(
+    layout: &Layout,
+    anchor: &Anchor,
+    candidates: Vec<Candidate>,
+    floor: BuildFloor,
+    now_unix: i64,
+    live: bool,
+) -> Result<TrustedIndex, FlowError> {
     let pass = select_index(anchor, candidates, floor, now_unix);
     observe_roster_generation(layout, pass.observed_roster_seq);
     let selected = pass.selected.ok_or(FlowError::NoIndex)?;
     let index = selected.index;
     if !index_is_fresh(&index, now_unix) {
         return Err(FlowError::Stale);
+    }
+    // Every fresh verification carries its vendor yanks forward, so staleness can never
+    // un-apply one (design §1.4); only one of bytes the source served LIVE stamps the
+    // latch current, so a targeted vendor door knows whether to verify again.
+    // Best-effort: an unwritten latch keeps the older yanks.
+    if layout.prefix.is_dir() {
+        use crate::vendor_direct::policy::YankLatch;
+        let written = if live {
+            YankLatch::update_from_index(layout, &index, now_unix)
+        } else {
+            YankLatch::carry_from_cached_index(layout, &index)
+        };
+        if let Err(e) = written {
+            eprintln!("atpkg: the vendor yank latch was not written ({e})");
+        }
     }
     Ok(index)
 }
@@ -2993,10 +3289,6 @@ pub(crate) fn observe_roster_generation(layout: &Layout, seq: u64) {
 /// `valid_until` window is still open at `now_unix`. A `valid_until` we cannot parse
 /// is lapsed (fail closed).
 ///
-/// (This used to say it was shared with "the CLI's seed-as-update-source
-/// admission". No such admission has ever existed: the seed is a BOOTSTRAP
-/// source only — `seed_bootstrap_leg` joins it to the chain solely on an empty
-/// store — and it was not restored as one when the lane came back in 2026-08-17.)
 pub(crate) fn index_is_fresh(index: &Index, now_unix: i64) -> bool {
     matches!(
         rfc3339_to_unix(&index.valid_until),
@@ -3008,16 +3300,14 @@ pub(crate) fn index_is_fresh(index: &Index, now_unix: i64) -> bool {
 /// NON-EMPTY fetch refreshes the cache; a fetch failure — or an EMPTY success, which is a
 /// fetch that FOUND nothing (an index tag pushed off the release listing, a repo with no
 /// index release) and previously bypassed the fallback into a repo-wide `NoIndex` while a
-/// good cache sat on disk — falls back to the last cached candidates FOR THE SAME SOURCE
-/// (a `dir:` cache never satisfies a failed `github:` fetch). Both the write and the load
-/// are keyed by [`Fetcher::cache_source_id`], and the write persists only
-/// [`Fetcher::cacheable_candidates`] — the NETWORK leg of a chained fetcher — so a seed-leg
-/// success can never overwrite the last-good network cache (cache masking, 2026-07-30).
-/// Cached bytes are RAW — everything downstream (verify-then-select, freshness, floor)
-/// is unchanged, so a tampered/stale cache installs nothing the live path wouldn't.
+/// good cache sat on disk — falls back to the last cached candidates FOR THE SAME SOURCE (a
+/// `dir:` cache never satisfies a failed `github:` fetch). Both the write and the load are
+/// keyed by [`Fetcher::source_id`]. Cached bytes are RAW — everything downstream
+/// (verify-then-select, freshness, floor) is unchanged, so a tampered/stale cache installs
+/// nothing the live path wouldn't.
 fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Candidate>, FlowError> {
     let cache = crate::cache::IndexCache::for_layout(layout);
-    let src = fetcher.cache_source_id();
+    let src = fetcher.source_id();
     // THE HIT PATH (see `Fetcher::index_identities`). Ask the cheap question first: is
     // the source still publishing the very assets the cached bytes came from? On the
     // production fetcher that question is answered by the release LISTING, which
@@ -3040,80 +3330,37 @@ fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Cand
     // owner-only) already owns the store the shims point into.
     //
     // `unwrap_or_default()` collapses "no cheap answer" to an empty vector, which
-    // `load_if_identical` refuses outright — so every non-participating fetcher (the seed
-    // `DirFetcher`, `ChainFetcher`, every test double) takes the historical path below,
-    // byte for byte.
+    // `load_if_identical` refuses outright — so every non-participating fetcher (a `dir:`
+    // `DirFetcher`, every test double) takes the historical path below, byte for byte.
     let live = fetcher.index_identities().unwrap_or_default();
     if let Some(hit) = cache.load_if_identical(&src, &live) {
         // The identities came off the LIVE listing: the source was reached, and the
         // cache is proven current — the one cache read that is not a fallback.
-        note_resolve(true, None);
+        note_resolve(true, None, true);
         return Ok(hit);
     }
     match fetcher.index_candidates() {
         Ok(c) if !c.is_empty() => {
-            match fetcher.cacheable_candidates(&c) {
-                // `store` itself refuses an empty set, so a network leg that succeeded
-                // with nothing keeps the older good cache rather than clobbering it.
-                // An EMPTY cacheable set takes the union arm below for the same reason
-                // `None` does: "the network found no index" and "the network could not
-                // be reached" both mean the authoritative leg said nothing this pass.
-                Some(cacheable) if !cacheable.is_empty() => {
-                    // Stamped with the identities probed ABOVE — the same listing that
-                    // produced these bytes, so the pairing cannot straddle a publish. A
-                    // fetcher that gave no identities stores none (`&[]`), and the entry
-                    // stays the failure-time fallback it has always been.
-                    cache.store(&src, &cacheable, &live);
-                    note_resolve(true, None);
-                    Ok(c)
-                }
-                // The CACHEABLE (network) leg contributed NOTHING, yet the fetch as a
-                // whole succeeded — only a chained fetcher can be in this state, and it
-                // means the seed leg alone answered. Closing the cache-masking tooth on
-                // the WRITE side is not enough here: leaving this as a plain `Ok` also
-                // masks the cache READ, because the fallback below is the only place the
-                // cache is consulted. That is the same defect the 2026-07-30 review
-                // named, one arm over.
-                //
-                // It is not theoretical. On an EMPTY store the durable `index_build`
-                // floor cannot rise (`advance_floors` runs only after a completed
-                // install), and the empty store is exactly when the seed leg is chained
-                // in — so an offline launch could resolve the SEALED index while a
-                // strictly newer, already-verified network index sat in the cache, and
-                // reinstate pins that index had yanked or floored out.
-                //
-                // So: UNION the last-good network candidates in and let the ordinary
-                // monotonic selection decide. The cache is not trusted here any more
-                // than anywhere else — these are raw bytes that still face
-                // verify-then-select, freshness, and the floor.
-                _ => {
-                    // Cached candidates FIRST: `select_index` replaces only on a
-                    // STRICTLY greater index_build, so on a tie the last-good network
-                    // index outranks an equal-build seal — the same authority ordering
-                    // the live chain uses.
-                    note_resolve(
-                        false,
-                        Some(String::from(
-                            "the network leg contributed no index; the sealed seed answered",
-                        )),
-                    );
-                    let mut merged = cache.load(&src).unwrap_or_default();
-                    merged.extend(c);
-                    Ok(merged)
-                }
-            }
+            // Stamped with the identities probed ABOVE — the same listing that produced
+            // these bytes, so the pairing cannot straddle a publish. A fetcher that gave
+            // no identities stores none (`&[]`), and the entry stays the failure-time
+            // fallback it has always been.
+            cache.store(&src, &c, &live);
+            note_resolve(true, None, true);
+            Ok(c)
         }
         // Reached the source, and it genuinely carried no index — a repo with no
         // index release, or a tag pushed off the listing. A trust-shaped answer is
         // the right one here.
         Ok(_) => {
-            note_resolve(true, None);
+            note_resolve(true, None, true);
             cache.load(&src).ok_or(FlowError::NoIndex)
         }
         // Could NOT reach it. Keep the reason: telling an offline user their
-        // signatures failed sends them to the wrong problem entirely.
+        // signatures failed sends them to the wrong problem entirely. Whether a host
+        // answered at all is kept too — a refusal is not an offline machine.
         Err(why) => {
-            note_resolve(false, Some(why.clone()));
+            note_resolve(false, Some(why.clone()), !fetcher.index_link_down());
             cache.load(&src).ok_or(FlowError::Unreachable(why))
         }
     }
@@ -3154,7 +3401,7 @@ fn resolve_candidates_live(
 ) -> Result<Vec<Candidate>, FlowError> {
     let cache = crate::cache::IndexCache::for_layout(layout);
     let live = fetcher.index_identities().unwrap_or_default();
-    if let Some(hit) = cache.load_if_identical(&fetcher.cache_source_id(), &live) {
+    if let Some(hit) = cache.load_if_identical(&fetcher.source_id(), &live) {
         return Ok(hit);
     }
     fetcher.index_candidates().map_err(|_| FlowError::NoIndex)
@@ -3173,21 +3420,53 @@ pub struct ResolveProvenance {
     pub reached: bool,
     /// Why it did not, when it did not — the transport's own sentence.
     pub why: Option<String>,
+    /// Whether a host ANSWERED at all — the listing, or a refusal with a status (a rate
+    /// limit, an auth answer, a 404, a 5xx). `false` only when the link itself failed
+    /// ([`Fetcher::index_link_down`]): the one resolve an offline pass is made of.
+    pub answered: bool,
 }
 
-static LAST_RESOLVE: std::sync::Mutex<Option<ResolveProvenance>> = std::sync::Mutex::new(None);
-
-fn note_resolve(reached: bool, why: Option<String>) {
-    if let Ok(mut slot) = LAST_RESOLVE.lock() {
-        *slot = Some(ResolveProvenance { reached, why });
-    }
+// PER THREAD: a pass reads what ITS resolve measured, and a pass is one thread — so two
+// passes in one process (the test suite's) can never read each other's network.
+thread_local! {
+    static LAST_RESOLVE: std::cell::RefCell<Option<ResolveProvenance>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// The provenance of the last [`resolve_verified_index`] in this process, `None` before
-/// the first.
+fn note_resolve(reached: bool, why: Option<String>, answered: bool) {
+    LAST_RESOLVE.with(|slot| {
+        *slot.borrow_mut() = Some(ResolveProvenance {
+            reached,
+            why,
+            answered: reached || answered,
+        });
+    });
+}
+
+// PER THREAD, like the resolve's provenance: the members this pass lost AT A FETCH.
+thread_local! {
+    static FETCH_FAULTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one member that failed AT A FETCH — its manifest or its artifact did not arrive.
+/// A pass that reached nothing is offline only when every failure it counts is one of these
+/// (`cli::run_update_pass` reads [`fetch_faults`] before and after); a full disk, a refused
+/// stage or a shim that could not be laid is a failure, whatever the network did.
+pub(crate) fn note_fetch_fault() {
+    FETCH_FAULTS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
+/// This thread's [`note_fetch_fault`] count so far.
+#[must_use]
+pub(crate) fn fetch_faults() -> u32 {
+    FETCH_FAULTS.with(std::cell::Cell::get)
+}
+
+/// The provenance of this thread's last [`resolve_verified_index`], `None` before the
+/// first.
 #[must_use]
 pub fn last_resolve() -> Option<ResolveProvenance> {
-    LAST_RESOLVE.lock().ok().and_then(|slot| slot.clone())
+    LAST_RESOLVE.with(|slot| slot.borrow().clone())
 }
 
 /// Roll `program` back to the highest RETAINED build strictly below its current active build
@@ -3321,6 +3600,7 @@ pub fn apply_program(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
+    refuse_vendor_program(program)?;
     let candidates = resolve_candidates_live(fetcher, layout)?;
     let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     // The channel as THIS target sees it (`pin_by_target` laid over `pin`): every decide,
@@ -3409,6 +3689,7 @@ pub fn plan_update(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<UpdatePlan, FlowError> {
+    refuse_vendor_program(program)?;
     let candidates = resolve_candidates_live(fetcher, layout)?;
     let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     // Decide against the pin THIS target installs (`pin_by_target` overlay), or a build
@@ -3428,6 +3709,18 @@ pub fn plan_update(
         // floor build running). See [`crate::gate::current_build_ok`].
         current_build_ok: crate::gate::current_build_ok(ch, program, installed_build),
     })
+}
+
+/// A vendor-direct program's decisions are its vendor lane's; the index's rules never
+/// reach it.
+fn refuse_vendor_program(program: &str) -> Result<(), FlowError> {
+    match crate::vendor_direct::spec(program) {
+        Some(spec) => Err(FlowError::Vendor(format!(
+            "{program} is updated from {}, not through the ALab index",
+            spec.vendor
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The read-only plan `plan_update` yields: which path to take (grouped vs ungrouped), the
@@ -3456,33 +3749,66 @@ pub(crate) fn verified_pkg(
     ch: &Channel,
     program: &str,
 ) -> Option<(u64, String, crate::manifest::PkgManifest)> {
-    let pinned = *ch.pin.get(program)?;
-    let repo = index.program(program)?.repo.clone();
-    let (raw, sig) = fetcher.pkg_manifest(&repo, program, pinned).ok()?;
-    let verified = index.verify_pkg(raw, &sig).ok()?;
-    let pkg = parse_pkg(&verified).ok()?;
-    Some((pinned, repo, pkg))
+    verified_pkg_or_miss(fetcher, index, ch, program).ok()
 }
 
-/// The version `program`'s SIGNED manifest states for `build` — any build, not the pin —
-/// verified under the index like every manifest read; `None` on any fetch/verify/parse
-/// miss. One manifest fetch (a few KB) the landing marker ([`crate::landing`]) spends,
-/// for an agent program only and only when a NEWER pin is about to replace `build`, so
-/// the wait can say `Ctrl-C runs 2.1.273 now` rather than `build 2026091601`.
-fn version_of_build(
+/// [`verified_pkg`], saying on a miss whether the manifest was FETCHED (`Err(true)`: it
+/// did not verify or parse, or the index names no pin) or not (`Err(false)`: the transfer
+/// failed — a fetch fault, [`note_fetch_fault`]).
+fn verified_pkg_or_miss(
+    fetcher: &dyn Fetcher,
+    index: &TrustedIndex,
+    ch: &Channel,
+    program: &str,
+) -> Result<(u64, String, crate::manifest::PkgManifest), bool> {
+    let pinned = *ch.pin.get(program).ok_or(true)?;
+    let repo = index.program(program).ok_or(true)?.repo.clone();
+    let (raw, sig) = fetcher
+        .pkg_manifest(&repo, program, pinned)
+        .map_err(|_| false)?;
+    let verified = index.verify_pkg(raw, &sig).map_err(|_| true)?;
+    let pkg = parse_pkg(&verified).map_err(|_| true)?;
+    Ok((pinned, repo, pkg))
+}
+
+/// `program`'s SIGNED manifest for `build` — any build, not the pin — verified under the
+/// index like every manifest read and bound to program and build; `None` on any
+/// fetch/verify/parse miss. One manifest fetch (a few KB).
+fn signed_pkg_of_build(
     fetcher: &dyn Fetcher,
     index: &TrustedIndex,
     repo: &str,
     program: &str,
     build: u64,
-) -> Option<String> {
+) -> Option<crate::manifest::PkgManifest> {
     let (raw, sig) = fetcher.pkg_manifest(repo, program, build).ok()?;
     let verified = index.verify_pkg(raw, &sig).ok()?;
     let pkg = parse_pkg(&verified).ok()?;
-    if !pkg.is_for(program) || pkg.build_number != build {
-        return None;
-    }
-    Some(pkg.version)
+    (pkg.is_for(program) && pkg.build_number == build).then_some(pkg)
+}
+
+/// The signed root `pkg` states for `triple`, when it states a non-empty one.
+fn signed_root_for(pkg: &crate::manifest::PkgManifest, triple: &str) -> Option<String> {
+    pkg.artifact_for(triple)
+        .map(|a| a.tree_root.clone())
+        .filter(|root| !root.is_empty())
+}
+
+/// The version `program`'s SIGNED manifest states for `build`, and the `tree_root` it
+/// states for `triple` when it states one ([`signed_pkg_of_build`]). The vendor lane names
+/// a legacy index build by its version with it, and keeps the root, from the same one
+/// fetch, for a rollback to that build.
+pub(crate) fn legacy_facts_of_build(
+    fetcher: &dyn Fetcher,
+    index: &TrustedIndex,
+    repo: &str,
+    program: &str,
+    build: u64,
+    triple: &str,
+) -> Option<(String, Option<String>)> {
+    let pkg = signed_pkg_of_build(fetcher, index, repo, program, build)?;
+    let root = signed_root_for(&pkg, triple);
+    Some((pkg.version, root))
 }
 
 /// The SIGNED asset size `program`'s pinned build ships for `triple`, or `None` on
@@ -3522,18 +3848,8 @@ pub fn signed_root_for_installed(
     triple: &str,
 ) -> Option<String> {
     let repo = index.program(program)?.repo.clone();
-    let (raw, sig) = fetcher.pkg_manifest(&repo, program, build).ok()?;
-    let verified = index.verify_pkg(raw, &sig).ok()?;
-    let pkg = parse_pkg(&verified).ok()?;
-    if !pkg.is_for(program) || pkg.build_number != build {
-        return None;
-    }
-    let root = pkg
-        .artifacts
-        .iter()
-        .find(|a| a.target == triple)
-        .map(|a| a.tree_root.clone())?;
-    (!root.is_empty()).then_some(root)
+    let pkg = signed_pkg_of_build(fetcher, index, &repo, program, build)?;
+    signed_root_for(&pkg, triple)
 }
 
 /// The one line a failed group member owes the log: WHICH program, at WHICH build, and WHY
@@ -3583,9 +3899,15 @@ fn stage_member(
 ) -> Option<Staged> {
     // `why` is the sentence the abort carries (2026-09-15): every `None` below names its
     // step, so `aborted: stage` on the record is never the whole story again.
-    let Some((pinned, repo, pkg)) = verified_pkg(fetcher, index, ch, program) else {
-        *why = format!("the signed manifest for {program} could not be fetched or verified");
-        return None;
+    let (pinned, repo, pkg) = match verified_pkg_or_miss(fetcher, index, ch, program) {
+        Ok(found) => found,
+        Err(fetched) => {
+            if !fetched {
+                note_fetch_fault();
+            }
+            *why = format!("the signed manifest for {program} could not be fetched or verified");
+            return None;
+        }
     };
     if !pkg.is_for(program) || pkg.build_number != pinned {
         *why = format!(
@@ -3674,7 +3996,7 @@ fn stage_member(
     let carried = carried_archive(&dl, artifact);
     if !carried {
         // Same reason as the singleton path: a stale staging entry can be a hardlink
-        // into the sealed registry, and fetching over it corrupts the app bundle. The
+        // into a `dir:` registry, and fetching over it corrupts the registry. The
         // carried arm never needs this: it only READS `dl` — nothing is written over a
         // hardlink — and what it reads already matched the signed digest.
         let _ = std::fs::remove_file(&dl);
@@ -3704,6 +4026,7 @@ fn stage_member(
             // reclaimed on this exit exactly as on the stage exit below, because a `dir:`
             // registry's copy lane writes there directly.
             let _ = std::fs::remove_file(&dl);
+            note_fetch_fault();
             *why = format!("the download of {} failed: {e}", artifact.asset);
             return None;
         }
@@ -3745,7 +4068,7 @@ fn stage_member(
         return None;
     }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
-    let staged = verify_and_stage(artifact, &dl, &build_dir);
+    let staged = verify_and_stage(artifact, &dl, &build_dir, &crate::install::StageHooks::NONE);
     drop(extract_scope);
     if let Err(e) = staged {
         // Reclaimed on THIS exit for a DIGEST failure only (the bytes are wrong — the
@@ -3914,8 +4237,22 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
             // list would re-activate the prior build with part of its PATH surface
             // silently missing. A sensitive name in the prior `bin/` never had a
             // shim (`ToolName::new` refuses it) and drops out here the same way.
+            //
+            // The LISTING half is admitted only through `rollback_may_claim`: a sysroot
+            // bundle's `bin/` carries backends belonging to OTHER atpkg programs — trust's
+            // carries `ay`, `clean` and `ty` — and restoring every file in it re-pointed
+            // those programs' shims (and `alab-` aliases) at `store/trust/<prior>`, after
+            // which the next trust flip's prune deleted them as stale trust shims. Measured
+            // on m3 (2026-09-23): `ty`, `ay`, `clean` and their aliases gone from PATH while
+            // `tla`, `ay-*` and `clean-lsp` stood, on a machine that had logged a trust flip
+            // aborted and rolled back; this path reproduces that end state exactly.
+            // `d784a9fb9` fixed the same clobber in `unlink`'s restore; this is its twin.
             let mut restore: std::collections::BTreeSet<crate::store::ToolName> =
                 s.exposes.iter().cloned().collect();
+            // Names that came from the listing alone: their aliases get the same ownership
+            // check as the primary before they are re-pointed.
+            let mut listing_only: std::collections::BTreeSet<crate::store::ToolName> =
+                std::collections::BTreeSet::new();
             if let Ok(entries) = std::fs::read_dir(prior_dir.join("bin")) {
                 for e in entries.flatten() {
                     // Files only: a stray subdirectory in `bin/` is not a tool and
@@ -3929,11 +4266,27 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
                         let logical = name
                             .strip_suffix(crate::platform::EXE_SUFFIX)
                             .unwrap_or(name);
-                        if let Some(tool) = crate::store::ToolName::new(logical) {
+                        if let Some(tool) = crate::store::ToolName::new(logical)
+                            && !restore.contains(&tool)
+                            && rollback_may_claim(layout, program, &tool)
+                        {
+                            listing_only.insert(tool.clone());
                             restore.insert(tool);
                         }
                     }
                 }
+            }
+            // `current` FIRST, then the shims — activation's own order. The flip used to come
+            // last, its failure swallowed, so an undo interrupted or failed there left
+            // `current` on the build being rolled OFF while the shims ran the prior one,
+            // and the next pass's roll-forward (`cli::roll_forward_interrupted_activations`)
+            // put the rolled-off build back. Now the one divergence an undo can leave is
+            // `current` ahead of the shims on the PRIOR build, which roll-forward completes.
+            if let Err(e) = activate_channel(layout, channel, &prior_dir) {
+                eprintln!(
+                    "atpkg: {program}: the rollback to build {prior} could not re-point \
+                     `current` ({e}) — its shims are re-laid all the same"
+                );
             }
             // The PRIOR build's shims export the PRIOR build's `shim_env` — its sidecar,
             // written from its own signed manifest when it was staged (design S7). A
@@ -3962,7 +4315,13 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
                 // The alias goes where the primary goes: re-pointed at the prior build
                 // beside it, or dropped with it. `None` when the policy is Off (the alias
                 // was never laid) or the tool is its own alias.
-                let alias = (s.aliases == Aliases::Alab).then(|| tool.alias()).flatten();
+                let alias = (s.aliases == Aliases::Alab)
+                    .then(|| tool.alias())
+                    .flatten()
+                    .filter(|alias| {
+                        !listing_only.contains(tool)
+                            || shim_free_or_owned_by(layout, program, &layout.shim(alias))
+                    });
                 if target.exists() {
                     let _ = crate::platform::install_shim_env(
                         &prior_dir.join("bin"),
@@ -3987,7 +4346,6 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
                     }
                 }
             }
-            let _ = activate_channel(layout, channel, &prior_dir);
         }
         Some(_) => { /* prior == new build: nothing meaningful to undo */ }
         None => {
@@ -4023,6 +4381,56 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
     crate::activate::reconcile_agents(layout);
 }
 
+/// Whether a rollback of `program` may lay `bin/<tool>` for a name it found ONLY in the
+/// prior build's `bin/` listing — not in the signed exposes it is rolling off.
+///
+/// A listing is not an exposes list: a sysroot bundle's `bin/` carries backends that belong
+/// to OTHER atpkg programs (trust's carries `ay`, `clean` and `ty`). So a listing name is
+/// claimed only when it is not another installed program's OWN name
+/// ([`another_program_is_installed_as`]) — that program owns it even when its shim has gone
+/// missing — and its shim is absent or already resolves into `store/<program>/` at some
+/// build (see [`shim_free_or_owned_by`]). The first case is the tool the new build dropped,
+/// whose shim the flip's prune deleted, which is what the listing half exists to restore.
+fn rollback_may_claim(layout: &Layout, program: &str, tool: &ToolName) -> bool {
+    if tool.as_str() != program && another_program_is_installed_as(layout, tool.as_str()) {
+        return false;
+    }
+    shim_free_or_owned_by(layout, program, &layout.shim(tool))
+}
+
+/// Whether a program named `name` is installed in this prefix: its `store/<name>/current`
+/// link exists, or — on a prefix older than that per-program link, which `relay_shims`
+/// also reads — `store/<name>/` holds a COMPLETE build ([`crate::store::build_is_complete`],
+/// the rule [`crate::ops::list_installed`] counts by). Either one makes `<name>` that
+/// program's own name, never a listing name a sysroot bundle may take.
+fn another_program_is_installed_as(layout: &Layout, name: &str) -> bool {
+    if std::fs::symlink_metadata(layout.program_current(name)).is_ok() {
+        return true;
+    }
+    let Ok(builds) = std::fs::read_dir(layout.prefix.join("store").join(name)) else {
+        return false;
+    };
+    builds.flatten().any(|b| {
+        b.file_name()
+            .to_str()
+            .and_then(crate::store::parse_build_name)
+            .is_some_and(|_| crate::store::build_is_complete(&b.path()))
+    })
+}
+
+/// Whether `shim` is absent, or resolves into `store/<program>/` (anchored to this prefix)
+/// at any build. Anything else — another program's shim, a dev link into a checkout, a
+/// tombstone, a file this manager cannot resolve, or a path it cannot stat — belongs to
+/// someone else and is left alone.
+fn shim_free_or_owned_by(layout: &Layout, program: &str, shim: &Path) -> bool {
+    match std::fs::symlink_metadata(shim) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => crate::platform::resolve_shim(shim)
+            .and_then(|t| crate::ops::store_build_of(&layout.prefix, &t))
+            .is_some_and(|(owner, _)| owner == program),
+    }
+}
+
 /// Sysroot-bundle pre-activation wiring, dispatched on the signed `reloc` policy
 /// (§10.1). `self-contained` (the pack-time-relocated default) needs nothing — the
 /// payload already carries its dependencies, which is the only policy the trust
@@ -4044,7 +4452,10 @@ fn apply_sysroot_bundle(reloc: &str) -> Result<(), FlowError> {
 /// `rollback_member` had, harmless in practice (a PE starts with `MZ`, which fails
 /// [`crate::relocate::is_native_object`], and the bundle backend errors on Windows anyway) but
 /// not worth leaving as the one site that still spells the rule by hand.
-fn bundle_resolve_check(build_dir: &Path, exposes: &[ToolName]) -> Result<(), FlowError> {
+pub(crate) fn bundle_resolve_check(
+    build_dir: &Path,
+    exposes: &[ToolName],
+) -> Result<(), FlowError> {
     for tool in exposes {
         let bin = build_dir.join("bin").join(tool.exe_file());
         // Only native objects (the compilers that link dylibs) have libraries to
@@ -4475,7 +4886,13 @@ mod tests {
         let build_dir = l.build_dir("claude", 2_026_091_301);
         crate::shim_env::write_sidecar(&build_dir, &env).unwrap();
         assert!(
-            verify_and_stage(&art, &archive, &build_dir).is_err(),
+            verify_and_stage(
+                &art,
+                &archive,
+                &build_dir,
+                &crate::install::StageHooks::NONE
+            )
+            .is_err(),
             "the archive does not match the signed sha256"
         );
         assert!(!build_dir.exists(), "no tree was staged");
@@ -4491,7 +4908,9 @@ mod tests {
         let live = l.build_dir("ay", 18);
         std::fs::create_dir_all(live.join("bin")).unwrap();
         crate::shim_env::write_sidecar(&live, &env).unwrap();
-        assert!(verify_and_stage(&art, &archive, &live).is_err());
+        assert!(
+            verify_and_stage(&art, &archive, &live, &crate::install::StageHooks::NONE).is_err()
+        );
         assert!(
             live.exists(),
             "the standing tree survives a failed re-stage"
@@ -4752,6 +5171,60 @@ mod tests {
         install(&fixture(&dir), &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert!(staged_assets(&layout, "ay").is_empty());
         assert!(crate::store::build_is_complete(&layout.build_dir("ay", 18)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SIGNER refusal is handled as a digest refusal is: the archive and its `.part` go,
+    /// and the memo holds the next pass off the wire — from the first refusal and
+    /// whatever the clock says, because the refused bytes matched their digests — until
+    /// the digests move. A machine fault (codesign that could not answer) records
+    /// nothing and keeps the archive.
+    #[test]
+    fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
+        let dir = scratch("signer-refusal");
+        let layout = layout(&dir);
+        let build = 1_000_002_000_001_000_280;
+        let build_dir = layout.build_dir("claude", build);
+        let art = crate::vendor::testkit::row();
+        let dl = dir.join("staging").join(&art.asset);
+        let part = dir.join("staging").join(format!("{}.part", art.asset));
+        std::fs::create_dir_all(dir.join("staging")).unwrap();
+
+        std::fs::write(&dl, b"verified bytes").unwrap();
+        let fault = StageError::Io(std::io::Error::other("bin/claude: codesign timed out"));
+        record_digest_refusal(&build_dir, &art, &fault);
+        reclaim_after_failed_stage(&dl, &fault);
+        assert!(dl.is_file(), "a machine fault keeps the verified archive");
+        assert_eq!(digest_refusal_note(&layout, "claude", build, &art), None);
+
+        std::fs::write(&part, b"partial").unwrap();
+        let refused = StageError::SignerRefused(
+            "bin/claude is not signed by Developer ID team Q6L2SF6YDW".into(),
+        );
+        record_digest_refusal(&build_dir, &art, &refused);
+        reclaim_after_failed_stage(&dl, &refused);
+        assert!(
+            !dl.exists() && !part.exists(),
+            "the refused bytes are reclaimed"
+        );
+        let note = digest_refusal_note(&layout, "claude", build, &art)
+            .expect("the first signer refusal already binds");
+        assert!(note.contains("failed the platform signer check"), "{note}");
+        assert!(
+            note.contains("signer refused: bin/claude is not signed"),
+            "{note}"
+        );
+        assert!(
+            note.contains("`aterm pkg install claude` retries now"),
+            "{note}"
+        );
+        let mut moved = art.clone();
+        moved.sha256 = "0".repeat(64);
+        assert_eq!(
+            digest_refusal_note(&layout, "claude", build, &moved),
+            None,
+            "new digests are a new question"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5146,6 +5619,33 @@ mod tests {
             "the dir: registry keeps the fail-closed default"
         );
         assert!(!dest.exists(), "a refusal writes nothing");
+
+        // The vendor-direct lanes answer "unreachable" by default: a fetcher with no
+        // network leg keeps what is installed, quietly, and writes nothing.
+        const HEAD: &str = "https://downloads.claude.ai/claude-code-releases/latest";
+        let unreachable = |e: VendorFetchError, needle: &str| match e {
+            VendorFetchError::Unreachable(m) => assert!(m.contains(needle), "{m}"),
+            other => panic!("{needle}: {other:?}"),
+        };
+        for fetcher in [&Inert as &dyn Fetcher, &dir_fetcher] {
+            for sent in [None, Some("\"e\"")] {
+                unreachable(
+                    fetcher.vendor_get("claude", HEAD, 64, sent).unwrap_err(),
+                    "cannot fetch vendor documents",
+                );
+            }
+            unreachable(
+                fetcher.vendor_content_length("claude", HEAD).unwrap_err(),
+                "cannot size vendor payloads",
+            );
+            unreachable(
+                fetcher
+                    .vendor_download("claude", HEAD, &dest, 64)
+                    .unwrap_err(),
+                "cannot download vendor payloads",
+            );
+        }
+        assert!(!dest.exists(), "a refusal writes nothing");
     }
 
     /// A `github-release` row's `asset` is joined onto `staging/<program>/`, and the flow
@@ -5477,8 +5977,8 @@ mod tests {
             "the shim exports it"
         );
         assert_eq!(
-            env.fix_line().as_deref(),
-            Some("self-update off (DISABLE_AUTOUPDATER=1)")
+            env.fix_line("ay").as_deref(),
+            Some("its own updater is off here (DISABLE_AUTOUPDATER=1)")
         );
         assert_eq!(
             crate::shim_env::read_sidecar(&l.build_dir("ay", 18)),
@@ -6865,9 +7365,8 @@ mod tests {
             installed: None,
         };
         let err = install(&app, &alay, &anchor(), &areq, fl(0), 0).unwrap_err();
-        // Now routed through the two-anchor app-apply gate (appgate::app_apply_allowed), which
-        // fails closed on the CLI path because notarization is unproven here — a distinct,
-        // gate-driven refusal rather than a blanket UnsupportedKind.
+        // Refused as the app's own pair — a distinct refusal rather than a blanket
+        // UnsupportedKind, so the pass can say the app updates itself.
         assert!(
             matches!(err, FlowError::AppBundleRefused(ref p) if p == "ay"),
             "got {err:?}"
@@ -7297,10 +7796,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // §16.4 dispatch / §16.2 gate: an `app-bundle` artifact (the app's in-session apply
-    // topology, owned by aterm-gui/aterm-update) is refused by `atpkg install` — driven
-    // through the two-anchor app-apply gate, which fails closed because notarization is
-    // unproven on the CLI install path, before any download.
+    // §16.4 dispatch: an `app-bundle` artifact over `github-release` (the app's in-session
+    // apply topology, owned by aterm-gui/aterm-update) is refused by `atpkg install`, always,
+    // before any download.
     #[test]
     fn refuses_app_bundle_kind() {
         let dir = scratch("appkind");
@@ -8579,8 +9077,8 @@ mod tests {
     // tombstone resolves nowhere, so the group had no installed member and `apply_group`
     // skipped it — not re-staged, not even reported, while the row kept reading
     // `tombstoned` and the commands kept failing. Only `aterm pkg update <name>` recovered
-    // it, and on a machine that installed one program by name (never adopted the set, no
-    // `auto_install`) the set-completion lane cannot stand in.
+    // it, and on a machine that installed one program by name (never adopted the set) the
+    // set-completion lane cannot stand in.
     #[test]
     fn a_plain_update_revives_a_tombstoned_singleton_when_its_pin_is_good_again() {
         let dir = scratch("tombstone-singleton-revive");
@@ -9596,117 +10094,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    // §14 CACHE KEYED OFF THE NETWORK LEG ONLY (the cache-masking tooth, 2026-07-30):
-    // chaining a seed dir must not let a seed-leg success rewrite the cache. Network
-    // leg DOWN → the resolve succeeds from the seed but writes NO cache; network leg
-    // UP → the cache holds the NETWORK candidates under the NETWORK source id, so the
-    // post-seed plain-network path falls back to the very same cache.
-    #[test]
-    fn chain_cache_is_keyed_off_the_network_leg_only() {
-        let dir = scratch("chain-cache");
-        let fake = fixture(&dir);
-        // The seed leg: the fixture laid out as a dir registry.
-        let reg = dir.join("seed-reg");
-        std::fs::create_dir_all(&reg).unwrap();
-        std::fs::write(reg.join("index.toml"), &fake.index).unwrap();
-        std::fs::write(reg.join("index.toml.sig"), &fake.index_sig).unwrap();
-        // A `dir:` registry publishes the master-signed roster too, exactly as a release
-        // does: index without the generation that authorized its signer is not a registry.
-        let (rb, rs) = testkit::published_roster();
-        std::fs::write(reg.join(aterm_update_core::roster::ROSTER_ASSET), &rb).unwrap();
-        std::fs::write(reg.join(aterm_update_core::roster::ROSTER_SIG_ASSET), &rs).unwrap();
-        let (raw, sig) = fake.pkg.get(&("ay".to_string(), 18u64)).unwrap();
-        std::fs::write(reg.join("pkg-ay-18.toml"), raw).unwrap();
-        std::fs::write(reg.join("pkg-ay-18.toml.sig"), sig).unwrap();
-        std::fs::copy(
-            fake.archives.get("ay-18.tar.zst").unwrap(),
-            reg.join("ay-18.tar.zst"),
-        )
-        .unwrap();
-        let layout = layout(&dir);
-        let req = InstallRequest {
-            channel: "stable",
-            program: "ay",
-            triple: TRIPLE,
-            installed: None,
-        };
-        let cache = crate::cache::IndexCache::for_layout(&layout);
-        // 1. Network DOWN, seed serves: the install succeeds via the seed leg…
-        let down = FlakyFake::new(fixture(&dir), "github:t/aterm");
-        down.fail.set(true);
-        let chain = crate::net::ChainFetcher::new(
-            Box::new(down),
-            Box::new(crate::net::DirFetcher::new(reg.clone())),
-        );
-        install(&chain, &layout, &anchor(), &req, fl(0), 0)
-            .expect("the seed leg serves the bootstrap");
-        // …but writes NO cache: a seed success must not mask the network failure.
-        assert!(
-            cache.load("github:t/aterm").is_none(),
-            "no network cache from a seed-leg success"
-        );
-        assert!(
-            cache.load(&chain.source_id()).is_none(),
-            "no chain-id cache either"
-        );
-        // 2. Network UP: the cache holds the NETWORK leg's candidates, network id.
-        let chain_up = crate::net::ChainFetcher::new(
-            Box::new(FlakyFake::new(fixture(&dir), "github:t/aterm")),
-            Box::new(crate::net::DirFetcher::new(reg.clone())),
-        );
-        install(&chain_up, &layout, &anchor(), &req, fl(0), 0).unwrap();
-        let cached = cache
-            .load("github:t/aterm")
-            .expect("network candidates cached under the NETWORK id");
-        assert_eq!(cached.len(), 1, "the seed leg's candidate is not absorbed");
-        assert_eq!(
-            cached[0].label, "v0",
-            "the network leg's candidate, not the dir leg's"
-        );
-        // 3. The plain-network path (same id, seed no longer chained) falls back to it.
-        let plain = FlakyFake::new(fixture(&dir), "github:t/aterm");
-        plain.fail.set(true);
-        install(&plain, &layout, &anchor(), &req, fl(0), 0)
-            .expect("the §14 fallback serves the plain-network path from the chain-written cache");
-
-        // 4. THE READ HALF of the cache-masking tooth. With the network leg DOWN and
-        //    the seed leg answering, the resolve must still CONSULT the last-good
-        //    network cache — not silently accept the seal as the only word.
-        //
-        //    Guarding only the cache WRITE (steps 1-3) left this open: a seed-leg
-        //    success turned the network failure into `Ok`, and the cache was read
-        //    exclusively in the failure arm, so the cached index was never even
-        //    looked at. On an empty store — the only state the seed leg is chained
-        //    in — the durable index_build floor cannot rise, so nothing else would
-        //    have caught a seal that reinstated pins a newer cached index had
-        //    yanked or floored out.
-        let down_again = FlakyFake::new(fixture(&dir), "github:t/aterm");
-        down_again.fail.set(true);
-        let chain_down = crate::net::ChainFetcher::new(
-            Box::new(down_again),
-            Box::new(crate::net::DirFetcher::new(reg.clone())),
-        );
-        let resolved = resolve_candidates(&chain_down, &layout)
-            .expect("the seed leg still answers when the network is down");
-        let labels: Vec<&str> = resolved.iter().map(|c| c.label.as_str()).collect();
-        assert!(
-            labels.contains(&"v0"),
-            "the last-good NETWORK candidate must be unioned in, not masked by the \
-             seed-leg success — got {labels:?}"
-        );
-        assert!(
-            labels.contains(&"dir"),
-            "the seed's own candidate must still be offered — got {labels:?}"
-        );
-        assert_eq!(
-            labels[0], "v0",
-            "cached network candidates come FIRST: select_index replaces only on a \
-             strictly greater index_build, so a tie must go to the network's last-good \
-             index rather than the seal — got {labels:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// A [`Fake`] that COUNTS index fetches and answers the cheap identity probe from a
     /// cell, so a test can move one asset's fingerprint and watch the resolve react.
     struct IdentityFake {
@@ -10065,6 +10452,223 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TRUST ROLLBACK NEVER TAKES ANOTHER PROGRAM'S SHIM. A sysroot bundle's `bin/`
+    /// carries backends belonging to other atpkg programs (trust's carries `ay`, `clean`
+    /// and `ty`), and the rollback's LISTING half restored every file in it: `bin/ty` and
+    /// `alab-ty` were re-pointed at `store/trust/<prior>`, and the next trust flip's prune
+    /// deleted them as stale trust shims — ty's `tla` standing, `ty` gone. That is the end
+    /// state measured on m3 (2026-09-23) for `ty`, `ay` and `clean`, which had logged a
+    /// trust flip aborted and rolled back. Covered here: a shim another program owns (ty), another
+    /// installed program's own name whose shim is already missing (ay), a dev link into a
+    /// checkout (clean) — each left alone. The tool the prior trust build ships and nobody
+    /// owns (`trustd`, absent) is still restored, AS IT ALWAYS WAS: that pins the old
+    /// behaviour for an unowned name, not a requirement. The listing half exists to restore a
+    /// tool the prior build EXPOSED and the new one dropped; `trustd` is in trust's `bin/`
+    /// but not its signed exposes, and laying it is a known over-reach this manager cannot
+    /// tell apart until each build records its signed exposes at stage time.
+    #[cfg(unix)]
+    #[test]
+    fn a_trust_rollback_never_takes_another_programs_shim() {
+        let dir = scratch("rb-foreign");
+        let l = layout(&dir);
+        let ty = bare_build(&l, "ty", 3007, &["ty", "tla"]);
+        activate_channel(&l, "stable", &ty).unwrap();
+        install_tools(&l, &ty, &[tool("ty"), tool("tla")], Aliases::Alab).unwrap();
+        // ay is installed but its shim is gone: its own name still belongs to it.
+        let ay = bare_build(&l, "ay", 8256, &["ay"]);
+        activate_channel(&l, "stable", &ay).unwrap();
+        // clean is dev-linked into a checkout.
+        let checkout = dir.join("checkout").join("bin");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("clean"), b"#!/bin/true\n").unwrap();
+        crate::platform::install_shim_env(
+            &checkout,
+            &tool("clean"),
+            &l.shim(&tool("clean")),
+            &crate::shim_env::ShimEnv::default(),
+        )
+        .unwrap();
+        let bundle = ["trustc", "ty", "ay", "clean", "trustd"];
+        let t1 = bare_build(&l, "trust", 1, &bundle);
+        let t2 = bare_build(&l, "trust", 2, &bundle);
+        activate_channel(&l, "stable", &t1).unwrap();
+        install_tools(&l, &t1, &[tool("trustc")], Aliases::Alab).unwrap();
+        activate_channel(&l, "stable", &t2).unwrap();
+        install_tools(&l, &t2, &[tool("trustc")], Aliases::Alab).unwrap();
+
+        let staged = Staged {
+            build: 2,
+            build_dir: t2.clone(),
+            exposes: vec![tool("trustc")],
+            prior_build: Some(1),
+            was_live: false,
+            reloc: None,
+            aliases: Aliases::Alab,
+            tree_root: String::new(),
+        };
+        rollback_member(&l, "stable", "trust", &staged);
+
+        let into = |name: &str| crate::platform::resolve_shim(&l.shim(&tool(name)));
+        let owned_by_ty = |label: &str| {
+            for name in ["ty", "alab-ty"] {
+                let target =
+                    into(name).unwrap_or_else(|| panic!("{label}: {name} is gone from bin/"));
+                assert!(
+                    target.starts_with(&ty),
+                    "{label}: {name} was taken off the ty program: {}",
+                    target.display()
+                );
+            }
+        };
+        owned_by_ty("after the rollback");
+        for name in ["ay", "alab-ay"] {
+            assert!(
+                std::fs::symlink_metadata(l.shim(&tool(name))).is_err(),
+                "the rollback laid {name} for trust: {:?}",
+                into(name)
+            );
+        }
+        assert_eq!(
+            into("clean"),
+            Some(checkout.join("clean")),
+            "the dev link is untouched"
+        );
+        assert!(
+            into("trustc").is_some_and(|t| t.starts_with(&t1)),
+            "trust's own tool is rolled back: {:?}",
+            into("trustc")
+        );
+        assert!(
+            into("trustd").is_some_and(|t| t.starts_with(&t1)),
+            "an unowned tool of the prior build is still restored, as before: {:?}",
+            into("trustd")
+        );
+
+        // The flip that follows prunes stale TRUST shims; ty's must survive it.
+        activate_channel(&l, "stable", &t2).unwrap();
+        install_tools(&l, &t2, &[tool("trustc")], Aliases::Alab).unwrap();
+        owned_by_ty("after the next trust flip");
+        assert!(into("tla").is_some_and(|t| t.starts_with(&ty)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A LISTING NAME'S ALIAS GETS ITS OWN OWNERSHIP CHECK. The primary `bin/trustd` is
+    /// absent — free, so the rollback may restore it into the prior trust build — while
+    /// `alab-trustd` is a dev link into a checkout. Restoring the primary must not drag the
+    /// alias along: the alias is someone else's, and is left exactly where it points. The
+    /// counter-case in the same run: `trustc`, a signed expose, has its alias re-pointed
+    /// unconditionally, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_never_takes_a_foreign_alias_of_a_listing_name() {
+        let dir = scratch("rb-foreign-alias");
+        let l = layout(&dir);
+        let checkout = dir.join("checkout").join("bin");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("trustd"), b"#!/bin/true\n").unwrap();
+        let bundle = ["trustc", "trustd"];
+        let t1 = bare_build(&l, "trust", 1, &bundle);
+        let t2 = bare_build(&l, "trust", 2, &bundle);
+        activate_channel(&l, "stable", &t1).unwrap();
+        install_tools(&l, &t1, &[tool("trustc")], Aliases::Alab).unwrap();
+        activate_channel(&l, "stable", &t2).unwrap();
+        install_tools(&l, &t2, &[tool("trustc")], Aliases::Alab).unwrap();
+        crate::platform::install_shim_env(
+            &checkout,
+            &tool("trustd"),
+            &l.shim(&tool("alab-trustd")),
+            &crate::shim_env::ShimEnv::default(),
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(l.shim(&tool("trustd"))).is_err());
+
+        let staged = Staged {
+            build: 2,
+            build_dir: t2.clone(),
+            exposes: vec![tool("trustc")],
+            prior_build: Some(1),
+            was_live: false,
+            reloc: None,
+            aliases: Aliases::Alab,
+            tree_root: String::new(),
+        };
+        rollback_member(&l, "stable", "trust", &staged);
+
+        let into = |name: &str| crate::platform::resolve_shim(&l.shim(&tool(name)));
+        assert!(
+            into("trustd").is_some_and(|t| t.starts_with(&t1)),
+            "the free primary is restored into the prior build: {:?}",
+            into("trustd")
+        );
+        assert_eq!(
+            into("alab-trustd"),
+            Some(checkout.join("trustd")),
+            "the dev-linked alias of a listing name is left alone"
+        );
+        for name in ["trustc", "alab-trustc"] {
+            assert!(
+                into(name).is_some_and(|t| t.starts_with(&t1)),
+                "{name}: a signed expose and its alias roll back: {:?}",
+                into(name)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AN OLDER PREFIX STILL OWNS ITS PROGRAMS' NAMES. A prefix laid before the
+    /// per-program `store/<program>/current` link has an installed `ay` — a COMPLETE build
+    /// under `store/ay/` — and no link. Its shim is gone. A trust rollback finds `ay` in
+    /// the prior bundle's `bin/` and must still refuse it: an absent shim is not a free
+    /// name when a program of that name is installed, or the next trust flip prunes it
+    /// and `ay` is lost exactly as on m3. The negative half: the same rollback with the ay
+    /// build left INCOMPLETE (no marker, so not installed) does restore `ay` for trust.
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_respects_a_program_installed_without_a_current_link() {
+        for complete in [true, false] {
+            let dir = scratch(if complete {
+                "rb-old-prefix"
+            } else {
+                "rb-old-prefix-partial"
+            });
+            let l = layout(&dir);
+            let ay = bare_build(&l, "ay", 8256, &["ay"]);
+            if complete {
+                crate::store::mark_build_ready(&ay).unwrap();
+            }
+            assert!(std::fs::symlink_metadata(l.program_current("ay")).is_err());
+            let bundle = ["trustc", "ay"];
+            let t1 = bare_build(&l, "trust", 1, &bundle);
+            let t2 = bare_build(&l, "trust", 2, &bundle);
+            activate_channel(&l, "stable", &t1).unwrap();
+            install_tools(&l, &t1, &[tool("trustc")], Aliases::Off).unwrap();
+            activate_channel(&l, "stable", &t2).unwrap();
+            install_tools(&l, &t2, &[tool("trustc")], Aliases::Off).unwrap();
+            let staged = Staged {
+                build: 2,
+                build_dir: t2.clone(),
+                exposes: vec![tool("trustc")],
+                prior_build: Some(1),
+                was_live: false,
+                reloc: None,
+                aliases: Aliases::Off,
+                tree_root: String::new(),
+            };
+            rollback_member(&l, "stable", "trust", &staged);
+            let laid = crate::platform::resolve_shim(&l.shim(&tool("ay")));
+            if complete {
+                assert_eq!(laid, None, "the installed ay's name was taken for trust");
+            } else {
+                assert!(
+                    laid.is_some_and(|t| t.starts_with(&t1)),
+                    "an incomplete ay build is not installed; the name is free: {:?}",
+                    crate::platform::resolve_shim(&l.shim(&tool("ay")))
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A ROLLBACK TO AN AFFECTED TRUST BUILD LAYS ITS EXEC ROOT BEFORE ITS SHIMS. Live on
@@ -10780,5 +11384,26 @@ mod tests {
             "every six-hourly tick re-downloaded the whole bundle; it must not"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AN UNDO FLIPS `current` BEFORE IT RE-LAYS THE SHIMS — activation's own order — so an
+    /// undo killed between the two leaves `current` on the PRIOR build, which the next pass's
+    /// roll-forward completes, never on the build rolled off, which it would put back.
+    #[test]
+    fn rollback_member_flips_current_before_the_shims() {
+        let src = include_str!("flow.rs");
+        let start = src.find("\nfn rollback_member(").expect("rollback_member");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let flip = body
+            .find("activate_channel(layout, channel, &prior_dir)")
+            .expect("the flip");
+        let shims = body.find("install_shim_env(").expect("the shims");
+        assert!(flip < shims, "{flip} {shims}");
+        assert_eq!(
+            body.matches("activate_channel(").count(),
+            1,
+            "one flip, not a second at the end"
+        );
     }
 }

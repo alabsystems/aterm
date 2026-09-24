@@ -33,9 +33,14 @@
 //! * A report is emitted on a worker thread; the observer must be cheap and must
 //!   never block (the host posts an event-loop message).
 
+#[cfg(any(target_os = "macos", test))]
 use std::path::Path;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::Arc;
+use std::sync::OnceLock;
+#[cfg(any(target_os = "macos", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+#[cfg(any(target_os = "macos", test))]
 use std::time::Duration;
 
 /// One report from inside a running check.
@@ -71,6 +76,7 @@ static OBSERVER: OnceLock<ProgressNotify> = OnceLock::new();
 /// turning an `Err` into a [`Progress::Failed`] report (a check that never got
 /// as far as bytes has nothing on screen to answer for). One check runs at a
 /// time per process (`check_lane`), so a process-wide flag is exact.
+#[cfg(any(target_os = "macos", test))]
 static DOWNLOAD_BEGAN: AtomicBool = AtomicBool::new(false);
 
 /// Install the process-wide observer. First caller wins (the host installs it
@@ -80,6 +86,7 @@ pub fn set_progress_observer(observer: ProgressNotify) {
 }
 
 /// Report one step. A no-op with no observer installed (every non-GUI process).
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn report(p: Progress) {
     if let Progress::Downloading { .. } = &p {
         DOWNLOAD_BEGAN.store(true, Ordering::Relaxed);
@@ -91,6 +98,7 @@ pub(crate) fn report(p: Progress) {
 
 /// Whether a download was reported since the last [`take_download_began`] —
 /// consumed by the check wrapper at each check's end.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn take_download_began() -> bool {
     DOWNLOAD_BEGAN.swap(false, Ordering::Relaxed)
 }
@@ -102,6 +110,7 @@ pub(crate) fn take_download_began() -> bool {
 /// The first report (0 of `total`) is emitted synchronously, so a host sees the
 /// download begin even if curl finishes before the first poll.
 #[must_use]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn watch_download(dest: &Path, version: &str, total: u64) -> DownloadWatch {
     let inert = DownloadWatch {
         stop: Arc::new(AtomicBool::new(true)),
@@ -148,11 +157,13 @@ pub(crate) fn watch_download(dest: &Path, version: &str, total: u64) -> Download
 }
 
 /// Stops the `.part` poller on drop.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct DownloadWatch {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Drop for DownloadWatch {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);

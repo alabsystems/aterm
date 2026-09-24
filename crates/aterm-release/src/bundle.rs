@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! .app assembly (release spec §6 `bundle.rs`): build `dist/aterm.app` from
+//! .app assembly (release spec §6 `bundle.rs`): build `dist/cut-app.noindex/aterm.app` from
 //! the `apps/aterm-mac/Info.plist` template via in-process string substitution
 //! (CFBundleShortVersionString, sealed `CFBundleVersion = n`, ATermGitCommit
 //! with the `-dirty` rule matching aterm-gui/build.rs), copy the static
 //! resources (ShellIntegration/, Help.html, Credits.html, aterm.icns), nest
-//! atpkg + aterm-ctl + aterm-cli in Contents/MacOS, drop the
-//! `.metadata_never_index` build-output marker (see [`assemble`] — it is NOT a
-//! Spotlight exclusion), and write the `dist/aterm-<ver>-build.txt` provenance
-//! record.
+//! atpkg + aterm-ctl + aterm-cli in Contents/MacOS, and write the
+//! `dist/aterm-<ver>-build.txt` provenance record. No `.metadata_never_index` marker
+//! (see [`assemble`]: inert for Spotlight, and its one reader is deleted).
 //!
 //! Port of the layout phase of the retired `apps/aterm-mac/build-app.sh`
 //! (steps 2–6c + 8) — that script was deleted with the shell pipeline and is
@@ -29,7 +28,7 @@ use std::process::Command;
 pub struct BundleSpec {
     /// Workspace root (locates the apps/aterm-mac templates + git).
     pub repo_root: PathBuf,
-    /// `dist/` — receives aterm.app and the build.txt provenance record.
+    /// `dist/` — receives `cut-app.noindex/aterm.app` and the build.txt provenance record.
     pub out_dir: PathBuf,
     /// Workspace-derived release version, canonical MAJOR.MINOR.PATCH ("0.2.0") →
     /// CFBundleShortVersionString and the `aterm-<ver>-build.txt` name.
@@ -162,17 +161,15 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Assemble `dist/aterm.app` (build-app.sh steps 2–6c). Returns the .app path.
-/// Signing is NOT done here — the caller runs `sign::` next (inside-out), then
-/// dmg, then [`write_provenance`] (whose binary_sha256 must cover the SIGNED
-/// bytes, so it must run after signing — same order as the script).
 /// The scratch directory the cut ASSEMBLES in, under `dist/`.
 ///
-/// Deliberately NOT `dist/aterm.app`: on the release machine that path is also a
-/// live, self-updating install (the owner runs it, and the activation lane watches
-/// it). Assembling there means the cut is writing a bundle another process owns,
-/// and the consequences are not theoretical — see [`staged_app_path`].
-pub const CUT_APP_DIR: &str = "cut-app";
+/// Named `.noindex` because that suffix is the only thing measured to keep a
+/// subtree out of Spotlight (crates/atpkg/src/noindex.rs): an indexed bundle is
+/// offered for "aterm" and launched through LaunchServices, which makes it a
+/// second copy running under the release's bundle id — and a copy that does not
+/// satisfy the stored code requirement resets the app's privacy grants
+/// (`aterm_containment::consent`, "The claimant census").
+pub const CUT_APP_DIR: &str = "cut-app.noindex";
 
 /// Where THIS cut's bundle is built, signed, notarized and packaged.
 ///
@@ -187,281 +184,62 @@ pub const CUT_APP_DIR: &str = "cut-app";
 /// gate that proves the stripped bundle still passes Gatekeeper. Only the
 /// provenance recount caught it, after two notarizations.
 ///
-/// Assembling somewhere no running process owns fixes that for EVERY client
-/// version, including ones already installed — a marker the client must honour
-/// would only protect clients new enough to know about it. It also stops
-/// [`assemble`]'s `rm -rf` from deleting the bundle a live process is executing
-/// out of, which every cut on this machine had been doing.
-///
-/// The finished bundle is placed at `dist/aterm.app` after the release verifies,
-/// so the dev install still takes its own release — just a complete one.
+/// Nothing is placed at `dist/aterm.app` any more: the installed app takes the
+/// release through its own updater, and [`discard_staged_app`] removes this
+/// bundle once the cut is done, so no finished cut leaves a launchable copy of
+/// the app behind.
 #[must_use]
 pub fn staged_app_path(dist: &Path) -> PathBuf {
     dist.join(CUT_APP_DIR).join("aterm.app")
 }
 
-/// The DEV INSTALL path: `dist/aterm.app`, what the owner's machine runs and what
-/// its updater watches. The cut only ever writes here through
-/// [`place_finished_bundle`], and only once the release is live.
-#[must_use]
-pub fn dev_install_app_path(dist: &Path) -> PathBuf {
-    dist.join("aterm.app")
-}
-
-/// Read one `<key>K</key><string>V</string>` value out of a stamped Info.plist.
-///
-/// Local rather than borrowed from `manifest_out`: this module is mounted on its own
-/// by several integration tests (`#[path]` module mounts), and a cross-module call
-/// would make it uncompilable there for a six-line string scan. It reads what
-/// [`set_plist_string`] writes.
-fn sealed_plist_string(plist: &str, key: &str) -> Option<String> {
-    let key_tag = format!("<key>{key}</key>");
-    let after = plist.find(&key_tag)? + key_tag.len();
-    let start = plist[after..].find("<string>")? + after + "<string>".len();
-    if plist[after..start].contains("<key>") {
-        return None;
-    }
-    let end = plist[start..].find("</string>")? + start;
-    Some(plist[start..end].to_string())
-}
-
-/// Put this cut's finished bundle at `dist/aterm.app`, where the dev install runs
-/// from — the LAST thing a cut does, after the release is live and verified.
-///
-/// Ordering is the whole point. The live updater on this machine watches that path
-/// and will adopt whatever appears there; before this split it could adopt a bundle
-/// mid-assembly. Now the only bundle it can ever see is one that has been signed,
-/// notarized, stapled, self-checked, published, verified and mirrored.
-///
-/// COPIED, not moved: `dist/cut-app/aterm.app` stays as the cut's artifact, so a
-/// late `--resume` still has the bytes its journal describes. `cp -Rc` clones on
-/// APFS, so a batteries-included bundle costs metadata rather than a second
-/// gigabyte, and `cp` (not a hand-rolled walk) is what preserves the symlinks,
-/// extended attributes and `_CodeSignature` layout the seal covers.
-///
-/// The swap is two renames within one directory rather than delete-then-copy, so
-/// there is no window in which `dist/aterm.app` does not exist — a launch during
-/// that window would simply fail to find the app.
-///
-/// Returns the number of bytes the placed bundle carries.
-pub fn place_finished_bundle(dist: &Path, version: &str, build: u64) -> Result<u64, String> {
-    let staged = staged_app_path(dist);
-    if !staged.is_dir() {
-        return Err(format!("{} is not a bundle", staged.display()));
-    }
-    // PROVE IT IS THIS CUT'S BUNDLE. `dist/cut-app/` is never cleaned, and two
-    // pipelines reach this line without having assembled anything: a RECOVERY of
-    // another machine's published release (its journal marks `build` done, so
-    // `assemble` never runs) and any resume past `build`. Whatever an earlier
-    // `--dry-run` or `--rehearse` left behind would otherwise be copied over the dev
-    // install under a transcript line calling it "this cut's verified bundle" —
-    // downgrading the machine, or, if that leftover carries a HIGHER provisional
-    // build number (a dry run claims `max(tail + 1, now)` and is signed and
-    // notarized for real), handing the activation lane a build that was never
-    // released. The lane accepts on build number + policy alone; it does not compare
-    // against the published manifest (2026-08-19 round-7 audit).
-    let plist = std::fs::read_to_string(staged.join("Contents/Info.plist"))
-        .map_err(|e| format!("read {}: {e}", staged.join("Contents/Info.plist").display()))?;
-    let sealed_version = sealed_plist_string(&plist, "CFBundleShortVersionString");
-    let sealed_build = sealed_plist_string(&plist, "CFBundleVersion");
-    if sealed_version.as_deref() != Some(version)
-        || sealed_build.as_deref() != Some(&build.to_string())
-    {
+/// Refuse to delete a staged bundle a live process is executing out of: its image
+/// would lose its path, and macOS could then match no grant for it.
+fn refuse_if_running(app: &Path) -> Result<(), String> {
+    if atpkg::gc::runs_from(app) == Some(true) {
         return Err(format!(
-            "{} carries {} build {}, not this cut's {version} build {build} — refusing to \
-             hand the dev install a bundle this cut did not produce",
-            staged.display(),
-            sealed_version.as_deref().unwrap_or("no version"),
-            sealed_build.as_deref().unwrap_or("no build"),
+            "{} is running — quit it before cutting (deleting a running bundle leaves the \
+             process with no code identity macOS can check a privacy grant against)",
+            app.display()
         ));
     }
-    let live = dev_install_app_path(dist);
-    let incoming = dist.join(".aterm.app.incoming");
-    let previous = dist.join(".aterm.app.previous");
-    for scratch in [&incoming, &previous] {
-        if scratch.exists() {
-            std::fs::remove_dir_all(scratch)
-                .map_err(|e| format!("clear {}: {e}", scratch.display()))?;
-        }
-    }
-    let clone = std::process::Command::new("cp")
-        .args(["-Rc"])
-        .arg(&staged)
-        .arg(&incoming)
-        .status();
-    let cloned = matches!(clone, Ok(status) if status.success());
-    if !cloned {
-        // A filesystem that cannot clone is the pre-existing behaviour, not a new
-        // failure mode.
-        let _ = std::fs::remove_dir_all(&incoming);
-        let plain = std::process::Command::new("cp")
-            .arg("-R")
-            .arg(&staged)
-            .arg(&incoming)
-            .status()
-            .map_err(|e| format!("cp -R into {}: {e}", incoming.display()))?;
-        if !plain.success() {
-            return Err(format!(
-                "cp -R {} -> {}",
-                staged.display(),
-                incoming.display()
-            ));
-        }
-    }
-    // REFUSE TO DISPLACE A BUNDLE SOMETHING IS RUNNING OUT OF.
-    //
-    // The two renames below are exactly the shape that cost the owner three
-    // Full Disk Access grants on 2026-09-21: rename the live bundle aside,
-    // then delete it, while a process is still executing out of it. macOS
-    // resolves a running process's image by VNODE, so that process is
-    // instantly re-attributed to `.aterm.app.previous` and then to a path that
-    // does not resolve at all — after which `tccd` can build no code identity
-    // for it, no grant keyed to that identity matches, and, because a
-    // requirement mismatch is resolved by REPLACING the stored requirement, the
-    // grant is reset for every copy sharing the bundle id.
-    //
-    // This is the LAST step of a cut: the release is already published,
-    // verified and mirrored. Refusing here costs the dev install this pass and
-    // nothing else — the app's own updater will take the release on its next
-    // check — whereas proceeding costs the owner's consent state.
-    //
-    // A NARROWING, NOT A PROOF. `ps` can only be asked about the instant it
-    // runs, and a process that starts between the question and the rename is
-    // not caught. When the question cannot be asked at all the placement
-    // proceeds, which is the pre-existing behaviour: this refuses a hazard it
-    // can SEE, and never invents one it cannot.
-    if let Some(running) = pids_running_from(&live)
-        && !running.is_empty()
-    {
-        return Err(format!(
-            "{} is running (pid {}) — refusing to displace a bundle a live process is \
-             executing out of. macOS would re-attribute that process to a bundle this cut \
-             then deletes, and a copy macOS cannot match does not merely fail its own \
-             checks: it REPLACES the stored code requirement for this bundle id and resets \
-             the grant for every copy of aterm on this Mac. The release itself is already \
-             published and verified; only the dev install at this path was skipped.",
-            live.display(),
-            running.join(", "),
-        ));
-    }
-    let had_live = live.exists();
-    if had_live {
-        std::fs::rename(&live, &previous)
-            .map_err(|e| format!("move the old dev install aside: {e}"))?;
-    }
-    if let Err(error) = std::fs::rename(&incoming, &live) {
-        // Put the old one back rather than leaving the machine with no app.
-        if had_live {
-            let _ = std::fs::rename(&previous, &live);
-        }
-        return Err(format!("place {}: {error}", live.display()));
-    }
-    if had_live {
-        let _ = std::fs::remove_dir_all(&previous);
-    }
-    Ok(dir_bytes(&live))
+    Ok(())
 }
 
-/// The pids executing out of a bundle at `root`, or `None` when the question
-/// could not be asked.
-///
-/// `ps -Ao pid=,comm=` reports each process's executable path as the KERNEL
-/// currently resolves it, which is the same view `tccd` attributes against —
-/// and the one `std::env::current_exe()` does not have, because on macOS that
-/// is the `execve`-time string and never follows a rename.
-///
-/// `None` and `Some(vec![])` are deliberately different: the first is "I could
-/// not look", the second is "I looked and nothing is running". Only the second
-/// licenses a displacement.
-fn pids_running_from(root: &Path) -> Option<Vec<String>> {
-    let prefix = format!("{}/", root.display());
-    let out = std::process::Command::new("/bin/ps")
-        .args(["-Ao", "pid=,comm="])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// Remove the staged bundle once a real or rehearsed cut is done. The DMG and the
+/// updater zip carry the same sealed bytes, and no later step reads the bundle.
+/// Left in place when something runs out of it, and the caller says so.
+pub fn discard_staged_app(dist: &Path) -> Result<(), String> {
+    let app = staged_app_path(dist);
+    if !app.exists() {
+        return Ok(());
     }
-    Some(pids_under_prefix(
-        &String::from_utf8_lossy(&out.stdout),
-        &prefix,
-    ))
+    refuse_if_running(&app)?;
+    std::fs::remove_dir_all(&app).map_err(|e| format!("rm -rf {}: {e}", app.display()))
 }
 
-/// The parsing half, pure: pids whose `comm` path sits under `prefix`.
-///
-/// Matching on the directory prefix (with its trailing separator) rather than
-/// on the bundle name is what keeps `dist/aterm.app` from matching
-/// `dist/aterm.app.rollback`, which is a different bundle with a different
-/// identity and is precisely the pair this whole area exists to tell apart.
-fn pids_under_prefix(ps_output: &str, prefix: &str) -> Vec<String> {
-    ps_output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            let (pid, comm) = line.split_once(char::is_whitespace)?;
-            comm.trim_start()
-                .starts_with(prefix)
-                .then(|| pid.to_string())
-        })
-        .collect()
-}
-
-/// Recursive byte total, tolerating anything unreadable — this feeds a transcript
-/// line, never a decision.
-fn dir_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| match entry.file_type() {
-            Ok(kind) if kind.is_dir() => dir_bytes(&entry.path()),
-            Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
-            _ => 0,
-        })
-        .sum()
-}
-
+/// Assemble [`staged_app_path`] (build-app.sh steps 2–6c). Returns the .app path.
+/// Signing is NOT done here — the caller runs `sign::` next (inside-out), then
+/// dmg, then [`write_provenance`] (whose binary_sha256 must cover the SIGNED
+/// bytes, so it must run after signing — same order as the script).
 pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     let mac_dir = spec.repo_root.join("apps/aterm-mac");
     let app = staged_app_path(&spec.out_dir);
 
-    // The `.metadata_never_index` marker: a BUILD-OUTPUT SENTINEL, and no longer
-    // claimed to be anything else.
-    //
-    // It was written here to keep dist/aterm.app — a real, launchable .app — from
-    // showing up as a SECOND "aterm" in Spotlight/Launchpad beside the installed
-    // /Applications copy. MEASURED 2026-09-02 on macOS 26.6.2 by A/B test
-    // (crates/atpkg/src/noindex.rs): a `.metadata_never_index` file in a
-    // subdirectory is INERT. It is the answer in most blog posts and it silently
-    // does nothing, so dist/aterm.app IS indexed and that second entry is real.
-    // The only mechanism measured to work is a directory name ending `.noindex`
-    // (`aterm pkg noindex`), which `dist/` cannot take without renaming a path the
-    // scripts, the ignore rules and the docs all spell out.
-    //
-    // The write STAYS because atpkg reads it as the durable "this is build output,
-    // not an install" marker (`cli.rs::is_build_output_bundle`), written by the only
-    // thing that knows — that is what it is for now, and the reason it is not a
-    // Spotlight claim is stated here so the next reader does not re-derive the inert
-    // answer a third time.
-    std::fs::create_dir_all(&spec.out_dir)
-        .map_err(|e| format!("create {}: {e}", spec.out_dir.display()))?;
-    let _ = std::fs::write(spec.out_dir.join(".metadata_never_index"), "");
-    // The assembly directory carries its own marker for the same sentinel reason:
-    // this bundle is even less of an install than the dev one beside it — for most
-    // of its life it is not yet signed — and `is_build_output_bundle` looks in the
-    // directory holding the bundle, not at an ancestor.
-    let staging_dir = spec.out_dir.join(CUT_APP_DIR);
-    std::fs::create_dir_all(&staging_dir)
-        .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;
-    let _ = std::fs::write(staging_dir.join(".metadata_never_index"), "");
+    // NO `.metadata_never_index` MARKER, in dist/ or in the assembly directory. As a
+    // Spotlight exclusion it is INERT — MEASURED 2026-09-02 on macOS 26.6.2 by A/B test
+    // (crates/atpkg/src/noindex.rs): only a directory name ending `.noindex` (`aterm pkg
+    // noindex`) keeps a subtree out, so an assembled bundle is indexed with or without it. Its
+    // other job, a "build output, not an install" sentinel, had one reader — atpkg's
+    // reclaim of a bundled toolchain seed — deleted with the sealed-seed client lane in
+    // Phase 5 (docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md §5.1). A marker
+    // nothing reads is a claim with no witness, so none is written; the directories come
+    // into being with the bundle below.
 
     // --- 2. lay out the bundle -------------------------------------------
     println!("==> assembling {}", app.display());
     if app.exists() {
+        refuse_if_running(&app)?;
         std::fs::remove_dir_all(&app).map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
     }
     let macos = app.join("Contents/MacOS");
@@ -563,7 +341,8 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     }
 
     // RETIRED 2026-08-26 (step 6d, the batteries-included toolchain seed sealed
-    // under `Contents/Resources/<atpkg::SEED_DIR_NAME>`): aterm ships ONE lean
+    // under `Contents/Resources/toolchain-seed.lproj`; the client lane that read it
+    // followed in Phase 5, 2026-09-23): aterm ships ONE lean
     // self-provisioning bundle — the client's own `atpkg` lane installs the
     // toolchain from the network on first launch, and nothing is sealed here.
 
@@ -682,44 +461,6 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod alias_tests {
-    /// THE PREFIX IS THE DIRECTORY, not the name.
-    ///
-    /// `dist/aterm.app` and `dist/aterm.app.rollback` are two bundles with two
-    /// identities, and telling them apart is the entire subject of this area.
-    /// A name-prefix match would report the rollback's process as the live
-    /// install's and refuse a placement that is safe — or, reversed, let the
-    /// cut displace a bundle a live process is executing out of, which is the
-    /// shape that cost the owner three grants on 2026-09-21.
-    #[test]
-    fn only_processes_under_the_bundle_itself_block_a_placement() {
-        use super::pids_under_prefix;
-        let ps = "\
-  101 /Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm
-  102 /Users//a/aterm/dist/aterm.app.rollback/Contents/MacOS/aterm
-  103 /Applications/aterm.app/Contents/MacOS/aterm
-  104 /bin/zsh
-  105 /Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm-gui
-";
-        assert_eq!(
-            pids_under_prefix(ps, "/Users//a/aterm/dist/aterm.app/"),
-            vec!["101", "105"],
-            "the bundle's own processes only"
-        );
-        // The sibling rollback is its OWN bundle.
-        assert_eq!(
-            pids_under_prefix(ps, "/Users//a/aterm/dist/aterm.app.rollback/"),
-            vec!["102"]
-        );
-        // An install elsewhere never blocks this one.
-        assert_eq!(
-            pids_under_prefix(ps, "/Applications/aterm.app/"),
-            vec!["103"]
-        );
-        // Nothing running out of it is an EMPTY list, which is what licenses
-        // the displacement — distinct from `None`, which does not.
-        assert!(pids_under_prefix(ps, "/Users//a/aterm/dist/other.app/").is_empty());
-        assert!(pids_under_prefix("", "/x/").is_empty());
-    }
 
     /// THE ARGV0 ALIAS SET IS HAND-TYPED IN FIVE PLACES, and on 2026-09-12 an
     /// audit found `aterm-link` in four of them. This pins the bundle's copy

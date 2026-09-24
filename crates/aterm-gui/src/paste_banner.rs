@@ -11,7 +11,7 @@
 //! aterm composes its own chrome on Linux, so the confirmation is composed the
 //! same way: the pending paste is PARKED on `App` ([`PendingPaste`]) — fail
 //! closed, nothing reaches the PTY — and this banner is spliced over the top
-//! grid rows (the [`crate::config_notice`] band pattern) showing a short
+//! grid rows (the retired config banner's band pattern) showing a short
 //! sanitized PREVIEW of what is about to be pasted plus the two keys that
 //! answer it. Enter delivers the parked text through the confirmed seam, Escape
 //! (or a click on the banner) drops it. The keystroke decision reuses
@@ -19,7 +19,7 @@
 //! macOS sheet interceptor answers through — so all three platforms agree on
 //! what a key means to a confirmation.
 //!
-//! Pure + geometry-injected like `config_notice`: the row builder takes explicit
+//! Pure + geometry-injected like `link_target`: the row builder takes explicit
 //! `cols`/`panel_rows` so it unit-tests without a window. Unlike the config
 //! banner there is NO TTL — a security question does not answer itself — and no
 //! auto-dismiss: the banner stands until a key or click answers it (the window
@@ -45,7 +45,7 @@ const MAX_BANNER_ROWS: usize = 5;
 const MAX_PREVIEW_LINES: usize = MAX_BANNER_ROWS - 1;
 
 /// The banner's left margin and the preview's hanging indent, in cells
-/// (mirrors `config_notice`).
+/// (mirrors `link_target`).
 const MARGIN: usize = 2;
 const PREVIEW_INDENT: usize = MARGIN + 2;
 
@@ -119,7 +119,7 @@ impl PendingPaste {
 }
 
 /// `s` cut to `max` cells with a trailing ellipsis when it does not fit (the
-/// `config_notice` shape: a hard cut reads like corruption, an ellipsis says
+/// `link_target` shape: a hard cut reads like corruption, an ellipsis says
 /// "there is more").
 fn ellipsized(s: &str, max: usize) -> String {
     if max == 0 {
@@ -159,7 +159,7 @@ pub(crate) fn question(text: &str) -> String {
 }
 
 /// PURE grid-cell row builder: exactly `panel_rows` rows, each exactly `cols`
-/// wide, so the splice overwrites frame rows in place (the `config_notice`
+/// wide, so the splice overwrites frame rows in place (the retired config banner's
 /// contract). Row 0 carries the question ([`question`]) with the two answer keys
 /// ([`ANSWER_KEYS`]) right-aligned; the following rows preview the paste body,
 /// sanitized and ellipsized, with a "+N more lines" tally when it overflows.
@@ -236,7 +236,7 @@ pub(crate) fn banner_rows(
             false,
         );
     }
-    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE — the `config_notice` contract this
+    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE — the contract this
     // builder's header claims, which it was not actually keeping. The question and
     // the answer keys are written over the row `blank_row` seamed, and `write_str`
     // rebuilds each cell without an overline, so the band's top edge arrived as
@@ -283,7 +283,7 @@ mod tests {
     }
 
     /// THE SEAM IS THE BAND'S TOP EDGE, so it must run the whole width. It did not:
-    /// this builder inherited the `config_notice` band pattern its header names, and
+    /// this builder inherited the retired config banner's band pattern its header names, and
     /// the same hole with it — `blank_row` stamps the rule, then the question and the
     /// answer keys punch themselves out of it (`write_str` rebuilds every cell it
     /// touches with no overline), leaving three stubs where a boundary belongs. A

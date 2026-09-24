@@ -91,6 +91,35 @@ use crate::store::Layout;
 /// The hook file base name (`00-` sorts first; distinct from any `aterm-pkg`-era name).
 pub const HOOK_BASENAME: &str = "00-atpkg";
 
+/// "THIS IS INSIDE ATERM": the environment variables whose UNION — any one of them
+/// non-empty — says a shell or a process runs inside an aterm session, so the managed
+/// agent programs lead there (owner ask 2026-09-22: *"claude managed via aterm should be
+/// in aterm only. NOT in ALL terminals like iterm!!!"*). A union because no single marker
+/// covers every lane: the GUI exports `ATERM_CHILD` and `ATERM_SESSION_ID` but not
+/// `ATERM_AGENTS_DIR`, and `aterm --session` launched from another terminal carries
+/// `ATERM_AGENTS_DIR` and deliberately neither of the others. `TERM_PROGRAM` is NOT one:
+/// `ATERM_TERM_PROGRAM` makes it user-settable, so it cannot decide which binary runs. No
+/// escape widens it past aterm (`ATPKG_AGENTS_EVERYWHERE` was one, removed 2026-09-23 with
+/// the other environment knobs); `aterm claude` runs the managed copy from any terminal.
+///
+/// THE ONE LIST. Every dialect's agents gate in [`hook_files`] is rendered from it, and so
+/// is the exec-time decision of the agents' reroute stubs
+/// ([`crate::reroute::agents_stub_body_sh`], 2026-09-23) — the hook decides at SHELL START
+/// and the stub when the program RUNS, and the two can only agree if they read the same
+/// markers.
+pub const AGENTS_MARKERS: &[&str] = &["ATERM_AGENTS_DIR", "ATERM_CHILD", "ATERM_SESSION_ID"];
+
+/// [`AGENTS_MARKERS`] as one POSIX word that is empty exactly when none is set:
+/// `${ATERM_AGENTS_DIR-}${ATERM_CHILD-}…` — each defaulted, so `set -u` cannot abort the
+/// hook or the stub that reads it.
+#[must_use]
+pub fn agents_markers_sh() -> String {
+    AGENTS_MARKERS
+        .iter()
+        .map(|m| format!("${{{m}-}}"))
+        .collect()
+}
+
 /// The hook file `shell` — the basename of `$SHELL` — sources: `00-atpkg.zsh`,
 /// `00-atpkg.bash`, `00-atpkg.fish`, `00-atpkg.ps1` (`pwsh`/`powershell`); NOT `sh` — the
 /// bash hook's body uses `${var//pat/rep}`, which a POSIX `sh` (dash) rejects, so a
@@ -176,6 +205,14 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // is rendered through its own quoter ([`fish_quote`]), never this one.
     let fish_bin = fish_quote(bin_dir);
     let fish_agents = fish_quote(agents_dir);
+    // The agents gate in each dialect, rendered from THE ONE LIST ([`AGENTS_MARKERS`]).
+    let markers_sh = agents_markers_sh();
+    let markers_fish: String = AGENTS_MARKERS.iter().map(|m| format!("${m}")).collect();
+    let markers_ps: String = AGENTS_MARKERS
+        .iter()
+        .map(|m| format!("$env:{m}"))
+        .collect::<Vec<_>>()
+        .join(" -or ");
     // POSIX (zsh + bash, down to macOS's bash 3.2): the managed bin/ is an idempotent
     // APPEND, and the agents dir is MOVED TO THE FRONT **ONLY INSIDE ATERM** — two
     // elements, two variables, so neither can mask the other; quoted for a space in
@@ -199,15 +236,18 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // "the managed copy is the one that runs **inside an aterm session**" — so this is the
     // implementation catching up with its own sentence, not a policy reversal.
     //
-    // The gate is a UNION of four markers, not one, because no single marker covers every
+    // The gate is a UNION of three markers, not one, because no single marker covers every
     // lane: the GUI exports ATERM_CHILD and ATERM_SESSION_ID but NOT ATERM_AGENTS_DIR, while
     // `aterm --session` launched from another terminal carries ATERM_AGENTS_DIR and
     // deliberately carries neither of the other two (aterm-cli/src/lib.rs: "Deliberately NOT
     // setting `ATERM_CHILD` here: this lane has never carried it") — so a gate on either
     // alone switches the managed copy off in a cell the owner wants it on. TERM_PROGRAM is
     // NOT in the union on purpose: ATERM_TERM_PROGRAM makes it user-settable, and
-    // net_listen.rs already had to stop trusting it. ATPKG_AGENTS_EVERYWHERE is the escape
-    // hatch for someone who wants the old behaviour back in every shell.
+    // net_listen.rs already had to stop trusting it. There is no escape hatch that puts
+    // the managed copy in front in every shell (`ATPKG_AGENTS_EVERYWHERE` was one, removed
+    // 2026-09-23 with the other environment knobs: the owner's rule is "NOT ENV VARS" and
+    // his ask here was aterm-only). `aterm claude` / `aterm codex` run the managed copy
+    // from any terminal, so no person needs a setting for it either.
     //
     // The false arm DEMOTES rather than merely declining to promote: it writes PATH back
     // without the agents element and unsets ATPKG_AGENTS, so a shell that INHERITED an
@@ -231,7 +271,7 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
          __atpkg_agents=\"{agents}\"\n\
          __atpkg_p=\":$PATH:\"\n\
          while :; do __atpkg_q=\"${{__atpkg_p//\":$__atpkg_agents:\"/:}}\"; [ \"$__atpkg_q\" = \"$__atpkg_p\" ] && break; __atpkg_p=\"$__atpkg_q\"; done\n\
-         case \"${{ATERM_AGENTS_DIR-}}${{ATERM_CHILD-}}${{ATERM_SESSION_ID-}}${{ATPKG_AGENTS_EVERYWHERE-}}\" in\n\
+         case \"{markers_sh}\" in\n\
          \"\") case \"$__atpkg_p\" in :) export PATH=\"\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_p\" ;; esac; unset ATPKG_AGENTS ;;\n\
          *) case \"$__atpkg_p\" in :) export PATH=\"$__atpkg_agents\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_agents:$__atpkg_p\" ;; esac; export ATPKG_AGENTS=\"$__atpkg_agents\" ;;\n\
          esac\n\
@@ -252,7 +292,7 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
          set -l __atpkg_agents \"{fish_agents}\"\n\
          set -l __atpkg_rest\n\
          for __atpkg_d in $PATH; if test \"$__atpkg_d\" != \"$__atpkg_agents\"; set __atpkg_rest $__atpkg_rest \"$__atpkg_d\"; end; end\n\
-         if test -n \"$ATERM_AGENTS_DIR$ATERM_CHILD$ATERM_SESSION_ID$ATPKG_AGENTS_EVERYWHERE\"; set -gx PATH \"$__atpkg_agents\" $__atpkg_rest; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -gx PATH $__atpkg_rest; set -e ATPKG_AGENTS; end\n"
+         if test -n \"{markers_fish}\"; set -gx PATH \"$__atpkg_agents\" $__atpkg_rest; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -gx PATH $__atpkg_rest; set -e ATPKG_AGENTS; end\n"
     );
     // PowerShell (Windows-native, and cross-platform pwsh): the aterm PowerShell integration
     // dot-sources `~/.aterm/shell.d/*.ps1`, so this is the ONLY thing that puts the managed
@@ -270,7 +310,7 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
          $env:ATPKG_BIN = $__atpkg_bin\n\
          $__atpkg_agents = '{ps_agents}'\n\
          $__atpkg_rest = @(($env:PATH -split [regex]::Escape($__atpkg_sep)) | Where-Object {{ $_ -ne $__atpkg_agents }})\n\
-         if ($env:ATERM_AGENTS_DIR -or $env:ATERM_CHILD -or $env:ATERM_SESSION_ID -or $env:ATPKG_AGENTS_EVERYWHERE) {{ $env:PATH = (@($__atpkg_agents) + $__atpkg_rest) -join $__atpkg_sep; $env:ATPKG_AGENTS = $__atpkg_agents }} else {{ $env:PATH = $__atpkg_rest -join $__atpkg_sep; Remove-Item Env:\\ATPKG_AGENTS -ErrorAction SilentlyContinue }}\n\
+         if ({markers_ps}) {{ $env:PATH = (@($__atpkg_agents) + $__atpkg_rest) -join $__atpkg_sep; $env:ATPKG_AGENTS = $__atpkg_agents }} else {{ $env:PATH = $__atpkg_rest -join $__atpkg_sep; Remove-Item Env:\\ATPKG_AGENTS -ErrorAction SilentlyContinue }}\n\
          Remove-Variable __atpkg_agents, __atpkg_bin, __atpkg_sep, __atpkg_rest\n"
     );
     vec![
@@ -279,6 +319,26 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
         (format!("{HOOK_BASENAME}.fish"), fish),
         (format!("{HOOK_BASENAME}.ps1"), powershell),
     ]
+}
+
+/// Whether the hook at `dest` is already `content`: a regular file (never a link), those
+/// exact bytes, and — on Unix — mode `0600`, the one [`stage_hook`] lays.
+fn hook_is_current(dest: &Path, content: &str) -> bool {
+    let Ok(meta) = fs::symlink_metadata(dest) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o777 != 0o600 {
+            return false;
+        }
+    }
+    crate::metadata_io::read_bounded_regular(dest, content.len() + 1)
+        .is_ok_and(|have| have == content.as_bytes())
 }
 
 /// What stood at a hook's destination before this pass replaced it, so the publish phase
@@ -331,8 +391,14 @@ fn restore_prev(dest: &Path, prev: Prev) {
     }
 }
 
-/// Write the three dialect hooks into `shell_d` (each `0600` via temp + rename) and delete a
-/// stray POSIX `00-atpkg.sh` (fish-safety). Returns the written file names.
+/// Write the dialect hooks into `shell_d` (each `0600` via temp + rename) and delete a
+/// stray POSIX `00-atpkg.sh` (fish-safety). Returns every dialect's file name now in place.
+///
+/// ONLY A HOOK WHOSE BYTES DIFFER IS WRITTEN (Phase 3, 2026-09-22): a rename gives the
+/// file a new inode, and every open zsh re-sources a hook whose inode moved at its next
+/// prompt — so a pass that rewrote four identical hooks every six hours re-sourced them
+/// in every tab on the machine. A hook already current (a regular file, these bytes,
+/// `0600`) is left exactly as it is.
 pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Result<Vec<String>> {
     // Stage every temp, then rename every destination; both phases are all-or-nothing.
     // The dialects are only correct as a set — one shell reads each — so a partial publish
@@ -340,8 +406,13 @@ pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Res
     // file is moved aside and put back if a later rename fails, so a failed publish leaves
     // `shell.d` as it found it and the next pass retries hooks and rc wiring together.
     let files = hook_files(bin_dir, agents_dir);
+    let current: Vec<String> = files
+        .iter()
+        .filter(|(name, content)| hook_is_current(&shell_d.join(name), content))
+        .map(|(name, _)| name.clone())
+        .collect();
     let mut staged = Vec::with_capacity(files.len());
-    for (name, content) in &files {
+    for (name, content) in files.iter().filter(|(name, _)| !current.contains(name)) {
         let dest = shell_d.join(name);
         match stage_hook(&dest, content) {
             Ok(tmp) => staged.push((tmp, dest, name.clone())),
@@ -353,7 +424,7 @@ pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Res
             }
         }
     }
-    let mut written = Vec::with_capacity(staged.len());
+    let mut written = current;
     // What stood at each destination this pass has already replaced, oldest first, so a
     // rename that fails later can put every one of them back.
     let mut published: Vec<(std::path::PathBuf, Prev)> = Vec::with_capacity(staged.len());
@@ -400,7 +471,8 @@ pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Res
 /// off unix, where no rc is wired, and on a home where no `RC_FILES` row exists.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HookPass {
-    /// `~/.aterm` and `~/.aterm/shell.d` were hardened and the hook files were written.
+    /// `~/.aterm` and `~/.aterm/shell.d` were hardened and the hook files are on disk as
+    /// rendered — written, or already byte-identical and left alone ([`write_hooks`]).
     /// One [`RcOutcome`] per rc file that exists, in `RC_FILES` order.
     Rewritten(Vec<(&'static str, RcOutcome)>),
     /// The directories were hardened, a hook file could not be written, and the rc step was
@@ -411,6 +483,14 @@ pub enum HookPass {
     /// user's own `0700` directory ([`ensure_private_dir`] refuses a symlink, a foreign
     /// owner or a group/other-writable mode): nothing was touched, no rc was read.
     NotHardened,
+    /// The UNATTENDED pass ran from an app bundle that is not the release `aterm.app` — a
+    /// dev bundle from `tools/dev-app.sh`, a renamed copy — and wrote nothing: the shell
+    /// hooks, the rc blocks and the command links are the release's to lay (2026-09-23;
+    /// [`in_release_bundle`]). Measured that day: a stale dev bundle launched from the Dock
+    /// rewrote `~/.aterm/shell.d` with a hook from before the in-aterm-only agents gate, so
+    /// `claude` led PATH in every terminal again. `atpkg repair` from such a bundle — the
+    /// asked-for pass — still writes.
+    NotReleaseBundle,
 }
 
 impl HookPass {
@@ -420,7 +500,7 @@ impl HookPass {
     pub fn rc(&self) -> &[(&'static str, RcOutcome)] {
         match self {
             Self::Rewritten(rc) => rc,
-            Self::HooksNotWritten | Self::NotHardened => &[],
+            Self::HooksNotWritten | Self::NotHardened | Self::NotReleaseBundle => &[],
         }
     }
 }
@@ -493,7 +573,20 @@ fn refresh_with(layout: &Layout, wiring: RcWiring) -> HookPass {
     let Some(home) = aterm_types::dirs::home_dir() else {
         return HookPass::NotHardened;
     };
-    pass_at(layout, &home, wiring)
+    let exe = std::env::current_exe().and_then(|e| e.canonicalize()).ok();
+    pass_as(layout, &home, wiring, exe.as_deref())
+}
+
+/// [`pass_at`] as the executable at `exe` runs it: the UNATTENDED pass
+/// ([`RcWiring::HonorOptOut`]) from a bundle that is not the release `aterm.app` writes
+/// nothing ([`HookPass::NotReleaseBundle`]); the asked-for pass ([`RcWiring::Rewire`],
+/// `atpkg repair`) runs from anywhere. `exe` is injected so a test drives the rule on a
+/// synthetic home.
+fn pass_as(layout: &Layout, home: &Path, wiring: RcWiring, exe: Option<&Path>) -> HookPass {
+    if wiring == RcWiring::HonorOptOut && exe.is_some_and(is_non_release_bundle_exe) {
+        return HookPass::NotReleaseBundle;
+    }
+    pass_at(layout, home, wiring)
 }
 
 /// One whole pass against a known `home`, as [`refresh_with`] runs it — so a test in
@@ -997,8 +1090,23 @@ fn sources_shell_d(rc: &str) -> bool {
 ///
 /// Deliberately narrow: symlinks only, into the same `~/.local/bin` that
 /// `tools/install.sh` uses, and never over anything that is not already ours — a real file
-/// there is someone's own build. No dotfile is touched here; `atpkg doctor` still prints
+/// there is left for `repair` to move aside ([`move_aside_copied_commands`]). No dotfile is
+/// touched here; `atpkg doctor` still prints
 /// the rc line for putting the managed `bin/` itself on PATH.
+///
+/// AND ONLY FROM THE RELEASE BUNDLE (2026-09-23). "Ours" is a link whose target lies in
+/// an `aterm.app` bundle ([`in_release_bundle`]), and this pass never writes a link it
+/// would itself refuse to repoint. It used to plant from ANY bundle, so a dev bundle —
+/// `aterm (dev).app`, from `tools/dev-app.sh` — took `~/.local/bin/aterm` and `atpkg` from
+/// the release every time it was launched, and the release could never take them back,
+/// because a link into the dev bundle is not "ours". Measured on the owner's Mac on
+/// 2026-09-23: the links pointed at a 0.85.0 dev build for nine days while the running app
+/// auto-updated to 0.91.0, and after they were restored by hand a single Dock launch of the
+/// stale dev bundle took both back within three seconds. Aiming `aterm` at a dev build is
+/// `tools/dev-app.sh` step 4's job — a stated choice, which prints what it displaced and
+/// which `--no-link` declines — and never a side effect of launching it; `atpkg` stays
+/// with the release (dev-app.sh has never linked it). The same rule keeps the unattended
+/// shell-hook pass ([`refresh`]) and the window's agent primer off a dev bundle.
 ///
 /// Unix-only: the whole body is bundle-shaped (`Contents/MacOS`, `~/.local/bin`,
 /// POSIX symlinks), so on Windows it could only ever return early — and
@@ -1011,24 +1119,46 @@ fn ensure_command_links(home: &Path) {
     let Ok(exe) = exe.canonicalize() else {
         return;
     };
-    // Only from inside a bundle: a source build's target/release is the developer's
-    // own tree, and linking out of it would outlive the checkout.
-    if !exe.parent().is_some_and(|d| d.ends_with("Contents/MacOS")) {
-        return;
-    }
-    // AND NOT FROM A TRANSLOCATED ONE. Gatekeeper runs a quarantined download from a
-    // read-only, randomly-named mount that disappears when the app quits, so a link
-    // into it is dangling by the next login — pointing at a path that will never
-    // exist again, on a machine whose real install is elsewhere
-    // (2026-08-20 round-9 audit).
-    if exe.components().any(|c| {
-        c.as_os_str()
-            .to_string_lossy()
-            .starts_with("AppTranslocation")
-    }) {
-        return;
-    }
-    let Some(macos) = exe.parent() else {
+    ensure_command_links_from(home, &exe);
+}
+
+/// Whether `path` lies inside a release-named `aterm.app` bundle's `Contents/MacOS` —
+/// the ONE spelling of "ours" for the unattended writers of shared user state: the test an
+/// existing command link's target must pass to be repointed, and the test the running
+/// executable must pass to write the links ([`ensure_command_links`]) or, unattended, the
+/// shell hooks ([`refresh`]). A dev bundle (`aterm (dev).app`), a renamed copy and a
+/// source tree all fail it. The cost of the name test, accepted: a release copy the user
+/// renamed (`aterm 2.app`, `Aterm.app`) lays no links either — renaming it back is the fix.
+fn in_release_bundle(path: &Path) -> bool {
+    path.to_string_lossy()
+        .contains("/aterm.app/Contents/MacOS/")
+}
+
+/// Whether the executable at `exe` (canonical) runs from inside an app bundle that is NOT
+/// the release `aterm.app` — the one case [`refresh`] and [`ensure_command_links`] stand
+/// aside for. A source build (`target/release/aterm`) is not a bundle and is not caught.
+fn is_non_release_bundle_exe(exe: &Path) -> bool {
+    exe.parent().is_some_and(|d| d.ends_with("Contents/MacOS")) && !in_release_bundle(exe)
+}
+
+/// Whether THIS process runs from an app bundle that is not the release `aterm.app` (see
+/// [`is_non_release_bundle_exe`]). Public so the window's agent primer applies the same
+/// rule: a stale dev bundle launched from the Dock rewrote `~/.claude/CLAUDE.md` and the
+/// skills with its older text in the same second it took the command links (2026-09-23).
+/// An executable that cannot be resolved answers `false` — the rule is a guard against one
+/// named shape, never a reason to stop a release install from working.
+#[must_use]
+pub fn runs_from_non_release_bundle() -> bool {
+    std::env::current_exe()
+        .and_then(|e| e.canonicalize())
+        .is_ok_and(|exe| is_non_release_bundle_exe(&exe))
+}
+
+/// [`ensure_command_links`] for the executable at `exe` (already canonical) — split out so
+/// the ownership rules can be driven by a test with a bundle tree of its own.
+#[cfg(unix)]
+fn ensure_command_links_from(home: &Path, exe: &Path) {
+    let Some(macos) = command_link_source(exe) else {
         return;
     };
     let Some(bin) = command_links_dir(home) else {
@@ -1037,7 +1167,7 @@ fn ensure_command_links(home: &Path) {
     if fs::create_dir_all(&bin).is_err() {
         return;
     }
-    for name in ["aterm", "atpkg"] {
+    for name in COMMAND_LINKS {
         let target = macos.join(name);
         if !target.exists() {
             continue;
@@ -1045,120 +1175,192 @@ fn ensure_command_links(home: &Path) {
         let link = bin.join(name);
         match fs::symlink_metadata(&link) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                // Ours to repoint only if it already points into an app bundle;
-                // anything else belongs to whoever put it there.
+                // Ours to repoint only if it already points into an `aterm.app` bundle;
+                // anything else — a dev bundle `tools/dev-app.sh` aimed `aterm` at,
+                // someone's own build — belongs to whoever put it there. ONE exception,
+                // `atpkg` into another bundle's `Contents/MacOS`: no tool states that
+                // choice (`tools/dev-app.sh` links `aterm` only, and never has), so such a
+                // link is the leftover of this pass before it was release-only — a dev
+                // bundle's launch took it — and it goes back to the release.
                 let ours = fs::read_link(&link).ok().is_some_and(|old| {
-                    old.to_string_lossy().contains("/aterm.app/Contents/MacOS/")
+                    in_release_bundle(&old)
+                        || (name == "atpkg"
+                            && old.parent().is_some_and(|d| d.ends_with("Contents/MacOS")))
                 });
                 if !ours || fs::read_link(&link).is_ok_and(|old| old == target) {
                     continue;
                 }
                 let _ = fs::remove_file(&link);
             }
-            // A REAL FILE. Until 2026-09-21 this arm was an unconditional
-            // `continue` reading "a real file is a hand-built binary; leave
-            // it" — and the one file it was most likely to meet was aterm's
-            // OWN: every install.sh before the symlink era COPIED the binary
-            // to this path. Measured on the owner's Mac that day:
-            // `~/.local/bin/atpkg` was a fresh symlink into the 0.90.0 bundle
-            // while `~/.local/bin/aterm` was still a Jul-3 copy reporting
-            // `aterm 0.15.2607021856`, because only the second name had ever
-            // been written as a file. This pass had declined it on every run
-            // since — and the owner's agent brief points every agent at
-            // `aterm ctl privacy`, a verb that binary predates entirely.
-            //
-            // So: adopt what identifies itself as OURS, and nothing else.
-            // `tools/install.sh` already trusts exactly this probe
-            // (`"$p" --version | grep -q '^aterm-ctl '`, :3178); this is the
-            // shipped half it was missing. Anything that will not run, times
-            // out, or answers with another program's name stays untouched —
-            // fail-closed, so a developer's own build at this path survives.
-            Ok(_) => {
-                if !claims_to_be(&link, name) {
-                    continue;
-                }
-                if fs::remove_file(&link).is_err() {
-                    continue;
-                }
-            }
+            // Not a link: a binary an install from before the links copied here, or
+            // someone's own build. Never touched unattended — `doctor` names it and
+            // `repair` moves it aside ([`move_aside_copied_commands`]).
+            Ok(_) => continue,
             Err(_) => {}
         }
         let _ = std::os::unix::fs::symlink(&target, &link);
     }
-    retire_superseded_ctl_shim(&bin);
 }
 
-/// Whether the binary at `path` identifies itself as `name` — the ownership
-/// probe, bounded hard.
-///
-/// This is the ONE place this module executes something it did not place, so
-/// every degree of freedom is closed: no shell, no arguments but `--version`,
-/// stdin and stderr on `/dev/null` so it can neither prompt nor scribble, and
-/// the FIRST line only. A non-zero exit, an unreadable child, a name that is
-/// not ours, or output that does not begin with `<name> ` all answer `false`,
-/// which leaves the file exactly as it was.
-///
-/// The match is `"<name> "` with the trailing space on purpose: `aterm-ctl`
-/// starts with `aterm`, and adopting one under the other's name is how a shim
-/// ends up pointing at the wrong binary.
+/// The names the command-link pass lays in `~/.local/bin`.
 #[cfg(unix)]
-fn claims_to_be(path: &Path, name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::process::{Command, Stdio};
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    // Not executable: nothing to ask, and nothing that could be shadowing us.
-    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
-        return false;
+const COMMAND_LINKS: [&str; 2] = ["aterm", "atpkg"];
+
+/// The `Contents/MacOS` an executable at `exe` (canonical) lays the command links from, or
+/// `None` where it may not lay them.
+#[cfg(unix)]
+fn command_link_source(exe: &Path) -> Option<&Path> {
+    // Only from inside a bundle: a source build's target/release is the developer's
+    // own tree, and linking out of it would outlive the checkout.
+    let macos = exe.parent().filter(|d| d.ends_with("Contents/MacOS"))?;
+    // AND ONLY FROM THE RELEASE BUNDLE: never write a link this pass would itself refuse
+    // to repoint. From a dev bundle (or any bundle not named `aterm.app`) the PATH names
+    // are not ours to take — see [`ensure_command_links`].
+    if !in_release_bundle(exe) {
+        return None;
     }
-    let Ok(out) = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
+    // AND NOT FROM A TRANSLOCATED ONE. Gatekeeper runs a quarantined download from a
+    // read-only, randomly-named mount that disappears when the app quits, so a link
+    // into it is dangling by the next login.
+    if exe.components().any(|c| {
+        c.as_os_str()
+            .to_string_lossy()
+            .starts_with("AppTranslocation")
+    }) {
+        return None;
     }
-    let Ok(text) = String::from_utf8(out.stdout) else {
-        return false;
-    };
-    text.lines()
-        .next()
-        .is_some_and(|first| first.starts_with(&format!("{name} ")))
+    Some(macos)
 }
 
-/// Retire OUR OWN superseded `aterm-ctl` shim, and only ours.
-///
-/// `aterm ctl …` is the front door; `tools/install.sh`'s `retire_exposed_siblings`
-/// (:3168-3182) has removed this sibling since the one-command collapse, but no
-/// SHIPPED code ever did — so a machine that last ran the installer before that
-/// change keeps a stale `aterm-ctl` on PATH forever, and `$ATERM_CTL`-style
-/// resolution can hand a 0.15 client to a 0.90 socket. Removing it is not a
-/// loss: the bundle still ships the argv0 alias, so `aterm ctl` and an
-/// in-session `aterm-ctl` both keep working.
-///
-/// Same fail-closed rule as [`claims_to_be`]: a symlink is ours only if it
-/// points into an aterm bundle, a regular file only if it says `aterm-ctl `.
+/// Names a file in `~/.local/bin` may still carry from an install before the one-binary
+/// collapse, which no pass links any more: `aterm ctl` replaces `aterm-ctl`.
 #[cfg(unix)]
-fn retire_superseded_ctl_shim(bin: &Path) {
-    let link = bin.join("aterm-ctl");
-    let Ok(meta) = fs::symlink_metadata(&link) else {
-        return;
+const RETIRED_COMMANDS: [&str; 1] = ["aterm-ctl"];
+
+/// The command paths in `~/.local/bin` that hold a regular file instead of a link: a binary
+/// an install from before the links copied there, or someone's own build, under a name the
+/// pass links ([`COMMAND_LINKS`]) or a retired one ([`RETIRED_COMMANDS`]). It never updates,
+/// and it runs instead of the app wherever `~/.local/bin` leads PATH. No unattended pass
+/// touches it; `doctor` names it and `repair` moves it aside ([`move_aside_copied_commands`]).
+#[cfg(unix)]
+pub(crate) fn copied_command_links(home: &Path) -> Vec<std::path::PathBuf> {
+    let Some(bin) = command_links_dir(home) else {
+        return Vec::new();
     };
-    let ours = if meta.file_type().is_symlink() {
-        fs::read_link(&link)
-            .ok()
-            .is_some_and(|old| old.to_string_lossy().contains("/aterm.app/Contents/MacOS/"))
-    } else {
-        claims_to_be(&link, "aterm-ctl")
+    COMMAND_LINKS
+        .iter()
+        .chain(RETIRED_COMMANDS.iter())
+        .map(|name| bin.join(name))
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()))
+        .collect()
+}
+
+/// How to run `repair` from the installed app, since a copied `~/.local/bin/aterm` is exactly
+/// what `aterm pkg repair` would run: this process's own `atpkg` when it is the release
+/// bundle's, else a description.
+#[cfg(unix)]
+pub(crate) fn repair_from_app_hint() -> String {
+    std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .ok()
+        .and_then(|exe| command_link_source(&exe).map(|macos| macos.join("atpkg")))
+        .map_or_else(
+            || "`atpkg repair` from the installed aterm.app".to_string(),
+            |atpkg| format!("`'{}' repair`", atpkg.display()),
+        )
+}
+
+/// One file `repair` moved out of a command path.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MovedAside {
+    pub(crate) from: std::path::PathBuf,
+    pub(crate) to: std::path::PathBuf,
+    /// Whether the app was linked in its place (a retired name gets no link).
+    pub(crate) linked: bool,
+}
+
+/// `atpkg repair`'s half of the command links: each [`copied_command_links`] path is moved to
+/// `<name>.moved-aside-<unix secs>` beside it, and a name the pass links gets the release
+/// bundle linked in its place. It is the asked-for pass, so it may displace someone's own
+/// build — which is why it moves rather than deletes, and says where the file went. Only
+/// where this process lays the links ([`command_link_source`]).
+#[cfg(unix)]
+pub(crate) fn move_aside_copied_commands() -> Vec<MovedAside> {
+    let Some(home) = aterm_types::dirs::home_dir() else {
+        return Vec::new();
     };
-    if ours {
-        let _ = fs::remove_file(&link);
+    let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) else {
+        return Vec::new();
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    move_aside_copied_commands_at(&home, &exe, secs)
+}
+
+#[cfg(unix)]
+fn move_aside_copied_commands_at(home: &Path, exe: &Path, secs: u64) -> Vec<MovedAside> {
+    let Some(macos) = command_link_source(exe) else {
+        return Vec::new();
+    };
+    let mut moved = Vec::new();
+    for from in copied_command_links(home) {
+        let Some(name) = from.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let link_to = COMMAND_LINKS.contains(&name).then(|| macos.join(name));
+        if link_to.as_ref().is_some_and(|target| !target.exists()) {
+            continue;
+        }
+        let mut aside = from.clone().into_os_string();
+        aside.push(format!(".moved-aside-{secs}"));
+        let aside = std::path::PathBuf::from(aside);
+        if rename_file_aside(&from, &aside, link_to.as_deref()) {
+            moved.push(MovedAside {
+                from,
+                to: aside,
+                linked: link_to.is_some(),
+            });
+        }
     }
+    moved
+}
+
+/// Give the file at `from` the name `aside`, then put a link to `link_to` at `from` (or leave
+/// nothing there). The file keeps a name at every step: `hard_link` refuses an existing
+/// `aside`, so an earlier move is never overwritten; the link is made under a temporary name
+/// and renamed over `from` in one step; and on any failure `aside` is dropped, leaving `from`
+/// as it was. `from` must still be the file that was linked — checked by inode — before it
+/// is replaced.
+#[cfg(unix)]
+fn rename_file_aside(from: &Path, aside: &Path, link_to: Option<&Path>) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let inode = |path: &Path| fs::symlink_metadata(path).map(|m| (m.dev(), m.ino())).ok();
+    if fs::hard_link(from, aside).is_err() {
+        return false;
+    }
+    let same = inode(from).is_some() && inode(from) == inode(aside);
+    let replaced = same
+        && match link_to {
+            Some(target) => {
+                let mut tmp = from.as_os_str().to_owned();
+                tmp.push(format!(".link-{}", std::process::id()));
+                let tmp = std::path::PathBuf::from(tmp);
+                let _ = fs::remove_file(&tmp);
+                let done = std::os::unix::fs::symlink(target, &tmp).is_ok()
+                    && fs::rename(&tmp, from).is_ok();
+                if !done {
+                    let _ = fs::remove_file(&tmp);
+                }
+                done
+            }
+            None => fs::remove_file(from).is_ok(),
+        };
+    if !replaced {
+        let _ = fs::remove_file(aside);
+    }
+    replaced
 }
 
 /// Where the `aterm`/`atpkg` command links go — `~/.local/bin` — or `None` when that
@@ -1388,130 +1590,6 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
-    }
-
-    /// Write a fake program that prints `line` for `--version`, and mark it
-    /// executable unless `runnable` is false.
-    #[cfg(unix)]
-    fn fake_program(path: &std::path::Path, line: &str, runnable: bool) {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::write(path, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
-        let mode = if runnable { 0o755 } else { 0o644 };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    /// THE OWNERSHIP PROBE, as a table.
-    ///
-    /// `ensure_command_links` skipped every regular file at the link path for
-    /// "a real file is a hand-built binary" — and the file it actually met on
-    /// the owner's Mac was aterm's OWN pre-symlink install artifact, a Jul-3
-    /// copy reporting `aterm 0.15.2607021856` that shadowed the 0.90.0 bundle
-    /// on PATH and could not run `aterm ctl privacy` at all. Adoption has to
-    /// be narrow enough that a developer's build survives it, so every arm
-    /// that is NOT ours is pinned here beside the one that is.
-    #[cfg(unix)]
-    #[test]
-    fn the_ownership_probe_adopts_only_what_names_itself() {
-        let home = tmp("ownership");
-
-        let ours = home.join("aterm");
-        fake_program(&ours, "aterm 0.15.2607021856", true);
-        assert!(
-            claims_to_be(&ours, "aterm"),
-            "our own former install artifact is ours to replace"
-        );
-
-        // The prefix trap: `aterm-ctl` starts with `aterm`. Adopting one under
-        // the other's name would point the shim at the wrong binary.
-        let ctl = home.join("aterm-ctl");
-        fake_program(&ctl, "aterm-ctl 0.15.2607021856", true);
-        assert!(claims_to_be(&ctl, "aterm-ctl"));
-        assert!(
-            !claims_to_be(&ctl, "aterm"),
-            "the trailing space is load-bearing: aterm-ctl is not aterm"
-        );
-
-        // Everything else is left alone, fail-closed.
-        let foreign = home.join("foreign");
-        fake_program(&foreign, "someone-elses-tool 2.0", true);
-        assert!(!claims_to_be(&foreign, "aterm"), "another program's name");
-
-        let unreadable = home.join("not-executable");
-        fake_program(&unreadable, "aterm 0.15.0", false);
-        assert!(
-            !claims_to_be(&unreadable, "aterm"),
-            "a file we cannot run tells us nothing"
-        );
-
-        let failing = home.join("nonzero");
-        fs::write(&failing, "#!/bin/sh\necho 'aterm 0.1'\nexit 3\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        assert!(
-            !claims_to_be(&failing, "aterm"),
-            "a non-zero exit is not an identification"
-        );
-
-        assert!(
-            !claims_to_be(&home.join("absent"), "aterm"),
-            "nothing there"
-        );
-        assert!(
-            !claims_to_be(&home, "aterm"),
-            "a directory is not a program"
-        );
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    /// `aterm ctl …` is the front door, so OUR superseded `aterm-ctl` shim is
-    /// retired — and only ours. `tools/install.sh` has done this since the
-    /// one-command collapse; no shipped code did, which is why a Jul-3
-    /// `~/.local/bin/aterm-ctl` was still on the owner's PATH in September.
-    #[cfg(unix)]
-    #[test]
-    fn the_superseded_ctl_shim_is_retired_but_only_when_it_is_ours() {
-        let bin = tmp("ctlshim");
-
-        // Ours as a regular file: the pre-symlink install artifact.
-        let link = bin.join("aterm-ctl");
-        fake_program(&link, "aterm-ctl 0.15.2607021856", true);
-        retire_superseded_ctl_shim(&bin);
-        assert!(!link.exists(), "our own stale copy is retired");
-
-        // Ours as a symlink into a bundle.
-        let bundle = bin.join("aterm.app/Contents/MacOS");
-        fs::create_dir_all(&bundle).unwrap();
-        fs::write(bundle.join("aterm-ctl"), "x").unwrap();
-        std::os::unix::fs::symlink(bundle.join("aterm-ctl"), &link).unwrap();
-        retire_superseded_ctl_shim(&bin);
-        assert!(!link.exists(), "our own bundle link is retired");
-
-        // NOT ours: a foreign program, and a link somewhere else. Both stay.
-        fake_program(&link, "someone-elses-ctl 9.9", true);
-        retire_superseded_ctl_shim(&bin);
-        assert!(
-            link.exists(),
-            "another program under that name is untouched"
-        );
-        fs::remove_file(&link).unwrap();
-
-        let elsewhere = bin.join("elsewhere");
-        fs::write(&elsewhere, "x").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
-        retire_superseded_ctl_shim(&bin);
-        assert!(
-            fs::symlink_metadata(&link).is_ok(),
-            "a link pointing outside an aterm bundle is not ours to remove"
-        );
-
-        // Nothing there at all is not an error.
-        fs::remove_file(&link).unwrap();
-        retire_superseded_ctl_shim(&bin);
-
-        let _ = fs::remove_dir_all(&bin);
     }
 
     /// The rc block goes in exactly once, sources the hook, and is removable.
@@ -2240,6 +2318,232 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    /// THE PATH NAMES ARE THE RELEASE BUNDLE'S TO WRITE (2026-09-23). A dev bundle
+    /// (`aterm (dev).app`) launched from the Dock took `~/.local/bin/aterm` and `atpkg`
+    /// from the release within three seconds, and the release could never take them back
+    /// (a link into the dev bundle is not "ours"). Driven through the real pass on a
+    /// bundle tree of its own: from the dev bundle nothing is planted and a release link
+    /// is left alone; from the release bundle an absent link is planted, a link into an
+    /// OLDER release location is repointed (moves still track), and a link `tools/dev-app.sh`
+    /// aimed at the dev bundle — the stated choice — is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn command_links_are_written_only_from_the_release_bundle() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp("cmdlink-owner").canonicalize().unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let bundle = |app: &str| -> PathBuf {
+            let macos = root.join("Applications").join(app).join("Contents/MacOS");
+            fs::create_dir_all(&macos).unwrap();
+            for name in ["aterm", "atpkg"] {
+                let p = macos.join(name);
+                fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            macos
+        };
+        let release = bundle("aterm.app");
+        let dev = bundle("aterm (dev).app");
+        let old_release = root.join("Old").join("aterm.app").join("Contents/MacOS");
+        let bin = home.join(".local/bin");
+        let target = |name: &str| fs::read_link(bin.join(name)).ok();
+        let set = |name: &str, to: &Path| {
+            let _ = fs::remove_file(bin.join(name));
+            std::os::unix::fs::symlink(to, bin.join(name)).unwrap();
+        };
+        // 1. From the dev bundle, with nothing at the link path: nothing is planted.
+        ensure_command_links_from(&home, &dev.join("aterm"));
+        assert_eq!(target("aterm"), None, "a dev bundle plants no `aterm`");
+        assert_eq!(target("atpkg"), None, "a dev bundle plants no `atpkg`");
+
+        // 2. From the release bundle: both are planted into it.
+        ensure_command_links_from(&home, &release.join("aterm"));
+        assert_eq!(target("aterm"), Some(release.join("aterm")));
+        assert_eq!(target("atpkg"), Some(release.join("atpkg")));
+
+        // 3. THE STEAL: the release owns them, then the dev bundle runs — untouched.
+        ensure_command_links_from(&home, &dev.join("aterm"));
+        assert_eq!(
+            target("aterm"),
+            Some(release.join("aterm")),
+            "a dev bundle's launch must not take the release's `aterm`"
+        );
+        assert_eq!(
+            target("atpkg"),
+            Some(release.join("atpkg")),
+            "a dev bundle's launch must not take the release's `atpkg`"
+        );
+
+        // 4. Moves still track: a link into an older `aterm.app` location is repointed.
+        set("aterm", &old_release.join("aterm"));
+        ensure_command_links_from(&home, &release.join("aterm"));
+        assert_eq!(target("aterm"), Some(release.join("aterm")));
+
+        // 5. The stated choice stands: `tools/dev-app.sh` aimed `aterm` at the dev bundle,
+        //    and the release leaves it there.
+        set("aterm", &dev.join("aterm"));
+        ensure_command_links_from(&home, &release.join("aterm"));
+        assert_eq!(target("aterm"), Some(dev.join("aterm")));
+
+        // 6. The leftover heals: an `atpkg` into the dev bundle can only be what the old
+        //    pass took (no tool states that choice), so the release takes it back — while
+        //    the `aterm` beside it, the stated choice, still stays.
+        set("atpkg", &dev.join("atpkg"));
+        ensure_command_links_from(&home, &release.join("aterm"));
+        assert_eq!(target("atpkg"), Some(release.join("atpkg")));
+        assert_eq!(target("aterm"), Some(dev.join("aterm")));
+
+        assert!(in_release_bundle(&release.join("aterm")));
+        assert!(!in_release_bundle(&dev.join("aterm")));
+        assert!(is_non_release_bundle_exe(&dev.join("aterm")));
+        assert!(!is_non_release_bundle_exe(&release.join("aterm")));
+        assert!(
+            !is_non_release_bundle_exe(&root.join("target/release/aterm")),
+            "a source build is not a bundle, and is not caught"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A copied binary at a link path stays until the owner asks: the unattended pass leaves
+    /// it byte-identical and [`copied_command_links`] names it for `doctor`. `repair` from the
+    /// release bundle renames it aside, never over an earlier one, and links the app. From a
+    /// dev bundle it moves nothing, because nothing would take the name.
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_command_is_left_alone_unattended_and_moved_aside_only_by_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp("cmdlink-copied").canonicalize().unwrap();
+        let home = root.join("home");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let bundle = |app: &str| -> PathBuf {
+            let macos = root.join("Applications").join(app).join("Contents/MacOS");
+            fs::create_dir_all(&macos).unwrap();
+            for name in ["aterm", "atpkg"] {
+                let p = macos.join(name);
+                fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            macos
+        };
+        let release = bundle("aterm.app");
+        let dev = bundle("aterm (dev).app");
+        let copied = bin.join("aterm");
+        let bytes = b"#!/bin/sh\necho 'aterm 0.15.0'\n";
+        fs::write(&copied, bytes).unwrap();
+        let is_file = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
+
+        ensure_command_links_from(&home, &release.join("aterm"));
+        assert_eq!(
+            fs::read(&copied).unwrap(),
+            bytes,
+            "the unattended pass never touches it"
+        );
+        assert_eq!(
+            fs::read_link(bin.join("atpkg")).ok(),
+            Some(release.join("atpkg")),
+            "the name beside it is still linked"
+        );
+        assert_eq!(copied_command_links(&home), vec![copied.clone()]);
+
+        assert!(move_aside_copied_commands_at(&home, &dev.join("aterm"), 7).is_empty());
+        assert!(
+            is_file(&copied),
+            "from a dev bundle nothing would take the name"
+        );
+
+        let earlier = bin.join("aterm.moved-aside-7");
+        fs::write(&earlier, b"earlier").unwrap();
+        assert!(move_aside_copied_commands_at(&home, &release.join("aterm"), 7).is_empty());
+        assert_eq!(
+            fs::read(&earlier).unwrap(),
+            b"earlier",
+            "an earlier move is never overwritten"
+        );
+        assert!(is_file(&copied));
+
+        let aside = bin.join("aterm.moved-aside-9");
+        let ctl = bin.join("aterm-ctl");
+        fs::write(&ctl, b"old ctl").unwrap();
+        assert_eq!(
+            move_aside_copied_commands_at(&home, &release.join("aterm"), 9),
+            vec![
+                MovedAside {
+                    from: copied.clone(),
+                    to: aside.clone(),
+                    linked: true,
+                },
+                MovedAside {
+                    from: ctl.clone(),
+                    to: bin.join("aterm-ctl.moved-aside-9"),
+                    linked: false,
+                },
+            ]
+        );
+        assert!(
+            fs::symlink_metadata(&ctl).is_err(),
+            "a retired name is moved and nothing is linked in its place"
+        );
+        assert_eq!(fs::read(&aside).unwrap(), bytes, "renamed, not deleted");
+        assert_eq!(fs::read_link(&copied).ok(), Some(release.join("aterm")));
+        assert!(copied_command_links(&home).is_empty());
+        assert!(
+            move_aside_copied_commands_at(&home, &release.join("aterm"), 10).is_empty(),
+            "a second repair has nothing to move"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// THE SHELL HOOKS ARE THE RELEASE BUNDLE'S TO LAY UNATTENDED (2026-09-23). The same
+    /// Dock launch of a stale dev bundle rewrote `~/.aterm/shell.d` with a hook from before
+    /// the in-aterm-only agents gate, so `claude` led PATH in every terminal again. Driven
+    /// through the real pass on a synthetic home: the unattended pass from the dev bundle
+    /// writes nothing; from the release bundle it writes; `repair` (the asked-for pass)
+    /// writes from the dev bundle too.
+    #[cfg(unix)]
+    #[test]
+    fn an_unattended_hooks_pass_from_a_dev_bundle_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp("hooks-owner").canonicalize().unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        let layout = Layout {
+            prefix: root.join("pkg"),
+        };
+        let dev = root.join("Applications/aterm (dev).app/Contents/MacOS/aterm");
+        let release = root.join("Applications/aterm.app/Contents/MacOS/aterm");
+        let hook = home.join(".aterm/shell.d/00-atpkg.zsh");
+
+        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&dev));
+        assert_eq!(pass, HookPass::NotReleaseBundle);
+        assert!(pass.rc().is_empty());
+        assert!(
+            !home.join(".aterm").exists(),
+            "the unattended pass from a dev bundle touches nothing under $HOME"
+        );
+
+        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&release));
+        assert!(matches!(pass, HookPass::Rewritten(_)), "{pass:?}");
+        assert!(hook.exists(), "the release bundle lays the hook");
+
+        fs::remove_file(&hook).unwrap();
+        let pass = pass_as(&layout, &home, RcWiring::Rewire, Some(&dev));
+        assert!(matches!(pass, HookPass::Rewritten(_)), "{pass:?}");
+        assert!(
+            hook.exists(),
+            "repair is the asked-for pass and writes from anywhere"
+        );
+
+        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, None);
+        assert!(
+            matches!(pass, HookPass::Rewritten(_)),
+            "an unresolvable executable never stops a pass: {pass:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// The rc rewrite's temp holds the WHOLE rc before its real mode is applied, so it is
     /// born 0600: created with the umask default (0644 under the usual 022) it left a
     /// 0600 rc's contents readable by other users until the chmod that followed
@@ -2377,18 +2681,17 @@ mod tests {
                 // ATERM_CHILD/ATERM_SESSION_ID but not ATERM_AGENTS_DIR, and the
                 // `aterm --session` lane carries ATERM_AGENTS_DIR and deliberately neither
                 // of the others.
-                for marker in [
-                    "ATERM_AGENTS_DIR",
-                    "ATERM_CHILD",
-                    "ATERM_SESSION_ID",
-                    "ATPKG_AGENTS_EVERYWHERE",
-                ] {
+                for marker in ["ATERM_AGENTS_DIR", "ATERM_CHILD", "ATERM_SESSION_ID"] {
                     assert!(
                         body.contains(&format!("${{{marker}-}}")),
                         "{marker} is in the gate, and defaulted so `set -u` cannot abort \
                          the hook"
                     );
                 }
+                assert!(
+                    !body.contains("EVERYWHERE"),
+                    "no environment escape widens the gate past aterm (2026-09-23)"
+                );
                 assert!(
                     !body.contains("TERM_PROGRAM"),
                     "TERM_PROGRAM is NOT a gate marker: ATERM_TERM_PROGRAM makes it \
@@ -2665,6 +2968,48 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// A HOOK THAT IS ALREADY CURRENT IS NEVER REWRITTEN (Phase 3): a rename hands the
+    /// hook a new inode and every open zsh re-sources it at its next prompt, so an idle
+    /// pass must leave identical hooks exactly as they are — and still rewrite the one
+    /// whose bytes or mode drifted.
+    #[cfg(unix)]
+    #[test]
+    fn write_hooks_leaves_identical_hooks_untouched() {
+        use std::os::unix::fs::MetadataExt as _;
+        let d = tmp("identical");
+        let (bin, agents) = (Path::new("/p/bin"), Path::new("/p/agents"));
+        write_hooks(&d, bin, agents).unwrap();
+        let inode = |name: &str| fs::metadata(d.join(name)).unwrap().ino();
+        let names = [
+            "00-atpkg.zsh",
+            "00-atpkg.bash",
+            "00-atpkg.fish",
+            "00-atpkg.ps1",
+        ];
+        let before: Vec<u64> = names.iter().map(|n| inode(n)).collect();
+        let again = write_hooks(&d, bin, agents).unwrap();
+        assert_eq!(again.len(), 4, "every dialect is still in place: {again:?}");
+        let after: Vec<u64> = names.iter().map(|n| inode(n)).collect();
+        assert_eq!(before, after, "no hook was rewritten");
+        // One drifted in content, one in mode: those two, and only those, are rewritten.
+        fs::write(d.join("00-atpkg.zsh"), "# edited by hand\n").unwrap();
+        fs::set_permissions(d.join("00-atpkg.fish"), fs::Permissions::from_mode(0o644)).unwrap();
+        write_hooks(&d, bin, agents).unwrap();
+        for (name, was) in names.iter().zip(&before) {
+            let drifted = *name == "00-atpkg.zsh" || *name == "00-atpkg.fish";
+            assert_eq!(inode(name) != *was, drifted, "{name}");
+        }
+        assert_eq!(
+            fs::metadata(d.join("00-atpkg.fish"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
     /// THE MEASURED FAILURE, REPLAYED IN REAL SHELLS (module doc). The inherited PATH is the
     /// m27 login shell's shape: `~/.local/bin` first, `/opt/homebrew/bin` ahead of the agents
     /// dir, the agents dir listed twice, and an EMPTY entry the user owns. Sourcing the
@@ -2711,6 +3056,9 @@ mod tests {
                     // Non-interactive bash sources $BASH_ENV even under --noprofile
                     // --norc; an inherited one would re-order PATH around the hook.
                     .env_remove("BASH_ENV")
+                    // This fixture tests an aterm session, not a foreign shell
+                    // where the production hook must demote managed agents.
+                    .env("ATERM_SESSION_ID", "atpkg-hook-test")
                     .env("ATPKG_TEST_HOOK", &hook)
                     .env("ATPKG_TEST_PATH", path)
                     .output()

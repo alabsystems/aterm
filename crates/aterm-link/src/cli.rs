@@ -20,6 +20,11 @@
 //! are now unknown subcommands like any other. Both answers are exit 2; what
 //! changed is that this file no longer promises a rung nobody is building.
 //!
+//! The one exception is `hook`, removed in round 25: a hook entry that survived the
+//! removal still runs it on every prompt, and an exit 2 there is Claude Code's BLOCKING
+//! error, so it answers exit 0 with nothing on stdout and one line on stderr
+//! (`retired_hook`) for a deprecation window.
+//!
 //! ## `ls` PRINTS §7'S COLUMNS, AND SAYS WHICH OF THEM HAVE NO WRITER
 //!
 //! §7 pins the row as `<node> <host> <sid> state= inc= role= detail= driving=
@@ -48,9 +53,10 @@
 //! `gen=`-bound approval is minted against), `observer=` (§11.2's watching,
 //! non-hosting attachment — a row an operator must not read as a host),
 //! `epoch=` (the launch nonce a drive record is fenced on), and round 13's
-//! `phase=` (busy | idle | prompt | question | limited | survey — the word
-//! `aterm drive phase` prints, from the same reader), `context=` (`<n>%` when
-//! Claude Code shows its indicator) and `title=` (the session's `meta set
+//! `phase=` (busy | idle | prompt | question | limited | survey — the
+//! server's `status agent=` verdict, relayed), `context=` (no longer written
+//! since 2026-09-23 — the server publishes no context figure — and printed
+//! for rows an older bridge wrote) and `title=` (the session's `meta set
 //! title` user title, else `-`; NEVER the terminal's title, which the program
 //! writes — [`crate::presence`]; 128 bytes). Dropping them to match §7
 //! exactly would lose the only face they have.
@@ -93,9 +99,7 @@ aterm-link — the aterm fabric bridge
 
   aterm-link serve --fleet <F> --broker <ep> --cap-file <path>... [options]
   aterm-link ls    --fleet <F> --broker <ep> --cap-file <path>... [--attention]
-  aterm-link hook  install claude [--merge] [--dry-run] [--rewake] [--report-to @sid] | run <event> [--check]   (`hook` for its own usage)
   aterm-link notify --on <attention|ask:<p>|halt>,... --exec <cmd>  (`notify` for its own usage)
-  aterm-link mirror <root> --sock <path>            (the file plane; `mirror` for its own usage)
   aterm-link broker <socket> [log] [--secret-file <path>]
                     the local bus itself (`broker` for its usage)
   aterm-link broker --tcp <host:port> --key-file <k> --secret-file <s> <log>
@@ -110,11 +114,10 @@ aterm-link — the aterm fabric bridge
                     bring a SECOND HOST into the fleet over the sealed wire
                     (`aterm fabric` is the same code; `fabric help` for its usage)
 
-`ls` and `mirror` default their flags from the rendezvous file
-`aterm fabric on` (or `join`) writes beside the instance control sockets (fabric.toml):
---fleet, --broker, --cap-file and --state for the first three — and --tcp --key-file
-with a defaulted --broker on a host that joined over the sealed wire — --sock for
-mirror. A flag given on the command line wins.
+`ls` defaults its flags from the rendezvous file `aterm fabric on` (or `join`) writes
+beside the instance control sockets (fabric.toml): --fleet, --broker, --cap-file and
+--state — and --tcp --key-file with a defaulted --broker on a host that joined over the
+sealed wire. A flag given on the command line wins.
 
   --fleet <F>            the fleet name (the `/f/<F>/` subtree)
   --broker <ep>          the broker: a Unix socket path, or <host>:<port> with --tcp
@@ -126,17 +129,17 @@ mirror. A flag given on the command line wins.
   --sock <path>          hand-started OBSERVER mode against a control socket
   --token-file <path>    the instance token, for --sock
   --presence <mode>      `serve` only: what a session's presence row carries.
-                         meta (the default) adds role= detail= phase= context=
-                         title= beside attention=. phase= is Claude Code's turn
-                         phase read off the last 40 rows of the screen, only when
-                         the session's status revision moved; a session running
-                         anything else reads idle (its detail= says what runs).
-                         title= is `meta set title` alone — never the terminal's
-                         title, which a program writes (Claude Code puts a
-                         summary of the conversation there) — and never any
-                         transcript text. minimal is attention= alone and never
-                         reads a screen. Without the flag, `[fabric] presence`
-                         in aterm.toml, else meta.
+                         meta (the default) adds role= detail= phase= title=
+                         beside attention=. phase= is aterm's own agent verdict
+                         (`status agent=`, pushed as `EVENT … agent` on each
+                         move), relayed; a session running no identified agent
+                         reads phase=- (its detail= says what runs). This bridge
+                         reads no screen. title= is `meta set title` alone —
+                         never the terminal's title, which a program writes
+                         (Claude Code puts a summary of the conversation there)
+                         — and never any transcript text. minimal is attention=
+                         alone. Without the flag, `[fabric] presence` in
+                         aterm.toml, else meta.
   --receipts             `serve` only: publish a RECEIPT (R8) when one of this
                          node's sessions runs `inbox seen <id> handled|refused|
                          deferred` on an ask or task — `kind=ack re=<off>
@@ -157,10 +160,11 @@ mirror. A flag given on the command line wins.
 
 `ls` prints §7's row — <node> <host> <sid> state= inc= role= detail= driving=
 holder= hold= fabric= attention= — then gen=, observer=, epoch=, phase=,
-context= and title=. `role=`, `detail=`, `phase=`, `context=` and `title=` are
-written by a round-13 bridge in `meta` mode (a `minimal` or older bridge leaves
-them `-`); every column is printed pct-encoded, so `context=12%` reads
-`context=12%25`; `driving=` has no writer in this fabric yet and always reads
+context= and title=. `role=`, `detail=`, `phase=` and `title=` are written by a
+round-13 bridge in `meta` mode (a `minimal` or older bridge leaves them `-`);
+`context=` is written by no bridge since 2026-09-23 and reads `-` except on a row
+an older bridge wrote; every column is printed pct-encoded, so `context=12%`
+reads `context=12%25`; `driving=` has no writer in this fabric yet and always reads
 `-`, and since round 21 cut the drive face `holder=` has none either on a row
 this node wrote — it is still PRINTED because the roster is a pass-through and
 an older node on the wire still publishes one;
@@ -203,11 +207,11 @@ pub fn dispatch(args: &[String]) -> ExitCode {
         // broker than its config names would be the report lying about itself.
         Some("ls") => run(&crate::enable::with_rendezvous_defaults(&args[1..]), false),
         Some("notify") => crate::notify::main(&args[1..]),
-        Some("hook") => crate::hook::main(&args[1..]),
-        Some("mirror") => crate::mirror::main(&crate::enable::with_default_sock(&args[1..])),
         Some("broker") => broker(&args[1..]),
         Some("mint") => mint(&args[1..]),
         Some("fabric") => crate::fabric::main(&args[1..]),
+        // THE RETIRED `hook` VERB: a silent no-op, never a refusal ([`retired_hook`]).
+        Some("hook") => retired_hook(),
         // Asked for: stdout, exit 0 — the same contract `aterm --help` and the
         // `broker -h` / `mint -h` children keep. Before this the front door
         // answered its own `--help` with exit 2 on stderr, disagreeing with
@@ -229,6 +233,39 @@ pub fn dispatch(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The one line `aterm link hook …` prints, on stderr, during the deprecation window
+/// ([`retired_hook`]).
+pub const RETIRED_HOOK_LINE: &str = "aterm-link: `hook` was removed (round 25: aterm installs \
+     nothing into the agent) — this hook entry does nothing; delete it from the settings \
+     file that runs it";
+
+/// `aterm link hook …`, any arguments: EXIT 0, NOTHING ON STDOUT, one stderr line
+/// ([`RETIRED_HOOK_LINE`]) — for a deprecation window whose end is the owner's call.
+///
+/// Round 25 cut the vendor hooks (59c3bee59), and the agents pass takes the entries aterm
+/// wrote out of `~/.claude/settings.json` — but never out of a PROJECT's
+/// `.claude/settings.local.json`, nor on a host the pass has not reached yet, nor from a
+/// Claude Code already running (it reads its hooks at startup). Refused by name like any
+/// unknown word, a surviving `aterm link hook run user-prompt-submit …` entry exited 2,
+/// which Claude Code reads as a BLOCKING error: after an upgrade every prompt was blocked
+/// (round-25 review, 2026-09-23, measured on the real binary). So the verb is answered with
+/// nothing: exit 0 is "go on", and stdout stays empty because a `UserPromptSubmit` or
+/// `SessionStart` hook's stdout is added to the model's context. What the vendor writes on
+/// stdin — the event's JSON, a whole pasted prompt for `UserPromptSubmit` — is read to its
+/// end first, so its write never meets a closed pipe: Claude Code closes the pipe once the
+/// JSON is written, and no byte cap is kept, because a cap bounds no time and a prompt over
+/// it would meet exactly that closed pipe (round-25 follow-up review, 2026-09-23). Never
+/// read from a terminal: a person typing the verb gets the line at once.
+fn retired_hook() -> ExitCode {
+    use std::io::IsTerminal as _;
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let _ = std::io::copy(&mut stdin.lock(), &mut std::io::sink());
+    }
+    eprintln!("{RETIRED_HOOK_LINE}");
+    ExitCode::SUCCESS
 }
 
 fn run(args: &[String], serve: bool) -> ExitCode {
@@ -1055,6 +1092,13 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control socket is the one method: no subcommand offers the fabric
+    /// as files.
+    #[test]
+    fn the_usage_offers_no_file_mirror() {
+        assert!(!USAGE.contains("mirror"), "{USAGE}");
+    }
 
     fn argv(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_string).collect()

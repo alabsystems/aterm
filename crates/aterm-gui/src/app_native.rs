@@ -24,6 +24,15 @@ use crate::native_updater_service::{
 use crate::packages_screen::{PackagesBusy, PackagesCommandOutcome, PackagesWorkerCompletion};
 use crate::{App, Wake, WindowId};
 
+/// Settings ▸ Messages is republished at most this often while the center
+/// moves (design §4.2): a downloading update restates at the tailer's 10 Hz,
+/// and the page need not repaint at that rate — 2 Hz is the eye's.
+pub(crate) const MESSAGES_PUBLISH_MIN_GAP: std::time::Duration =
+    std::time::Duration::from_millis(500);
+/// …and at least this often while a view is on the route with nothing
+/// moving, so the relative times tick (`3 min ago` becomes `4 min ago`).
+pub(crate) const MESSAGES_PUBLISH_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
 static NEXT_CONTROL_SETTINGS_REQUEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -385,15 +394,18 @@ pub(crate) struct AutoApplyEnvironmentBlock {
     blocked_at: std::time::Instant,
 }
 
-/// The activity-revoked retry ladder has this many distinct rungs (2 s → 15 min,
+/// The activity-revoked retry ladder has this many distinct rungs (2 s → 30 s,
 /// [`automatic_retry_delay`]); past the last one every further revocation waits
 /// the last rung again. Activity is never a reason to stop: on the machine this
 /// feature exists for — a daily driver with an agent streaming shell output into
 /// it — revocation is the NORMAL outcome of an attempt, not evidence of a
 /// problem, and the ladder in `native_update_auto_intent` is what makes the
-/// next attempt land. Every attempt is a lossless launch/park/paint round trip,
-/// so the spacing is what bounds the cost, not a budget.
-const ACTIVITY_REVOKED_LADDER_RUNGS: u8 = 8;
+/// next attempt land. Every attempt is a lossless launch/park/paint round trip
+/// (a successor boot, ~1.3 s measured), so the spacing is what bounds the cost
+/// — at most two a minute once saturated — and it stays inside
+/// `LANDS_WITHIN`: a spacing of minutes would break the one-minute promise on
+/// its own.
+const ACTIVITY_REVOKED_LADDER_RUNGS: u8 = 5;
 
 /// Physical handoff failures get a SMALL budget on a LONG leash — not the zero
 /// they used to get.
@@ -673,9 +685,19 @@ impl PhysicalFailureSchedule {
 /// How long the automatic lane waits between attempts once an artifact's cheap
 /// PREFLIGHT-BLOCK budget is spent. A probe is screen-silent
 /// (`ClosePreflightVisibility::Quiet`), so this is retry spacing on a retained
-/// intent and nothing more; ten minutes keeps a user with an unsaved Settings
-/// edit from waiting hours for a build that was ready.
-const PREFLIGHT_BLOCK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// intent and nothing more; a minute means a user who saves or closes the
+/// Settings edit that blocked the update gets it within a minute, the same
+/// bound the ladder promises.
+const PREFLIGHT_BLOCK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How the close preflight's per-person blockers open (`native_update_close_preflight`)
+/// — the shapes [`App::update_blocker_for_person`] recognises as work a person
+/// has to save, so the reason and its reader cannot drift apart.
+const SETTINGS_DRAFTS_BLOCK: &str = "Review Settings Drafts:";
+const DIRTY_DOCUMENTS_BLOCK: &str = "Checkpoint Drafts:";
+const FAILED_CHECKPOINTS_BLOCK: &str = "Retry:";
+
+const _: () = assert!(PREFLIGHT_BLOCK_COOLDOWN.as_secs() <= 60);
 
 /// WHICH LANE'S BUDGET A RETURNED HANDOFF FAILURE MAY SPEND, carried from the
 /// [`crate::native_updater_service::ApplyMode`] the attempt was authorized under.
@@ -690,10 +712,9 @@ const PREFLIGHT_BLOCK_COOLDOWN: std::time::Duration = std::time::Duration::from_
 ///     bad afternoon could converge the background lane to manual-only — the exact
 ///     "staged, applies on relaunch" state the seamless lane exists to delete;
 ///   * it also stamped `auto_apply_physical_retry` MICROSECONDS before surfacing,
-///     which is precisely the freshness window
-///     [`App::physical_failure_deserves_a_pill`] uses to recognise the automatic
-///     lane's own quiet retries — so the person who just asked for the update got
-///     silence.
+///     which is precisely the freshness window the pill rule of the day used to
+///     recognise the automatic lane's own quiet retries — so the person who just
+///     asked for the update got silence.
 ///
 /// A person's failure therefore charges NOTHING: no budget, no manual-only latch,
 /// no retirement of a live automatic intent. It is surfaced (loudly, by the
@@ -955,8 +976,8 @@ enum AutomaticRetryKind {
     /// TERMINAL ACTIVITY before Commit. The rollback is proven lossless (kill,
     /// reap, resume readers; zero bytes consumed by the parent post-park), so
     /// — unlike `PhysicalFailure` — repeating later is as safe as the first
-    /// attempt. Exponentially spaced so a busy terminal is not launched at
-    /// continuously; never exhausted, because activity is never a reason to
+    /// attempt. Spaced (2 s growing to 30 s) so a busy terminal is not launched
+    /// at continuously; never exhausted, because activity is never a reason to
     /// stop (the ladder decides when the next attempt lands).
     ActivityRevoked,
     PhysicalFailure,
@@ -986,18 +1007,16 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
     let seconds = match (kind, cycles.min(ACTIVITY_REVOKED_LADDER_RUNGS - 1)) {
         (AutomaticRetryKind::PreflightBlocked, 0 | 1) => 5,
         (AutomaticRetryKind::PreflightBlocked, _) => 15,
-        // Exponential spacing that saturates at 15 min: each revoked attempt
-        // costs a launch/park/paint round trip, so back off hard while the
-        // terminal stays busy. The ladder's phase decides what the next attempt
-        // waits for, and the spacing starts over after a long idle gap.
+        // Spacing that saturates at 30 s: each revoked attempt costs a
+        // launch/park/paint round trip, so back off while the terminal stays
+        // busy — but in seconds, because the lane promises a landing within a
+        // minute. The ladder's phase decides what the next attempt waits for,
+        // and the spacing starts over after a long idle gap.
         (AutomaticRetryKind::ActivityRevoked, 0) => 2,
-        (AutomaticRetryKind::ActivityRevoked, 1) => 8,
-        (AutomaticRetryKind::ActivityRevoked, 2) => 30,
-        (AutomaticRetryKind::ActivityRevoked, 3) => 60,
-        (AutomaticRetryKind::ActivityRevoked, 4) => 120,
-        (AutomaticRetryKind::ActivityRevoked, 5) => 300,
-        (AutomaticRetryKind::ActivityRevoked, 6) => 600,
-        (AutomaticRetryKind::ActivityRevoked, _) => 900,
+        (AutomaticRetryKind::ActivityRevoked, 1) => 5,
+        (AutomaticRetryKind::ActivityRevoked, 2) => 10,
+        (AutomaticRetryKind::ActivityRevoked, 3) => 20,
+        (AutomaticRetryKind::ActivityRevoked, _) => 30,
         // Kept explicit so this helper stays fail-closed if the early return above is
         // Tens of minutes, not seconds. A physical retry costs a real
         // park/spawn/paint round trip, and the failure it is recovering from is a
@@ -1062,6 +1081,8 @@ pub(crate) fn load_native_updater_service() -> NativeUpdaterService {
 pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> DurableUpdateStatus {
     let apply_lane = aterm_update::apply_lane_report(status.current_build).unwrap_or_default();
     DurableUpdateStatus {
+        linux_host: cfg!(target_os = "linux"),
+        linux: status.linux,
         enabled: status.enabled,
         current_build: status.current_build,
         staged_build: status.staged_build,
@@ -1079,11 +1100,14 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
         apply_failures_for_target: apply_lane.failures_for_target,
         installable: status.installable,
         channel_unreadable: status.channel_unreadable,
+        checked_at: aterm_update_core::pkg_check::rfc3339_to_unix(&status.updated_at),
     }
 }
 
 fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
     DurableUpdateStatus {
+        linux_host: cfg!(target_os = "linux"),
+        linux: None,
         enabled: true,
         current_build: build,
         staged_build: None,
@@ -1106,6 +1130,7 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         installable: true,
         // Likewise: only a completed check can pronounce the channel unreadable.
         channel_unreadable: false,
+        checked_at: None,
     }
 }
 
@@ -1848,8 +1873,9 @@ impl App {
                         )
                     {
                         // A NEWLY STAGED BUILD IS ANNOUNCED BY THE STATUS BAR
-                        // (2026-09-07): "aterm vX is ready … click to apply now",
-                        // held for as long as the apply is armed. The floating
+                        // (2026-09-07): "Updating to aterm vX", live for as long
+                        // as the automatic lane is armed ("aterm vX is ready ·
+                        // click to install" where a press installs it). The floating
                         // "Update ready" card and the stage-time border glow are
                         // retired: the glow is the UPGRADE's, and fires when the
                         // apply actually runs.
@@ -3557,6 +3583,22 @@ impl App {
                     )?;
                 }
             }
+            // The page named an entry and a button; the host resolves both
+            // and performs the intent in THIS window (`perform_message_act`).
+            AppEffect::MessageAct { id, action, reply } => {
+                let outcome = self.perform_message_act(wid, id, action);
+                if self.native_runtime.completion_is_current(&reply) {
+                    self.dispatch_native_completion(
+                        wid,
+                        instance,
+                        view,
+                        AppEvent::MessageActFinished {
+                            operation: reply.operation,
+                            outcome,
+                        },
+                    )?;
+                }
+            }
             AppEffect::OpenDocumentEditor { document } => {
                 let uri = self
                     .document_store
@@ -3592,6 +3634,27 @@ impl App {
                     if let Ok(Err(error)) = outcome.try_recv() {
                         aterm_log::warn!("wallpaper picker: {error}");
                     }
+                }
+            }
+            AppEffect::OpenLogFolder => {
+                // The host's own log directory — never a path from the view — opened
+                // through NSWorkspace like Open Log: no shell, no Terminal.
+                match crate::logging::log_dir() {
+                    Some(dir) if crate::menu::open_file_in_workspace(&dir) => {}
+                    Some(dir) => {
+                        aterm_log::warn!("could not open the log folder {}", dir.display());
+                    }
+                    None => aterm_log::warn!("the log folder has no directory to live in"),
+                }
+            }
+            AppEffect::OpenPackagesLog => {
+                // atpkg's own resolution of where it writes — never a path from the view.
+                match atpkg::packages_log::log_path() {
+                    Some(path) if crate::menu::open_file_in_workspace(&path) => {}
+                    Some(path) => {
+                        aterm_log::warn!("could not open the package log {}", path.display());
+                    }
+                    None => aterm_log::warn!("the package log has no directory to live in"),
                 }
             }
             AppEffect::RequestCloseSelf => {
@@ -3772,6 +3835,8 @@ impl App {
         authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
     ) {
         let label = crate::app_fabric_menu::presence_key_label(key);
+        // `(cause, indeterminate)`: the toggle reverted, or may not have
+        // persisted (design §10.3 C17).
         let feedback = match outcome {
             ConfigPatchOutcome::Applied { .. } => {
                 if let Some(snapshot) = authoritative {
@@ -3779,20 +3844,19 @@ impl App {
                 }
                 None
             }
-            ConfigPatchOutcome::Conflict { .. } => Some(format!(
-                "{label} was not saved because aterm.toml changed first; its current value was kept."
+            ConfigPatchOutcome::Conflict { .. } => Some((
+                "aterm.toml changed first; its current value was kept".to_string(),
+                false,
             )),
-            ConfigPatchOutcome::Indeterminate { message } => {
-                Some(format!("{label} may not have been saved: {message}"))
-            }
-            other => Some(format!(
-                "{label} was not saved: {}",
+            ConfigPatchOutcome::Indeterminate { message } => Some((message.clone(), true)),
+            other => Some((
                 control_settings_completion_reply(key, Some(&desired.to_string()), other, None)
                     .err()
-                    .unwrap_or_else(|| "the write was refused".to_string())
+                    .unwrap_or_else(|| "the write was refused".to_string()),
+                false,
             )),
         };
-        if let Some(words) = feedback {
+        if let Some((cause, indeterminate)) = feedback {
             // The durable truth wins over the click: re-read it from the
             // authoritative snapshot when there is one, else from the config
             // the App last adopted.
@@ -3801,9 +3865,12 @@ impl App {
                 |snapshot| crate::app_fabric_menu::presence_key_resolve(key, &snapshot.config),
             );
             self.set_presence_bit(key, durable);
-            self.config_notice =
-                crate::config_notice::ConfigNotice::new(vec![words], std::time::Instant::now());
-            self.request_redraw_all_windows();
+            self.post_message(crate::message_reporters::presence_not_saved(
+                key,
+                label,
+                &cause,
+                indeterminate,
+            ));
         }
     }
 
@@ -4201,11 +4268,34 @@ impl App {
     /// would only be used to pre-emptively fail the caller that dispatches the
     /// NEXT sample, i.e. to punish a caller for a diagnosis that its own probe
     /// is in the middle of disproving.
+    ///
+    /// "TELL THE USER ONCE" MEANS ABOUT WHAT WAS LOST, so it is said only when
+    /// something was. The commonest way here is a hand-edited `aterm.toml` that
+    /// does not parse: the watcher reports it ("Config observation was not valid
+    /// TOML", on the config lane's one row), fences the lane, and the sample this
+    /// settles re-reads the same broken file and fails the same way. With nothing
+    /// queued, "queued changes were not written" was simply false — and because
+    /// both messages share the lane's key, the false one REPLACED the true one on
+    /// the band: the person who broke their file was told about writes they never
+    /// asked for, instead of which line does not parse. With nothing queued there
+    /// is nothing to account for and the fence costs nothing (the next save takes
+    /// a fresh sample and reports against its own request), so the lane's row is
+    /// left standing and the failure goes to the log.
     fn fail_native_config_reconciliation(&mut self, error: &str) {
         self.native_config_service.mark_reconciliation_required();
-        self.reject_pending_native_config(&format!("config reconciliation failed: {error}"));
+        let rejected =
+            self.reject_pending_native_config(&format!("config reconciliation failed: {error}"));
+        if rejected == 0 {
+            aterm_log::warn!("native config: reconciliation failed with nothing queued: {error}");
+            return;
+        }
+        let lost = if rejected == 1 {
+            "1 queued change was".to_string()
+        } else {
+            format!("{rejected} queued changes were")
+        };
         self.surface_native_config_lane_error(format!(
-            "Config reconciliation failed; queued changes were not written: {error}"
+            "Config reconciliation failed; {lost} not written: {error}"
         ));
     }
 
@@ -4482,11 +4572,12 @@ impl App {
         }
     }
 
+    /// The native config lane's own error (an observation that was not TOML,
+    /// a pump that failed, a request the lane dropped): logged, and posted as
+    /// the `config.lane` row (design R13) — one row, the newest cause.
     pub(crate) fn surface_native_config_lane_error(&mut self, message: String) {
         aterm_log::warn!("native config: {message}");
-        self.config_notice =
-            crate::config_notice::ConfigNotice::new(vec![message], std::time::Instant::now());
-        self.request_redraw_all_windows();
+        self.post_message(crate::message_reporters::config_lane_error(&message));
     }
 
     /// Answer EVERY still-queued semantic request with one bounded rejection and
@@ -4512,11 +4603,15 @@ impl App {
     /// runs BEFORE the emptiness check, so pumping a freshly drained queue would
     /// dispatch yet another reconciliation and spin the worker against a path it
     /// already cannot read.
-    pub(crate) fn reject_pending_native_config(&mut self, message: &str) {
+    ///
+    /// Returns how many requests it rejected, so a caller that wants to tell the
+    /// person something was LOST can tell whether anything was.
+    pub(crate) fn reject_pending_native_config(&mut self, message: &str) -> usize {
         let abandoned = std::mem::take(&mut self.native_config_pending);
         if abandoned.is_empty() {
-            return;
+            return 0;
         }
+        let rejected = abandoned.len();
         aterm_log::warn!(
             "native config: rejecting {} queued config request(s): {message}",
             abandoned.len()
@@ -4533,6 +4628,7 @@ impl App {
             );
         }
         self.refresh_serious_mode_queued_projection();
+        rejected
     }
 
     fn publish_native_config_origin(
@@ -4686,8 +4782,7 @@ impl App {
             ),
         };
         if let Some(message) = feedback {
-            self.config_notice =
-                crate::config_notice::ConfigNotice::new(vec![message], std::time::Instant::now());
+            self.post_message(crate::message_reporters::serious_mode_feedback(&message));
         }
 
         // Settings already received the exact snapshot synchronously above;
@@ -4837,8 +4932,9 @@ impl App {
     /// Admit one Packages verb. Physical work (spawning the CO-LOCATED `atpkg`
     /// binary, reading its `status.toml`) always happens on a worker thread —
     /// this admission is memory-only plus one `current_exe`-sibling stat.
-    /// `pub(crate)`: the first-launch admin card (`App::notice_click`) is the second
-    /// caller besides the Settings effect executor — same seam, same argv table.
+    /// `pub(crate)`: the first-launch admin step's *Install* capsule
+    /// (`App::perform_intent`, R18/R19) is the second caller besides the Settings effect
+    /// executor — same seam, same argv table.
     pub(crate) fn execute_native_packages(&mut self, request: PackagesRequest) -> PackagesOutcome {
         let atpkg = crate::co_located_atpkg();
         if let Err(message) = packages_request_admissible(&request) {
@@ -4846,10 +4942,11 @@ impl App {
         }
         let processes = packages_argv(&request);
         // `atpkg machine apply` is a LOCAL verb: no store, no index, no root key —
-        // it works with the package manager switched off (ATPKG_DISABLE), so the
-        // manager gate below does not apply to it. Its stdout is captured too: the
+        // it works in a build whose manager is inert, so the manager gate below does
+        // not apply to it. Its stdout is captured too: the
         // `machine-settings:` row and the verdict sentence ride it.
         let machine_apply = matches!(request, PackagesRequest::MachineApply);
+        let check = matches!(request, PackagesRequest::CheckUpdate);
         let Some(atpkg) = atpkg else {
             return PackagesOutcome::Failed {
                 message: "no co-located atpkg binary beside this executable".to_string(),
@@ -4859,8 +4956,9 @@ impl App {
             // Same trust posture the binary itself enforces; refusing here is
             // honesty, not authority — atpkg would refuse loudly anyway.
             return PackagesOutcome::Blocked {
-                message: "the package manager is inert (no effective root key is available, or ATPKG_DISABLE is set)"
-                    .to_string(),
+                message:
+                    "the package manager is inert (no package root key is pinned in this build)"
+                        .to_string(),
             };
         }
         if self.native_packages_service.busy().is_some() {
@@ -4910,6 +5008,22 @@ impl App {
                 let mut command = PackagesCommandOutcome::Succeeded { operation: busy };
                 let mut machine_verdict: Option<String> = None;
                 let mut machine_state: Option<atpkg::machine::MachineState> = None;
+                let layout = atpkg::store::resolve_configured();
+                // THE CHECK'S ONE FAIL-FAST: a store held by a PERSON's typed verb (a
+                // terminal's `aterm pkg …`, `claude update`) is answered at once — a click
+                // must not queue silently behind work someone is watching. Behind any lane
+                // (the window's own pass, a session's) it waits like the window's passes.
+                if check && let Some(pid) = layout.as_ref().and_then(atpkg::lock::person_holder) {
+                    command = PackagesCommandOutcome::Failed {
+                        operation: busy,
+                        message: check_held_by_person_message(pid),
+                    };
+                }
+                let processes = if matches!(command, PackagesCommandOutcome::Failed { .. }) {
+                    Vec::new()
+                } else {
+                    processes
+                };
                 for verb in &processes {
                     // NO STDIN: a windowed child inherits whatever the app was launched
                     // with (a Terminal's tty when run from one), and atpkg's door reads a
@@ -4924,19 +5038,35 @@ impl App {
                     // Security card both want) and one verdict sentence — so those are
                     // captured and fed through the same marker parser the launch pass
                     // uses (`spawn_machine_settings_once`).
-                    // A PASS APPLIES THE HOST SETTINGS TOO, so its stdout is worth
-                    // reading. `packages/check` (an update pass) and the default-set
-                    // install run `apply_machine_settings` at their top like every
-                    // other pass — and with stdout nulled, the `machine-settings:`
-                    // marker they print went nowhere: the card never learned about a
-                    // change a Settings-initiated pass had just made, and the pull-down
-                    // row never appeared.
+                    // A PASS MAY APPLY THE HOST SETTINGS TOO, so its stdout is worth
+                    // reading: `packages/check` (an update pass) and every install carry
+                    // an EDIT to the `[machine]` table at their edge (Phase 3) — and with
+                    // stdout nulled, the `machine-settings:` marker they print went
+                    // nowhere: the card never learned about a change a Settings-initiated
+                    // pass had just made, and the pull-down row never appeared.
                     let reads_stdout = machine_apply || busy.applies_machine_settings();
                     // Upstream's QoS-classed spawner, kept: a background pass must not
                     // compete with the window for the scheduler.
                     let mut child = crate::qos::command(crate::qos::Role::Background, &atpkg);
+                    // THE CHECK IS THE WINDOW'S OWN PASS (Phase 3): the same argv
+                    // (`--wait-lock` with the lanes' bound, `--progress-file`), the
+                    // spawner's pid and the login shell's PATH — so a window that quits
+                    // mid-check hands the child to the orphan watch instead of killing it
+                    // at its next print — and it is run the lanes' way below, so its
+                    // waiting row streams like any pass's.
+                    if check {
+                        child
+                            .args(crate::pass_args(
+                                crate::PassVerb::Update,
+                                layout.as_ref(),
+                                None,
+                            ))
+                            .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
+                            .env("PATH", crate::spawn::atpkg_child_path());
+                    } else {
+                        child.args(verb);
+                    }
                     child
-                        .args(verb)
                         .stdin(std::process::Stdio::null())
                         .stdout(if reads_stdout {
                             std::process::Stdio::piped()
@@ -4965,6 +5095,33 @@ impl App {
                         machine_verdict = read.1;
                         machine_state = read.2;
                         if matches!(command, PackagesCommandOutcome::Failed { .. }) {
+                            break;
+                        }
+                        continue;
+                    }
+                    // THE CHECK STREAMS, as the lanes' passes do ([`crate::run_pass_child`]):
+                    // queued behind another pass, its waiting row shows at once instead of
+                    // a busy page with no reason for up to its 30-minute bound. Not its
+                    // `machine-state:` record, for the reason below.
+                    if check {
+                        let post_proxy = proxy.clone();
+                        let post = move |event: Wake| {
+                            if !matches!(event, Wake::PkgMachineState(_)) {
+                                let _ = post_proxy.send_event(event);
+                            }
+                        };
+                        let ran = crate::run_pass_child(&mut child, layout.as_ref(), false, &post);
+                        let (said, result) = match ran {
+                            Ok((run, status)) => (run.said.trim().to_string(), status),
+                            Err(error) => (String::new(), Err(error)),
+                        };
+                        if let Some(message) =
+                            packages_child_failure(result.as_ref().copied(), verb, &said)
+                        {
+                            command = PackagesCommandOutcome::Failed {
+                                operation: busy,
+                                message,
+                            };
                             break;
                         }
                         continue;
@@ -5124,8 +5281,19 @@ impl App {
         let finished = self.native_packages_service.busy();
         let confirmed_by_its_record =
             finished == Some(PackagesBusy::MachineApply) && completion.machine_state.is_some();
+        // The admin step's install (R19): its live row ends with this pass —
+        // resolved on a clean end, superseded by a short failure row on a
+        // failed one (`App::finish_admin_install`).
+        let admin_failure =
+            (finished == Some(PackagesBusy::InstallAdmin)).then(|| match &completion.command {
+                Some(PackagesCommandOutcome::Failed { message, .. }) => Some(message.clone()),
+                _ => None,
+            });
         if !self.native_packages_service.finish(sequence, completion) {
             return;
+        }
+        if let Some(failure) = admin_failure {
+            self.finish_admin_install(failure.as_deref());
         }
         self.publish_native_packages_state();
         if finished.is_some_and(PackagesBusy::applies_machine_settings) && !confirmed_by_its_record
@@ -5135,30 +5303,32 @@ impl App {
         }
     }
 
-    /// Publish the shared packages projection to the Settings controller and
-    /// fan the revision out to every Settings view (the packages analogue of
-    /// [`Self::publish_native_update_state`]).
-    pub(crate) fn publish_native_packages_state(&mut self) {
-        let revision = self.native_packages_service.revision();
-        let state = self
-            .native_packages_service
-            .state(
-                self.config.packages_update_loop_enabled(),
-                self.config.packages_enabled(),
-                self.config.packages_auto_update(),
-                self.config.packages_auto_install(),
-                self.package_update_loop_running,
-            )
-            .with_machine_config(
-                self.config.machine_universal_control(),
-                self.config.machine_spotlight_noindex(),
-            );
-        if !self
+    /// Publish the Settings ▸ Messages projection to the Settings controller
+    /// and fan the revision out to every Settings view (design §4.2, the
+    /// [`Self::publish_native_packages_state`] shape): the projection is
+    /// built ONCE from the center and the log (`App::messages_state`), and
+    /// every view repaints from the controller's copy. Unconditional — the
+    /// caller that opens Settings wants the page current now; the gated
+    /// twin [`Self::publish_native_messages_state_if_due`] serves the sync
+    /// and the park. A no-op with no Settings instance to hold it.
+    pub(crate) fn publish_native_messages_state(&mut self) {
+        if self
             .native_runtime
-            .replace_settings_packages(state, revision)
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .is_none()
         {
             return;
         }
+        let state = self.messages_state();
+        let revision = state.revision;
+        if !self
+            .native_runtime
+            .replace_settings_messages(state, revision)
+        {
+            return;
+        }
+        self.messages_last_publish = Some(std::time::Instant::now());
+        self.messages_published_revision = revision;
         let views =
             self.view_store
                 .iter()
@@ -5177,8 +5347,148 @@ impl App {
             let _ = self.native_runtime.dispatch(
                 *instance,
                 *view,
-                AppEvent::PackagesChanged { revision },
+                AppEvent::MessagesChanged { revision },
             );
+        }
+        let setting_views = views
+            .iter()
+            .map(|(_, view)| *view)
+            .collect::<std::collections::BTreeSet<_>>();
+        for ws in self.windows.values_mut() {
+            let shows_settings = ws.tab_set.tabs().iter().any(|tab| {
+                tab.root
+                    .leaves()
+                    .iter()
+                    .any(|view| setting_views.contains(view))
+            });
+            if shows_settings {
+                ws.last_present = None;
+                if let Some(window) = ws.os_window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// [`Self::publish_native_messages_state`] when it is DUE (design §4.2):
+    /// the center moved since the last publish and at least
+    /// [`MESSAGES_PUBLISH_MIN_GAP`] has passed — a downloading update
+    /// restates at the tailer's 10 Hz and the page repaints at 2 at most —
+    /// or [`MESSAGES_PUBLISH_TICK`] has passed while any Settings view is on
+    /// the Messages route, so `3 min ago` becomes `4 min ago` with nothing
+    /// posted. Run after every settle and on the way to every wait (the
+    /// route-gated per-park pattern of `sync_settings_consent_posture`); a
+    /// publish the gap holds back is re-armed through `messages_deadline`.
+    /// Costs one enum compare per window off the route, nothing with no
+    /// Settings instance.
+    pub(crate) fn publish_native_messages_state_if_due(&mut self, now: std::time::Instant) {
+        if self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .is_none()
+        {
+            return;
+        }
+        let since = self
+            .messages_last_publish
+            .map(|at| now.saturating_duration_since(at));
+        let moved = self.messages.revision() != self.messages_published_revision;
+        let due = match since {
+            None => true,
+            Some(since) if moved => since >= MESSAGES_PUBLISH_MIN_GAP,
+            Some(since) => since >= MESSAGES_PUBLISH_TICK && self.settings_view_on_messages(),
+        };
+        if due {
+            self.publish_native_messages_state();
+        }
+    }
+
+    /// The instant the next publish falls due, for the loop's deadline fold —
+    /// the twin of [`Self::publish_native_messages_state_if_due`]'s predicate,
+    /// so the loop is asked back for exactly what that park will do: the 2 Hz
+    /// hold-back of a publish the center's move earned, or, with the center
+    /// quiet, the [`MESSAGES_PUBLISH_TICK`] while any Settings view is on the
+    /// Messages route (design §4.2: `3 min ago` becomes `4 min ago` in a
+    /// window nobody touches — the loop is `Wait` when idle, so a tick nobody
+    /// arms never fires). `None` with no Settings instance to publish into,
+    /// or with the center quiet and no view on the route, so an idle band
+    /// still arms no wake (FL-1).
+    pub(crate) fn messages_publish_due_at(&self) -> Option<std::time::Instant> {
+        self.native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)?;
+        let gap = if self.messages.revision() != self.messages_published_revision {
+            MESSAGES_PUBLISH_MIN_GAP
+        } else if self.settings_view_on_messages() {
+            MESSAGES_PUBLISH_TICK
+        } else {
+            return None;
+        };
+        Some(
+            self.messages_last_publish
+                .map_or_else(std::time::Instant::now, |at| at + gap),
+        )
+    }
+
+    /// Whether any window's Settings view is on the Messages route right
+    /// now — the gate for the relative-time tick.
+    fn settings_view_on_messages(&self) -> bool {
+        self.view_store.iter().any(|(view, link)| {
+            matches!(link, crate::tab_model::View::Native(_))
+                && matches!(
+                    self.native_runtime.view_state(view),
+                    Some(crate::native_app::AppViewState::Settings(state))
+                        if state.route == crate::native_settings::SettingsRoute::Messages
+                )
+        })
+    }
+
+    /// Publish the shared packages projection to the Settings controller and
+    /// fan the revision out to every Settings view (the packages analogue of
+    /// [`Self::publish_native_update_state`]).
+    pub(crate) fn publish_native_packages_state(&mut self) {
+        let revision = self.native_packages_service.revision();
+        let state = self
+            .native_packages_service
+            .state(
+                self.config.packages_enabled(),
+                self.config.packages_auto_install(),
+                self.package_update_loop_running,
+            )
+            .with_machine_config(
+                self.config.machine_universal_control(),
+                self.config.machine_spotlight_noindex(),
+            )
+            .with_retired_switch_note(self.config.packages_retired_switch_note());
+        if !self
+            .native_runtime
+            .replace_settings_packages(state, revision)
+        {
+            return;
+        }
+        self.dispatch_to_settings_views(&AppEvent::PackagesChanged { revision });
+    }
+
+    /// Deliver `event` to every Settings view and repaint every window that shows one — the
+    /// fan-out after a shared Settings projection (packages, the log) was replaced.
+    fn dispatch_to_settings_views(&mut self, event: &AppEvent) {
+        let views =
+            self.view_store
+                .iter()
+                .filter_map(|(view, link)| match link {
+                    crate::tab_model::View::Native(native)
+                        if self.native_runtime.app(native.instance).is_some_and(|app| {
+                            app.kind() == crate::native_app::AppKind::Settings
+                        }) =>
+                    {
+                        Some((native.instance, view))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+        for (instance, view) in &views {
+            let _ = self
+                .native_runtime
+                .dispatch(*instance, *view, event.clone());
         }
         let setting_views = views
             .iter()
@@ -5301,7 +5611,7 @@ impl App {
             CheckStart::Joined(_) => UpdateOutcome::Accepted,
             CheckStart::Rejected(block) => match block {
                 CheckBlock::Disabled => UpdateOutcome::Failed {
-                    message: "automatic updates are disabled on this build".to_string(),
+                    message: "aterm updates itself on macOS only".to_string(),
                 },
                 CheckBlock::UpdateAlreadyStaged => UpdateOutcome::Blocked {
                     reasons: vec!["A verified update is already ready to install".to_string()],
@@ -5315,12 +5625,7 @@ impl App {
             },
             CheckStart::Start(ticket) => {
                 self.publish_native_update_state();
-                let (owner, repo) = self
-                    .config
-                    .update
-                    .as_ref()
-                    .map(|update| (update.owner.clone(), update.repo.clone()))
-                    .unwrap_or((None, None));
+                let provider = crate::update_control::check_settings_provider(proxy.clone());
                 let snapshot = self.native_updater_service.snapshot();
                 let build = snapshot.current_build;
                 let spawn = std::thread::Builder::new()
@@ -5329,9 +5634,7 @@ impl App {
                         // QoS (port of 61a6c8b62): a network update probe;
                         // nobody at the keyboard is blocked on its answer.
                         crate::qos::set_self(crate::qos::Role::Background);
-                        let source =
-                            aterm_update::Source::resolve(owner.as_deref(), repo.as_deref());
-                        let status = aterm_update::check_now(build, &source);
+                        let status = aterm_update::check_now_with_settings(build, &provider);
                         let _ = proxy.send_event(Wake::NativeUpdateFinished {
                             ticket,
                             status: durable_update_status(status),
@@ -5467,154 +5770,6 @@ impl App {
         lapsed
     }
 
-    /// Start the ONE provenance-repair measurement, off the event loop.
-    ///
-    /// The measurement is a probe write plus a handful of attribute reads and one walk of
-    /// a ten-file bundle — small, but it is filesystem work and it publishes into a mutex
-    /// the GUI thread only ever `try_lock`s, so it belongs on a thread of its own. It runs
-    /// at most once per process ([`crate::provenance_repair::RepairPosture`]), and a
-    /// thread that will not spawn settles the latch rather than leaving it Measuring for
-    /// ever.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn spawn_provenance_repair_probe(&mut self) {
-        if !self.provenance_repair.begin_measuring() {
-            return;
-        }
-        let slot = std::sync::Arc::clone(&self.provenance_repair_verdict);
-        let successor = crate::provenance_repair::same_image_successor();
-        let spawned = std::thread::Builder::new()
-            .name("aterm-provenance-repair".to_string())
-            .spawn(move || {
-                // Pure background measurement: a probe write, a few attribute reads and
-                // one walk of a ten-file bundle. Nothing waits on it — the GUI thread
-                // only ever `try_lock`s the slot — so it takes the lowest band.
-                crate::qos::set_self(crate::qos::Role::Background);
-                let facts = crate::provenance_repair::measure_repair_facts(successor);
-                let refusal = crate::provenance_repair::repair_refusal(facts);
-                if let Ok(mut slot) = slot.lock() {
-                    *slot = Some(refusal);
-                }
-            });
-        if spawned.is_err() {
-            self.provenance_repair.settle();
-        }
-    }
-
-    /// Offer a provenance self-repair when one is earned and every gate agrees.
-    ///
-    /// Called from the event loop's existing fold, AFTER the auto-apply poll, so a real
-    /// staged update always gets the tick first and a repair only ever runs on a tick
-    /// where that lane already declined. Everything here refuses; nothing here forces.
-    ///
-    /// The verdict is consumed inside `apply_staged_update_now`, so a repair is attempted
-    /// at most once — but a gate that is merely BUSY (a keystroke inside the typing gap,
-    /// an updater mid-check) leaves the verdict intact and is retried on a later tick,
-    /// because those are the gates that exist to pick a good moment rather than to say
-    /// no. A gate that can never pass in this process settles the latch instead.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn try_provenance_self_repair(&mut self) {
-        // The cheap reads first: the verdict, then the facts that cost nothing.
-        if !self.provenance_repair.is_eligible() {
-            return;
-        }
-        // NOT AN UPDATE, BUT STILL A PROCESS REPLACEMENT — which is the thing this
-        // setting is actually about. A user who turned automatic replacement off does not
-        // get one, and never will in this process.
-        if !crate::app_config::update_auto_apply(&self.config)
-            || Self::relaunch_nudge_seam_suppresses_auto_apply()
-        {
-            self.provenance_repair.settle();
-            return;
-        }
-        // The seamless vetoes, through the same predicate the apply gate reads, so the
-        // repair cannot disagree with it: no seamless lane, no repair, ever.
-        if self.seamless_handoff_unavailable().is_some() {
-            self.provenance_repair.settle();
-            return;
-        }
-        // NOTHING TO FIGHT. A staged build, an apply in flight or a handoff already
-        // running all make the repair permanently ineligible: a real apply launches its
-        // successor through this same lane from this same clean bundle, and sheds the tag
-        // for free. Racing it would only cost the user a second freeze.
-        let snapshot = self.native_updater_service.snapshot();
-        // A STAGED build settles permanently: the real apply launches its successor
-        // through this same lane from this same clean bundle and sheds the tag for free,
-        // so a repair would only cost a second freeze.
-        if snapshot.staged.is_some() || self.update_handoff_in_flight() {
-            self.provenance_repair.settle();
-            return;
-        }
-        // `active` is the updater's ONE physical work ticket and a routine six-hourly
-        // CHECK holds it, so settling on it would let an unrelated check disable the
-        // repair for the life of the process. Transient: wait for the tick where the
-        // updater is quiet.
-        if snapshot.active.is_some() || self.auto_apply_intent.is_some() {
-            return;
-        }
-        // A repair needs a session to hand over: with none, the only admissible lane is
-        // the cold one, which execs in place and stays tracked. Transient — a window may
-        // open later — so the verdict is kept.
-        if self.pool.iter().count() == 0 {
-            return;
-        }
-        // A repair is background work nobody asked for, so it rides the AUTOMATIC lane —
-        // declared once here and carried to the apply below, so the gate and the attempt
-        // cannot disagree about which lane this is.
-        let mode = crate::native_updater_service::ApplyMode::Automatic;
-        // HANDS OFF THE KEYS: the typing-gap refusal, checked exactly as
-        // `apply_native_update` checks it, and — like it — only on an automatic lane
-        // (`consent_warmup::tests::a_manual_apply_is_never_held` pins that shape).
-        // Transient by construction: a gap between keystrokes arrives on a later tick.
-        if mode.is_automatic() && !self.update_apply_hands_off_keys(std::time::Instant::now()) {
-            return;
-        }
-        // The expensive gates last, BOTH of them and in the order every other apply lane
-        // runs them: the reducer-owned shutdown barrier first, then the counting
-        // preflight. Quiet visibility because nobody asked for this — no tab switch, no
-        // focus steal, no recovery palette. Running only the second one would have made
-        // the repair the one lane that skips the barrier.
-        // The barrier's verdict decides whether the counting preflight runs at all —
-        // the same shape `apply_native_update` uses, so a reducer that answers "unsaved
-        // work" blocks the repair exactly as it blocks an update.
-        let (preflight, token) = match self.prepare_all_native_shutdown(
-            crate::native_app::CloseScope::Relaunch,
-            crate::app_tabs::ClosePreflightVisibility::Quiet,
-        ) {
-            Ok(true) => self.native_update_close_preflight(),
-            _ => (ClosePreflight::Blocked(Vec::new()), None),
-        };
-        let Some(token) = token.filter(|_| matches!(preflight, ClosePreflight::Ready)) else {
-            // SETTLE, rather than re-running the barrier on every later tick. A close
-            // preflight that is not Ready means something in the app is holding a
-            // document or a dialog, which is a state a person resolves on their own
-            // schedule — and this is optional background work with no deadline. One
-            // attempt, then leave them alone; the next update repairs it anyway.
-            aterm_log::info!(
-                "provenance self-repair: not attempted — the close preflight is not ready"
-            );
-            self.provenance_repair.settle();
-            return;
-        };
-        aterm_log::info!(
-            "provenance self-repair: this process is provenance-tracked and the bundle it \
-             runs from is clean — asking to be relaunched from it so the successor, and \
-             every shell it opens, is not tracked"
-        );
-        if let Err(error) = self.apply_staged_update_now(
-            token,
-            mode,
-            None,
-            Some(crate::app_update_handoff::SameImageHandoff::ProvenanceRepair),
-        ) {
-            // Every refusal below the request is terminal for this process: the verdict
-            // was consumed on the way in, so this is said once and never retried. Settled
-            // again here as belt and braces, so no future edit to the authority
-            // derivation can resurrect an unbounded retry.
-            self.provenance_repair.settle();
-            aterm_log::info!("provenance self-repair: not attempted — {error}");
-        }
-    }
-
     /// Authenticate the staged candidate OFF the GUI thread and OUTSIDE the
     /// parked window, caching the verdict for the next handoff attempt.
     ///
@@ -5728,22 +5883,43 @@ impl App {
     }
 
     /// The close-preflight blocker for unsaved native-app (editor / Settings)
-    /// work. Says what the update is waiting for — never "before relaunching":
-    /// the apply is in place and the shells keep running.
+    /// work — the one blocker a person can clear, so it is also the update
+    /// row's words ([`Self::update_blocker_for_person`]): what to do, point
+    /// first. Never "before relaunching": the install is in place.
     pub(crate) const UNSAVED_NATIVE_WORK_BLOCKS_APPLY: &'static str =
-        "Review or discard unsaved native-app work before the update can apply";
-    /// The close-preflight blocker while session restore / adoption is in flight.
+        "Save or close the open editor to finish updating";
+    /// The close-preflight blocker while session restore / adoption is in flight
+    /// — it clears by itself.
     pub(crate) const RESTORE_IN_FLIGHT_BLOCKS_APPLY: &'static str =
-        "Wait for session restore to finish before the update applies";
+        "Updating after session restore finishes";
     /// The `InstalledNeedsRelaunch` outcome's sentence: the bundle on disk is
-    /// already the newer build. Activation has its own admission and automatic
-    /// policy, so installation alone cannot promise when it will run.
+    /// already the newer build. Switching to it has its own admission and
+    /// automatic policy, so installation alone cannot promise when it will run.
     pub(crate) const INSTALLED_ACTIVATES_IN_PLACE: &'static str =
-        "The update is already on disk; activation is pending — your shells keep running";
+        "The update is installed; aterm switches to it in place";
+
+    /// The update row for a close-preflight refusal the PERSON can clear —
+    /// unsaved editor or Settings work, a document checkpoint that failed —
+    /// or `None` when every reason clears by itself (a checkpoint still
+    /// running, a restore landing), which is the lane's to wait out without a
+    /// word. The reasons are this file's own (`native_update_close_preflight`,
+    /// the shutdown preflight's [`Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY`]).
+    pub(crate) fn update_blocker_for_person(reasons: &[String]) -> Option<&'static str> {
+        reasons
+            .iter()
+            .any(|reason| {
+                reason == Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY
+                    || reason.starts_with(SETTINGS_DRAFTS_BLOCK)
+                    || reason.starts_with(DIRTY_DOCUMENTS_BLOCK)
+                    || reason.starts_with(FAILED_CHECKPOINTS_BLOCK)
+            })
+            .then_some(Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY)
+    }
 
     /// `true` while the `ATERM_DEBUG_RELAUNCH_NUDGE` screenshot seam is
     /// suppressing the automatic update lane — and it SAYS SO, once per process,
-    /// the first time either the arm or the poll asks.
+    /// the first time either the arm or the poll asks. A DEVELOPMENT SEAM
+    /// (`aterm_types::dev_seam!`, 2026-09-23): a shipped binary never reads it.
     ///
     /// The seam seeds a fake `Wake::UpdateStaged` so the update-ready nudge can be
     /// captured with `ctl image` without waiting for a real background stage, and
@@ -5758,7 +5934,7 @@ impl App {
     pub(crate) fn relaunch_nudge_seam_suppresses_auto_apply() -> bool {
         static SEAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *SEAM.get_or_init(|| {
-            let on = std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_some();
+            let on = aterm_types::dev_seam!("ATERM_DEBUG_RELAUNCH_NUDGE").is_some();
             if on {
                 aterm_log::warn!(
                     "$ATERM_DEBUG_RELAUNCH_NUDGE is set: this is the QA/screenshot \
@@ -5846,7 +6022,7 @@ impl App {
                     Some(ladder) => aterm_log::info!(
                         "update auto-apply re-armed for build {build} ({}…): {} s since it \
                          was first armed, in the {} phase; the bound still counts from that \
-                         first arming (it lands no later than {} s after it)",
+                         first arming (it stops waiting {} s after it)",
                         &digest[..digest.len().min(12)],
                         now.saturating_duration_since(ladder.armed_at).as_secs(),
                         crate::native_update_auto_intent::apply_phase(
@@ -5857,12 +6033,15 @@ impl App {
                     ),
                     None => aterm_log::info!(
                         "update auto-apply armed for build {build} ({}…): lands at the first \
-                         quiet moment, and no later than {} s after arming whatever the \
-                         terminal is doing (idle preferred for {} s, then a gap in output, \
-                         then a gap in typing, then unconditionally)",
+                         quiet moment, and stops waiting {} s after arming whatever the \
+                         terminal is doing (idle preferred for {} s, then a gap in output \
+                         until {} s, then a gap in typing, then unconditionally)",
                         &digest[..digest.len().min(12)],
                         crate::native_update_auto_intent::LANDS_WITHIN.as_secs(),
-                        crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE.as_secs()
+                        crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE.as_secs(),
+                        (crate::native_update_auto_intent::PREFER_IDLE_WINDOW
+                            + crate::native_update_auto_intent::PREFER_OUTPUT_GAP_WINDOW)
+                            .as_secs()
                     ),
                 }
                 self.auto_apply_intent = Some(crate::AutoApplyIntent {
@@ -5872,9 +6051,9 @@ impl App {
                     attempts: 0,
                 });
                 // The status bar's "applies in place within ~2 min" was a POLICY line
-                // when the Staged report painted it; now it is an armed fact (or,
-                // under `ATERM_NO_SEAMLESS_UPDATE`, the line that says nothing applies
-                // while a terminal is open) — re-state it while the bar is still up.
+                // when the Staged report painted it; now it is an armed fact (or, where
+                // the handoff is unavailable, the line that says nothing applies while
+                // a terminal is open) — re-state it while the bar is still up.
                 self.restate_staged_bar_posture(build);
                 true
             }
@@ -5917,9 +6096,9 @@ impl App {
         self.automatic_apply_phase(now).max(floor)
     }
 
-    /// The four facts about the terminal the ladder reads, sampled at `now`.
-    /// The keystroke gate (and the warm-up hold it folds) is consulted only on
-    /// an automatic lane; an explicit apply never reads it and parks at once.
+    /// The facts about the terminal the ladder reads, sampled at `now`. The
+    /// keystroke gate and the warm-up hold are consulted only on an automatic
+    /// lane; an explicit apply never reads them and parks at once.
     pub(crate) fn automatic_activity_facts(
         &self,
         mode: ApplyMode,
@@ -5930,6 +6109,7 @@ impl App {
             hands_off_keys: mode.is_automatic() && self.update_apply_hands_off_keys(now),
             output_quiet: self.automatic_update_output_quiet(now),
             focused: self.any_os_window_focused(),
+            consent_warmup: mode.is_automatic() && self.update_apply_warmup_holds(now),
         }
     }
 
@@ -5947,7 +6127,7 @@ impl App {
         ladder.announced = phase;
         aterm_log::info!(
             "update auto-apply for build {}: {} s since arming with no landing; now waiting \
-             for {} (it lands no later than {} s after arming)",
+             for {} (it stops waiting {} s after arming)",
             ladder.build,
             ladder.armed_at.elapsed().as_secs(),
             phase.waits_for(),
@@ -5970,8 +6150,8 @@ impl App {
         let deadline_ready = now >= intent.retry_at;
         let phase = self.automatic_apply_phase(now);
         self.announce_apply_phase(phase);
-        // A PROVENANCE REPAIR COUNTS AS WORK. Without this a real stage arriving while a
-        // repair handoff is in flight would reach `apply_staged_update_now` and be told
+        // A SAME-IMAGE HANDOFF COUNTS AS WORK. Without this a real stage arriving while the
+        // QA seam's handoff is in flight would reach `apply_staged_update_now` and be told
         // "an update handoff is already in flight" — a FAILURE that spends retry budget.
         // Counted as work instead, it answers `Wait(WorkActive)`: intent retained, no
         // budget spent, re-polled shortly. A no-op for real handoffs, which already set
@@ -6084,6 +6264,17 @@ impl App {
                 "automatic update retained exact intent after a deferral in {attempt_phase:?}: \
                  {reason}"
             );
+            // Past the output gap only the person's typing holds it: the flow
+            // row says so (words only — a repaint, never a row, so it is not
+            // itself activity), and the one-minute bound still stands behind it.
+            if attempt_phase == ApplyPhase::KeysOnly
+                && reason == crate::native_update_auto_intent::TYPING_REFUSAL
+            {
+                // A restatement of the flow row: it syncs the band and repaints
+                // itself, and says nothing when the row already says it.
+                let _ = self
+                    .restate_update_flow_holds(intent.build, crate::update_words::Holds::Typing);
+            }
             return;
         }
         intent.attempts = intent.attempts.saturating_add(1);
@@ -6096,10 +6287,13 @@ impl App {
         });
         match (disposition, outcome) {
             (AttemptDisposition::Complete, UpdateOutcome::Accepted) => {
-                // A successful replacement never returns. Accepted here can only be a
-                // joined in-flight request, whose owner now owns completion/recovery.
+                // A successful replacement never returns. Accepted here means the
+                // successor is LAUNCHING (or a joined in-flight request's owner now
+                // owns completion/recovery) — a start, not a landing; the landing is
+                // its own line at Commit (`finish_update_handoff`).
                 aterm_log::info!(
-                    "update auto-apply accepted for build {} after {} attempt(s)",
+                    "update auto-apply started for build {} (new process launching; \
+                     attempt {})",
                     intent.build,
                     intent.attempts
                 );
@@ -6236,11 +6430,13 @@ impl App {
                 // owed here too now that admission refusals route through this
                 // lane (2026-09-01): the refusal is synchronous, so it runs
                 // inside the Staged bar's hold with the automatic promise
-                // ("applies by itself at the next quiet moment") possibly still
-                // on screen while the gate's posture says the lane is off. Recompute the posture onto the bar; for
+                // ("installs within a minute") possibly still on screen while
+                // the gate's posture says the lane is off. Recompute the posture onto the bar; for
                 // an ordinary close-preflight block the posture is unchanged
-                // and this is a no-op restatement.
-                self.restate_staged_bar_posture(intent.build);
+                // and this is a no-op restatement — except that unsaved editor
+                // work holding it is named on the flow row, not the minute the
+                // lane cannot keep until the person saves.
+                self.restate_blocked_update_bar(intent.build, &reasons);
                 if intent.attempts == 1 {
                     // The FIRST block of an intent is always logged (the pill below
                     // stays gated on `announce`, which is the UI's business): a
@@ -6270,22 +6466,17 @@ impl App {
                         reasons.join(" · "),
                         PREFLIGHT_BLOCK_COOLDOWN.as_secs()
                     );
-                    // The LOG says it every cooldown; the UI says it once. A log
-                    // line is pull, a pill is push.
-                    aterm_log::warn!("{message}");
+                    // The LOG says it at WARN once per artifact and at debug on
+                    // every later cooldown — at one probe a minute, a warning each
+                    // time would be sixty lines an hour for one unsaved Settings
+                    // draft. The UI says it once, and only when it is the
+                    // person's to clear (an unsaved editor): a lane re-probing on
+                    // its own posts no row — the flow row says it is still on it.
                     if first_exhaustion {
-                        // THE OLD PILL WAS A LIE ABOUT A STATE THAT NO LONGER
-                        // EXISTS. "Update paused — manual retry" told the user the
-                        // automatic lane had given up and that clicking was now
-                        // the only way out; neither half is true. Say the two
-                        // things a user can act on: it comes back by itself, and
-                        // there is a control that does it right now.
-                        self.note_update_outcome(
-                            '\u{2191}',
-                            "Update waiting",
-                            "retries on its own, or use the Version menu",
-                            crate::status_bars::Tone::Info,
-                        );
+                        aterm_log::warn!("{message}");
+                        self.note_update_blockers(&reasons, true);
+                    } else {
+                        aterm_log::debug!("{message}");
                     }
                 }
             }
@@ -6430,9 +6621,9 @@ impl App {
                     // The label used to say "manual retry required" even when
                     // `retry_at` had just scheduled another automatic attempt —
                     // it described the exhausted case for all of them. The label
-                    // now names which of the three schedules answered, and the
-                    // PILL (which is the part a user sees) is chosen by
-                    // `physical_failure_deserves_a_pill` from the same budget.
+                    // now names which of the three schedules answered; the glass
+                    // says nothing while one is scheduled (the flow row does), and
+                    // names the Version menu once they are spent.
                     match schedule {
                         PhysicalFailureSchedule::Retry(_) => "automatic · retrying later",
                         PhysicalFailureSchedule::StandDown(_) => {
@@ -6614,6 +6805,13 @@ impl App {
             durable,
             installed,
         } = facts;
+        // When the last check completed, whoever ran it (Settings says "Checked 12 min ago").
+        if self
+            .native_updater_service
+            .note_checked_at(durable.as_ref().and_then(|durable| durable.checked_at))
+        {
+            self.publish_native_update_state();
+        }
         let build = self.native_updater_service.snapshot().current_build;
         // THE INSTALLED BUNDLE OUTRANKS A STAGED DOWNLOAD once it is newer than this
         // process (the activation lane below): a downloaded stage still in memory is
@@ -6965,7 +7163,7 @@ impl App {
             ApplyPreflightStart::Joined(_) => return UpdateOutcome::Accepted,
             ApplyPreflightStart::Disabled => {
                 return UpdateOutcome::Blocked {
-                    reasons: vec!["Automatic updates are disabled on this build".to_string()],
+                    reasons: vec!["aterm updates itself on macOS only".to_string()],
                 };
             }
             ApplyPreflightStart::NotStaged => {
@@ -7159,8 +7357,8 @@ impl App {
     ///     these exact bytes until a strictly newer build ships or the app
     ///     relaunches. Nine failures across three independent epochs and ~14 hours
     ///     is evidence about the artifact, not about the machine's afternoon, and
-    ///     the user is told once (see
-    ///     [`App::physical_failure_deserves_a_pill`]) instead of every 40 minutes
+    ///     the user is told once, when the retries are spent
+    ///     (`App::react_to_update_apply_outcome`), instead of every 40 minutes
     ///     forever. A shape that proved more converges sooner; one that proved
     ///     less — [`PhysicalFailureShape::Unexplained`] — converges in between.
     ///
@@ -7242,64 +7440,6 @@ impl App {
             // [`PHYSICAL_RETRY_BUDGET_REPLENISH`] is what guarantees that).
             None => PhysicalFailureSchedule::StandDown(now + PHYSICAL_FAILURE_EPOCH_COOLDOWN),
         }
-    }
-
-    /// Whether a physical apply failure for `staged_build` is one of the two the
-    /// user is told about, or one of the ones that pass in silence.
-    ///
-    /// Owner instruction: do not notify a user on a schedule for a failure that is
-    /// not going to fix itself. The physical lane can cost nine failures before it
-    /// converges, and painting "↑ Update delayed — retries on its own" on each of
-    /// them is a pill every ~40 minutes for most of a day, describing a state the
-    /// user cannot do anything about — the lane is already coming back by itself.
-    ///
-    /// So the same shape the preflight-block lane already proved: THE LOG SAYS IT
-    /// EVERY TIME, THE UI SAYS IT TWICE.
-    ///   * the FIRST physical failure for these bytes — something visibly did not
-    ///     happen, and one pill is how the user learns the lane exists;
-    ///   * convergence — which does not come through here at all, because a
-    ///     converged artifact has `retry_at: None` and takes
-    ///     `surface_update_apply_outcome`'s "see Version menu" branch, the one
-    ///     that names a control the user can actually press.
-    ///
-    /// Everything between the two is quiet.
-    ///
-    /// Answering `true` for an artifact with no physical record is deliberate:
-    /// activity-revoked latches and the fail-safe policy-mismatch arm keep their
-    /// existing single pill, since neither spends this budget.
-    ///
-    /// THE FRESHNESS TERM IS NOT DECORATION — it is what keeps the suppression
-    /// pointed at the automatic lane. Only the lanes that spend the budget
-    /// (`finish_native_auto_apply_attempt` and the automatic completions) call
-    /// [`Self::spend_physical_failure_budget`] IMMEDIATELY before surfacing, so
-    /// for them the record is microseconds old. A PERSON's failure — the Version
-    /// menu, the palette, or an `aterm-ctl update apply` control request — spends
-    /// nothing, so it inherits a mid-budget record that is at least one retry
-    /// interval old and speaks: a person who just asked for something is exactly
-    /// who should be told it did not happen. The physical schedule's own minimum
-    /// spacing is 600 s, so any window far below that separates the two without a
-    /// new plumbing parameter.
-    ///
-    /// THAT SENTENCE WAS FALSE UNTIL THE COMPLETION PATH CARRIED ITS `ApplyMode`.
-    /// A person's RETURNED handoff (not the submission-time failures this prose was
-    /// written against) went through the same reduction as a background one, spent
-    /// the budget microseconds before surfacing, and was therefore silenced by the
-    /// very rule written to protect it. [`HandoffFailureLane`] is what makes the
-    /// premise true; the residual is a genuine coincidence window — a person whose
-    /// apply fails within `JUST_SPENT` of an automatic failure for the same bytes
-    /// still inherits a fresh record — which the automatic schedule's 600 s minimum
-    /// spacing makes rare and which no observation available here can separate.
-    pub(crate) fn physical_failure_deserves_a_pill(&self, staged_build: u64) -> bool {
-        /// How recently the physical budget must have been spent for this failure
-        /// to be the one that spent it. Three orders of magnitude under the 600 s
-        /// minimum retry spacing, so no real retry can be mistaken for "just now".
-        const JUST_SPENT: std::time::Duration = std::time::Duration::from_secs(5);
-
-        self.auto_apply_physical_retry
-            .filter(|retry| {
-                retry.build == staged_build && retry.last_attempt.elapsed() < JUST_SPENT
-            })
-            .is_none_or(|retry| retry.cycles <= 1)
     }
 
     /// Consume one activity-revoked overlap retry cycle for this exact artifact
@@ -7611,17 +7751,17 @@ impl App {
         let mut blockers = Vec::new();
         if settings_drafts > 0 {
             blockers.push(format!(
-                "Review Settings Drafts: {settings_drafts} Settings view(s) have unsaved text"
+                "{SETTINGS_DRAFTS_BLOCK} {settings_drafts} Settings view(s) have unsaved text"
             ));
         }
         if dirty_documents > 0 {
             blockers.push(format!(
-                "Checkpoint Drafts: {dirty_documents} document(s) have uncheckpointed edits"
+                "{DIRTY_DOCUMENTS_BLOCK} {dirty_documents} document(s) have uncheckpointed edits"
             ));
         }
         if failed_checkpoints > 0 {
             blockers.push(format!(
-                "Retry: {failed_checkpoints} document checkpoint(s) previously failed"
+                "{FAILED_CHECKPOINTS_BLOCK} {failed_checkpoints} document checkpoint(s) previously failed"
             ));
         }
         if pending_checkpoints > 0 {
@@ -7871,19 +8011,28 @@ impl App {
     }
 }
 
+/// The Check's fail-fast answer when a person's typed verb holds the store (pid `pid`).
+fn check_held_by_person_message(pid: u32) -> String {
+    format!(
+        "A package command running in a terminal (pid {pid}) is using the package store; \
+         check again when it finishes."
+    )
+}
+
 /// The failure sentence for one finished `atpkg` child of the Packages worker, or
 /// `None` when it succeeded — pure over the exit status, the argv and the child's
 /// stderr, so the classification is testable without a child.
 ///
-/// FAIL-FAST ON PURPOSE when another atpkg pass holds the store lock: a person
-/// clicked a button, and the worker never passes `--wait-lock` — a wait they cannot
-/// see is worse than a sentence they can act on. That refusal is classified by
-/// CODE now that atpkg reserves 75 (`EX_TEMPFAIL`) for contention (2026-09-10), and
-/// its sentence names the other installer rather than the lock file. The headline
-/// stays the operation's `failed_headline`: `PackagesCommandOutcome` is pinned to
-/// {none, success, failure} by the aterm-spec model
-/// (`models_native.rs` / `native_packages_conformance.rs`), so a distinct
-/// "deferred" outcome is a separate slice.
+/// CONTENTION: the Check runs the window's own pass argv (`--wait-lock`, Phase 3), so its
+/// 75 means a half-hour wait ran out; the worker answers it at once, before any spawn,
+/// only when a PERSON's typed verb holds the store. Every other verb still fails fast —
+/// a person clicked a button, and a wait they cannot see is worse than a sentence they
+/// can act on. Either refusal is classified by CODE (atpkg reserves 75, `EX_TEMPFAIL`,
+/// for contention, 2026-09-10), and its sentence names the other installer rather than
+/// the lock file; the offline code (69) says offline. The headline stays the operation's
+/// `failed_headline`: `PackagesCommandOutcome` is pinned to {none, success, failure} by
+/// the aterm-spec model (`models_native.rs` / `native_packages_conformance.rs`), so a
+/// distinct "deferred" outcome is a separate slice.
 fn packages_child_failure(
     result: Result<std::process::ExitStatus, &std::io::Error>,
     verb: &[String],
@@ -7905,6 +8054,18 @@ fn packages_child_failure(
                 "Nothing was installed: the registry served no package \
                  this machine can run. This is not a temporary error — \
                  retrying will not change it."
+                    .to_string(),
+            )
+        }
+        // The offline code: the pass ran and nothing answered — the index listing and every
+        // vendor channel. Not a fault of the store; said as what it is.
+        Ok(status)
+            if status.code()
+                == Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT)) =>
+        {
+            Some(
+                "Could not reach the package channels \u{2014} this Mac looks offline. The \
+                 installed packages are unchanged."
                     .to_string(),
             )
         }
@@ -8353,8 +8514,8 @@ pub(crate) fn packages_argv(request: &PackagesRequest) -> Vec<Vec<String>> {
             .iter()
             .map(|name| spell(&["install", name, "--elevate=osascript"]))
             .collect(),
-        // The [machine] host settings, now — the same pass every package pass runs
-        // first. No `--wait-lock`: the verb takes no store lock.
+        // The [machine] host settings, now — their own verb, which keeps them applied
+        // (a pass carries only an edit to them). No `--wait-lock`: it takes no store lock.
         PackagesRequest::MachineApply => vec![spell(&["machine", "apply"])],
     }
 }
@@ -8469,6 +8630,75 @@ mod packages_argv_tests {
             vec![s(&["machine", "apply"])],
             "no --wait-lock: the verb takes no store lock"
         );
+    }
+
+    /// THE CHECK IS THE WINDOW'S OWN PASS (Phase 3): the worker spawns the Check with the
+    /// lanes' argv (`pass_args(PassVerb::Update, …)`: `--wait-lock` with their bound and
+    /// `--progress-file`), the spawner's pid and the login shell's PATH — the orphan watch
+    /// and the progress file are armed by exactly those — and answers at once only when a
+    /// person's typed verb holds the store. Pinned by scrape: the spawn is inside the
+    /// worker thread, which a unit test cannot reach without a real child.
+    #[test]
+    fn the_settings_check_runs_the_windows_pass_argv() {
+        let src = include_str!("app_native.rs");
+        let start = src
+            .find("pub(crate) fn execute_native_packages(")
+            .expect("the worker");
+        let body = &src[start..start + src[start..].find("\n    }\n").unwrap()];
+        let gate = body.find("if check {").expect("the Check's own spawn");
+        let spawn = &body[gate..gate + 600];
+        // Match the exact call after removing formatting whitespace: rustfmt
+        // wraps this argument list across lines.
+        let compact: String = spawn.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(
+            compact.contains("crate::pass_args(crate::PassVerb::Update,layout.as_ref(),None,)"),
+            "Check uses the package lane's update argv: {spawn}"
+        );
+        for needle in [
+            "atpkg::cli::SPAWNER_PID_ENV",
+            "crate::spawn::atpkg_child_path()",
+        ] {
+            assert!(spawn.contains(needle), "{needle}: {spawn}");
+        }
+        let fail_fast = body
+            .find("atpkg::lock::person_holder")
+            .expect("the fail-fast rule");
+        assert!(fail_fast < gate, "decided before anything is spawned");
+        // …and RUN the lanes' way: its stdout streamed, not collected at exit.
+        let runs = body[gate..]
+            .find("crate::run_pass_child(&mut child, layout.as_ref(), false, &post)")
+            .map(|i| gate + i)
+            .expect("the Check runs through the lanes' child runner");
+        let collected = body
+            .find("let result = child.output();")
+            .expect("the other verbs");
+        assert!(
+            runs < collected,
+            "the Check leaves the loop before the collect-at-exit"
+        );
+        let args = crate::pass_args(crate::PassVerb::Update, None, None);
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsString::from("update"),
+                "--wait-lock".into(),
+                crate::ATPKG_WAIT_LOCK_SECS.to_string().into()
+            ],
+            "the lanes' own bound"
+        );
+        assert!(check_held_by_person_message(4242).contains("pid 4242"));
+    }
+
+    /// The offline code reads as what it is, never as a bare exit status.
+    #[cfg(unix)]
+    #[test]
+    fn an_offline_check_says_offline() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let code = i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT);
+        let status = std::process::ExitStatus::from_raw(code << 8);
+        let said =
+            packages_child_failure(Ok(status), &["update".to_string()], "").expect("not a success");
+        assert!(said.contains("offline"), "{said}");
     }
 
     /// The machine apply worker sorts the child's stdout: the `machine-settings:`
@@ -9860,6 +10090,50 @@ fn apply(c: &mut Command) {
             app.native_config_service.reconciliation_required(),
             "only an admitted disk generation may reopen the lane"
         );
+        // Two requests WERE lost, so the band says so — and says how many.
+        assert!(
+            app.has_live_message("2 queued changes were not written"),
+            "a failure that discarded queued work must say it did"
+        );
+    }
+
+    /// A hand-broken `aterm.toml` must be reported as what it is. The watcher
+    /// posts "not valid TOML" on the config lane's row and fences the lane; the
+    /// reconciliation sample then re-reads the same broken file and fails. With
+    /// NOTHING queued it used to post "queued changes were not written" anyway —
+    /// false — and, sharing the lane's key, that sentence REPLACED the true one on
+    /// the band (measured on a live dev build 2026-09-23: the row read
+    /// "Config reconciliation failed; queued changes were not written" with no
+    /// Settings edit anywhere in the session).
+    #[test]
+    fn a_failed_reconciliation_with_nothing_queued_leaves_the_true_row_standing() {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = false\n".to_string(),
+        )
+        .unwrap();
+        app.surface_native_config_lane_error(
+            "Config observation was not valid TOML: TOML parse error at line 2, column 19"
+                .to_string(),
+        );
+        assert!(app.native_config_pending.is_empty(), "nothing is queued");
+
+        app.fail_native_config_reconciliation(
+            "existing aterm.toml is not valid TOML: TOML parse error at line 2, column 19",
+        );
+
+        assert!(
+            !app.has_live_message("queued change"),
+            "nothing was queued, so nothing may be reported as lost"
+        );
+        assert!(
+            app.has_live_message("aterm.toml syntax error"),
+            "the row that names the real problem must survive the settle"
+        );
+        assert!(
+            app.native_config_service.reconciliation_required(),
+            "the fence still stands; only its false report is gone"
+        );
     }
 
     #[test]
@@ -10470,12 +10744,7 @@ fn apply(c: &mut Command) {
 
         assert!(!app.serious_mode_enabled());
         assert_eq!(app.config.serious_mode, Some(false));
-        assert!(app.config_notice.as_ref().is_some_and(|notice| {
-            notice
-                .lines
-                .iter()
-                .any(|line| line.contains("aterm.toml changed first"))
-        }));
+        assert!(app.has_live_message("aterm.toml changed first"));
     }
 
     #[test]
@@ -11179,6 +11448,8 @@ fn apply(c: &mut Command) {
 
     fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus {
         DurableUpdateStatus {
+            linux_host: false,
+            linux: None,
             enabled: true,
             current_build: 10,
             staged_build,
@@ -11200,6 +11471,7 @@ fn apply(c: &mut Command) {
             apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
+            checked_at: None,
         }
     }
 
@@ -11320,6 +11592,8 @@ fn apply(c: &mut Command) {
             7,
             7,
             Some(DurableUpdateStatus {
+                linux_host: false,
+                linux: None,
                 enabled: true,
                 current_build: app.native_updater_service.snapshot().current_build,
                 staged_build: Some(build),
@@ -11337,6 +11611,7 @@ fn apply(c: &mut Command) {
                 apply_failures_for_target: 0,
                 installable: true,
                 channel_unreadable: false,
+                checked_at: None,
             }),
             Some(InstalledUpdate {
                 build,
@@ -11445,12 +11720,15 @@ fn apply(c: &mut Command) {
         let mut app = App::headless_for_test();
         let running = app.native_updater_service.snapshot().current_build;
         let build = running + 1;
-        assert!(app.notice.is_none() && app.level_up.is_none() && app.relaunch.is_none());
+        assert!(app.level_up.is_none() && app.relaunch.is_none());
+        let rows_before = app.messages.live_rows().count();
         let facts = || {
             reconcile_facts_with_installed(
                 1,
                 1,
                 Some(DurableUpdateStatus {
+                    linux_host: false,
+                    linux: None,
                     enabled: true,
                     current_build: running,
                     staged_build: Some(build),
@@ -11468,6 +11746,7 @@ fn apply(c: &mut Command) {
                     apply_failures_for_target: 0,
                     installable: true,
                     channel_unreadable: false,
+                    checked_at: None,
                 }),
                 Some(installed_update(running)),
             )
@@ -11482,17 +11761,23 @@ fn apply(c: &mut Command) {
             Some(build),
             "PRECONDITION: the stage imported"
         );
-        // THE ANNOUNCEMENT IS THE STATUS BAR'S (2026-09-07): the updater's own
-        // `Staged` report paints the row, so the reconcile raises no floating
-        // card and no border glow — the surge is the upgrade's, and fires when
-        // the apply actually runs.
+        // THE ANNOUNCEMENT IS THE BAND'S (2026-09-07): the stage is the band's
+        // staged row, and nothing floats — the retired card is gone and no
+        // border glow is raised; the surge is the upgrade's, and fires when the
+        // apply actually runs.
+        let rows = |app: &App| {
+            app.messages
+                .live_rows()
+                .map(|l| (l.id, l.msg.title.clone()))
+                .collect::<Vec<_>>()
+        };
+        let announced = rows(&app);
         assert!(
-            app.notice.is_none(),
-            "a newly imported stage raises no floating card"
+            announced.len() <= rows_before + 1,
+            "one staged row at most: {announced:?}"
         );
         assert!(app.level_up.is_none(), "…and no stage-time glow");
         // The SAME stage again is not news.
-        app.notice = None;
         app.level_up = None;
         let mut again = facts();
         again.observation_sequence = 2;
@@ -11501,7 +11786,7 @@ fn apply(c: &mut Command) {
         };
         app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::StageAvailable, again);
         assert!(
-            app.notice.is_none() && app.level_up.is_none(),
+            rows(&app) == announced && app.level_up.is_none(),
             "a repeat import is quiet"
         );
     }
@@ -12318,14 +12603,14 @@ fn apply(c: &mut Command) {
     }
 
     /// Seamless seam 4 (retry spacing): an activity-revoked overlap schedules
-    /// exponentially spaced automatic re-attempts that SATURATE at 15 min and
-    /// never exhaust — activity is a delay, not a verdict. Genuine physical
-    /// failures keep their small, exhausting budget, and a preflight block keeps
-    /// its own much smaller one.
+    /// spaced automatic re-attempts that SATURATE at 30 s and never exhaust —
+    /// activity is a delay, not a verdict, and the spacing stays inside the
+    /// ladder's one-minute bound. Genuine physical failures keep their small,
+    /// exhausting budget, and a preflight block keeps its own much smaller one.
     #[test]
     fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
         use std::time::Duration;
-        let schedule = [2, 8, 30, 60, 120, 300, 600, 900];
+        let schedule = [2, 5, 10, 20, 30];
         assert_eq!(
             schedule.len(),
             usize::from(ACTIVITY_REVOKED_LADDER_RUNGS),
@@ -12344,10 +12629,14 @@ fn apply(c: &mut Command) {
         for cycles in [ACTIVITY_REVOKED_LADDER_RUNGS, 50, u8::MAX] {
             assert_eq!(
                 automatic_retry_delay(cycles, AutomaticRetryKind::ActivityRevoked),
-                Some(Duration::from_secs(900)),
+                Some(Duration::from_secs(30)),
                 "cycle {cycles}: the last rung, forever — never `None`"
             );
         }
+        assert!(
+            Duration::from_secs(30) < crate::native_update_auto_intent::LANDS_WITHIN,
+            "the saturated spacing fits inside the bound it serves"
+        );
         // The preflight budget is deliberately NOT widened: a blocked preflight
         // is a real ordering fault, not "the terminal was busy".
         assert_eq!(
@@ -12764,11 +13053,12 @@ fn apply(c: &mut Command) {
 
     /// THE SECOND FINDING OF THE 2026-09-21 LADDER AUDIT, as a dead mutant: a
     /// physical-failure latch lapsing used to clear the ladder's anchor, so one
-    /// transient dial timeout cost its 600 s latch PLUS a fresh fifteen-minute
-    /// ladder — on a never-quiet terminal, admitted at KeysOnly (~300 s), failed
-    /// at ~330 s, latched to ~930 s, then refused again until a NEW KeysOnly at
-    /// ~1230 s. The bound is per artifact and counts from the first arming; the
-    /// lapse re-arms the intent and resumes the ladder where the clock is.
+    /// transient dial timeout cost its 600 s latch PLUS a fresh ladder — on a
+    /// never-quiet terminal (then with a fifteen-minute ladder), admitted at
+    /// KeysOnly (~300 s), failed at ~330 s, latched to ~930 s, then refused
+    /// again until a NEW KeysOnly at ~1230 s. The bound is per artifact and
+    /// counts from the first arming; the lapse re-arms the intent and resumes
+    /// the ladder where the clock is.
     ///
     /// Driven through the real completion lane and the real re-arm (the Refresh
     /// reconcile's `arm_native_auto_apply`, which lapses the latch first).
@@ -12783,9 +13073,12 @@ fn apply(c: &mut Command) {
             app.arm_native_auto_apply(build, &digest),
             "PRECONDITION: automatic apply is enabled and armable for these bytes"
         );
-        // The incident's machine: admitted at KeysOnly, ~330 s after arming.
+        // The incident's machine: admitted at KeysOnly.
         let now = std::time::Instant::now();
-        let armed_at = now - std::time::Duration::from_secs(330);
+        let armed_at = now
+            - crate::native_update_auto_intent::PREFER_IDLE_WINDOW
+            - crate::native_update_auto_intent::PREFER_OUTPUT_GAP_WINDOW
+            - std::time::Duration::from_secs(1);
         app.auto_apply_ladder = Some(crate::AutoApplyLadder {
             build,
             armed_at,
@@ -12828,8 +13121,9 @@ fn apply(c: &mut Command) {
         );
 
         // The latch lapses. The wall clock is now past the bound measured from
-        // the FIRST arming (330 s + 600 s > 900 s): age the anchor with it and
-        // expire the deadline, then take the re-arm the Refresh reconcile takes.
+        // the FIRST arming (the 600 s latch alone outlasts the ladder): age the
+        // anchor with it and expire the deadline, then take the re-arm the
+        // Refresh reconcile takes.
         let now = std::time::Instant::now();
         let armed_at = now - LANDS_WITHIN - std::time::Duration::from_secs(30);
         app.auto_apply_ladder = Some(crate::AutoApplyLadder {
@@ -12853,13 +13147,13 @@ fn apply(c: &mut Command) {
         assert_eq!(
             app.auto_apply_ladder.map(|ladder| ladder.armed_at),
             Some(armed_at),
-            "THE MUTANT: a lapse that clears the anchor starts a second fifteen \
-             minutes for the same artifact"
+            "THE MUTANT: a lapse that clears the anchor starts a second ladder for \
+             the same artifact"
         );
         assert_eq!(
             app.automatic_apply_phase(now),
             ApplyPhase::Land,
-            "930 s after the first arming the lane is past its bound: the next poll \
+            "past the bound since the first arming the lane lands: the next poll \
              attempts whatever the terminal is doing, not a fresh PreferIdle"
         );
         assert_eq!(
@@ -12958,7 +13252,7 @@ fn apply(c: &mut Command) {
         );
         assert_eq!(
             app.arm_activity_revoked_overlap_retry(&download),
-            Some(std::time::Duration::from_secs(8)),
+            Some(std::time::Duration::from_secs(5)),
             "rung 2, still a download"
         );
 
@@ -12966,17 +13260,14 @@ fn apply(c: &mut Command) {
         // artifact identity — the ladder CONTINUES.
         assert_eq!(
             app.arm_activity_revoked_overlap_retry(&activation),
-            Some(std::time::Duration::from_secs(30)),
+            Some(std::time::Duration::from_secs(10)),
             "rung 3 across the flip — not a refilled `2s`"
         );
 
         for (cycle, want) in [
-            Some(std::time::Duration::from_secs(60)),
-            Some(std::time::Duration::from_secs(120)),
-            Some(std::time::Duration::from_secs(300)),
-            Some(std::time::Duration::from_secs(600)),
-            Some(std::time::Duration::from_secs(900)),
-            Some(std::time::Duration::from_secs(900)),
+            Some(std::time::Duration::from_secs(20)),
+            Some(std::time::Duration::from_secs(30)),
+            Some(std::time::Duration::from_secs(30)),
         ]
         .into_iter()
         .enumerate()
@@ -12988,12 +13279,12 @@ fn apply(c: &mut Command) {
             );
         }
         // What is pinned here is that the rungs are counted ACROSS the flip —
-        // nine attempts total, not eight per artifact identity — and that the
+        // six attempts total, not five per artifact identity — and that the
         // last rung repeats rather than ending anything.
         assert_eq!(
             app.auto_overlap_retry.map(|retry| retry.cycles),
             Some(ACTIVITY_REVOKED_LADDER_RUNGS + 1),
-            "nine attempts total, not eight per artifact identity"
+            "six attempts total, not five per artifact identity"
         );
         assert!(
             app.auto_overlap_retry.is_some_and(|retry| retry.activation),
@@ -13053,14 +13344,11 @@ fn apply(c: &mut Command) {
         });
         let expected = [
             Some(std::time::Duration::from_secs(2)),
-            Some(std::time::Duration::from_secs(8)),
+            Some(std::time::Duration::from_secs(5)),
+            Some(std::time::Duration::from_secs(10)),
+            Some(std::time::Duration::from_secs(20)),
             Some(std::time::Duration::from_secs(30)),
-            Some(std::time::Duration::from_secs(60)),
-            Some(std::time::Duration::from_secs(120)),
-            Some(std::time::Duration::from_secs(300)),
-            Some(std::time::Duration::from_secs(600)),
-            Some(std::time::Duration::from_secs(900)),
-            Some(std::time::Duration::from_secs(900)),
+            Some(std::time::Duration::from_secs(30)),
         ];
         for (cycle, want) in expected.into_iter().enumerate() {
             let got = app.arm_activity_revoked_overlap_retry(&ticket);
@@ -13204,6 +13492,8 @@ fn apply(c: &mut Command) {
             app.native_updater_service.finish_check(
                 ticket,
                 DurableUpdateStatus {
+                    linux_host: false,
+                    linux: None,
                     enabled: true,
                     current_build,
                     staged_build: Some(build),
@@ -13221,6 +13511,7 @@ fn apply(c: &mut Command) {
                     apply_failures_for_target: 0,
                     installable: true,
                     channel_unreadable: false,
+                    checked_at: None,
                 },
             ),
             CheckCompletion::Reduced,
@@ -13276,6 +13567,8 @@ fn apply(c: &mut Command) {
                     11,
                     11,
                     Some(DurableUpdateStatus {
+                        linux_host: false,
+                        linux: None,
                         enabled: true,
                         current_build: app.native_updater_service.snapshot().current_build,
                         staged_build: Some(build),
@@ -13293,6 +13586,7 @@ fn apply(c: &mut Command) {
                         apply_failures_for_target: 0,
                         installable: true,
                         channel_unreadable: false,
+                        checked_at: None,
                     }),
                     Some(InstalledUpdate {
                         build,
@@ -13555,7 +13849,7 @@ fn apply(c: &mut Command) {
         let current = app.native_updater_service.snapshot().current_build;
         stage_one_build_for_test(&mut app, current + 4_913);
         let before = aterm_update::status(current).unwrap();
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.clear_messages_for_test();
 
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
@@ -13665,7 +13959,7 @@ fn apply(c: &mut Command) {
             "PRECONDITION: the staged build armed automatic intent"
         );
 
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.clear_messages_for_test();
         spend_one_preflight_block_budget(&mut app);
         // THE FIRST BUDGET IS ALREADY THREE PROBES. Even before the cooldown
         // schedule is reached, none of them may have taken the screen.
@@ -13693,20 +13987,25 @@ fn apply(c: &mut Command) {
              cadence (got {cooldown:?})"
         );
 
-        // The ONE pill. Its wording has to survive too: the old text asserted the
-        // automatic lane had given up, which is now false.
+        // The ONE row, and it names the one thing the person can do (ruling
+        // 143): the lane comes back by itself, so it says nothing about itself.
         let pill = app
             .update_row_text()
             .expect("the first exhaustion tells the user once");
-        assert!(
-            pill.contains("retries on its own"),
-            "the pill must say the lane comes back by itself, got {pill:?}"
+        assert_eq!(
+            pill,
+            format!(
+                "{} \u{2014} {}",
+                crate::app_update_screen::UPDATE_WAITS_FOR_YOU,
+                App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY
+            ),
+            "the row must name the blocker the person can clear"
         );
 
         // SECOND ROUND. Each further attempt costs exactly ONE probe (not three)
         // and must add nothing to the screen.
         for round in 0..4 {
-            app.status_bars = crate::status_bars::StatusBars::default();
+            app.clear_messages_for_test();
             force_auto_apply_attempt_now(&mut app);
             app.try_pending_native_auto_apply(false);
             let again = app
@@ -13727,11 +14026,12 @@ fn apply(c: &mut Command) {
                 "round {round}: still spaced by the cooldown"
             );
             assert!(
-                app.update_row_text().is_none(),
+                app.update_row_text().is_none() && app.update_record_text().is_none(),
                 "round {round}: THE NAG. The user was already told once; telling \
                  them again on a two-hour schedule is the regression this test exists \
-                 for (got {:?})",
-                app.update_row_text()
+                 for (got {:?} / {:?})",
+                app.update_row_text(),
+                app.update_record_text()
             );
             // THE OTHER HALF OF THE NAG, and the half no `notice` assertion can
             // ever see: the pill is one-shot, but the tab switch / focus theft /
@@ -13747,10 +14047,11 @@ fn apply(c: &mut Command) {
         // THE SCOPE OF WHAT THIS BLOCK PROVES, because the previous version of it
         // claimed more. It shows the AUTHORIZATION, by two witnesses that a
         // `Blocked` outcome cannot fake:
-        //   * the pill. `Blocked` paints "Update waiting"; only
-        //     `UpdateOutcome::Failed` reaches the "Update delayed" arm, and the
-        //     close preflight cannot produce `Failed` for a declining reducer (it
-        //     produces `Blocked`; only a reducer ERROR is `Failed`, and there is
+        //   * the receipt. The refusal the attempt records is the ADMISSION
+        //     gate's ("Update kept …"), which only an attempt that got past the
+        //     close preflight can reach — a `Blocked` preflight records its own
+        //     blocker, and the close preflight cannot produce `Failed` for a
+        //     declining reducer (only a reducer ERROR is `Failed`, and there is
         //     none here — the reducer answered cleanly for four rounds above);
         //   * the SCHEDULING SHAPE. `Blocked` retains the intent and installs no
         //     latch; the physical lane does the exact opposite. This is the pair
@@ -13770,7 +14071,7 @@ fn apply(c: &mut Command) {
              binary instead of returning"
         );
         discard_settings_drafts(&mut app, settings);
-        app.status_bars = crate::status_bars::StatusBars::default();
+        app.clear_messages_for_test();
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
 
@@ -13817,8 +14118,8 @@ fn apply(c: &mut Command) {
     ///
     /// Deleting the recovery surface outright would satisfy every "nothing moved"
     /// assertion in the lane test above, so this pins that the surface is intact
-    /// where it belongs — on the lane a person actually asked for, which is also
-    /// the lane the exhaustion pill sends them to ("or use the Version menu").
+    /// where it belongs — on the lane a person actually asked for (the Version
+    /// menu's "Install aterm vX now").
     #[test]
     fn an_automatic_probe_is_silent_while_a_person_s_apply_still_surfaces_recovery() {
         let mut app = App::headless_for_test();
@@ -14047,13 +14348,13 @@ fn apply(c: &mut Command) {
         // is what marched the field machine to failing_applies=23 and, at nine,
         // would have retired the automatic lane outright.)
         discard_settings_drafts(&mut app, settings);
-        app.notice = None;
+        let row_before = app.update_row_text();
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
-        assert!(
-            app.notice.is_none(),
-            "a refused re-probe past the exhaustion pill paints nothing: {:?}",
-            app.update_row_text()
+        assert_eq!(
+            app.update_row_text(),
+            row_before,
+            "a refused re-probe past the exhaustion row paints nothing new"
         );
         // WHICH GATE REFUSED IS PART OF THE PREMISE, not decoration. The fixture's
         // candidate carries a PASSED pre-park verification, so a real attempt is
@@ -14107,7 +14408,6 @@ fn apply(c: &mut Command) {
         // genuinely re-ATTEMPTED — rather than merely re-reading its struct —
         // is the monotone `attempts` counter advancing across the gate.
         let attempts_before = after_gate.attempts;
-        app.notice = None;
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
         let re_probed = app
@@ -14163,7 +14463,6 @@ fn apply(c: &mut Command) {
         // This call IS the `(Some(attempt), None)` arm of
         // `reduce_returned_handoff_completion`; the mode-to-lane classification that
         // wraps it is proven in `app_update_handoff.rs`.
-        app.notice = None;
         let returned = app.abort_reaped_native_apply_before_reconcile(
             &attempt,
             "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
@@ -14194,6 +14493,8 @@ fn apply(c: &mut Command) {
             9,
             9,
             Some(DurableUpdateStatus {
+                linux_host: false,
+                linux: None,
                 enabled: true,
                 current_build: app.native_updater_service.snapshot().current_build,
                 staged_build: Some(build),
@@ -14211,6 +14512,7 @@ fn apply(c: &mut Command) {
                 apply_failures_for_target: 0,
                 installable: true,
                 channel_unreadable: false,
+                checked_at: None,
             }),
             Some(InstalledUpdate {
                 build,
@@ -14347,7 +14649,7 @@ fn apply(c: &mut Command) {
     }
 
     /// EVERY PHYSICAL LANE SHARES ONE BUDGET, THE BUDGET RUNS OUT, AND THE USER IS
-    /// TOLD TWICE — NOT NINE TIMES AND NOT FOREVER.
+    /// TOLD ONCE — WHEN IT HAS — NOT NINE TIMES AND NOT FOREVER.
     ///
     /// Three independent things are pinned here because each of them shipped
     /// broken in a different round:
@@ -14365,8 +14667,9 @@ fn apply(c: &mut Command) {
     ///   * and the user-visible half: every one of those failures painted
     ///     "Update delayed — retries on its own". That is a notification on a
     ///     SCHEDULE for a condition the user cannot act on. Owner instruction: the
-    ///     transient lane retries quietly. Exactly two pills, and the second one
-    ///     names a control.
+    ///     transient lane retries quietly (2026-09-23: automatic retries post no
+    ///     row at all — the flow row says the lane is on it). Exactly one row,
+    ///     when the lane is out of retries, and it names a control.
     ///
     /// The pill is surfaced here the way the production caller does it
     /// (`app_update_handoff.rs`: `surface_update_apply_outcome("automatic handoff",
@@ -14392,7 +14695,7 @@ fn apply(c: &mut Command) {
         let mut pills = Vec::new();
         for _ in 0..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) {
             ticket.make_current_apply_for_test(&mut app.native_updater_service);
-            app.status_bars = crate::status_bars::StatusBars::default();
+            app.clear_messages_for_test();
             let outcome = app.abort_reaped_native_apply_before_reconcile(
                 &ticket,
                 "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
@@ -14405,6 +14708,9 @@ fn apply(c: &mut Command) {
                     .retry_at
                     .map(|at| at.saturating_duration_since(std::time::Instant::now())),
             );
+            // Ruling 143: a retry the lane scheduled is silent on the glass; the
+            // "pill" this test counts is the outcome ROW, which only a lane
+            // that stopped raises (`Install now`, the Version menu's press).
             pills.push(app.update_row_text());
         }
 
@@ -14442,31 +14748,26 @@ fn apply(c: &mut Command) {
             "each returned failure spends exactly one attempt"
         );
 
-        // THE NAG, counted. One pill at the start so the user knows the lane
-        // exists, one at the end naming the control, and silence in between.
+        // THE NAG, counted: silence while the lane is coming back, and one row
+        // at the end naming the control.
         assert_eq!(
             pills.iter().filter(|pill| pill.is_some()).count(),
-            2,
-            "nine failures may cost at most two pills, got {pills:?}"
-        );
-        assert_eq!(
-            pills.first().and_then(Clone::clone).as_deref(),
-            Some("Update delayed — retries on its own"),
-            "the first failure tells the user the lane is handling it"
+            1,
+            "nine failures may cost at most one row, got {pills:?}"
         );
         assert!(
-            pills[1..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) - 1]
+            pills[..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) - 1]
                 .iter()
                 .all(Option::is_none),
-            "every failure between the first and the last must pass in silence — \
-             the user has nothing to do and the lane is already coming back, \
-             got {pills:?}"
+            "every failure before the last must pass in silence — the user has \
+             nothing to do and the lane is already coming back, got {pills:?}"
         );
-        assert_eq!(
-            pills.last().and_then(Clone::clone).as_deref(),
-            Some("Update paused — see Version menu"),
+        let last = pills.last().and_then(Clone::clone).unwrap_or_default();
+        assert!(
+            last.starts_with("Couldn't install aterm v")
+                && last.ends_with(crate::update_words::INSTALL_FROM_MENU),
             "the ONE actionable moment — the lane is out of retries — must name a \
-             control, not repeat 'retries on its own'"
+             control: {last:?}"
         );
 
         // AND CONVERGED MEANS CONVERGED. `arm` refuses the artifact, and the latch
@@ -14525,8 +14826,8 @@ fn apply(c: &mut Command) {
     #[test]
     fn a_stand_down_restates_the_staged_bar_while_it_is_still_up() {
         use crate::app_update_handoff::HandoffUnavailable;
-        use crate::status_bars::{ApplyPosture, staged_detail};
         use crate::update_apply_trouble::ApplyRetry;
+        use crate::update_words::{ApplyPosture, staged_detail};
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         assert!(
@@ -14536,8 +14837,7 @@ fn apply(c: &mut Command) {
              authorized apply below would `exec()` the test binary"
         );
         assert!(
-            !crate::app_update_handoff::seamless_handoff_opted_out()
-                && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
+            std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
             "PRECONDITION: the reason the lane is unavailable must be the App's own shape"
         );
         let build = app.native_updater_service.snapshot().current_build + 1;
@@ -14545,15 +14845,21 @@ fn apply(c: &mut Command) {
             version: format!("1.0.{build}"),
             build,
         };
-        let bar_detail = |app: &App| {
-            app.status_bars
-                .bars()
-                .next()
-                .expect("the Staged bar is still up")
-                .1
-                .text
-                .detail
-                .clone()
+        // Design §10.5 H2: a staged build nothing can press is a RECORD — the
+        // log keeps its posture's words, and no row promises anything.
+        let recorded = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .rev()
+                .find(|r| r.key.as_deref() == Some(crate::update_words::KEY_PROGRESS))
+                .map(|r| r.detail.join("; "))
+                .expect("the staged report is recorded")
+        };
+        let no_row = |app: &App| {
+            app.messages
+                .live_by_key(crate::update_words::KEY_PROGRESS)
+                .is_none()
         };
         // The gate and the bar read one predicate: headless, so no seamless lane.
         let why = app
@@ -14564,23 +14870,32 @@ fn apply(c: &mut Command) {
         // The report lands first, from the check thread, and paints the posture —
         // already the warning, because the lane is not there…
         app.note_update_progress(&staged);
-        assert_eq!(bar_detail(&app), staged_detail(build, unavailable));
+        assert_eq!(recorded(&app), staged_detail(unavailable));
+        assert!(no_row(&app), "the headless posture is a record, not a row");
         assert!(
-            !bar_detail(&app).contains("~2 min") && !bar_detail(&app).contains("Version menu"),
+            !recorded(&app).contains("~2 min") && !recorded(&app).contains("Version menu"),
             "{}",
-            bar_detail(&app)
+            recorded(&app)
         );
         // …then the stage is reconciled and armed (the arm reads policy, not the
         // lane: the cold lane is a real automatic path once every PTY is gone).
         stage_one_build_for_test(&mut app, build);
-        assert_eq!(bar_detail(&app), staged_detail(build, unavailable));
-        // Model the bar a WINDOWED app paints — the automatic promise.
-        app.status_bars.update_progress(
-            &staged,
-            Some(ApplyPosture::Automatic),
-            std::time::Instant::now(),
+        assert!(
+            no_row(&app),
+            "arming raises no row over a lane that cannot run"
         );
-        assert!(bar_detail(&app).contains("applies by itself at the next quiet moment"));
+        // Model the row a WINDOWED app paints — the automatic promise, the
+        // busy flow row on the glass (ruling 143) — as the lane's flow row
+        // (the state the restatement below looks the row up by).
+        app.post_update_row(
+            crate::update_words::progress(&staged, Some(ApplyPosture::Automatic), ""),
+            &format!("1.0.{build}"),
+            crate::messages_host::FlowPhase::Staged { build, flow: true },
+        );
+        assert_eq!(
+            app.update_row_detail().as_deref(),
+            Some(staged_detail(ApplyPosture::Automatic).as_str())
+        );
 
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
@@ -14616,15 +14931,19 @@ fn apply(c: &mut Command) {
         // this build's latch does not outrank a lane that cannot run.
         let posture = app.apply_posture_for(build);
         assert_eq!(posture, unavailable);
-        let detail = bar_detail(&app);
-        assert_eq!(
-            detail,
-            staged_detail(build, posture),
-            "the live bar carries the posture the App computes now"
-        );
         assert!(
-            detail.contains("will NOT apply while any terminal is open")
-                && !detail.contains("~2 min")
+            no_row(&app),
+            "the stand-down folds the flow row: its posture is a record now"
+        );
+        assert_eq!(
+            recorded(&app),
+            staged_detail(posture),
+            "the record carries the posture the App computes now"
+        );
+        let detail = staged_detail(posture);
+        assert!(
+            detail.contains("installs once every terminal is closed")
+                && !detail.contains("minute")
                 && !detail.contains("Version menu"),
             "{detail}"
         );
@@ -14639,7 +14958,7 @@ fn apply(c: &mut Command) {
     /// than after the next unrelated reconcile.
     #[test]
     fn a_reaped_abort_restates_the_staged_bar_it_stands_down() {
-        use crate::status_bars::{ApplyPosture, staged_detail};
+        use crate::update_words::{ApplyPosture, staged_detail};
         let mut app = App::headless_for_test();
         let build = app.native_updater_service.snapshot().current_build + 1;
         let staged = aterm_update::Progress::Staged {
@@ -14653,15 +14972,16 @@ fn apply(c: &mut Command) {
             &"ab".repeat(32),
         );
         ticket.make_current_apply_for_test(&mut app.native_updater_service);
-        let bar_detail = |app: &App| {
-            app.status_bars
-                .bars()
-                .next()
-                .expect("the Staged bar is still up")
-                .1
-                .text
-                .detail
-                .clone()
+        // Design §10.5 H2: the staged build is a RECORD under every posture
+        // but a stood-down one where a press applies it.
+        let recorded = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .rev()
+                .find(|r| r.key.as_deref() == Some(crate::update_words::KEY_PROGRESS))
+                .map(|r| r.detail.join("; "))
+                .expect("the staged report is recorded")
         };
         // A headless App has no seamless lane, and the report painted that fact
         // (the posture reads the gate's own predicate). Model the promise a
@@ -14672,15 +14992,18 @@ fn apply(c: &mut Command) {
                 .expect("a headless App has no seamless lane"),
             veto: None,
         };
-        assert_eq!(bar_detail(&app), staged_detail(build, unavailable));
-        app.status_bars.update_progress(
-            &staged,
-            Some(ApplyPosture::Automatic),
-            std::time::Instant::now(),
+        assert_eq!(recorded(&app), staged_detail(unavailable));
+        // Model the row a WINDOWED app paints — the automatic promise, the
+        // busy flow row on the glass (ruling 143) — as the lane's flow row
+        // (the state the restatement below looks the row up by).
+        app.post_update_row(
+            crate::update_words::progress(&staged, Some(ApplyPosture::Automatic), ""),
+            &format!("1.0.{build}"),
+            crate::messages_host::FlowPhase::Staged { build, flow: true },
         );
         assert_eq!(
-            bar_detail(&app),
-            staged_detail(build, ApplyPosture::Automatic)
+            app.update_row_detail().as_deref(),
+            Some(staged_detail(ApplyPosture::Automatic).as_str())
         );
 
         app.abort_reaped_native_apply_before_reconcile(
@@ -14698,8 +15021,14 @@ fn apply(c: &mut Command) {
             posture, unavailable,
             "this build's latch does not outrank a lane that cannot run"
         );
-        let detail = bar_detail(&app);
-        assert_eq!(detail, staged_detail(build, posture));
+        // The posture is a record now: the flow row folded and its words
+        // are on record; nothing is raised over a lane that cannot run.
+        assert!(
+            app.staged_update_row().is_none(),
+            "a record posture raises no decision"
+        );
+        let detail = recorded(&app);
+        assert_eq!(detail, staged_detail(posture));
         assert!(
             !detail.contains("~2 min") && !detail.contains("Version menu"),
             "{detail}"
@@ -14792,7 +15121,7 @@ fn apply(c: &mut Command) {
         });
         assert_eq!(
             app.arm_activity_revoked_overlap_retry(&ticket),
-            Some(std::time::Duration::from_secs(900)),
+            Some(std::time::Duration::from_secs(30)),
             "past the last rung the spacing stays at the last rung"
         );
         app.auto_overlap_retry = Some(crate::AutoOverlapRetry {

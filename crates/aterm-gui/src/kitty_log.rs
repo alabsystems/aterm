@@ -3938,6 +3938,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
     }
 
+    /// The ledger once a DETACHED exit writer has had its chance to land.
+    /// `flush_exit` waits only [`EXIT_JOIN_BUDGET`] and then detaches a worker
+    /// that is still writing — process teardown wins over ledger durability, by
+    /// design — so a test that reads the ledger the instant `flush_exit` returns
+    /// demands that the worker already finished. Worse, `read_with_sidecar` takes
+    /// the same lock pair the worker's `flush_merge` TRIES, so an early read can
+    /// also take the lock out from under the write: the injected single-try worker
+    /// below then gives up, and nothing is ever persisted. The v-fast gate of
+    /// 149bbe294, run beside another gate, read 0 of 3 and 1 of 2 sightings that
+    /// way; alone the worker always wins the 100 ms.
+    ///
+    /// So the wait polls with the LOCK-FREE [`KittyLog::read`], which cannot
+    /// contend, and takes the one locked read only once the ledger shows the
+    /// count — after the worker is through. A batch that never reaches disk
+    /// still fails the caller's assertions when the bounded window ends.
+    fn read_once_persisted(ledger: &Path, sightings: u64) -> KittyLog {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while KittyLog::read(ledger).sightings < sightings && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        KittyLog::read_with_sidecar(ledger)
+    }
+
     #[test]
     fn full_normal_queue_cannot_drop_the_dedicated_exit_tail() {
         let ledger = tmp("writer-full-normal-exit-tail");
@@ -4083,7 +4106,7 @@ mod tests {
             host.delta.is_empty(),
             "successful shutdown transfers and persists every owned batch"
         );
-        let saved = KittyLog::read_with_sidecar(&ledger);
+        let saved = read_once_persisted(&ledger, 3);
         assert_eq!(saved.sightings, 3);
         assert_eq!(saved.collectibles.len(), 1);
         assert_eq!(saved.collectibles[0].count, 3);
@@ -4127,7 +4150,7 @@ mod tests {
         host.observe(8, [sighting(22)], lex, t0 + Duration::from_secs(1), true);
         // Exit drains the tail and joins the worker — both counts must be on disk.
         host.flush_exit();
-        let saved = KittyLog::read_with_sidecar(&ledger);
+        let saved = read_once_persisted(&ledger, 2);
         assert_eq!(
             saved.sightings, 2,
             "both sightings persisted across the background writer + exit drain"

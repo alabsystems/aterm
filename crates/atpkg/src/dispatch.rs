@@ -20,7 +20,7 @@
 //! (§10.1), and `aterm.app` itself is **not** a tarball at all — it is a notarized DMG the
 //! app's own updater applies IN-SESSION by the overlap handoff (a successor is spawned and
 //! every PTY is handed across; the cold-launch swap is only the fallback), never the
-//! immediate shim flip — atpkg refuses it closed (the two-anchor gate, §16.2/§16.4). A
+//! immediate shim flip — atpkg refuses it, always (§16.4). A
 //! VENDOR's `.app` (Emacs from its DMG) is a different thing again:
 //! it lands in the store and is shimmed through its `links`, and it must never be confused
 //! with the self-update topology — so it gets its own variant. [`strategy_for`] is that
@@ -44,11 +44,10 @@ pub enum ApplyStrategy {
     SysrootBundle,
     /// The `aterm.app` DMG: NOT extracted as a tarball — applied **in-session by the app's
     /// own updater** (the seamless overlap handoff in aterm-gui; `renamex_np(RENAME_SWAP)`
-    /// lives in aterm-update, never here), AND-gated by the two anchors (notarization + the
-    /// signed-index sha256), never the immediate flip (§16.2/§16.4). A different apply
-    /// *topology*, dispatched here so it can never be symlink-flipped like a tool — atpkg's
-    /// role is to REFUSE it closed and defer, not to stage or swap. `app-bundle` over
-    /// `github-release` ONLY.
+    /// lives in aterm-update, never here), never the immediate flip (§16.4). A different
+    /// apply *topology*, dispatched here so it can never be symlink-flipped like a tool —
+    /// atpkg REFUSES it, always ([`crate::FlowError::AppBundleRefused`]), and never stages
+    /// or swaps it. `app-bundle` over `github-release` ONLY.
     AppBundle,
     /// A VENDOR's `.app` (`app-bundle` over `https`, `payload = "dmg"`): the single
     /// `.app` at the image root is copied into the store with its mode bits preserved and
@@ -155,8 +154,8 @@ mod tests {
     }
 
     /// The vendor `.app` and the aterm self-update are DIFFERENT strategies: the former
-    /// lands in the store and shims, the latter is the two-anchor gate that defers to the
-    /// app's own in-session updater. Neither may ever be taken for the other, and neither
+    /// lands in the store and shims, the latter is refused so the app's own in-session
+    /// updater stays the only thing that applies it. Neither may ever be taken for the other, and neither
     /// is a plain Shim.
     #[test]
     fn a_vendor_app_is_not_the_self_update_app_bundle() {

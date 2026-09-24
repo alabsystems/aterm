@@ -79,7 +79,9 @@ fn tagged(path: &Path) -> bool {
 /// Build the subject through an UNTRACKED launchd job, so it starts clean whatever this
 /// test process is. Returns once the job has answered.
 fn launchd_sh(script: &str, args: &[&Path], done: &Path) {
-    let label = format!("systems.alab.probe.rename-{}", std::process::id());
+    // One label per job: the tests run in parallel, and a second `submit` under a label
+    // that is still loaded exits 0 and starts nothing, so its done-marker never appears.
+    let label = format!("systems.alab.probe.rename-{}", unique());
     let _ = std::fs::remove_file(done);
     let mut cmd = Command::new("/bin/launchctl");
     cmd.arg("submit")
@@ -126,8 +128,17 @@ fn rename_swap(a: &Path, b: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `<pid>-<n>`, distinct for every call in this process — the tests run in parallel, and
+/// a scratch directory or label shared between them lets one test delete or replace
+/// another's.
+fn unique() -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{n}", std::process::id())
+}
+
 fn scratch() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("aterm-rename-probe-{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("aterm-rename-probe-{}", unique()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("scratch");
     d

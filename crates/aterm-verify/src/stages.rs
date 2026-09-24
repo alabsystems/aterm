@@ -1661,13 +1661,28 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 /// move printed); the suite reproduces the refusal against the real indexer, measures
 /// the catch-up, and drives the lane end to end in STAGE mode with the pack scripts
 /// stubbed.
-pub const ATPKG_SUITES: [&str; 10] = [
+///
+/// Three joined on 2026-09-23 with the vendor-direct cutover (design 2026-09-22 §1.9):
+/// `test-atpkg-index-vendor-direct.sh` is new (the cutover index keeps the vendor rows and
+/// pins nothing for them; the drop, a dropped row and a re-pin are each typed);
+/// `test-atpkg-auto-alab.sh` drives the ALab lane, which now carries those rows into the
+/// spec it derives; and `test-atpkg-prerelease-gate.sh` pins `--prerelease` on every
+/// release-create site of the indexer and the lib — both sat in `tools/` wired into
+/// nothing, and the second had rotted (its gh stub predates `atpkg_gh_release`'s
+/// public-immutability probe). The other orphans stay out: `test-atpkg-seed-extras.sh`
+/// and `test-atpkg-pack-toolchain.sh` cover the seed stager and the packers, which this
+/// change did not touch, and `test-atpkg-pack-arch-gate.sh` already runs under
+/// `aterm-release`'s `pack_arch_gate` test.
+pub const ATPKG_SUITES: [&str; 13] = [
     "test-atpkg-vendor-tooling.sh",
     "test-atpkg-mirror-extras.sh",
     "test-atpkg-auto-vendor.sh",
+    "test-atpkg-auto-alab.sh",
     "test-atpkg-target-pins.sh",
     "test-atpkg-index-target-pins.sh",
     "test-atpkg-index-staging-collision.sh",
+    "test-atpkg-index-vendor-direct.sh",
+    "test-atpkg-prerelease-gate.sh",
     "test-atpkg-stale-pin.sh",
     "test-atpkg-spec-catch-up.sh",
     "test-linux-auto-atpkg.sh",
@@ -2843,7 +2858,7 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
             "          at {} (the embedded + ty tiers still ran).",
             mc_root.display()
         ));
-        r.raw("          fix: `aterm pkg install trust-mc` (`aterm pkg doctor` names the store);");
+        r.raw("          fix: `aterm pkg install trust-mc` (`aterm pkg doctor --verbose` names the store);");
         r.raw("          or set TRUST_MC_SYSROOT at a from-source build-trust-mc sysroot.");
         r.skip("trust-mc / Kani BMC floor (tool unavailable; `aterm pkg install trust-mc`)");
         return;
@@ -4119,7 +4134,7 @@ mod tests {
     /// Measured 2026-09-13 on 07a76fca7 with dry unit graphs, units keyed
     /// recursively on package, target, profile (less its name), features, mode,
     /// platform and dependencies:
-    /// `ATERM_REROUTE_QUIET=1 targo --unverified test --workspace --no-fail-fast
+    /// `targo --unverified test --workspace --no-fail-fast
     /// <sel> --config profile.dev.build-override.debug=2 --unit-graph -Z
     /// unstable-options --offline`.
     ///  * `--no-run` = the old single child: 1131 units, identical keys.

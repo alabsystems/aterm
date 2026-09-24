@@ -119,7 +119,7 @@ fn window_seven_px_past_grid_fit_offsets_content_without_scaling() {
     // CPU/GPU AGREEMENT: the softbuffer twin over the same source must equal
     // the GPU blit byte-for-byte — both backends absorb the remainder the same.
     let mut cpu = vec![0u32; dw * dh];
-    place_frame_bands(&mut cpu, dw, dh, &source.pixels, fw, fh, false, bg);
+    place_frame_bands(&mut cpu, dw, dh, &source.pixels, fw, fh, false, bg, 0);
     for (i, (&c, &g)) in cpu.iter().zip(blit.pixels.iter()).enumerate() {
         assert_eq!(
             c & 0x00ff_ffff,
@@ -254,4 +254,100 @@ fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
         (source.pixels[interior_y * fw + x] ^ 0x00ff_ffff) & 0x00ff_ffff,
         "crop-local overlay must not leak into its interior when wash alpha is zero"
     );
+}
+
+/// CHROME REACHES THE WINDOW EDGE (the message band's full-width meter,
+/// ruling 55, 2026-09-23). With two chrome rows declared — the second a
+/// METERED row whose gutters wear its own fill and track tones — a window 7 px
+/// past grid fit continues each chrome row's edge pixels through the leftover
+/// bands (so the meter's fill reaches the true window edge), keeps every other
+/// band pixel the theme background, and agrees with the CPU twin
+/// (`place_frame_bands` with the same `edge_rows`) byte for byte.
+#[test]
+fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
+    let Some(mut gpu) = fresh_gpu() else { return };
+    const FILL: u32 = 0x0050_FA7B;
+    const TRACK: u32 = 0x0044_4750;
+    const BAND: u32 = 0x0030_3135;
+    gpu.set_pad(9);
+    gpu.set_chrome_bleed(Some(aterm_render::ChromeBleed {
+        rows: 2,
+        color: BAND,
+        seam: None,
+        top_extends_cells: false,
+        row_edges: [
+            Some(aterm_render::ChromeRowEdges {
+                row: 1,
+                left: FILL,
+                right: TRACK,
+            }),
+            None,
+            None,
+        ],
+    }));
+    let mut win = aterm_gpu::WindowGpu::new();
+    let input = representative_input();
+    let source = gpu.render_input(&mut win, &input, None);
+    let (fw, fh) = (source.width, source.height);
+    let edge_rows = gpu.chrome_extent_px(fh);
+    assert!(
+        edge_rows > 0 && edge_rows < fh,
+        "two chrome rows: {edge_rows} of {fh}"
+    );
+    let (dw, dh) = (fw + 7, fh + 7);
+    let blit = gpu.blit_to_sized_for_test(&mut win, false, dw as u32, dh as u32);
+    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
+    let bg = Theme::default().bg & 0x00ff_ffff;
+    let mut saw = [false; 3]; // band tone, fill, track continued
+    for y in 0..dh {
+        for x in 0..dw {
+            let got = blit.pixels[y * dw + x] & 0x00ff_ffff;
+            let (sx, sy) = (x as i64 - ox, y as i64 - oy);
+            let in_rows = sy >= 0 && (sy as usize) < fh;
+            let in_cols = sx >= 0 && (sx as usize) < fw;
+            if in_rows && in_cols {
+                continue;
+            }
+            if in_rows && (sy as usize) < edge_rows {
+                let row = sy as usize * fw;
+                let edge = if sx < 0 {
+                    source.pixels[row]
+                } else {
+                    source.pixels[row + fw - 1]
+                } & 0x00ff_ffff;
+                assert_eq!(
+                    got, edge,
+                    "chrome band pixel at ({x},{y}) continues the edge"
+                );
+                for (i, tone) in [BAND, FILL, TRACK].into_iter().enumerate() {
+                    saw[i] |= got == tone;
+                }
+            } else {
+                assert_eq!(got, bg, "band pixel at ({x},{y}) is the theme bg");
+            }
+        }
+    }
+    assert_eq!(
+        saw, [true; 3],
+        "the band tone, the fill and the track all reached the edge"
+    );
+    let mut cpu = vec![0u32; dw * dh];
+    place_frame_bands(
+        &mut cpu,
+        dw,
+        dh,
+        &source.pixels,
+        fw,
+        fh,
+        false,
+        bg,
+        edge_rows,
+    );
+    for (i, (&c, &g)) in cpu.iter().zip(blit.pixels.iter()).enumerate() {
+        assert_eq!(
+            c & 0x00ff_ffff,
+            g & 0x00ff_ffff,
+            "CPU placement and GPU blit diverge at pixel {i}"
+        );
+    }
 }

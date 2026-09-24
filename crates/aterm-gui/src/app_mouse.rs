@@ -1418,39 +1418,36 @@ impl App {
         self.strip_col_at_with(wid, self.pointer_geometry(wid), x, y)
     }
 
-    /// If pixel position `(x, y)` lands on one of window `wid`'s STATUS BAR rows
-    /// (the chrome rows directly below the tab strip), which bar's lane. `None`
-    /// when no bar is up or the point is elsewhere. The bars are chrome: a press
-    /// on one opens the lane's deliberate surface (Settings ▸ Packages /
-    /// Software Update) and never reaches the terminal underneath — there is no
-    /// terminal underneath, the grid starts below them.
-    pub(crate) fn status_bar_lane_at(
-        &self,
-        wid: WindowId,
-        x: f64,
-        y: f64,
-    ) -> Option<crate::status_bars::Lane> {
-        // The PRESENCE row (round 19) sits between the strip and the bars, in
-        // the row its window committed; the bars start below it.
-        let presence_rows = self.windows.get(&wid).map_or(0, |ws| ws.presence.rows);
-        if self.status_bar_rows == 0 && presence_rows == 0 {
-            return None;
+    /// A left press at window pixel `(px, py)`: if it lands on the message
+    /// band (or the presence row above it), consume it — `true` — and perform
+    /// what the band says (`App::press_band`). THE PASTE QUESTION FIRST,
+    /// FAIL-CLOSED (design §3.4): the multi-line-paste confirmation OVERWRITES
+    /// the top composed rows in place — the band's own rows — so while it is
+    /// up in this window a press inside its band is its answer (cancel; the
+    /// parked text is dropped), never a capsule press underneath it.
+    fn press_band_at(&mut self, wid: WindowId, px: f64, py: f64) -> bool {
+        // THE PASTE QUESTION IS ANSWERED FIRST, and exactly once. It overwrites
+        // the top composed rows of THIS window whether or not the band has a
+        // row committed under it, so the press is judged against the banner's
+        // own floor (`paste_banner_tray_floor_y`, `0` = no banner) before the
+        // band's hit test is asked at all: a press on a modal security question
+        // is its FAIL-CLOSED answer (cancel — the parked text is dropped), never
+        // a confirm, and never the capsule underneath it.
+        if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
+            let floor = self.paste_banner_tray_floor_y(wid);
+            let (_, fy) = self.window_to_frame(wid, px, py);
+            let top = (self.win_pad_top(wid) + self.win_head(wid)) as f64;
+            if floor > 0 && fy >= top && fy < f64::from(floor) {
+                self.answer_paste_banner(false);
+                self.request_redraw_all_windows();
+                return true;
+            }
         }
-        let geom = self.pointer_geometry(wid);
-        let (_, ch) = geom.cell;
-        let (_, y) = self.window_to_frame_with(wid, geom, x, y);
-        let gy = (y as usize).saturating_sub(geom.pad_top + geom.head);
-        let strip_px = usize::from(self.tab_strip_rows) * ch.max(1);
-        let presence_px = usize::from(presence_rows) * ch.max(1);
-        let bars_px = usize::from(self.status_bar_rows) * ch.max(1);
-        if gy < strip_px || gy >= strip_px + presence_px + bars_px {
-            return None;
-        }
-        if gy < strip_px + presence_px {
-            return Some(crate::status_bars::Lane::Presence);
-        }
-        self.status_bars
-            .lane_at((gy - strip_px - presence_px) / ch.max(1))
+        let Some(target) = self.band_hit_at(wid, px, py) else {
+            return false;
+        };
+        self.press_band(wid, target);
+        true
     }
 
     /// [`Self::strip_col_at`] against geometry the caller already derived.
@@ -1611,6 +1608,65 @@ impl App {
         true
     }
 
+    /// A left press that landed on ROBI'S TIP BUBBLE dismisses it and is
+    /// CONSUMED (`true`); `false` when no bubble is visible here or the point
+    /// misses it (the click flows on). A decoration: nothing is recorded,
+    /// posted or announced.
+    ///
+    /// Two gates keep this from firing on a bubble the person cannot see: it
+    /// must be ON GLASS IN THIS WINDOW ([`crate::WindowState::bubble_is_on_glass`]
+    /// — `App::robi_bubble` is global and the paint-only cards share one slot),
+    /// and it must still be legible ([`crate::robi_bubble::CLICK_MIN_ALPHA`]: the
+    /// exit tail runs to nothing, and a target you cannot see is a trap). The hit
+    /// reads the SAME geometry the painter uses (`robi_bubble::bubble_hit` — same
+    /// `now`, same motion amplitude, same reserved chrome rows), so the target is
+    /// the pixels, through the slide. Runs BEFORE [`Self::robi_press_at`]: the
+    /// bubble sits over his head, and a tap on it must never cost the robot.
+    pub(crate) fn robi_bubble_click(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
+        let Some(bubble) = self.robi_bubble.as_ref() else {
+            return false;
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        if !ws.bubble_is_on_glass() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if bubble.alpha(now) < crate::robi_bubble::CLICK_MIN_ALPHA {
+            return false;
+        }
+        let (cw, ch) = self.win_cell_size(wid);
+        let pad = self.win_pad(wid) as f32;
+        let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
+        let geom = crate::settings::SettingsGeom {
+            cw: cw as f32,
+            ch: ch as f32,
+            font_px: self.win_font_px(wid),
+            cols: ws.cols as usize,
+            panel_rows: 0,
+        };
+        let motion = self
+            .motion_policy(true)
+            .amplitude(crate::motion::MotionEffect::NoticePill);
+        let (x, y) = self.window_to_frame(wid, x, y);
+        let (px, py) = (x as f32 - pad, y as f32 - top);
+        if !crate::robi_bubble::bubble_hit(
+            bubble,
+            &geom,
+            now,
+            motion,
+            self.bubble_clear_rows(wid),
+            px,
+            py,
+        ) {
+            return false;
+        }
+        self.robi_bubble = None;
+        self.request_redraw_all_windows();
+        true
+    }
+
     /// DISMISSING ROBI: if the last pointer position lands on Robi's drawn
     /// body (the rect the redraw stashed post-tick, padded by
     /// [`ROBI_HIT_SLOP_PX`]), send him away and CONSUME the press. Returns
@@ -1642,10 +1698,10 @@ impl App {
     /// the banner saying why.
     ///
     /// A press on his TIP BUBBLE is not a dismissal: the bubble is the
-    /// app-global transient notice (`TransientNotice::robi_tip`), and
-    /// `notice_click` consumes a press on any visible card EARLIER in
-    /// `on_mouse_input`'s chain — an ordering this seam depends on, pinned
-    /// by `a_press_on_robis_tip_bubble_dismisses_the_bubble_not_the_robot`.
+    /// app-global `App::robi_bubble`, and [`Self::robi_bubble_click`] consumes
+    /// a press on it EARLIER in `on_mouse_input`'s chain — an ordering this
+    /// seam depends on, pinned by
+    /// `a_press_on_robis_tip_bubble_dismisses_the_bubble_not_the_robot`.
     ///
     /// Same chrome-wins policy and stale-`last_cursor_px` caveat as
     /// [`Self::pet_press_at`].
@@ -1819,7 +1875,9 @@ impl App {
         // pointer would keep vouching for a position the pointer has left.
         ws.pointer_position_known = false;
         ws.hover_grid_owned = false;
-        if ws.strip_hover.is_none() && !ws.strip_hover_new_tab {
+        // The band's lit chip is the same shape of stale claim as the strip's.
+        let band_lit = ws.band_hover.take().is_some();
+        if ws.strip_hover.is_none() && !ws.strip_hover_new_tab && !band_lit {
             return;
         }
         ws.strip_hover = None;
@@ -2582,6 +2640,18 @@ impl App {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return Resolved(None);
         }
+        // The message band (design §3.4): a hand over a capsule or a row body
+        // — a press there does something — and the plain pointer over the
+        // rest of it (the presence row, the overflow link Phase 2 connects).
+        // Never an I-beam: the band is not selectable text.
+        if let Some(target) = self.band_hit_at(wid, px, py) {
+            if self.band_press_acts(wid, target) {
+                self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
+            } else {
+                self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+            }
+            return Resolved(None);
+        }
         // Split dividers (hover half): the 1-cell seam is drawn, but until this
         // probe nothing SAID it was draggable — the resize cursor appeared only
         // once `begin_divider_drag` had already armed, i.e. you had to be
@@ -2967,6 +3037,7 @@ impl App {
         // returns immediately after, before any later use.
         let geom = self.pointer_geometry(wid);
         self.track_strip_hover(wid, geom, x, y);
+        self.track_band_hover(wid, x, y);
         if self.palette_claims_pointer(wid) {
             self.palette_pointer_motion(wid, x, y);
             return;
@@ -4232,6 +4303,13 @@ impl App {
                     self.handle_tab_strip_click(wid, col);
                     return;
                 }
+                // The band lies above `native_content_origin_y` like the strip:
+                // a press on it over a native-fronted tab is the band's, never
+                // the view's (the bars let it fall through to the native
+                // boundary, which swallowed it — a latent defect, design §3.4).
+                if self.press_band_at(wid, px, py) {
+                    return;
+                }
                 // Below the strip, on a native view: still a click away from an
                 // open in-grid rename field, so it still commits. Same rule as the
                 // terminal path — the field's exit must not depend on what kind of
@@ -4345,30 +4423,18 @@ impl App {
             }
             return;
         }
-        // THE STATUS BARS are chrome rows: a press on one opens the lane's own
-        // deliberate surface (the durable record the bar points at) and is
-        // consumed — like the strip, and unlike the retired floating card, this
-        // is a press on chrome, not on something the chrome is standing on. Only
-        // the PRESS is swallowed; the orphan-release guard below drops the
-        // matching release, so a tracking app sees a balanced stream.
+        // THE MESSAGE BAND is chrome rows: a press on one performs the row's
+        // capsule or its primary intent (`App::press_band`) and is consumed —
+        // like the strip, and unlike the retired floating card, this is a press
+        // on chrome, not on something the chrome is standing on. Only the PRESS
+        // is swallowed; the orphan-release guard below drops the matching
+        // release, so a tracking app sees a balanced stream.
         if pressed && button == WinitMouseButton::Left {
             let (px, py) = self
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-            if let Some(lane) = self.status_bar_lane_at(wid, px, py) {
-                match lane {
-                    crate::status_bars::Lane::Toolchain => {
-                        let _ =
-                            self.open_settings_tab(crate::native_settings::SettingsRoute::Packages);
-                    }
-                    // THE UPDATE ROW IS THE ONE-CLICK APPLY (2026-09-07): a staged
-                    // build applies in place on a press — what the retired
-                    // floating card did — and any other state opens the details.
-                    crate::status_bars::Lane::Update => self.press_update_bar(),
-                    // The presence band has no press action (design §2).
-                    crate::status_bars::Lane::Presence => {}
-                }
+            if self.press_band_at(wid, px, py) {
                 return;
             }
         }
@@ -4376,63 +4442,18 @@ impl App {
         // tab strip (off macOS — handled by the tab-strip click path below via
         // `TabHit::Update`), not a floating overlay, so there is no separate mouse gate
         // here.
-        // TRANSIENT "Update ready" NOTICE: the fading top-centre pill is clickable — a
-        // left press on it APPLIES the update in one gesture (details-overlay fallback
-        // when nothing is actually staged) + dismisses the pill; see
-        // `App::apply_update_or_details`. Checked here (no modal is open, else the pill
-        // is hidden under it) BEFORE the mouse-report path so the click doesn't also
-        // reach the program running in the terminal.
+        // ROBI'S TIP BUBBLE: a press on it dismisses it and stops there. Checked here
+        // (no modal is open, else the bubble is hidden under it) BEFORE Robi's own
+        // body (`robi_press_at` below — the bubble sits over his head) and before the
+        // mouse-report path, so the click neither dismisses the robot nor reaches the
+        // program running in the terminal.
         if pressed && button == WinitMouseButton::Left {
             let (px, py) = self
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-            if self.notice_click(wid, px, py) {
+            if self.robi_bubble_click(wid, px, py) {
                 return;
-            }
-        }
-        // CONFIG-WARNING BANNER: `splice_config_notice` OVERWRITES the top grid rows
-        // IN PLACE — tab strip included, since it paints last — so a press inside its
-        // band is a press on chrome, not on whatever the chrome is standing on. It was
-        // the one occluding surface with no mouse gate (palette, Settings, About, the
-        // Update overlay, the strip, the find bar and the pet all have one), so a click
-        // on a warning about `columns/lines` fell through to `strip_col_at` — and a chip's
-        // `x` under it CLOSES A TAB, PTYs and all, with no confirmation unless it is the
-        // window's last. With the strip off it leaked into a selection, or into a
-        // mouse-tracking TUI's stdin.
-        //
-        // Chrome wins, and the click also DISMISSES the banner — the gesture the user is
-        // already making at a notice they have read. The band is the SAME geometry the
-        // splice paints (`config_notice_tray_floor_y`, `0` = no banner), so the hit region
-        // cannot drift from the pixels, and the no-banner path stays byte-identical.
-        //
-        // Only the PRESS is swallowed: never having set the `reported_buttons` bit, the
-        // matching release is already dropped by the orphan-release guard below, so a
-        // tracking app still sees a balanced button stream (it sees neither half).
-        if pressed && button == WinitMouseButton::Left {
-            let floor = self.config_notice_tray_floor_y(wid);
-            if floor > 0 {
-                let (px, py) = self
-                    .windows
-                    .get(&wid)
-                    .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-                let (_, fy) = self.window_to_frame(wid, px, py);
-                let top = (self.win_pad_top(wid) + self.win_head(wid)) as f64;
-                if fy >= top && fy < f64::from(floor) {
-                    // The multi-line-paste confirmation paints over the config
-                    // notice when both bands are up, so it takes the click first:
-                    // a press on a modal security question is its FAIL-CLOSED
-                    // answer (cancel — the parked text is dropped), never a
-                    // confirm. Only with no confirmation outstanding does the
-                    // click dismiss the config-warning banner as before.
-                    if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
-                        self.answer_paste_banner(false);
-                    } else {
-                        self.config_notice = None;
-                    }
-                    self.request_redraw_all_windows();
-                    return;
-                }
             }
         }
         // MIDDLE-CLICK PASTE (X11 PRIMARY): when no app is tracking the mouse, a
@@ -4644,9 +4665,8 @@ impl App {
         // is over the grid and only his grip touches the band's last pixel row —
         // but a press there is still a press on him, and it must dismiss him
         // rather than switch (or close!) the tab underneath. Still below the
-        // modals and the notice card, which composite over the finished frame
-        // at present time — and his own tip bubble IS that notice card,
-        // consumed by `notice_click` above.
+        // modals and his tip bubble, which composite over the finished frame
+        // at present time — the bubble consumed by `robi_bubble_click` above.
         if pressed && button == WinitMouseButton::Left && self.robi_press_at(wid) {
             return;
         }
@@ -7877,79 +7897,6 @@ mod tests {
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
     }
 
-    /// THE CONFIG-WARNING BANNER IS CHROME, and chrome wins the press.
-    ///
-    /// `splice_config_notice` overwrites the top grid rows IN PLACE and paints
-    /// LAST, so it covers the tab strip as well — yet it was the one occluding
-    /// surface with no mouse gate. A press on a warning about `columns/lines`
-    /// therefore fell through to whatever it was standing on: a strip chip's `x`
-    /// (which closes a tab outright), a selection, or a mouse-tracking app's
-    /// stdin. It must dismiss the banner and stop there, while the same press
-    /// BELOW the band keeps behaving exactly as it always did.
-    #[test]
-    fn a_click_on_the_config_warning_banner_dismisses_it_and_stops_there() {
-        use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        // Size the row buffer the way a redraw does: the banner's floor is clamped
-        // by `input_scratch`'s row count, so an unsized buffer claims no band at all.
-        {
-            let terminal = app
-                .front_terminal(wid)
-                .expect("front terminal")
-                .term
-                .clone();
-            let ws = app.windows.get_mut(&wid).expect("headless window");
-            let mut term = crate::term_lock(&terminal);
-            term.cell_frame_into(&mut ws.input_scratch, 24, 80);
-        }
-        let warning = || {
-            crate::config_notice::ConfigNotice::new(
-                vec!["columns/lines applies on next launch".to_string()],
-                std::time::Instant::now(),
-            )
-        };
-        app.config_notice = warning();
-        let floor = app.config_notice_tray_floor_y(wid);
-        assert!(floor > 0, "PRECONDITION: the banner must own a band");
-        let (ox, oy) = app.frame_origin(wid);
-        let x = ox as f64 + app.win_pad(wid) as f64 + 2.0;
-        let band_top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
-
-        app.on_cursor_moved(wid, x, oy as f64 + band_top + 2.0);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(
-            app.config_notice.is_none(),
-            "the press on the banner dismissed it"
-        );
-        assert!(
-            !app.windows.get(&wid).unwrap().selecting,
-            "and was consumed above the selection layer"
-        );
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        assert!(
-            !app.windows.get(&wid).unwrap().selecting,
-            "the orphan release is dropped (press/release stay paired)"
-        );
-
-        // The control: a press one row BELOW the painted band is not the banner's,
-        // so it reaches the terminal and leaves the notice up.
-        app.config_notice = warning();
-        app.on_cursor_moved(wid, x, oy as f64 + f64::from(floor) + 2.0);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(
-            app.config_notice.is_some(),
-            "a press under the band must not dismiss what it never touched"
-        );
-        assert!(
-            app.windows.get(&wid).unwrap().selecting,
-            "and still starts an ordinary selection"
-        );
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-    }
-
     /// PETTING (wave 1): a cleared stash (pet not drawn) can never eat a
     /// click — the guard for stale rects after a style switch or fade-out.
     #[test]
@@ -7971,9 +7918,9 @@ mod tests {
     /// stashed body rect is CONSUMED (never a selection), spends the rect
     /// immediately, and routes the `robi = false` intent into the versioned
     /// settings lane — which the headless harness (no event-loop proxy)
-    /// refuses synchronously, so the refusal surfacing as a config-notice
-    /// banner is the proof the persist path was really invoked (and a
-    /// refusal arms NO latch: he stays, the banner says why). The same press
+    /// refuses synchronously, so the refusal surfacing as a `config.lane`
+    /// message is the proof the persist path was really invoked (and a
+    /// refusal arms NO latch: he stays, the row says why). The same press
     /// outside the padded rect still runs the ordinary selection gesture.
     #[test]
     fn a_click_on_robi_dismisses_him_and_never_selects() {
@@ -7991,7 +7938,7 @@ mod tests {
             assert_eq!(ws.robi_hit_rect, None, "the rect is spent by the press");
         }
         assert!(
-            app.config_notice.is_some(),
+            app.has_live_message("Robi not dismissed"),
             "the persist attempt reached the settings lane (headless refusal is surfaced)"
         );
         assert!(
@@ -8004,7 +7951,7 @@ mod tests {
             "the orphan release is dropped (press/release stay paired)"
         );
         // The control: the same gesture outside the padded rect selects (the
-        // notice claims no band here — headless leaves `input_scratch` unsized).
+        // band claims no rows here — headless leaves `input_scratch` unsized).
         app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some((100, 200, 100, 160));
         app.on_cursor_moved(wid, 420.0, 300.0);
         app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
@@ -8030,13 +7977,13 @@ mod tests {
         let ws = app.windows.get(&wid).unwrap();
         assert!(ws.selecting, "the press reached the selection layer");
         assert!(
-            app.config_notice.is_none(),
+            !app.has_live_message("Robi not dismissed"),
             "and no dismissal was ever attempted"
         );
     }
 
     /// DISMISSING ROBI, the latch's settlement law (`poll_robi_dismissal`):
-    /// a FAILED lane completion releases the latch AND banners (a click that
+    /// a FAILED lane completion releases the latch AND posts (a click that
     /// did nothing is never silent — Robi walks back on as visible proof); a
     /// SUCCESSFUL one holds it until `robi = false` is the live config (else
     /// the gate would read the old `robi = true` in the completion-to-
@@ -8051,7 +7998,7 @@ mod tests {
         // shipped default is off, so the enable is explicit here — without
         // it `poll` reads `robi_or_default() == false` and releases early).
         app.config.robi = Some(true);
-        // Failure completion (the OCC-conflict shape): banner + release.
+        // Failure completion (the OCC-conflict shape): message + release.
         let (tx, rx) = std::sync::mpsc::channel();
         app.robi_dismissal = Some(RobiDismissal::InFlight(rx));
         tx.send(Err(
@@ -8064,11 +8011,16 @@ mod tests {
             "a failed write releases the latch — Robi returns"
         );
         assert!(
-            app.config_notice.is_some(),
+            app.has_live_message("Robi not dismissed"),
             "…and the failure is surfaced, never silent"
         );
+        let surfaced = app
+            .messages
+            .live_by_key(crate::message_reporters::KEY_CONFIG_LANE)
+            .map(|l| l.id)
+            .expect("the failure row");
+        assert!(app.resolve_message(surfaced, aterm_messages::Outcome::Ok));
         // A still-pending write keeps the latch armed…
-        app.config_notice = None;
         let (tx, rx) = std::sync::mpsc::channel();
         app.robi_dismissal = Some(RobiDismissal::InFlight(rx));
         app.poll_robi_dismissal();
@@ -8083,7 +8035,10 @@ mod tests {
             matches!(app.robi_dismissal, Some(RobiDismissal::AwaitingConfig)),
             "success waits for the generation, not the reply"
         );
-        assert!(app.config_notice.is_none(), "success needs no banner");
+        assert!(
+            !app.has_live_message("Robi not dismissed"),
+            "success needs no message"
+        );
         // …and it releases the moment the dismissal IS the live config.
         app.config.robi = Some(false);
         app.poll_robi_dismissal();
@@ -8094,10 +8049,10 @@ mod tests {
     }
 
     /// DISMISSING ROBI vs HIS OWN BUBBLE: the tip bubble is the app-global
-    /// transient notice, and `notice_click` runs EARLIER in `on_mouse_input`
-    /// than `robi_press_at` — so a press on the bubble dismisses the bubble
-    /// and never costs the robot, even where the card overlaps his padded
-    /// body (it sits right over his head). This pins the one ordering fact
+    /// `App::robi_bubble`, and `robi_bubble_click` runs EARLIER in
+    /// `on_mouse_input` than `robi_press_at` — so a press on the bubble
+    /// dismisses the bubble and never costs the robot, even where the card
+    /// overlaps his padded body (it sits right over his head). This pins the one ordering fact
     /// unique to Robi; reorder the chrome chain and this test names the
     /// regression: a bubble tap would write `robi = false`.
     #[test]
@@ -8110,13 +8065,13 @@ mod tests {
         // A tip mid-hold (past the entrance ramp, so it is clickable),
         // anchored the way the redraw anchors it: over the speaker.
         let spawned = std::time::Instant::now() - std::time::Duration::from_secs(2);
-        app.notice = Some(crate::notice::TransientNotice::robi_tip(
+        app.robi_bubble = Some(crate::robi_bubble::RobiBubble::new(
             aterm_effects::robi::ROBI_TIPS[0].text,
             Some((160.0, 140.0)),
             spawned,
         ));
         // On glass in this window (what the splice records when it paints).
-        app.windows.get_mut(&wid).unwrap().notice_card = Some(crate::SettingsCard {
+        app.windows.get_mut(&wid).unwrap().bubble_card = Some(crate::SettingsCard {
             rgba: Vec::new(),
             pw: 0,
             ph: 0,
@@ -8141,12 +8096,12 @@ mod tests {
         let motion = app
             .motion_policy(true)
             .amplitude(crate::motion::MotionEffect::NoticePill);
-        let (rx, ry, rw, rh) = crate::notice::notice_rect(
-            app.notice.as_ref().unwrap(),
+        let (rx, ry, rw, rh) = crate::robi_bubble::bubble_rect(
+            app.robi_bubble.as_ref().unwrap(),
             &geom,
             now,
             motion,
-            app.notice_clear_rows(wid),
+            app.bubble_clear_rows(wid),
         );
         assert!(
             rw > 0.0 && rh > 0.0,
@@ -8167,7 +8122,7 @@ mod tests {
         app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some(body);
         app.on_cursor_moved(wid, click_x, click_y);
         app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(app.notice.is_none(), "the press dismissed the bubble");
+        assert!(app.robi_bubble.is_none(), "the press dismissed the bubble");
         let ws = app.windows.get(&wid).unwrap();
         assert_eq!(
             ws.robi_hit_rect,
@@ -10181,5 +10136,738 @@ mod tests {
         let ch = app.win_cell_size(wid).1 as f64;
         assert!(app.selection_autoscroll(wid, -4.0 * ch));
         assert_eq!(crate::term_lock(&term).grid().display_offset(), 6);
+    }
+
+    /// The pixel at the middle of column `col` on the band's FIRST row,
+    /// through this window's real lattice — its pad, its strip, its cell
+    /// size — as the band's own hit test reads it.
+    fn band_pixel(app: &crate::App, wid: crate::WindowId) -> impl Fn(usize) -> (f64, f64) + use<> {
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64
+            + f64::from(app.tab_strip_rows) * ch as f64;
+        move |col: usize| (pad + (col as f64 + 0.5) * cw as f64, top + ch as f64 * 0.5)
+    }
+
+    /// A toolchain row with its `Packages` capsule — the row every band press
+    /// test presses.
+    fn toolchain_row() -> aterm_messages::Message {
+        aterm_messages::Message::new(
+            aterm_messages::tags::TOOLCHAIN,
+            aterm_messages::Severity::Info,
+            "Installing ALab toolchain",
+        )
+        .line("trust — extracting")
+        .action(aterm_messages::Intent::OpenSettings {
+            route: "/packages".into(),
+        })
+        .hold(aterm_messages::Hold::Live {
+            stale_after: aterm_messages::STALE_TAILED,
+        })
+    }
+
+    /// The band's first row at this window's width.
+    fn band_row(app: &crate::App, wid: crate::WindowId) -> aterm_messages::RowLayout {
+        let cols = usize::from(app.windows[&wid].cols);
+        app.band_presentation(cols).rows[0].clone()
+    }
+
+    /// A column inside the row's first authored capsule.
+    fn capsule_col(app: &crate::App, wid: crate::WindowId) -> usize {
+        band_row(app, wid)
+            .capsules
+            .iter()
+            .find(|c| !c.action.is_details())
+            .expect("an authored capsule")
+            .col
+            + 1
+    }
+
+    /// The capsule the engine recorded a press on, if any.
+    fn acted(
+        app: &crate::App,
+        id: aterm_messages::MessageId,
+    ) -> Option<aterm_messages::ActionIndex> {
+        app.messages.live(id).and_then(|l| l.acted.map(|(k, _)| k))
+    }
+
+    /// The Settings route the window's FRONT native view is on, if Settings
+    /// fronts it.
+    fn settings_route(
+        app: &crate::App,
+        wid: crate::WindowId,
+    ) -> Option<crate::native_settings::SettingsRoute> {
+        let (_, view) = app.active_native_view(wid)?;
+        match app.native_runtime.view_state(view)? {
+            crate::native_app::AppViewState::Settings(state) => Some(state.route),
+            _ => None,
+        }
+    }
+
+    /// The entry Settings ▸ Messages has selected in the window's front
+    /// Settings view, if any.
+    fn selected_message(app: &crate::App, wid: crate::WindowId) -> Option<u64> {
+        let (_, view) = app.active_native_view(wid)?;
+        match app.native_runtime.view_state(view)? {
+            crate::native_app::AppViewState::Settings(state) => state.messages_selected,
+            _ => None,
+        }
+    }
+
+    /// A PRESS ON A BAND CAPSULE PERFORMS ITS INTENT AND STOPS THERE (design
+    /// §7.2): through the whole press path, the engine records the press,
+    /// the host opens Settings ▸ Packages IN THE PRESSED WINDOW, the row
+    /// stays (`OpenSettings` closes nothing), and the grid under the band
+    /// never sees the press. The BODY of any row is its `Details ›` (§2.2's
+    /// one law): Settings ▸ Messages at that entry, nothing recorded as a
+    /// capsule press, a held row folded; one row below the band the press
+    /// is the grid's, as before.
+    #[test]
+    fn a_press_on_a_band_capsule_performs_its_intent_and_stops_there() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let id = app.post_message(toolchain_row());
+        assert_eq!(app.message_band_rows, 1);
+        assert_eq!(
+            settings_route(&app, wid),
+            None,
+            "a terminal fronts the window"
+        );
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(capsule_col(&app, wid));
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert!(
+            app.messages.live(id).is_some(),
+            "an OpenSettings press keeps the row"
+        );
+        assert_eq!(
+            acted(&app, id),
+            Some(aterm_messages::ActionIndex(0)),
+            "the engine recorded the press"
+        );
+        assert_eq!(
+            settings_route(&app, wid),
+            Some(crate::native_settings::SettingsRoute::Packages),
+            "Settings ▸ Packages opened in the pressed window"
+        );
+        {
+            let ws = &app.windows[&wid];
+            assert!(
+                !ws.selecting && ws.held_mouse_button.is_none(),
+                "the press never reached the grid"
+            );
+        }
+
+        // The body of a row WITH a capsule: the Details press, not the
+        // capsule's — Settings ▸ Messages at this entry, the live row seen
+        // and, being a live meter, still on the band.
+        let mut app = crate::App::headless_for_test();
+        let id = app.post_message(toolchain_row());
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(band_row(&app, wid).title.0);
+        assert!(app.press_band_at(wid, x, y), "consumed by the band");
+        assert_eq!(
+            acted(&app, id),
+            None,
+            "the body is no capsule: nothing is recorded as one"
+        );
+        assert_eq!(
+            settings_route(&app, wid),
+            Some(crate::native_settings::SettingsRoute::Messages),
+            "Settings \u{25b8} Messages, in the pressed window"
+        );
+        assert_eq!(selected_message(&app, wid), Some(id.raw()));
+        assert!(
+            app.messages.live(id).is_some_and(|l| l.seen),
+            "a live meter is seen and stays"
+        );
+        // One row below the band: the grid's, not the band's.
+        let ch = app.win_cell_size(wid).1 as f64;
+        assert!(
+            !app.press_band_at(wid, x, y + ch),
+            "one row below the band is the grid's"
+        );
+
+        // The `Details ›` chip itself: the same press.
+        let mut app = crate::App::headless_for_test();
+        let id = app.post_message(toolchain_row());
+        let details = band_row(&app, wid)
+            .capsules
+            .into_iter()
+            .find(|c| c.action.is_details())
+            .expect("the row's Details \u{203a}");
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(details.col + 1);
+        assert!(app.press_band_at(wid, x, y));
+        assert_eq!(acted(&app, id), None);
+        assert_eq!(selected_message(&app, wid), Some(id.raw()));
+
+        // The body of a capsule-less HELD row: seen, so it folds — and the
+        // page shows it as folded, selected.
+        let mut app = crate::App::headless_for_test();
+        let id = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::UPDATE,
+                aterm_messages::Severity::Warn,
+                "Update stopped safely",
+            )
+            .line("see Settings \u{25b8} Software Update"),
+        );
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(band_row(&app, wid).title.0);
+        assert!(app.press_band_at(wid, x, y));
+        assert!(app.messages.live(id).is_none(), "read, and folded");
+        assert_eq!(
+            settings_route(&app, wid),
+            Some(crate::native_settings::SettingsRoute::Messages)
+        );
+        assert_eq!(selected_message(&app, wid), Some(id.raw()));
+
+        // The overflow row: one link, Settings ▸ Messages at the top, nothing
+        // selected.
+        let mut app = crate::App::headless_for_test();
+        for i in 0..5 {
+            app.post_message(aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                format!("w{i}"),
+            ));
+        }
+        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(4);
+        let ch = app.win_cell_size(wid).1 as f64;
+        assert!(app.press_band_at(wid, x, y + 2.0 * ch), "the overflow row");
+        assert_eq!(
+            settings_route(&app, wid),
+            Some(crate::native_settings::SettingsRoute::Messages)
+        );
+        assert_eq!(selected_message(&app, wid), None);
+    }
+
+    /// A PRESS ON THE PASTE QUESTION OVER THE BAND ANSWERS NO FIRST (design
+    /// §3.4, fail-closed): the multi-line-paste confirmation overwrites the
+    /// band's rows in place, so while it stands in this window a press
+    /// inside its rows is its answer — cancel — and never the capsule
+    /// underneath; answered, the same press is the capsule's. A question
+    /// standing in ANOTHER window does not stand between this one and its
+    /// band.
+    #[test]
+    fn a_press_on_the_paste_question_over_the_band_answers_no_first() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.prepare_terminal_capture_grid(wid)
+            .expect("the scratch composes headless");
+        let id = app.post_message(toolchain_row());
+        let question = |wid: crate::WindowId| {
+            crate::paste_banner::PendingPaste::new(
+                wid,
+                Some(0),
+                "line one\nline two\n".to_string(),
+                crate::input::Source::Human,
+                crate::input::PasteFraming::AtDrain,
+            )
+        };
+        app.paste_banner = Some(question(wid));
+        assert!(
+            app.paste_banner_tray_floor_y(wid) > 0,
+            "the question owns the top rows of this window"
+        );
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(capsule_col(&app, wid));
+        assert!(app.press_band_at(wid, x, y), "consumed");
+        assert!(app.paste_banner.is_none(), "the question is answered: no");
+        assert_eq!(
+            acted(&app, id),
+            None,
+            "the capsule under the question was not pressed"
+        );
+        assert_eq!(settings_route(&app, wid), None);
+        assert!(app.press_band_at(wid, x, y));
+        assert_eq!(
+            acted(&app, id),
+            Some(aterm_messages::ActionIndex(0)),
+            "answered, the same press is the capsule's"
+        );
+
+        let mut app = crate::App::headless_for_test();
+        app.prepare_terminal_capture_grid(wid)
+            .expect("the scratch composes headless");
+        let id = app.post_message(toolchain_row());
+        app.paste_banner = Some(question(crate::WindowId(7)));
+        assert_eq!(
+            app.paste_banner_tray_floor_y(wid),
+            0,
+            "another window's question owns none of this window's rows"
+        );
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(capsule_col(&app, wid));
+        assert!(app.press_band_at(wid, x, y));
+        assert_eq!(acted(&app, id), Some(aterm_messages::ActionIndex(0)));
+        assert!(
+            app.paste_banner.is_some(),
+            "the other window's question stands"
+        );
+
+        // NO BAND ROW AT ALL: the question still owns the top rows of its
+        // window, so a press on them is its answer and is consumed here —
+        // never handed down to the grid as a click — while a press below its
+        // floor is nobody's, there being no band to hit.
+        let mut app = crate::App::headless_for_test();
+        app.prepare_terminal_capture_grid(wid)
+            .expect("the scratch composes headless");
+        assert_eq!(app.message_band_rows, 0, "no band row is committed");
+        app.paste_banner = Some(question(wid));
+        assert!(
+            app.paste_banner_tray_floor_y(wid) > 0,
+            "the question owns the top rows without a band under it"
+        );
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(4);
+        assert!(
+            app.press_band_at(wid, x, y),
+            "consumed: the question's answer"
+        );
+        assert!(app.paste_banner.is_none(), "answered: no");
+        assert_eq!(settings_route(&app, wid), None);
+        app.paste_banner = Some(question(wid));
+        let ch = app.win_cell_size(wid).1 as f64;
+        let rows = app
+            .paste_banner
+            .as_ref()
+            .map_or(0, crate::paste_banner::PendingPaste::wanted_rows) as f64;
+        assert!(
+            !app.press_band_at(wid, x, y + rows * ch),
+            "below the question, with no band: nobody's press"
+        );
+        assert!(app.paste_banner.is_some(), "the question stands");
+    }
+
+    /// BAND CAPSULES WORK ON A WINDOW FRONTING SETTINGS (design §7.2, the
+    /// native-branch arm): the band lies above the native content like the
+    /// strip, so a press on it over a native-fronted tab is the band's — the
+    /// bars let it fall through to the native boundary, which swallowed it.
+    #[test]
+    fn band_capsules_work_on_a_window_fronting_settings() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Home));
+        assert_eq!(
+            settings_route(&app, wid),
+            Some(crate::native_settings::SettingsRoute::Home),
+            "Settings fronts the window"
+        );
+        let id = app.post_message(toolchain_row());
+        assert_eq!(app.message_band_rows, 1);
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(capsule_col(&app, wid));
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(
+            acted(&app, id),
+            Some(aterm_messages::ActionIndex(0)),
+            "the band took the press over the native view"
+        );
+        assert_eq!(
+            settings_route(&app, wid),
+            Some(crate::native_settings::SettingsRoute::Packages),
+            "the same Settings tab, now on Packages"
+        );
+    }
+
+    /// HOVER OVER A CAPSULE LIGHTS IT AND SHOWS THE POINTER (design §7.2):
+    /// the motion tracker records the chip under the pointer — the capsule,
+    /// or the body itself, whose press is the row's `Details ›` and lights
+    /// it — and the cursor is the hand there; over the grid nothing is lit
+    /// and the cursor is the I-beam again; the pointer leaving the window
+    /// clears the lit chip.
+    #[test]
+    fn hover_over_a_capsule_lights_it_and_shows_the_pointer() {
+        use crate::message_band::{BandHover, HoverTarget};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.post_message(toolchain_row());
+        let layout = band_row(&app, wid);
+        assert_eq!(layout.capsules.len(), 2, "Packages, then Details \u{203a}");
+        let packages = layout.capsules[0].clone();
+        let details = layout.capsules[1].clone();
+        assert!(details.action.is_details());
+        let at = band_pixel(&app, wid);
+        let hover = |app: &crate::App| app.windows[&wid].band_hover;
+        let cursor = |app: &crate::App| {
+            let ws = &app.windows[&wid];
+            (ws.hover_pointer, ws.native_text_cursor)
+        };
+        let (x, y) = at(packages.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            hover(&app),
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Capsule(aterm_messages::ActionIndex(0))
+            })
+        );
+        assert_eq!(cursor(&app), (true, false), "the hand over a capsule");
+        let (x, y) = at(layout.title.0);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            hover(&app),
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Body
+            }),
+            "the body lights the Details \u{203a} its press performs"
+        );
+        assert_eq!(cursor(&app), (true, false));
+        let (x, y) = at(details.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            hover(&app),
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Capsule(aterm_messages::ActionIndex::DETAILS)
+            }),
+            "the Details \u{203a} is a chip like any other"
+        );
+        assert_eq!(cursor(&app), (true, false));
+        // Down into the grid: nothing lit, the I-beam.
+        let ch = app.win_cell_size(wid).1 as f64;
+        app.on_cursor_moved(wid, x, y + 3.0 * ch);
+        assert_eq!(hover(&app), None, "off the band, nothing is lit");
+        assert_eq!(cursor(&app), (false, true), "the grid's I-beam");
+        // Back onto the capsule, then out of the window.
+        let (x, y) = at(packages.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert!(hover(&app).is_some());
+        app.on_cursor_left(wid);
+        assert_eq!(hover(&app), None, "leaving the window clears the lit chip");
+    }
+
+    /// A DETAILS PRESS OPENS THE ENTRY IN THE CLICKED WINDOW (design §4.5,
+    /// D5): the band is chrome in every window, so a body press in a window
+    /// that is NOT frontmost installs Settings ▸ Messages THERE — that
+    /// window's own view of the one Settings controller, the entry
+    /// selected — and the frontmost window gets nothing; the same press in
+    /// the other window gives it its own view at the same entry; and a
+    /// press on another row moves the pressed window's view to it (one
+    /// Settings tab per window, the selection moved) without touching the
+    /// other window's selection.
+    #[test]
+    fn a_details_press_opens_the_entry_in_the_clicked_window() {
+        let mut app = crate::App::headless_for_test();
+        let first = crate::WindowId(0);
+        let session = app.next_session_id;
+        let second = app.insert_logical_window(crate::stub_session(session), 24, 80);
+        assert_eq!(
+            app.frontmost_window,
+            Some(second),
+            "the new window is frontmost; the press below lands in the other one"
+        );
+        let id = app.post_message(toolchain_row());
+        assert_eq!(app.message_band_rows, 1);
+        let tabs = |app: &crate::App, wid: crate::WindowId| app.windows[&wid].tab_set.tabs().len();
+        assert_eq!((tabs(&app, first), tabs(&app, second)), (1, 1));
+
+        // The body, in the first (background) window.
+        let at = band_pixel(&app, first);
+        let (x, y) = at(band_row(&app, first).title.0);
+        assert!(app.press_band_at(first, x, y), "consumed by the band");
+        assert_eq!(
+            settings_route(&app, first),
+            Some(crate::native_settings::SettingsRoute::Messages),
+            "Settings \u{25b8} Messages, in the pressed window"
+        );
+        assert_eq!(selected_message(&app, first), Some(id.raw()));
+        assert_eq!(
+            (tabs(&app, first), tabs(&app, second)),
+            (2, 1),
+            "the Settings tab went to the pressed window, not the frontmost one"
+        );
+        assert_eq!(settings_route(&app, second), None);
+        assert_eq!(acted(&app, id), None, "the body is no capsule");
+        assert!(
+            app.messages.live(id).is_some_and(|l| l.seen),
+            "the row is read and — a live meter — stays"
+        );
+
+        // The same press in the second window: its own view of the one
+        // controller, at the same entry.
+        let at = band_pixel(&app, second);
+        let (x, y) = at(band_row(&app, second).title.0);
+        assert!(app.press_band_at(second, x, y));
+        assert_eq!(
+            settings_route(&app, second),
+            Some(crate::native_settings::SettingsRoute::Messages)
+        );
+        assert_eq!(selected_message(&app, second), Some(id.raw()));
+        assert_eq!((tabs(&app, first), tabs(&app, second)), (2, 2));
+        let (instance_a, view_a) = app
+            .active_native_view(first)
+            .expect("Settings fronts the first window");
+        let (instance_b, view_b) = app
+            .active_native_view(second)
+            .expect("Settings fronts the second window");
+        assert_eq!(instance_a, instance_b, "one Settings controller");
+        assert_ne!(view_a, view_b, "…presented by a view of each window's own");
+
+        // Another row, pressed in the first window: that window's view moves
+        // to it — no second Settings tab — and the second window's view
+        // keeps its own selection.
+        let warning = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                "aterm.toml: unknown key `foo`",
+            )
+            .line("at line 12"),
+        );
+        assert_eq!(app.message_band_rows, 2);
+        let cols = usize::from(app.windows[&first].cols);
+        let rows = app.band_presentation(cols).rows;
+        let row = rows
+            .iter()
+            .position(|r| matches!(r.kind, aterm_messages::RowKind::Message(m) if m == warning))
+            .expect("the warning is on the band");
+        let at = band_pixel(&app, first);
+        let ch = app.win_cell_size(first).1 as f64;
+        let (x, y) = at(rows[row].title.0);
+        assert!(app.press_band_at(first, x, y + row as f64 * ch));
+        assert_eq!(selected_message(&app, first), Some(warning.raw()));
+        assert_eq!(tabs(&app, first), 2, "one Settings tab per window");
+        assert_eq!(
+            selected_message(&app, second),
+            Some(id.raw()),
+            "the other window's view is its own"
+        );
+        assert!(
+            app.messages.live(warning).is_none(),
+            "a held warning folds once read"
+        );
+    }
+
+    /// THE OVERFLOW ROW OPENS THE PAGE UNSELECTED (design §4.5): a press
+    /// anywhere on `… N more messages   Messages ›` — the words or the
+    /// chip — opens Settings ▸ Messages in the pressed window at the top of
+    /// the log with nothing expanded, reads no row, records no press and
+    /// folds nothing: every row is live and unseen afterwards and the band
+    /// still ends in the same link. The hover twin: the link lights from
+    /// anywhere on the row.
+    #[test]
+    fn the_overflow_row_opens_the_page_unselected() {
+        use crate::message_band::{BandHover, HoverTarget};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let ids: Vec<_> = (0..5)
+            .map(|i| {
+                app.post_message(
+                    aterm_messages::Message::new(
+                        aterm_messages::tags::CONFIG,
+                        aterm_messages::Severity::Warn,
+                        format!("config warning {i}"),
+                    )
+                    .line("why"),
+                )
+            })
+            .collect();
+        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
+        let cols = usize::from(app.windows[&wid].cols);
+        let rows = app.band_presentation(cols).rows;
+        let overflow = rows
+            .iter()
+            .position(|r| matches!(r.kind, aterm_messages::RowKind::Overflow { .. }))
+            .expect("five rows on a three-row band: an overflow row");
+        assert_eq!(
+            overflow,
+            usize::from(aterm_messages::MAX_ROWS) - 1,
+            "the last row"
+        );
+        assert!(
+            matches!(
+                rows[overflow].kind,
+                aterm_messages::RowKind::Overflow { hidden: 3 }
+            ),
+            "two rows shown, three behind the link: {:?}",
+            rows[overflow].kind
+        );
+        assert_eq!(rows[overflow].capsules.len(), 1, "one link");
+        let link = rows[overflow].capsules[0].clone();
+        assert_eq!(link.full_label, "Messages \u{203a}");
+        let at = band_pixel(&app, wid);
+        let ch = app.win_cell_size(wid).1 as f64;
+        let dy = overflow as f64 * ch;
+        // The words, then the chip: the same press, the same page.
+        for col in [4, link.col + 1] {
+            let (x, y) = at(col);
+            let target = app.band_hit_at(wid, x, y + dy).expect("on the band");
+            assert_eq!(
+                app.band_hover_for(wid, target),
+                Some(BandHover {
+                    row: overflow as u8,
+                    target: HoverTarget::Body
+                }),
+                "the link lights from column {col}"
+            );
+            assert!(app.press_band_at(wid, x, y + dy), "consumed by the band");
+            assert_eq!(
+                settings_route(&app, wid),
+                Some(crate::native_settings::SettingsRoute::Messages),
+                "Settings \u{25b8} Messages, in the pressed window (column {col})"
+            );
+            assert_eq!(
+                selected_message(&app, wid),
+                None,
+                "nothing expanded (column {col})"
+            );
+            assert_eq!(
+                app.windows[&wid].tab_set.tabs().len(),
+                2,
+                "the terminal and one Settings tab"
+            );
+        }
+        for id in &ids {
+            let live = app.messages.live(*id).expect("every row is still live");
+            assert!(!live.seen, "a link to the log reads no row");
+            assert_eq!(acted(&app, *id), None);
+        }
+        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
+        assert!(
+            app.band_presentation(cols)
+                .rows
+                .iter()
+                .any(|r| matches!(r.kind, aterm_messages::RowKind::Overflow { hidden: 3 })),
+            "the band is as it was"
+        );
+    }
+
+    /// HOVER OVER THE BODY LIGHTS DETAILS (design §2.2, §7.2): through the
+    /// real motion path and the real painter, a pointer on a row's title,
+    /// its glyph or its detail records the body and the frame lights that
+    /// row's `Details ›` — the press a click there performs — and not the
+    /// authored chip beside it; on the authored chip that chip lights and
+    /// the link goes out; on the link it lights as a chip; off the band
+    /// nothing is lit; a capsule-less row lights its lone link.
+    #[test]
+    fn hover_over_the_body_lights_details() {
+        use crate::message_band::{BandHover, HoverTarget, paint_rows};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.post_message(toolchain_row());
+        let layout = band_row(&app, wid);
+        let packages = layout
+            .capsules
+            .iter()
+            .find(|c| !c.action.is_details())
+            .expect("Packages")
+            .clone();
+        let details = layout
+            .capsules
+            .iter()
+            .find(|c| c.action.is_details())
+            .expect("Details \u{203a}")
+            .clone();
+        let cols = usize::from(app.windows[&wid].cols);
+        let theme = aterm_render::Theme::default();
+        let c = crate::chrome_band::band_colors(theme);
+        // What the frame carries for `cap` on row 0 under the window's own
+        // recorded hover: the painter's hover fill and ink.
+        let lit = |app: &crate::App, cap: &aterm_messages::CapsuleLayout| {
+            let p = app.band_presentation(cols);
+            let still =
+                app.messages
+                    .motion(&p, std::time::Instant::now(), aterm_messages::Look::STILL);
+            let painted = paint_rows(&p, theme, app.windows[&wid].band_hover, &still);
+            painted[0][cap.col].bg == c.capsule_hover
+                && painted[0][cap.col + 1].fg == c.capsule_hover_ink
+        };
+        let hover = |app: &crate::App| app.windows[&wid].band_hover;
+        assert_eq!(hover(&app), None);
+        assert!(
+            !lit(&app, &details) && !lit(&app, &packages),
+            "at rest nothing is lit"
+        );
+        let at = band_pixel(&app, wid);
+        // The title, the glyph, the detail: the body — and the Details ›
+        // lit, the authored chip not.
+        let mut body_cols = vec![layout.title.0, layout.glyph.0];
+        body_cols.extend(layout.detail.as_ref().map(|(col, _)| *col));
+        for col in body_cols {
+            let (x, y) = at(col);
+            app.on_cursor_moved(wid, x, y);
+            assert_eq!(
+                hover(&app),
+                Some(BandHover {
+                    row: 0,
+                    target: HoverTarget::Body
+                }),
+                "column {col} is the body"
+            );
+            assert!(
+                lit(&app, &details),
+                "column {col}: the Details \u{203a} lights"
+            );
+            assert!(
+                !lit(&app, &packages),
+                "column {col}: the authored chip does not"
+            );
+        }
+        // The authored chip: it lights, the link goes out.
+        let (x, y) = at(packages.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            hover(&app),
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Capsule(packages.action)
+            })
+        );
+        assert!(lit(&app, &packages) && !lit(&app, &details));
+        // The link itself: lit as a chip.
+        let (x, y) = at(details.col + 1);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            hover(&app),
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Capsule(aterm_messages::ActionIndex::DETAILS)
+            })
+        );
+        assert!(lit(&app, &details) && !lit(&app, &packages));
+        // Off the band: cleared, nothing lit.
+        let ch = app.win_cell_size(wid).1 as f64;
+        let (x, y) = at(layout.title.0);
+        app.on_cursor_moved(wid, x, y + 2.0 * ch);
+        assert_eq!(hover(&app), None);
+        assert!(!lit(&app, &details) && !lit(&app, &packages));
+
+        // A capsule-less row: its lone Details › is what the body lights.
+        let mut app = crate::App::headless_for_test();
+        app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                "aterm.toml: unknown key `foo`",
+            )
+            .line("at line 12"),
+        );
+        let layout = band_row(&app, wid);
+        assert_eq!(layout.capsules.len(), 1, "its Details \u{203a} alone");
+        let link = layout.capsules[0].clone();
+        assert!(link.action.is_details());
+        let at = band_pixel(&app, wid);
+        let (x, y) = at(layout.title.0);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            hover(&app),
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Body
+            })
+        );
+        assert!(lit(&app, &link), "the body lights the row's one link");
     }
 }

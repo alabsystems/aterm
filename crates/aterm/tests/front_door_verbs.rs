@@ -217,7 +217,6 @@ fn the_front_door_serves_the_hidden_helper_verbs_under_its_own_name() {
         let out = Command::new(env!("CARGO_BIN_EXE_aterm"))
             .arg(verb)
             .arg(&spec)
-            .env("ATERM_NO_AUTO_UPDATE", "1")
             .output()
             .expect("run the front door");
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

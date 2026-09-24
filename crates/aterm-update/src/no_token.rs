@@ -151,7 +151,7 @@ pub(crate) fn announce_unreadable(staging: &Staging, current_build: u64, explana
 ///
 /// This is not a stranded state and must not arm [`is_stranded`] — but "you
 /// provisioned a token and I threw it away" is still worth saying: it puts this
-/// REPOINTED source on the credential-less web lane (a 30-minute cadence instead of
+/// REPOINTED source on the credential-less web lane (a 10-minute cadence instead of
 /// 75 s, and a private repository is unreadable there) instead of the token lane it
 /// was provisioned for. Throttled like the stranded warning; silent when nothing was
 /// rejected (an absent source is just "not configured", which is a perfectly normal
@@ -166,11 +166,12 @@ pub(crate) fn note_unusable_token(source: &crate::Source, diagnosis: &Diagnosis)
         last_rejection_warned(),
         &format!(
             "an update token is present but unusable ({}) — github.com/{}/{} is being \
-             read over the credential-less web lane instead (a 30-minute cadence, and \
+             read over the credential-less web lane instead (a {}-minute cadence, and \
              unreadable there if the repository is private). Fix it with: {}",
             rejections.join("; "),
             source.owner,
             source.repo,
+            crate::cadence::WEB_INTERVAL_SECS / 60,
             // THE RUNG THIS SOURCE ACTUALLY CONSULTS — naming a rung the chain never
             // reads sent the operator to fix something that is never read
             // (2026-08-19, third instance of the class).
@@ -235,7 +236,7 @@ mod tests {
         Diagnosis {
             resolved: None,
             probes: vec![SourceProbe {
-                source: "$ATERM_UPDATE_TOKEN",
+                source: "keychain item aterm-update-token",
                 outcome: ProbeOutcome::Absent,
             }],
         }

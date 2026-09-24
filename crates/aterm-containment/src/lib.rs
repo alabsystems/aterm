@@ -176,15 +176,12 @@ pub use capability::{
 // repair's entry points are found by reading the consent module, not by tab
 // completion on the crate root.
 pub use consent::{
-    Attribution, BundleIdentity, CachedProbe, Claimant, Claimants, ConsentCache, ConsentKey,
-    ConsentPosture, DrClass, Enumeration, FdaProbe, FdaScope, FdaState, Folder, FsConsent,
-    ImageAnchor, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome, ResetAttempt, ResetOffer,
-    ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible, ResponsibleApp,
-    ResponsibleError, SelfImage, SpikeEvidence, TccutilPresence, bundle_identity,
-    claimant_search_roots, claimants_for, classify_claimants, classify_dr, classify_image_anchor,
-    classify_signing, codesign_report, designated_requirement, image_anchor, looks_like_bundle,
-    plist_marks_dev_build, plist_string, probe_fda, protected_roots, read_bounded, responsible_app,
-    responsible_pid, self_image, team_identifier,
+    Attribution, CachedProbe, ConsentCache, ConsentKey, ConsentPosture, DrClass, FdaProbe,
+    FdaScope, FdaState, Folder, FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel,
+    ProbeOutcome, ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus,
+    Responsible, ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr,
+    classify_image_anchor, image_anchor, probe_fda, protected_roots, responsible_app,
+    responsible_pid,
 };
 pub use mode::{ContainmentMode, ParseModeError};
 pub use output_filter::OutputSanitizer;

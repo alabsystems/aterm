@@ -164,8 +164,7 @@ pub fn decide(reading: &Reading, floor: u64, root: &Path) -> Result<(), String> 
         Reading::Free(free) if *free >= floor => Ok(()),
         Reading::Free(free) => Err(format!(
             "disk: {} free on the volume holding {}, under the {} floor — nothing was built \
-             (the volume filled mid-ladder twice on 2026-09-20; one of those runs started under \
-             this floor)",
+             (the volume filled mid-ladder twice on 2026-09-20)",
             gib(*free),
             root.display(),
             gib(floor)

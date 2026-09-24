@@ -512,6 +512,7 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
         commit: owner,
         min_build: None,
         arm64_only: false,
+        linux: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

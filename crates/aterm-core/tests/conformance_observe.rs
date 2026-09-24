@@ -385,3 +385,186 @@ impl aterm_core::terminal::RowMatch for ContainsReady {
         row.contains("READY")
     }
 }
+
+/// Paint one dialog on the alternate screen: the same bytes for every dialog but
+/// its one-word label, so two dialogs cost the same number of grid writes.
+fn dialog(label: &str) -> Vec<u8> {
+    format!("\x1b[H\x1b[2J Bash command\r\n\r\n   {label}\r\n\r\n ❯ 1. Yes\r\n   2. No\r\n")
+        .into_bytes()
+}
+
+#[derive(Debug)]
+struct ContainsBoxB;
+impl aterm_core::terminal::RowMatch for ContainsBoxB {
+    fn matches(&self, row: &str) -> bool {
+        row.contains("rm-box-B")
+    }
+}
+
+/// REGRESSION (the equal-seq re-entry): a TUI that leaves and re-enters the
+/// alternate screen and draws a second dialog with the same number of writes
+/// lands on the SAME `content_seq` on the SAME grid flag — box A `ls-box-A`
+/// and box B `rm-box-B` both read `seq=15` on a private headless aterm. The
+/// kernel keyed change on `(seq, alt)`, neither of which moved, so an `await
+/// match` armed while box A showed answered `OK timeout` while `text` showed
+/// box B. The screen GENERATION (`invalidation_epoch`, advanced by every screen
+/// switch) is what moved; the kernel now keys on it. Both shapes: the whole
+/// re-entry in ONE batch, and the switch and the paint split across two.
+#[test]
+fn a_row_match_latches_across_an_equal_seq_alt_screen_re_entry() {
+    for split in [false, true] {
+        let base = Instant::now();
+        let mut t = Terminal::new(24, 80);
+        t.process_at(b"\x1b[?1049h", clock_at(base, 1));
+        t.process_at(&dialog("ls-box-A"), clock_at(base, 2));
+        let seq_a = t.content_seq();
+        let epoch_a = t.content_scroll_state().invalidation_epoch;
+
+        let id = t
+            .watch_rows(
+                std::sync::Arc::new(ContainsBoxB),
+                aterm_core::terminal::RowRange::All,
+                clock_at(base, 3).monotonic,
+            )
+            .expect("arm");
+        let seq_watch = t
+            .watch(WatcherSpec::SeqAdvanced { after: seq_a }, base)
+            .expect("arm");
+        assert!(t.watch_poll(id).is_none(), "box B is not on screen yet");
+        assert!(t.watch_poll(seq_watch).is_none(), "nothing moved yet");
+
+        let mut reentry = b"\x1b[?1049l\x1b[?1049h".to_vec();
+        if split {
+            t.process_at(&reentry, clock_at(base, 4));
+            t.process_at(&dialog("rm-box-B"), clock_at(base, 5));
+        } else {
+            reentry.extend_from_slice(&dialog("rm-box-B"));
+            t.process_at(&reentry, clock_at(base, 4));
+        }
+
+        // The premise, or the test proves nothing: the grid flag and the seq
+        // are exactly what they were under box A, and only the epoch moved.
+        assert!(t.is_alternate_screen(), "split={split}");
+        assert_eq!(t.content_seq(), seq_a, "split={split}: the seq repeats");
+        assert!(
+            t.content_scroll_state().invalidation_epoch > epoch_a,
+            "split={split}: the screen switch advanced the generation"
+        );
+        assert!(
+            (0..t.rows() as usize).any(|i| t.row_text(i).is_some_and(|r| r.contains("rm-box-B"))),
+            "split={split}: box B is on screen"
+        );
+
+        assert!(
+            t.watch_poll(id).is_some(),
+            "split={split}: box B is on screen and `await match` must latch on it"
+        );
+        assert!(
+            t.watch_poll(seq_watch).is_some(),
+            "split={split}: a re-entered screen is a surface change for `await seq`"
+        );
+    }
+}
+
+/// NEGATIVE CONTROL for the above: with no screen switch, a repaint that keeps
+/// the seq and the text latches nothing — the generation is not a clock that
+/// fires on every batch.
+#[test]
+fn an_unmoved_generation_latches_nothing() {
+    let base = Instant::now();
+    let mut t = Terminal::new(24, 80);
+    t.process_at(b"\x1b[?1049h", clock_at(base, 1));
+    t.process_at(&dialog("ls-box-A"), clock_at(base, 2));
+    let seq_a = t.content_seq();
+    let id = t
+        .watch_rows(
+            std::sync::Arc::new(ContainsBoxB),
+            aterm_core::terminal::RowRange::All,
+            clock_at(base, 3).monotonic,
+        )
+        .expect("arm");
+    let seq_watch = t
+        .watch(WatcherSpec::SeqAdvanced { after: seq_a }, base)
+        .expect("arm");
+    // A cursor move alone: no write, no switch.
+    t.process_at(b"\x1b[5;5H", clock_at(base, 4));
+    assert_eq!(t.content_seq(), seq_a, "premise: nothing was written");
+    assert!(t.watch_poll(id).is_none());
+    assert!(t.watch_poll(seq_watch).is_none());
+}
+
+/// TIER-1 for `aterm_spec`'s `ObservationScreenGeneration`: drive the real
+/// engine through real batches — writes, and leave-and-re-enter switches with
+/// and without a paint in the same batch — and before each one arm a fresh
+/// `SeqAdvanced` at the current seq (the kernel's own view of "unchanged").
+/// Project the real `content_seq` / `invalidation_epoch` before and after the
+/// batch onto the model's `seen_seq`/`seen_epoch` and `seq`/`epoch`, fire the
+/// model's `Observe`, and require the real latch to agree with it: latched
+/// exactly when the model reads an advance. NEGATIVE CONTROL: the old
+/// `(seq, alt)` test (`Buggy=1`) disagrees with the real kernel on the
+/// equal-seq re-entry this schedule contains, so the bind is not vacuous.
+#[test]
+fn the_kernel_change_test_conforms_to_the_screen_generation_model() {
+    use aterm_spec::derive::observation_screen_generation_model;
+    use aterm_spec::interp::{State, with_buggy};
+
+    let model = observation_screen_generation_model();
+    let old = with_buggy(&model, 1);
+    let base = Instant::now();
+    let mut t = Terminal::new(24, 80);
+    t.process_at(b"\x1b[?1049h", clock_at(base, 1));
+
+    let mut reentry_paint = b"\x1b[?1049l\x1b[?1049h".to_vec();
+    reentry_paint.extend_from_slice(&dialog("rm-box-B"));
+    let batches: Vec<Vec<u8>> = vec![
+        dialog("ls-box-A"),
+        reentry_paint,
+        b"x".to_vec(),
+        b"\x1b[?1049l\x1b[?1049h".to_vec(),
+        dialog("ls-box-A"),
+        b"\x1b[3;3H".to_vec(),
+    ];
+    let mut old_disagreed = false;
+    for (i, bytes) in batches.iter().enumerate() {
+        let (seq0, epoch0) = (t.content_seq(), t.content_scroll_state().invalidation_epoch);
+        let id = t
+            .watch(WatcherSpec::SeqAdvanced { after: seq0 }, base)
+            .expect("arm");
+        t.process_at(bytes, clock_at(base, 10 + i as u64));
+        let (seq1, epoch1) = (t.content_seq(), t.content_scroll_state().invalidation_epoch);
+        let real = t.watch_poll(id).is_some();
+        t.watch_disarm(id);
+
+        let state = |seq: u64, epoch: u64| -> State {
+            let mut s = model.init_state();
+            for (k, v) in [
+                ("seq", seq),
+                ("epoch", epoch),
+                ("seen_seq", seq0),
+                ("seen_epoch", epoch0),
+            ] {
+                s.insert(k, i64::try_from(v).expect("small"));
+            }
+            s.insert("dirty", 1);
+            s
+        };
+        let changed = seq1 != seq0 || epoch1 != epoch0;
+        if !changed {
+            // No change: the model has no `Observe` to fire, and the kernel
+            // must latch nothing.
+            assert!(!real, "batch {i}: an unchanged surface latched");
+            continue;
+        }
+        let mut s = state(seq1, epoch1);
+        assert!(model.fire("Observe", &mut s));
+        assert_eq!(real, s["missed"] == 0, "batch {i}: kernel vs model");
+        assert!(model.check_invariant("EveryChangeIsSeen", &s), "batch {i}");
+        let mut o = state(seq1, epoch1);
+        assert!(old.fire("Observe", &mut o));
+        old_disagreed |= (o["missed"] == 0) != real;
+    }
+    assert!(
+        old_disagreed,
+        "the schedule must contain a batch the old (seq, alt) test misses"
+    );
+}

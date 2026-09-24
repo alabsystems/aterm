@@ -2438,27 +2438,6 @@ struct Meteor {
     arrived: bool,
 }
 
-/// Occupancy knowledge for ONE row flanking the probed cursor row — the
-/// STAR-LANDING seam ([`CursorGlow::observe_neighbor_rows`]). The displaced
-/// rainbow ribbon stars paint in the pixel bands of the rows ABOVE and BELOW the
-/// swept row, so the legibility gate must interrogate THOSE rows, not the
-/// spark's own cell; this enum records what the host actually told us, and the
-/// gate falls back to the safe in-cell placement whenever the answer is not a
-/// provable "blank".
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NbrProbe {
-    /// The host supplied no neighbor capture with this probe (older embedders,
-    /// hosts that only wire `observe_row`): occupancy UNKNOWN — displaced
-    /// stars must not gamble, so they take the in-cell fallback.
-    Unprobed,
-    /// The row does not exist (grid edge): the landing band is window padding
-    /// the effects box clips into — provably glyph-free by construction.
-    OffGrid,
-    /// Captured: the chars ride the matching `row_above_*`/`row_below_*`
-    /// double buffer, rotated in lockstep with `row_cur`/`row_prev`.
-    Probed,
-}
-
 /// Which detector families may consume one row probe — the repair for the
 /// alt-screen `no-row-probe` retire class: on `less` /-search typing, `vi`
 /// insert mode, and a per-key-echo TUI whose concurrent streamer writes at
@@ -2502,17 +2481,31 @@ struct RowProbe {
     caret: u16,
     fill: u16,
     at: Instant,
-    /// What the host told us about the row ABOVE `row` (see [`NbrProbe`]).
-    /// Rides the probe metadata so the neighbor buffers can never be read
-    /// against the wrong probe generation — the meta and its buffers rotate
-    /// as one unit in `poof_scan`.
-    above: NbrProbe,
-    /// What the host told us about the row BELOW `row`.
-    below: NbrProbe,
     /// Which detector families may read this probe (see [`ProbeTrust`]).
     /// Rides the metadata and rotates with it, so a kill branch can never
     /// pair a full-trust `cur` against a content-only `prev` unnoticed.
     trust: ProbeTrust,
+}
+
+/// A bounded, exact content witness for the last adjacent typed echo run.
+/// It is inert while the hand rests: only a later licensed typed echo reads
+/// it. A retired ribbon cell cannot be held by its old cohort, but the next
+/// key may re-lay the unchanged text it was typed beside.
+const RECENT_TYPED_RUN_CAP: usize = 256;
+
+#[derive(Clone, Copy)]
+struct RecentTypedRun {
+    row: u16,
+    col0: u16,
+    len: u16,
+    glyphs: [char; RECENT_TYPED_RUN_CAP],
+    at: Instant,
+}
+
+impl RecentTypedRun {
+    fn end(&self) -> u16 {
+        self.col0.saturating_add(self.len)
+    }
 }
 
 /// What a [`Vapor`] puff IS — palette + growth curve family.
@@ -2915,7 +2908,7 @@ impl TypedStamps {
 }
 
 /// **THE PRESS-CREDIT RING** — the typed-echo coalescer's ledger, one slot
-/// per keyed glyph (`(press instant, unpaid cells)`), banked by
+/// per keyed glyph (`(press instant, unpaid cells, exact glyph if known)`), banked by
 /// [`CursorGlow::note_typed_glyph`] and spent, oldest first, by the cells a
 /// licensed typed echo lays. THE LEDGER, NOT THE CLOCK: the presses that
 /// produce a late batch are by construction older than the batch (a hand at
@@ -2936,9 +2929,18 @@ impl TypedStamps {
 /// never the ring): a stalled batch whose box grew before it echoed is the
 /// echo the pool is there to pay for. Fixed-size and `Copy`: the steady
 /// frame path allocates nothing.
+type LiveUnpaidPress = (usize, Instant, u8, Option<char>);
+
+/// A loaded host can miss a whole composer row, not just the first four
+/// letters in the captured take. Bound this exceptional exact-glyph proof by
+/// the same 128 credits the ordinary typed sweep can spend. Up to eight older
+/// credits may precede the run, but none may be skipped inside it.
+const EXACT_COALESCED_PREFIX_MAX: usize = TYPED_STAMP_DEPTH;
+const EXACT_COALESCED_STALE_PREFIX_MAX: usize = 8;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PressCredits {
-    slots: [Option<(Instant, u8)>; TYPED_STAMP_DEPTH],
+    slots: [Option<(Instant, u8, Option<char>)>; TYPED_STAMP_DEPTH],
     /// The next slot to write — the ring overwrites its OLDEST press when
     /// full, so the newest [`TYPED_STAMP_DEPTH`] presses are the ones kept.
     /// Only [`Self::bank`] moves it; every other mutator blanks slots in
@@ -2960,16 +2962,20 @@ impl Default for PressCredits {
 
 impl PressCredits {
     /// Bank one press worth `credits` cells.
-    fn bank(&mut self, now: Instant, credits: u8) {
-        self.slots[self.head] = Some((now, credits));
+    fn bank(&mut self, now: Instant, credits: u8, glyph: Option<char>) {
+        self.slots[self.head] = Some((now, credits, glyph));
         self.head = (self.head + 1) % TYPED_STAMP_DEPTH;
     }
 
     /// The LIVE presses: unpaid, and younger than [`IN_FLIGHT_PATIENCE_S`].
-    fn within(&self, now: Instant) -> impl Iterator<Item = (Instant, u8)> + '_ {
-        self.slots.iter().flatten().copied().filter(move |(t, c)| {
-            *c > 0 && now.saturating_duration_since(*t).as_secs_f32() <= IN_FLIGHT_PATIENCE_S
-        })
+    fn within(&self, now: Instant) -> impl Iterator<Item = (Instant, u8, Option<char>)> + '_ {
+        self.slots
+            .iter()
+            .flatten()
+            .copied()
+            .filter(move |(t, c, _)| {
+                *c > 0 && now.saturating_duration_since(*t).as_secs_f32() <= IN_FLIGHT_PATIENCE_S
+            })
     }
 
     /// Unpaid CELLS of the live presses whose instant `keep` admits — the
@@ -2981,8 +2987,8 @@ impl PressCredits {
     /// from).
     fn cells_where(&self, now: Instant, keep: impl Fn(Instant) -> bool) -> usize {
         self.within(now)
-            .filter(|(t, _)| keep(*t))
-            .map(|(_, c)| usize::from(c))
+            .filter(|(t, _, _)| keep(*t))
+            .map(|(_, c, _)| usize::from(c))
             .sum()
     }
 
@@ -3002,7 +3008,127 @@ impl PressCredits {
     /// Oldest, because presses license echoes in press order — the rule
     /// [`TypedStamps::take_fresh`] follows.
     fn oldest_unpaid(&self, now: Instant) -> Option<Instant> {
-        self.within(now).map(|(t, _)| t).min()
+        self.within(now).map(|(t, _, _)| t).min()
+    }
+
+    /// The oldest FRESH press's exact glyph, in ring order. Older unspent
+    /// credits can survive a TUI's earlier suppressed echoes for the full
+    /// in-flight patience; they are not witnesses for this new print. A
+    /// later typeahead key cannot replace the earlier fresh glyph.
+    fn oldest_fresh_glyph(&self, now: Instant, freshness_s: f32) -> Option<(usize, char)> {
+        for k in 0..TYPED_STAMP_DEPTH {
+            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            if let Some((at, credits, glyph)) = self.slots[i]
+                && credits > 0
+                && now.saturating_duration_since(at).as_secs_f32() <= freshness_s
+            {
+                return glyph.map(|glyph| (i, glyph));
+            }
+        }
+        None
+    }
+
+    /// The chronological unpaid one-cell keys must spell this entire small
+    /// observed run. A stalled compositor may first show several Codex echoes
+    /// in one frame after the oldest key exceeds the short hint window; the
+    /// in-flight ledger, bounded to its normal patience, still remembers the
+    /// exact sequence. Only credits already stale at the prior blank-row
+    /// sample may be skipped before the run; none may be skipped inside it.
+    fn exact_unpaid_run(
+        &self,
+        now: Instant,
+        previous_probe_at: Instant,
+        glyphs: &[char],
+    ) -> Option<usize> {
+        self.exact_unpaid_run_with_tail_window(
+            now,
+            previous_probe_at,
+            glyphs,
+            CursorGlow::TYPE_HINT_FRESH,
+        )
+    }
+
+    /// The same chronological proof with a caller-selected tail age. A
+    /// same-caret blank-to-glyph transition itself witnesses a single delayed
+    /// echo; a moving coalesced prefix still requires its final key to be
+    /// fresh. Earlier credits may be skipped only when they predate the prior
+    /// row probe and have aged beyond the short key hint.
+    fn exact_unpaid_run_with_tail_window(
+        &self,
+        now: Instant,
+        previous_probe_at: Instant,
+        glyphs: &[char],
+        tail_window_s: f32,
+    ) -> Option<usize> {
+        if glyphs.is_empty() || glyphs.len() > EXACT_COALESCED_PREFIX_MAX {
+            return None;
+        }
+        // A fixed stack ledger holds the whole candidate plus only the bounded
+        // older-credit prefix. More pending keys are ambiguous and fail closed.
+        let mut live: [Option<LiveUnpaidPress>;
+            EXACT_COALESCED_PREFIX_MAX + EXACT_COALESCED_STALE_PREFIX_MAX] =
+            [None; EXACT_COALESCED_PREFIX_MAX + EXACT_COALESCED_STALE_PREFIX_MAX];
+        let mut n = 0;
+        for k in 0..TYPED_STAMP_DEPTH {
+            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let Some((at, credits, glyph)) = self.slots[i] else {
+                continue;
+            };
+            if credits == 0
+                || now.saturating_duration_since(at).as_secs_f32() > IN_FLIGHT_PATIENCE_S
+            {
+                continue;
+            }
+            if n == live.len() {
+                return None;
+            }
+            live[n] = Some((i, at, credits, glyph));
+            n += 1;
+        }
+        for start in 0..n {
+            if start + glyphs.len() <= n {
+                let exact = glyphs.iter().enumerate().all(|(offset, &expected)| {
+                    live[start + offset].is_some_and(|(_, _, credits, glyph)| {
+                        credits == 1 && glyph == Some(expected)
+                    })
+                });
+                if exact {
+                    let (_, last_at, _, _) = live[start + glyphs.len() - 1]?;
+                    // An old exact phrase cannot borrow an unrelated fresh
+                    // key's hint to claim a later program redraw.
+                    if now.saturating_duration_since(last_at).as_secs_f32() <= tail_window_s {
+                        return live[start].map(|(slot, _, _, _)| slot);
+                    }
+                }
+            }
+            // A failed candidate may be passed only if its first credit is
+            // older than the sampled blank row and the short hint window.
+            // That includes a repeated old `a`; a valid delayed echo above
+            // still wins before this skip is considered.
+            let (_, at, _, _) = live[start]?;
+            if start >= EXACT_COALESCED_STALE_PREFIX_MAX
+                || at > previous_probe_at
+                || now.saturating_duration_since(at).as_secs_f32() <= CursorGlow::TYPE_HINT_FRESH
+            {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// A later exact content echo proves earlier same-stream keys already
+    /// appeared or were suppressed. Drop their unpaid credits before the
+    /// existing oldest-first spend, so a suppressed echo cannot later fund
+    /// unrelated program output. Identify the selected slot by ring position,
+    /// not timestamp: two keys can share the host's input clock.
+    fn retire_before_slot(&mut self, selected: usize) {
+        for k in 0..TYPED_STAMP_DEPTH {
+            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            if i == selected {
+                return;
+            }
+            self.slots[i] = None;
+        }
     }
 
     /// SPEND `cells`, oldest-first: the presses that produced this echo are
@@ -3020,7 +3146,7 @@ impl PressCredits {
                 break;
             }
             let i = (self.head + k) % TYPED_STAMP_DEPTH;
-            let Some((t, c)) = &mut self.slots[i] else {
+            let Some((t, c, _)) = &mut self.slots[i] else {
                 continue;
             };
             if *c == 0 || now.saturating_duration_since(*t).as_secs_f32() > IN_FLIGHT_PATIENCE_S {
@@ -3041,7 +3167,7 @@ impl PressCredits {
     /// head does not move, so the chronological walk still holds).
     fn blank_where(&mut self, pred: impl Fn(Instant) -> bool) {
         for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|(t, _)| pred(t)) {
+            if slot.is_some_and(|(t, _, _)| pred(t)) {
                 *slot = None;
             }
         }
@@ -3079,6 +3205,38 @@ impl PressCredits {
         self.blank_where(|t| t <= at);
     }
 
+    /// A single exact one-cell key dispatched after an insert but banked by
+    /// its delivery. More than one eligible key is ambiguous: the unknown
+    /// insert width cannot say which, if any, was echoed inside its hop.
+    fn one_exact_between(
+        &self,
+        now: Instant,
+        dispatched_at: Instant,
+        delivered_at: Instant,
+    ) -> Option<(Instant, char)> {
+        let mut one = None;
+        for &(at, credits, glyph) in self.slots.iter().flatten() {
+            if at <= dispatched_at
+                || at > delivered_at
+                || credits == 0
+                || now.saturating_duration_since(at).as_secs_f32() > IN_FLIGHT_PATIENCE_S
+            {
+                continue;
+            }
+            if one.is_some() || credits != 1 {
+                return None;
+            }
+            let glyph = glyph?;
+            // A blank cell cannot witness a space or NUL echo: accepting it
+            // would let an unrelated program move spend this queued key.
+            if matches!(glyph, ' ' | '\0') {
+                return None;
+            }
+            one = Some((at, glyph));
+        }
+        one
+    }
+
     /// Take every press banked AFTER `at` out of the ring, at its own index
     /// — the twin of [`TypedStamps::split_off_after`] for a held park's
     /// flush: the judgment then spends, forgets or reads only
@@ -3090,7 +3248,7 @@ impl PressCredits {
             head: self.head,
         };
         for (i, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_some_and(|(t, _)| t > at) {
+            if slot.is_some_and(|(t, _, _)| t > at) {
                 later.slots[i] = slot.take();
             }
         }
@@ -3106,8 +3264,8 @@ impl PressCredits {
         if self.head == 0 && self.slots.iter().all(Option::is_none) {
             for k in 0..TYPED_STAMP_DEPTH {
                 let i = (later.head + k) % TYPED_STAMP_DEPTH;
-                if let Some((t, c)) = later.slots[i] {
-                    self.bank(t, c);
+                if let Some((t, c, glyph)) = later.slots[i] {
+                    self.bank(t, c, glyph);
                 }
             }
             return;
@@ -3124,7 +3282,7 @@ impl PressCredits {
         self.slots
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| slot.map(|(t, _)| (i, t)))
+            .filter_map(|(i, slot)| slot.map(|(t, _, _)| (i, t)))
             .max_by_key(|&(_, t)| t)
             .map(|(i, _)| i)
     }
@@ -3157,7 +3315,7 @@ impl PressCredits {
             return;
         }
         if let Some(i) = self.newest()
-            && let Some((_, c)) = &mut self.slots[i]
+            && let Some((_, c, _)) = &mut self.slots[i]
         {
             *c = c.saturating_sub(cells);
             if *c == 0 {
@@ -3236,6 +3394,10 @@ struct InsertLicence {
     /// The delivery instant — the writer thread's completed write (or the
     /// dispatch instant for a synchronous insert such as Tab).
     at: Instant,
+    /// The first byte of this insert was dispatched before keys pressed after
+    /// this instant. Those keys cannot own an echo of this insert's bytes,
+    /// even if their credits are already banked when the frame arrives.
+    dispatched_at: Instant,
     /// The insert's cell width as the host priced it from the text it put on
     /// the wire, or the [`CursorGlow::INSERT_GESTURE_CELLS`] bound when it
     /// could not. Accumulates when a second insert is delivered before the
@@ -3420,9 +3582,32 @@ struct InsertSeam {
     /// [`CursorGlow::INSERT_REWRITE_FRESH`] old ([`Self::retire_orphans`]).
     /// A key whose echo lands the next frame spends its own credit as `key`
     /// before that, and the retire is then a no-op. Cleared with the pool.
-    orphans: Option<(Instant, Instant)>,
+    orphans: Option<UnknownInsertOrphans>,
+    /// One ambiguous post-insert key, removed from the generic press pool at
+    /// orphan cleanup. Only a later exact glyph at this insert's next cell
+    /// can claim it; every other movement leaves the ordinary pool empty.
+    orphan_exact: Option<OrphanExactKey>,
     /// `trail status`'s insert rows ([`InsertTally`]).
     tally: InsertTally,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UnknownInsertOrphans {
+    dispatched_at: Instant,
+    delivered_at: Instant,
+    laid_at: Instant,
+    /// Absent when the insert lacked a sampled row/print generation or its
+    /// coordinate space was rewritten or translated before cleanup.
+    site: Option<(u16, u16, u64)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OrphanExactKey {
+    pressed_at: Instant,
+    row: u16,
+    col: u16,
+    glyph: char,
+    print_seq: u64,
 }
 
 /// What an arm overwrote, restored when THAT arm is revoked at its exact
@@ -3452,7 +3637,14 @@ impl InsertSeam {
     /// wins when it has one; a stale stamp is simply replaced. The
     /// accumulated-into licence is kept as the undo, so a revoke of THIS
     /// arm restores it rather than discarding the paste's credit.
-    fn arm(&mut self, at: Instant, cells: u16, known: bool, row: Option<u16>) -> InsertLicence {
+    fn arm(
+        &mut self,
+        at: Instant,
+        dispatched_at: Instant,
+        cells: u16,
+        known: bool,
+        row: Option<u16>,
+    ) -> InsertLicence {
         self.tally.delivered += 1;
         self.undo.last_cells = self.tally.last_cells;
         self.tally.last_cells = cells;
@@ -3462,6 +3654,7 @@ impl InsertSeam {
         let armed = match prior {
             Some(prev) => InsertLicence {
                 at,
+                dispatched_at: prev.dispatched_at.min(dispatched_at),
                 // A PRICED part adds its exact width; the unknown class's
                 // bound is counted ONCE per licence — a second unspent Tab
                 // / ⌃V (an auto-repeat, a double-tap that beeped) does not
@@ -3479,6 +3672,7 @@ impl InsertSeam {
             },
             None => InsertLicence {
                 at,
+                dispatched_at,
                 cells,
                 known,
                 row,
@@ -3529,6 +3723,8 @@ impl InsertSeam {
         self.clear();
         self.span = None;
         self.pending_hop = None;
+        self.orphans = None;
+        self.orphan_exact = None;
     }
 
     /// Move the ROW-ADDRESSED members with a scroll or a band move under
@@ -3541,6 +3737,10 @@ impl InsertSeam {
     fn translate_rows(&mut self, map: impl Fn(u16) -> Option<u16>) {
         self.span = None;
         self.pending_hop = None;
+        if let Some(orphans) = self.orphans.as_mut() {
+            orphans.site = None;
+        }
+        self.orphan_exact = None;
         for ins in [&mut self.armed, &mut self.undo.licence]
             .into_iter()
             .flatten()
@@ -3612,6 +3812,7 @@ impl InsertSeam {
         self.clear();
         self.pending_hop = None;
         self.span = Some(span);
+        self.orphan_exact = None;
         self.tally.lit += 1;
     }
 
@@ -3621,6 +3822,10 @@ impl InsertSeam {
         if let Some(span) = self.span.as_mut() {
             span.col1 = col;
         }
+        if let Some(orphans) = self.orphans.as_mut() {
+            orphans.site = None;
+        }
+        self.orphan_exact = None;
         self.tally.retracted += 1;
     }
 
@@ -3628,14 +3833,14 @@ impl InsertSeam {
     /// hop is old enough for any next-frame echo of theirs to have spent
     /// them ([`Self::orphans`]): returns the delivery instant to retire the
     /// press ring through, once.
-    fn retire_orphans(&mut self, now: Instant) -> Option<Instant> {
-        let (through, laid) = self.orphans?;
-        (now.saturating_duration_since(laid).as_secs_f32() > CursorGlow::INSERT_REWRITE_FRESH).then(
-            || {
+    fn retire_orphans(&mut self, now: Instant) -> Option<UnknownInsertOrphans> {
+        let orphans = self.orphans?;
+        (now.saturating_duration_since(orphans.laid_at).as_secs_f32()
+            > CursorGlow::INSERT_REWRITE_FRESH)
+            .then(|| {
                 self.orphans = None;
-                through
-            },
-        )
+                orphans
+            })
     }
 }
 
@@ -4337,10 +4542,9 @@ pub struct CursorGlow {
     /// credit, which is the right answer for the first key of a new burst.
     key_cue_at: Option<Instant>,
     /// The live style/pack's per-keystroke heat GAIN and cooling τ,
-    /// snapshotted by every [`Self::tick`] that gets past the MASTER SWITCH
-    /// and is not handled by the classic engine (which returns above the
-    /// store, writing neither these nor [`Self::sound_live`]) — not only by a
-    /// drawing one. Both are pure functions of the config
+    /// snapshotted ([`Self::store_key_timbre`]) by every [`Self::tick`] that
+    /// may open the key seam — every tick past the MASTER SWITCH, the classic
+    /// wake and a degenerate grid included — not only by a drawing one. Both are pure functions of the config
     /// (neither reads `intensity`), so the dark-but-audible path computes
     /// bit-identical values, and a click minted during a load-shed frame
     /// reads THIS tick's timbre rather than the last lit tick's. [`Self::cue_keystroke`] runs from the
@@ -4349,15 +4553,17 @@ pub struct CursorGlow {
     /// key-time click would carry the PRE-keystroke timbre (one keystroke of
     /// lag in the sound, the exact "feels behind" the seam exists to remove).
     /// Read only behind [`Self::sound_live`], and no tick opens that seam
-    /// without writing these first (they are stored at the end of the lazy
-    /// thermal decay, ABOVE both the zero-amplitude return and the live
-    /// path), so the zeroed `Default` is unreachable in the cue path.
+    /// without writing these first (every [`Self::settle_key_seam`] call site
+    /// stores them above it), so the zeroed `Default` is unreachable in the
+    /// cue path.
     heat_gain_live: f32,
     heat_tau_live: f32,
     /// Whether the LAST [`Self::tick`] left the key seam OPEN — it ran the
     /// live path (master on, real geometry, nonzero amplitude), OR it went
-    /// dark only for a MOTION or PERFORMANCE reason while
-    /// [`GlowConfig::audible`] said the key still belongs to this window.
+    /// dark for any reason but the master switch (a motion policy, the
+    /// load-shed envelope, a degenerate grid, the classic wake's own dark
+    /// frame) while [`GlowConfig::audible`] said the key still belongs to
+    /// this window. One law, [`Self::settle_key_seam`], on every style.
     /// [`Self::cue_keystroke`] records nothing unless this is set.
     ///
     /// THE LAW IT CARRIES, restated: sound is silenced by exactly the gates
@@ -4391,19 +4597,10 @@ pub struct CursorGlow {
     row_cur_meta: Option<RowProbe>,
     /// Metadata for `row_prev`.
     row_prev_meta: Option<RowProbe>,
-    /// THIS frame's capture of the row ABOVE the probed cursor row
-    /// ([`Self::observe_neighbor_rows`]) — the STAR-LANDING seam's newer half.
-    /// Same per-column char convention as `row_cur`. Readable ONLY through the
-    /// probe metadata's [`NbrProbe::Probed`] state, so a frame that skipped
-    /// the neighbor capture can never serve these bytes stale.
-    row_above_cur: Vec<char>,
-    /// Last-presented capture of the row above (rotated from `row_above_cur`
-    /// by `poof_scan`, in lockstep with `row_prev`).
-    row_above_prev: Vec<char>,
-    /// THIS frame's capture of the row BELOW the probed cursor row.
-    row_below_cur: Vec<char>,
-    /// Last-presented capture of the row below.
-    row_below_prev: Vec<char>,
+    /// Exact glyphs of the last adjacent, licensed typed run. Kept outside
+    /// the ribbon pool and deadline calculation after its visible cells
+    /// retire; read only by the next typed echo on this row.
+    recent_typed_run: Option<RecentTypedRun>,
     /// EASED display temperature 0..1 — the ONE number every fire layer reads
     /// (see [`Self::fire_t`]): it chases `max(heat, flare, coal floor)` damped
     /// by the quench, with a short attack and a slower release, so the whole
@@ -4498,11 +4695,13 @@ pub struct CursorGlow {
     /// each mutating entry that writes wiped state. Entries that only move
     /// state TOWARD the wiped fixpoint (`clear_blink`, `clear_typed`,
     /// `drop_row_probe`, the drains/takes/swaps) keep it, as do the two that
-    /// are structurally inert while dark: `cue_keystroke` no-ops once the
-    /// MASTER-OFF tick forces `sound_live` false — this latch is set by that
-    /// branch and by no other, so the argument does not rest on the
-    /// zero-amplitude return, which now leaves the seam open for a shed or
-    /// motion-reduced frame — and `observe_neighbor_rows`
+    /// are structurally inert while dark: `cue_keystroke` no-ops while
+    /// `sound_live` is false — this latch is set by the master-off /
+    /// degenerate-grid branch and by no other, and ONLY when that branch
+    /// leaves the seam shut (a degenerate grid the key belongs to stays open
+    /// and unlatched), so the argument rests on neither the zero-amplitude
+    /// return nor the classic wake, which leave the seam open for a heard dark
+    /// frame — and `observe_neighbor_rows`
     /// no-ops until an `observe_row` — which unsettles — lands first.
     /// `#[derive(Default)]` starts it false, so the first dark tick still
     /// runs one (no-op) wipe before latching.
@@ -6368,6 +6567,7 @@ impl CursorGlow {
     /// value: read as "unpriced", a zero-width glyph's erase retired the
     /// press BEFORE the run for a glyph it never laid.
     pub fn note_backspace_erasing(&mut self, now: Instant, cells: Option<u16>) {
+        self.recent_typed_run = None;
         // Backspace establishes a new deletion class. Close every older
         // movement class and, critically, the swallowed typed cohort's
         // unspent admission credits before arming quench/poof state below.
@@ -6430,6 +6630,7 @@ impl CursorGlow {
     /// touches heat/coal, so a live blaze from real typing keeps cooling
     /// naturally while you navigate.
     pub fn note_navigation(&mut self, now: Instant) {
+        self.recent_typed_run = None;
         self.flush_held_park();
         self.unsettle();
         // A newer, stronger input class supersedes a swallowed Tab/paste. If
@@ -6476,11 +6677,22 @@ impl CursorGlow {
         shifted: bool,
         class: rk::TypedClass,
     ) {
+        self.note_typed_glyph_with_expected(now, cells, shifted, class, None);
+    }
+
+    fn note_typed_glyph_with_expected(
+        &mut self,
+        now: Instant,
+        cells: u16,
+        shifted: bool,
+        class: rk::TypedClass,
+        expected: Option<char>,
+    ) {
         self.unsettle();
         self.supersede_typed_press();
         self.type_hint.stamp(now);
         let credits = cells.clamp(1, Self::RAINBOW_TYPED_SWEEP_MAX as u16) as u8;
-        self.type_press_ring.bank(now, credits);
+        self.type_press_ring.bank(now, credits, expected);
         self.last_committed_type = Some(now);
         // SEAM POINT 2 (§17.2, D14): the typed key → v2's `Typed`, the ONLY
         // event that builds its spine, beside the v1 stamps the classifier
@@ -6501,10 +6713,31 @@ impl CursorGlow {
         }
     }
 
+    /// The one-cell typed hint with the input glyph's exact identity. Hosts
+    /// that know only a cell count use [`Self::note_typed_glyph`] and cannot
+    /// enter the same-caret inference lane; every ordinary move is unchanged.
+    pub fn note_typed_expected(
+        &mut self,
+        now: Instant,
+        cells: u16,
+        shifted: bool,
+        class: rk::TypedClass,
+        glyph: char,
+    ) {
+        self.note_typed_glyph_with_expected(
+            now,
+            cells,
+            shifted,
+            class,
+            (cells == 1).then_some(glyph),
+        );
+    }
+
     /// Record a main-screen ENTER classifier stamp. It LICENSES the move that
     /// follows it, and a FRESH stamp is the bare-Enter license for the jump
     /// arm ("a cold Enter throws the streak again").
     pub fn note_return(&mut self, now: Instant) {
+        self.recent_typed_run = None;
         self.flush_held_park();
         self.unsettle();
         self.user_gesture_hint = None;
@@ -6651,7 +6884,7 @@ impl CursorGlow {
     }
 
     fn deliver_insert(&mut self, at: Instant, dispatched_at: Option<Instant>, width: InsertWidth) {
-        let Some(armed) = self.arm_insert(at, width) else {
+        let Some(armed) = self.arm_insert(at, dispatched_at.unwrap_or(at), width) else {
             return;
         };
         // THE LATE RECEIPT ([`PendingHop`]): the frame that observed the
@@ -6691,7 +6924,7 @@ impl CursorGlow {
     /// its instant finds it, undoes the tally, and the delivery re-arm
     /// counts the gesture once and performs the (legitimate) retro claim.
     pub fn note_insert_armed(&mut self, at: Instant, width: InsertWidth) {
-        let _ = self.arm_insert(at, width);
+        let _ = self.arm_insert(at, at, width);
     }
 
     /// The arm shared by [`Self::note_insert_delivered`] and
@@ -6701,15 +6934,21 @@ impl CursorGlow {
     /// ahead of that frame's anchor feed and tick, so what the engine
     /// remembers is where the hand was — and the seam armed
     /// ([`InsertSeam::arm`]). Returns the licence, or `None` for `Cells(0)`.
-    fn arm_insert(&mut self, at: Instant, width: InsertWidth) -> Option<InsertLicence> {
+    fn arm_insert(
+        &mut self,
+        at: Instant,
+        dispatched_at: Instant,
+        width: InsertWidth,
+    ) -> Option<InsertLicence> {
         let (cells, known) = match width {
             InsertWidth::Cells(0) => return None,
             InsertWidth::Cells(cells) => (cells, true),
             InsertWidth::Unknown => (Self::INSERT_GESTURE_CELLS, false),
         };
+        self.recent_typed_run = None;
         self.unsettle();
         let row = self.hand_row(at);
-        Some(self.insert.arm(at, cells, known, row))
+        Some(self.insert.arm(at, dispatched_at, cells, known, row))
     }
 
     /// THE HAND'S ROW at `now`, read once when an insert is armed as its
@@ -6867,11 +7106,11 @@ impl CursorGlow {
     /// Whether a FRESHER press class owns this same-row forward hop, so the
     /// insert must wait for its own echo: a navigation press (an arrow's own
     /// hop), a reflow, a scripted gesture stamped at another instant, or
-    /// unpaid typed presses whose credits cover the whole hop (the per-key
-    /// path and a coalesced batch — the classifier's `rainbow_coalesce` owns
-    /// those, and the insert's one shot must not be spent on them; a lone
-    /// late glyph the gate then refuses is relit by the insert's own sweep
-    /// through the echo ledger, `Licence::Insert`).
+    /// unpaid typed presses dispatched before this insert whose credits
+    /// cover the whole hop (the per-key path and a coalesced batch). Keys
+    /// dispatched behind the insert cannot have echoed ahead of its bytes
+    /// on the FIFO wire, even when a delayed frame finds all their credits
+    /// banked. Their own later echo must keep those credits.
     fn fresher_class_owns_hop(&self, hop: usize, ins: InsertLicence, now: Instant) -> bool {
         if hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
             || hint_fresh(self.reflow_hint, now, Self::REFLOW_HINT_FRESH)
@@ -6880,7 +7119,9 @@ impl CursorGlow {
         {
             return true;
         }
-        let credits = self.typed_credits_within(now);
+        let credits = self
+            .type_press_ring
+            .cells_where(now, |key_at| key_at <= ins.dispatched_at);
         credits > 0 && credits >= hop
     }
 
@@ -6955,6 +7196,9 @@ impl CursorGlow {
     /// gesture but it is not typing. Logged `licensed licence=insert`.
     fn lay_insert(&mut self, pr: u16, pc: u16, cr: u16, cc: u16, ins: InsertLicence, now: Instant) {
         self.unsettle();
+        if let Some(orphans) = self.insert.orphans.as_mut() {
+            orphans.site = None;
+        }
         let hop = usize::from(cc.saturating_sub(pc));
         let surplus = hop.saturating_sub(usize::from(ins.cells));
         if surplus > 0 {
@@ -6973,7 +7217,20 @@ impl CursorGlow {
         // banked at or before its delivery are bounded away later instead
         // ([`Self::insert_orphans`]).
         if !ins.known && self.type_press_ring.cells_where(now, |t| t <= ins.at) > 0 {
-            self.insert.orphans = Some((ins.at, now));
+            let site = self
+                .row_cur_meta
+                .filter(|m| m.row == cr && m.caret == cc && m.at == now)
+                .and_then(|_| {
+                    self.print_anchor
+                        .filter(|&(row, col, _)| row == cr && col == cc)
+                        .map(|(_, _, seq)| (cr, cc, seq))
+                });
+            self.insert.orphans = Some(UnknownInsertOrphans {
+                dispatched_at: ins.dispatched_at,
+                delivered_at: ins.at,
+                laid_at: now,
+                site,
+            });
         }
         self.insert.laid(InsertSpan {
             row: cr,
@@ -7067,6 +7324,7 @@ impl CursorGlow {
     /// retirement that the row change it is about to see was AUTHORED, so the
     /// line above still holds the text its trail decorates.
     pub fn note_newline_break(&mut self, now: Instant) {
+        self.recent_typed_run = None;
         self.unsettle();
         self.newline_hint = Some(now);
     }
@@ -7075,6 +7333,7 @@ impl CursorGlow {
     /// host resets this engine because an old cell-space path is not truthful
     /// after a resize/font/scale coordinate change.
     pub fn note_reflow(&mut self, now: Instant) {
+        self.recent_typed_run = None;
         // Reflow is a newer, disjoint movement class. Close any swallowed
         // typed cohort before arming it so a resize cannot leave old credits
         // available to pool with a later key.
@@ -7089,6 +7348,7 @@ impl CursorGlow {
     /// press, one license — and the classifier reads the landing's SHAPE to
     /// decide whether the jump choreography fires.
     pub fn note_motion(&mut self, now: Instant) {
+        self.recent_typed_run = None;
         self.clear_typed(now);
         self.unsettle();
         self.nav_hint = Some(now);
@@ -7101,6 +7361,7 @@ impl CursorGlow {
     /// the scripted move is licensed exactly like a Tab/paste.
     #[doc(hidden)]
     pub fn note_synthetic_move(&mut self, now: Instant) {
+        self.recent_typed_run = None;
         self.clear_typed(now);
         self.unsettle();
         self.user_gesture_hint = Some(now);
@@ -7273,6 +7534,7 @@ impl CursorGlow {
     /// press the clock had not retired went with them.
     fn forget_typed_credits(&mut self, now: Instant) {
         self.insert.orphans = None;
+        self.insert.orphan_exact = None;
         if self.type_press_ring.is_empty() {
             return;
         }
@@ -7587,6 +7849,7 @@ impl CursorGlow {
     /// forward Delete) must not leak the classifier into the next exact typed
     /// candidate.
     pub fn note_kill(&mut self, now: Instant, moves_cursor: bool) {
+        self.recent_typed_run = None;
         self.flush_held_park();
         self.unsettle();
         // A kill is the line's content going (the in-flight law): whatever
@@ -7950,6 +8213,12 @@ impl CursorGlow {
     /// press in [`TypedStamps`] and spent one per observed echo sweep, so the
     /// ceiling is gone: K keys in one frame license K sweeps, no more.
     pub fn clear_typed(&mut self, now: Instant) {
+        // This closes movement licences, including the boundary between two
+        // controller `turn` calls. The recent typed run is content evidence,
+        // not an unpaid licence: a later typed echo must still prove its own
+        // credit and an exact, adjacent same-row continuation before rejoining.
+        // Explicit edit/navigation/geometry boundaries retire the run where
+        // they are classified, rather than every generic licence clear.
         self.flush_held_park();
         self.type_hint.clear();
         self.clear_non_typed_hints(now);
@@ -8151,6 +8420,8 @@ impl CursorGlow {
         self.type_hint.clear();
         self.insert.clear();
         self.insert.pending_hop = None;
+        self.insert.orphans = None;
+        self.insert.orphan_exact = None;
         self.quench_hint = None;
         self.nav_hint = None;
         self.return_hint = None;
@@ -8204,27 +8475,15 @@ impl CursorGlow {
     /// never compare two different terminals (or pre/post-scroll content) into
     /// a phantom poof. Capacity is retained: zero steady-state allocation.
     pub fn drop_row_probe(&mut self) {
+        self.recent_typed_run = None;
         self.park_source_intact = None;
         self.row_cur.clear();
         self.row_prev.clear();
         self.row_cur_meta = None;
         self.row_prev_meta = None;
-        self.clear_neighbor_rows();
         self.kill_hint = None;
         self.bs_poof_hint = None;
         self.bs_baseline = None;
-    }
-
-    /// Clear the star-landing neighbor captures (both generations). Called
-    /// wherever the row probe itself is dropped — the neighbor buffers are
-    /// meta-gated (unreadable once the metas are `None`), so this is capacity-
-    /// retaining hygiene keeping their lifecycle byte-identical to
-    /// `row_cur`/`row_prev`'s.
-    fn clear_neighbor_rows(&mut self) {
-        self.row_above_cur.clear();
-        self.row_above_prev.clear();
-        self.row_below_cur.clear();
-        self.row_below_prev.clear();
     }
 
     /// A PTY-driven scroll shifted the whole screen up `rows` lines this
@@ -8253,6 +8512,7 @@ impl CursorGlow {
         if rows == 0 {
             return;
         }
+        self.recent_typed_run = None;
         self.carry_held_park(|row| row.checked_sub(rows));
         // A plain-Backspace classifier and its legacy `(row, fill)` baseline
         // describe the pre-scroll content stream. Even before the host's
@@ -8470,6 +8730,7 @@ impl CursorGlow {
         if delta == 0 || top > bottom {
             return;
         }
+        self.recent_typed_run = None;
         self.carry_held_park(|row| band_row(row, top, bottom, delta));
         self.bs_poof_hint = None;
         self.bs_baseline = None;
@@ -8609,12 +8870,6 @@ impl CursorGlow {
             caret,
             fill,
             at: now,
-            // Neighbor knowledge arrives separately (`observe_neighbor_rows`,
-            // called right after this by hosts that wire it); until it does,
-            // the star-landing gate treats the flanking rows as UNKNOWN and
-            // displaced stars take the safe in-cell fallback.
-            above: NbrProbe::Unprobed,
-            below: NbrProbe::Unprobed,
             trust,
         });
         // SEAM POINT 13 (§5.4): the same probe, handed to v2's glyph gate.
@@ -8741,29 +8996,13 @@ impl CursorGlow {
     /// `observe_row` (it no-ops when no fresh probe arrived this frame);
     /// skipping it entirely leaves the neighbors UNKNOWN and displaced stars
     /// fall back to the in-cell placement — never a guess over someone
-    /// else's glyphs. Copied into the same rotate-on-`poof_scan` double
-    /// buffering as the row probe: zero steady-state allocation.
+    /// else's glyphs. The supplied slices feed v2 directly; no retained
+    /// neighbor copy is needed after the occupancy bitsets are updated.
     pub fn observe_neighbor_rows(&mut self, above: Option<&[char]>, below: Option<&[char]>) {
-        let Some(meta) = self.row_cur_meta.as_mut() else {
+        let Some(meta) = self.row_cur_meta else {
             return;
         };
         let probed_row = i32::from(meta.row);
-        self.row_above_cur.clear();
-        self.row_below_cur.clear();
-        meta.above = match above {
-            Some(cols) => {
-                self.row_above_cur.extend_from_slice(cols);
-                NbrProbe::Probed
-            }
-            None => NbrProbe::OffGrid,
-        };
-        meta.below = match below {
-            Some(cols) => {
-                self.row_below_cur.extend_from_slice(cols);
-                NbrProbe::Probed
-            }
-            None => NbrProbe::OffGrid,
-        };
         // SEAM POINT 13 (§5.4): the flanking rows feed v2's sky-band gate —
         // a star is born over row−1 only where this says it is blank. An
         // off-grid neighbour needs no write: the engine answers `Some(false)`
@@ -9381,6 +9620,7 @@ impl CursorGlow {
     /// HEARD, so it must KEEP the credits an in-flight echo is about to
     /// spend, while a master-off, reset or unfocused tick must not.
     fn clear_transient_state(&mut self) {
+        self.recent_typed_run = None;
         self.park_source_intact = None;
         // A held park is judged before the teardown takes its stamp and
         // its pool: today's verdict, then the wipe.
@@ -9410,7 +9650,6 @@ impl CursorGlow {
         self.row_prev.clear();
         self.row_cur_meta = None;
         self.row_prev_meta = None;
-        self.clear_neighbor_rows();
     }
 
     /// Clear output-bearing geometry and the per-frame accessor caches, while
@@ -9471,7 +9710,8 @@ impl CursorGlow {
     /// WHO CALLS IT: [`Self::reset`] and the master-off dark return, both
     /// unconditionally (a credit banked before the switch, or in a coordinate
     /// space that just died, must not mute the first click of the next one);
-    /// and the zero-amplitude return ONLY when the tick is inaudible. A shed
+    /// and [`Self::settle_key_seam`] — the zero-amplitude return, a
+    /// degenerate grid, the classic wake — ONLY when the tick is inaudible. A shed
     /// or motion-reduced frame is dark but still heard, so its banked credits
     /// must survive — the in-flight echoes of keys typed during the shed
     /// arrive after the latch flaps back to lit, find their credits, and stay
@@ -9483,6 +9723,40 @@ impl CursorGlow {
     fn clear_sound_ledger(&mut self) {
         self.sound_cues.clear();
         self.clear_keyed_clicks();
+    }
+
+    /// Snapshot the key-time click's TIMBRE inputs ([`Self::heat_gain_live`],
+    /// [`Self::heat_tau_live`]) off this tick's config. Both are pure
+    /// functions of `cfg` that never read `intensity`. Every tick that may
+    /// OPEN the key seam calls this first, so the seam never opens on a
+    /// stale or `Default` thermal snapshot.
+    fn store_key_timbre(&mut self, cfg: &GlowConfig) {
+        self.heat_gain_live = Self::heat_gain(cfg, matches!(cfg.style, GlowStyle::Fire));
+        self.heat_tau_live = Self::heat_tau(cfg);
+    }
+
+    /// THE KEY SEAM'S ONE LAW for every tick past the master switch: open
+    /// when this tick DREW, or when the host marked it [`GlowConfig::audible`]
+    /// (the key belongs to this window and the person asked for an aurora).
+    /// A tick that is dark only because of a motion policy, the load-shed
+    /// envelope, a degenerate grid, or the classic engine's own dark frame
+    /// is still heard. When the seam closes, the sound ledger goes with it,
+    /// and only then: a heard dark frame keeps its banked credits, so the
+    /// echoes of keys typed during it stay silent when they land.
+    ///
+    /// Four call sites (the degenerate-grid return, the classic wake, the
+    /// zero-amplitude return, the live path) and ONE law. That is what the
+    /// `TrailSoundSeam` model's Tier-1 conformance drives on every style.
+    /// Before 2026-09-22 the classic wake returned above every writer, so its
+    /// seam was whatever the previous style left: a fresh `classic` session
+    /// never clicked, and one switched from another style kept clicking in
+    /// an unfocused window.
+    fn settle_key_seam(&mut self, cfg: &GlowConfig, drew: bool) {
+        let open = drew || cfg.audible;
+        if !open {
+            self.clear_sound_ledger();
+        }
+        self.sound_live = open;
     }
 
     /// UN-LATCH the dark-settled fast path (see [`Self::dark_settled`]): the
@@ -9619,8 +9893,32 @@ impl CursorGlow {
         {
             self.flush_held_park();
         }
-        if let Some(through) = self.insert.retire_orphans(now) {
-            self.type_press_ring.retire_through(through);
+        if let Some(orphans) = self.insert.retire_orphans(now) {
+            self.insert.orphan_exact = orphans
+                .site
+                .zip(self.type_press_ring.one_exact_between(
+                    now,
+                    orphans.dispatched_at,
+                    orphans.delivered_at,
+                ))
+                .map(
+                    |((row, col, print_seq), (pressed_at, glyph))| OrphanExactKey {
+                        pressed_at,
+                        row,
+                        col,
+                        glyph,
+                        print_seq,
+                    },
+                );
+            // The generic one-credit `+1` path must NEVER read this key:
+            // an ambient different glyph on the same row would otherwise
+            // spend it. The exact escrow above is its only remaining claim.
+            self.type_press_ring.retire_through(orphans.delivered_at);
+        }
+        if self.insert.orphan_exact.is_some_and(|key| {
+            now.saturating_duration_since(key.pressed_at).as_secs_f32() > IN_FLIGHT_PATIENCE_S
+        }) {
+            self.insert.orphan_exact = None;
         }
     }
 
@@ -9826,7 +10124,22 @@ impl CursorGlow {
             } else {
                 Self::CROWN_MS
             };
-            if self.spawn(pr, pc, cr, cc, now, cfg, geom, SpawnLane::Visible) {
+            self.coalesced_prefix_echo((pr, pc), (cr, cc), now, cfg, geom);
+            // An unknown-width insert's later single key was removed from
+            // the generic press pool. Restore it for THIS exact observed
+            // glyph only, through the ordinary classifier/spend, then drop
+            // any remainder. The escrow is one-shot even on a refusal.
+            let exact_orphan = self.orphan_exact_echo((pr, pc), (cr, cc), now, cfg);
+            let orphan = self.insert.orphan_exact.take().filter(|_| exact_orphan);
+            if let Some(key) = orphan {
+                self.type_press_ring
+                    .bank(key.pressed_at, 1, Some(key.glyph));
+            }
+            let admitted = self.spawn(pr, pc, cr, cc, now, cfg, geom, SpawnLane::Visible);
+            if let Some(key) = orphan {
+                self.type_press_ring.revoke_at(key.pressed_at);
+            }
+            if admitted {
                 self.last_move = Some(now);
                 self.crown_until = Some(now + Duration::from_millis(self.crown_window_ms));
             } else {
@@ -9887,6 +10200,47 @@ impl CursorGlow {
             // and the Sweep lays the glyph), and a mirror seeded at `(r, 0)`
             // would fold that key's neighbour cell onto the row above.
         }
+    }
+
+    /// The only witness that can release a key held out of the generic pool
+    /// after an unknown insert: its own next cell, still on the insert's row,
+    /// changes from blank to that exact glyph in a frame with a new PTY print
+    /// generation. A different glyph, a moved/re-written insert, a newer
+    /// pending key or an old print leaves the escrow unusable.
+    fn orphan_exact_echo(
+        &self,
+        from: (u16, u16),
+        to: (u16, u16),
+        now: Instant,
+        cfg: &GlowConfig,
+    ) -> bool {
+        let Some(key) = self.insert.orphan_exact else {
+            return false;
+        };
+        if matches!(key.glyph, ' ' | '\0')
+            || !matches!(cfg.style, GlowStyle::RainbowKitty)
+            || from != (key.row, key.col)
+            || to != (key.row, key.col.saturating_add(1))
+            || !self.type_press_ring.is_empty()
+            || !self
+                .insert
+                .span
+                .is_some_and(|span| span.row == key.row && span.col1 == key.col)
+            || !self
+                .row_prev_meta
+                .is_some_and(|m| m.row == key.row && m.caret == key.col && m.at < now)
+            || !self.row_cur_meta.is_some_and(|m| {
+                m.row == key.row && m.caret == key.col.saturating_add(1) && m.at == now
+            })
+            || !self
+                .print_anchor
+                .is_some_and(|(_, _, seq)| seq > key.print_seq && seq != self.print_anchor_seen)
+        {
+            return false;
+        }
+        let col = usize::from(key.col);
+        self.row_prev.get(col).copied().unwrap_or(' ') == ' '
+            && self.row_cur.get(col).copied().unwrap_or(' ') == key.glyph
     }
 
     /// The caret was SHOWN at `cur` this tick (or not shown at all): the
@@ -9989,10 +10343,25 @@ impl CursorGlow {
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || geom.rows == 0 || geom.cols == 0 {
             // Full zero includes any in-flight style crossfade: OFF means dark
             // NOW, not a quarter-second of residue from the previous style.
-            // The key seam closes with the light (see `sound_live`): while the
-            // master is off, a keypress records no cue — and any credit banked
-            // before the switch dies with the cues it was accounting for.
-            self.sound_live = false;
+            //
+            // THE KEY SEAM on this return depends on WHY it is taken. The
+            // MASTER SWITCH (and serious mode, which arrives as `enabled`)
+            // closes it: while the master is off a keypress records no cue,
+            // and any credit banked before the switch dies with the cues it
+            // was accounting for. A DEGENERATE GRID does not close it. That
+            // is a fact about the light's canvas, not a gate about sound, so
+            // it takes the one law every tick past the master switch takes
+            // ([`Self::settle_key_seam`]): dark, and heard exactly when the
+            // host marked it `audible`. It used to close the seam like the
+            // master switch, and `aterm ctl tone` had no name for that, so a
+            // focused window with a momentarily empty grid read
+            // `closed:engine-silent` — the alarm reserved for a regression.
+            if cfg.enabled {
+                self.store_key_timbre(cfg);
+                self.settle_key_seam(cfg, false);
+            } else {
+                self.sound_live = false;
+            }
             // LATCHED (driver-02): after one full teardown every store in the
             // wipe pair below is already at its cleared value, and only an
             // enabled tick, [`Self::reset`], or an [`Self::unsettle`] caller
@@ -10003,12 +10372,23 @@ impl CursorGlow {
             // OUTSIDE the latch on purpose: re-enabling mid-session must see
             // the live position, or the first lit frame spawns one giant
             // spurious comet (the cursor_trail.rs disabled-branch rationale).
+            //
+            // The latch is set ONLY while the seam is shut. A degenerate grid
+            // the key belongs to leaves the seam open, and `cue_keystroke`
+            // writes the sound ledger without unsettling, so latching there
+            // would hold a dirty ledger past a later master-off. It runs the
+            // teardown every frame instead, which only a transient empty grid
+            // pays. The sound ledger survives it for the reason it survives a
+            // shed frame: the echoes of keys typed during it must still find
+            // their credits.
             if !self.dark_settled {
                 self.clear_transient_state();
-                self.clear_sound_ledger();
+                if !self.sound_live {
+                    self.clear_sound_ledger();
+                }
                 self.clear_thermals();
-                self.dark_settled = true;
             }
+            self.dark_settled = !self.sound_live;
             self.last = cur;
             self.last_visible = cur.map(|c| (c, now));
             self.hide_bridge_shown = None;
@@ -10041,6 +10421,13 @@ impl CursorGlow {
             self.kill_hint = None;
             self.bs_poof_hint = None;
             self.bs_baseline = None;
+            // The classic wake SOUNDS (its voice is the phaser's `pew`), and
+            // its key seam obeys the one law every style obeys. The v0.28
+            // engine mints no echo cues of its own, so the key-time click is
+            // its only sound; the timbre snapshot rides the same config the
+            // modern path reads.
+            self.store_key_timbre(cfg);
+            self.settle_key_seam(cfg, cfg.intensity > 0.0);
             return self.classic.tick(cur, now, cfg, geom, out);
         }
 
@@ -10199,13 +10586,13 @@ impl CursorGlow {
         }
         self.heat_at = Some(now);
         // THE KEY-TIME CLICK'S TIMBRE INPUTS, written by every tick that gets
-        // past the master switch AND is not handled by the classic engine
-        // (which returns ~150 lines above, writing neither these nor
-        // `sound_live`) — including one that is about to return dark for a
-        // motion or performance reason, which now still sounds its keys.
-        // THE INVARIANT THIS SITE EXISTS FOR, stated exactly: both writers of
-        // `sound_live` sit BELOW these two stores, so the seam can never open
-        // on a stale thermal snapshot.
+        // past the master switch (the degenerate-grid return and the classic
+        // wake above store them through the same [`Self::store_key_timbre`])
+        // — including one that is about to return dark for a motion or
+        // performance reason, which now still sounds its keys.
+        // THE INVARIANT THIS SITE EXISTS FOR, stated exactly: both
+        // [`Self::settle_key_seam`] calls below sit BELOW this store, so the
+        // seam can never open on a stale thermal snapshot.
         // Both are pure functions of `cfg`: `heat_gain` reads fire-ness and
         // `pack.heat.gain`, `heat_tau` reads the style and `pack.heat.tau`,
         // and NEITHER reads `intensity` — so the ramp shadow above (which
@@ -10215,8 +10602,7 @@ impl CursorGlow {
         // aged the integrators they pair with, so a cue minted after any
         // non-master-off tick reads a COHERENT thermal snapshot rather than a
         // `Default` zero.
-        self.heat_gain_live = Self::heat_gain(cfg, matches!(cfg.style, GlowStyle::Fire));
-        self.heat_tau_live = Self::heat_tau(cfg);
+        self.store_key_timbre(cfg);
 
         // ZERO AMPLITUDE (unfocused / motion-reduced / a genuine 0 intensity):
         // emit NO light and spawn nothing, but KEEP the long-lived thermal
@@ -10249,30 +10635,28 @@ impl CursorGlow {
             // respect. NOTE: no `clear_thermals` here — the lazy decay above
             // already cooled the long-lived integrators by the elapsed gap,
             // which is the whole focus-blip contract this branch guards.
-            self.sound_live = cfg.audible;
-            self.clear_transient_state();
+            //
             // The SOUND ledger is transient state the audio half owns, so it
-            // goes only when the seam goes: wiping the banked key credits on
-            // every shed frame would double-click the whole burst the moment
-            // the latch flapped back to lit (the in-flight echoes would find
-            // no credit to spend). An unfocused tick keeps today's wipe.
-            if !cfg.audible {
-                self.clear_sound_ledger();
-            }
+            // goes only when the seam goes ([`Self::settle_key_seam`]): wiping
+            // the banked key credits on every shed frame would double-click
+            // the whole burst the moment the latch flapped back to lit (the
+            // in-flight echoes would find no credit to spend). An unfocused
+            // tick keeps today's wipe.
+            self.settle_key_seam(cfg, false);
+            self.clear_transient_state();
             self.track_shown_caret(cur, now);
             return 0;
         }
         // Past both dark returns: this tick DRAWS, so the key seam is open.
-        // The two dark paths above no longer agree about it: the MASTER-OFF
-        // return still shuts it (it runs a full `clear_thermals` teardown, so
-        // a click minted after it would read a genuinely dead thermal state,
-        // and it is also the `cursor_trail = false` / serious-mode case the
-        // user asked for), while the zero-amplitude return asks
-        // `cfg.audible` — a shed or motion-reduced frame is dark but heard.
-        // The thermal constants this click reads are written above, at the
-        // end of the lazy decay, so every tick past the master switch leaves
-        // them fresh.
-        self.sound_live = true;
+        // Only the MASTER-OFF return shuts it unconditionally (it is the
+        // `cursor_trail = false` / serious-mode case the user asked for);
+        // every other return — a degenerate grid, the classic wake, zero
+        // amplitude — asks `cfg.audible` through the same
+        // [`Self::settle_key_seam`], so a shed or motion-reduced frame is dark
+        // but heard. The thermal constants this click reads are written
+        // above, at the end of the lazy decay, so every tick past the master
+        // switch leaves them fresh.
+        self.settle_key_seam(cfg, true);
 
         self.expire_seam_holds(now);
         // Spawn on a real move between two visible positions — where "visible"
@@ -10295,7 +10679,8 @@ impl CursorGlow {
         if cur.is_some() && cur != self.last_visible.map(|(cell, _)| cell) {
             self.wrap_paid_row = None;
         }
-        self.echo_anchor_pass(cur, cursor_move_observed, now, cfg, geom);
+        let content_echo = self.same_caret_typed_echo(cur, cursor_move_observed, now, cfg, geom);
+        self.echo_anchor_pass(cur, cursor_move_observed || content_echo, now, cfg, geom);
         self.track_shown_caret(cur, now);
 
         // ERASE POOF detection: a fresh kill-key hint paired with a same-row NET
@@ -10998,6 +11383,228 @@ impl CursorGlow {
         let on_grid = u16::try_from(pane_col1.saturating_sub(1)).unwrap_or(u16::MAX);
         self.hide_bridge_shown = self.hide_bridge_shown.or(estimate);
         self.last_visible = Some(((ar, col.min(on_grid)), now));
+    }
+
+    /// A new glyph immediately before the observed caret, backed by the
+    /// oldest eligible one-cell press and a resident hand-owned cell. A moving
+    /// prefix needs the short key hint; the same-caret path may use the full
+    /// in-flight patience because the exact blank-to-glyph row change is its
+    /// only movement witness. The row probe and print generation were
+    /// already sampled by the host; this reads them only on a candidate,
+    /// never on an idle frame.
+    fn exact_pending_prefix_slot(
+        &self,
+        row: u16,
+        col: u16,
+        observed_caret: u16,
+        now: Instant,
+        same_caret: bool,
+    ) -> Option<usize> {
+        if col == 0
+            || self
+                .print_anchor
+                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+            || (!same_caret && !self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH))
+            || self.typed_credits_within(now) == 0
+            || !self
+                .row_prev_meta
+                .is_some_and(|p| p.row == row && p.caret == col)
+            || !self
+                .row_cur_meta
+                .is_some_and(|p| p.row == row && p.caret == observed_caret)
+        {
+            return None;
+        }
+        let glyph_col = usize::from(col - 1);
+        // A wholly blank row is trimmed to an empty probe. Missing trailing
+        // columns are blank cells, unlike a wide glyph's `\0` continuation.
+        let old = self.row_prev.get(glyph_col).copied().unwrap_or(' ');
+        let new = self.row_cur.get(glyph_col).copied().unwrap_or(' ');
+        if old != ' ' || matches!(new, ' ' | '\0') {
+            return None;
+        }
+        let slot = if same_caret {
+            self.type_press_ring.exact_unpaid_run_with_tail_window(
+                now,
+                self.row_prev_meta?.at,
+                &[new],
+                IN_FLIGHT_PATIENCE_S,
+            )?
+        } else {
+            let (slot, expected) = self
+                .type_press_ring
+                .oldest_fresh_glyph(now, Self::TYPE_HINT_FRESH)?;
+            (new == expected).then_some(slot)?
+        };
+        self.v2
+            .ribbon()
+            .cells()
+            .iter()
+            .any(|c| c.row == row && c.col == col - 1 && c.typing && !c.leaving())
+            .then_some(slot)
+    }
+
+    /// A slipped host frame can coalesce Codex's first wrapped-row `a`
+    /// with later keys. Re-lay only that exact glyph before judging the
+    /// observed forward hop, which retains its original source and licence.
+    fn coalesced_prefix_echo(
+        &mut self,
+        from: (u16, u16),
+        to: (u16, u16),
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+    ) {
+        let (pr, pc) = from;
+        let (cr, cc) = to;
+        if !matches!(cfg.style, GlowStyle::RainbowKitty)
+            || pr != cr
+            || cc <= pc
+            || self.last != Some((pr, pc))
+        {
+            return;
+        }
+        let Some(slot) = self
+            .exact_pending_prefix_slot(pr, pc, cc, now, false)
+            .or_else(|| self.exact_coalesced_prefix_slot(pr, pc, cc, now))
+        else {
+            return;
+        };
+        let credits = self.type_press_ring;
+        self.type_press_ring.retire_before_slot(slot);
+        let admitted = self.spawn(pr, pc - 1, pr, pc, now, cfg, geom, SpawnLane::Visible);
+        if !admitted {
+            self.type_press_ring = credits;
+        } else {
+            self.remember_exact_first_cell(pr, pc - 1, now);
+        }
+    }
+
+    /// A whole first composer batch can arrive after its `a` has aged beyond
+    /// the 250 ms per-key hint, or after wrap-fill was refused and left no
+    /// owned cell. Require every visible cell from the missing left edge
+    /// through the observed caret to match consecutive unpaid exact keys,
+    /// plus a fresh same-row probe and a newer PTY print generation. The
+    /// ordinary `spawn` still judges/spends one credit for the missing `a`;
+    /// the observed move spends the remaining keys unchanged.
+    fn exact_coalesced_prefix_slot(
+        &self,
+        row: u16,
+        col: u16,
+        target: u16,
+        now: Instant,
+    ) -> Option<usize> {
+        let width = target.checked_sub(col)?.checked_add(1)?;
+        if col == 0
+            || !(2..=EXACT_COALESCED_PREFIX_MAX).contains(&usize::from(width))
+            || self
+                .print_anchor
+                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+            || !self
+                .row_cur_meta
+                .is_some_and(|m| m.row == row && m.caret == target && m.at == now)
+            || !self.row_prev_meta.is_some_and(|m| {
+                m.row == row
+                    && m.caret == col
+                    && m.at <= now
+                    && self
+                        .row_prev
+                        .get(usize::from(col - 1))
+                        .copied()
+                        .unwrap_or(' ')
+                        == ' '
+            })
+        {
+            return None;
+        }
+        let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+        for (i, cell_col) in ((col - 1)..target).enumerate() {
+            glyphs[i] = self
+                .row_cur
+                .get(usize::from(cell_col))
+                .copied()
+                .unwrap_or(' ');
+        }
+        if matches!(glyphs[0], ' ' | '\0') {
+            return None;
+        }
+        self.type_press_ring.exact_unpaid_run(
+            now,
+            self.row_prev_meta?.at,
+            &glyphs[..usize::from(width)],
+        )
+    }
+
+    /// A TUI can redraw the visible caret back onto its old cell after a
+    /// one-glyph echo. Codex does this for the first glyph on a wrapped
+    /// composer row, then prints its status row in the same synchronized
+    /// bracket: neither the observed caret nor the terminal's LAST print
+    /// anchor can identify the new glyph. The already-captured caret-row
+    /// probes can. Require an in-flight unpaid key with its exact glyph identity,
+    /// a new PTY print generation, and that same glyph replacing a blank
+    /// immediately behind the unchanged caret. An ambient Braille particle
+    /// cannot spend the pending key. The usual `spawn` license then spends
+    /// that one key; no speculative row-wide sweep is introduced.
+    fn same_caret_typed_echo(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        cursor_move_observed: bool,
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+    ) -> bool {
+        let Some((row, col)) = cur else { return false };
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || cursor_move_observed || self.last != cur
+        {
+            return false;
+        }
+        let Some(press_slot) = self.exact_pending_prefix_slot(row, col, col, now, true) else {
+            return false;
+        };
+        let credits = self.type_press_ring;
+        self.type_press_ring.retire_before_slot(press_slot);
+        let admitted = self.spawn(row, col - 1, row, col, now, cfg, geom, SpawnLane::Visible);
+        if !admitted {
+            self.type_press_ring = credits;
+        } else {
+            self.remember_exact_first_cell(row, col - 1, now);
+        }
+        admitted
+    }
+
+    /// A licensed first-cell admission can take the re-anchor branch in
+    /// `classify_move`, so the ordinary typed Sweep does not always pass
+    /// through `hand_v2_typed_sweep`. Carry the already-laid glyph into its
+    /// dormant content run before the next key joins it. No ribbon event or
+    /// extra credit is minted here; the caller already laid and paid for it.
+    fn remember_exact_first_cell(&mut self, row: u16, col: u16, now: Instant) {
+        if !self
+            .row_cur_meta
+            .is_some_and(|m| m.row == row && m.at == now)
+        {
+            return;
+        }
+        let glyph = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+        if matches!(glyph, ' ' | '\0') {
+            return;
+        }
+        if let Some(run) = self.recent_typed_run.as_mut()
+            && run.row == row
+            && run.col0 == col
+            && run.glyphs[0] == glyph
+        {
+            run.at = now;
+            return;
+        }
+        let mut glyphs = [' '; RECENT_TYPED_RUN_CAP];
+        glyphs[0] = glyph;
+        self.recent_typed_run = Some(RecentTypedRun {
+            row,
+            col0: col,
+            len: 1,
+            glyphs,
+            at: now,
+        });
     }
 
     /// THE HIDDEN/PARKED-CARET ECHO LANE (2026-08-30, the TUI total-suppression
@@ -11798,6 +12405,107 @@ impl CursorGlow {
         }
     }
 
+    /// A typed echo can resume beside cells whose natural swoosh has already
+    /// removed them. The last run's exact grid glyphs (including a typed
+    /// trailing space) are kept outside the live ribbon. Only this next
+    /// licensed, adjacent typed echo can read them, and only while the same
+    /// row still holds every glyph. Re-lay once on that key frame if any old
+    /// cell has expired; idle frames do no scan and no work is scheduled.
+    fn hand_v2_typed_sweep(&mut self, row: u16, col0: u16, col1: u16, born: Instant, now: Instant) {
+        let sample = self
+            .row_cur_meta
+            .is_some_and(|m| m.row == row && m.at == now)
+            && col0 < col1;
+        if !sample {
+            self.recent_typed_run = None;
+            self.v2.on_event(rk::Event::Sweep { row, col0, col1 }, born);
+            return;
+        }
+        let old = self.recent_typed_run.as_ref();
+        let joined = old.is_some_and(|run| {
+            run.row == row
+                && run.end() == col0
+                && usize::from(run.len) + usize::from(col1 - col0) <= RECENT_TYPED_RUN_CAP
+                && now.saturating_duration_since(run.at).as_secs_f32() <= rk::ribbon::CHAIN_GAP_MAX
+                && (run.col0..col0).all(|col| {
+                    self.row_cur.get(usize::from(col)).copied().unwrap_or(' ')
+                        == run.glyphs[usize::from(col - run.col0)]
+                })
+        });
+        if joined && let Some(run) = old {
+            let ribbon = self.v2.ribbon();
+            let mut standing = [false; RECENT_TYPED_RUN_CAP];
+            let cohorts = ribbon.cohorts();
+            // Cohorts are appended with wrapping IDs and only removed, never
+            // reordered. Compare offsets from the oldest live ID so even an
+            // ID wrap preserves binary-search order. One lookup per relevant
+            // cell avoids a cohorts scan for every key in a long typed run.
+            let first_cohort = cohorts.first().map_or(0, |coh| coh.id);
+            for cell in ribbon.cells() {
+                if cell.row != row
+                    || !(run.col0..col0).contains(&cell.col)
+                    || !cell.typing
+                    || cell.leaving()
+                {
+                    continue;
+                }
+                let id_offset = cell.cohort.wrapping_sub(first_cohort);
+                let Some(coh) = cohorts
+                    .binary_search_by_key(&id_offset, |coh| coh.id.wrapping_sub(first_cohort))
+                    .ok()
+                    .map(|idx| &cohorts[idx])
+                else {
+                    continue;
+                };
+                if !coh.leaving_at(now)
+                    && now
+                        .saturating_duration_since(cell.born.max(coh.alive_at))
+                        .as_secs_f32()
+                        < cell.life_s
+                {
+                    standing[usize::from(cell.col - run.col0)] = true;
+                }
+            }
+            let missing = standing[..usize::from(run.len)].contains(&false);
+            if missing {
+                self.v2.on_event(
+                    rk::Event::Sweep {
+                        row,
+                        col0: run.col0,
+                        col1: col0,
+                    },
+                    now,
+                );
+            }
+        }
+        self.v2.on_event(rk::Event::Sweep { row, col0, col1 }, born);
+        if joined {
+            if let Some(run) = self.recent_typed_run.as_mut() {
+                let start = usize::from(run.len);
+                for (i, col) in (col0..col1).enumerate() {
+                    run.glyphs[start + i] =
+                        self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+                }
+                run.len += col1 - col0;
+                run.at = now;
+            }
+        } else if usize::from(col1 - col0) <= RECENT_TYPED_RUN_CAP {
+            let mut glyphs = [' '; RECENT_TYPED_RUN_CAP];
+            for (i, col) in (col0..col1).enumerate() {
+                glyphs[i] = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
+            }
+            self.recent_typed_run = Some(RecentTypedRun {
+                row,
+                col0,
+                len: col1 - col0,
+                glyphs,
+                at: now,
+            });
+        } else {
+            self.recent_typed_run = None;
+        }
+    }
+
     /// HAND V2 THE LICENSED MOVE (seam point 1): the typed sweep, the
     /// re-anchor's landing, the fold's cells, the kill's retreat, then the
     /// `Move` — in that order, the ribbon's contract — and the ring row.
@@ -11853,14 +12561,21 @@ impl CursorGlow {
             && cc > pc
             && (mv.rainbow_coalesce || !mv.re_anchor)
         {
-            self.v2.on_event(
-                rk::Event::Sweep {
-                    row: cr,
-                    col0: pc,
-                    col1: cc,
-                },
-                mv.typed_at.unwrap_or(now),
-            );
+            if licence == rk::Licence::Typed {
+                self.hand_v2_typed_sweep(cr, pc, cc, mv.typed_at.unwrap_or(now), now);
+            } else {
+                self.recent_typed_run = None;
+                self.v2.on_event(
+                    rk::Event::Sweep {
+                        row: cr,
+                        col0: pc,
+                        col1: cc,
+                    },
+                    mv.typed_at.unwrap_or(now),
+                );
+            }
+        } else if licence != rk::Licence::Typed || cr != pr || cc < pc {
+            self.recent_typed_run = None;
         }
         // **THE RE-ANCHOR'S LANDING IS SWEPT** (the held park's dark
         // landing). A typed re-anchor lays exactly ONE cell, the landing,
@@ -11913,6 +12628,18 @@ impl CursorGlow {
                 },
                 born,
             );
+            // The ordinary one-cell typed re-anchor can lay the first
+            // wrapped-row glyph here without taking the usual typed-Sweep
+            // path. Preserve its already-licensed content for a later
+            // same-row continuation after the ribbon's natural retirement.
+            if licence == rk::Licence::Typed
+                && mv.typing
+                && mv.typed_hinted
+                && cr == pr
+                && pc.checked_add(1) == Some(cc)
+            {
+                self.remember_exact_first_cell(cr, cc - 1, now);
+            }
         }
         // THE FOLD'S OWN CELLS (the stalled key whose echo wraps the
         // row): a typed fold reaches v2 as a bare `Move`, which the ribbon
@@ -14933,17 +15660,10 @@ impl CursorGlow {
             self.bs_poof_hint = None;
             self.bs_baseline = None;
         }
-        // Rotate unconditionally — but only when a FRESH probe arrived this
-        // frame; an unprobed frame (scrolled back, split pane unwired) keeps
-        // the previous truth in place instead of forgetting it. The star-
-        // landing neighbor captures rotate in the SAME motion: their validity
-        // states ride the probe metadata, so meta and buffers stay one unit
-        // (a fresh probe without a neighbor capture rotates `Unprobed` states
-        // in, and the stale neighbor bytes become unreadable by construction).
+        // Rotate only when a fresh probe arrived this frame; an unprobed frame
+        // keeps the previous truth in place instead of forgetting it.
         if self.row_cur_meta.is_some() {
             std::mem::swap(&mut self.row_prev, &mut self.row_cur);
-            std::mem::swap(&mut self.row_above_prev, &mut self.row_above_cur);
-            std::mem::swap(&mut self.row_below_prev, &mut self.row_below_cur);
             self.row_prev_meta = self.row_cur_meta.take();
         }
     }
@@ -18389,6 +19109,206 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    #[test]
+    fn neighbor_probe_still_gates_star_pixels_after_discarding_duplicate_row_storage() {
+        let now = Instant::now();
+        let cfg = cfg_for_style_name("rainbow kitty", true);
+        let geom = retina_geom();
+        let mut glow = CursorGlow::default();
+        let mut quads = Vec::new();
+        glow.tick(Some((3, 0)), now, &cfg, geom, &mut quads);
+        assert!(glow.v2.engaged(), "rainbow kitty owns the next probe");
+
+        glow.observe_row(3, 1, &[' '; 40], now + ms(16));
+        glow.observe_neighbor_rows(Some(&['─', 'X', '═']), Some(&[' ', 'Y']));
+        let sky = glow.v2.probe();
+        assert_eq!(sky.at(2, 0, geom.rows), Some(true));
+        assert_eq!(sky.sky_at(2, 0, geom.rows), Some(false));
+        assert_eq!(sky.sky_at(2, 1, geom.rows), Some(true));
+        assert_eq!(sky.sky_at(2, 2, geom.rows), Some(true));
+        assert_eq!(sky.at(4, 0, geom.rows), Some(false));
+        assert_eq!(sky.at(4, 1, geom.rows), Some(true));
+    }
+
+    #[test]
+    fn exact_coalesced_keys_retire_older_space_but_refuse_stale_or_interleaved_runs() {
+        let t0 = Instant::now();
+        let mut keys = PressCredits::default();
+        keys.bank(t0, 1, Some(' ')); // Earlier wrap-fill, already seen blank.
+        for (dt, ch) in [(600, 'a'), (688, 'n'), (771, 'd'), (850, ' ')] {
+            keys.bank(t0 + ms(dt), 1, Some(ch));
+        }
+        let now = t0 + ms(950);
+        let selected = keys
+            .exact_unpaid_run(now, t0 + ms(500), &['a', 'n', 'd', ' '])
+            .expect("later exact phrase has a fresh tail");
+        keys.retire_before_slot(selected);
+        assert_eq!(
+            keys.cells_within(now),
+            4,
+            "old wrap-fill credit was retired"
+        );
+        assert_eq!(keys.spend_counting(now, 4), 4);
+        assert!(
+            keys.exact_unpaid_run(now, t0 + ms(500), &['a', 'n', 'd', ' '])
+                .is_none(),
+            "keyless later paint cannot reuse the spent phrase"
+        );
+
+        let mut stale = PressCredits::default();
+        for (dt, ch) in [(0, 'a'), (80, 'n'), (160, 'd'), (240, ' '), (990, 'x')] {
+            stale.bank(t0 + ms(dt), 1, Some(ch));
+        }
+        assert!(
+            stale
+                .exact_unpaid_run(t0 + ms(1000), t0 + ms(500), &['a', 'n', 'd', ' '])
+                .is_none(),
+            "fresh unrelated key cannot fund an old exact phrase"
+        );
+
+        let mut interleaved = PressCredits::default();
+        for (dt, ch) in [
+            (0, ' '),
+            (600, 'a'),
+            (688, 'x'),
+            (771, 'n'),
+            (850, 'd'),
+            (900, ' '),
+        ] {
+            interleaved.bank(t0 + ms(dt), 1, Some(ch));
+        }
+        assert!(
+            interleaved
+                .exact_unpaid_run(t0 + ms(950), t0 + ms(500), &['a', 'n', 'd', ' '])
+                .is_none(),
+            "no live mismatched credit may be skipped within the selected run"
+        );
+
+        let mut repeated_a = PressCredits::default();
+        for (dt, ch) in [(0, 'a'), (600, 'a'), (688, 'n'), (771, 'd'), (850, ' ')] {
+            repeated_a.bank(t0 + ms(dt), 1, Some(ch));
+        }
+        let selected = repeated_a
+            .exact_unpaid_run(t0 + ms(950), t0 + ms(500), &['a', 'n', 'd', ' '])
+            .expect("a stale earlier a must not hide the complete later run");
+        repeated_a.retire_before_slot(selected);
+        assert_eq!(repeated_a.cells_within(t0 + ms(950)), 4);
+    }
+
+    #[test]
+    fn delayed_single_exact_key_skips_only_a_prior_stale_credit() {
+        let t0 = Instant::now();
+        let now = t0 + ms(1_100);
+        let prior_probe = t0 + ms(500);
+        let mut keys = PressCredits::default();
+        keys.bank(t0, 1, Some(' '));
+        keys.bank(t0 + ms(600), 1, Some('a'));
+        let selected = keys
+            .exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_S)
+            .expect("the delayed exact key follows a stale, already-probed space");
+        assert!(
+            keys.exact_unpaid_run(now, prior_probe, &['a']).is_none(),
+            "the moving-prefix lane retains its short tail window"
+        );
+        assert!(
+            keys.exact_unpaid_run_with_tail_window(now, prior_probe, &['x'], IN_FLIGHT_PATIENCE_S)
+                .is_none(),
+            "an ambient other glyph cannot spend the key"
+        );
+        keys.retire_before_slot(selected);
+        assert_eq!(keys.cells_within(now), 1, "the older space was retired");
+        assert_eq!(keys.spend_counting(now, 1), 1);
+        assert!(
+            keys.exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_S)
+                .is_none(),
+            "a keyless repaint cannot reuse the spent key"
+        );
+
+        let mut unproven_prefix = PressCredits::default();
+        unproven_prefix.bank(t0 + ms(550), 1, Some(' '));
+        unproven_prefix.bank(t0 + ms(600), 1, Some('a'));
+        assert!(
+            unproven_prefix
+                .exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_S,)
+                .is_none(),
+            "a credit newer than the prior probe cannot be skipped"
+        );
+        assert!(
+            unproven_prefix
+                .exact_unpaid_run_with_tail_window(
+                    t0 + ms(10_601),
+                    prior_probe,
+                    &['a'],
+                    IN_FLIGHT_PATIENCE_S,
+                )
+                .is_none(),
+            "the exact key is bounded by the in-flight patience"
+        );
+    }
+
+    #[test]
+    fn exact_coalesced_run_of_32_keys_remains_one_shot_and_exact() {
+        let t0 = Instant::now();
+        let now = t0 + ms(1300);
+        let previous_probe = t0 + ms(500);
+        let glyphs: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEF".chars().collect();
+        assert_eq!(glyphs.len(), 32);
+        let mut keys = PressCredits::default();
+        keys.bank(t0 + ms(100), 1, Some(' ')); // Old wrap-fill, already blank on glass.
+        for (i, &glyph) in glyphs.iter().enumerate() {
+            keys.bank(t0 + ms(600 + i as u64 * 20), 1, Some(glyph));
+        }
+        let forged = keys;
+        let selected = keys
+            .exact_unpaid_run(now, previous_probe, &glyphs)
+            .expect("a 32-cell exact run with a fresh tail has one first glyph");
+        keys.retire_before_slot(selected);
+        assert_eq!(keys.cells_within(now), glyphs.len());
+        assert_eq!(keys.spend_counting(now, glyphs.len()), glyphs.len());
+        assert!(
+            keys.exact_unpaid_run(now, previous_probe, &glyphs)
+                .is_none(),
+            "a later keyless paint cannot spend the phrase again"
+        );
+
+        let mut wrong = glyphs.clone();
+        wrong[16] = '!';
+        assert!(
+            forged
+                .exact_unpaid_run(now, previous_probe, &wrong)
+                .is_none(),
+            "one changed glyph inside the larger run must refuse the whole proof"
+        );
+        assert!(
+            forged
+                .exact_unpaid_run(t0 + ms(1600), previous_probe, &glyphs)
+                .is_none(),
+            "an old phrase cannot borrow a later fresh key's clock"
+        );
+        let mut too_long = glyphs.clone();
+        too_long.resize(EXACT_COALESCED_PREFIX_MAX + 1, '!');
+        assert!(
+            forged
+                .exact_unpaid_run(now, previous_probe, &too_long)
+                .is_none(),
+            "the exceptional proof still refuses a run wider than its fixed cap"
+        );
+
+        let mut interleaved = PressCredits::default();
+        for (i, &glyph) in glyphs.iter().enumerate() {
+            interleaved.bank(t0 + ms(600 + i as u64 * 20), 1, Some(glyph));
+            if i == 12 {
+                interleaved.bank(t0 + ms(600 + i as u64 * 20 + 10), 1, Some('!'));
+            }
+        }
+        assert!(
+            interleaved
+                .exact_unpaid_run(now, previous_probe, &glyphs)
+                .is_none(),
+            "an unrelated key inside the delayed batch cannot be skipped"
+        );
+    }
+
     /// Type `text` at the owner's measured cadence (85 ms per key) from the
     /// caret at `(row, col)`, each key echoed 3 ms after its press (a Space
     /// carries its class, so the ribbon's moved-word relay has the witness
@@ -19623,10 +20543,11 @@ mod tests {
     /// DARK ⇒ SILENT for the key seam, for the gates that are ABOUT SOUND.
     /// The spawn edge gets its silence for free (it is unreachable while
     /// dark); a cue born at the KEY does not, so the seam is gated on the
-    /// last tick's verdict — master off, degenerate geometry, and a dark tick
-    /// the host marked INAUDIBLE (unfocus) all close it, as does never having
-    /// ticked at all. A dark tick the host marked audible — a load-shed frame
-    /// or a `Reduce Motion` session — does NOT: that case is pinned by
+    /// last tick's verdict — master off, and a dark tick (zero amplitude or a
+    /// degenerate grid) the host marked INAUDIBLE (unfocus) both close it, as
+    /// does never having ticked at all. A dark tick the host marked audible —
+    /// a load-shed frame, a `Reduce Motion` session, an empty grid — does
+    /// NOT: that case is pinned by
     /// `a_shed_frame_keeps_the_key_seam_open` in
     /// `tests/shed_frame_is_still_a_heard_key.rs`.
     #[test]
@@ -19671,6 +20592,105 @@ mod tests {
         assert_eq!(glow.keyed_clicks, 0);
         assert!(!glow.cue_keystroke(t0));
         assert_eq!(glow.drain_sound_cues().count(), 0);
+    }
+
+    /// ONE SEAM LAW ON EVERY RETURN PAST THE MASTER SWITCH, including the two
+    /// that used to break it. The classic wake returned above every writer
+    /// of `sound_live`, so a fresh `classic` session never clicked, and one
+    /// switched from another style kept that style's seam, clicking in an
+    /// unfocused window. A degenerate grid closed the seam like the master
+    /// switch, which `aterm ctl tone` could only call `engine-silent`. Both
+    /// now take `settle_key_seam`: heard when the tick drew or the host
+    /// marked it audible, silent otherwise.
+    #[test]
+    fn the_classic_wake_and_an_empty_grid_obey_the_one_key_seam_law() {
+        let g = geom();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let classic = cfg(GlowStyle::Classic, true);
+        let unfocused = |c: GlowConfig| GlowConfig {
+            classic_mono: c.classic_mono,
+            intensity: 0.0,
+            audible: false,
+            ..c
+        };
+
+        // A FRESH classic session: its first tick opens the seam and the key
+        // clicks, with the timbre snapshot a modern style would have stored.
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 0)), t0, &classic, g, &mut out);
+        assert!(glow.sound_seam_open(), "a fresh classic session is heard");
+        assert!(glow.cue_keystroke(t0));
+        assert!(glow.take_key_cue().is_some());
+        assert_eq!(glow.heat_tau_live, CursorGlow::heat_tau(&classic));
+
+        // Classic, dark for a motion reason (audible): still heard.
+        let shed = GlowConfig {
+            classic_mono: false,
+            intensity: 0.0,
+            ..classic
+        };
+        glow.tick(Some((2, 1)), t0, &shed, g, &mut out);
+        assert!(glow.sound_seam_open(), "a shed classic frame is heard");
+
+        // SWITCHED from a style that left the seam open, then unfocused: the
+        // classic tick closes it and drops the banked credit.
+        let mut glow = CursorGlow::default();
+        glow.tick(
+            Some((2, 0)),
+            t0,
+            &cfg(GlowStyle::RainbowKitty, true),
+            g,
+            &mut out,
+        );
+        assert!(glow.cue_keystroke(t0));
+        assert!(glow.take_key_cue().is_some());
+        glow.tick(Some((2, 0)), t0, &unfocused(classic), g, &mut out);
+        assert!(
+            !glow.sound_seam_open(),
+            "an unfocused classic tick is silent"
+        );
+        assert_eq!(glow.keyed_clicks, 0, "and its credit went with the seam");
+        assert!(!glow.cue_keystroke(t0));
+
+        // AN EMPTY GRID in the window the key belongs to: dark and heard, the
+        // banked credit kept (its echo must stay silent when it lands), and
+        // the dark latch NOT set, so a later master-off still wipes.
+        for (empty, what) in [
+            (Geom { cols: 0, ..g }, "no columns"),
+            (Geom { rows: 0, ..g }, "no rows"),
+            (Geom { cw: 0, ..g }, "no cell width"),
+        ] {
+            let mut glow = CursorGlow::default();
+            let live = cfg(GlowStyle::RainbowKitty, true);
+            glow.tick(Some((2, 0)), t0, &live, g, &mut out);
+            assert!(glow.cue_keystroke(t0));
+            assert!(glow.take_key_cue().is_some());
+            glow.tick(Some((2, 0)), t0, &live, empty, &mut out);
+            assert!(out.is_empty(), "an empty grid draws nothing");
+            assert!(glow.sound_seam_open(), "{what}: an empty grid is heard");
+            assert_eq!(glow.keyed_clicks, 1, "{what}: the credit survives");
+            assert!(!glow.dark_settled, "{what}: an open seam never latches");
+            assert!(glow.cue_keystroke(t0));
+            assert!(glow.take_key_cue().is_some());
+            // …an unfocused one is silent and wipes the ledger…
+            glow.tick(Some((2, 0)), t0, &unfocused(live), empty, &mut out);
+            assert!(!glow.sound_seam_open());
+            assert_eq!(glow.keyed_clicks, 0);
+            // …and the master switch closes it whatever the grid.
+            glow.tick(Some((2, 0)), t0, &live, empty, &mut out);
+            assert!(glow.cue_keystroke(t0));
+            glow.tick(
+                Some((2, 0)),
+                t0,
+                &cfg(GlowStyle::RainbowKitty, false),
+                empty,
+                &mut out,
+            );
+            assert!(!glow.sound_seam_open());
+            assert_eq!(glow.keyed_clicks, 0, "master off wipes what the grid kept");
+            assert!(glow.dark_settled, "and a shut seam latches");
+        }
     }
 
     /// THE BRRRRING'S PREVIEW FEED, pinned — the exact cue morphology of rapid
@@ -24972,6 +25992,197 @@ mod tests {
         );
     }
 
+    /// A real queued key follows an unknown-width insert on the FIFO wire,
+    /// while its dispatch stamp precedes the insert's delivery receipt. The
+    /// first frame shows only the insert's placeholder; cleanup runs after
+    /// two seconds with the key still unpaid. This is the Tier-1 projection
+    /// shared by the positive and refusal paths below.
+    fn unknown_insert_orphan_key_setup(
+        t0: Instant,
+        keys: usize,
+        site: bool,
+    ) -> (CursorGlow, Vec<GlowQuad>, [char; 40]) {
+        unknown_insert_orphan_key_setup_with_glyph(t0, keys, site, 'k')
+    }
+
+    fn unknown_insert_orphan_key_setup_with_glyph(
+        t0: Instant,
+        keys: usize,
+        site: bool,
+        first_glyph: char,
+    ) -> (CursorGlow, Vec<GlowQuad>, [char; 40]) {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let at = |tick_ms: u64| t0 + ms(tick_ms);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        three_visible_echoes(&mut glow, t0, &mut out);
+        for (time, glyph) in [(800, first_glyph), (810, 'm')].into_iter().take(keys) {
+            let class = if glyph == ' ' {
+                rk::TypedClass::Space
+            } else {
+                rk::TypedClass::Glyph
+            };
+            glow.note_typed_expected(at(time), 1, false, class, glyph);
+            glow.revoke_input_hints_at(at(time)); // queued behind the paste
+        }
+        glow.note_insert_delivered_from(at(600), at(900), InsertWidth::Unknown);
+        for i in 0..keys {
+            glow.note_delivered(at(905 + i as u64), DeliveredClass::Typed);
+        }
+        let mut row = [' '; 40];
+        row[2..13].fill('x');
+        if site {
+            glow.observe_print_anchor(Some((3, 13, 1)));
+            glow.observe_row(3, 13, &row, at(910));
+        }
+        glow.tick(Some((3, 13)), at(910), &c, g, &mut out);
+        assert_eq!(glow.spawns(), 4, "the insert lays its own hop");
+        if site {
+            glow.observe_row(3, 13, &row, at(3_000));
+        }
+        glow.tick(Some((3, 13)), at(3_000), &c, g, &mut out);
+        assert_eq!(glow.typed_credits_within(at(3_000)), 0);
+        (glow, out, row)
+    }
+
+    #[test]
+    fn unknown_insert_orphan_key_exact_echo_matches_derived_model() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+        let mut state = model.init_state();
+        for action in ["QueueOne", "LayWithSite", "Cleanup"] {
+            assert!(model.fire(action, &mut state));
+        }
+        let (mut glow, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 1, true);
+        assert_eq!(
+            usize::from(state["escrow"] != 0),
+            usize::from(glow.insert.orphan_exact.is_some())
+        );
+        assert_eq!(
+            state["generic"],
+            glow.typed_credits_within(at(3_000)) as i64
+        );
+        row[13] = 'k';
+        glow.observe_print_anchor(Some((3, 14, 2)));
+        glow.observe_row(3, 14, &row, at(3_200));
+        glow.tick(Some((3, 14)), at(3_200), &c, g, &mut out);
+        assert!(model.fire("ExactNewPrint", &mut state));
+        assert_eq!(glow.spawns() - 4, state["lit"] as u64);
+        assert!(
+            v2_cols(&glow, 3).contains(&13),
+            "the queued key's cell is lit"
+        );
+        assert_eq!(glow.insert.orphan_exact.is_some(), state["escrow"] != 0);
+        assert_eq!(glow.typed_credits_within(at(3_200)), 0);
+
+        row[14] = 'z';
+        glow.observe_print_anchor(Some((3, 15, 3)));
+        glow.observe_row(3, 15, &row, at(3_400));
+        glow.tick(Some((3, 15)), at(3_400), &c, g, &mut out);
+        assert!(model.fire("LaterProgramPrint", &mut state));
+        assert_eq!(glow.spawns() - 4, state["lit"] as u64, "the key spent once");
+
+        for (keys, printed, print_seq, action) in [
+            (1, 'z', 2, "AmbientOtherGlyph"),
+            (0, 'z', 2, "AmbientOtherGlyph"),
+            (2, 'k', 2, "ExactNewPrint"),
+            (1, 'k', 1, "ExactOldPrint"),
+        ] {
+            let (mut control, mut cout, mut chars) =
+                unknown_insert_orphan_key_setup(t0, keys, true);
+            let mut control_state = model.init_state();
+            assert!(model.fire(
+                match keys {
+                    0 => "QueueNone",
+                    2 => "QueueTwo",
+                    _ => "QueueOne",
+                },
+                &mut control_state
+            ));
+            for step in ["LayWithSite", "Cleanup"] {
+                assert!(model.fire(step, &mut control_state));
+            }
+            chars[13] = printed;
+            control.observe_print_anchor(Some((3, 14, print_seq)));
+            control.observe_row(3, 14, &chars, at(3_200));
+            control.tick(Some((3, 14)), at(3_200), &c, g, &mut cout);
+            assert!(model.fire(action, &mut control_state));
+            assert_eq!(control.spawns() - 4, control_state["lit"] as u64);
+            assert!(!v2_cols(&control, 3).contains(&13));
+            assert!(control.insert.orphan_exact.is_none());
+            assert_eq!(control.typed_credits_within(at(3_200)), 0);
+        }
+    }
+
+    #[test]
+    fn unknown_insert_orphan_space_cannot_claim_an_unchanged_blank() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+        let mut state = model.init_state();
+        for action in ["QueueBlank", "LayWithSite", "Cleanup"] {
+            assert!(model.fire(action, &mut state));
+        }
+        let (mut glow, mut out, row) = unknown_insert_orphan_key_setup_with_glyph(t0, 1, true, ' ');
+        assert_eq!(glow.insert.orphan_exact.is_some(), state["escrow"] != 0);
+        assert_eq!(glow.typed_credits_within(at(3_000)), 0);
+        // A program print elsewhere advances the PTY print generation, then
+        // moves the caret one cell. The candidate cell never changed.
+        glow.observe_print_anchor(Some((10, 8, 2)));
+        glow.observe_row(3, 14, &row, at(3_200));
+        glow.tick(Some((3, 14)), at(3_200), &c, g, &mut out);
+        assert!(model.fire("ExactNewPrint", &mut state));
+        assert_eq!(glow.spawns() - 4, state["lit"] as u64);
+        assert!(!v2_cols(&glow, 3).contains(&13));
+    }
+
+    #[test]
+    fn unknown_insert_orphan_key_escrow_expires_and_drops_on_space_changes() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+        for action in ["Expire", "Scroll", "Rewrite", "Reset"] {
+            let (mut glow, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 1, true);
+            let mut state = model.init_state();
+            for step in ["QueueOne", "LayWithSite", "Cleanup"] {
+                assert!(model.fire(step, &mut state));
+            }
+            match action {
+                "Expire" => {
+                    row[13] = 'k';
+                    glow.observe_print_anchor(Some((3, 14, 2)));
+                    glow.observe_row(3, 14, &row, at(11_000));
+                    glow.tick(Some((3, 14)), at(11_000), &c, g, &mut out);
+                    assert_eq!(glow.spawns(), 4, "an expired key stayed dark");
+                }
+                "Scroll" => glow.note_scroll(1),
+                "Rewrite" => glow.retract_insert(3, 10, 3, at(3_100)),
+                "Reset" => glow.reset(),
+                _ => unreachable!(),
+            }
+            assert!(model.fire(action, &mut state));
+            assert_eq!(glow.insert.orphan_exact.is_some(), state["escrow"] != 0);
+            assert_eq!(glow.typed_credits_within(at(11_000)), 0);
+        }
+        let (without_site, _, _) = unknown_insert_orphan_key_setup(t0, 1, false);
+        let mut no_site = model.init_state();
+        for step in ["QueueOne", "LayWithoutSite", "Cleanup"] {
+            assert!(model.fire(step, &mut no_site));
+        }
+        assert_eq!(
+            without_site.insert.orphan_exact.is_some(),
+            no_site["escrow"] != 0
+        );
+    }
+
     /// Seed the hidden-caret TUI shape the row tests share: a spinner row
     /// at `(10, 19)`, the input row at `(12, 2)`, one typed echo `2 → 3` on
     /// it at 245 ms establishing it (`spawns == 1`, `last_anchor_sweep` on
@@ -26073,6 +27284,7 @@ mod tests {
         let now = Instant::now();
         let unknown = InsertLicence {
             at: now,
+            dispatched_at: now,
             cells: CursorGlow::INSERT_GESTURE_CELLS,
             known: false,
             row: Some(12),
@@ -26099,6 +27311,7 @@ mod tests {
         );
         let priced = InsertLicence {
             at: now,
+            dispatched_at: now,
             cells: 11,
             known: true,
             row: Some(12),

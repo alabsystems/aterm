@@ -283,6 +283,17 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/lib.rs",
     },
     GuardHelper {
+        // Settings ▸ Security's conflicting-copies retire worker: `retire_slot()`
+        // returns the guard of `RetireState.shared` (`Arc<Mutex<Slot>>`), which
+        // the worker thread also locks as `shared` — one lock, one node, the
+        // identity both of its interior acquisitions already resolve to. Named
+        // `retire_slot`, not `slot`: a bare `slot(` is also aterm-effects'
+        // `SkyIndex::slot`, whose calls would have read as acquisitions.
+        symbol: "retire_slot",
+        identity: "shared",
+        def_file: "crates/aterm-gui/src/consent_retire.rs",
+    },
+    GuardHelper {
         symbol: "lock_fonts",
         identity: "chrome_fonts",
         def_file: "crates/aterm-gui/src/tray_raster.rs",
@@ -355,6 +366,17 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "supervisor",
         identity: "SUPERVISOR",
         def_file: "crates/aterm-gui/src/fabric_launch.rs",
+    },
+    GuardHelper {
+        // atpkg's terminal meter: the one stderr line it draws and whatever owns
+        // that line now (an open line, a hold). `around`, `hold`, the hold's drop
+        // and the meter's own drop take it through this free fn, and `around`
+        // keeps it across a caller's print, so those holds are invisible at the
+        // call sites without registration. atpkg is in the GUI's closure; the
+        // meter itself draws only on a person's terminal, never in the window.
+        symbol: "screen_lock",
+        identity: "SCREEN",
+        def_file: "crates/atpkg/src/meter.rs",
     },
 ];
 
@@ -3258,7 +3280,7 @@ mod tests {
     /// written into a tree that never scans that crate would fail the very check
     /// it exists to satisfy. Every synthetic tree that composes its own manifest
     /// set must splice these in too.
-    const SYNTH_HELPER_CRATES: &[(&str, &str)] = &[("aterm-log", "")];
+    const SYNTH_HELPER_CRATES: &[(&str, &str)] = &[("aterm-log", ""), ("atpkg", "")];
 
     fn synth_helper_files() -> Vec<(String, String)> {
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(SYNTH_HELPER_CRATES);
@@ -3272,6 +3294,17 @@ mod tests {
              term.lock().unwrap()\n}\n\
              pub(crate) fn term_lock_ui(term: &Mutex<Terminal>, w: &AtomicU32) -> TermGuard<'_> {\n    \
              term_lock(term)\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            // Settings ▸ Security's retire worker: `retire_slot` returns the
+            // guard of `self.shared`, spelled with the poison-recovering closure
+            // the shipping helper uses.
+            "crates/aterm-gui/src/consent_retire.rs".to_string(),
+            "impl RetireState {\n    \
+             fn retire_slot(&self) -> std::sync::MutexGuard<'_, Slot> {\n        \
+             self.shared.lock().unwrap_or_else(|p| p.into_inner())\n    \
+             }\n}\n"
                 .to_string(),
         ));
         files.push((
@@ -3329,6 +3362,14 @@ mod tests {
             "impl ConnectionTable {\n    \
              pub(crate) fn records(&self) -> MutexGuard<'_, Records> {\n        \
              self.records.lock().unwrap_or_else(|p| p.into_inner())\n    }\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            // atpkg's terminal meter: the one stderr line it draws, behind a
+            // bare static `Mutex` whose guard escapes to `around`/`hold`.
+            "crates/atpkg/src/meter.rs".to_string(),
+            "fn screen_lock() -> std::sync::MutexGuard<'static, Screen> {\n    \
+             SCREEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
         // The registered vocabulary interior (VOCABULARY_INTERIORS):
@@ -5065,14 +5106,17 @@ mod tests {
 
     #[test]
     fn file_advisory_locks_are_categorized_on_this_tree() {
-        // The three real OS file-advisory sites (`restore::with_restore_lock`'s
+        // The six real OS file-advisory sites (`restore::with_restore_lock`'s
         // sibling-lock flock over the restore manifest; the updater's
         // install-ledger lock in aterm-update-core — its blocking `acquire`
         // plus the bounded-wait `try_lock` loop `acquire_within` grew for the
-        // launch path) must be classified by File EVIDENCE, listed with their
-        // binding spans, and excluded from the mutex graph —
-        // existence-checked here so the classification cannot silently rot into
-        // UNKNOWN (or vanish).
+        // launch path; atpkg's `machine_apply_queue` flock; the log
+        // rotation's non-blocking `try_lock` in aterm-gui logging.rs, which
+        // `aterm.log` and `messages.log` both rotate through; and the harness's
+        // live-upgrade `sweep_lock` try_lock in aterm-agent) must be
+        // classified by File EVIDENCE, listed with their binding spans, and
+        // excluded from the mutex graph — existence-checked here so the
+        // classification cannot silently rot into UNKNOWN (or vanish).
         //
         // NOTE (2026-07-24): this named `crates/aterm-gui/src/kitty_log.rs` for
         // the first site long after that flock moved to `restore.rs` — kitty_log
@@ -5086,17 +5130,80 @@ mod tests {
         // this test is what caught it. The bindings now carry an explicit
         // `: std::fs::File` ascription (compiler-enforced evidence the census
         // accepts), and the count includes `acquire_within`'s try_lock loop.
+        //
+        // NOTE (2026-09-22): a FOURTH site — the unified message log's
+        // compaction guard (`messages_store::try_lock`, the sibling
+        // `messages.log.lock` try-lock in the kitty_log idiom; never blocking,
+        // held for one rewrite at load), docs/DESIGN-unified-messages-2026-09-21.md
+        // §3.7. Its binding is a `File` by construction (`OpenOptions::open`),
+        // which the census reads as File evidence.
+        //
+        // NOTE (2026-09-23): a FIFTH site — atpkg's `machine_apply_queue`
+        // (`<prefix>/machine.lock`, b90627b61, "Phase 3 review fixes"), held
+        // BLOCKING for one apply of the `[machine]` settings so the window's
+        // launch apply, a session's and a pass edge never walk `$HOME` renaming
+        // the same build directories together. Cross-process by purpose (each
+        // applier is its own atpkg process); its binding is a `File` by
+        // construction (`OpenOptions::open`). The gate was red on `main` from
+        // that commit until the note that first counted it.
+        //
+        // NOTE (2026-09-23, the ux/status-reporting merge): the SIXTH was
+        // aterm.log's rotation — the non-blocking `try_lock` on the log file
+        // that lets exactly one process rotate it (aterm-gui logging.rs), with
+        // the same explicit `: std::fs::File` ascription. Two branches each
+        // moved this count on the same day.
+        //
+        // NOTE (2026-09-23, design ruling 65): back to FIVE. messages.log now
+        // rotates while running through that same `logging::rotate_if_oversized`
+        // (its lock is `messages.log.lock`, the file the compaction guard took),
+        // so the compaction guard and `messages_store::try_lock` are deleted —
+        // one lock site serves both logs.
+        //
+        // NOTE (2026-09-23, origin/main merged into ux/status-reporting): SIX
+        // again — main added the harness's live-upgrade sweep lock
+        // (`upgrade_drive::sweep_lock`, `<harness state>/upgrade/sweep.lock`),
+        // a non-blocking `try_lock` so the window's host and a hand-run
+        // `aterm harness upgrade` never both type a notice into one session.
+        // Cross-process by purpose; a `File` by its binding's ascription. Main
+        // counted six WITH the message log's compaction guard and this branch
+        // five WITHOUT the sweep lock; the merged tree has the sweep lock and
+        // no compaction guard. The six, as the census lists them: restore.rs's
+        // manifest flock, update-core sys.rs's blocking `acquire` and its
+        // `acquire_within` try_lock loop, atpkg cli.rs's `machine_apply_queue`,
+        // aterm-gui logging.rs's rotation try_lock, and upgrade_drive.rs's
+        // `sweep_lock`.
+        //
+        // NOTE (2026-09-24, fin/integrate merged over origin/main): EIGHT — the
+        // six above plus atpkg's `lock::Flock::try_lock` and `Flock::lock_within`
+        // (fin/deflake 54ec81ca4), the one acquisition path of the store lock,
+        // the index probe's range locks and the head watch's shared file, which
+        // release by `LOCK_UN` on drop. Cross-process by purpose; a `File` by
+        // each binding's ascription. fin/deflake moved the store lock's old
+        // `open_store_lock` site into them. The census, not the notes, says
+        // eight.
         let out = run_lock_order_census(&repo_root());
         assert!(
-            out.log.contains("3 OS file-advisory"),
-            "expected exactly the restore-manifest flock plus update-core's two \
-             sites (blocking acquire + the bounded-wait try_lock loop) in the \
+            out.log.contains("8 OS file-advisory"),
+            "expected exactly the restore-manifest flock, update-core's two \
+             sites (blocking acquire + the bounded-wait try_lock loop), atpkg's \
+             machine-apply queue, the log rotation's try_lock, the harness's \
+             upgrade sweep lock and atpkg's two Flock acquisitions in the \
              advisory category:\n{}",
             out.log
         );
         assert!(
             out.log.contains("crates/aterm-gui/src/restore.rs")
                 && out.log.contains("crates/aterm-update-core/src/sys.rs")
+                && !out.log.contains("crates/aterm-gui/src/messages_store.rs")
+                && out.log.contains("crates/atpkg/src/cli.rs")
+                && out.log.contains("fn `machine_apply_queue`")
+                && out.log.contains("crates/aterm-gui/src/logging.rs")
+                && out
+                    .log
+                    .contains("crates/aterm-agent/src/harness/upgrade_drive.rs")
+                && out.log.contains("fn `sweep_lock`")
+                && out.log.contains("crates/atpkg/src/lock.rs")
+                && out.log.contains("fn `lock_within`")
                 && out.log.contains("proven std::fs::File by its binding at"),
             "each advisory listing must carry its audit evidence:\n{}",
             out.log
@@ -5325,8 +5432,11 @@ mod tests {
         let out = run_lock_order_census(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "GREEN expected:\n{}", out.log);
+        // aterm-gui and aterm-types, the new dependency, and every helper crate.
+        let crates = 3 + SYNTH_HELPER_CRATES.len();
         assert!(
-            out.log.contains("across 4 workspace crate(s)")
+            out.log
+                .contains(&format!("across {crates} workspace crate(s)"))
                 && out.log.contains("crates/aterm-newdep/src"),
             "the new dependency must be scanned automatically:\n{}",
             out.log
