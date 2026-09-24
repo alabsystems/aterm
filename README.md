@@ -22,7 +22,8 @@ curl -fsSL https://alab.systems/install.sh | bash
 
 or download `aterm.dmg` from the newest release. aterm updates itself.
 
-Every release is listed under [Releases](https://github.com/alabsystems/aterm/releases).
+Every release is listed under [Releases](https://github.com/alabsystems/aterm/releases),
+and its notes are in `release-notes/`.
 
 ## Security
 
