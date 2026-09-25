@@ -6,42 +6,35 @@
 # command (ONE name on PATH; it fronts every verb — aterm help / ctl / pkg /
 # fleet / drive), in one command. Every release is ONE lean app: a ~27 MB
 # download, aterm opens immediately, and the ALab toolchain installs itself on
-# first launch with live progress. Flags only EXCLUDE — except --token, the
-# one opt-in. (--batteries — the batteries-included DMG pair, seeded offline
+# first launch with live progress. Flags only EXCLUDE. (--batteries — the
+# batteries-included DMG pair, seeded offline
 # from a sealed payload — was RETIRED 2026-08-26: no release cuts that pair
 # any more, and the bare aterm-<v>.dmg is the same lean app as the zip. The
 # flag is still parsed so an old command line fails loudly, exit 2, naming
 # its next act.)
 #
-# The DEFAULT download source is the PUBLIC release repo (alabsystems/aterm),
-# fetched anonymously — no GitHub credential required. An authenticated `gh`
-# is preferred when present (it serves any slug), and is REQUIRED for the
-# private staging repo: ATERM_REPO_SLUG=alabsystems/aterm, or a run from the
-# private checkout, whose Cargo.toml derives that slug. No credential is
-# copied anywhere by default — the `token` half below is opt-in, because the
-# compiled-in public update channel reads none. The copy matters only for a
-# DEVELOPMENT build repointed at a private update source (`[update] owner`/`repo`
-# in aterm.toml — a shipped build reads its compiled channel), which then keeps
-# updating without `gh` on PATH — which a Finder-launched .app does not have.
+# The download source is the PUBLIC release repo (alabsystems/aterm; a run
+# from a checkout derives the slug from its Cargo.toml, ATERM_REPO_SLUG names
+# another), read ONLY from github.com's release download host — the unmetered
+# host the in-app updater reads — with curl, no credential, and no GitHub API
+# request. No credential is ever read or written.
 #
-# The three halves, and when each can run:
+# The halves, and when each can run:
 #   app — the released aterm.app from the GitHub Release (the bundle is macOS-
 #         only; supported Linux targets take this half as the released ONE binary — see
-#         the LINUX paragraph below; anonymous curl against a public repo,
-#         authenticated gh otherwise).
+#         the LINUX paragraph below).
 #         Verified with a deliberately weaker bootstrap tier than the installed
 #         updater (see docs/RELEASING.md):
-#           1. paginate the complete release catalog and select the unique
-#              numeric maximum of its current-scheme vMAJOR.MINOR.PATCH tags,
-#              independent of GitHub REST row order (NOT the "latest" pointer,
-#              which non-app releases can hold). Retired two-component tags are
-#              archive history: they are skipped, never elected, exactly as the
-#              in-app updater skips them. An explicit --version pin bypasses
-#              selection and may still name an archived release
-#           2. require exactly one manifest and canonical container asset —
-#              the lean aterm-<v>-mac.zip; a pinned pre-lean release that
-#              ships no zip takes its bare aterm-<v>.dmg (elect_container) —
-#              carrying each exact API asset ID and byte size into its download
+#           1. ONE HEAD of the channel's latest-release pointer
+#              (…/releases/latest/download/aterm-appcast.toml, redirects
+#              refused) names the head's vMAJOR.MINOR.PATCH tag — the release
+#              cut owns that pointer, so it is the newest app release (see
+#              channel_head). An explicit --version names the tag instead, and
+#              may still name a retired two-component archive release
+#           2. fetch the manifest and ONE canonical container from that tag's
+#              own download URLs — the lean aterm-<v>-mac.zip; a pinned
+#              pre-lean release that ships no zip takes its bare aterm-<v>.dmg
+#              (elect_container) — each held to the byte size the host names
 #           3. bind tag == manifest version == container filename, then verify
 #              the container's SHA-256 against that manifest
 #           4. verify the bundle's code signature; on the official public repo
@@ -56,18 +49,17 @@
 #         notarized builds plus Ed25519 .sig assets, but this script cannot
 #         verify Ed25519 (macOS's stock LibreSSL has no support), so the
 #         bootstrap root of trust is the APPLE CODE-SIGNING CHAIN via the
-#         pinned Team ID, plus the transport's repo metadata — a
-#         gh-authenticated API session, or TLS to api.github.com on the
-#         anonymous lane — and the manifest digest. Full Ed25519 verification
-#         lives in the installed updater.
+#         pinned Team ID, plus TLS to github.com and the manifest digest.
+#         Full Ed25519 verification lives in the installed updater.
 #         LINUX (aarch64 and x86_64): installs the elected release's raw ELF
-#         aterm-<version>-linux-<arch> into the cli store below. Python 3.11+
-#         and OpenSSL verify the pinned paper-master roster, live machine
-#         signature, signed target name/size/hash, existing rollback floors,
-#         and ELF architecture before any execution. A checksum-only legacy
-#         tarball is never an automatic fallback. The installed runtime then
-#         independently verifies the proof and enrolls this managed binary for
-#         signed updates. A source fallback is NOT automatically enrolled.
+#         aterm-<version>-linux-<arch> into the cli store below, fetched from the
+#         same download host. Python 3.11+ and OpenSSL verify the pinned
+#         paper-master roster, live machine signature, signed target
+#         name/size/hash, existing rollback floors, and ELF architecture before
+#         any execution. A checksum-only legacy tarball is never an automatic
+#         fallback. The installed runtime then independently verifies the proof
+#         and enrolls this managed binary for signed updates. A source fallback
+#         is NOT automatically enrolled.
 #   cli — the `aterm` command (transparent PTY passthrough + the front door
 #         for every verb). ONE name lands on PATH — the [workspace.metadata.
 #         atpkg] expose declaration; the verb siblings (aterm-ctl, atpkg,
@@ -90,32 +82,15 @@
 #         (~/.local/lib/aterm/bin, override ATERM_STORE_DIR) with the one
 #         `aterm` symlink in ~/.local/bin — non-macOS, older bundles, or no
 #         installed app. A PATH hint prints if ~/.local/bin isn't on PATH.
-#   token — OPT-IN: a per-machine GitHub token for the IN-APP UPDATER, written
-#         to "~/Library/Application Support/aterm/update-token" (0600, in a
-#         0700 dir). Sourced from `gh auth token`. NOT needed for the default
-#         channel: the compiled-in update source is the PUBLIC repo, which the
-#         updater reads anonymously, and for it the token chain consults NO rung
-#         — never the keychain and never this file
-#         (crates/aterm-update-core/src/token.rs, `needs_ambient_credential`).
-#         The file matters ONLY to a development build repointed with `[update]
-#         owner`/`repo` — so by DEFAULT this half is SKIPPED: a broad `gh auth
-#         token` credential must not land in a plaintext file nothing reads. It
-#         runs only when the operator asks: --token. A one-line intent notice
-#         prints before the write; --no-token is a hard off. No environment
-#         variable is read for it (the app's `$ATERM_UPDATE_TOKEN`, `$GITHUB_TOKEN`
-#         and `$GH_TOKEN` rungs are gone since 2026-09-23).
-#         This credential-store provisioning helper is macOS-only; the Linux
-#         public updater uses the committed signature chain and needs no
-#         provisioned secret. Idempotent; the token is
-#         never printed. Re-running refreshes a rotated token, and no failure
-#         here is fatal: the app is installed and, on the public channel,
-#         updating regardless.
+#   toolset — `aterm pkg seed` + `pkg update` (a fresh lean install defers it
+#         to the app's first launch); PATH — one marker-fenced block in your
+#         shell profile. Each has its --no-… flag.
 #
 # FAILSAFE POLICY: each half is pre-flighted BEFORE any install work; a half
 # that is impossible in this environment (piped script with no checkout,
-# an OS/arch with no released artifact, a repo needing credentials this run
-# lacks, missing cargo or the
-# pinned trust toolchain, no release yet, unwritable destination) is
+# an OS/arch with no released artifact, a private or unreadable repo, missing
+# cargo or the pinned trust toolchain, no release yet or a head whose release
+# is still being published, unwritable destination) is
 # SKIPPED with a loud reason and the rest still installs. Exit 1 when nothing
 # was installed. A real mid-flight failure (download, SHA-256 / signature
 # verification, build) always aborts non-zero — those are never skipped.
@@ -129,9 +104,6 @@
 #                                                     # on first launch with live progress
 #   tools/install.sh --no-cli                         # exclude the `aterm` command
 #   tools/install.sh --no-app                         # exclude the app
-#   tools/install.sh --token                          # DO provision the update token
-#                                                     # (default: skipped — see `token`)
-#   tools/install.sh --no-token                       # hard off for the token half
 #   tools/install.sh --no-toolchain                   # lean zip, toolset excluded — but the
 #                                                     # exclusion does not persist yet: no
 #                                                     # config is written, so the app's first
@@ -140,10 +112,6 @@
 #                                                     # is in ~/.config/aterm/aterm.toml first
 #                                                     # (`aterm help pkg`)
 #   tools/install.sh --no-path                        # don't touch the shell profile
-#   tools/install.sh --token --no-app --no-cli --no-toolchain --no-path
-#                                                     # ONLY provision the token — for a
-#                                                     # machine that points the updater at
-#                                                     # a private repo (see `token` above)
 #   tools/install.sh --version 0.5.0                  # pin the app release
 #   tools/install.sh --dry-run                        # print the whole install plan —
 #                                                     # elected release, asset + size,
@@ -163,10 +131,6 @@
 # app when its bundle ships the tools; against older releases the cli half is
 # skipped with a note, since building from source needs a checkout):
 #   curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
-# Operators installing from the PRIVATE staging repo (needs authenticated gh):
-#   gh api -H "Accept: application/vnd.github.raw" \
-#     repos/alabsystems/aterm/contents/tools/install.sh |
-#     ATERM_REPO_SLUG=alabsystems/aterm bash
 set -euo pipefail
 
 # Is this file really on disk (vs piped/`bash -s`, where BASH_SOURCE is unusable —
@@ -180,7 +144,7 @@ usage() {
 		# Print the header comment: from line 5 to the first non-comment line, drop it.
 		sed -n '5,/^[^#]/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
 	else
-		echo "usage: install.sh [--no-cli] [--no-app] [--token] [--no-token] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
+		echo "usage: install.sh [--no-cli] [--no-app] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
 	fi
 }
 
@@ -215,8 +179,8 @@ decimal_in_closed_range() {
 
 # Classify one published release tag, mirroring the updater's parse_numeric_tag
 # (crates/aterm-update/src/github.rs). Sets TAG_KIND_RESULT to:
-#   candidate — the current scheme: canonical vMAJOR.MINOR.PATCH, i.e. the
-#               workspace MAJOR.MINOR.DEV version with DEV reset to 0
+#   candidate — the current scheme: canonical vMAJOR.MINOR.PATCH, the
+#               workspace [workspace.package] version as written
 #               (VERSIONING.md). Only these are ever installed by default.
 #   legacy    — a retired pre-cut-over two-component vMAJOR.MINOR. Those
 #               releases stay published as archive history and are skipped, not
@@ -301,105 +265,6 @@ compare_numeric_tags() {
 	fi
 }
 
-# Input rows are TAG<TAB>DRAFT<TAB>EXACT_MANIFEST_COUNT, emitted for every page
-# by gh's embedded jq. Output is the unique numeric maximum of the CURRENT-scheme
-# vMAJOR.MINOR.PATCH candidates; retired two-component releases are skipped even
-# when their numbers are larger (v0.61 does not outrank v0.5.0 — it is not in the
-# running at all). Return 1 for no app candidate and 2 for malformed/ambiguous/
-# noncanonical authority.
-#
-# Mirrors select_authoritative_release (crates/aterm-update/src/github.rs) on
-# BOTH of its order-independence rules, not just tag arbitration:
-#   - a duplicate-manifest release is a candidate with POISONED metadata: it
-#     still competes under its unambiguous tag, and the poison is fatal only
-#     when that release WINS (the winner-only gate after the loop). Erroring
-#     before arbitration let a duplicate asset on an old, strictly-lower
-#     release wedge the whole install even though it could never be elected —
-#     a losing release simply loses, and failing closed over it defends
-#     nothing.
-#   - a REPEATED candidate tag fails closed wherever it sits in the catalog,
-#     the same as the updater's seen_tags set. Detecting ties only against the
-#     running maximum made the verdict depend on REST row order: the duplicate
-#     pair was invisible whenever a higher tag arrived first.
-select_authoritative_tag() {
-	local rows="$1" tag draft manifest_count extra selected=""
-	local seen_candidates=$'\n' poisoned=$'\n'
-	while IFS=$'\t' read -r tag draft manifest_count extra ||
-		[[ -n "${tag}${draft}${manifest_count}${extra}" ]]; do
-		[[ -n "${tag}${draft}${manifest_count}${extra}" ]] || continue
-		if [[ -n "$extra" || ( "$draft" != true && "$draft" != false ) ||
-			! "$manifest_count" =~ ^[0-9]+$ ]]; then
-			echo "install.sh: malformed release metadata row for ${tag:-<missing-tag>}" >&2
-			return 2
-		fi
-		[[ "$draft" == true ]] && continue
-		[[ "$manifest_count" == 0 ]] && continue
-		if ! parse_release_tag "$tag"; then
-			echo "install.sh: app release tag $tag is not numeric dotted vN.N.N" >&2
-			return 2
-		fi
-		# Retired-scheme releases stay published but are never installed. Skipping
-		# (rather than erroring) is what lets the pre-cut-over archive coexist with
-		# the current channel — the same `continue` the updater's selector takes,
-		# which also discards any duplicate-manifest poison a legacy row carries.
-		[[ "$TAG_KIND_RESULT" == candidate ]] || continue
-		if [[ "$seen_candidates" == *$'\n'"$tag"$'\n'* ]]; then
-			echo "install.sh: published app releases use the numeric order of $tag more than once" >&2
-			return 2
-		fi
-		seen_candidates="$seen_candidates$tag"$'\n'
-		[[ "$manifest_count" == 1 ]] || poisoned="$poisoned$tag"$'\n'
-		if [[ -z "$selected" ]]; then
-			selected="$tag"
-		else
-			compare_numeric_tags "$tag" "$selected" || return 2
-			case "$TAG_COMPARE_RESULT" in
-			1) selected="$tag" ;;
-			0)
-				# Unreachable for two DISTINCT canonical tags (leading-zero
-				# rejection gives each numeric order exactly one spelling, and
-				# literal repeats fail on the set above) — kept as a fail-closed
-				# backstop, never as the primary duplicate detector.
-				echo "install.sh: published app releases $selected and $tag have the same numeric order" >&2
-				return 2
-				;;
-			esac
-		fi
-	done <<<"$rows"
-	[[ -n "$selected" ]] || return 1
-	# THE WINNER-ONLY GATE (github.rs): a poisoned maximum fails the whole
-	# check closed — never elect a runner-up behind a broken winner.
-	if [[ "$poisoned" == *$'\n'"$selected"$'\n'* ]]; then
-		echo "install.sh: release $selected has duplicate aterm-appcast.toml assets" >&2
-		return 2
-	fi
-	if ! canonical_authority_tag "$selected"; then
-		echo "install.sh: authoritative app release $selected is not canonical vMAJOR.MINOR.PATCH" >&2
-		return 2
-	fi
-	printf '%s\n' "$selected"
-}
-
-# Require one exact API asset ID. This is separately tested because using an
-# order-dependent first match would make duplicate assets an availability bug.
-require_unique_asset_id() {
-	local ids="$1" label="$2" id count=0 selected=""
-	while IFS= read -r id || [[ -n "$id" ]]; do
-		[[ -n "$id" ]] || continue
-		if [[ ! "$id" =~ ^[1-9][0-9]*$ ]]; then
-			echo "install.sh: malformed asset ID for $label" >&2
-			return 2
-		fi
-		count=$((count + 1))
-		selected="$id"
-	done <<<"$ids"
-	if [[ "$count" -ne 1 ]]; then
-		echo "install.sh: release has $count assets named $label; expected exactly one" >&2
-		return 2
-	fi
-	printf '%s\n' "$selected"
-}
-
 # Bind tag, manifest version, local path shape, and digest before any DMG lookup,
 # join, or download. The elected authority is always vMAJOR.MINOR.PATCH; an
 # explicit --version may also name a retired two-component archive release, and
@@ -421,190 +286,45 @@ validate_manifest_identity() {
 	fi
 }
 
-# --- anonymous-lane extractors: the gh-embedded jq's job, without gh ----------
+# --- the one transport: github.com's release download host --------------------
 #
-# The anonymous lane reads api.github.com directly, which pretty-prints: in the
-# release LIST response, release-object fields sit at exactly 4 spaces and asset
-# fields at exactly 8; in the single-release (tags/<tag>) response, asset objects
-# open at exactly 4 and their fields sit at exactly 6. JSON strings cannot carry
-# a raw newline or raw tab, so exact-indent anchoring cannot be forged from a
-# release name or body, and the emitted TSV cannot be split by a value. This is
-# NOT a permissive JSON parser: any release/asset whose expected fields arrive
-# in an unexpected shape emits a deliberately malformed row, which the row
-# validators downstream (select_authoritative_tag / require_unique_asset_record)
-# refuse LOUDLY — a parser surprise stops the install, never narrows the set.
+# Every byte comes from `https://github.com/<owner>/<repo>/releases/…` with no
+# credential — the unmetered host the in-app updater reads (crates/aterm-update
+# github.rs, crates/aterm-update-core pointer.rs). Nothing here calls the GitHub
+# API: no catalog walk, no asset metadata, no shared 60-requests/hour budget.
+#
+#   the head   ONE HEAD of …/releases/latest/download/aterm-appcast.toml with
+#              redirects refused. GitHub answers 302 to the tag-specific URL of
+#              the newest published release — drafts and prereleases excluded on
+#              the server — and the release cut owns that pointer, so it names
+#              the newest APP release. The Location is accepted only when it is
+#              exactly the derived appcast URL of this repository under a
+#              canonical vMAJOR.MINOR.PATCH tag; anything else is refused, never
+#              followed.
+#   the bytes  tag-specific …/releases/download/<tag>/<name> URLs, never `latest`
+#              again, so a pointer that moves mid-install cannot mix two
+#              releases. A HEAD that refuses redirects answers 302 when the asset
+#              exists and 404 when it does not; a HEAD that follows them names
+#              its size (the CDN's Content-Length); a GET streams it, bounded.
+#
+# Authenticity is not the transport's job: the manifest digest and the Apple
+# code-signing chain decide what installs (install_app).
 
-# stdin: one page of /repos/<slug>/releases JSON.
-# stdout: TAG<TAB>DRAFT<TAB>EXACT_MANIFEST_COUNT per release — the same rows the
-# gh lane's embedded jq emits for select_authoritative_tag.
-anon_release_rows() {
-	awk '
-		/^  \{$/ { open = 1; bad = 0; tag = ""; draft = ""; prerelease = "false"; count = 0; next }
-		open != 1 { next }
-		/^    "tag_name":/ {
-			if ($0 ~ /^    "tag_name": "[^"]*",?$/) {
-				tag = $0
-				sub(/^    "tag_name": "/, "", tag)
-				sub(/",?$/, "", tag)
-			} else bad = 1
-		}
-		/^    "draft":/ {
-			if ($0 ~ /^    "draft": (true|false),?$/) {
-				draft = $0
-				sub(/^    "draft": /, "", draft)
-				sub(/,$/, "", draft)
-			} else bad = 1
-		}
-		/^    "prerelease":/ {
-			if ($0 ~ /^    "prerelease": (true|false),?$/) {
-				prerelease = $0
-				sub(/^    "prerelease": /, "", prerelease)
-				sub(/,$/, "", prerelease)
-			} else bad = 1
-		}
-		/^        "name": "aterm-appcast\.toml",?$/ { count += 1 }
-		/^  \},?$/ {
-			if (bad || tag == "" || draft == "") print "MALFORMED\tMALFORMED\tMALFORMED\tMALFORMED"
-			else print tag "\t" ((draft == "true" || prerelease == "true") ? "true" : "false") "\t" count
-			open = 0
-		}
-	'
+RELEASE_HOST="https://github.com"
+# Upper bound for the manifest (a few KiB).
+MANIFEST_MAX_BYTES=5000000
+
+# Every request goes through here: https only, redirects included, a bounded
+# connect, never a credential. One function, so the suite stubs the transport
+# in one place.
+web_curl() {
+	curl --proto '=https' --proto-redir '=https' --connect-timeout 10 "$@"
 }
 
-# Linux additionally needs per-architecture hints and archived metadata for
-# older native targets. JSON is parsed, bounded and validated before row use;
-# the catalog identifies locations only, never authenticates a release.
-linux_catalog_page() {
-	python3 -c '
-import json, re, sys
-raw = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
-if len(raw) > 8 * 1024 * 1024: raise SystemExit("Linux catalog page exceeds8MiB")
-rows = json.loads(raw)
-if not isinstance(rows, list) or len(rows) > 100: raise SystemExit("invalid Linux catalog page")
-print("COUNT\t" + str(len(rows)))
-for row in rows:
-    tag, assets = row.get("tag_name"), row.get("assets", [])
-    draft, prerelease = row.get("draft", False), row.get("prerelease", False)
-    if not isinstance(tag, str) or not isinstance(assets, list) or type(draft) is not bool or type(prerelease) is not bool:
-        raise SystemExit("invalid Linux release metadata")
-    names = [asset["name"] for asset in assets]
-    if not all(isinstance(name, str) for name in names): raise SystemExit("invalid Linux asset name")
-    if draft or prerelease: continue
-    exact = names.count("aterm-appcast.toml")
-    archive = names.count("aterm-appcast-" + tag + ".toml")
-    if not names.count("aterm-appcast-" + tag + ".toml.sig"): archive = 0
-    raw_count = names.count("aterm-" + tag.removeprefix("v") + "-linux-" + sys.argv[1])
-    if not exact and not (archive and raw_count): continue
-    if re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag): continue
-    if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag) or any(int(p) > 2**64-1 for p in tag[1:].split(".")):
-        raise SystemExit("noncanonical APP release tag: " + tag)
-    print(tag, exact, archive, raw_count, sep="\t")
-' "$1"
-}
-
-linux_catalog_order() {
-	python3 -c '
-import sys
-seen = {}
-for row in sys.stdin:
-    if not row.strip(): continue
-    tag, exact, archive, native = row.rstrip("\n").split("\t")
-    if tag in seen: raise SystemExit("duplicate Linux APP release tag: " + tag)
-    seen[tag] = (int(exact), int(archive), int(native))
-for tag in sorted(seen, key=lambda t: tuple(map(int, t[1:].split("."))), reverse=True):
-    print(tag, *seen[tag], sep="\t")
-'
-}
-
-linux_load_catalog() {
-	local page=1 json rows count all="" tag exact archived native extra
-	while [[ "$page" -le 30 ]]; do
-		if [[ "$APP_LANE" == gh ]]; then
-			json="$(gh api "repos/$REPO_SLUG/releases?per_page=100&page=$page")" || return 1
-		else
-			json="$(curl -fsS --connect-timeout 10 --max-time 60 --retry 2 -H 'Accept: application/vnd.github+json' \
-				"https://api.github.com/repos/$REPO_SLUG/releases?per_page=100&page=$page")" || return 1
-		fi
-		rows="$(linux_catalog_page "$LINUX_ARCH" <<<"$json")" || return 2
-		count="${rows%%$'\n'*}"; count="${count#COUNT$'\t'}"
-		rows="$(printf '%s\n' "$rows" | sed '1d')"
-		all="${all}${rows:+$rows$'\n'}"
-		[[ "$count" -eq 100 ]] || break
-		page=$((page + 1))
-	done
-	[[ "$page" -le 30 ]] || { echo "install.sh: Linux release catalog exhausted its page bound" >&2; return 2; }
-	LINUX_CATALOG_ROWS="$(linux_catalog_order <<<"$all")" || return 2
-	LINUX_HEAD_TAG=""
-	while IFS=$'\t' read -r tag exact archived native extra; do
-		[[ -n "$tag" ]] || continue
-		if [[ "$exact" -gt 0 ]]; then
-			[[ "$exact" -eq 1 ]] || { echo "install.sh: current APP head has ambiguous appcasts" >&2; return 2; }
-			LINUX_HEAD_TAG="$tag"; break
-		fi
-	done <<<"$LINUX_CATALOG_ROWS"
-	[[ -n "$LINUX_HEAD_TAG" ]] || return 1
-	local requested="${TAG:-}" selected=""
-	while IFS=$'\t' read -r tag exact archived native extra; do
-		[[ -n "$tag" && "$native" -gt 0 ]] || continue
-		if [[ "$TAG_EXPLICIT" -eq 1 ]]; then [[ "$tag" == "$requested" ]] || continue; fi
-		compare_numeric_tags "$tag" "$LINUX_HEAD_TAG" || return 2
-		[[ "$TAG_COMPARE_RESULT" -le 0 ]] || continue
-		[[ "$native" -eq 1 && "$exact" -le 1 ]] || { echo "install.sh: native candidate has ambiguous assets" >&2; return 2; }
-		if [[ "$exact" -eq 1 ]]; then LINUX_MANIFEST_ASSET=aterm-appcast.toml
-		elif [[ "$archived" -eq 1 ]]; then LINUX_MANIFEST_ASSET="aterm-appcast-$tag.toml"
-		else echo "install.sh: native candidate has ambiguous archived appcasts" >&2; return 2; fi
-		selected="$tag"; break
-	done <<<"$LINUX_CATALOG_ROWS"
-	if [[ -n "$selected" ]]; then TAG="$selected"; else TAG="$LINUX_HEAD_TAG"; fi
-	LINUX_NATIVE_AVAILABLE=0
-	[[ -z "$selected" ]] || LINUX_NATIVE_AVAILABLE=1
-}
-
-# stdin: one /repos/<slug>/releases/tags/<tag> JSON document.
-# stdout: ID<TAB>SIZE for every asset whose name is exactly $1 — the same rows
-# the gh lane's embedded jq feeds require_unique_asset_record.
-anon_asset_records() {
-	awk -v wanted="$1" '
-		/^    \{$/ { open = 1; bad = 0; n = ""; id = ""; size = ""; next }
-		open != 1 { next }
-		/^      "name":/ {
-			if ($0 ~ /^      "name": "[^"]*",?$/) {
-				n = $0
-				sub(/^      "name": "/, "", n)
-				sub(/",?$/, "", n)
-			} else bad = 1
-		}
-		/^      "id":/ {
-			if ($0 ~ /^      "id": [0-9]+,?$/) {
-				id = $0
-				sub(/^      "id": /, "", id)
-				sub(/,$/, "", id)
-			} else bad = 1
-		}
-		/^      "size":/ {
-			if ($0 ~ /^      "size": [0-9]+,?$/) {
-				size = $0
-				sub(/^      "size": /, "", size)
-				sub(/,$/, "", size)
-			} else bad = 1
-		}
-		/^    \},?$/ {
-			if (n == wanted) {
-				if (bad || id == "" || size == "") print "MALFORMED\tMALFORMED\tMALFORMED"
-				else print id "\t" size
-			}
-			open = 0
-		}
-	'
-}
-
-# Return every exact ID/size record for a validated tag/name pair. Callers must
-# apply require_unique_asset_record before using the result; keeping immutable
-# API identity metadata makes the subsequent octet download order-independent.
-# Both lanes carry the same records, so every uniqueness/bounds gate downstream
-# is lane-independent. APP_LANE defaults to gh so the library-only test seam
-# (which mocks `gh`) keeps its transport semantics.
-release_asset_records() {
+# The tag-specific download URL of one asset, on stdout — or a refusal (status 2)
+# for a tag or a name outside the allowlist, so a manifest can never name an
+# arbitrary asset of the release.
+release_asset_url() { # <tag> <name>
 	local tag="$1" name="$2"
 	canonical_numeric_tag "$tag" || {
 		echo "install.sh: refusing asset lookup for invalid release tag $tag" >&2
@@ -615,19 +335,15 @@ release_asset_records() {
 	"aterm-appcast-$tag.toml" | "aterm-appcast-$tag.toml.sig") ;;
 	*)
 		# Two canonical macOS container names, both anchored and version-shaped:
-		# the bare DMG and the lean zip. The zip is admitted because every
-		# current install comes FROM it; without that arm the whole lean lane
-		# was dead on arrival — every Intel install aborted here with
-		# "noncanonical name" before downloading a byte. The bare DMG stays
-		# because the manifest's required `dmg` key binds it and a pinned
-		# pre-lean release (no zip) still installs from it. The Intel
-		# `-x86_64.dmg` row of the retired batteries pair is GONE (2026-08-26):
-		# no release cuts it any more, so a manifest naming it is refused here
-		# like any other foreign asset.
+		# the lean zip every current install comes from, and the bare DMG the
+		# manifest's required `dmg` key binds (a pinned pre-lean release installs
+		# from it). The Intel `-x86_64.dmg` of the retired batteries pair is not
+		# here (2026-08-26): a manifest naming it is a foreign asset. The Linux
+		# rows are the released ONE binary, a raw ELF per architecture, and the
+		# retired checksum-only tarball pair.
 		#
-		# Kept as an explicit allowlist rather than a loosened pattern: the point of
-		# this gate is that a manifest cannot name an arbitrary asset in the
-		# release, and each suffix is exactly as constrained as `.dmg`.
+		# An explicit allowlist rather than a loosened pattern: each suffix is
+		# exactly as constrained as `.dmg`.
 		#
 		# Linux release installation elects only the signed raw ELF spelling.
 		# Legacy checksum-only tarball names remain recognizable for archive
@@ -641,108 +357,123 @@ release_asset_records() {
 		}
 		;;
 	esac
-	if [[ "${APP_LANE:-gh}" == gh ]]; then
-		gh api "repos/$REPO_SLUG/releases/tags/$tag" \
-			--jq ".assets[] | select(.name == \"$name\") | [(.id | tostring), (.size | tostring)] | @tsv"
-	elif [[ "${RELEASE_DOC_TAG:-}" == "$tag" && -r "${RELEASE_DOC_FILE:-}" ]]; then
-		# ONE fetch of the release document serves every lookup for the elected
-		# tag: prime_release_document filled this file, so the manifest, .sig,
-		# and container lookups no longer spend three of the 60 anonymous
-		# requests/hour re-reading the same immutable document.
-		anon_asset_records "$name" <"$RELEASE_DOC_FILE"
-	else
-		curl -fsS --connect-timeout 10 --retry 2 -H "Accept: application/vnd.github+json" \
-			"https://api.github.com/repos/$REPO_SLUG/releases/tags/$tag" |
-			anon_asset_records "$name"
+	printf '%s/%s/releases/download/%s/%s\n' "$RELEASE_HOST" "$REPO_SLUG" "$tag" "$name"
+}
+
+# The channel head: the tag GitHub's `latest` names, from ONE HEAD with redirects
+# refused. Sets HEAD_TAG (status 0), or HEAD_WHY and status 1 when there is
+# nothing to install from it (no published release, an unreachable host, a head
+# that is not an app release — a skip), or status 2 when the redirect is one this
+# script refuses to interpret (a refusal, never "follow and hope"). Called
+# directly, never in $(…), so the two globals reach the caller.
+HEAD_TAG=""
+HEAD_WHY=""
+channel_head() {
+	local url="$RELEASE_HOST/$REPO_SLUG/releases/latest/download/aterm-appcast.toml"
+	local answer code location rest tag rc=0
+	HEAD_TAG=""
+	HEAD_WHY=""
+	answer="$(web_curl -sS -I -o /dev/null --max-time 30 -w '%{http_code} %{redirect_url}' "$url" 2>/dev/null)" || rc=$?
+	if [[ "$rc" -ne 0 ]]; then
+		HEAD_WHY="could not reach $url (curl exit $rc: the network, DNS or TLS)"
+		return 1
 	fi
-}
-
-# Prime the one anonymous fetch of the elected release's document (see the
-# cache arm in release_asset_records). Best-effort: on failure the cache stays
-# unset and every lookup falls back to its own fetch with its own error path.
-RELEASE_DOC_FILE=""
-RELEASE_DOC_TAG=""
-prime_release_document() { # <tag> <destination-file>
-	[[ "${APP_LANE:-gh}" == anon ]] || return 0
-	curl -fsS --connect-timeout 10 --retry 2 -H "Accept: application/vnd.github+json" \
-		"https://api.github.com/repos/$REPO_SLUG/releases/tags/$1" >"$2" 2>/dev/null || return 0
-	RELEASE_DOC_FILE="$2"
-	RELEASE_DOC_TAG="$1"
-}
-
-# A rate-limited anonymous user deserves the real diagnosis, not a mute
-# transport error. /rate_limit is documented as NOT counting against the
-# budget, so this costs nothing even when the budget is the problem.
-# Best-effort: any parse surprise stays silent and the caller's own error
-# message stands.
-explain_anon_rate_limit() {
-	[[ "${APP_LANE:-gh}" == anon ]] || return 0
-	local doc remaining reset when=""
-	doc="$(curl -fsS --connect-timeout 10 --retry 2 -H "Accept: application/vnd.github+json" \
-		"https://api.github.com/rate_limit" 2>/dev/null)" || return 0
-	remaining="$(awk '/"core":/ { f = 1 } f && /"remaining":/ { gsub(/[^0-9]/, ""); print; exit }' <<<"$doc")"
-	reset="$(awk '/"core":/ { f = 1 } f && /"reset":/ { gsub(/[^0-9]/, ""); print; exit }' <<<"$doc")"
-	[[ "$remaining" == 0 ]] || return 0
-	if [[ "$reset" =~ ^[0-9]+$ ]]; then
-		# macOS date takes -r <epoch>; GNU date takes -d @<epoch>.
-		when="$(date -r "$reset" 2>/dev/null || date -d "@$reset" 2>/dev/null || true)"
-	fi
-	echo "install.sh: GitHub anonymous rate limit exhausted (60 requests/hour/IP) — retry after ${when:-it resets (within the hour)}, or authenticate: brew install gh && gh auth login" >&2
-}
-
-require_unique_asset_record() {
-	local records="$1" label="$2" minimum="$3" maximum="$4"
-	local id size extra count=0 selected_id="" selected_size=""
-	while IFS=$'\t' read -r id size extra || [[ -n "${id}${size}${extra}" ]]; do
-		[[ -n "${id}${size}${extra}" ]] || continue
-		if [[ -n "$extra" || ! "$id" =~ ^[1-9][0-9]*$ ]] ||
-			! decimal_in_closed_range "$size" "$minimum" "$maximum"; then
-			echo "install.sh: malformed or out-of-bounds asset metadata for $label" >&2
-			return 2
-		fi
-		count=$((count + 1))
-		selected_id="$id"
-		selected_size="$size"
-	done <<<"$records"
-	if [[ "$count" -ne 1 ]]; then
-		echo "install.sh: release has $count assets named $label; expected exactly one" >&2
+	code="${answer%% *}"
+	location="${answer#* }"
+	case "$code" in
+	302) ;;
+	404)
+		HEAD_WHY="$REPO_SLUG has no published release (or the repository is private, renamed or missing — github.com answers the same for all three)"
+		return 1
+		;;
+	429 | 5[0-9][0-9])
+		HEAD_WHY="github.com answered HTTP $code to $url — retry in a few minutes"
+		return 1
+		;;
+	*)
+		HEAD_WHY="github.com answered HTTP ${code:-000} to $url, which is not a release pointer (a proxy or a filtered host?)"
+		return 1
+		;;
+	esac
+	# The Location must be EXACTLY <host>/<slug>/releases/download/<tag>/
+	# aterm-appcast.toml with <tag> one path segment: strip the derived prefix
+	# and suffix, and anything left over (another host, repository or asset, a
+	# query, a second segment) refuses. What remains is then the derived URL for
+	# <tag> by construction — every later request is addressed to that.
+	rest="${location#"$RELEASE_HOST/$REPO_SLUG/releases/download/"}"
+	tag="${rest%/aterm-appcast.toml}"
+	if [[ "$rest" == "$location" || "$tag" == "$rest" || -z "$tag" || "$tag" == */* ]]; then
+		HEAD_WHY="the latest-release pointer of $REPO_SLUG redirected somewhere this installer refuses to follow (not the tag-specific aterm-appcast.toml URL of this repository)"
 		return 2
 	fi
-	printf '%s\t%s\n' "$selected_id" "$selected_size"
+	if ! canonical_authority_tag "$tag"; then
+		HEAD_WHY="the latest release of $REPO_SLUG is ${tag//[^A-Za-z0-9._-]/?}, which is not an app release (vMAJOR.MINOR.PATCH) — name one with --version"
+		return 1
+	fi
+	HEAD_TAG="$tag"
 }
 
-release_unique_asset_record() {
-	local tag="$1" name="$2" minimum="$3" maximum="$4" records
-	if ! records="$(release_asset_records "$tag" "$name")"; then
-		echo "install.sh: could not resolve $name in release $tag" >&2
+# Is <name> published on release <tag>? One HEAD with redirects refused: 302 (to
+# the asset CDN) is present, 404 is absent. Status 0 present, 1 absent, 2 no
+# answer either way (ASSET_WHY says why). Called directly, never in $(…).
+ASSET_WHY=""
+release_asset_present() { # <tag> <name>
+	local url code rc=0
+	ASSET_WHY=""
+	url="$(release_asset_url "$1" "$2")" || return 2
+	code="$(web_curl -sS -I -o /dev/null --max-time 30 -w '%{http_code}' "$url" 2>/dev/null)" || rc=$?
+	if [[ "$rc" -ne 0 ]]; then
+		ASSET_WHY="could not reach $url (curl exit $rc: the network, DNS or TLS)"
 		return 2
 	fi
-	require_unique_asset_record "$records" "$name" "$minimum" "$maximum"
+	case "$code" in
+	302) return 0 ;;
+	404) return 1 ;;
+	*)
+		ASSET_WHY="github.com answered HTTP ${code:-000} to $url"
+		return 2
+		;;
+	esac
 }
 
-# The one producer of asset octets, per lane. Both stream the exact immutable
-# asset ID (never a name or "latest" pointer), so the identity carried from
-# release_asset_records is what gets downloaded on either transport.
-fetch_asset_octets() {
-	if [[ "${APP_LANE:-gh}" == gh ]]; then
-		gh api -H "Accept: application/octet-stream" "repos/$REPO_SLUG/releases/assets/$1"
-	else
-		# -L: the API answers an octet-stream request with a redirect to the CDN.
-		curl -fsSL -H "Accept: application/octet-stream" \
-			"https://api.github.com/repos/$REPO_SLUG/releases/assets/$1"
+# The size, in bytes, the download host serves for <name> of <tag>: one HEAD that
+# follows the redirect, whose FINAL Content-Length is the answer. It must lie in
+# 1..<max> (default 2 GiB); the download is then held to exactly that many bytes.
+release_asset_size() { # <tag> <name> [max-bytes]
+	local tag="$1" name="$2" max="${3:-2147483648}" url headers size
+	url="$(release_asset_url "$tag" "$name")" || return 2
+	headers="$(web_curl -fsSIL --max-time 60 "$url" 2>/dev/null)" || {
+		echo "install.sh: could not read the size of $name in release $tag ($url)" >&2
+		return 1
+	}
+	size="$(printf '%s\n' "$headers" | tr -d '\r' |
+		awk 'tolower($1) == "content-length:" { v = $2 } END { print v }')"
+	if ! decimal_in_closed_range "$size" 1 "$max"; then
+		echo "install.sh: $name in release $tag has no size in 1..$max bytes (the download host said '${size:-none}')" >&2
+		return 2
 	fi
+	printf '%s\n' "$size"
+}
+
+# Stream <name> of <tag> to stdout, at most <max> bytes plus one: the caller holds
+# what arrived to the size it expects, so an overrunning body fails instead of
+# filling the disk, and pipefail fails an overrunning producer too.
+# --max-filesize lets curl refuse an oversize Content-Length before the body.
+fetch_release_asset() { # <tag> <name> <max-bytes>
+	local url
+	url="$(release_asset_url "$1" "$2")" || return 2
+	web_curl -fsSL --retry 2 --max-time 3600 --max-filesize "$3" "$url" | head -c "$(($3 + 1))"
 }
 
 # --- download progress ---------------------------------------------------------
 # The DMG went from ~51 MB to ~1.1 GB when the toolchain moved into it, on a
-# transport chosen to be silent (`curl -fsS`, `gh api` with no meter). That is
-# many wordless minutes in the middle of a `curl … | bash`, which is exactly
-# when someone concludes it has hung and ^Cs a half-written install.
+# transport chosen to be silent (`curl -fsS`, no meter). That is many wordless
+# minutes in the middle of a `curl … | bash`, which is exactly when someone
+# concludes it has hung and ^Cs a half-written install.
 #
-# The meter polls the DESTINATION FILE rather than the transport, so one
-# implementation covers both lanes and neither one's flags have to change — and
-# it leans on the only quantity the caller already proved trustworthy, the
-# immutable API size that bounds the read below.
+# The meter polls the DESTINATION FILE rather than the transport, so the
+# transport's flags never have to change — and it leans on the size the caller
+# already bounded (release_asset_size), which also bounds the read below.
 #
 # Terminal-only. Under `curl … | bash` just stdin is the pipe, so stderr is
 # still the tty and the meter shows; CI redirects stderr and gets clean logs
@@ -782,36 +513,33 @@ stop_download_meter() {
 	return 0
 }
 
-download_release_asset_id() {
-	local id="$1" expected_size="$2" destination="$3" actual_size rc=0
-	if [[ ! "$id" =~ ^[1-9][0-9]*$ || -z "$destination" ]] ||
-		! decimal_in_closed_range "$expected_size" 1 2147483648; then
+# Download <name> of <tag> to <destination>, which must end up exactly
+# <expected-size> bytes — the size release_asset_size read from the host.
+download_release_asset() { # <tag> <name> <expected-size> <destination>
+	local tag="$1" name="$2" expected_size="$3" destination="$4" actual_size rc=0
+	if [[ -z "$destination" ]] || ! decimal_in_closed_range "$expected_size" 1 2147483648; then
 		echo "install.sh: refusing malformed release asset download" >&2
 		return 2
 	fi
-	# Read at most one byte beyond the immutable API size. pipefail makes a
-	# producer that overruns the bound fail, while the exact byte-count check
-	# below catches both short and one-byte-overlong responses. This caps disk
-	# exposure even if transport metadata and body disagree.
+	# Read at most one byte beyond the expected size. pipefail makes a producer
+	# that overruns the bound fail, while the exact byte-count check below
+	# catches both short and one-byte-overlong responses. This caps disk
+	# exposure even if the size header and the body disagree.
 	#
 	# The meter is started around the transfer and stopped on EVERY path — the
 	# `|| rc=$?` keeps `set -e` from leaving a poller orphaned on a failed
 	# download, which would otherwise redraw over the error message explaining
 	# what went wrong.
 	start_download_meter "$destination" "$expected_size"
-	fetch_asset_octets "$id" |
-		head -c "$((expected_size + 1))" >"$destination" || rc=$?
+	fetch_release_asset "$tag" "$name" "$expected_size" >"$destination" || rc=$?
 	stop_download_meter
 	if [[ "$rc" -ne 0 ]]; then
-		echo "install.sh: exact asset $id download failed" >&2
-		# On the anonymous lane the likeliest silent killer is the shared
-		# 60/hour budget — one uncounted /rate_limit call says so by name.
-		explain_anon_rate_limit
+		echo "install.sh: download of $name from release $tag failed" >&2
 		return 1
 	fi
 	actual_size="$(wc -c <"$destination" | tr -d '[:space:]')"
 	if [[ "$actual_size" != "$expected_size" ]]; then
-		echo "install.sh: exact asset $id size mismatch (API $expected_size, downloaded $actual_size)" >&2
+		echo "install.sh: $name size mismatch (the download host said $expected_size bytes, $actual_size arrived)" >&2
 		return 2
 	fi
 }
@@ -877,6 +605,65 @@ parse_manifest_identity_fields() { # <manifest-text>
 OFFICIAL_REPO_SLUG="alabsystems/aterm"
 OFFICIAL_TEAM_ID="A66A9P66Z7"
 
+# One bare GitHub name segment (an owner OR a repo): the alphabet and bounds of
+# crates/aterm-update-core/build.rs `valid_segment`.
+valid_slug_segment() {
+	[[ "$1" =~ ^[A-Za-z0-9._-]{1,100}$ && "$1" != . && "$1" != .. ]]
+}
+
+# The update channel a workspace manifest declares, as OWNER/REPO on stdout —
+# EXACTLY the derivation of the shipped binary's compiled-in channel
+# (crates/aterm-update-core/build.rs): `[workspace.metadata.aterm]
+# update_channel` when it is a valid slug inside that table, else the
+# `[workspace.package] repository` URL. A run from a checkout installs from
+# where that checkout's binaries update from — the public channel every release
+# is published to — and never from `repository` alone: in the development
+# checkout that is the private repository the source lives in, which carries
+# no release a tokenless machine can read. Status 1 when neither rung yields a
+# valid slug (the caller then keeps its default).
+channel_slug_from_manifest() { # <Cargo.toml>
+	local manifest="$1" slug
+	[[ -r "$manifest" ]] || return 1
+	slug="$(manifest_table_string "$manifest" workspace.metadata.aterm update_channel)"
+	if ! valid_slug "$slug"; then
+		slug="$(manifest_table_string "$manifest" workspace.package repository |
+			sed -E 's#^https?://github\.com/##; s#^git@github\.com:##; s#\.git$##; s#/$##')"
+		valid_slug "$slug" || return 1
+	fi
+	printf '%s\n' "$slug"
+}
+
+# Exactly two valid segments.
+valid_slug() {
+	local owner="${1%%/*}" repo="${1#*/}"
+	[[ "$1" == */* && "$repo" != */* ]] && valid_slug_segment "$owner" && valid_slug_segment "$repo"
+}
+
+# One `key = "value"` string out of one `[table]` of a TOML file, on stdout (empty
+# when absent): the line-oriented shape build.rs `table_string` reads, line for
+# line — the exact header, then `key = "value"` with the value the first
+# double-quoted run (a trailing `# comment` falls outside it), whitespace trimmed.
+manifest_table_string() { # <file> <table> <key>
+	awk -v header="[$2]" -v key="$3" '
+		{ line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+		substr(line, 1, 1) == "[" { in_table = (line == header); next }
+		!in_table { next }
+		{
+			eq = index(line, "="); if (eq == 0) next
+			name = substr(line, 1, eq - 1); sub(/[ \t]+$/, "", name)
+			if (name != key) next
+			rest = substr(line, eq + 1); sub(/^[ \t]+/, "", rest)
+			if (substr(rest, 1, 1) != "\"") exit
+			rest = substr(rest, 2); close_at = index(rest, "\"")
+			if (close_at > 0) {
+				value = substr(rest, 1, close_at - 1)
+				sub(/^[ \t]+/, "", value); sub(/[ \t]+$/, "", value)
+				print value
+			}
+			exit
+		}' "$1"
+}
+
 # The REQUIRED signing team for one install, or a refusal. stdout: the Team ID
 # to enforce ("" = no pin — the ad-hoc lane, for forks and dev builds only).
 # Status 2 when the official channel's manifest omits or contradicts the
@@ -912,23 +699,6 @@ sha256_equal() {
 	b="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
 	[[ "$a" == "$b" ]]
 }
-
-# Whether the token half RUNS. Pure, so the deterministic suite pins the
-# consent contract: a broad `gh auth token` credential is copied to disk only
-# when asked outright (--token). The environment triggers it used to honour
-# (ATERM_UPDATE_TOKEN, a repointing ATERM_UPDATE_OWNER/_REPO) are gone with the
-# app's own environment knobs (2026-09-23): the only reader of the file is a
-# development build's repointed channel. --no-token is a hard off.
-token_provisioning_wanted() { # <do_token> <token_flag>
-	[[ "$1" -eq 1 ]] || return 1
-	[[ "$2" -eq 1 ]]
-}
-
-# The token half's destination (the update-token section further down owns the
-# story). Defined at library level so the --dry-run plan can NAME the file
-# without running the half.
-UPDATE_TOKEN_DIR="$HOME/Library/Application Support/aterm"
-UPDATE_TOKEN_FILE="$UPDATE_TOKEN_DIR/update-token"
 
 # The idempotence gate for the app half: an UNPINNED run that elected exactly
 # the installed version has nothing to download. Pure — the caller reads the
@@ -1239,7 +1009,7 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 #     typed, and on a case-insensitive volume (macOS's default APFS) any
 #     spelling reaches the checkout: from `cd /users/<user>/aterm/...` the
 #     builtin printed /users/... while rustup printed
-#     `trust (overridden by '/Users//<user>/aterm/.../rust-toolchain.toml')`
+#     `trust (overridden by '/Users/<user>/aterm/.../rust-toolchain.toml')`
 #     (measured 2026-09-10, bash 3.2.57, rustup 1.29.1). An ambient
 #     RUSTUP_TOOLCHAIN steers rustup and the proxy alike — measured on the
 #     `trust` pin 2026-09-10: RUSTUP_TOOLCHAIN=1.97.1 gives
@@ -1742,6 +1512,56 @@ linux_release_arch() {
 	esac
 }
 
+# The Linux target's remote pre-flight, head-only: no release catalog is listed
+# (R3, 2026-09-23) — the head comes from channel_head, and everything below is
+# one redirect-refusing HEAD per asset (release_asset_present).
+#
+# <tag> is installable when it is at or below <head> (a native target is
+# authorized only under the head's current appcast and roster), it publishes
+# <asset> — the signed raw binary for THIS architecture, so presence is decided
+# per platform — and, when it is older than the head, it still carries an
+# appcast to bind that binary: the current name, else the archived
+# aterm-appcast-<tag>.toml the cutter re-attaches when a newer release takes
+# the head. The head's own appcast is read later, from the head.
+#
+# Sets LINUX_TARGET_SKIP (empty when installable, else the reason the half is
+# skipped) and LINUX_MANIFEST_ASSET (the appcast name to fetch from <tag>).
+# Called directly, never in $(…), so both globals reach the caller.
+LINUX_TARGET_SKIP=""
+linux_target_preflight() { # <tag> <head-tag> <asset>
+	local tag="$1" head="$2" asset="$3" present
+	LINUX_TARGET_SKIP=""
+	LINUX_MANIFEST_ASSET=aterm-appcast.toml
+	if ! compare_numeric_tags "$tag" "$head" || [[ "$TAG_COMPARE_RESULT" -gt 0 ]]; then
+		LINUX_TARGET_SKIP="release $tag is not at or below the channel head $head — a native target is authorized only under the head's current appcast and roster"
+		return 0
+	fi
+	present=0
+	release_asset_present "$tag" "$asset" || present=$?
+	case "$present" in
+	1)
+		LINUX_TARGET_SKIP="release $tag publishes no signed Linux artifact $asset. Legacy checksum-only tarballs are not auto-update-capable and are never selected. Remedy: the cli half builds the same toolset from source (it runs next), or pin a release that ships the signed artifact with --version"
+		return 0
+		;;
+	2)
+		LINUX_TARGET_SKIP="could not inspect release $tag for $asset ($ASSET_WHY)"
+		return 0
+		;;
+	esac
+	[[ "$tag" != "$head" ]] || return 0
+	present=0
+	release_asset_present "$tag" aterm-appcast.toml || present=$?
+	if [[ "$present" -eq 1 ]]; then
+		present=0
+		release_asset_present "$tag" "aterm-appcast-$tag.toml" || present=$?
+		[[ "$present" -ne 0 ]] || LINUX_MANIFEST_ASSET="aterm-appcast-$tag.toml"
+	fi
+	case "$present" in
+	1) LINUX_TARGET_SKIP="release $tag carries no appcast (current or archived) to authorize $asset under" ;;
+	2) LINUX_TARGET_SKIP="could not inspect release $tag for its appcast ($ASSET_WHY)" ;;
+	esac
+}
+
 # Linux has no Apple bootstrap chain. Verify the SAME paper-master -> live
 # machine -> appcast chain as update-core before interpreting an artifact claim.
 # Kept inside the one-file installer so the curl|bash path never fetches an
@@ -2066,7 +1886,7 @@ fi
 #
 # Removes the six things install.sh creates — app bundle, the ONE `aterm`
 # symlink, the source-built store, man pages, shell completions, the Linux
-# desktop entry + icons — plus the update token and its keychain item.
+# desktop entry + icons — plus the PATH block and an EMPTY support dir.
 # Nothing else.
 #
 # EVERY removal is OWNERSHIP-CHECKED first. The installer writes into shared,
@@ -2303,29 +2123,15 @@ uninstall_everything() {
 		fi
 	done
 
-	# 7. the update token, its keychain twin, and the support dir when EMPTY.
-	#    The support dir also holds settings and staged updates, so it is only
-	#    rmdir'd (never rm -rf'd) — a non-empty one is left exactly as it is.
-	#    A dry run PROBES both (read-only) and reports the same decisions the
-	#    real run takes: '--dry-run prints the same decisions' is the contract
-	#    above, and the keychain item and the rmdir were silently exempt from it.
+	# 7. the support dir when EMPTY. It holds settings and staged updates, so
+	#    it is only rmdir'd (never rm -rf'd) — a non-empty one is left exactly
+	#    as it is. A dry run PROBES it (read-only) and reports the same
+	#    decision the real run takes: '--dry-run prints the same decisions' is
+	#    the contract above.
 	local support="$HOME/Library/Application Support/aterm" leftover
-	[[ -f "$support/update-token" ]] && _rm "$support/update-token" "update token"
-	if command -v security >/dev/null 2>&1 &&
-		security find-generic-password -s aterm-update-token >/dev/null 2>&1; then
-		if [[ "$DRY_RUN" -eq 1 ]]; then
-			echo "install.sh: $act keychain item: aterm-update-token"
-			removed=$((removed + 1))
-		elif security delete-generic-password -s aterm-update-token >/dev/null 2>&1; then
-			echo "install.sh: removed keychain item: aterm-update-token"
-			removed=$((removed + 1))
-		fi
-	fi
 	if [[ -d "$support" ]]; then
 		if [[ "$DRY_RUN" -eq 1 ]]; then
-			# Judge emptiness as the real run will see it — after the
-			# update-token removal announced above has actually happened.
-			leftover="$(ls -A "$support" 2>/dev/null | grep -v '^update-token$' || true)"
+			leftover="$(ls -A "$support" 2>/dev/null || true)"
 			if [[ -z "$leftover" ]]; then
 				echo "install.sh: $act empty support dir: $support"
 				removed=$((removed + 1))
@@ -2425,15 +2231,9 @@ uninstall_everything() {
 # aborts loudly, exactly as the real run would.
 print_install_plan() {
 	local tmp_hint="${TMPDIR:-/tmp}/aterm-install.<random>"
-	local lane_desc="" record asset_id asset_size manifest_text team_want rc
+	local asset_size manifest_size manifest_text team_want rc
 
 	echo "install.sh: DRY RUN — the full plan; nothing is created, written, or edited"
-	if [[ "${APP_LANE:-}" == gh ]]; then
-		lane_desc="authenticated gh lane"
-	elif [[ "${APP_LANE:-}" == anon ]]; then
-		lane_desc="anonymous public lane"
-	fi
-
 	if [[ "$DO_APP" -eq 0 ]]; then
 		echo "install.sh: app: excluded (--no-app)"
 	elif [[ -n "$APP_SKIP" ]]; then
@@ -2441,28 +2241,23 @@ print_install_plan() {
 	elif [[ -n "$APP_ALREADY" ]]; then
 		echo "install.sh: app: aterm $APP_ALREADY already installed at $DEST/aterm.app and signature-verified — nothing to download (--version $APP_ALREADY forces a reinstall)"
 	elif [[ "$LINUX_RELEASE" -eq 1 ]]; then
-		# The pre-flight already carried the tarball's exact records; bind them
-		# to one immutable asset here exactly as install_linux_app will.
-		record="$(require_unique_asset_record "$LINUX_ASSET_RECORDS" "$LINUX_ASSET" 64 536870912)" || exit 1
-		IFS=$'\t' read -r asset_id asset_size <<<"$record"
-		echo "install.sh: app: $REPO_SLUG $TAG (linux-$LINUX_ARCH, $lane_desc)"
+		# The pre-flight proved the raw ELF is published; its size is the one
+		# install_linux_app holds the download to (after the signed size agrees).
+		asset_size="$(release_asset_size "$TAG" "$LINUX_ASSET" 536870912)" || exit 1
+		echo "install.sh: app: $REPO_SLUG $TAG (linux-$LINUX_ARCH)"
 		echo "  download: $LINUX_ASSET — $((asset_size / 1000000)) MB -> $tmp_hint/ (deleted after install)"
 		echo "  verify:   paper-master roster, live machine signature, signed size/hash, ELF architecture, rollback floors"
-		echo "  note:     this dry-run lists API assets only; signatures are verified before a real install"
+		echo "  note:     this dry-run reads sizes only; signatures are verified before a real install"
 		echo "  install:  the released ONE binary -> $STORE_DIR/aterm, exposed as the $BIN_DIR/aterm symlink"
 	else
 		# The same read-only resolution install_app performs — one manifest,
-		# the shared container election, one exact container asset — with the
+		# the shared container election, one container size — with the
 		# manifest's bytes as the only thing fetched.
-		record="$(release_unique_asset_record "$TAG" 'aterm-appcast.toml' 1 5000000)" ||
-			{ explain_anon_rate_limit; exit 1; }
-		IFS=$'\t' read -r asset_id asset_size <<<"$record"
-		# Read at most one byte past the carried API size — the same exposure
-		# cap download_release_asset_id enforces, applied to memory: pipefail
-		# turns an overrunning producer into this loud abort.
-		manifest_text="$(fetch_asset_octets "$asset_id" | head -c "$((asset_size + 1))")" || {
-			echo "install.sh: exact asset $asset_id download failed" >&2
-			explain_anon_rate_limit
+		manifest_size="$(release_asset_size "$TAG" aterm-appcast.toml "$MANIFEST_MAX_BYTES")" || exit 1
+		# At most one byte past the size the host named — the cap
+		# download_release_asset enforces, applied to memory.
+		manifest_text="$(fetch_release_asset "$TAG" aterm-appcast.toml "$manifest_size")" || {
+			echo "install.sh: download of aterm-appcast.toml from release $TAG failed" >&2
 			exit 1
 		}
 		if ! parse_manifest_identity_fields "$manifest_text"; then
@@ -2475,10 +2270,8 @@ print_install_plan() {
 		# name a different container than the install downloads.
 		elect_container "$DO_TOOLCHAIN" "$VERSION" \
 			"$DMG_NAME" "$SHA_WANT" "$ZIP_NAME" "$ZIP_SHA" || exit 1
-		record="$(release_unique_asset_record "$TAG" "$ASSET_NAME" 1 2147483648)" ||
-			{ explain_anon_rate_limit; exit 1; }
-		IFS=$'\t' read -r asset_id asset_size <<<"$record"
-		echo "install.sh: app: $REPO_SLUG $TAG ($lane_desc)"
+		asset_size="$(release_asset_size "$TAG" "$ASSET_NAME")" || exit 1
+		echo "install.sh: app: $REPO_SLUG $TAG"
 		echo "  download: $ASSET_NAME — $((asset_size / 1000000)) MB -> $tmp_hint/$ASSET_NAME (deleted after the swap)"
 		if [[ -n "$team_want" ]]; then
 			echo "  verify:   manifest SHA-256, then the Developer-ID chain for team $team_want + notarization"
@@ -2521,14 +2314,6 @@ print_install_plan() {
 		echo "install.sh: toolset: aterm pkg seed + pkg update — from the app's sealed payload when it carries one, else the signed network index; unpacks to ~4.4 GiB under your home directory"
 	fi
 
-	if [[ "$TOKEN_WANTED" -eq 1 ]]; then
-		echo "install.sh: token: provisions the update token (0600) -> $UPDATE_TOKEN_FILE"
-	elif [[ "$DO_TOKEN" -eq 1 ]]; then
-		echo "install.sh: token: skipped (public channel reads no token file; --token to provision for a repointed updater)"
-	else
-		echo "install.sh: token: excluded (--no-token)"
-	fi
-
 	if [[ "$DO_PATH" -eq 0 ]]; then
 		echo "install.sh: PATH: excluded (--no-path / ATERM_NO_PATH=1)"
 	else
@@ -2544,14 +2329,12 @@ print_install_plan() {
 
 	if [[ "$DO_APP" -eq 0 ]]; then
 		echo "install.sh: network: no GitHub traffic — the app half is excluded"
-	elif [[ -z "${APP_LANE:-}" ]]; then
-		# The skip that decided against BOTH lanes (no curl and no gh, an
-		# unreleased platform, an unreachable repo) leaves no transport open.
-		echo "install.sh: network: no further GitHub traffic — the app half is skipped with no download lane"
-	elif [[ "$APP_LANE" == gh ]]; then
-		echo "install.sh: network: api.github.com via authenticated gh (release catalog, asset metadata, asset octets), following its release-asset CDN redirects"
+	elif [[ "$APP_NET" -eq 0 ]]; then
+		# An unreleased platform or no curl: the half was skipped before any
+		# request.
+		echo "install.sh: network: no GitHub traffic — the app half is skipped before any request"
 	else
-		echo "install.sh: network: api.github.com over TLS, no credential (release catalog, asset metadata, asset octets — a shared 60 requests/hour/IP budget), following its release-asset CDN redirects"
+		echo "install.sh: network: github.com's release download host over TLS — no credential and no GitHub API request (the latest-release pointer, then that tag's own asset URLs), following its redirects to the release-asset CDN"
 	fi
 	if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 		echo "  and: aterm pkg seed/update resolves the signed atpkg index over its own configured source when no sealed payload covers this machine."
@@ -2587,8 +2370,6 @@ TAG_INPUT=""
 TAG_EXPLICIT=0
 DO_APP=1
 DO_CLI=1
-DO_TOKEN=1
-TOKEN_EXPLICIT=0
 # The toolset is the product, not an add-on (docs/GOLDEN-INSTALL-PATH.md §1.3:
 # "Installing aterm installs all those packages"). Until this existed the seed
 # fired ONLY from the GUI (crates/aterm-gui/src/lib.rs `spawn_pkg_update_check`),
@@ -2651,14 +2432,6 @@ while [[ $# -gt 0 ]]; do
 		DO_APP=0
 		shift
 		;;
-	--token)
-		TOKEN_EXPLICIT=1
-		shift
-		;;
-	--no-token)
-		DO_TOKEN=0
-		shift
-		;;
 	--no-toolchain)
 		DO_TOOLCHAIN=0
 		shift
@@ -2700,17 +2473,11 @@ fi
 # Install-mode --dry-run deliberately has no dispatch here: the pre-flights
 # below are read-only under DRY_RUN (ensure_dirs_writable), and the plan
 # prints once they have decided everything — see print_install_plan.
-# The token half's arbitration, decided ONCE and consulted by the excludes
-# gate here and the run phase below (see token_provisioning_wanted).
-TOKEN_WANTED=0
-token_provisioning_wanted "$DO_TOKEN" "$TOKEN_EXPLICIT" && TOKEN_WANTED=1
-# Refuse only when every half that COULD run is out: app, cli, the default-on
-# toolchain and PATH halves, and a token half nothing opted into (the token
-# half is opt-in — --token). Checking fewer halves made the toolchain-only
-# repair (--no-app --no-cli against an already-installed app) unreachable.
-if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 && "$TOKEN_WANTED" -eq 0 &&
-	"$DO_TOOLCHAIN" -eq 0 && "$DO_PATH" -eq 0 ]]; then
-	echo "install.sh: every half is excluded or unwanted (--no-app --no-cli --no-toolchain --no-path, and no --token) — nothing to do" >&2
+# Refuse only when every half is out: app, cli, and the default-on toolchain
+# and PATH halves. Checking fewer halves made the toolchain-only repair
+# (--no-app --no-cli against an already-installed app) unreachable.
+if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 && "$DO_TOOLCHAIN" -eq 0 && "$DO_PATH" -eq 0 ]]; then
+	echo "install.sh: every half is excluded (--no-app --no-cli --no-toolchain --no-path) — nothing to do" >&2
 	exit 2
 fi
 if [[ "$TAG_EXPLICIT" -eq 1 ]] && ! canonical_numeric_tag "$TAG"; then
@@ -2718,22 +2485,17 @@ if [[ "$TAG_EXPLICIT" -eq 1 ]] && ! canonical_numeric_tag "$TAG"; then
 	exit 2
 fi
 
-# Repo slug: env override first; else (when run from a checkout) the single source
-# of truth, [workspace.package] repository in Cargo.toml — same derivation as the
-# binary's compiled-in default, so the private staging checkout targets itself and
-# the public export (whose transform rewrites the owner) targets the mirror; else
-# the canonical PUBLIC release repo, which is what a piped run installs from.
-repo_slug_from_cargo() {
+# Repo slug: env override first; else, run from a checkout, the update channel its
+# manifest declares (channel_slug_from_manifest — the shipped binary's own
+# derivation); else, piped (`… | bash`, no script path), the public channel.
+checkout_channel_slug() {
 	local root
-	# When piped (`… | bash`) there is no script path — skip straight to the default.
 	self_on_disk || return 0
 	root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" || return 0
-	[[ -f "$root/Cargo.toml" ]] || return 0
-	awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^repository[[:space:]]*=/{print $2; exit}' "$root/Cargo.toml" |
-		sed -E 's#^[a-z]+://github\.com/##; s#^git@github\.com:##; s#\.git$##; s#/$##'
+	channel_slug_from_manifest "$root/Cargo.toml" || true
 }
-REPO_SLUG="${ATERM_REPO_SLUG:-$(repo_slug_from_cargo)}"
-: "${REPO_SLUG:=alabsystems/aterm}"
+REPO_SLUG="${ATERM_REPO_SLUG:-$(checkout_channel_slug)}"
+: "${REPO_SLUG:=$OFFICIAL_REPO_SLUG}"
 
 # --- pre-flight: decide what each half CAN do here (fail fast, skip loud) ------
 BIN_DIR="${ATERM_BIN_DIR:-$HOME/.local/bin}"
@@ -2747,7 +2509,8 @@ STORE_DIR="${ATERM_STORE_DIR:-$HOME/.local/lib/aterm/bin}"
 APP_SKIP=""
 APP_FATAL=""
 APP_ALREADY=""
-APP_LANE=""
+# Whether the app half reached the network (the plan's network line says so).
+APP_NET=0
 DEST=""
 # The app half's Linux shape: there is no bundle, so the released artifact is
 # the signed raw ONE binary for this architecture, landed in the SAME store
@@ -2757,109 +2520,41 @@ LINUX_RELEASE=0
 LINUX_ARCH="$(linux_release_arch "$(uname -s)" "$(uname -m)" || true)"
 [[ -n "$LINUX_ARCH" ]] && LINUX_RELEASE=1
 LINUX_ASSET=""
-LINUX_ASSET_RECORDS=""
+# The channel head Linux authorizes an older native target under (its current
+# appcast and roster), and the appcast name the target release carries.
+LINUX_HEAD_TAG=""
+LINUX_MANIFEST_ASSET=aterm-appcast.toml
 if [[ "$DO_APP" -eq 1 ]]; then
 	if [[ "$(uname -s)" != "Darwin" && "$LINUX_RELEASE" -eq 0 ]]; then
 		APP_SKIP="no supported release target for $(uname -s)/$(uname -m) — Linux supports aarch64 and x86_64; the app bundle supports macOS"
-	elif command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
-		# An authenticated gh serves ANY slug, and is the only way into the
-		# private staging repo. Decided ONCE here: every release/asset call
-		# below rides the same lane, so metadata and octets never split
-		# between credentials.
-		APP_LANE=gh
 	elif ! command -v curl >/dev/null 2>&1; then
-		APP_SKIP="needs curl (anonymous public download) or an authenticated gh (brew install gh, then gh auth login)"
+		APP_SKIP="needs curl to read the release download host (github.com)"
 	else
-		# The default lane: the PUBLIC release repo, fetched anonymously — on a
-		# budget of 60 API requests/hour/IP. No separate reachability probe is
-		# spent when the catalog walk below runs: the walk doubles as the
-		# probe. An explicit --version pin skips the walk, so only that path
-		# still probes — reachability decides SKIP vs install (failsafe
-		# policy), and without it a private repo would abort mid-install
-		# instead of skipping up front.
-		APP_LANE=anon
-		if [[ -n "$TAG" ]] && ! curl -fsS --connect-timeout 10 --retry 2 -o /dev/null \
-			"https://api.github.com/repos/$REPO_SLUG"; then
-			APP_LANE=""
-			APP_SKIP="cannot reach $REPO_SLUG anonymously — a private repo (the staging tree) needs an authenticated gh (brew install gh, then gh auth login); otherwise the network or the anonymous API rate limit is the problem"
+		APP_NET=1
+		# The tag: an explicit --version, else the channel head — ONE HEAD of
+		# the latest-release pointer (channel_head). No catalog is listed. Linux
+		# resolves the head under --version too: its current appcast and roster
+		# are the policy an older native target is authorized under.
+		if [[ -z "$TAG" || "$LINUX_RELEASE" -eq 1 ]]; then
+			HEAD_STATUS=0
+			channel_head || HEAD_STATUS=$?
+			case "$HEAD_STATUS" in
+			0)
+				LINUX_HEAD_TAG="$HEAD_TAG"
+				[[ -n "$TAG" ]] || TAG="$HEAD_TAG"
+				;;
+			2) APP_FATAL="$HEAD_WHY" ;;
+			*) APP_SKIP="$HEAD_WHY" ;;
+			esac
 		fi
-	fi
-	if [[ -n "$APP_LANE" ]]; then
-		LIST_ERR=0
-		if [[ "$LINUX_RELEASE" -eq 1 ]]; then
-			if ! command -v python3 >/dev/null || ! python3 -c 'import tomllib' >/dev/null 2>&1; then
-				APP_FATAL="signed Linux discovery requires Python 3.11+"
-			else
-				LINUX_CATALOG_STATUS=0
-				linux_load_catalog || LINUX_CATALOG_STATUS=$?
-				case "$LINUX_CATALOG_STATUS" in
-				1) LIST_ERR=1; TAG="" ;;
-				2) APP_FATAL="Linux release catalog is malformed, ambiguous, or incomplete; refusing fallback" ;;
-				esac
-			fi
-		elif [[ -z "$TAG" ]]; then
-			# The repo also publishes non-app releases (for example the atpkg
-			# index), so enumerate every page and arbitrate the complete exact-name
-			# appcast catalog. GitHub does not promise REST release row order.
-			RELEASE_ROWS=""
-			if [[ "$APP_LANE" == gh ]]; then
-				if ! RELEASE_ROWS="$(gh api --paginate "repos/$REPO_SLUG/releases?per_page=100" \
-					--jq '.[] | [.tag_name, ((.draft or .prerelease) | tostring), ([((.assets // [])[] | select(.name == "aterm-appcast.toml"))] | length | tostring)] | @tsv' \
-					2>/dev/null)"; then
-					LIST_ERR=1
-				fi
-			else
-				# Anonymous pagination: same complete-catalog contract as gh's
-				# --paginate. A short page ends the walk; the page cap keeps a
-				# pathological catalog from spinning against the 60-requests/hour
-				# anonymous limit (30 pages ⇒ 3000 releases, not a real state).
-				RELEASE_PAGE=1
-				while :; do
-					if ! RELEASE_PAGE_JSON="$(curl -fsS --connect-timeout 10 --retry 2 -H "Accept: application/vnd.github+json" \
-						"https://api.github.com/repos/$REPO_SLUG/releases?per_page=100&page=$RELEASE_PAGE")"; then
-						LIST_ERR=1
-						break
-					fi
-					RELEASE_PAGE_ROWS="$(anon_release_rows <<<"$RELEASE_PAGE_JSON")"
-					[[ -n "$RELEASE_PAGE_ROWS" ]] || break
-					RELEASE_ROWS="${RELEASE_ROWS:+$RELEASE_ROWS$'\n'}$RELEASE_PAGE_ROWS"
-					[[ "$(printf '%s\n' "$RELEASE_PAGE_ROWS" | wc -l | tr -d '[:space:]')" -eq 100 ]] || break
-					RELEASE_PAGE=$((RELEASE_PAGE + 1))
-					[[ "$RELEASE_PAGE" -le 30 ]] || { LIST_ERR=1; break; }
-				done
-			fi
-			if [[ "$LIST_ERR" -eq 0 ]]; then
-				SELECT_STATUS=0
-				TAG="$(select_authoritative_tag "$RELEASE_ROWS")" || SELECT_STATUS=$?
-				if [[ "$SELECT_STATUS" -eq 2 ]]; then
-					if [[ "$APP_LANE" == anon ]]; then
-						# Two very different causes produce one parse surprise
-						# on the anonymous lane — name both, and the way out.
-						APP_FATAL="release catalog is malformed or ambiguous; refusing order-dependent fallback. On the anonymous lane a GitHub response-format change and rate limiting both look like this — install/authenticate gh (brew install gh && gh auth login), or retry later"
-					else
-						APP_FATAL="release catalog is malformed or ambiguous; refusing order-dependent fallback"
-					fi
-				fi
-			fi
-		fi
-		if [[ -n "$APP_FATAL" ]]; then
+		if [[ -n "$APP_FATAL$APP_SKIP" ]]; then
 			:
-		elif [[ -z "$TAG" && "$LIST_ERR" -eq 1 ]]; then
-			if [[ "$APP_LANE" == gh ]]; then
-				APP_SKIP="could not list releases in $REPO_SLUG (bad/expired token, no repo access, or rate limit — try: gh auth status)"
-			else
-				APP_SKIP="could not list releases in $REPO_SLUG anonymously — a private repo (the staging tree) needs an authenticated gh (brew install gh, then gh auth login); otherwise the network or the GitHub API rate limit is the problem (retry later, or authenticate)"
-			fi
-		elif [[ -z "$TAG" ]]; then
-			APP_SKIP="no current-scheme app release (a vMAJOR.MINOR.PATCH tag carrying aterm-appcast.toml) found in $REPO_SLUG — retired two-component releases are archive history and are never elected; name one with --version to install it anyway"
 		elif [[ "$LINUX_RELEASE" -eq 1 ]]; then
 			# Destination on Linux is the cli store itself, and the artifact may
-			# simply not exist yet (every release before the first Linux cut is
+			# simply not exist (a release before the first Linux cut is
 			# macOS-only). Both are environment facts, so both are pre-flighted
 			# HERE — an unwritable store or an artifact-less release skips the
-			# half before any download, per the failsafe policy. The resolved
-			# records are CARRIED into the install so the probed identity and
-			# the downloaded bytes cannot drift between two listings.
+			# half before any download, per the failsafe policy.
 			LINUX_ASSET="aterm-${TAG#v}-linux-$LINUX_ARCH"
 			# FAILSAFE POLICY: the verify/extract tools are environment facts,
 			# so probe them HERE — their absence used to surface as a
@@ -2871,14 +2566,27 @@ if [[ "$DO_APP" -eq 1 ]]; then
 				APP_SKIP="signed Linux bootstrap needs Python 3.11+ and OpenSSL with Ed25519 support — install them and re-run; unsigned tarballs are not a fallback"
 			elif ! ensure_dirs_writable "$STORE_DIR" "$BIN_DIR"; then
 				APP_SKIP="cannot create/write $STORE_DIR or $BIN_DIR (set ATERM_STORE_DIR / ATERM_BIN_DIR to writable dirs)"
-			elif [[ "${LINUX_NATIVE_AVAILABLE:-0}" -eq 0 ]]; then
-				APP_SKIP="no canonical signed-ELF candidate is listed for linux-$LINUX_ARCH (head $LINUX_HEAD_TAG). Legacy checksum-only tarballs are never selected; a release owner must cut native Linux artifacts"
-			elif ! LINUX_ASSET_RECORDS="$(release_asset_records "$TAG" "$LINUX_ASSET")"; then
-				APP_SKIP="could not inspect release $TAG for $LINUX_ASSET (network, or the GitHub API rate limit)"
-			elif [[ -z "$LINUX_ASSET_RECORDS" ]]; then
-				APP_SKIP="release $TAG publishes no signed Linux artifact $LINUX_ASSET. Legacy checksum-only tarballs are not auto-update-capable and are never selected. A source checkout can build locally; a release owner must cut signed Linux artifacts for public installation"
+			else
+				# At or below the head, this architecture's signed binary
+				# published, and an appcast (current or archived) to bind it.
+				linux_target_preflight "$TAG" "$LINUX_HEAD_TAG" "$LINUX_ASSET"
+				APP_SKIP="$LINUX_TARGET_SKIP"
 			fi
 		else
+			# The manifest must be published on the tag before anything else is
+			# decided: the head's release can be mid-publication, and a pinned
+			# tag may not exist at all — both skips, never a mid-install abort.
+			PRESENT=0
+			release_asset_present "$TAG" aterm-appcast.toml || PRESENT=$?
+			if [[ "$PRESENT" -eq 2 ]]; then
+				APP_SKIP="could not inspect release $TAG ($ASSET_WHY)"
+			elif [[ "$PRESENT" -eq 1 && "$TAG_EXPLICIT" -eq 1 ]]; then
+				APP_SKIP="release $TAG publishes no aterm-appcast.toml in $REPO_SLUG — no such app release (or the repository is private, renamed or missing: github.com answers the same for each)"
+			elif [[ "$PRESENT" -eq 1 ]]; then
+				APP_SKIP="the channel head $TAG has no app manifest yet — its release is still being published; retry in a few minutes, or name an earlier release with --version"
+			fi
+		fi
+		if [[ -z "$APP_FATAL$APP_SKIP" && "$LINUX_RELEASE" -eq 0 ]]; then
 			# Destination: explicit env wins; else /Applications, else ~/Applications.
 			# (The in-app updater never relocates — it defers when its location isn't
 			# writable, docs/RELEASING.md — so choosing a user-writable dir here is what
@@ -2894,7 +2602,7 @@ if [[ "$DO_APP" -eq 1 ]]; then
 				"$(defaults read "$DEST/aterm.app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || true)" \
 				"$(defaults read "$DEST/aterm.app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || true)"; then
 				# IDEMPOTENT RE-RUN: the elected release IS the installed bundle,
-				# so the app half has nothing to download — the cli/token/toolset
+				# so the app half has nothing to download — the cli/toolset/PATH
 				# halves still run. An explicit --version pin always reinstalls.
 				# Version strings alone vouch for nothing: the bundle must still
 				# pass the same signature gate a fresh install enforces, else the
@@ -3070,16 +2778,9 @@ install_app() {
 	}
 	trap cleanup EXIT
 
-	# ONE anonymous fetch of the release document serves every asset lookup
-	# below (manifest, .sig, container) — see release_asset_records.
-	prime_release_document "$TAG" "$TMP/release-document.json"
-
-	# Resolve and carry one exact manifest asset identity. Filename-pattern
-	# downloads can silently pick an order-dependent duplicate and are forbidden.
-	MANIFEST_RECORD="$(release_unique_asset_record "$TAG" 'aterm-appcast.toml' 1 5000000)" ||
-		{ explain_anon_rate_limit; exit 1; }
-	IFS=$'\t' read -r MANIFEST_ID MANIFEST_SIZE <<<"$MANIFEST_RECORD"
-	download_release_asset_id "$MANIFEST_ID" "$MANIFEST_SIZE" "$TMP/aterm-appcast.toml"
+	# The manifest, from the tag's own URL, held to the size the host names.
+	MANIFEST_SIZE="$(release_asset_size "$TAG" aterm-appcast.toml "$MANIFEST_MAX_BYTES")" || exit 1
+	download_release_asset "$TAG" aterm-appcast.toml "$MANIFEST_SIZE" "$TMP/aterm-appcast.toml" || exit 1
 	# ONE parse, shared with the --dry-run plan (parse_manifest_identity_fields),
 	# fed the size-verified download's contents.
 	if ! parse_manifest_identity_fields "$(cat "$TMP/aterm-appcast.toml")"; then
@@ -3132,22 +2833,9 @@ install_app() {
 	esac
 
 	# Official releases DO publish an Ed25519 aterm-appcast.toml.sig, but this
-	# bootstrap lane cannot verify it (macOS's stock LibreSSL has no Ed25519) —
-	# so its presence is inventory-checked only: absence is tolerated (dev/fork
-	# builds), and a present signature must still be exactly one 64-byte asset,
-	# never a duplicate resolved by order.
-	if ! SIGNATURE_RECORDS="$(release_asset_records "$TAG" 'aterm-appcast.toml.sig')"; then
-		echo "install.sh: could not inspect manifest signatures for release $TAG" >&2
-		explain_anon_rate_limit
-		exit 1
-	elif [[ -n "$SIGNATURE_RECORDS" ]]; then
-		require_unique_asset_record "$SIGNATURE_RECORDS" 'aterm-appcast.toml.sig' 64 64 >/dev/null || exit 1
-	fi
-	if [[ "${APP_LANE:-gh}" == gh ]]; then
-		TRANSPORT_DESC="gh-authenticated repo metadata"
-	else
-		TRANSPORT_DESC="TLS to api.github.com (anonymous)"
-	fi
+	# bootstrap lane cannot verify it (macOS's stock LibreSSL has no Ed25519),
+	# so it is not fetched at all: the installed updater verifies it.
+	TRANSPORT_DESC="TLS to github.com"
 	if [[ -n "$TEAM_WANT" ]]; then
 		echo "install.sh: BOOTSTRAP TRUST BOUNDARY: the release's Ed25519 manifest signature is not" >&2
 		echo "  verified here (macOS's stock LibreSSL cannot), so the root of trust is the Apple" >&2
@@ -3178,10 +2866,8 @@ install_app() {
 	fi
 
 	# Identity validation above makes this the canonical basename before it is
-	# joined to TMP. Resolve exactly one matching API asset and download that ID.
-	ASSET_RECORD="$(release_unique_asset_record "$TAG" "$ASSET_NAME" 1 2147483648)" ||
-		{ explain_anon_rate_limit; exit 1; }
-	IFS=$'\t' read -r ASSET_ID ASSET_SIZE <<<"$ASSET_RECORD"
+	# joined to TMP. Its size, from the host, bounds the download.
+	ASSET_SIZE="$(release_asset_size "$TAG" "$ASSET_NAME")" || exit 1
 	# DISK PRE-FLIGHT, before the first byte: ~2.5x the container covers the
 	# download itself, the staged bundle copy, and mount/expansion slack —
 	# checked on BOTH volumes, since TMPDIR and the destination may not share
@@ -3192,8 +2878,8 @@ install_app() {
 	# SAY WHAT IS ABOUT TO HAPPEN. This download went from ~51 MB to ~650 MB when the
 	# toolchain moved into the DMG, and the script's output did not change by one
 	# character: between "installing <slug> <tag>" and "sha256 verified" it prints
-	# nothing, on a transport that is deliberately quiet (`curl -fsS`, `gh api` with
-	# no meter). On a slow line that is many minutes of a `curl | bash` pipeline that
+	# nothing, on a transport that is deliberately quiet (`curl -fsS`, no meter).
+	# On a slow line that is many minutes of a `curl | bash` pipeline that
 	# looks hung — the classic reason someone ^Cs an install half-written.
 	# SAY THE WHOLE PLAN, BEFORE ANY OF IT HAPPENS. Two numbers decide whether
 	# someone waits or reaches for ^C: what is about to come down the wire, and
@@ -3238,7 +2924,7 @@ install_app() {
 			echo "  and: one marker-fenced PATH block is appended to $PLAN_RC unless already present (skip: --no-path / ATERM_NO_PATH=1)."
 		fi
 	fi
-	download_release_asset_id "$ASSET_ID" "$ASSET_SIZE" "$TMP/$ASSET_NAME"
+	download_release_asset "$TAG" "$ASSET_NAME" "$ASSET_SIZE" "$TMP/$ASSET_NAME" || exit 1
 	SHA_GOT="$(shasum -a 256 "$TMP/$ASSET_NAME" | awk '{print $1}')"
 	# Case-insensitive on purpose: an uppercase manifest spelling is the same
 	# digest, not a mismatch (sha256_equal; the 64-hex shape was bound above).
@@ -3343,11 +3029,8 @@ install_app() {
 
 	echo "install.sh: installed aterm $VERSION -> $DEST/aterm.app"
 	echo "  launch:  open '$DEST/aterm.app'"
-	# ONE line-set for both lanes, because the truth is lane-independent: the
-	# compiled-in update channel is the PUBLIC repo and the updater reads it
-	# anonymously (token.rs consults no rung there). The old lane-split text promised updates "once the token half
-	# provisions a credential" — false, and contradicted minutes later by the
-	# token half's own no-credential message. Round-11 honesty: checks and
+	# The compiled-in update channel is the PUBLIC repo and the updater reads it
+	# with no credential. Round-11 honesty: checks and
 	# staging run in the app AND in `aterm` terminal sessions; the APPLY (a
 	# re-exec) rides the window entry, so the window is named as the apply path
 	# rather than promising a silence that terminal-only machines cannot cash.
@@ -3360,8 +3043,10 @@ install_app() {
 
 # --- the app half on Linux: the released ONE binary, signature-verified --------
 # Same raw ELF contract as the runtime updater; no archive extraction surface.
-# Exact API identity metadata and signed appcast identity must agree before
-# placement. The release and source lanes share the canonical store layout.
+# Every byte comes from the release download host by its tag-specific URL, with
+# no credential and no GitHub API request (owner ruling R3); the host's size and
+# the signed appcast's must agree before placement. The release and source lanes
+# share the canonical store layout.
 install_linux_app() {
 	echo "install.sh: installing $REPO_SLUG $TAG (linux-$LINUX_ARCH, signed raw ELF)"
 	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
@@ -3371,8 +3056,20 @@ install_linux_app() {
 	}
 	trap cleanup EXIT
 
-	local asset record asset_id asset_size minimum maximum proof verified remote_asset source_tag
+	local asset minimum maximum proof verified remote_asset source_tag host_size
 	local name digest size build roster_seq
+	# fetch_bounded <tag> <name> <min> <max> <destination>: the host's size, held to
+	# <min>..<max>, then exactly that many bytes. A signature is exactly 64.
+	fetch_bounded() {
+		local from="$1" what="$2" low="$3" high="$4" to="$5" bytes
+		bytes="$(release_asset_size "$from" "$what" "$high")" || exit 1
+		decimal_in_closed_range "$bytes" "$low" "$high" || {
+			echo "install.sh: $what in release $from is $bytes bytes, outside $low..$high — refusing" >&2
+			exit 1
+		}
+		download_release_asset "$from" "$what" "$bytes" "$to" || exit 1
+		chmod 600 "$to"
+	}
 	for asset in aterm-machines.toml aterm-machines.toml.sig aterm-appcast.toml aterm-appcast.toml.sig; do
 		minimum=1
 		maximum=5000000
@@ -3386,20 +3083,14 @@ install_linux_app() {
 		aterm-appcast.toml) remote_asset="${LINUX_MANIFEST_ASSET:-aterm-appcast.toml}" ;;
 		aterm-appcast.toml.sig) remote_asset="${LINUX_MANIFEST_ASSET:-aterm-appcast.toml}.sig" ;;
 		esac
-		record="$(release_unique_asset_record "$source_tag" "$remote_asset" "$minimum" "$maximum")" || exit 1
-		IFS=$'\t' read -r asset_id asset_size <<<"$record"
-		download_release_asset_id "$asset_id" "$asset_size" "$TMP/$asset"
-		chmod 600 "$TMP/$asset"
+		fetch_bounded "$source_tag" "$remote_asset" "$minimum" "$maximum" "$TMP/$asset"
 	done
 	if [[ "${LINUX_HEAD_TAG:-$TAG}" != "$TAG" ]]; then
 		for asset in aterm-appcast.toml aterm-appcast.toml.sig; do
 			minimum=1; maximum=5000000
 			[[ "$asset" != *.sig ]] || { minimum=64; maximum=64; }
-			record="$(release_unique_asset_record "$LINUX_HEAD_TAG" "$asset" "$minimum" "$maximum")" || exit 1
-			IFS=$'\t' read -r asset_id asset_size <<<"$record"
 			proof="${asset/aterm-appcast/aterm-policy-appcast}"
-			download_release_asset_id "$asset_id" "$asset_size" "$TMP/$proof"
-			chmod 600 "$TMP/$proof"
+			fetch_bounded "$LINUX_HEAD_TAG" "$asset" "$minimum" "$maximum" "$TMP/$proof"
 		done
 	fi
 
@@ -3409,11 +3100,10 @@ install_linux_app() {
 	verified="$(linux_release_verify "$TMP" "$TAG" "$REPO_SLUG" "$LINUX_ARCH" "$STORE_DIR")" || exit 1
 	IFS=$'\t' read -r name digest size build roster_seq <<<"$verified"
 	[[ "$name" == "$LINUX_ASSET" ]] || { echo "install.sh: Linux asset identity changed" >&2; exit 1; }
-	record="$(require_unique_asset_record "$LINUX_ASSET_RECORDS" "$name" 64 536870912)" || exit 1
-	IFS=$'\t' read -r asset_id asset_size <<<"$record"
-	[[ "$asset_size" == "$size" ]] || { echo "install.sh: API size disagrees with signed Linux size" >&2; exit 1; }
+	host_size="$(release_asset_size "$TAG" "$name" 536870912)" || exit 1
+	[[ "$host_size" == "$size" ]] || { echo "install.sh: the download host's size for $name disagrees with the signed Linux size" >&2; exit 1; }
 	echo "install.sh: downloading authenticated $name ($((size / 1000000)) MB)"
-	download_release_asset_id "$asset_id" "$size" "$TMP/$name"
+	download_release_asset "$TAG" "$name" "$size" "$TMP/$name" || exit 1
 
 	# Recheck floors immediately before placement, then verify the exact file's
 	# hash/size/ELF architecture BEFORE executing it. No archive parser is used.
@@ -3854,143 +3544,6 @@ install_linux_desktop_entry() {
 	return 0
 }
 
-# --- update token: the credential for a REPOINTED update source ---------------
-#
-# History: the update channel used to be a private repo, so the updater needed a
-# token to read it at all, and an install on a `gh`-authenticated developer Mac
-# "just worked" while every other machine silently never updated. That is no
-# longer the shape. The compiled-in channel is the PUBLIC repo and the updater
-# reads it with no credential; a token only raises the anonymous API cadence.
-#
-# So this half is NOT what decides whether a Mac updates. Per
-# crates/aterm-update-core/src/token.rs (`needs_ambient_credential` + `walk`):
-# for the compiled-in channel the chain consults NO rung and never touches the
-# keychain or the file written below. The chain — keychain, this 0600 file,
-# `gh auth token`; no environment rung since 2026-09-23 — runs only for a
-# repointed source, which only a DEVELOPMENT build honours (`[update]
-# owner`/`repo`).
-#
-# That is why this half is OPT-IN (token_provisioning_wanted): copying a broad
-# `gh auth token` credential into a plaintext file NOTHING reads is pure
-# exposure, so by default nothing is copied and the run says so. It runs only
-# for --token, and it keeps a developer's repointed case working without `gh` on
-# PATH (a Finder-launched .app has a minimal one).
-#
-# It is idempotent (a matching token is left alone), it NEVER prints the token,
-# and --no-token is a hard off. No failure here is fatal.
-# (UPDATE_TOKEN_DIR/UPDATE_TOKEN_FILE are defined at library level, next to
-# token_provisioning_wanted, so the --dry-run plan can name the file.)
-
-# Whether $1 is a well-formed token by the SAME rule the app enforces
-# (`valid_token` in token.rs: [A-Za-z0-9_-], 1..=512). Keeping the two in step
-# matters — provisioning a value the app will refuse is worse than not
-# provisioning at all, because it looks done.
-well_formed_token() {
-	local t="$1"
-	[[ -n "$t" && ${#t} -le 512 && "$t" =~ ^[A-Za-z0-9_-]+$ ]]
-}
-
-provision_update_token() {
-	# macOS-only: the updater itself is macOS-only (aterm_update::enabled), so a
-	# token elsewhere would be a file nothing reads.
-	[[ "$(uname -s)" == "Darwin" ]] || return 0
-
-	local tok="" tok_source=""
-	if command -v gh >/dev/null 2>&1; then
-		tok="$(gh auth token 2>/dev/null || true)"
-		tok_source="gh auth token"
-	fi
-	# Trim only LEADING/TRAILING whitespace — exactly what the app's validation
-	# chokepoint does. Deleting whitespace everywhere would be worse than useless:
-	# it would turn a garbage value with an interior space into something that
-	# passes `well_formed_token` and gets provisioned as a real credential.
-	tok="${tok#"${tok%%[![:space:]]*}"}"
-	tok="${tok%"${tok##*[![:space:]]}"}"
-
-	if [[ -z "$tok" ]]; then
-		# Only shout if there is genuinely no other way in. A machine with the
-		# keychain item or an existing 0600 file is already provisioned and does
-		# not need a lecture.
-		if [[ -r "$UPDATE_TOKEN_FILE" ]] ||
-			security find-generic-password -s aterm-update-token -w >/dev/null 2>&1; then
-			INSTALLED_ANY=1
-			echo "install.sh: update token already provisioned (existing file or keychain item) — left alone"
-			return 0
-		fi
-		# NOT a warning: the compiled-in channel is public and updates
-		# anonymously. Only a machine that repoints the updater at a private
-		# repo needs this file, and it can add it later.
-		# NOT a warning: the compiled-in channel is public, so this Mac updates
-		# without any credential — just on the slower anonymous interval.
-		echo "install.sh: no GitHub token available — the update channel is public, so this Mac"
-		echo "install.sh:   auto-updates with no credential at all."
-		# NOT "$0": piped as `… | bash` that is literally "bash". Name the
-		# invocation for how this run ACTUALLY happened: tools/install.sh
-		# exists only for a checkout, and the audience that reaches this
-		# message is dominated by piped anon-lane users (no gh means no gh
-		# lane) — they need the one-liner, not a path they do not have.
-		echo "install.sh:   The file this step writes is read only by a development build whose"
-		echo "install.sh:   [update] owner/repo point the updater at another repo; add it later with:"
-		if self_on_disk; then
-			echo "install.sh:     gh auth login && tools/install.sh --token --no-app --no-cli --no-toolchain --no-path"
-		else
-			echo "install.sh:     gh auth login && curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh |"
-			echo "install.sh:       bash -s -- --token --no-app --no-cli --no-toolchain --no-path"
-		fi
-		echo "install.sh:   Check update health any time with:  aterm update status"
-		return 0
-	fi
-
-	if ! well_formed_token "$tok"; then
-		echo "install.sh: WARNING: the available GitHub token is malformed, so it was NOT provisioned" >&2
-		echo "install.sh:   (expected [A-Za-z0-9_-]; got ${#tok} characters). Updates from the public" >&2
-		echo "install.sh:   channel are unaffected; re-authenticate with \`gh auth login\` if you need a" >&2
-		echo "install.sh:   token for a repointed, private update source." >&2
-		return 0
-	fi
-
-	# Already provisioned with this exact token → nothing to change. Still counts
-	# as a satisfied half, so `--no-app --no-cli` (the repair invocation) reports
-	# success rather than "nothing was installed".
-	if [[ -r "$UPDATE_TOKEN_FILE" ]] && [[ "$(cat "$UPDATE_TOKEN_FILE" 2>/dev/null)" == "$tok" ]]; then
-		INSTALLED_ANY=1
-		echo "install.sh: update token already provisioned -> $UPDATE_TOKEN_FILE (unchanged)"
-		return 0
-	fi
-
-	# CONSENT BEFORE THE COPY: a broad GitHub credential is about to land in a
-	# plaintext (0600) file, so intent prints BEFORE the write — what, where,
-	# why, and the off switch. (The half only runs at all when something will
-	# read the file or the operator asked; see token_provisioning_wanted.)
-	echo "install.sh: provisioning: copying the GitHub credential from $tok_source to $UPDATE_TOKEN_FILE (0600) so a development build's repointed updater ([update] owner/repo) can authenticate without gh on PATH — --no-token skips this"
-
-	if ! mkdir -p "$UPDATE_TOKEN_DIR" 2>/dev/null; then
-		echo "install.sh: WARNING: could not create $UPDATE_TOKEN_DIR — the update token was NOT provisioned (public-channel updates are unaffected)" >&2
-		return 0
-	fi
-	chmod 700 "$UPDATE_TOKEN_DIR" 2>/dev/null || true
-	# Write to a per-pid temp created under umask 077 (so the bytes are never on
-	# disk world-readable, not even briefly), then rename over the destination:
-	# the live file is atomically the old token or the new one, never a partial.
-	local tmp="$UPDATE_TOKEN_FILE.$$.tmp"
-	if ! (
-		umask 077
-		printf '%s' "$tok" >"$tmp"
-	) 2>/dev/null; then
-		rm -f "$tmp" 2>/dev/null
-		echo "install.sh: WARNING: could not write $UPDATE_TOKEN_FILE — the update token was NOT provisioned (public-channel updates are unaffected)" >&2
-		return 0
-	fi
-	chmod 600 "$tmp" 2>/dev/null || true
-	if ! mv -f "$tmp" "$UPDATE_TOKEN_FILE" 2>/dev/null; then
-		rm -f "$tmp" 2>/dev/null
-		echo "install.sh: WARNING: could not install $UPDATE_TOKEN_FILE — the update token was NOT provisioned (public-channel updates are unaffected)" >&2
-		return 0
-	fi
-	INSTALLED_ANY=1
-	echo "install.sh: provisioned the update token (0600) -> $UPDATE_TOKEN_FILE (used only if you repoint the updater at a private repo)"
-}
-
 cli_path_hint() {
 	local rc_name f
 	case ":$PATH:" in
@@ -4256,15 +3809,6 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 		install_cli
 	fi
 fi
-if [[ "$TOKEN_WANTED" -eq 1 ]]; then
-	provision_update_token
-elif [[ "$DO_TOKEN" -eq 1 ]]; then
-	# The honest default: the compiled-in public channel reads NO token file
-	# (crates/aterm-update-core/src/token.rs), so no credential is copied
-	# unless something will read it or the operator asks. --no-token stays
-	# silent — an explicit exclusion needs no status line.
-	echo "install.sh: token: skipped (public channel reads no token file; --token to provision for a repointed updater)"
-fi
 # After the CLI half: the seed lane is driven THROUGH the installed `aterm`, so
 # it needs the symlink (or the bundle) to already exist. Before the PATH half,
 # which points at a hook that only exists once atpkg has laid the toolset down.
@@ -4305,11 +3849,11 @@ if [[ "$CLI_PATH_HINT_WANTED" -eq 1 && "$PATH_BLOCK_WROTE" -eq 0 ]]; then
 	cli_path_hint
 fi
 if [[ "$INSTALLED_ANY" -eq 0 ]]; then
-	# A toolchain/PATH-only invocation (--no-app --no-cli --no-token) installs
-	# nothing by INSTALLED_ANY's deliberately narrow definition even when it
-	# did exactly what was asked; a completed seed or a standing managed PATH
-	# block IS that run's success, so it must not exit "nothing was installed".
-	if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 && "$DO_TOKEN" -eq 0 ]] &&
+	# A toolchain/PATH-only invocation (--no-app --no-cli) installs nothing by
+	# INSTALLED_ANY's deliberately narrow definition even when it did exactly
+	# what was asked; a completed seed or a standing managed PATH block IS that
+	# run's success, so it must not exit "nothing was installed".
+	if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 ]] &&
 		[[ "$TOOLCHAIN_RAN" -eq 1 || "$PATH_BLOCK_WROTE" -eq 1 ]]; then
 		exit 0
 	fi
