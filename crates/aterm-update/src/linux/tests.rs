@@ -9,7 +9,39 @@ struct Fixture {
     context: Context,
     state: State,
     proof: Proof,
-    channel: String,
+    /// The paper master the fixture's roster is signed by — the one anchor (K1
+    /// retired): an appcast verifies only through a roster this key signed.
+    master: String,
+}
+
+/// The fixture's machine: the roster admits it as `fixture` at sequence 1, and it
+/// signs the appcast.
+fn machine() -> Ed25519KeyPair {
+    key(7)
+}
+
+/// The fixture's paper master, which signs the roster.
+fn master() -> Ed25519KeyPair {
+    key(11)
+}
+
+/// A master-signed roster admitting [`machine`] as `fixture` at `seq`.
+fn roster_proof(seq: u64) -> (Vec<u8>, Vec<u8>) {
+    let roster = aterm_update_core::Roster {
+        schema: 1,
+        roster_seq: seq,
+        valid_until: "2099-01-01T00:00:00Z".into(),
+        machines: vec![aterm_update_core::Machine {
+            id: "fixture".into(),
+            pubkey: public(&machine()),
+            added_at: String::new(),
+            not_after: None,
+        }],
+        revoked: Vec::new(),
+    };
+    let bytes = roster.to_toml().unwrap().into_bytes();
+    let signature = master().sign(&bytes).as_ref().to_vec();
+    (bytes, signature)
 }
 
 fn key(seed: u8) -> Ed25519KeyPair {
@@ -18,15 +50,6 @@ fn key(seed: u8) -> Ed25519KeyPair {
 
 fn public(key: &Ed25519KeyPair) -> String {
     aterm_codec::base64::encode(key.public_key().as_ref()).unwrap()
-}
-
-fn catalog(tag: &str, native: bool) -> aterm_update_core::release_catalog::ReleaseCandidate {
-    aterm_update_core::release_catalog::ReleaseCandidate {
-        tag: tag.into(),
-        current_appcast: true,
-        linux_aarch64: native,
-        linux_x86_64: native,
-    }
 }
 
 fn settings_provider(auto_apply: bool) -> crate::CheckSettingsProvider {
@@ -124,8 +147,7 @@ fn manual_policy_stages_exact_authenticated_identity_and_explicit_apply_still_wo
         &mut f.state,
         &f.proof,
         Pins {
-            masters: &[],
-            channels: &[&f.channel],
+            masters: &[&f.master],
         },
         &source,
         &provider,
@@ -162,8 +184,7 @@ fn default_policy_applies_and_rechecks_live_policy_after_candidate_probe() {
         &mut automatic.state,
         &automatic.proof,
         Pins {
-            masters: &[],
-            channels: &[&automatic.channel],
+            masters: &[&automatic.master],
         },
         &source,
         &provider,
@@ -202,8 +223,7 @@ fn default_policy_applies_and_rechecks_live_policy_after_candidate_probe() {
             &mut f.state,
             &f.proof,
             Pins {
-                masters: &[],
-                channels: &[&f.channel],
+                masters: &[&f.master],
             },
             &source,
             &provider,
@@ -240,8 +260,7 @@ fn manual_staging_never_bypasses_authentication_or_the_apply_time_recheck() {
             &mut f.state,
             &bad,
             Pins {
-                masters: &[],
-                channels: &[&f.channel]
+                masters: &[&f.master],
             },
             &source,
             &provider,
@@ -255,8 +274,7 @@ fn manual_staging_never_bypasses_authentication_or_the_apply_time_recheck() {
         &mut f.state,
         &f.proof,
         Pins {
-            masters: &[],
-            channels: &[&f.channel],
+            masters: &[&f.master],
         },
         &source,
         &provider,
@@ -289,8 +307,7 @@ fn staged_status_and_reuse_obey_new_minimum_revocations_and_exact_current_bytes(
         &mut f.state,
         &f.proof,
         Pins {
-            masters: &[],
-            channels: &[&f.channel],
+            masters: &[&f.master],
         },
         &source,
         &provider,
@@ -339,8 +356,7 @@ fn failed_stage_refresh_cannot_advertise_the_previous_candidate() {
     let provider = settings_provider(false);
     let source = provider().unwrap().source;
     let pins = Pins {
-        masters: &[],
-        channels: &[&f.channel],
+        masters: &[&f.master],
     };
     finish_candidate(
         &f.context,
@@ -463,30 +479,31 @@ impl Fixture {
         let digest = hash_file(&context.dir.join("candidate")).unwrap();
         let arch = native().unwrap().arch();
         let text = format!(
-            "schema = 1\nversion = \"0.11.0\"\nbuild_number = 11\ncommit = \"{}\"\ndmg = \"aterm-0.11.0.dmg\"\nsha256 = \"{}\"\nlinux_{arch} = \"aterm-0.11.0-linux-{arch}\"\nlinux_{arch}_sha256 = \"{digest}\"\nlinux_{arch}_size = 128\n",
+            "schema = 1\nmachine_id = \"fixture\"\nroster_seq = 1\nversion = \"0.11.0\"\nbuild_number = 11\ncommit = \"{}\"\ndmg = \"aterm-0.11.0.dmg\"\nsha256 = \"{}\"\nlinux_{arch} = \"aterm-0.11.0-linux-{arch}\"\nlinux_{arch}_sha256 = \"{digest}\"\nlinux_{arch}_size = 128\n",
             "b".repeat(40),
             "0".repeat(64)
         );
+        let (roster, roster_signature) = roster_proof(1);
         let proof = Proof {
             policy: None,
             appcast: text.into_bytes(),
             signature: Vec::new(),
-            roster: Vec::new(),
-            roster_signature: Vec::new(),
+            roster,
+            roster_signature,
         };
         let mut this = Self {
             root,
             context,
             state,
             proof,
-            channel: public(&key(7)),
+            master: public(&master()),
         };
         this.resign();
         this
     }
 
     fn resign(&mut self) {
-        self.proof.signature = key(7).sign(&self.proof.appcast).as_ref().to_vec();
+        self.proof.signature = machine().sign(&self.proof.appcast).as_ref().to_vec();
     }
 
     fn alter_manifest(&mut self, from: &str, to: &str) {
@@ -503,8 +520,7 @@ impl Fixture {
             &mut self.state,
             &self.proof,
             Pins {
-                masters: &[],
-                channels: &[&self.channel],
+                masters: &[&self.master],
             },
             |_, _, _| Ok(()),
             |_| Ok(()),
@@ -603,8 +619,7 @@ fn bootstrap_preserves_enrolled_bytes_and_state_on_probe_failure_then_uses_norma
     fs::copy(f.context.dir.join("candidate"), &source).unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
     let pins = Pins {
-        masters: &[],
-        channels: &[&f.channel],
+        masters: &[&f.master],
     };
     assert!(
         install_locked(&f.context, &source, &f.proof, pins, |_, _, _| Err(
@@ -647,8 +662,7 @@ fn bootstrap_first_install_and_latest_policy_handoff_preserve_floors() {
     fs::remove_file(&f.context.target).unwrap();
     fs::remove_file(f.context.dir.join("state.toml")).unwrap();
     let pins = Pins {
-        masters: &[],
-        channels: &[&f.channel],
+        masters: &[&f.master],
     };
     let mut proof = f.proof.clone();
     let policy = format!(
@@ -715,8 +729,7 @@ fn interrupted_prepared_transaction_can_be_retried_by_the_bootstrap_entry() {
     fs::copy(f.context.dir.join("candidate"), &download).unwrap();
     fs::set_permissions(&download, fs::Permissions::from_mode(0o755)).unwrap();
     let pins = Pins {
-        masters: &[],
-        channels: &[&f.channel],
+        masters: &[&f.master],
     };
     assert!(
         apply_with_checkpoints(
@@ -791,8 +804,7 @@ fn bootstrap_executes_real_authenticated_native_inode_after_closing_all_writers(
         &format!("_size = {}", fs::metadata(&source).unwrap().len()),
     );
     let pins = Pins {
-        masters: &[],
-        channels: &[&f.channel],
+        masters: &[&f.master],
     };
     install_locked(&f.context, &source, &f.proof, pins, |path, _, _| {
         let status = std::process::Command::new(path)
@@ -890,7 +902,8 @@ fn tamper_wrong_key_wrong_target_bad_size_and_replay_cannot_replace_installed_by
         let old = hash_file(&f.context.target).unwrap();
         match case {
             "signature" => f.proof.appcast[0] ^= 1,
-            "key" => f.channel = public(&key(9)),
+            // Signed by a machine the master-signed roster does not admit.
+            "key" => f.proof.signature = key(9).sign(&f.proof.appcast).as_ref().to_vec(),
             "bytes" => {
                 fs::write(f.context.dir.join("candidate"), elf(3, native().unwrap())).unwrap()
             }
@@ -990,8 +1003,7 @@ fn interrupted_apply_recovers_both_sides_of_the_atomic_rename() {
             &mut f.state,
             &f.proof,
             Pins {
-                masters: &[],
-                channels: &[&f.channel],
+                masters: &[&f.master],
             },
             |_, _, _| Ok(()),
             |at| {
@@ -1017,14 +1029,34 @@ fn interrupted_apply_recovers_both_sides_of_the_atomic_rename() {
     }
 }
 
+/// K1 IS RETIRED: the paper master is the one anchor. A build that pins none has
+/// nothing to verify a roster — and so an appcast — against, and refuses every
+/// update channel rather than falling back to a bare channel key.
+#[test]
+fn a_build_that_pins_no_paper_master_verifies_no_update_channel() {
+    let mut f = Fixture::new();
+    let error = authorize(&f.context, &mut f.state, &f.proof, Pins { masters: &[] })
+        .expect_err("no anchor, no channel");
+    assert!(error.contains("pins no paper master"), "{error}");
+    // Negative control: the very same proof verifies under the fixture's master.
+    assert!(
+        authorize(
+            &f.context,
+            &mut f.state,
+            &f.proof,
+            Pins {
+                masters: &[&f.master]
+            }
+        )
+        .is_ok()
+    );
+}
+
 #[test]
 fn admitted_roster_revocation_is_durable_even_when_it_refuses_the_appcast() {
     let mut f = Fixture::new();
-    f.alter_manifest(
-        "schema = 1",
-        "schema = 1\nmachine_id = \"fixture\"\nroster_seq = 2",
-    );
-    let master = key(11);
+    f.alter_manifest("roster_seq = 1", "roster_seq = 2");
+    let master = master();
     let anchor = public(&master);
     let mut roster = aterm_update_core::Roster {
         schema: 1,
@@ -1032,7 +1064,7 @@ fn admitted_roster_revocation_is_durable_even_when_it_refuses_the_appcast() {
         valid_until: "2099-01-01T00:00:00Z".into(),
         machines: vec![aterm_update_core::Machine {
             id: "fixture".into(),
-            pubkey: f.channel.clone(),
+            pubkey: public(&machine()),
             added_at: String::new(),
             not_after: None,
         }],
@@ -1042,7 +1074,6 @@ fn admitted_roster_revocation_is_durable_even_when_it_refuses_the_appcast() {
     f.proof.roster_signature = master.sign(&f.proof.roster).as_ref().to_vec();
     let pins = Pins {
         masters: &[&anchor],
-        channels: &[],
     };
     assert!(authorize(&f.context, &mut f.state, &f.proof, pins).is_ok());
     let old_proof = f.proof.clone();
@@ -1155,64 +1186,6 @@ fn actual_boot_and_health_transitions_bind_build_commit_and_process_inode() {
 }
 
 #[test]
-fn newest_mac_only_release_does_not_hide_an_older_authenticated_native_artifact() {
-    let mut f = Fixture::new();
-    let candidate = f.proof.clone();
-    let head_text = String::from_utf8(candidate.appcast.clone())
-        .unwrap()
-        .lines()
-        .filter(|line| !line.starts_with("linux_"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .replace("0.11.0", "0.12.0")
-        .replace("build_number = 11", "build_number = 12");
-    let mut head = candidate.clone();
-    head.appcast = head_text.into_bytes();
-    head.signature = key(7).sign(&head.appcast).as_ref().to_vec();
-    let pins = Pins {
-        masters: &[],
-        channels: &[&f.channel],
-    };
-    let policy = authenticate_tag(&f.context, &mut f.state, "v0.12.0", &head, pins).unwrap();
-    assert!(policy.linux_artifact(native().unwrap()).unwrap().is_none());
-    let (tag, elected, _) = older_native_candidate(
-        &f.context,
-        &mut f.state,
-        "v0.12.0",
-        &head,
-        &[
-            catalog("v0.12.0", false),
-            catalog("v0.11.5", false),
-            catalog("v0.11.0", true),
-        ],
-        pins,
-        |candidate_location, _| {
-            assert_eq!(candidate_location.tag, "v0.11.0");
-            Ok(candidate.clone())
-        },
-    )
-    .unwrap();
-    assert_eq!(tag, "v0.11.0");
-    assert_eq!(elected.build_number, 11);
-    let bad = Proof {
-        signature: vec![0; 64],
-        ..candidate
-    };
-    assert!(
-        older_native_candidate(
-            &f.context,
-            &mut f.state,
-            "v0.12.0",
-            &head,
-            &[catalog("v0.11.0", true)],
-            pins,
-            |_, _| Ok(bad.clone())
-        )
-        .is_err()
-    );
-}
-
-#[test]
 fn source_only_pointer_can_reach_discovery_but_a_non_app_tag_cannot_authorize_an_appcast() {
     let mut f = Fixture::new();
     let tag = discovered_head(Err(aterm_update_core::pointer::PointerError::OtherTag {
@@ -1227,8 +1200,7 @@ fn source_only_pointer_can_reach_discovery_but_a_non_app_tag_cannot_authorize_an
             &tag,
             &f.proof,
             Pins {
-                masters: &[],
-                channels: &[&f.channel]
+                masters: &[&f.master],
             }
         )
         .is_err()
@@ -1238,23 +1210,6 @@ fn source_only_pointer_can_reach_discovery_but_a_non_app_tag_cannot_authorize_an
             why: "foreign location"
         }))
         .is_err()
-    );
-    assert!(
-        older_native_candidate(
-            &f.context,
-            &mut f.state,
-            "v0.12.0",
-            &f.proof,
-            &[catalog("v0.11.0", false)],
-            Pins {
-                masters: &[],
-                channels: &[&f.channel]
-            },
-            |_, _| panic!("Mac-only inventory must not authenticate retired unrelated history")
-        )
-        .err()
-        .unwrap()
-        .contains("no authenticated")
     );
 }
 
@@ -1269,55 +1224,6 @@ fn appcasts_have_the_full_five_megabyte_bound_not_the_small_state_record_bound()
         bytes.len()
     );
     assert!(read_small(&path).is_err());
-}
-
-#[test]
-fn archived_native_manifest_is_elected_under_current_policy_and_normalized_for_storage() {
-    let mut f = Fixture::new();
-    let mut archived = catalog("v0.11.0", true);
-    archived.current_appcast = false;
-    assert_eq!(archived.appcast_name(), "aterm-appcast-v0.11.0.toml");
-    let old_proof = f.proof.clone();
-    let head_text = String::from_utf8(old_proof.appcast.clone())
-        .unwrap()
-        .replace("0.11.0", "0.12.0")
-        .replace("build_number = 11", "build_number = 12");
-    let head_bytes = head_text.into_bytes();
-    let head = Proof {
-        appcast: head_bytes.clone(),
-        signature: key(7).sign(&head_bytes).as_ref().to_vec(),
-        ..old_proof.clone()
-    };
-    let (_, manifest, proof) = older_native_candidate(
-        &f.context,
-        &mut f.state,
-        "v0.12.0",
-        &head,
-        &[archived],
-        Pins {
-            masters: &[],
-            channels: &[&f.channel],
-        },
-        |location, policy| {
-            assert!(!location.current_appcast);
-            assert_eq!(location.appcast_name(), "aterm-appcast-v0.11.0.toml");
-            Ok(Proof {
-                policy: Some((policy.appcast.clone(), policy.signature.clone())),
-                ..old_proof.clone()
-            })
-        },
-    )
-    .unwrap();
-    assert_eq!(manifest.build_number, 11);
-    proof.save(&f.context.dir).unwrap();
-    assert_eq!(
-        read_bounded(&f.context.dir.join(APPCAST), APPCAST_LIMIT).unwrap(),
-        old_proof.appcast
-    );
-    assert_eq!(
-        read_bounded(&f.context.dir.join(POLICY), APPCAST_LIMIT).unwrap(),
-        head.appcast
-    );
 }
 
 fn transaction_model() -> aterm_spec::derive::Model {
@@ -1351,8 +1257,7 @@ fn derived_transaction_model_proves_and_catches_missing_prepare_and_binds_shippi
         &mut f.state,
         &f.proof,
         Pins {
-            masters: &[],
-            channels: &[&f.channel],
+            masters: &[&f.master],
         },
         |_, _, _| Ok(()),
         |at| {

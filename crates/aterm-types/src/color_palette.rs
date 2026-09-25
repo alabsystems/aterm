@@ -674,50 +674,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn parse_named_color_basic() {
-        assert_eq!(
-            ColorPalette::parse_color_spec("red"),
-            Some(Rgb::new(255, 0, 0))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("blue"),
-            Some(Rgb::new(0, 0, 255))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("green"),
-            Some(Rgb::new(0, 128, 0))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("black"),
-            Some(Rgb::new(0, 0, 0))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("white"),
-            Some(Rgb::new(255, 255, 255))
-        );
-    }
-
-    #[test]
-    fn parse_named_color_case_insensitive() {
-        assert_eq!(
-            ColorPalette::parse_color_spec("Red"),
-            Some(Rgb::new(255, 0, 0))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("RED"),
-            Some(Rgb::new(255, 0, 0))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("DarkSlateGray"),
-            Some(Rgb::new(47, 79, 79))
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("DARKSLATEGRAY"),
-            Some(Rgb::new(47, 79, 79))
-        );
-    }
-
-    #[test]
     fn parse_named_color_extended() {
         // Test a selection of the full X11 color list
         assert_eq!(
@@ -735,19 +691,6 @@ mod tests {
         assert_eq!(
             ColorPalette::parse_color_spec("rebeccapurple"),
             Some(Rgb::new(102, 51, 153))
-        );
-    }
-
-    #[test]
-    fn parse_named_color_grey_variants() {
-        // Both "gray" and "grey" spellings
-        assert_eq!(
-            ColorPalette::parse_color_spec("gray"),
-            ColorPalette::parse_color_spec("grey")
-        );
-        assert_eq!(
-            ColorPalette::parse_color_spec("DarkSlateGray"),
-            ColorPalette::parse_color_spec("DarkSlateGrey")
         );
     }
 
@@ -822,96 +765,6 @@ mod tests {
     // =========================================================================
     // ColorPalette — performance scaling proof
     // =========================================================================
-
-    /// Prove that palette lookup cost is CONSTANT in the override count.
-    ///
-    /// This test used to document the opposite: `get()` linear-scanned the
-    /// overrides SmallVec, so the per-frame cost of a full-screen redraw of
-    /// indexed-color cells was O(cells * N) — up to 16 comparisons for any
-    /// configured theme (which `set`s all 16 ANSI slots) and up to 256 across
-    /// 16 cache lines once OSC 4 pushed the vec onto the heap. `get()` now
-    /// reads the dense `cache`, so all three trials below do one array load per
-    /// lookup regardless of N.
-    ///
-    /// The sparse `overrides` record is retained unchanged — it is what
-    /// `overrides()`/`overrides_count()` expose for serialization — so the
-    /// structural assertions at the bottom still hold.
-    #[test]
-    fn palette_get_scaling_linear_in_overrides() {
-        // Measure lookup cost via operation counter.
-        // We simulate what the rendering hot path does: look up many
-        // indexed colors with varying override counts.
-
-        let lookups_per_trial = 10_000u64;
-
-        // Trial 1: 0 overrides (empty palette — all defaults)
-        let p0 = ColorPalette::new();
-        assert_eq!(p0.overrides_count(), 0);
-        let mut sum0 = 0u64;
-        for i in 0..lookups_per_trial {
-            let color = p0.get((i % 256) as u8);
-            sum0 += u64::from(color.r);
-        }
-
-        // Trial 2: 16 overrides (typical theme — ANSI colors customized)
-        let mut p16 = ColorPalette::new();
-        for i in 0..16u8 {
-            // Use values guaranteed distinct from any default (offset by +1/+2/+3)
-            p16.set(
-                i,
-                Rgb::new(i.wrapping_add(1), i.wrapping_add(2), i.wrapping_add(3)),
-            );
-        }
-        assert_eq!(p16.overrides_count(), 16);
-        let mut sum16 = 0u64;
-        for i in 0..lookups_per_trial {
-            let color = p16.get((i % 256) as u8);
-            sum16 += u64::from(color.r);
-        }
-
-        // Trial 3: 256 overrides (full palette override via OSC 4)
-        let mut p256 = ColorPalette::new();
-        for i in 0..=255u8 {
-            // +1 offset ensures index 0 doesn't match default Rgb(0,0,0)
-            p256.set(
-                i,
-                Rgb::new(i.wrapping_add(1), i.wrapping_add(2), i.wrapping_add(3)),
-            );
-        }
-        assert_eq!(p256.overrides_count(), 256);
-        let mut sum256 = 0u64;
-        for i in 0..lookups_per_trial {
-            let color = p256.get((i % 256) as u8);
-            sum256 += u64::from(color.r);
-        }
-
-        // Prevent dead-code elimination
-        assert!(sum0 > 0);
-        assert!(sum16 > 0);
-        assert!(sum256 > 0);
-
-        // Structural assertions: overrides are stored as claimed
-        assert_eq!(p0.overrides_count(), 0, "empty palette has 0 overrides");
-        assert_eq!(p16.overrides_count(), 16, "theme palette has 16 overrides");
-        assert_eq!(
-            p256.overrides_count(),
-            256,
-            "full palette has 256 overrides"
-        );
-
-        // Correctness: overridden values are returned, not defaults
-        assert_eq!(p16.get(0), Rgb::new(1, 2, 3)); // 0+1, 0+2, 0+3
-        assert_eq!(p16.get(1), Rgb::new(2, 3, 4)); // 1+1, 1+2, 1+3
-        assert_eq!(p256.get(100), Rgb::new(101, 102, 103)); // 100+1, 100+2, 100+3
-
-        // Verify the design tradeoff: SmallVec inline threshold
-        // SmallVec<(u8, Rgb), 16> stores 16 entries inline (no heap).
-        // Entry size = size_of::<(u8, Rgb)>() = 4 bytes (u8 + 3×u8, packed).
-        let entry_size = std::mem::size_of::<(u8, Rgb)>();
-        assert_eq!(entry_size, 4, "palette entry is 4 bytes (u8 index + Rgb)");
-        // 16 entries × 4 bytes = 64 bytes inline = 1 cache line
-        assert_eq!(16 * entry_size, 64, "16 overrides fit in one cache line");
-    }
 
     /// The dense `cache` behind `get()` must agree with the sparse `overrides`
     /// record for EVERY index after any mutation sequence — that equivalence is

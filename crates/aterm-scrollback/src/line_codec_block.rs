@@ -403,6 +403,11 @@ pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
 /// caller's per-line content and wire budgets, every record must deserialize,
 /// and no trailing bytes may remain. Length checks run before `Line::deserialize`
 /// allocates its content/sidecars.
+///
+/// `max_cells_per_line` is a count of physical COLUMNS: it bounds hyperlink and
+/// underline-colour span ends exactly. The attrs RLE is indexed per character,
+/// so it is bounded by the larger of that and the line's own character count
+/// (itself capped by `max_content_bytes_per_line`) — see `decode_line_strict`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn deserialize_lines_strict(
@@ -466,10 +471,27 @@ fn decode_line_strict(
         return None;
     }
     if let Some(attrs) = line.attrs() {
-        let mut cells = 0usize;
+        // The attrs RLE is indexed by CHARACTER, not by cell: the grid's
+        // row→line conversion charges one entry per `char` of a cell's text
+        // (a combining mark gets its own, a ZWJ cluster one per codepoint, a
+        // wide spacer none). A full-width styled row holding `e` + U+0301 or
+        // `👨‍💻` therefore has more attrs than the grid has columns, and
+        // comparing the sum to the CELL cap alone refused it as hostile — the
+        // 2026-09-22 update wedge, where one such row on a visible screen (or
+        // on the saved primary under an alt-screen app) refused every
+        // in-session update for as long as it stayed there.
+        //
+        // The bound is `max(cells, the line's own character count)`: strictly
+        // more lenient than the old cell cap (an older producer's carry can
+        // only start passing, never start failing), and still bounded, because
+        // the character count is itself bounded by the content-bytes cap
+        // checked above. Hyperlink and underline spans below keep the plain
+        // column cap — their `end_col` is a real column.
+        let max_attr_entries = max_cells_per_line.max(line_char_count(line.as_bytes()));
+        let mut entries = 0usize;
         for run in attrs.runs() {
-            cells = cells.checked_add(run.length as usize)?;
-            if cells > max_cells_per_line {
+            entries = entries.checked_add(run.length as usize)?;
+            if entries > max_attr_entries {
                 return None;
             }
         }
@@ -484,6 +506,19 @@ fn decode_line_strict(
         })
     });
     spans_bounded.then_some((line, size))
+}
+
+/// The number of characters in a line's content, as the attrs RLE counts them.
+///
+/// Counts UTF-8 lead bytes (every byte that is not a `10xxxxxx` continuation),
+/// which is exactly `str::chars().count()` for valid UTF-8 and never exceeds
+/// the byte length for anything else — so it is bounded by the content-bytes
+/// cap the strict decoder has already enforced, and it needs no allocation or
+/// validation pass of its own. It exists so [`decode_line_strict`] can bound
+/// the attrs RLE by the unit that RLE is actually indexed in (characters)
+/// rather than by cells, the mismatch behind the 2026-09-22 update wedge.
+fn line_char_count(content: &[u8]) -> usize {
+    content.iter().filter(|&&byte| byte & 0xC0 != 0x80).count()
 }
 
 /// Strictly validate a bounded scrollback-then-visible checkpoint while retaining

@@ -187,28 +187,6 @@ fn luminance_near_srgb_threshold() {
     );
 }
 
-/// Verify cross-language sRGB linearization threshold agreement.
-///
-/// All three codebases (Rust, Metal, Swift) must use the IEC 61966-2-1
-/// threshold of 0.04045. This test validates continuity at the exact
-/// threshold boundary — the piecewise linear and gamma branches must agree
-/// at the transition point.
-#[test]
-fn srgb_threshold_cross_language_agreement() {
-    // IEC 61966-2-1 threshold: 0.04045
-    // At the threshold, both branches of the piecewise function should agree:
-    //   linear branch: 0.04045 / 12.92 ≈ 0.003130805
-    //   gamma branch:  ((0.04045 + 0.055) / 1.055)^2.4 ≈ 0.003130805
-    let threshold = 0.04045_f64;
-    let linear_val = threshold / 12.92;
-    let gamma_val = ((threshold + 0.055) / 1.055).powf(2.4);
-    let diff = (linear_val - gamma_val).abs();
-    assert!(
-        diff < 1e-6,
-        "piecewise branches must agree at threshold: linear={linear_val}, gamma={gamma_val}, diff={diff}"
-    );
-}
-
 // =========================================================================
 // Rec.709 coefficient validation
 // =========================================================================

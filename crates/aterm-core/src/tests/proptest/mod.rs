@@ -6,8 +6,8 @@
 //! Physical files relocated to test_support/proptest/ (Part of #6814).
 //! These tests still exercise crate-private seams and remain owned by aterm-core.
 
-#[path = "../../../test_support/proptest/scrollback.rs"]
-mod scrollback;
+#[path = "../../../test_support/proptest/grapheme.rs"]
+mod grapheme;
 
 // SCR-1 absolute-content pinning: live output while scrolled back keeps the same
 // absolute row at the viewport top (the engine invariant the renderer's scroll-restore

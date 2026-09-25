@@ -33,11 +33,9 @@ use aterm_digest::Sha256;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Fixed 64-byte lowercase record used only by unpinned development builds.
-/// A release always has a non-empty committed pin
-/// (`aterm_update_core::pins::update_channel_signing_pubkey`), so the release
-/// cutter compares the Mach-O record against the permanent authority and
-/// rejects this sentinel.
+/// Fixed 64-byte lowercase record used only when no paper master is pinned (a fork).
+/// This tree always has one (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`), so the
+/// release cutter compares the Mach-O record against it and rejects this sentinel.
 const UNPINNED_UPDATE_PIN_SENTINEL: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -76,26 +74,24 @@ fn main() {
         println!("cargo::rustc-cfg=a11y_tree");
     }
 
-    // Derive the updater-key fingerprint from the SAME compile-time input that
-    // `aterm-update::PINNED_UPDATE_PUBKEY` consumes.  `build_info.rs` places this
-    // exact fixed-width value in `__DATA,__aterm_upin`, allowing the release
-    // cutter to prove the x86_64 slice's authority without executing it under
-    // Rosetta.  Invalid non-empty inputs fail the build instead of embedding an
-    // ambiguous record; an ordinary unpinned dev build gets the explicit zero
-    // sentinel and remains updater-inert.
-    // The anchor is the COMMITTED constant, not build-environment state: read it
-    // from the one file that owns it so the embedded record proves the same key the
-    // runtime verifies under. Reading an env var here would reintroduce exactly the
-    // drift this record exists to detect — a binary whose embedded pin disagrees
-    // with the anchor it actually trusts.
-    let update_pin_sha256 = match aterm_update_core::pins::update_channel_signing_pubkey() {
-        encoded if !encoded.is_empty() => {
+    // The update pin: the fingerprint of the paper master, the ONE anchor that
+    // authorizes a release — the SAME compile-time input `aterm-update`'s
+    // `compiled_update_pin_sha256` reports. `build_info.rs` places this exact
+    // fixed-width value in `__DATA,__aterm_upin`, allowing the release cutter to prove
+    // the x86_64 slice's authority without executing it under Rosetta. Invalid
+    // non-empty inputs fail the build instead of embedding an ambiguous record; a fork
+    // with no master gets the explicit zero sentinel.
+    // The anchor is the COMMITTED constant, not build-environment state: read it from
+    // the one file that owns it so the embedded record proves the same key the runtime
+    // verifies under.
+    let update_pin_sha256 = match aterm_update_core::pins::PAPER_MASTER_PUBKEYS.first() {
+        Some(encoded) if !encoded.is_empty() => {
             let raw = aterm_codec::base64::decode_strict(encoded.as_bytes())
-                .expect("UPDATE_CHANNEL_PUBKEYS[0] must be standard base64");
+                .expect("PAPER_MASTER_PUBKEYS[0] must be standard base64");
             assert_eq!(
                 raw.len(),
                 32,
-                "UPDATE_CHANNEL_PUBKEYS[0] must decode to an Ed25519 32-byte public key"
+                "PAPER_MASTER_PUBKEYS[0] must decode to an Ed25519 32-byte public key"
             );
             Sha256::digest(raw)
                 .iter()

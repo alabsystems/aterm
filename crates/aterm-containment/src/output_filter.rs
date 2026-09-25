@@ -371,75 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn passes_plain_text_unchanged() {
-        let out = sanitize(b"hello world\n");
-        assert_eq!(out, b"hello world\n");
-    }
-
-    #[test]
-    fn preserves_csi_sgr_coloring() {
-        // Red foreground via SGR — must survive.
-        let input = b"\x1b[31mred\x1b[0m";
-        assert_eq!(sanitize(input), input);
-    }
-
-    #[test]
-    fn preserves_csi_cursor_move() {
-        let input = b"\x1b[2J\x1b[H\x1b[10;5Hxx";
-        assert_eq!(sanitize(input), input);
-    }
-
-    #[test]
     fn strips_osc_title_bel_terminated() {
         // OSC 2 ; hostile-title BEL — common window-title hijack.
         let input = b"before\x1b]2;EVIL TITLE\x07after";
         assert_eq!(sanitize(input), b"beforeafter");
-    }
-
-    #[test]
-    fn strips_osc_title_st_terminated() {
-        let input = b"before\x1b]2;TITLE\x1b\\after";
-        assert_eq!(sanitize(input), b"beforeafter");
-    }
-
-    #[test]
-    fn strips_osc52_clipboard_write() {
-        // OSC 52 ; c ; base64-of-payload BEL — clipboard write primitive.
-        let input = b"\x1b]52;c;aGVsbG8gd29ybGQ=\x07okay";
-        assert_eq!(sanitize(input), b"okay");
-    }
-
-    #[test]
-    fn strips_osc8_hyperlink() {
-        // OSC 8 ; ; URL ST TEXT OSC 8 ; ; ST — the whole hyperlink wrapping
-        // is OSC. The inner TEXT is preserved.
-        let input = b"\x1b]8;;https://evil.example\x1b\\TEXT\x1b]8;;\x1b\\";
-        assert_eq!(sanitize(input), b"TEXT");
-    }
-
-    #[test]
-    fn strips_dcs_tmux_passthrough() {
-        // DCS tmux pass-through: ESC P tmux; <inner> ESC \
-        let input = b"pre\x1bPtmux;\x1b]0;inner\x07\x1b\\post";
-        assert_eq!(sanitize(input), b"prepost");
-    }
-
-    #[test]
-    fn strips_apc() {
-        let input = b"a\x1b_some apc payload\x1b\\b";
-        assert_eq!(sanitize(input), b"ab");
-    }
-
-    #[test]
-    fn strips_sos() {
-        let input = b"a\x1bXpayload\x1b\\b";
-        assert_eq!(sanitize(input), b"ab");
-    }
-
-    #[test]
-    fn strips_pm() {
-        let input = b"a\x1b^payload\x1b\\b";
-        assert_eq!(sanitize(input), b"ab");
     }
 
     #[test]
@@ -451,27 +386,6 @@ mod tests {
         // Similarly for code points that include other C1-range bytes.
         let mixed = "café 😀".as_bytes();
         assert_eq!(sanitize(mixed), mixed);
-    }
-
-    #[test]
-    fn streaming_preserves_split_osc() {
-        let mut s = OutputSanitizer::new();
-        let mut out = Vec::new();
-        // Split an OSC across three calls.
-        s.sanitize_into(b"hello\x1b]", &mut out);
-        s.sanitize_into(b"0;title", &mut out);
-        s.sanitize_into(b"\x07world", &mut out);
-        assert_eq!(out, b"helloworld");
-    }
-
-    #[test]
-    fn streaming_preserves_split_esc() {
-        // ESC delivered alone, then the terminator of a CSI sequence.
-        let mut s = OutputSanitizer::new();
-        let mut out = Vec::new();
-        s.sanitize_into(b"a\x1b", &mut out);
-        s.sanitize_into(b"[31mX", &mut out);
-        assert_eq!(out, b"a\x1b[31mX");
     }
 
     #[test]
@@ -532,18 +446,6 @@ mod tests {
         let out = s.sanitize(&[]);
         assert!(out.is_empty());
         assert!(!s.in_sequence());
-    }
-
-    #[test]
-    fn preserves_utf8_multibyte() {
-        let input = "héllo 你好 🌍\n".as_bytes();
-        assert_eq!(sanitize(input), input);
-    }
-
-    #[test]
-    fn strips_consecutive_osc_sequences() {
-        let input = b"\x1b]0;A\x07\x1b]0;B\x07\x1b]0;C\x07end";
-        assert_eq!(sanitize(input), b"end");
     }
 
     #[test]

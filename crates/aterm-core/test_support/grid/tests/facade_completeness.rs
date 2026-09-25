@@ -4,97 +4,32 @@
 
 //! Compile-time checks that `aterm_core::grid` still re-exports the extracted
 //! `aterm-grid` types that cross-crate consumers rely on.
+//!
+//! Each line coerces `identity::<aterm_grid::T>` to `fn(aterm_grid::T) ->
+//! grid::T`, which type-checks only while the two names are the same type,
+//! so a broken or diverging re-export fails the test build. (This was sixteen
+//! `#[test]` fns whose bodies could not fail at run time.)
 
 use crate::grid;
+use core::convert::identity;
 
-macro_rules! assert_type_identity {
-    ($test_name:ident, $core_ty:ty, $grid_expr:expr_2021) => {
-        #[test]
-        fn $test_name() {
-            let _: $core_ty = $grid_expr;
-        }
-    };
-}
-
-assert_type_identity!(cell_type_identity, grid::Cell, aterm_grid::Cell::default());
-assert_type_identity!(
-    cell_flags_type_identity,
-    grid::CellFlags,
-    aterm_grid::CellFlags::empty()
-);
-assert_type_identity!(
-    packed_color_type_identity,
-    grid::PackedColor,
-    aterm_grid::PackedColor::DEFAULT_FG
-);
-assert_type_identity!(
-    packed_colors_type_identity,
-    grid::PackedColors,
-    aterm_grid::PackedColors::DEFAULT
-);
-assert_type_identity!(
-    damage_type_identity,
-    grid::Damage,
-    aterm_grid::Damage::default()
-);
-assert_type_identity!(
-    page_store_type_identity,
-    grid::PageStore,
-    aterm_grid::PageStore::new()
-);
-assert_type_identity!(
-    line_size_type_identity,
-    grid::LineSize,
-    aterm_grid::LineSize::SingleWidth
-);
-assert_type_identity!(
-    row_flags_type_identity,
-    grid::RowFlags,
-    aterm_grid::RowFlags::empty()
-);
-assert_type_identity!(
-    style_id_type_identity,
-    grid::StyleId,
-    aterm_grid::StyleId::default()
-);
-assert_type_identity!(
-    style_type_identity,
-    grid::Style,
-    aterm_grid::Style::default()
-);
-assert_type_identity!(
-    color_type_identity,
-    grid::Color,
-    aterm_grid::Color::DEFAULT_FG
-);
-assert_type_identity!(
-    style_attrs_type_identity,
-    grid::StyleAttrs,
-    aterm_grid::StyleAttrs::empty()
-);
-assert_type_identity!(
-    style_table_type_identity,
-    grid::StyleTable,
-    aterm_grid::StyleTable::new()
-);
-
-#[test]
-fn row_type_identity() {
-    let mut pages = aterm_grid::PageStore::new();
-    // SAFETY: The test-local page store outlives the constructed row.
-    let _: grid::Row = unsafe { aterm_grid::Row::new(8, &mut pages) };
-}
-
-// Page and PageSlice are intentionally NOT re-exported (#5573).
-// Only PageStore and PAGE_SIZE are part of the public facade.
-#[test]
-fn page_size_accessible_via_facade() {
+const _: () = {
+    let _: fn(aterm_grid::Cell) -> grid::Cell = identity;
+    let _: fn(aterm_grid::CellFlags) -> grid::CellFlags = identity;
+    let _: fn(aterm_grid::PackedColor) -> grid::PackedColor = identity;
+    let _: fn(aterm_grid::PackedColors) -> grid::PackedColors = identity;
+    let _: fn(aterm_grid::Damage) -> grid::Damage = identity;
+    let _: fn(aterm_grid::PageStore) -> grid::PageStore = identity;
+    let _: fn(aterm_grid::LineSize) -> grid::LineSize = identity;
+    let _: fn(aterm_grid::RowFlags) -> grid::RowFlags = identity;
+    let _: fn(aterm_grid::StyleId) -> grid::StyleId = identity;
+    let _: fn(aterm_grid::Style) -> grid::Style = identity;
+    let _: fn(aterm_grid::Color) -> grid::Color = identity;
+    let _: fn(aterm_grid::StyleAttrs) -> grid::StyleAttrs = identity;
+    let _: fn(aterm_grid::StyleTable) -> grid::StyleTable = identity;
+    let _: fn(aterm_grid::Row) -> grid::Row = identity;
+    let _: fn(aterm_grid::style::ExtendedStyleInfo) -> grid::style::ExtendedStyleInfo = identity;
+    // Page and PageSlice are intentionally NOT re-exported (#5573); only
+    // PageStore and PAGE_SIZE are part of the public facade.
     let _: usize = grid::page::PAGE_SIZE;
-}
-
-#[test]
-fn extended_style_info_type_identity() {
-    fn accepts_core_extended(_: grid::style::ExtendedStyleInfo) {}
-
-    let _: fn(aterm_grid::style::ExtendedStyleInfo) = accepts_core_extended;
-}
+};

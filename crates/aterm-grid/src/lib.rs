@@ -47,9 +47,6 @@ pub(crate) mod test_counters;
 #[cfg(feature = "testing")]
 pub mod test_counters;
 
-#[cfg(test)]
-mod mem_measure_tests;
-
 // TRUST_NATIVE_TLA §4 (Phase 4): the kani-half of the unified verifier ledger.
 //
 // UN-GATED w.r.t. `cfg(kani)` (the ring-buffer harnesses in `grid/proofs_kani_ring.rs`

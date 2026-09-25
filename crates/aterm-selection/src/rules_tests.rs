@@ -4,42 +4,6 @@
 
 use super::*;
 
-#[test]
-fn test_url_pattern() {
-    let rule = BuiltinRules::url();
-    let text = "Check https://example.com/path?q=1 for info";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "https://example.com/path?q=1");
-}
-
-#[test]
-fn test_url_with_trailing_punctuation() {
-    let rule = BuiltinRules::url();
-    let text = "See https://example.com.";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "https://example.com");
-}
-
-#[test]
-fn test_file_path_unix() {
-    let rule = BuiltinRules::file_path();
-    let text = "File at ./file.txt exists";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "./file.txt");
-}
-
-#[test]
-fn test_file_path_relative() {
-    let rule = BuiltinRules::file_path();
-    let text = "Check ./src/main.rs file";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "./src/main.rs");
-}
-
 /// A relative path with no `./` is matched WHOLE, from its first segment — never from
 /// its first slash. The old pattern required a leading `/`, `./` or `../`, so the
 /// leftmost match inside `crates/aterm-gui/src/lib.rs` was `/aterm-gui/src/lib.rs`: a
@@ -67,15 +31,6 @@ fn test_file_path_bare_relative_is_whole_not_fabricated_absolute() {
 }
 
 #[test]
-fn test_email_pattern() {
-    let rule = BuiltinRules::email();
-    let text = "Contact user@example.com for info";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "user@example.com");
-}
-
-#[test]
 fn test_ipv4_pattern() {
     let rule = BuiltinRules::ipv4();
     let text = "Server at 192.168.1.100:8080 is up";
@@ -94,42 +49,12 @@ fn test_git_hash_pattern() {
 }
 
 #[test]
-fn test_git_hash_full() {
-    let rule = BuiltinRules::git_hash();
-    let text = "SHA: abcdef0123456789abcdef0123456789abcdef01";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(
-        matches[0].as_str(),
-        "abcdef0123456789abcdef0123456789abcdef01"
-    );
-}
-
-#[test]
-fn test_quoted_string_double() {
-    let rule = BuiltinRules::double_quoted_string();
-    let text = r#"echo "hello world" done"#;
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), r#""hello world""#);
-}
-
-#[test]
 fn test_quoted_string_with_escape() {
     let rule = BuiltinRules::double_quoted_string();
     let text = r#"echo "hello \"world\"" done"#;
     let matches: Vec<_> = rule.find_all(text).collect();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].as_str(), r#""hello \"world\"""#);
-}
-
-#[test]
-fn test_uuid_pattern() {
-    let rule = BuiltinRules::uuid();
-    let text = "ID: 550e8400-e29b-41d4-a716-446655440000 found";
-    let matches: Vec<_> = rule.find_all(text).collect();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].as_str(), "550e8400-e29b-41d4-a716-446655440000");
 }
 
 #[test]

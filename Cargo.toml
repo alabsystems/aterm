@@ -3,6 +3,13 @@
 
 [workspace]
 members = ["crates/*"]
+# vendor/astream is a GIT SUBMODULE of github.com/alabsystems/astream (see
+# vendor/README-astream.md): its crates are path dependencies of aterm-link that
+# belong to ASTREAM's workspace, and inherit their package fields from its root
+# Cargo.toml. Without this line cargo makes every path dependency under this
+# directory an aterm member, and resolves their `workspace = true` against THIS
+# manifest instead of theirs.
+exclude = ["vendor/astream"]
 resolver = "2"
 
 # The AUTHORITATIVE atpkg surface for the `aterm` program (tools/atpkg-pack.sh reads both;
@@ -46,8 +53,10 @@ account = "alabsystems"
 #     ledger/lease/fence protocol, and it is the slug the cutter binds
 #     `git remote get-url origin` against.
 #   * `update_channel` = where INSTALLED COPIES look for updates. It is the
-#     PUBLIC mirror, so a fresh machine can read the channel with no token at
-#     all (an unauthenticated `GET /repos/alabsystems/aterm/releases` is 200).
+#     PUBLIC channel: installed copies read its download host with no credential
+#     and no API request, so any channel an updater is pointed at — a
+#     development repoint or a `cut --rehearse` channel included — must be
+#     publicly readable.
 #
 # Two consumers read this one key, and a test proves they agree:
 #   * crates/aterm-update-core/build.rs stamps it into ATERM_DEFAULT_OWNER /
@@ -69,7 +78,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.92.0"
+version = "0.93.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -210,6 +219,11 @@ aterm-predict = { path = "crates/aterm-predict" }
 # `messages`/`notice` verbs — a clockless aterm-time-only leaf, so the native
 # host and a web host drive ONE implementation and the host only paints cells.
 aterm-messages = { path = "crates/aterm-messages" }
+# The strain row's samplers (docs/DESIGN-unified-messages-2026-09-21.md §10.14):
+# one reading of the machine and one bounded process sweep, as the engine's
+# plain data. Every platform cfg of the feature lives here, so the host adds
+# none; it holds no timer — the host asks, on the probe thread.
+aterm-sysprobe = { path = "crates/aterm-sysprobe" }
 aterm-suggest = { path = "crates/aterm-suggest" }
 aterm-core = { path = "crates/aterm-core" }
 # The headless half of the control protocol: verb bodies over a `SessionHost`

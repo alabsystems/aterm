@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The ONE place a property-combinator instance is declared. Both the Tier-0 `ty`
-//! suite (`derived_ring_ty.rs`) and the Tier-1 interpreter-BMC suite
-//! (`introspection_bmc.rs`) iterate this table, so adding a verified property is a
-//! generator instance (≈3 lines in `derive::props`) + ONE row here — zero new test
-//! functions. Each row carries its proof CLASS: a `Safety` invariant (ty
-//! prove+catch / BMC prove+catch) or a `Liveness` deadlock-freedom check (ty
-//! CHECK_DEADLOCK / BMC no-successor wedge), the latter with its work-complete
-//! `is_final` predicate.
-
-#![allow(dead_code)] // each test binary uses one driver; the other's helpers warn.
+//! The ONE place a property-combinator instance is declared. The umbrella in
+//! `derived_ring_ty.rs` iterates this table and discharges every row on both
+//! tiers — the in-process interpreter BMC always, `ty` wherever installed — so
+//! adding a verified property is a generator instance (≈3 lines in
+//! `derive::props`) + ONE row here — zero new test functions. Each row carries
+//! its proof CLASS: a `Safety` invariant (prove+catch) or a `Liveness`
+//! deadlock-freedom check (`CHECK_DEADLOCK` / the no-successor wedge), the
+//! latter with its work-complete `is_final` predicate.
 
 use std::collections::BTreeMap;
 

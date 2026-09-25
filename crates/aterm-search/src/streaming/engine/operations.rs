@@ -884,7 +884,10 @@ impl StreamingSearch {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::error::SearchError;
+    // The cases the `streaming/tests` suite does not already reach: no-ops
+    // from Idle/NoResults, generation stability on a same-pattern update,
+    // invalidation-driven state and index clamping, reflow, the exact
+    // result cap, content_added duplicate prevention, and `next_index`.
     use super::super::super::types::{
         FilterMode, NavigationDirection, SearchState, StreamingSearchConfig,
     };
@@ -902,152 +905,8 @@ mod tests {
     }
 
     // ====================================================================
-    // Start search / basic scanning
+    // Navigation no-ops
     // ====================================================================
-
-    #[test]
-    fn test_start_search_transitions_to_searching() {
-        let mut engine = StreamingSearch::new();
-        assert_eq!(engine.state(), SearchState::Idle);
-
-        engine.start_search("needle", FilterMode::Literal).unwrap();
-        assert_eq!(engine.state(), SearchState::Searching);
-        assert_eq!(engine.pattern(), "needle");
-        assert_eq!(engine.filter_mode(), FilterMode::Literal);
-        assert_eq!(engine.scan_progress(), 0);
-    }
-
-    #[test]
-    fn test_start_search_empty_pattern_returns_error() {
-        let mut engine = StreamingSearch::new();
-        let result = engine.start_search("", FilterMode::Literal);
-        assert_eq!(result, Err(SearchError::EmptyPattern));
-        assert_eq!(engine.state(), SearchState::Idle);
-    }
-
-    #[test]
-    fn test_start_search_pattern_too_long() {
-        let config = StreamingSearchConfig {
-            max_pattern_len: 10,
-            ..StreamingSearchConfig::default()
-        };
-        let mut engine = StreamingSearch::with_config(config);
-        let long_pattern = "a".repeat(11);
-        let result = engine.start_search(&long_pattern, FilterMode::Literal);
-        assert_eq!(result, Err(SearchError::PatternTooLong));
-    }
-
-    #[test]
-    fn test_scan_rows_finds_matches_and_completes() {
-        let engine = engine_with_matches("hello", &["hello world", "goodbye", "hello again"]);
-        assert_eq!(engine.state(), SearchState::HasResults);
-        assert_eq!(engine.result_count(), 2);
-        assert_eq!(engine.total_matches(), 2);
-        assert_eq!(engine.current_index(), 1);
-    }
-
-    #[test]
-    fn test_scan_no_matches_transitions_to_no_results() {
-        let engine = engine_with_matches("xyz", &["hello world", "goodbye"]);
-        assert_eq!(engine.state(), SearchState::NoResults);
-        assert_eq!(engine.result_count(), 0);
-        assert_eq!(engine.current_index(), 0);
-    }
-
-    #[test]
-    fn test_scan_multiple_matches_same_line() {
-        let engine = engine_with_matches("ab", &["ab cd ab ef ab"]);
-        assert_eq!(engine.state(), SearchState::HasResults);
-        assert_eq!(engine.result_count(), 3);
-        let results = engine.results();
-        assert_eq!(results[0].start_col, 0);
-        assert_eq!(results[1].start_col, 6);
-        assert_eq!(results[2].start_col, 12);
-    }
-
-    #[test]
-    fn test_match_positions_across_lines() {
-        let engine = engine_with_matches("test", &["test line 0", "no match", "test line 2"]);
-        assert_eq!(engine.result_count(), 2);
-        let results = engine.results();
-        assert_eq!(results[0].row, 0);
-        assert_eq!(results[0].start_col, 0);
-        assert_eq!(results[1].row, 2);
-        assert_eq!(results[1].start_col, 0);
-    }
-
-    // ====================================================================
-    // Navigation: next/prev match cycling
-    // ====================================================================
-
-    #[test]
-    fn test_next_match_cycles_forward() {
-        let mut engine = engine_with_matches("x", &["x", "x", "x"]);
-        assert_eq!(engine.current_index(), 1);
-
-        engine.next_match();
-        assert_eq!(engine.current_index(), 2);
-
-        engine.next_match();
-        assert_eq!(engine.current_index(), 3);
-
-        // Wrap around (wrap_enabled is true by default)
-        engine.next_match();
-        assert_eq!(engine.current_index(), 1);
-    }
-
-    #[test]
-    fn test_prev_match_cycles_backward() {
-        let mut engine = engine_with_matches("x", &["x", "x", "x"]);
-        assert_eq!(engine.current_index(), 1);
-
-        // Wrap backward from first
-        engine.prev_match();
-        assert_eq!(engine.current_index(), 3);
-
-        engine.prev_match();
-        assert_eq!(engine.current_index(), 2);
-
-        engine.prev_match();
-        assert_eq!(engine.current_index(), 1);
-    }
-
-    #[test]
-    fn test_next_match_no_wrap() {
-        let config = StreamingSearchConfig {
-            wrap_enabled: false,
-            ..StreamingSearchConfig::default()
-        };
-        let mut engine = StreamingSearch::with_config(config);
-        engine.start_search("x", FilterMode::Literal).unwrap();
-        engine.scan_row(0, "x", 2);
-        engine.scan_row(1, "x", 2);
-        assert_eq!(engine.state(), SearchState::HasResults);
-        assert_eq!(engine.current_index(), 1);
-
-        engine.next_match();
-        assert_eq!(engine.current_index(), 2);
-
-        // Should stay at end when wrap is disabled
-        engine.next_match();
-        assert_eq!(engine.current_index(), 2);
-    }
-
-    #[test]
-    fn test_prev_match_no_wrap() {
-        let config = StreamingSearchConfig {
-            wrap_enabled: false,
-            ..StreamingSearchConfig::default()
-        };
-        let mut engine = StreamingSearch::with_config(config);
-        engine.start_search("x", FilterMode::Literal).unwrap();
-        engine.scan_row(0, "x", 1);
-        assert_eq!(engine.current_index(), 1);
-
-        // Should stay at 1 when wrap is disabled
-        engine.prev_match();
-        assert_eq!(engine.current_index(), 1);
-    }
 
     #[test]
     fn test_next_match_noop_when_no_results() {
@@ -1062,26 +921,6 @@ mod tests {
         let mut engine = StreamingSearch::new();
         engine.prev_match();
         assert_eq!(engine.current_index(), 0);
-    }
-
-    #[test]
-    fn test_jump_to_match_valid_index() {
-        let mut engine = engine_with_matches("x", &["x", "x", "x"]);
-        engine.jump_to_match(3);
-        assert_eq!(engine.current_index(), 3);
-
-        engine.jump_to_match(1);
-        assert_eq!(engine.current_index(), 1);
-    }
-
-    #[test]
-    fn test_jump_to_match_invalid_index_noop() {
-        let mut engine = engine_with_matches("x", &["x", "x"]);
-        engine.jump_to_match(0); // 0 is invalid (1-based)
-        assert_eq!(engine.current_index(), 1);
-
-        engine.jump_to_match(3); // out of range
-        assert_eq!(engine.current_index(), 1);
     }
 
     // ====================================================================
@@ -1137,18 +976,6 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_update_pattern_restarts_search() {
-        let mut engine = engine_with_matches("hello", &["hello world"]);
-        assert_eq!(engine.state(), SearchState::HasResults);
-
-        engine.update_pattern("world").unwrap();
-        assert_eq!(engine.state(), SearchState::Searching);
-        assert_eq!(engine.pattern(), "world");
-        assert_eq!(engine.result_count(), 0);
-        assert_eq!(engine.scan_progress(), 0);
-    }
-
-    #[test]
     fn test_update_pattern_to_empty_resets_to_idle() {
         let mut engine = engine_with_matches("hello", &["hello world"]);
         engine.update_pattern("").unwrap();
@@ -1169,41 +996,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_update_pattern_idle_returns_error() {
-        let mut engine = StreamingSearch::new();
-        let result = engine.update_pattern("test");
-        assert_eq!(result, Err(SearchError::InvalidState));
-    }
-
-    #[test]
-    fn test_update_pattern_too_long() {
-        let config = StreamingSearchConfig {
-            max_pattern_len: 5,
-            ..StreamingSearchConfig::default()
-        };
-        let mut engine = StreamingSearch::with_config(config);
-        engine.start_search("abc", FilterMode::Literal).unwrap();
-        let result = engine.update_pattern("toolong");
-        assert_eq!(result, Err(SearchError::PatternTooLong));
-    }
-
     // ====================================================================
     // Cancel
     // ====================================================================
-
-    #[test]
-    fn test_cancel_resets_to_idle() {
-        let mut engine = engine_with_matches("hello", &["hello world"]);
-        assert_eq!(engine.state(), SearchState::HasResults);
-
-        engine.cancel();
-        assert_eq!(engine.state(), SearchState::Idle);
-        assert_eq!(engine.pattern(), "");
-        assert_eq!(engine.result_count(), 0);
-        assert_eq!(engine.current_index(), 0);
-        assert_eq!(engine.scan_progress(), -1);
-    }
 
     #[test]
     fn test_cancel_noop_when_idle() {
@@ -1219,47 +1014,12 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_content_added_appends_matches() {
-        let mut engine = engine_with_matches("needle", &["needle here"]);
-        assert_eq!(engine.result_count(), 1);
-
-        engine.content_added(5, "another needle");
-        assert_eq!(engine.result_count(), 2);
-        assert_eq!(engine.total_matches(), 2);
-    }
-
-    #[test]
-    fn test_content_added_transitions_no_results_to_has_results() {
-        let mut engine = engine_with_matches("xyz", &["no match"]);
-        assert_eq!(engine.state(), SearchState::NoResults);
-
-        engine.content_added(1, "xyz found");
-        assert_eq!(engine.state(), SearchState::HasResults);
-        assert_eq!(engine.result_count(), 1);
-        assert_eq!(engine.current_index(), 1);
-    }
-
-    #[test]
     fn test_content_added_noop_when_idle() {
         let mut engine = StreamingSearch::new();
         let gen_before = engine.generation();
         engine.content_added(0, "needle");
         assert_eq!(engine.generation(), gen_before);
         assert_eq!(engine.result_count(), 0);
-    }
-
-    #[test]
-    fn test_content_invalidated_removes_matches() {
-        let mut engine =
-            engine_with_matches("test", &["test 0", "test 1", "test 2", "test 3", "test 4"]);
-        assert_eq!(engine.result_count(), 5);
-
-        // Invalidate rows 1 through 3
-        engine.content_invalidated(1, 3);
-        assert_eq!(engine.result_count(), 2);
-        let rows: Vec<usize> = engine.results().iter().map(|m| m.row).collect();
-        assert!(rows.contains(&0));
-        assert!(rows.contains(&4));
     }
 
     #[test]
@@ -1283,27 +1043,6 @@ mod tests {
     }
 
     #[test]
-    fn test_content_modified_replaces_matches() {
-        let mut engine = engine_with_matches("needle", &["needle here", "no match"]);
-        assert_eq!(engine.result_count(), 1);
-
-        // Modify row 0 to remove the match
-        engine.content_modified(0, "nothing here");
-        assert_eq!(engine.result_count(), 0);
-        assert_eq!(engine.state(), SearchState::NoResults);
-    }
-
-    #[test]
-    fn test_content_modified_adds_new_match() {
-        let mut engine = engine_with_matches("needle", &["no match"]);
-        assert_eq!(engine.state(), SearchState::NoResults);
-
-        engine.content_modified(0, "needle found");
-        assert_eq!(engine.state(), SearchState::HasResults);
-        assert_eq!(engine.result_count(), 1);
-    }
-
-    #[test]
     fn test_content_reflowed_restarts_search() {
         let mut engine = engine_with_matches("test", &["test here"]);
         let gen_before = engine.generation();
@@ -1322,99 +1061,6 @@ mod tests {
         engine.content_reflowed();
         assert_eq!(engine.state(), SearchState::Idle);
         assert_eq!(engine.generation(), gen_before);
-    }
-
-    // ====================================================================
-    // Configuration toggles
-    // ====================================================================
-
-    #[test]
-    fn test_toggle_wrap() {
-        let mut engine = StreamingSearch::new();
-        assert!(engine.wrap_enabled());
-        engine.toggle_wrap();
-        assert!(!engine.wrap_enabled());
-        engine.toggle_wrap();
-        assert!(engine.wrap_enabled());
-    }
-
-    #[test]
-    fn test_toggle_highlight_all() {
-        let mut engine = StreamingSearch::new();
-        assert!(engine.highlight_all());
-        engine.toggle_highlight_all();
-        assert!(!engine.highlight_all());
-    }
-
-    #[test]
-    fn test_toggle_case_sensitive_restarts_search() {
-        let mut engine = engine_with_matches("hello", &["hello world"]);
-        assert_eq!(engine.state(), SearchState::HasResults);
-
-        engine.toggle_case_sensitive();
-        assert_eq!(engine.state(), SearchState::Searching);
-        assert_eq!(engine.result_count(), 0);
-    }
-
-    #[test]
-    fn test_set_filter_mode_restarts_search() {
-        let mut engine = engine_with_matches("hello", &["hello world"]);
-        assert_eq!(engine.filter_mode(), FilterMode::Literal);
-
-        engine.set_filter_mode(FilterMode::Fuzzy).unwrap();
-        assert_eq!(engine.filter_mode(), FilterMode::Fuzzy);
-        assert_eq!(engine.state(), SearchState::Searching);
-    }
-
-    #[test]
-    fn test_set_filter_mode_same_is_noop() {
-        let mut engine = engine_with_matches("hello", &["hello world"]);
-        let gen_before = engine.generation();
-        engine.set_filter_mode(FilterMode::Literal).unwrap();
-        assert_eq!(engine.generation(), gen_before);
-    }
-
-    // ====================================================================
-    // Generation counter
-    // ====================================================================
-
-    #[test]
-    fn test_generation_bumps_on_start_search() {
-        let mut engine = StreamingSearch::new();
-        assert_eq!(engine.generation(), 0);
-        engine.start_search("test", FilterMode::Literal).unwrap();
-        assert_eq!(engine.generation(), 1);
-    }
-
-    #[test]
-    fn test_generation_bumps_on_cancel() {
-        let mut engine = StreamingSearch::new();
-        engine.start_search("test", FilterMode::Literal).unwrap();
-        let gen_before = engine.generation();
-        engine.cancel();
-        assert_eq!(engine.generation(), gen_before + 1);
-    }
-
-    // ====================================================================
-    // Invariant verification after operations
-    // ====================================================================
-
-    #[test]
-    fn test_all_invariants_hold_after_full_lifecycle() {
-        let mut engine = engine_with_matches("test", &["test one", "no match", "test two"]);
-        assert!(engine.verify_all_invariants());
-
-        engine.next_match();
-        assert!(engine.verify_all_invariants());
-
-        engine.content_added(5, "test added");
-        assert!(engine.verify_all_invariants());
-
-        engine.content_invalidated(0, 0);
-        assert!(engine.verify_all_invariants());
-
-        engine.cancel();
-        assert!(engine.verify_all_invariants());
     }
 
     // ====================================================================

@@ -24,14 +24,19 @@
 pub(crate) mod compress;
 pub(crate) mod hashtable;
 
+// The upstream raw-pointer decoder (`decompress.rs`) was never compiled here:
+// every consumer keeps the default `safe-decode`, so it was deleted rather
+// than carried as untested unsafe code. The bounds-checked decoder is the
+// only one, and turning `safe-decode` off is refused at compile time below.
+#[cfg(not(feature = "safe-decode"))]
+compile_error!(
+    "aterm-lz4 carries only the bounds-checked decoder; the `safe-decode` feature is required"
+);
 #[cfg(feature = "safe-decode")]
-#[cfg_attr(feature = "safe-decode", forbid(unsafe_code))]
+#[forbid(unsafe_code)]
 pub(crate) mod decompress_safe;
 #[cfg(feature = "safe-decode")]
 pub(crate) use decompress_safe as decompress;
-
-#[cfg(not(feature = "safe-decode"))]
-pub(crate) mod decompress;
 
 pub use compress::*;
 pub use decompress::*;

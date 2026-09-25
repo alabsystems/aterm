@@ -8,9 +8,16 @@
 //!
 //!   atpkg-keys pubkey <key-file>            print the base64 pubkey of an existing key
 //!   atpkg-keys sign   <key-file> <file> [<sig-out>]   detached-sign <file>'s exact bytes
+//!   atpkg-keys verify-signed <master-pubkey-b64> <file> <file.sig> <roster> <roster.sig>
+//!                                           did a live machine of that roster sign <file>?
 //!
-//! Both operate on the machine key `setup`/`join` minted (`~/.aterm/machine.key`); the
-//! detached signature is exactly what the verify-only client (`atpkg::sig`) checks.
+//! `pubkey` and `sign` operate on the machine key `setup`/`join` minted
+//! (`~/.aterm/machine.key`); the detached signature is exactly what the verify-only client
+//! (`atpkg::sig`) checks. `verify-signed` is the check for a signed file that is not an
+//! atpkg document, an ALab release's `SHA256SUMS`: the roster must verify under the master
+//! and be live, and a live machine of it must have signed the file's exact bytes. It runs
+//! the client's own roster code, and `tools/atpkg-auto-alab.sh` runs it before it builds
+//! anything.
 //! There is deliberately NO standalone key generator any more: every signing identity is
 //! a machine key born in provisioning, so a key that exists is a key the roster can
 //! account for. (`keygen` was that generator; it made keys the roster had never heard
@@ -18,26 +25,23 @@
 //!
 //! ## Arming the channel — the two verbs the owner actually runs
 //!
-//!   atpkg-keys setup --id <id> [--head-id <id>]   FIRST machine, once ever
-//!   atpkg-keys join  --id <id>                    EVERY later machine
+//!   atpkg-keys setup --id <id>   FIRST machine, once ever
+//!   atpkg-keys join  --id <id>   EVERY later machine
 //!   (both also take [--pins <path>] [--roster <path>] [--key <path>], which
 //!   choose the anchor file, the roster and the machine key they write)
 //!
 //! `setup` generates the paper master, shows the 52 characters ONCE **on the terminal**
 //! (`/dev/tty`, never stdout — see below), and then does every remaining step itself: it
 //! writes the master's public key into `pins::PAPER_MASTER_PUBKEYS`, mints this machine's
-//! keypair to a `0600` file in `$HOME`, and creates the master-signed roster. That roster
-//! names the INCUMBENT keyset head first (`--head-id`, default `incumbent-head`) and this
-//! machine second, because arming the master changes how a cut is authorized and a roster
-//! without the incumbent would leave the one machine every PRE-ROSTER client can verify
-//! unable to cut. `join` does the same remaining work on a later machine, after PROVING
+//! keypair to a `0600` file in `$HOME`, and creates the master-signed roster naming this
+//! machine. `join` does the same remaining work on a later machine, after PROVING
 //! the phrase you type against the committed anchor and the existing roster — which must
 //! be copied to that machine first, since the roster is a release asset and not part of
 //! the repository.
 //!
-//! **Neither verb touches `pins::UPDATE_CHANNEL_PUBKEYS`.** A minted machine is authorized
-//! by the roster, which is revocable; a keyset entry would be a grant no revocation can
-//! reach, made to clients this tool cannot influence anyway. See `provision`'s module doc.
+//! **The roster is the only grant.** A minted machine is authorized by the roster, which
+//! `machine-revoke` can take back; no verb edits any anchor but the master's. See
+//! `provision`'s module doc.
 //!
 //! **The only thing a human does is write the phrase on paper.** There is no step that
 //! asks anyone to copy a key into a source file, because that is the transcription this
@@ -56,7 +60,7 @@
 //!
 //! That is the WHOLE surface: provision with `setup`/`join`, revoke with
 //! `machine-revoke`, check a transcription with `master-check`, and let the publish
-//! scripts drive `pubkey`/`sign`. The one-per-act rule is deliberate — this tool used to
+//! scripts drive `pubkey`/`sign`/`verify-signed`. The one-per-act rule is deliberate — this tool used to
 //! carry a second generator (`master-new`), a second minting path (`machine-mint`) and a
 //! bare roster checker (`roster-verify`), each a way to do half a provisioning by hand
 //! and get the other half wrong. All three are deleted, not hidden: `setup`/`join` are
@@ -324,6 +328,9 @@ fn main() -> ExitCode {
             Some("master-check") => {
                 vetted("master-check", &argv, &[], 0).and_then(|()| master_check())
             }
+            Some("verify-signed") => {
+                vetted("verify-signed", &argv, &[], 5).and_then(|()| verify_signed(&argv))
+            }
             Some("setup") => vetted("setup", &argv, PROVISION_FLAGS, 0)
                 .and_then(|()| provision(atpkg_keys::provision::Verb::Setup, &argv)),
             Some("join") => vetted("join", &argv, PROVISION_FLAGS, 0)
@@ -333,10 +340,10 @@ fn main() -> ExitCode {
             Some(other) => Err(concat(&[
                 "unknown verb '",
                 other,
-                "' (try: setup, join, machine-revoke, master-check, pubkey, sign)",
+                "' (try: setup, join, machine-revoke, master-check, pubkey, sign, verify-signed)",
             ])),
             None => Err(
-                "usage: atpkg-keys <setup|join|machine-revoke|master-check|pubkey|sign> …"
+                "usage: atpkg-keys <setup|join|machine-revoke|master-check|pubkey|sign|verify-signed> …"
                     .to_string(),
             ),
         }
@@ -391,6 +398,51 @@ fn read_key(path: &str) -> Result<Vec<u8>, String> {
 fn pubkey(key: Option<&str>) -> Result<(), String> {
     let key = key.ok_or("usage: atpkg-keys pubkey <key-file>")?;
     print_line(&atpkg_keys::pubkey_b64(&read_key(key)?)?);
+    Ok(())
+}
+
+/// `verify-signed <master-pubkey-b64> <file> <file.sig> <roster> <roster.sig>` — did a
+/// live machine of a roster that verifies under that master sign this file's exact bytes?
+/// Prints `OK: signed by machine <id> under roster seq <n>`. A signature that does not
+/// verify, whatever the reason, is the one opaque `FAIL:` line (no verification oracle,
+/// §8); an unreadable input names its path. Every refusal exits 1.
+#[cfg(unix)]
+fn verify_signed(argv: &Argv) -> Result<(), String> {
+    const USAGE: &str = "usage: atpkg-keys verify-signed <master-pubkey-b64> <file> <file.sig> \
+         <aterm-machines.toml> <aterm-machines.toml.sig>";
+    let (Some(master), Some(file), Some(sig), Some(roster), Some(roster_sig)) = (
+        positional(argv, 0),
+        positional(argv, 1),
+        positional(argv, 2),
+        positional(argv, 3),
+        positional(argv, 4),
+    ) else {
+        return Err(USAGE.to_string());
+    };
+    let read = |p: &str| read_bytes(p).map_err(|e| concat(&["read ", p, ": ", &e.to_string()]));
+    // The signed file may be a whole source tree's SHA256SUMS (the trust repo's is ~9 MB).
+    let file_bytes = atpkg_keys::fsio::read_bytes_up_to(file, 64 * 1024 * 1024)
+        .map_err(|e| concat(&["read ", file, ": ", &e.to_string()]))?;
+    let now =
+        i64::try_from(now_unix()?).map_err(|_| "the system clock is out of range".to_string())?;
+    let who = atpkg_keys::verify_signed(
+        &[master],
+        read(roster)?,
+        &read(roster_sig)?,
+        &file_bytes,
+        &read(sig)?,
+        now,
+    )
+    .map_err(|_| {
+        "FAIL: no live machine of a roster that verifies under that master signed this file"
+            .to_string()
+    })?;
+    print_line(&concat(&[
+        "OK: signed by machine ",
+        &who.machine_id,
+        " under roster seq ",
+        &who.roster_seq.to_string(),
+    ]));
     Ok(())
 }
 
@@ -574,13 +626,9 @@ fn master_check() -> Result<(), String> {
     Ok(())
 }
 
-/// The flags `setup` and `join` read. `--head-id` is only meaningful to `setup` (it names
-/// the incumbent on the first roster) but is accepted by both, because refusing it on
-/// `join` would be a refusal the operator has to look up rather than a fact they can act
-/// on. `join` vets it and then ignores it silently: its roster must already exist, so
-/// there is no head to seed and the closing report never mentions the flag.
+/// The flags `setup` and `join` read.
 #[cfg(unix)]
-const PROVISION_FLAGS: &[&str] = &["id", "pins", "roster", "key", "head-id"];
+const PROVISION_FLAGS: &[&str] = &["id", "pins", "roster", "key"];
 
 /// What `setup` must say if it cannot arm the anchor. Nothing was shown and nothing was
 /// written, so the correct action is simply to try again.
@@ -659,7 +707,6 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
 
     let id = flag(argv, "id")
         .ok_or_else(|| concat(&["usage: atpkg-keys ", verb.name(), " --id <machine-id>"]))?;
-    let head_id = flag(argv, "head-id").unwrap_or(prov::DEFAULT_HEAD_ID);
     let now = now_unix()?;
     let paths = prov::Paths {
         // Discovered, not configured: the operator's job is to type one phrase, and a
@@ -693,7 +740,7 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
     };
 
     // Every refusal that can be made before a secret exists is made here.
-    let pre = prov::preflight(verb, id, head_id, &paths)?;
+    let pre = prov::preflight(verb, id, &paths)?;
 
     let report = match verb {
         prov::Verb::Setup => {

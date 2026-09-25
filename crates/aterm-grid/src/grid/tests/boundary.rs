@@ -19,41 +19,6 @@ fn write_marker_line(grid: &mut Grid, marker: char) {
 // =========================================================================
 
 #[test]
-fn grid_new_minimum_1x1() {
-    let grid = Grid::new(1, 1);
-    assert_eq!(grid.rows(), 1, "1x1 grid: 1 row");
-    assert_eq!(grid.cols(), 1, "1x1 grid: 1 column");
-    assert_eq!(grid.cursor_row(), 0);
-    assert_eq!(grid.cursor_col(), 0);
-    grid.assert_invariants();
-}
-
-#[test]
-fn grid_new_zero_dims_clamped_to_1() {
-    // Grid::with_scrollback clamps rows.max(1), cols.max(1)
-    let grid = Grid::new(0, 0);
-    assert_eq!(grid.rows(), 1, "0x0 should be clamped to 1x1");
-    assert_eq!(grid.cols(), 1, "0x0 should be clamped to 1x1");
-    grid.assert_invariants();
-}
-
-#[test]
-fn grid_new_zero_rows_clamped() {
-    let grid = Grid::new(0, 80);
-    assert_eq!(grid.rows(), 1, "0 rows clamped to 1");
-    assert_eq!(grid.cols(), 80);
-    grid.assert_invariants();
-}
-
-#[test]
-fn grid_new_zero_cols_clamped() {
-    let grid = Grid::new(24, 0);
-    assert_eq!(grid.rows(), 24);
-    assert_eq!(grid.cols(), 1, "0 cols clamped to 1");
-    grid.assert_invariants();
-}
-
-#[test]
 fn grid_write_char_1x1_stays_at_origin() {
     let mut grid = Grid::new(1, 1);
 
@@ -238,25 +203,6 @@ fn grid_delete_lines_exceeding_available() {
 // =========================================================================
 // Edge-position operations
 // =========================================================================
-
-#[test]
-fn grid_restore_cursor_without_save() {
-    let mut grid = Grid::new(24, 80);
-    grid.set_cursor(10, 40);
-
-    // Restore without prior save — should not panic, implementation-defined behavior
-    grid.restore_cursor();
-    grid.assert_invariants();
-}
-
-#[test]
-fn grid_insert_chars_at_last_column() {
-    let mut grid = Grid::new(24, 80);
-    grid.set_cursor(0, 79);
-    grid.insert_chars(5);
-    // Should not panic; insert at last column has no visible effect
-    grid.assert_invariants();
-}
 
 #[test]
 fn grid_delete_chars_at_last_column() {

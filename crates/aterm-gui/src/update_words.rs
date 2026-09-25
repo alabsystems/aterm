@@ -15,19 +15,19 @@
 //! state (`App::update_flow`), never its words (ruling 57). Its title takes
 //! §10's form, verb first and a title per phase: `Downloading aterm vX` (a
 //! fill with its ETA, or busy with the bytes so far), `Checking aterm vX`
-//! (busy), `Installing aterm vX` — the automatic staged row, busy with the
-//! time word `within a minute`, because a verified update installs by itself
-//! within a minute (the owner) — `Installing aterm vX` again for the switch,
-//! and the successor's `Finishing aterm vX`. Every phase word rides behind
-//! `Details ›` and in the log ([`Message::no_excerpt`], ruling 77); only what
-//! holds the install ([`holds_restatement`]) is painted, because it changes
-//! what the person does. The landing is the flow row's Complete echo and a
-//! RECORD in the old row's words ([`landed`]: "Updated to aterm vX").
+//! (busy), `Installing aterm vX` for the switch, and the successor's
+//! `Finishing aterm vX`. Every phase word rides behind `Details ›` and in the
+//! log ([`Message::no_excerpt`], ruling 77). The landing is the flow row's
+//! Complete echo and a RECORD in the old row's words ([`landed`]: "Updated to
+//! aterm vX").
 //!
-//! Where a PRESS is how the build installs — the lane is off, or has stopped
-//! — the staged row is the READY row instead ("aterm vX is ready") with the
-//! `Install now` capsule ([`apply_capsule_for`]); a posture nobody can press
-//! and that the lane does not land within a minute is a RECORD. The words
+//! A STAGED build the automatic lane installs by itself takes NO row: its
+//! words are a RECORD, and the download row, if one is up, ends in its
+//! Complete echo (the owner's silent path, 2026-09-24,
+//! DESIGN-atpkg-vendor-direct-updates §5.3(d)). Where a PRESS is how the
+//! build installs — the lane is off, or has stopped — the staged row is the
+//! READY row ("aterm vX is ready") with the `Install now` capsule
+//! ([`apply_capsule_for`]); every other posture is a record too. The words
 //! never describe a press (the capsule is the affordance).
 //!
 //! # What may be claimed
@@ -73,34 +73,12 @@ pub(crate) const KEY_OUTCOME: &str = "update.outcome";
 /// The check-health warning's key (R38).
 pub(crate) const KEY_HEALTH: &str = "update.health";
 
-/// The staleness backstop on the AUTOMATIC lane's staged row — the update's
-/// flow row, "installs within a minute" (2026-09-23). That row is LIVE, not
-/// held: the landing replaces it (the switch's row, then the successor's
-/// Complete echo), a stand-down restates it to the ready row's hold or folds
-/// it to a record, and an outcome beside it never covers it. This only
-/// retires a row whose landing never came, and it outlasts the whole ladder
-/// (`native_update_auto_intent::LANDS_WITHIN`) plus the longest a launched
-/// successor may be held, so the row can never fold while the update it
-/// announces is still on its way — the 2026-09-23 audit found the old
-/// ten-minute hold (`aterm_messages::HOLD_STAGED_AUTOMATIC`, retired) folding
-/// five minutes before the fifteen-minute bound it promised.
-pub(crate) const STAGED_AUTOMATIC_STALE: Duration =
-    Duration::from_secs(crate::native_update_auto_intent::LANDS_WITHIN.as_secs() + 120);
-
-#[cfg(unix)]
-const _: () = assert!(
-    STAGED_AUTOMATIC_STALE.as_secs()
-        >= crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
-            + crate::app_update_handoff::PRELAUNCH_HOLD_MAX.as_secs()
-);
-
 /// The glyph of an update in progress — the flow row's from the first byte
 /// to the switch. `↻` is "working", `✓` is "done", `⚠` is "needs you".
 const FLOW_GLYPH: char = '\u{21bb}';
 /// `✓` — the ready row and the landing's record.
 const READY: char = '\u{2713}';
-/// `⚠` — the flow row while it waits on a person ([`Holds::Editor`]), and an
-/// outcome the person acts on.
+/// `⚠` — an outcome the person acts on.
 const NEEDS_YOU: char = '\u{26a0}';
 
 /// How a STAGED build will be applied — what the staged row's detail line may
@@ -190,24 +168,13 @@ pub(crate) const DOWNLOADING: &str = "downloading";
 /// The container arrived: the size, digest, signature and Gatekeeper checks
 /// and the stage publish, seconds each.
 pub(crate) const CHECKING: &str = "checking the download";
-/// Staged, and the automatic lane will install it by itself: the ladder lands
-/// it within a minute of arming, whatever the terminal does
-/// (`native_update_auto_intent::LANDS_WITHIN` plus the switch, asserted there to
-/// be at most a minute). In words, never `LANDS_WITHIN / 60` arithmetic: that
-/// printed "within 1 min", and "within 0 min" for any bound under a minute.
-pub(crate) const INSTALLS_BY_ITSELF: &str = "installs within a minute \u{2014} keep working";
-/// The automatic staged row's time slot (ruling 143): how long the person
-/// waits, said in the row's stats while it is busy.
-pub(crate) const WITHIN_A_MINUTE: &str = "within a minute";
-/// …while only the person's typing is holding it (the ladder's keys-only
-/// phase refused a park for a keystroke). Never "pause": the owner's
-/// 2026-09-18 ruling keeps stall words off the update rows. PAINTED: it
-/// changes what the person does (ruling 77).
-pub(crate) const TYPING_HOLDS_IT: &str = "finishes when you stop typing";
-/// …while unsaved editor or Settings work is holding it (the close preflight
-/// refused the install for it): the one thing the person can do, instead of a
-/// one-minute promise the lane cannot keep until they do it. PAINTED.
-pub(crate) const EDITOR_HOLDS_IT: &str = "save or close the open editor to finish";
+/// Staged, and the automatic lane will install it by itself — the staged
+/// RECORD's detail: the ladder lands it within a minute of arming, whatever the
+/// terminal does (`native_update_auto_intent::LANDS_WITHIN` plus the switch,
+/// asserted there to be at most a minute). In words, never `LANDS_WITHIN / 60`
+/// arithmetic: that printed "within 1 min", and "within 0 min" for any bound
+/// under a minute.
+pub(crate) const INSTALLS_BY_ITSELF: &str = "installs by itself within a minute";
 /// The outgoing process is handing over.
 pub(crate) const INSTALLING: &str = "installing\u{2026}";
 /// The successor's frames before Commit: what is typed now is queued and
@@ -216,16 +183,6 @@ pub(crate) const INSTALLING: &str = "installing\u{2026}";
 pub(crate) const FINISHING: &str = "almost done \u{2014} what you type is kept";
 /// A download that failed: the next check retries it.
 pub(crate) const DOWNLOAD_FAILED: &str = "will try again by itself";
-
-/// Whether the lane is WORKING on the install under `posture` — the automatic
-/// lane armed, landing it within a minute — and so whether its staged row is
-/// the busy flow row on the glass. A lane standing down with a retry
-/// scheduled installs by itself too, but the retry is ten minutes to six
-/// hours away (wave-B review, 2026-09-23: a spinner over that wait
-/// overstated it), so its staged build is a record.
-pub(crate) fn lane_is_working(posture: Option<ApplyPosture>) -> bool {
-    matches!(posture, Some(ApplyPosture::Automatic))
-}
 
 /// The `Software Update` capsule: the page that holds the durable record.
 fn software_update() -> Intent {
@@ -366,33 +323,22 @@ pub(crate) fn staged_detail_lines(posture: Option<ApplyPosture>) -> Vec<String> 
     aterm_messages::text::split_sentence(&sentence, DETAIL_LINE_CAP)
 }
 
-/// R35 (Staged) — a build is staged and verified. Three answers (ruling 143):
+/// R35 (Staged) — a build is staged and verified. Two answers (ruling 143, as
+/// amended 2026-09-24 by the owner's silent path, §5.3(d)):
 ///
-/// * the lane installs it within a minute ([`lane_is_working`]): the flow row
-///   ON THE GLASS — `Installing aterm vX`, busy, the time word
-///   [`WITHIN_A_MINUTE`] in its stats, LIVE under [`STAGED_AUTOMATIC_STALE`]
-///   until the landing replaces it — a timed wait the person should expect;
 /// * a press installs it ([`staged_is_decision`]): the READY row, `aterm vX is
 ///   ready`, Info with `✓`, how it installs behind `Details ›`, the
 ///   `Install now` capsule, held [`HOLD_STAGED_MANUAL`] — raised once per
 ///   build and posture by the host (ruling 119);
-/// * anything else — a stand-down that retries later, the handoff off — is a
-///   RECORD with the posture's sentence verbatim: it lands by itself (or once
-///   the terminals close), and nothing on the glass could be pressed.
+/// * anything else — the automatic lane that lands it within a minute, a
+///   stand-down that retries later, the handoff off — is a RECORD with the
+///   posture's sentence verbatim: it lands by itself (or once the terminals
+///   close), and nothing on the glass could be pressed. No row, no re-grid;
+///   the Version menu's ⬆️ says it is there.
 ///
 /// The App re-states the words once the lane has actually armed or stood
 /// down for this build ([`restate_apply_posture`]).
 pub(crate) fn staged(version: &str, build: u64, posture: Option<ApplyPosture>) -> Message {
-    if lane_is_working(posture) {
-        return flow(
-            flow_title("Installing", version),
-            INSTALLS_BY_ITSELF,
-            Meter::busy(WITHIN_A_MINUTE),
-            Hold::Live {
-                stale_after: STAGED_AUTOMATIC_STALE,
-            },
-        );
-    }
     let title = staged_title(version);
     match apply_capsule_for(posture, build) {
         Some(install) => row(Severity::Info, title)
@@ -410,65 +356,21 @@ pub(crate) fn staged(version: &str, build: u64, posture: Option<ApplyPosture>) -
     }
 }
 
-/// Re-state HOW a staged `build` installs on the live staged row — the
+/// Re-state HOW a staged `build` installs on the live ready row — the
 /// refinement the App posts once the lane has actually armed (or stood down)
-/// for it, a moment after the `Staged` report painted the policy line: the
-/// FULL words of [`staged`] under `posture` — title, glyph, tone, detail,
-/// animation, capsule and lifetime — so a ready↔flow change re-words,
-/// re-tones and re-lives the same row (the center re-arms a Live row's cap
-/// from now and re-anchors a held one on glass). A posture whose words are a
-/// RECORD is not a restatement: the host folds the row and records them
-/// (`App::restate_staged_bar_posture`). The host applies it only to the
-/// flow state's staged row for this build (`App::update_flow`), never to the
-/// switch's row that replaces it.
+/// for it, a moment after the `Staged` report said the policy line: the FULL
+/// words of [`staged`] under `posture` — title, glyph, tone, detail, capsule
+/// and lifetime (the center re-anchors a held row on glass). A posture whose
+/// words are a RECORD is not a restatement: the host folds the row and
+/// records them (`App::restate_staged_bar_posture`). The host applies it only
+/// to the flow state's staged row for this build (`App::update_flow`), never
+/// to the switch's row that replaces it.
 pub(crate) fn restate_apply_posture(
     version: &str,
     build: u64,
     posture: ApplyPosture,
 ) -> Restatement {
     crate::messages_host::restatement_of(&staged(version, build, Some(posture)))
-}
-
-/// What holds the install of a staged build, said on its flow row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Holds {
-    /// Only the person's typing (the ladder's keys-only phase): the lane is
-    /// still at work, so the row keeps moving.
-    Typing,
-    /// Unsaved editor or Settings work (the close preflight): the lane waits
-    /// on a person, so the row is still and says what to do.
-    Editor,
-}
-
-/// The flow row re-worded to what holds it (words, tone, glyph and indicator
-/// only — its title and lifetime stay), PAINTED: both change what the person
-/// does (ruling 77). The typing words keep the row working (`↻`, Info, busy);
-/// the editor words make it a wait on a person (`⚠`, Warn, STILL — ruling
-/// 139: a Live row blocked on the person carries no indicator). The Warn tone
-/// on the flow row replaces the separate ⚠ blocker row that used to stand
-/// beside it: two rows for one fact is a grow and a shrink of every running
-/// TUI. Every posture restatement sets the words back, so the next probe
-/// animates it again and the refusal it meets says the editor again in the
-/// same turn.
-pub(crate) fn holds_restatement(h: Holds) -> Restatement {
-    match h {
-        Holds::Typing => Restatement {
-            detail: Some(vec![TYPING_HOLDS_IT.to_string()]),
-            meter: Some(Some(Meter::busy(""))),
-            severity: Some(Severity::Info),
-            glyph: Some(glyph(FLOW_GLYPH)),
-            excerpt: Some(true),
-            ..Restatement::default()
-        },
-        Holds::Editor => Restatement {
-            detail: Some(vec![EDITOR_HOLDS_IT.to_string()]),
-            meter: Some(None),
-            severity: Some(Severity::Warn),
-            glyph: Some(glyph(NEEDS_YOU)),
-            excerpt: Some(true),
-            ..Restatement::default()
-        },
-    }
 }
 
 /// R35 — one report from inside the updater's own check
@@ -511,6 +413,7 @@ pub(crate) fn progress(
                     }),
                     load: None,
                     busy: false,
+                    level: false,
                 }
             } else {
                 Meter::busy(fmt_bytes(*bytes_done))
@@ -610,20 +513,51 @@ pub(crate) fn finishing(version: &str) -> Message {
 }
 
 /// R36 — THE NEW BUILD TOOK OVER (or a cold-lane boot found it already
-/// running): a RECORD (ruling 141) — the flow row's Complete echo and the
-/// landing surge are the moment. "✓ Updated to aterm vX" ("Updated to build
+/// running): a RECORD (ruling 141) — the flow row's Complete echo, where one
+/// was up, is the moment. "✓ Updated to aterm vX" ("Updated to build
 /// N" with no version), no claim about the shells. How long the update took
 /// is a record of its own ([`installed_after`]).
-pub(crate) fn landed(version: &str, build: u64) -> Message {
+///
+/// A REPAINT IS ON THE RECORD (the 2026-09-22/23 update audit, plan P1-5):
+/// when the successor adopted `repainted` sessions onto a blank screen (the
+/// seamless lane's `IncomingHandoff::repainted_tabs`; always 0 on the cold
+/// lane, which carried no screen), the record names how many and why those
+/// tabs came over blank. Until then the only word was a WARN line in the log,
+/// and the user found a blank tab with no word about why. The record, not a
+/// row: the landing is one of the lane's durable facts (ruling 76, ruling
+/// 141), and a blank tab is nothing for the person to do — the handoff sent
+/// it a size pulse (`spawn::adoption_needs_size_pulse`), so its program
+/// redraws its own screen.
+pub(crate) fn landed(version: &str, build: u64, repainted: usize) -> Message {
     let v = v(version);
     let title = if v.trim().is_empty() {
         format!("Updated to build {build}")
     } else {
         format!("Updated to aterm v{v}")
     };
-    row(Severity::Success, title)
+    let msg = row(Severity::Success, title)
         .glyph(glyph(READY))
-        .hold(Hold::LogOnly)
+        .hold(Hold::LogOnly);
+    match repainted_words(repainted) {
+        Some(words) => msg.line(words).sentence(if repainted == 1 {
+            "its screen could not be carried, so it came over blank and the program in it \
+             was asked to redraw"
+        } else {
+            "their screens could not be carried, so they came over blank and the programs \
+             in them were asked to redraw"
+        }),
+        None => msg,
+    }
+}
+
+/// "1 tab repainted" / "3 tabs repainted", or `None` for a handoff that
+/// carried every screen exactly.
+fn repainted_words(repainted: usize) -> Option<String> {
+    match repainted {
+        0 => None,
+        1 => Some("1 tab repainted".to_string()),
+        n => Some(format!("{n} tabs repainted")),
+    }
 }
 
 /// The landing's RECORD: how long the update took from THIS build's finished
@@ -817,16 +751,21 @@ pub(crate) fn needs_install(title: &str, detail: &str, severity: Severity, build
 
 /// R37 — an attempt that FAILED and that nothing retries, a FAILURE row
 /// (ruling 143, main's "Update didn't finish"): Warn, `⚠`, the warning's
-/// hold, the `Software Update` capsule — the page that says what happened.
-/// `detail` is painted only when it is a blocker the person can clear
-/// (`actionable`); a mechanism's account rides behind `Details ›`.
+/// hold, the `Software Update` capsule — the page that says what happened;
+/// a mechanism's account rides behind `Details ›`. A blocker the person can
+/// clear (`actionable`) is the other way round: its words are painted, and
+/// they ARE the press — a capsule that cannot clear it only took the columns
+/// they need (2026-09-24: at 80 columns "Save or close the…", at 60 nothing).
 pub(crate) fn failed(title: &str, detail: &str, actionable: bool) -> Message {
     let msg = row(Severity::Warn, sanitize_for_tty(title, 80))
         .glyph(glyph(NEEDS_YOU))
         .sentence(detail)
-        .action(software_update())
         .key(KEY_OUTCOME);
-    if actionable { msg } else { msg.no_excerpt() }
+    if actionable {
+        msg
+    } else {
+        msg.action(software_update()).no_excerpt()
+    }
 }
 
 /// R38 — THE CHECK-HEALTH WARNING. The updater's ledger says one half of the
@@ -964,10 +903,6 @@ mod tests {
             "0.91.0",
         );
         completes(&check, "Verified aterm v0.91.0");
-        completes(
-            &staged("0.91.0", 7, Some(ApplyPosture::Automatic)),
-            "Installed aterm v0.91.0",
-        );
         completes(&installing("0.91.0"), "Installed aterm v0.91.0");
         completes(&finishing("0.91.0"), "Installed aterm v0.91.0");
         completes(&finishing(""), "Installed update");
@@ -1008,7 +943,8 @@ mod tests {
             download_failed("0.48.0", "zip sha256 mismatch"),
             installing("0.48.0"),
             finishing("0.48.0"),
-            landed("0.48.0", 7),
+            landed("0.48.0", 7, 0),
+            landed("0.48.0", 7, 2),
             installed_after("0.48.0", Duration::from_secs(42)),
             downloaded("0.48.0", 7),
             switch_started(Some("0.48.0"), "0.47.0", 6),
@@ -1193,7 +1129,7 @@ mod tests {
             installing("0.91.0"),
             installing(""),
             finishing("0.91.0"),
-            landed("0.91.0", 7),
+            landed("0.91.0", 7, 0),
             installed_after("0.91.0", Duration::from_secs(42)),
             downloaded("0.91.0", 7),
             switch_started(Some("0.91.0"), "0.90.0", 6),
@@ -1225,7 +1161,11 @@ mod tests {
                 7,
             ),
             failed("Update didn't finish", "", false),
-            failed("Update waits for the editor", EDITOR_HOLDS_IT, true),
+            failed(
+                crate::app_update_screen::UPDATE_WAITS_FOR_YOU,
+                crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+                true,
+            ),
             health_recovered("aterm can't install updates", "since Sep 14"),
             staged("0.91.0", 7, None),
         ];
@@ -1237,15 +1177,6 @@ mod tests {
                 aterm_update::health_failing_title(class),
                 "3 failed checks in a row since 2026-09-14T22:04:36Z: x.",
             ));
-        }
-        // The holds restated onto the automatic flow row.
-        for h in [Holds::Typing, Holds::Editor] {
-            let mut m = staged("0.91.0", 7, Some(ApplyPosture::Automatic));
-            let r = holds_restatement(h);
-            m.detail = r.detail.expect("words");
-            m.meter = r.meter.expect("an indicator decision");
-            m.severity = r.severity.expect("a tone");
-            all.push(m);
         }
         let mut classes = std::collections::BTreeSet::new();
         for m in &all {
@@ -1292,30 +1223,21 @@ mod tests {
     }
 
     /// THE STAGED ROW SAYS HOW THE UPDATE INSTALLS, AND NEVER ASKS FOR A
-    /// RESTART (ruling 143). Where the lane lands it within a minute the row is
-    /// the flow row on the glass — `Installing aterm vX`, busy, `within a
-    /// minute` in its time slot, LIVE under the backstop that outlasts the
-    /// ladder; where a press installs it, the ready row with the `Install now`
-    /// capsule, held for the press; every other posture is a RECORD.
+    /// RESTART (ruling 143; the owner's silent path, 2026-09-24). Where a press
+    /// installs it, the ready row with the `Install now` capsule, held for the
+    /// press; every other posture — the automatic lane that lands it within a
+    /// minute included — is a RECORD: no row, no re-grid.
     #[test]
     fn a_staged_row_says_how_the_update_installs_and_never_asks_for_a_restart() {
         use ApplyPosture as P;
+        assert_eq!(
+            staged("0.67.0", 7, Some(P::Automatic)).hold,
+            Hold::LogOnly,
+            "the automatic lane's staged build takes no row"
+        );
         for posture in every_posture() {
             let m = staged("0.67.0", 7, Some(posture));
-            if lane_is_working(Some(posture)) {
-                assert_eq!(m.title, "Installing aterm v0.67.0", "{posture:?}");
-                assert_eq!(m.glyph.ch(), FLOW_GLYPH);
-                assert_eq!(m.severity, Severity::Info);
-                assert_eq!(
-                    m.hold,
-                    Hold::Live {
-                        stale_after: STAGED_AUTOMATIC_STALE
-                    }
-                );
-                assert!(busy(&m), "{posture:?}: a timed wait moves");
-                assert_eq!(stats_of(&m), WITHIN_A_MINUTE, "the time word");
-                assert!(!m.excerpt);
-            } else if staged_is_decision(Some(posture)) {
+            if staged_is_decision(Some(posture)) {
                 assert_eq!(m.title, "aterm v0.67.0 is ready", "{posture:?}");
                 assert_eq!(m.glyph.ch(), '\u{2713}');
                 assert_eq!(m.severity, Severity::Info, "a decision, not a confirmation");
@@ -1442,25 +1364,16 @@ mod tests {
     }
 
     /// RESTATE: the App refines the staged row once the lane has actually
-    /// armed or stood down — the FULL words, so a ready↔flow change re-words,
-    /// re-tones and re-lives the same row.
+    /// armed or stood down — the FULL words. A lane that installs by itself
+    /// (armed, or retrying later) is a RECORD, which the host folds the ready
+    /// row into rather than restating it.
     #[test]
     fn a_posture_restatement_carries_the_full_words() {
         use ApplyPosture as P;
         let r = restate_apply_posture("0.67.0", 7, P::Automatic);
-        assert_eq!(r.title.as_deref(), Some("Installing aterm v0.67.0"));
+        assert_eq!(r.hold, Some(Hold::LogOnly));
         assert_eq!(r.detail, Some(vec![INSTALLS_BY_ITSELF.to_string()]));
         assert_eq!(r.actions, Some(Vec::new()));
-        assert_eq!(r.severity, Some(Severity::Info));
-        assert_eq!(r.glyph, Some(glyph(FLOW_GLYPH)));
-        assert_eq!(r.excerpt, Some(false));
-        assert_eq!(
-            r.hold,
-            Some(Hold::Live {
-                stale_after: STAGED_AUTOMATIC_STALE
-            })
-        );
-        assert_eq!(r.meter, Some(Some(Meter::busy(WITHIN_A_MINUTE))));
         // STANDING DOWN FOR GOOD: the ready row, the capsule, the short hold,
         // still.
         let r = restate_apply_posture("0.67.0", 7, P::ManualOnlyLatched { lapses: false });
@@ -1523,32 +1436,6 @@ mod tests {
         assert_eq!(Intent::ApplyUpdate { build: 3 }.label(), "Install now");
     }
 
-    /// WHAT HOLDS THE INSTALL is said on the flow row: typing keeps it
-    /// working (`↻`, moving); unsaved editor work makes it a wait on a person
-    /// (`⚠` Warn, still — no animation wake for a wait).
-    #[test]
-    fn what_holds_the_install_is_a_restatement_of_the_flow_row() {
-        let typing = holds_restatement(Holds::Typing);
-        assert_eq!(typing.detail, Some(vec![TYPING_HOLDS_IT.to_string()]));
-        assert_eq!(typing.severity, Some(Severity::Info));
-        assert_eq!(typing.glyph, Some(glyph(FLOW_GLYPH)));
-        assert_eq!(typing.meter, Some(Some(Meter::busy(""))));
-        assert_eq!(
-            typing.excerpt,
-            Some(true),
-            "it changes what the person does"
-        );
-        assert_eq!(typing.title, None, "the title stays");
-        assert_eq!(typing.hold, None, "and so does its lifetime");
-        let editor = holds_restatement(Holds::Editor);
-        assert_eq!(editor.detail, Some(vec![EDITOR_HOLDS_IT.to_string()]));
-        assert_eq!(editor.severity, Some(Severity::Warn));
-        assert_eq!(editor.glyph, Some(glyph(NEEDS_YOU)));
-        assert_eq!(editor.meter, Some(None), "a wait on a person is still");
-        assert_eq!(editor.excerpt, Some(true));
-        assert_eq!(editor.hold, None);
-    }
-
     /// Every flow detail is short and point first: at most 40 characters, so
     /// the phase is read at a glance and survives any ordinary width.
     #[test]
@@ -1558,21 +1445,12 @@ mod tests {
             DOWNLOADING,
             CHECKING,
             INSTALLS_BY_ITSELF,
-            TYPING_HOLDS_IT,
-            EDITOR_HOLDS_IT,
             INSTALLING,
             FINISHING,
             DOWNLOAD_FAILED,
-            WITHIN_A_MINUTE,
         ]
         .map(str::to_string)
         .to_vec();
-        for posture in every_posture()
-            .into_iter()
-            .filter(|p| lane_is_working(Some(*p)))
-        {
-            details.push(staged_detail(posture));
-        }
         details.push(staged_detail(P::Automatic));
         for d in details {
             assert!(
@@ -1609,20 +1487,11 @@ mod tests {
             })
             .collect();
         sentences.push(staged_detail_unknown());
-        sentences.extend(
-            [
-                DOWNLOADING,
-                CHECKING,
-                TYPING_HOLDS_IT,
-                EDITOR_HOLDS_IT,
-                DOWNLOAD_FAILED,
-            ]
-            .map(str::to_string),
-        );
+        sentences.extend([DOWNLOADING, CHECKING, DOWNLOAD_FAILED].map(str::to_string));
         for m in [
             installing("0.88.0"),
             finishing("0.88.0"),
-            landed("0.88.0", 7),
+            landed("0.88.0", 7, 0),
         ] {
             sentences.push(m.title);
             sentences.extend(m.detail);
@@ -1662,7 +1531,7 @@ mod tests {
         assert!(!f.excerpt, "a reassurance changes nothing the person does");
         assert!(busy(&f));
         assert_eq!(f.key, i.key);
-        let l = landed("9.9.9", 7);
+        let l = landed("9.9.9", 7, 0);
         assert_eq!(l.title, "Updated to aterm v9.9.9");
         assert!(
             l.detail.is_empty(),
@@ -1677,7 +1546,47 @@ mod tests {
         );
         assert_eq!(l.severity, Severity::Success);
         assert_eq!(l.key, None);
-        assert_eq!(landed("", 7).title, "Updated to build 7");
+        assert_eq!(landed("", 7, 0).title, "Updated to build 7");
+    }
+
+    /// A REPAINT IS NEVER UNSEEN (the 2026-09-22/23 update audit, plan P1-5):
+    /// when the successor adopted any session onto a blank screen, the landing
+    /// RECORD names how many — singular and plural — and why those tabs came
+    /// over blank; a desk that crossed exactly keeps main's bare record. One
+    /// record for one fact: the landing is a durable fact and no row (ruling
+    /// 76, ruling 141), and nothing on a blank tab is the person's to do.
+    #[test]
+    fn the_landing_names_the_tabs_it_repainted() {
+        let one = landed("0.92.0", 7, 1);
+        assert_eq!(one.title, "Updated to aterm v0.92.0");
+        assert_eq!(one.detail[0], "1 tab repainted");
+        assert!(
+            one.detail[1..]
+                .join(" ")
+                .starts_with("its screen could not be carried"),
+            "{:?}",
+            one.detail
+        );
+        assert!(
+            one.detail.join(" ").contains("asked to redraw"),
+            "{:?}",
+            one.detail
+        );
+        assert_eq!(one.severity, Severity::Success);
+        assert_eq!(one.hold, Hold::LogOnly, "still a record (ruling 141)");
+        assert!(
+            one.actions.is_empty(),
+            "nothing to press: {:?}",
+            one.actions
+        );
+        let three = landed("0.92.0", 7, 3);
+        assert_eq!(three.detail[0], "3 tabs repainted");
+        assert!(
+            three.detail[1..].join(" ").starts_with("their screens"),
+            "{:?}",
+            three.detail
+        );
+        assert!(landed("0.92.0", 7, 0).detail.is_empty());
     }
 
     /// THE UPDATE'S RECORDS: when it downloaded, when the switch began or
@@ -1720,7 +1629,7 @@ mod tests {
         assert_eq!(took.hold, Hold::LogOnly);
         assert_ne!(
             took.title,
-            landed("0.79.0", 7).title,
+            landed("0.79.0", 7, 0).title,
             "two titles, one each"
         );
         for (secs, words) in [
@@ -1811,8 +1720,13 @@ mod tests {
         assert_eq!(bare.hold, Hold::Default);
         assert_eq!(bare.severity, Severity::Warn);
         assert_eq!(bare.actions, vec![software_update()]);
-        let blocked = failed("Update waits for the editor", EDITOR_HOLDS_IT, true);
+        let blocked = failed(
+            crate::app_update_screen::UPDATE_WAITS_FOR_YOU,
+            crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+            true,
+        );
         assert!(blocked.excerpt, "a blocker the person clears is painted");
+        assert!(blocked.actions.is_empty(), "its words are the press");
         assert!(!failed("x", "handoff proof ended TimedOut", false).excerpt);
     }
 
@@ -2005,8 +1919,9 @@ mod tests {
         for m in [
             installing("9.9.9"),
             finishing("9.9.9"),
-            landed("9.9.9", 7),
-            landed("", 7),
+            landed("9.9.9", 7, 0),
+            landed("9.9.9", 7, 3),
+            landed("", 7, 0),
             download_failed("9.9.9", "x"),
             download_postponed("busy"),
             downloaded("9.9.9", 7),
@@ -2027,15 +1942,10 @@ mod tests {
                 format!("{} — {}", m.title, m.detail.join(" ")),
             ));
         }
-        for holds in [Holds::Typing, Holds::Editor] {
-            surfaces.push((
-                "flow row (holds)",
-                holds_restatement(holds)
-                    .detail
-                    .unwrap_or_default()
-                    .join(" "),
-            ));
-        }
+        surfaces.push((
+            "blocker row",
+            crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string(),
+        ));
         for class in ["apply", "pipeline", "stage", "manifest"] {
             surfaces.push((
                 "health row",
@@ -2069,8 +1979,9 @@ mod tests {
         for m in [
             installing("9.9.9"),
             finishing("9.9.9"),
-            landed("9.9.9", 7),
-            landed("", 7),
+            landed("9.9.9", 7, 0),
+            landed("9.9.9", 7, 1),
+            landed("", 7, 0),
             download_postponed("busy"),
         ] {
             sentences.push(m.title);

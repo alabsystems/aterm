@@ -10,29 +10,23 @@
 //!
 //! * A process is tracked when its EXECUTABLE carries the tag, when the bundle the kernel
 //!   charges it to carries it — the outermost `.app` above the executable, or failing
-//!   one the `X.<ext>` wrapper around `Contents/MacOS/` (measured 2026-09-23; the table
-//!   is on [`taint_candidates`]) — or when its PARENT is tracked. Everything a
-//!   tracked process creates or touches is tagged: `open(O_CREAT)`,
-//!   but also `rename`, `link`, `chmod`, `utimes`, `setxattr` and an append — a tracked
-//!   parent that merely renames a clean file tags it. Reads, `stat` and `fsync` do not.
+//!   one the `X.<ext>` wrapper around `Contents/MacOS/` (measured 2026-09-23) — or when
+//!   its PARENT is tracked. Everything a tracked process creates or touches is tagged:
+//!   `open(O_CREAT)`, but also `rename`, `link`, `chmod`, `utimes`, `setxattr` and an
+//!   append — a tracked parent that merely renames a clean file tags it. Reads, `stat` and `fsync` do not.
 //! * The tag is inherited across `fork`, `posix_spawn`, `setsid`, `osascript`,
 //!   `launchctl asuser`, and it SURVIVES `exec` into an untagged image: a tagged
 //!   `#!/bin/sh` shim that `exec`s a clean tool still produces tagged output. The shims
 //!   atpkg lays in `bin/` are exactly that shape.
-//! * A job launchd spawns (`launchctl submit`, `launchctl bootstrap gui/<uid>`) is NOT a
-//!   child of the submitter: with an untagged executable it writes clean files even when
-//!   submitted by a tracked process, even into a tagged directory, even through a tagged
-//!   symlink. With a tagged executable it writes tagged files — the tag follows the
-//!   executable. And with an untagged executable inside a STAMPED bundle it writes
-//!   tagged files too (2026-09-23): the stamp on the bundle directory is enough.
-//! * A byte copy of a tagged executable made by an untracked process (`cat a > b`) is
-//!   clean and runs clean; `cp`/`ditto` copy the attribute along with the bytes.
+//! * A job launchd spawns (`launchctl submit`) is NOT a child of the submitter: with an
+//!   untagged executable outside any stamped bundle it is untracked even when a tracked
+//!   process submitted it; with a tagged executable it is tracked.
 //! * `xattr -d com.apple.provenance` and `xattr -c` run by a TRACKED process exit 0 and
 //!   remove nothing. The same `/usr/bin/xattr -d` run by a job launchd spawns from
 //!   `/bin/sh` — platform binaries, which never carry the tag — removes it in place
 //!   (2026-09-23: files, directories, a symlink itself, a Developer ID Mach-O whose
-//!   signature still verifies afterwards; a 324 MB tree in milliseconds). That is
-//!   [`heal`], and why a tagged store is repaired in place rather than re-seeded.
+//!   signature still verifies afterwards; a 324 MB tree in milliseconds; 2026-09-24: the
+//!   whole store on m7, 0 tagged files left). That is [`heal`], the ONE cure.
 //! * (2026-09-15) A process that LOADS a tagged dynamic library becomes tracked: a
 //!   launchd-spawned, untracked `python3` that `dlopen`ed a tagged copy of the trust
 //!   bundle's `libstd-*.dylib` wrote a tagged file afterwards; the same process
@@ -50,12 +44,12 @@
 //! (v0.83.0, 2026-09-12: bundle `trust/8590`, seeded from a shell that was itself
 //! tracked). The 02:27 seed of `trust/8589` by the app's own update lane, from an
 //! untracked app, came out clean, and the cut succeeded once that bundle was first on
-//! PATH. Four surfaces read this module: the cutter's pre-claim gate
-//! (`aterm-release::gates::provenance_gate`), `aterm pkg doctor`, the store's own
-//! staging lane, which hands extraction to an untracked launchd job when the installer
-//! measures itself as tracked ([`crate::stage_helper`]), and [`heal_store`], which every
-//! package pass and `aterm pkg repair` run so a tag that got in anyway is cleared
-//! silently.
+//! PATH. So every store-changing door and `aterm pkg repair` end with [`heal_store`], the
+//! cutter clears its own toolchain with [`heal`] and refuses before the claim whatever
+//! stays tagged (`aterm-release::gates::provenance_gate`), and `aterm pkg doctor` counts
+//! what is still tagged. Installs write in-process like any other program: until
+//! 2026-09-24 they were routed through untracked launchd lanes so their files came out
+//! clean, and that machinery was deleted once the heal cleared the real store in place.
 //!
 //! Outside a release cut the tag changes nothing a user runs: every tagged tool runs
 //! normally. Its one everyday trace is archive metadata — macOS `tar` and `ditto -c -k`
@@ -64,6 +58,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "macos")]
+mod job;
 
 /// The attribute name, exactly as `xattr -l` prints it.
 pub const PROVENANCE_XATTR: &str = "com.apple.provenance";
@@ -76,12 +73,12 @@ pub const WHAT_IT_BREAKS: &str = "the tag follows the executable and the parent 
     a burned build number (v0.83.0, 2026-09-12); `xattr -d` run by a tracked process exits 0 \
     and removes nothing, while the same command run by a launchd job clears it";
 
-/// The cure, for the release cutter's refusal.
+/// The cure, for the release cutter's refusal: the heal, from the store's door or the
+/// cutter's own — never a re-install, which writes the same tagged files again.
 pub const REMEDY: &str = "`aterm pkg repair` clears the tag from every installed file through \
-    a launchd job; if a file keeps it, re-seed the bundle — `aterm pkg uninstall <program> && \
-    aterm pkg install <program>`, then `aterm pkg install --default-set` to keep the set \
-    auto-completing — or point TRUST_STAGE2_BIN at an untagged bundle's bin/ (`xattr -l \
-    <bin>/trustc` prints nothing on a clean one)";
+    a launchd job, and the cutter clears its own toolchain and binary the same way before this \
+    gate; a file still tagged after that is one the job could not clear — its reason is above, \
+    and `aterm pkg doctor` counts what stays tagged";
 
 /// The extended-attribute NAMES on `path` (symlinks followed), in the order the kernel
 /// lists them.
@@ -189,127 +186,10 @@ pub fn carries(path: &Path, attr: &str) -> bool {
     xattr_names(path).is_ok_and(|names| names.iter().any(|n| n == attr))
 }
 
-/// Whether `path` carries `com.apple.provenance`.
-#[must_use]
-pub fn carries_provenance(path: &Path) -> bool {
-    carries(path, PROVENANCE_XATTR)
-}
-
-/// The attribute macOS stamps on a browser download. It matters here because a
-/// QUARANTINED executable is provenance-tracked in every invocation — a job launchd
-/// spawns from it included, which is the one escape the untracked lane relies on
-/// (measured 2026-09-14 on m16: a launchd job that exec'd the quarantined, UNTAGGED
-/// `aterm.app` binary in place wrote a result file carrying `com.apple.provenance`).
-/// So a quarantined helper is as unusable in place as a tagged one, and
-/// [`crate::stage_helper::plan_for_exe`] must treat it the same way. An app laid down
-/// by aterm's own updater carries neither attribute.
+/// The attribute macOS stamps on a browser download. A QUARANTINED executable is
+/// provenance-tracked in every invocation (measured 2026-09-14 on m16), which the window's
+/// one provenance log line reads (`aterm-gui`'s `provenance_repair`).
 pub const QUARANTINE_XATTR: &str = "com.apple.quarantine";
-
-/// The paths whose attributes decide whether a process exec'd from `exe` is tracked:
-/// `exe` itself; every directory above it whose extension is `app` in any case; and the
-/// directory `X` when `exe` is `X/Contents/MacOS/<exe>`, whatever `X` is called. Nearest
-/// first, each once. Never `Contents/`, `Contents/MacOS/`, `Info.plist` or a plain
-/// parent: those were measured and never charged.
-///
-/// # What was measured (2026-09-23, this Mac: a launchd job running a CLEAN executable in
-/// place, with the named directory stamped by a tracked shell and nothing else stamped)
-///
-/// | where the clean executable sits | what the job wrote |
-/// |---|---|
-/// | `S.app/Contents/MacOS/`, `S.app` stamped | STAMPED |
-/// | the same, `S.App` or `S.APP` stamped | STAMPED |
-/// | `S.app/bin/`, `S.app/a/b/`, `S.app` stamped | STAMPED |
-/// | `S.xpc`, `S.appex`, `S.bundle`, `S.plugin`, `S.framework`, `S.kext` or `S.foo`, each with `Contents/MacOS/`, the wrapper stamped | STAMPED |
-/// | `S.foo/Contents/MacOS/` with no `Info.plist`, `S.foo` stamped | STAMPED |
-/// | `S.app` stamped, no `Info.plist` | STAMPED |
-/// | a stamped OUTER `.app` around a clean inner helper `.app` | STAMPED |
-/// | a clean outer `.app` around a stamped inner `.app` or `.xpc` | clean |
-/// | `Q/Contents/MacOS/`, `Q` stamped and bundle-shaped, no extension | clean |
-/// | `S.foo/bin/`, `S.bundle/bin/`, `S.foo/Contents/Resources/`, `S.framework/Versions/A/` | clean |
-/// | only `Contents/`, `Contents/MacOS/` or `Info.plist` stamped | clean |
-/// | a stamped plain parent directory, or a free-standing executable | clean |
-///
-/// So the kernel charges the process to the OUTERMOST `.app` above its executable when
-/// there is one, and otherwise to the `X.<ext>` wrapper around `Contents/MacOS/`. The
-/// same mechanism was measured independently on m16 on 2026-09-20 (15ec68a85: a clean
-/// `Contents/MacOS/aterm` under a tagged root wrote a tagged file from a launchd job).
-///
-/// This walk is a SUPERSET of that rule on purpose. It names every `.app`, not only the
-/// outermost, and the wrapper even when it has no extension (`Q` above measured clean).
-/// A false positive costs a replica copy; a missed carrier costs a tagged toolchain,
-/// which is the failure this module exists to prevent. Shapes nobody measured — other
-/// placements, other extensions without `Contents/MacOS/` — are not claimed either way.
-/// `crates/atpkg/tests/untracked_stamped_bundle.rs` keeps the first rows as live
-/// negative controls.
-pub fn taint_candidates(exe: &Path) -> impl Iterator<Item = &Path> {
-    let wrapper = contents_macos_wrapper(exe);
-    std::iter::once(exe).chain(
-        exe.ancestors()
-            .skip(1)
-            .filter(move |a| is_app_dir(a) || Some(*a) == wrapper),
-    )
-}
-
-/// `X` for `X/Contents/MacOS/<exe>`, whatever `X` is called (the ASCII case of
-/// `Contents` and `MacOS` ignored, as the default macOS volume does).
-fn contents_macos_wrapper(exe: &Path) -> Option<&Path> {
-    let macos = exe.parent()?;
-    if !macos.file_name()?.eq_ignore_ascii_case("MacOS") {
-        return None;
-    }
-    let contents = macos.parent()?;
-    if !contents.file_name()?.eq_ignore_ascii_case("Contents") {
-        return None;
-    }
-    contents.parent()
-}
-
-/// A directory named `*.app`, the extension in any ASCII case.
-fn is_app_dir(p: &Path) -> bool {
-    p.extension().is_some_and(|x| x.eq_ignore_ascii_case("app"))
-}
-
-/// The provenance carrier behind `exe`, if any: `exe` itself or a bundle directory above
-/// it ([`taint_candidates`]). A path that cannot be INSPECTED is an `Err`, never "clean":
-/// a plan built on a failure to look would run a possibly tainted helper in place and
-/// call its files clean.
-///
-/// # Errors
-/// The first candidate whose attribute list cannot be read, named.
-pub fn provenance_carrier(exe: &Path) -> Result<Option<PathBuf>, String> {
-    carrier_of(exe, PROVENANCE_XATTR)
-}
-
-/// [`provenance_carrier`] for the attribute `attr` — a parameter so a test can taint a
-/// bundle with an attribute it is able to set.
-pub(crate) fn carrier_of(exe: &Path, attr: &str) -> Result<Option<PathBuf>, String> {
-    for candidate in taint_candidates(exe) {
-        let names = xattr_names(candidate)
-            .map_err(|e| format!("cannot inspect {} for {attr}: {e}", candidate.display()))?;
-        if names.iter().any(|n| n == attr) {
-            return Ok(Some(candidate.to_path_buf()));
-        }
-    }
-    Ok(None)
-}
-
-/// The quarantined carrier behind `exe`, if any: `exe` itself or a bundle directory above
-/// it ([`taint_candidates`]) — a browser stamps the bundle it downloaded and the
-/// executable inside it, and either is enough to make every invocation tracked. `None`
-/// when none carries the attribute, and on every non-macOS platform. Until 2026-09-23
-/// this looked at the nearest lowercase `.app` only; it now shares the provenance walk,
-/// which can only ever find more carriers, never fewer. Only the provenance half of that
-/// walk was measured against the kernel; for quarantine it is the conservative choice,
-/// not a measurement.
-#[must_use]
-pub fn quarantined_carrier(exe: &Path) -> Option<PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    taint_candidates(exe)
-        .find(|p| carries(p, QUARANTINE_XATTR))
-        .map(Path::to_path_buf)
-}
 
 /// The regular files a scan found carrying an attribute, and how many regular files it
 /// looked at ("3 of 31").
@@ -319,27 +199,6 @@ pub struct Scan {
     pub carriers: Vec<PathBuf>,
     /// Regular files inspected.
     pub total: usize,
-}
-
-/// Scan one directory level for regular files carrying `attr` (see [`Scan`]). An
-/// unreadable `dir` is an empty scan: `total == 0` says nothing was inspected. The
-/// reroute directory's marker file is not an executable — nothing execs it, so its tag
-/// tracks nothing — and is never counted ([`crate::reroute::DIR_MARKER_FILE`]).
-#[must_use]
-pub fn tagged_files_in(dir: &Path, attr: &str) -> Scan {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Scan::default();
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|e| e.file_name() != crate::reroute::DIR_MARKER_FILE)
-        .map(|e| e.path())
-        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
-        .collect();
-    paths.sort();
-    let total = paths.len();
-    let carriers = paths.into_iter().filter(|p| carries(p, attr)).collect();
-    Scan { carriers, total }
 }
 
 /// Every regular file under `dir`, recursively, that carries `attr` — the shape a
@@ -494,8 +353,8 @@ pub const HEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// the attribute, the roots after. `-r` walks each root, `-s` acts on a symlink itself and
 /// never on its target, and `-d` removes that ONE attribute — never `-c`, which would strip
 /// every other one (a code signature kept in an attribute included). It records xattr's
-/// status, removes its own label and exits 0, like the lanes' wrapper
-/// ([`crate::stage_helper`]): a job launchd keeps is one it re-runs.
+/// status, removes its own label and exits 0 (`provenance/job.rs`): a job launchd keeps
+/// is one it re-runs.
 #[cfg(target_os = "macos")]
 const HEAL_SCRIPT: &str = r#"s="$1"; l="$2"; a="$3"; shift 3
 /usr/bin/xattr -r -s -d "$a" "$@"
@@ -513,7 +372,7 @@ exit 0
 /// and `/usr/bin/xattr` cannot carry the tag, so the job is untracked whatever state
 /// aterm's own bundle is in). Nothing is submitted when a scan finds no carrier. The job
 /// is waited for at most [`HEAL_TIMEOUT`] and its label is removed on every path; a scan
-/// afterwards is the verdict. `scratch` holds the job's status and logs (removed after).
+/// afterwards is the verdict. `scratch` holds the job's status (removed after).
 /// Off macOS there is no tag, and this answers [`HealOutcome::Clean`] without looking.
 #[must_use]
 pub fn heal(roots: &[PathBuf], scratch: &Path) -> HealOutcome {
@@ -521,9 +380,10 @@ pub fn heal(roots: &[PathBuf], scratch: &Path) -> HealOutcome {
 }
 
 /// [`heal`] for the attribute `attr` — a parameter only so a test can use one it is able to
-/// set (`com.apple.provenance` cannot be minted by hand); production clears that one.
+/// set (`com.apple.provenance` cannot be minted by hand; the release cutter's gate test
+/// uses it too); production clears that one.
 #[must_use]
-pub(crate) fn heal_with(roots: &[PathBuf], scratch: &Path, attr: &str) -> HealOutcome {
+pub fn heal_with(roots: &[PathBuf], scratch: &Path, attr: &str) -> HealOutcome {
     if !cfg!(target_os = "macos") {
         return HealOutcome::Clean;
     }
@@ -565,10 +425,10 @@ pub(crate) fn heal_with(roots: &[PathBuf], scratch: &Path, attr: &str) -> HealOu
 /// The job is dropped — its label removed and its scratch deleted — before this returns.
 #[cfg(target_os = "macos")]
 fn run_heal_job(roots: &[PathBuf], scratch: &Path, attr: &str) -> Result<Option<i32>, String> {
-    let mut job = crate::stage_helper::Job::prepare(scratch, "heal")?;
+    let mut job = job::Job::prepare(scratch, "heal")?;
     let mut args: Vec<&std::ffi::OsStr> = vec![std::ffi::OsStr::new(attr)];
     args.extend(roots.iter().map(|r| r.as_os_str()));
-    job.submit_platform("atpkg-heal", HEAL_SCRIPT, &args)?;
+    job.submit("atpkg-heal", HEAL_SCRIPT, &args)?;
     Ok(job.wait_for_status(HEAL_TIMEOUT))
 }
 
@@ -578,11 +438,9 @@ fn run_heal_job(_roots: &[PathBuf], _scratch: &Path, _attr: &str) -> Result<Opti
     Err(String::from("there is no launchd here"))
 }
 
-/// [`heal`] over the whole store ([`store_roots`]), then the records squared with it: a
-/// `<build>.tracked-install` record beside a build whose files now measure clean is
-/// removed, and so is one beside a build that is no longer active — nothing will ever
-/// clear it otherwise. The caller holds the store lock. What every package pass runs at
-/// its end, and what `aterm pkg repair` runs.
+/// [`heal`] over the whole store ([`store_roots`]), then the retired lanes' leftovers
+/// swept ([`sweep_lane_leftovers`]). The caller holds the store lock. What every
+/// store-changing door runs at its end, and what `aterm pkg repair` runs.
 ///
 /// Inside atpkg's own unit tests the heal is `test_bind`'s scan-only stand-in unless the
 /// test opted into the real one: a tracked test process (an agent's shell) tags every file
@@ -611,8 +469,8 @@ fn store_healer() -> Healer {
 ///
 /// By default [`heal_store`] runs [`test_bind`]'s `scan_only`: the scan [`heal`] starts
 /// with, answered as the heal that cleared every carrier it found, and NO launchd job — so
-/// the records are squared exactly as after a heal that worked, while the files keep
-/// whatever tag they had. A test that proves the real heal THROUGH A DOOR opts in for its
+/// the door carries on exactly as after a heal that worked, while the files keep whatever
+/// tag they had. A test that proves the real heal THROUGH A DOOR opts in for its
 /// scope with [`test_bind::real`]. The heal's own tests call [`heal`], [`heal_with`] or
 /// [`heal_store_with`] directly and never pass through this binding.
 #[cfg(test)]
@@ -677,12 +535,12 @@ pub(crate) mod test_bind {
 #[must_use]
 pub fn heal_store_with(layout: &crate::store::Layout, heal: Healer) -> HealOutcome {
     let outcome = heal(&store_roots(layout), &heal_scratch(layout));
-    reconcile_records(layout, outcome.left());
+    sweep_lane_leftovers(layout);
     outcome
 }
 
-/// Where a heal of `layout`'s files keeps its job: the lanes' scratch under that prefix
-/// (`<prefix>/staging/.lanes/`), or the temp dir when it cannot be made.
+/// Where a heal of `layout`'s files keeps its job: `<prefix>/staging/.lanes/` (the name the
+/// retired lanes gave it), or the temp dir when it cannot be made.
 fn heal_scratch(layout: &crate::store::Layout) -> PathBuf {
     let scratch = layout.prefix.join("staging").join(".lanes");
     if layout.ensure_dir(&scratch).is_ok() {
@@ -692,65 +550,28 @@ fn heal_scratch(layout: &crate::store::Layout) -> PathBuf {
     }
 }
 
-/// Remove every `<build>.tracked-install` record that no longer describes a tagged build:
-/// one beside a build that is not active, and one beside an active build none of whose
-/// files is among `left` (what the heal could not clear). Returns the build dirs whose
-/// records were removed.
-pub fn reconcile_records(layout: &crate::store::Layout, left: &[PathBuf]) -> Vec<PathBuf> {
-    let active: Vec<PathBuf> = crate::ops::active_builds(layout)
-        .into_iter()
-        .map(|(program, build)| layout.build_dir(&program, build))
-        .collect();
-    let mut removed = Vec::new();
-    for build_dir in recorded_builds(layout) {
-        let still_tagged =
-            active.contains(&build_dir) && left.iter().any(|p| p.starts_with(&build_dir));
-        if !still_tagged {
-            crate::store::clear_tracked_install(&build_dir);
-            removed.push(build_dir);
-        }
-    }
-    removed
-}
-
-/// Every build dir with a `<build>.tracked-install` record beside it, in name order.
-#[must_use]
-pub fn recorded_builds(layout: &crate::store::Layout) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// Remove what the untracked lanes (deleted 2026-09-24) left in the store, which nothing
+/// reads any more: every `store/<program>/<build>.tracked-install` record and the
+/// `<prefix>/tag-relay.tried` memo. Tagged files are measured, never recorded.
+fn sweep_lane_leftovers(layout: &crate::store::Layout) {
+    let _ = std::fs::remove_file(layout.prefix.join("tag-relay.tried"));
     let Ok(programs) = std::fs::read_dir(layout.prefix.join("store")) else {
-        return out;
+        return;
     };
     for program in programs.flatten() {
         let Ok(entries) = std::fs::read_dir(program.path()) else {
             continue;
         };
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            if let Some(build) = name
+            let is_record = entry
+                .file_name()
                 .to_str()
-                .and_then(|n| n.strip_suffix(crate::store::TRACKED_INSTALL_SUFFIX))
-                .filter(|b| !b.is_empty())
-            {
-                out.push(program.path().join(build));
+                .and_then(|n| n.strip_suffix(".tracked-install"))
+                .is_some_and(|build| !build.is_empty());
+            if is_record && entry.file_type().is_ok_and(|t| t.is_file()) {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
-    }
-    out.sort();
-    out
-}
-
-/// Clear the tag from `roots` under `layout`, which this tracked process just laid itself
-/// because its lane could not run, and log one line only if some of it stays tagged — the
-/// view and exec-root lanes' fallback ([`crate::seam`], [`crate::compat`]). `what` names
-/// what was laid, for that line.
-pub(crate) fn heal_laid(layout: &crate::store::Layout, what: &str, roots: &[PathBuf]) {
-    let healed = heal(roots, &heal_scratch(layout));
-    if !healed.is_clean() {
-        log_line(&format!(
-            "could not clear a macOS tag from {} of {what} ({}); `aterm pkg repair` tries again",
-            count_of(healed.left().len(), "file"),
-            healed.why().unwrap_or("no reason given")
-        ));
     }
 }
 
@@ -777,57 +598,8 @@ pub fn count_of(n: usize, noun: &str) -> String {
 
 /// Whether THIS process is provenance-tracked — MEASURED, by writing a probe file into
 /// `scratch` and reading the attribute back, never inferred from the binary's own
-/// attributes (a clean binary under a tracked parent is tracked; that is the whole
-/// incident). Answered once per process: tracking is decided at exec and does not change.
-///
-/// `true` — tracked — when the probe cannot be written or inspected (2026-09-15; it
-/// was `false`): a lane that cannot measure must route the write through the machinery
-/// that measures its own outcome, never in-process where a tag would land unseen. The
-/// probe is removed before returning.
-///
-/// An UNMEASURABLE probe is NOT cached (audit 2026-09-15). The ANSWER is a property of
-/// the process, but the ability to take it is a property of the scratch dir handed in,
-/// and the lanes hand in different ones: [`crate::lay::lay_executables`] measures in
-/// `$TMPDIR`, [`crate::install::verify_and_stage`] in the staging dir beside the
-/// archive, and the spawn seam's `reroute::lay` usually gets there first. Latching one
-/// transient failure there — a `$TMPDIR` reaped between the write and the `listxattr`, a
-/// momentary ENOSPC, a `$TMPDIR` this process cannot write — pinned "untracked" for the
-/// life of the process, and the staging lane that followed, with a scratch dir that was
-/// writable by construction, then laid every shim and staged every bundle in-process and
-/// TAGGED, with nothing measuring what it laid — the v0.83.0 shape this module exists to
-/// prevent (module doc). So the step at hand still proceeds as TRACKED (fail closed,
-/// below), logs it once ([`log_line`]), and the next call measures again.
-#[must_use]
-pub fn process_is_tracked(scratch: &Path) -> bool {
-    static MEASURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if let Some(tracked) = MEASURED.get() {
-        return *tracked;
-    }
-    let Some(tracked) = measure_tracked(scratch) else {
-        // Once per process: every spawn seam with stubs to lay reaches this, and eight
-        // identical lines would bury the one that matters.
-        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            // A diagnostic, for the log ([`log_line`]): a session's reroute lay reaches here.
-            log_line(&format!(
-                "could not check {} for the macOS tag; installing the safe way",
-                scratch.display()
-            ));
-        }
-        // FAIL CLOSED (2026-09-15): a lane that cannot measure is a lane that cannot see,
-        // and the tag's whole failure mode is being invisible — a probe refused by a full
-        // disk or a permission is answered by the untracked lane, which writes elsewhere
-        // and MEASURES what it laid, never by an in-process write that would carry the
-        // tag with nothing saying so. Not cached, so a transient failure costs one lane
-        // round trip, not the process's whole life.
-        return true;
-    };
-    // Whoever measured first wins a race; both took the same process-wide property.
-    *MEASURED.get_or_init(|| tracked)
-}
-
-/// The un-cached measurement behind [`process_is_tracked`]: `Some(tagged)` when a probe
-/// could be written and read, `None` when it could not.
+/// attributes (a clean binary under a tracked parent is tracked): `Some(tagged)` when the
+/// probe could be written and read, `None` when it could not. The probe is removed.
 pub fn measure_tracked(scratch: &Path) -> Option<bool> {
     if !cfg!(target_os = "macos") {
         return Some(false);
@@ -907,32 +679,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A quarantined BUNDLE makes its executable a quarantined carrier, and so does the
-    /// executable itself — the Safari-download shape, which reads as untagged and is
-    /// nevertheless tracked under every parent (2026-09-14).
-    #[test]
-    fn a_quarantined_bundle_or_executable_is_found_as_the_carrier() {
-        let d = tmp("quarantine");
-        let contents = d.join("aterm.app").join("Contents");
-        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
-        let exe = contents.join("MacOS").join("aterm");
-        std::fs::write(&exe, b"x").unwrap();
-        assert_eq!(quarantined_carrier(&exe), None, "clean to begin with");
-        // The attribute a browser sets is one a test CAN mint (unlike the provenance tag).
-        set_xattr_for_test(&d.join("aterm.app"), QUARANTINE_XATTR, b"0083;0;Safari;").unwrap();
-        assert_eq!(
-            quarantined_carrier(&exe),
-            Some(d.join("aterm.app")),
-            "the bundle is the carrier"
-        );
-        let lone = d.join("atpkg");
-        std::fs::write(&lone, b"x").unwrap();
-        assert_eq!(quarantined_carrier(&lone), None);
-        set_xattr_for_test(&lone, QUARANTINE_XATTR, b"0083;0;Safari;").unwrap();
-        assert_eq!(quarantined_carrier(&lone), Some(lone.clone()));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
     /// "Could not look" is an error, never "clean".
     #[test]
     fn a_missing_path_is_an_error_not_a_clean_answer() {
@@ -943,30 +689,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The directory scan counts regular files only, names the carriers sorted, and
-    /// ignores symlinks and subdirectories.
+    /// The recursive scan counts regular files only, names the carriers sorted, walks into
+    /// subdirectories and never through a symlink.
     #[test]
-    fn the_bin_scan_counts_regular_files_and_names_the_carriers() {
+    fn the_lib_scan_counts_regular_files_and_names_the_carriers() {
         let d = tmp("scan");
-        let bin = d.join("bin");
-        std::fs::create_dir_all(bin.join("subdir")).unwrap();
-        for name in ["trustc", "targo", "ay"] {
-            std::fs::write(bin.join(name), b"#!/bin/true\n").unwrap();
+        let lib = d.join("lib");
+        std::fs::create_dir_all(lib.join("rustlib")).unwrap();
+        for name in ["libstd.dylib", "rustlib/librustc_driver.dylib", "README"] {
+            std::fs::write(lib.join(name), b"x").unwrap();
         }
-        std::os::unix::fs::symlink("trustc", bin.join("rustc")).unwrap();
-        set_xattr_for_test(&bin.join("trustc"), "user.aterm.probe", b"1").unwrap();
-        set_xattr_for_test(&bin.join("ay"), "user.aterm.probe", b"1").unwrap();
-        let scan = tagged_files_in(&bin, "user.aterm.probe");
-        assert_eq!(scan.total, 3, "three regular files, one link, one dir");
-        assert_eq!(scan.carriers, vec![bin.join("ay"), bin.join("trustc")]);
-        // A different attribute name finds nothing.
+        std::os::unix::fs::symlink("libstd.dylib", lib.join("libstd-alias.dylib")).unwrap();
+        for tagged in ["libstd.dylib", "rustlib/librustc_driver.dylib"] {
+            set_xattr_for_test(&lib.join(tagged), "user.aterm.probe", b"1").unwrap();
+        }
+        let scan = tagged_files_under(&lib, "user.aterm.probe");
+        assert_eq!(scan.total, 3, "three regular files, one link");
         assert_eq!(
-            tagged_files_in(&bin, "user.aterm.other").carriers,
-            Vec::<PathBuf>::new()
+            scan.carriers,
+            vec![
+                lib.join("libstd.dylib"),
+                lib.join("rustlib/librustc_driver.dylib")
+            ]
         );
-        // An unreadable dir inspects nothing — and says so through `total`.
+        assert!(
+            tagged_files_under(&lib, "user.aterm.other")
+                .carriers
+                .is_empty()
+        );
         assert_eq!(
-            tagged_files_in(&d.join("absent"), "user.aterm.probe"),
+            tagged_files_under(&d.join("absent"), "user.aterm.probe"),
             Scan::default()
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -1119,8 +871,8 @@ mod tests {
             "the file a link points to, outside the roots, keeps its tag"
         );
         // The job's scratch goes after launchd has forgotten its label (`Job`'s drop; the
-        // label's own removal is pinned by `stage_helper`'s platform-job test, which knows
-        // it — other tests' heals of this process run beside this one).
+        // label's own removal is pinned by `job`'s test, which knows it — other tests'
+        // heals of this process run beside this one).
         let jobs: Vec<String> = std::fs::read_dir(&scratch)
             .unwrap()
             .flatten()
@@ -1147,7 +899,7 @@ mod tests {
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::create_dir_all(tree.join("sub")).unwrap();
         std::fs::write(tree.join("sub").join("file"), b"written by this process").unwrap();
-        let tracked = carries_provenance(&tree.join("sub").join("file"));
+        let tracked = carries(&tree.join("sub").join("file"), PROVENANCE_XATTR);
         let own = std::process::Command::new("/usr/bin/xattr")
             .args(["-d", PROVENANCE_XATTR])
             .arg(tree.join("sub").join("file"))
@@ -1156,7 +908,7 @@ mod tests {
         if tracked {
             assert!(own.success(), "a tracked xattr -d reports success…");
             assert!(
-                carries_provenance(&tree.join("sub").join("file")),
+                carries(&tree.join("sub").join("file"), PROVENANCE_XATTR),
                 "…and removes nothing"
             );
         }
@@ -1170,7 +922,7 @@ mod tests {
                 HealOutcome::Clean
             }
         );
-        assert!(!carries_provenance(&tree.join("sub").join("file")));
+        assert!(!carries(&tree.join("sub").join("file"), PROVENANCE_XATTR));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1183,7 +935,7 @@ mod tests {
         let measured = measure_tracked(&d).expect("a writable scratch dir must be measurable");
         let witness = d.join("witness");
         std::fs::write(&witness, b"w").unwrap();
-        assert_eq!(measured, carries_provenance(&witness));
+        assert_eq!(measured, carries(&witness, PROVENANCE_XATTR));
         let leftovers: Vec<_> = std::fs::read_dir(&d)
             .unwrap()
             .flatten()
@@ -1194,13 +946,10 @@ mod tests {
             leftovers.is_empty(),
             "the probe must be removed: {leftovers:?}"
         );
-        // The cached answer agrees with the fresh one.
-        assert_eq!(process_is_tracked(&d), measured);
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// An unwritable scratch cannot be measured — `None`, so the predicate answers `false`
-    /// for the step at hand (it never routes on a measurement it did not take).
+    /// An unwritable scratch cannot be measured — `None`, never a guess.
     #[test]
     fn an_unwritable_scratch_is_unmeasurable() {
         let d = tmp("unwritable");
@@ -1208,95 +957,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A probe that could not be TAKEN must not decide the process's answer: after a call
-    /// with an unmeasurable scratch, a call with a measurable one still agrees with a
-    /// direct measurement. The invariant is asserted in the order-independent form on
-    /// purpose — the cache is process-wide and the tests in this module share it, so this
-    /// must hold whether or not another test primed it first (audit 2026-09-15).
+    /// The store heal sweeps what the retired lanes left: every `<build>.tracked-install`
+    /// record and the tag-relay memo go, whatever the heal found; a build, its `.ready` and
+    /// a file that merely ENDS in the suffix with no build before it stay.
     #[test]
-    fn an_unmeasurable_probe_does_not_pin_the_process_answer() {
-        let d = tmp("unpinned");
-        let _ = process_is_tracked(&d.join("absent").join("deeper"));
-        let fresh = measure_tracked(&d).expect("a writable scratch dir must be measurable");
-        assert_eq!(
-            process_is_tracked(&d),
-            fresh,
-            "a scratch dir that could not be probed must not pin the process-wide answer"
+    fn the_store_heal_sweeps_the_retired_lanes_leftovers() {
+        let d = tmp("leftovers");
+        let layout = crate::store::Layout {
+            prefix: d.join("pkg"),
+        };
+        let build = layout.build_dir("trust", 9192);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        let store = build.parent().unwrap().to_path_buf();
+        for keep in ["9192.ready", ".tracked-install"] {
+            std::fs::write(store.join(keep), b"x").unwrap();
+        }
+        for stale in ["9192.tracked-install", "8590.tracked-install"] {
+            std::fs::write(store.join(stale), b"tracked-install v1\nwhy=x\n").unwrap();
+        }
+        std::fs::write(layout.prefix.join("tag-relay.tried"), b"1\t/x\n").unwrap();
+        let healed = heal_store_with(&layout, |_, _| HealOutcome::Clean);
+        assert_eq!(healed, HealOutcome::Clean);
+        assert!(!store.join("9192.tracked-install").exists());
+        assert!(!store.join("8590.tracked-install").exists());
+        assert!(!layout.prefix.join("tag-relay.tried").exists());
+        assert!(store.join("9192.ready").exists() && build.join("bin").is_dir());
+        assert!(
+            store.join(".tracked-install").exists(),
+            "no build named: not a record"
         );
         let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// THE WALK, pure: the executable, every `.app` above it in any case, and the
-    /// wrapper around `Contents/MacOS/` whatever it is called — nearest first, each once.
-    /// The directories MEASURED not to matter (`Contents/`, `Contents/MacOS/`, a plain
-    /// parent) are never looked at, and both bundles of a nested helper are, because the
-    /// kernel charges the process to the OUTERMOST one (measured 2026-09-23; the table is
-    /// on [`taint_candidates`]).
-    #[test]
-    fn the_taint_walk_names_the_executable_and_every_bundle_above_it() {
-        let walk = |p: &str| -> Vec<String> {
-            taint_candidates(Path::new(p))
-                .map(|c| c.display().to_string())
-                .collect()
-        };
-        assert_eq!(
-            walk("/Applications/aterm.app/Contents/MacOS/aterm"),
-            [
-                "/Applications/aterm.app/Contents/MacOS/aterm",
-                "/Applications/aterm.app"
-            ],
-            "the shipped app: the executable and its bundle once, not Contents/ or MacOS/"
-        );
-        assert_eq!(
-            walk("/A/Outer.app/Contents/Helpers/Inner.app/Contents/MacOS/tool"),
-            [
-                "/A/Outer.app/Contents/Helpers/Inner.app/Contents/MacOS/tool",
-                "/A/Outer.app/Contents/Helpers/Inner.app",
-                "/A/Outer.app",
-            ],
-            "a nested helper: both bundles, nearest first — the OUTER one is the one \
-             the kernel charges, so stopping at the nearest would miss it"
-        );
-        assert_eq!(
-            walk("/A/aterm.App/Contents/MacOS/aterm"),
-            ["/A/aterm.App/Contents/MacOS/aterm", "/A/aterm.App"],
-            "a case variant of `.app` is charged (measured), so it is a candidate"
-        );
-        assert_eq!(
-            walk("/A/Svc.xpc/Contents/MacOS/svc"),
-            ["/A/Svc.xpc/Contents/MacOS/svc", "/A/Svc.xpc"],
-            "a non-`.app` wrapper around Contents/MacOS/ is charged (measured)"
-        );
-        assert_eq!(
-            walk("/A/Q/Contents/MacOS/tool"),
-            ["/A/Q/Contents/MacOS/tool", "/A/Q"],
-            "a wrapper with no extension measured clean, and is a candidate anyway: a \
-             false positive costs a copy, a miss costs a tagged toolchain"
-        );
-        assert_eq!(
-            walk("/A/O.app/Contents/XPCServices/S.xpc/Contents/MacOS/s"),
-            [
-                "/A/O.app/Contents/XPCServices/S.xpc/Contents/MacOS/s",
-                "/A/O.app/Contents/XPCServices/S.xpc",
-                "/A/O.app",
-            ],
-            "an XPC service inside an app: its wrapper and the app"
-        );
-        assert_eq!(
-            walk("/A/C.app/bin/tool"),
-            ["/A/C.app/bin/tool", "/A/C.app"],
-            "an `.app` above counts wherever the executable sits inside it (measured)"
-        );
-        assert_eq!(
-            walk("/Users//x/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc"),
-            ["/Users//x/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc"],
-            "a free-standing binary: itself alone"
-        );
-        assert_eq!(
-            walk("/tmp/not-a-bundle.apps/bin/tool"),
-            ["/tmp/not-a-bundle.apps/bin/tool"],
-            "only an `app` extension counts, not a name that merely starts with it"
-        );
     }
 }
 

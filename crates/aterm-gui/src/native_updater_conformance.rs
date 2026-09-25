@@ -851,10 +851,24 @@ fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
 /// phase asking for a quiet moment, its `grace_expired` is every later phase —
 /// so a rule that drifts out of one of them fails here rather than on a user's
 /// terminal.
+///
+/// THE MASTERS ARE ENUMERATED TOO (the 2026-09-22/23 update audit, plan P1-3):
+/// this used to pin `masters_quiet: true`, so the one gate that held every
+/// automatic attempt behind a `--hold` pane or a flooding job was invisible to
+/// the binding. `masters_quiet` now comes from the REAL peek over real PTY
+/// masters — a quiet live session, a live one with unread output, and an
+/// EXITED one whose slave hung up with bytes still queued — and the shipping
+/// gate must park exactly where the model does AND the masters allow: a live
+/// session's unread output holds it (until the `Land` bound has waited
+/// `PRELAUNCH_LAND_MAX_WAITS` times); an exited pane is never counted as
+/// output, and holds it only as what it is — a dead session — until its pane
+/// closes.
+#[cfg(unix)]
 #[test]
 fn real_park_gate_admits_exactly_the_model_s_reader_park() {
     use crate::app_update_handoff::{
-        ParkGate, ParkGateFacts, prelaunch_hold_cap, prelaunch_park_admitted,
+        PRELAUNCH_LAND_MAX_WAITS, ParkGate, ParkGateFacts, handoff_masters_closed,
+        handoff_masters_have_activity, prelaunch_hold_cap, prelaunch_park_admitted,
     };
     use crate::native_update_auto_intent::ActivityFacts;
     let model = native_update_auto_intent_model();
@@ -881,6 +895,64 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
         focused: true,
         consent_warmup: false,
     };
+    // Real masters. An EXITED pane: its command wrote, then its slave closed —
+    // the state a `--hold` pane sits in for as long as it stays open.
+    let openpty = || {
+        let (mut master, mut slave) = (-1i32, -1i32);
+        // SAFETY: openpty(3) into two valid out-slots; no termios/winsize.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        (master, slave)
+    };
+    let write_byte = |fd: i32| {
+        // SAFETY: bounded write of a stack byte to a test-owned slave.
+        assert_eq!(unsafe { libc::write(fd, [0x62u8].as_ptr().cast(), 1) }, 1);
+    };
+    let (quiet_master, quiet_slave) = openpty();
+    let (busy_master, busy_slave) = openpty();
+    write_byte(busy_slave);
+    let (exited_master, exited_slave) = openpty();
+    write_byte(exited_slave);
+    aterm_pty::close_fd(exited_slave);
+    let exited = vec![(3u64, exited_master, 4003i32)];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !handoff_masters_closed(&exited) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the exited slave hung up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let desks = [
+        (
+            "a quiet live session",
+            vec![(1u64, quiet_master, 4001i32)],
+            true,
+        ),
+        (
+            "unread live output",
+            vec![(2u64, busy_master, 4002i32)],
+            false,
+        ),
+        ("an exited --hold pane", exited.clone(), true),
+        (
+            "an exited pane beside a quiet live one",
+            vec![
+                (1u64, quiet_master, 4001i32),
+                (3u64, exited_master, 4003i32),
+            ],
+            true,
+        ),
+    ];
+
     for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
         for quiet in [false, true] {
             for grace_expired in [false, true] {
@@ -895,28 +967,56 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                 );
                 // The shipping predicate, given the same two facts: the
                 // model's `grace_expired` is any phase after the first.
-                let phase = if grace_expired {
-                    ApplyPhase::PreferOutputGap
+                let phases: &[ApplyPhase] = if grace_expired {
+                    &[
+                        ApplyPhase::PreferOutputGap,
+                        ApplyPhase::KeysOnly,
+                        ApplyPhase::Land,
+                    ]
                 } else {
-                    ApplyPhase::PreferIdle
+                    &[ApplyPhase::PreferIdle]
                 };
-                let real = prelaunch_park_admitted(
-                    ParkGateFacts {
-                        mode,
-                        phase,
-                        activity: calm(quiet),
-                        masters_quiet: true,
-                        held_for: std::time::Duration::ZERO,
-                    },
-                    prelaunch_hold_cap(mode),
-                ) == ParkGate::Park;
-                assert_eq!(
-                    real, model_parks,
-                    "{mode:?} quiet={quiet} grace_expired={grace_expired}: the shipping gate \
-                     and the model agree exactly"
-                );
+                for &phase in phases {
+                    for (desk, live, quiet_masters) in &desks {
+                        let masters_quiet = !handoff_masters_have_activity(live);
+                        let masters_alive = !handoff_masters_closed(live);
+                        assert_eq!(masters_quiet, *quiet_masters, "the real peek over {desk}");
+                        for land_waits in [0, PRELAUNCH_LAND_MAX_WAITS] {
+                            let real = prelaunch_park_admitted(
+                                ParkGateFacts {
+                                    mode,
+                                    phase,
+                                    activity: calm(quiet),
+                                    masters_quiet,
+                                    masters_alive,
+                                    land_waits,
+                                    held_for: std::time::Duration::ZERO,
+                                },
+                                prelaunch_hold_cap(mode),
+                            ) == ParkGate::Park;
+                            let bound_waited =
+                                phase == ApplyPhase::Land && land_waits >= PRELAUNCH_LAND_MAX_WAITS;
+                            assert_eq!(
+                                real,
+                                model_parks && masters_alive && (masters_quiet || bound_waited),
+                                "{mode:?} quiet={quiet} {phase:?} {desk} after {land_waits} \
+                                 waits: the shipping gate parks exactly where the model \
+                                 does and the masters allow"
+                            );
+                        }
+                    }
+                }
             }
         }
+    }
+    for fd in [
+        quiet_slave,
+        busy_slave,
+        quiet_master,
+        busy_master,
+        exited_master,
+    ] {
+        aterm_pty::close_fd(fd);
     }
 
     // NEGATIVE CONTROL: the mutant parks with neither fact, and the invariant
@@ -941,6 +1041,8 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                     phase: ApplyPhase::PreferIdle,
                     activity: calm(false),
                     masters_quiet: true,
+                    masters_alive: true,
+                    land_waits: 0,
                     held_for: std::time::Duration::ZERO,
                 },
                 prelaunch_hold_cap(mode),
@@ -1092,8 +1194,12 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
     assert_exact_model_action(&model, "PhysicalFailure", &keys_only, &latched);
     let aged = model.successors("Advance", &latched)[0].clone();
     assert_exact_model_action(&model, "Advance", &latched, &aged);
-    let lapsed = model.successors("Lapse", &aged)[0].clone();
-    assert_exact_model_action(&model, "Lapse", &aged, &lapsed);
+    // The latch's deadline passes first: a lapse is only ever AT the deadline
+    // (plan P0-6).
+    let due = model.successors("Due", &aged)[0].clone();
+    assert_exact_model_action(&model, "Due", &aged, &due);
+    let lapsed = model.successors("Lapse", &due)[0].clone();
+    assert_exact_model_action(&model, "Lapse", &due, &lapsed);
     assert_eq!(lapsed["phase"], 3);
 
     // The shipping App on the same arc: anchored past the bound, latched with
@@ -1110,6 +1216,7 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
     app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
         build,
         dmg_sha256: [0xab; 32],
+        activation: false,
         retry_at: Some(now - std::time::Duration::from_secs(1)),
     });
     assert!(
@@ -1156,6 +1263,323 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
             HandoffFailureLane::ActivityRevoked,
             "{mode:?}: a park miss never reaches a physical shape"
         );
+    }
+}
+
+/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-6), bound to the model step that
+/// describes it: `BundleSwap` — the failed candidate had already boot-applied the
+/// bundle, so the next reconcile retires the download for the installed-bundle
+/// activation of the SAME update — keeps the latch and its deadline.
+///
+/// The shipping arc, driven for real: a STRUCTURAL failure returns through
+/// `abort_reaped_native_apply_before_reconcile` (a latch ten minutes out), then
+/// `reconcile_native_update_facts` is fed the disk that failure left (the
+/// installed bundle IS the target build). The real latch, projected onto the
+/// model's `latched`/`due`/`swapped`, must be exactly the model's post-`BundleSwap`
+/// state. The negative control is the mutant `BundleSwapClearsLatch` — the
+/// v0.87–v0.91 retire arm, which cleared the latch and let the confirming retry
+/// run 0.5 s after the failure — and `NoEarlyRelease` catches it.
+#[test]
+fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
+    use crate::app_native::{
+        HandoffFailureLane, NativeUpdateReconcileFacts, NativeUpdateReconcileTicket,
+        PhysicalFailureShape,
+    };
+    use crate::native_updater_service::{ApplyAttemptTicket, InstalledUpdate};
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let model = native_update_apply_ladder_model();
+
+    // The model: KeysOnly, a physical failure latches, and the bundle swaps.
+    let mut keys_only = model.init_state();
+    for _ in 0..2 {
+        keys_only = model.successors("Advance", &keys_only)[0].clone();
+    }
+    let latched = model.successors("PhysicalFailure", &keys_only)[0].clone();
+
+    // The shipping App on the same arc.
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = crate::App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    let ticket = ApplyAttemptTicket::for_test(build, COMMIT, &"ab".repeat(32));
+    ticket.make_current_apply_for_test(&mut app.native_updater_service);
+    let _ = app.abort_reaped_native_apply_before_reconcile(
+        &ticket,
+        "overlap handoff failed safely: handoff proof ended AdoptionMismatch".to_string(),
+        HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+    );
+    let before = app
+        .auto_apply_manual_only
+        .expect("PRECONDITION: the structural failure latched the lane");
+    let _ = app.reconcile_native_update_facts(NativeUpdateReconcileFacts {
+        _ticket: NativeUpdateReconcileTicket::for_test(1),
+        observation_sequence: 1,
+        observed_at: std::time::Instant::now(),
+        durable: Some(DurableUpdateStatus {
+            current_build: app.native_updater_service.snapshot().current_build,
+            staged_dmg_sha256: Some("ab".repeat(32)),
+            ..status(Some(build), 0)
+        }),
+        installed: Some(InstalledUpdate {
+            build,
+            commit: COMMIT.to_string(),
+            version: None,
+            receipt_build: Some(build),
+            receipt_dmg_sha256: Some("ab".repeat(32)),
+        }),
+    });
+    assert!(
+        app.native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .is_some_and(|staged| staged.build == build && staged.is_installed_activation()),
+        "PRECONDITION: the download retired for the activation of the same build"
+    );
+
+    // Project the real latch onto the model's variables.
+    let after = app.auto_apply_manual_only;
+    let now = std::time::Instant::now();
+    let mut projected = latched.clone();
+    projected.insert("swapped", 1);
+    projected.insert("latched", i64::from(after.is_some()));
+    projected.insert(
+        "due",
+        i64::from(
+            after
+                .and_then(|manual| manual.retry_at)
+                .is_some_and(|at| at <= now),
+        ),
+    );
+    assert_exact_model_action(&model, "BundleSwap", &latched, &projected);
+    assert_eq!(
+        after.map(|manual| manual.retry_at),
+        Some(before.retry_at),
+        "the deadline is the one the failure bought"
+    );
+
+    // NEGATIVE CONTROL: the mutant clears the latch before its deadline, the
+    // invariant catches it, and the shipping reducer did not take that step.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let cleared = buggy.successors("BundleSwapClearsLatch", &latched)[0].clone();
+    assert!(!buggy.check_invariant("NoEarlyRelease", &cleared));
+    assert_ne!(
+        cleared, projected,
+        "the shipping retire arm must not be the v0.87–v0.91 mutant"
+    );
+}
+
+/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-3), bound to the model steps that
+/// describe it: a capture failure is sorted into a MISS or a REFUSAL by its
+/// type, and a refusal never reaches the activity lane.
+///
+/// Every `CaptureFailure` variant goes through the shipping
+/// `classify_capture_failure`. Timing and storage are `Missed` — the model's
+/// `ParkMissed`, which the lane re-parks on the next rung. A `Refused` is
+/// `Refused`, never `Missed`; its stand-down is typed `CaptureRefused`, and the
+/// shipping `HandoffFailureLane::classify` files that in the refusal lane on
+/// both automatic modes — even with the main thread's activity flag raised —
+/// which is the model's healthy `CaptureRefused` (`quiet` and `refusals`
+/// untouched).
+///
+/// NEGATIVE CONTROL: the retired mapping, replayed through the shipping
+/// functions it used — every capture `Err` became `ParkAttempt::Missed`, the
+/// last rung's `park_miss_disposition` stood the successor down as
+/// `ActivityRevoked`, and `classify` filed THAT in the activity lane. Projected
+/// onto the model it is the mutant `CaptureRefusedAsActivity` (the terminal reads
+/// busy, one refusal re-filed), and `RefusalNeverRetriesAsActivity` catches it.
+#[cfg(unix)]
+#[test]
+fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
+    use crate::app_native::HandoffFailureLane;
+    use crate::app_update_handoff::{
+        CaptureFailure, CaptureRefusal, PRELAUNCH_MAX_PARK_MISSES, ParkAttempt,
+        ParkMissDisposition, capture_refusal_stand_down, classify_capture_failure,
+        park_miss_disposition,
+    };
+    let model = native_update_apply_ladder_model();
+
+    // The model at Land with a refusing desk and a quiet terminal: every one of
+    // the park's alternatives is enabled there.
+    let mut land = model.init_state();
+    for _ in 0..3 {
+        land = model.successors("Advance", &land)[0].clone();
+    }
+    let quiet = model.successors("Quiet", &land)[0].clone();
+    let refusing = model.successors("DeskRefuses", &quiet)[0].clone();
+    assert_exact_model_action(&model, "DeskRefuses", &quiet, &refusing);
+
+    // TIMING AND STORAGE ARE MISSES — the model's `ParkMissed`.
+    for failure in [
+        CaptureFailure::Deadline { freeze_ms: 20 },
+        CaptureFailure::EngineBusy,
+        CaptureFailure::Storage,
+    ] {
+        match classify_capture_failure(&failure) {
+            ParkAttempt::Missed(reason) => assert_eq!(reason, failure.to_string()),
+            other => panic!("{failure:?} is timing, so it re-parks: {other:?}"),
+        }
+        let missed = model.successors("ParkMissed", &refusing)[0].clone();
+        assert_exact_model_action(&model, "ParkMissed", &refusing, &missed);
+    }
+
+    // A REFUSAL IS A REFUSAL, whether or not it names a session.
+    for failure in [
+        CaptureFailure::Refused {
+            local_id: Some(3),
+            cause: "visible checkpoint set could not be committed canonically: too many \
+                    sessions"
+                .to_string(),
+        },
+        CaptureFailure::Refused {
+            local_id: None,
+            cause: "duplicate local id".to_string(),
+        },
+    ] {
+        let CaptureFailure::Refused { local_id, .. } = &failure else {
+            unreachable!("built as a refusal");
+        };
+        let refusal = match classify_capture_failure(&failure) {
+            ParkAttempt::Refused(refusal) => refusal,
+            ParkAttempt::Missed(reason) => {
+                panic!("a deterministic refusal was filed as a park miss: {reason}")
+            }
+            other => panic!("{failure:?} must be Refused: {other:?}"),
+        };
+        assert_eq!(
+            refusal,
+            CaptureRefusal {
+                local_id: *local_id,
+                cause: failure.to_string(),
+            }
+        );
+        let stand_down = capture_refusal_stand_down(&refusal);
+        assert_eq!(
+            stand_down.outcome,
+            crate::UpdateHandoffOutcome::CaptureRefused
+        );
+        if let Some(local_id) = local_id {
+            assert!(
+                stand_down
+                    .detail
+                    .contains(&format!("refused session {local_id}")),
+                "the stand-down names the session: {}",
+                stand_down.detail
+            );
+        }
+        for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+            for revoked_by_activity in [false, true] {
+                assert_eq!(
+                    HandoffFailureLane::classify(
+                        mode,
+                        stand_down.outcome,
+                        crate::ChildDeathEvidence::Unobserved,
+                        revoked_by_activity,
+                    ),
+                    HandoffFailureLane::Refused,
+                    "{mode:?} activity={revoked_by_activity}: a refusal is its own lane"
+                );
+            }
+        }
+        // …which is the model's healthy `CaptureRefused`: answered, not busy.
+        let answered = model.successors("CaptureRefused", &refusing)[0].clone();
+        assert_exact_model_action(&model, "CaptureRefused", &refusing, &answered);
+        assert_eq!(answered["quiet"], refusing["quiet"]);
+        assert_eq!(answered["refusals"], 0);
+
+        // NEGATIVE CONTROL — the retired mapping through the shipping functions.
+        let retired = ParkAttempt::Missed(failure.to_string());
+        let ParkAttempt::Missed(reason) = retired else {
+            unreachable!("the retired mapping");
+        };
+        let ParkMissDisposition::StandDown(retired_stand_down) =
+            park_miss_disposition(PRELAUNCH_MAX_PARK_MISSES, reason)
+        else {
+            panic!("past the last rung the retired lane stood down");
+        };
+        assert_eq!(
+            HandoffFailureLane::classify(
+                ApplyMode::AutomaticPastGrace,
+                retired_stand_down.outcome,
+                crate::ChildDeathEvidence::Unobserved,
+                false,
+            ),
+            HandoffFailureLane::ActivityRevoked,
+            "the retired mapping filed the refusal as the machine being busy"
+        );
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        assert!(
+            model
+                .successors("CaptureRefusedAsActivity", &refusing)
+                .is_empty(),
+            "the healthy ladder has no refusal it files as activity"
+        );
+        let refiled = buggy.successors("CaptureRefusedAsActivity", &refusing)[0].clone();
+        assert_eq!(
+            refiled["quiet"], 0,
+            "the retired lane read the refusal as activity"
+        );
+        assert!(!buggy.check_invariant("RefusalNeverRetriesAsActivity", &refiled));
+    }
+}
+
+/// REAL REFUSED DESKS through the shipping park capture (plan P0-3): the four
+/// desks the 2026-09-22/23 audit found the outgoing build refusing on — a NUL
+/// in a reported cwd, a 5K fullscreen grid (99x338, over the old per-grid
+/// cap), a styled full-width row ending in a combining mark, and a parser left
+/// inside an unterminated OSC — each park either (degraded, if it must) or
+/// comes back `Refused`. None is ever a `Missed`: that answer re-parked the
+/// same refusal on a wider rung and then retried it as the machine being busy
+/// every fifteen minutes, forever. Before the producer slice every one of these
+/// was a capture `Err`, and before this slice every capture `Err` was `Missed`.
+#[cfg(unix)]
+#[test]
+fn real_refused_desks_park_degraded_or_refused_and_never_missed() {
+    use crate::app_update_handoff::ParkAttempt;
+    let caps = crate::seamless::WireCaps::current();
+    let mut combining_row = b"\x1b[1m".to_vec();
+    combining_row.extend_from_slice(&[b'a'; 148]);
+    combining_row.extend_from_slice("e\u{301}".as_bytes());
+    let desks = [
+        (
+            "a NUL in the reported cwd",
+            None,
+            b"\x1b]7;file:///tmp/a%00b\x07".to_vec(),
+        ),
+        (
+            "a 5K fullscreen grid",
+            Some((99, 338)),
+            b"$ ls\r\n".to_vec(),
+        ),
+        (
+            "a styled full-width row ending in a combining mark",
+            Some((55, 149)),
+            combining_row,
+        ),
+        (
+            "a parser left inside an unterminated OSC",
+            None,
+            b"\x1b]0;x".to_vec(),
+        ),
+    ];
+    for (desk, geometry, bytes) in desks {
+        let mut app = crate::App::headless_for_test();
+        for session in app.pool.iter() {
+            // A fresh engine AT the desk's geometry rather than a resize under the
+            // held guard: the resize would be `grep_guard`'s L0 shape, whose
+            // `#[cfg(test)]` strip does not see this file's inner attribute.
+            if let Some((rows, cols)) = geometry {
+                *crate::term_lock(&session.term) = aterm_core::terminal::Terminal::new(rows, cols);
+            }
+            crate::term_lock(&session.term).process(&bytes);
+        }
+        match app.capture_park_outcome_for_conformance(caps) {
+            Ok(_repainted) => {}
+            Err(ParkAttempt::Refused(_)) => {}
+            Err(ParkAttempt::Missed(reason)) => {
+                panic!("{desk}: a deterministic desk was filed as a park miss: {reason}")
+            }
+            Err(other) => panic!("{desk}: the capture answers only a miss or a refusal: {other:?}"),
+        }
     }
 }
 

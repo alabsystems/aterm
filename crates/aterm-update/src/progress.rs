@@ -26,8 +26,8 @@
 //!
 //! # Honesty
 //!
-//! * `bytes_total` is the GitHub API's asset size, `0` when it was not reported —
-//!   a host must render that as "unknown", never divide by it.
+//! * `bytes_total` is `0` — the download host declares no size up front — and a
+//!   host must render that as "unknown", never divide by it.
 //! * `bytes_done` is the `.part` file's size and can DROP: curl `--retry`
 //!   truncates its sink between attempts. A host clamps and moves on.
 //! * A report is emitted on a worker thread; the observer must be cheap and must
@@ -56,11 +56,11 @@ pub enum Progress {
     /// policy and the atomic stage publish — seconds each, one phase.
     Verifying { version: String },
     /// Verified and published: the in-session apply lane applies it in place
-    /// (automatic by default, forced within ~2 min); the next launch picks it up
-    /// only if no handoff ever completes.
+    /// (automatic by default, landing within `aterm-gui`'s `LANDS_WITHIN`, 15
+    /// minutes); the next launch picks it up only if no handoff ever completes.
     Staged { version: String, build: u64 },
-    /// The download was cut short by something that will heal on its own (a
-    /// GitHub rate limit); the check backs off and retries later.
+    /// The download was cut short by something that will heal on its own (the
+    /// download host answering 429); the check backs off and retries later.
     Deferred { detail: String },
     /// A check that had begun downloading failed. `detail` is the same sentence
     /// `status.toml` records.
@@ -107,11 +107,11 @@ pub(crate) fn take_download_began() -> bool {
 /// reporting [`Progress::Downloading`] on every size change; the guard stops and
 /// joins the poller on drop. With no observer installed nothing is spawned.
 ///
-/// The first report (0 of `total`) is emitted synchronously, so a host sees the
-/// download begin even if curl finishes before the first poll.
+/// The first report (0 of an unknown total) is emitted synchronously, so a host sees
+/// the download begin even if curl finishes before the first poll.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn watch_download(dest: &Path, version: &str, total: u64) -> DownloadWatch {
+pub(crate) fn watch_download(dest: &Path, version: &str) -> DownloadWatch {
     let inert = DownloadWatch {
         stop: Arc::new(AtomicBool::new(true)),
         handle: None,
@@ -122,7 +122,7 @@ pub(crate) fn watch_download(dest: &Path, version: &str, total: u64) -> Download
     report(Progress::Downloading {
         version: version.to_string(),
         bytes_done: 0,
-        bytes_total: total,
+        bytes_total: 0,
     });
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
@@ -146,7 +146,7 @@ pub(crate) fn watch_download(dest: &Path, version: &str, total: u64) -> Download
                     report(Progress::Downloading {
                         version: version.clone(),
                         bytes_done: n,
-                        bytes_total: total,
+                        bytes_total: 0,
                     });
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn watching_without_an_observer_spawns_nothing() {
         let dir = std::env::temp_dir();
-        let w = watch_download(&dir.join("never-created.part"), "0.1.0", 10);
+        let w = watch_download(&dir.join("never-created.part"), "0.1.0");
         assert!(w.handle.is_none());
         assert!(w.stop.load(Ordering::Acquire));
     }

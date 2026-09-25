@@ -732,12 +732,19 @@ mod erase_pending_wrap_tests {
     }
 
     #[test]
-    fn ed0_at_pending_wrap_then_print_overwrites_last_column() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[1;80H!\x1b[J?");
-        assert_eq!(glyph(&term, 0, 79), '?');
-        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
-        assert_eq!(cursor(&term), (0, 79));
+    fn ed_at_pending_wrap_then_print_overwrites_last_column() {
+        // ED 0, 1 and 2 each reset the deferred wrap, so the next print lands
+        // on the parked last column instead of wrapping. One row per former test.
+        for ed in [b"\x1b[J".as_slice(), b"\x1b[1J", b"\x1b[2J"] {
+            let mut term = Terminal::new(24, 80);
+            term.process(b"\x1b[1;80H!");
+            term.process(ed);
+            term.process(b"?");
+            let label = String::from_utf8_lossy(ed);
+            assert_eq!(glyph(&term, 0, 79), '?', "{label}");
+            assert!(row_is_blank(&term, 1), "{label}: nothing wrapped to row 1");
+            assert_eq!(cursor(&term), (0, 79), "{label}");
+        }
     }
 
     #[test]
@@ -761,24 +768,6 @@ mod erase_pending_wrap_tests {
         assert_eq!(row_glyphs(&term, 23).trim(), "?");
         assert_eq!(glyph(&term, 23, 79), '?');
         assert_eq!(cursor(&term), (23, 79));
-    }
-
-    #[test]
-    fn ed1_at_pending_wrap_then_print_overwrites_last_column() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[1;80H!\x1b[1J?");
-        assert_eq!(glyph(&term, 0, 79), '?');
-        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
-        assert_eq!(cursor(&term), (0, 79));
-    }
-
-    #[test]
-    fn ed2_at_pending_wrap_then_print_overwrites_last_column() {
-        let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[1;80H!\x1b[2J?");
-        assert_eq!(glyph(&term, 0, 79), '?');
-        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
-        assert_eq!(cursor(&term), (0, 79));
     }
 
     #[test]

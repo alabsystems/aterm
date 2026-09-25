@@ -12,9 +12,11 @@
 //! a CI/local backstop:
 //!
 //! ```text
-//! TY_BIN=$HOME/trust/first-party/ty/target/release/ty \
-//!   cargo run -p aterm-spec --example trust_models
+//! targo --unverified run -p aterm-spec --example trust_models
 //! ```
+//!
+//! The checker is the one [`aterm_spec::verify::find_ty`] discovers (the atpkg
+//! store's shim, then PATH) — not a second search of its own.
 //!
 //! aterm keeps its own (API-identical) `aterm_spec::derive` generator rather than
 //! depending on `trust-spec-temporal`; this example reuses `Model::to_tla` /
@@ -31,40 +33,6 @@ use aterm_spec::derive::{
     ring_model, snapshot_model, subscribe_model, tier_residency_model, transact_model,
     window_routing_model,
 };
-
-/// Locate the embedded ty checker (same precedence as the derived-ty test).
-fn find_ty() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("TY_BIN") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        for rel in [
-            "trust/first-party/ty/target/release/ty",
-            "trust/build/host/stage2/bin/ty",
-            "ty/target/release/ty",
-        ] {
-            let p = PathBuf::from(&home).join(rel);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg("command -v ty")
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    None
-}
 
 /// `ty check` exits 0 even on a violation, so the verdict is parsed from stdout.
 fn proved_exhaustive(out: &str) -> bool {
@@ -166,10 +134,10 @@ fn main() -> ExitCode {
         window_routing_model(),
     ];
 
-    let Some(ty) = find_ty() else {
+    let Some(ty) = aterm_spec::verify::find_ty() else {
         eprintln!(
-            "aterm temporal gate: embedded ty checker not found (set TY_BIN or build \
-             $HOME/trust/first-party/ty) — FAILING fail-closed (a missing checker must never read ok)."
+            "aterm temporal gate: ty checker not found (`aterm pkg install ty`) — FAILING \
+             fail-closed (a missing checker must never read ok)."
         );
         return ExitCode::from(1);
     };

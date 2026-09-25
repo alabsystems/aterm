@@ -997,32 +997,6 @@ impl Host {
             .collect()
     }
 
-    /// The body at every column of the line on this frame: `(col, glyph,
-    /// cov, up/ch, dn/ch)` of the column's strongest segment.
-    fn body(&self) -> Vec<(u16, char, u8, f32, f32)> {
-        let rib = self.ribbon();
-        let cw = CW as f32;
-        let ch = CH as f32;
-        let l = line();
-        (COL0..COL0 + l.len() as u16)
-            .map(|col| {
-                let seg = rib
-                    .plan_segments()
-                    .iter()
-                    .filter(|s| {
-                        ((s.spine / ch) - 0.5).floor() as i64 == i64::from(ROW)
-                            && (s.x / cw).floor() as i64 == i64::from(col)
-                    })
-                    .max_by_key(|s| s.cov);
-                let glyph = l.chars().nth(usize::from(col - COL0)).unwrap_or(' ');
-                match seg {
-                    Some(s) => (col, glyph, s.cov, s.up / ch, s.dn / ch),
-                    None => (col, glyph, 0, 0.0, 0.0),
-                }
-            })
-            .collect()
-    }
-
     /// The ring's declined and in-flight-licensed rows so far, oldest
     /// first: `origin->target reason/licence @ms`.
     fn ring_notes(&self) -> String {
@@ -1585,43 +1559,3 @@ fn claude_code_s_recorded_frames_mid_turn_keep_every_boundary_space_lit_at_25cps
 }
 
 // ---- the body, for the owner's screenshot --------------------------------
-
-/// The per-column body extents on the settled final frame of one take —
-/// the cursor-cell Ink composer, the space before a 1200 ms pause — so the
-/// thin-vs-tall bodies in the owner's screenshot can be compared. A REPORT,
-/// not a test: it asserts nothing, so it is ignored by default and run by
-/// name with `--ignored` when the numbers are wanted.
-#[test]
-#[ignore = "a report: prints one take's body extents and asserts nothing — run with --ignored to read it"]
-fn the_final_frame_s_body_extents_are_printed_for_one_take() {
-    let mut h = Host::new(
-        ink(Shape {
-            cursor_cell: true,
-            ..Shape::default()
-        }),
-        Seam::Classed,
-    );
-    for (i, burst) in BURSTS.iter().enumerate() {
-        let mut keys: Vec<char> = burst.chars().collect();
-        if i + 1 < BURSTS.len() {
-            keys.push(' ');
-        }
-        for (j, &ch) in keys.iter().enumerate() {
-            let ms = if j == 0 && i > 0 { 1200 } else { KEY_MS };
-            h.key_after(ch, ms, j + 1 == keys.len());
-        }
-        if i + 1 < BURSTS.len() {
-            h.pause_train(1200);
-        }
-    }
-    h.idle(SETTLE_MS);
-    println!(
-        "body at +{} ms, per column (col glyph cov up/ch dn/ch):",
-        h.ms()
-    );
-    for (col, glyph, cov, up, dn) in h.body() {
-        println!("  {col:>2} {glyph:?} cov={cov:>3} up={up:.2} dn={dn:.2}");
-    }
-    println!("cohorts: {:?}", h.cohort_rows());
-    println!("slabs_per_cell={}", h.ribbon().slabs_per_cell());
-}

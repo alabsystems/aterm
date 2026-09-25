@@ -14,7 +14,8 @@
 //! The law: for every reference spelled `crate::<module>::<name>` resolving to an item
 //! declared in that module's own file, at least one declaration of the name must survive
 //! wherever the reference site survives. A name whose declarations cover both sides of a
-//! predicate (`unix` + `not(unix)`, the twin shape `seam.rs` uses four times over) is exempt,
+//! predicate (`unix` + `not(unix)`, the twin shape `seam.rs` uses four times over), or the
+//! exact three-way `unix` / `windows` / `not(any(unix, windows))` partition, is exempt,
 //! as is one with any declaration carrying no platform cfg.
 //!
 //! `cargo xtask gate cells` really cross-compiles and stays the authority; this rides along
@@ -96,7 +97,7 @@ fn violations(tree: &BTreeMap<String, String>) -> Vec<Violation> {
                 if !every.iter().any(|p| mentions_platform(p)) {
                     continue;
                 }
-                if twinned(&every) {
+                if twinned(&every) || unix_windows_other_partition(&gates) {
                     continue;
                 }
                 let active = &scan.active[i];
@@ -170,6 +171,19 @@ fn twinned(preds: &[&String]) -> bool {
             .iter()
             .any(|b| **a == format!("not({b})") || **b == format!("not({a})"))
     })
+}
+
+/// The portable third branch of a Unix/Windows/other implementation is not a
+/// simple `not(unix)` twin, but these three *bare* gates cover every target.
+/// Requiring each whole gate stack avoids treating a feature-gated Windows
+/// branch as complete coverage.
+fn unix_windows_other_partition(declarations: &[&Vec<String>]) -> bool {
+    let has = |pred: &str| {
+        declarations
+            .iter()
+            .any(|gates| gates.len() == 1 && gates[0] == pred)
+    };
+    has("unix") && has("windows") && has("not(any(unix,windows))")
 }
 
 fn mentions_platform(pred: &str) -> bool {
@@ -719,7 +733,7 @@ pub(crate) fn set_xattr_for_test(path: &Path, name: &str, value: &[u8]) -> io::R
 mod tests {
     GATE
     #[test]
-    fn a_tracked_install_record_is_reported_as_the_cause() {
+    fn a_tagged_file_is_counted() {
         crate::provenance::set_xattr_for_test(&trust_exe, "user.aterm.probe", b"1").unwrap();
     }
 }
@@ -825,6 +839,45 @@ pub fn e(
     );
     let found = violations(&tree);
     assert!(found.is_empty(), "{}", report(&found));
+}
+
+/// The real `metadata_io::open_regular` shape: all three platform branches
+/// cover the ungated lock-release probe, but an extra gate on one branch does
+/// not. This is the scanner's historical false positive and its negative
+/// control, run through the same source parser as the crate-wide law.
+#[test]
+fn the_unix_windows_other_partition_needs_three_bare_branches() {
+    let mut tree = BTreeMap::new();
+    let declarations = r#"
+#[cfg(unix)]
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> { todo!() }
+#[cfg(windows)]
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> { todo!() }
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> { todo!() }
+"#;
+    tree.insert("metadata_io.rs".to_string(), declarations.to_string());
+    tree.insert(
+        "lock.rs".to_string(),
+        "pub fn released(path: &Path) { let _ = crate::metadata_io::open_regular(path); }"
+            .to_string(),
+    );
+    assert!(violations(&tree).is_empty(), "all targets have one branch");
+
+    tree.insert(
+        "metadata_io.rs".to_string(),
+        declarations.replace(
+            "#[cfg(windows)]",
+            "#[cfg(all(windows, feature = \"extra\"))]",
+        ),
+    );
+    let found = violations(&tree);
+    assert_eq!(
+        found.len(),
+        1,
+        "an extra gate makes Windows coverage partial"
+    );
+    assert_eq!(found[0].path, "crate::metadata_io::open_regular");
 }
 
 /// Non-vacuity, half three: the scan must still see the crate. Every limit in this file's

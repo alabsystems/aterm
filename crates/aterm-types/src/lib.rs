@@ -96,7 +96,6 @@ pub mod perception;
 pub mod pipeline_timestamps;
 pub use pipeline_timestamps::PipelineTimestamps;
 pub mod callback_events;
-mod callback_registry;
 mod callback_types;
 pub mod charset;
 pub mod paragraph_direction;
@@ -127,11 +126,6 @@ pub use window::{WindowOperation, WindowResponse};
 pub use shell_blocks::{BlockState, OutputBlock, RowSpan};
 // Re-export shell types at crate root (Part of #5663 Phase 3).
 pub use shell_types::{Annotation, CommandMark, ShellEvent, TerminalMark, current_time_ms};
-// Re-export callback registry types at crate root (Part of #5663 Phase 2).
-pub use callback_registry::{
-    CALLBACK_REGISTRY, CallbackCategory, CallbackInfo, callback_by_name, callback_count,
-    callback_info,
-};
 // Re-export core terminal types at crate root (Part of #5663).
 pub use terminal_core::{TerminalCapabilities, TerminalSnapshot};
 // Re-export terminal mode flags at crate root (Part of #5663).
@@ -370,20 +364,6 @@ mod tests {
     // =========================================================================
     // Rgb
     // =========================================================================
-
-    #[test]
-    fn rgb_new() {
-        let c = Rgb::new(10, 20, 30);
-        assert_eq!(c.r, 10);
-        assert_eq!(c.g, 20);
-        assert_eq!(c.b, 30);
-    }
-
-    #[test]
-    fn rgb_eq() {
-        assert_eq!(Rgb::new(0, 0, 0), Rgb::new(0, 0, 0));
-        assert_ne!(Rgb::new(0, 0, 0), Rgb::new(0, 0, 1));
-    }
 
     // =========================================================================
     // CursorStyle

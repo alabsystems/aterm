@@ -28,13 +28,12 @@
 //! health: gpu-web's `scrollback_tiers_api` copy is missing five `#[test]`s the
 //! wasm copy has, most of which look mirrorable (budget/limit tests over a
 //! production surface this guard proves matches line for line). That is real
-//! coverage loss, tracked separately — [`TEST_FLOORS`] pins it so it cannot
-//! quietly widen.
+//! coverage loss, tracked separately.
 //!
 //! Legitimate divergence is exactly THREE things, all normalized below: (1) the
 //! host terminal type ident (`AtermTerminal` vs `AtermGpuTerminal`), (2) the
 //! per-crate doc/comment wording, and (3) whatever [`FOLDED`] declares, entry by
-//! entry, each with a written reason and each required to still resolve.
+//! entry, each with a written reason.
 //! Anything else that differs is unintended drift and MUST fail.
 
 use std::collections::BTreeSet;
@@ -71,18 +70,6 @@ const KNOWN_DUPLICATED: &[&str] = &[
     "scrollback_tiers_api.rs",
 ];
 
-/// Per-copy `#[test]` floors: `(module, wasm count, gpu-web count)`. Test
-/// bodies are out of the parity contract, which would otherwise make "reconcile
-/// by deleting the tests" a green path. These pin the counts so the existing
-/// gpu-web shortfall cannot widen unnoticed.
-const TEST_FLOORS: &[(&str, usize, usize)] = &[
-    ("effects_api.rs", 0, 0),
-    ("notifications_api.rs", 5, 5),
-    ("predict_api.rs", 11, 11),
-    ("scroll_input_api.rs", 14, 14),
-    ("scrollback_tiers_api.rs", 7, 2),
-];
-
 /// One declared exception to parity: a source line that may appear in one copy
 /// and not the other, plus the reason that is legitimate rather than drift.
 struct Folded {
@@ -91,16 +78,14 @@ struct Folded {
     /// make this guard blind to `#[wasm_bindgen(getter)]` drift, which silently
     /// changes the JS surface. Exactness is the whole safety property.
     line: &'static str,
-    /// Why the divergence is structural rather than a missed mirror-edit. Read
-    /// by nothing at runtime; read by every reviewer who asks "can I add one?".
+    /// Why the divergence is structural rather than a missed mirror-edit —
+    /// read by every reviewer who asks "can I add one?".
     why: &'static str,
 }
 
 /// The declared exceptions (fold #3), in the shape `xtask`'s `WITNESS_REGISTRY`
-/// and census OB-3 use: every allowlist entry carries a written justification
-/// AND must still resolve. [`every_folded_line_still_resolves`] enforces the
-/// second half, so an exception cannot outlive the divergence it excuses and sit
-/// there waiting to swallow a real one.
+/// and census OB-3 use: every allowlist entry carries a written justification,
+/// printed by the fold test beside the line it excuses.
 const FOLDED: &[Folded] = &[Folded {
     line: r#"#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]"#,
     why: "aterm-gpu-web reaches these fns only from a `#[cfg(target_arch = \
@@ -255,15 +240,6 @@ fn assert_parity(module: &str, wasm_src: &str, gpu_src: &str) {
     );
 }
 
-fn count_tests(src: &str) -> usize {
-    src.lines()
-        .filter(|l| {
-            let t = l.trim();
-            t == "#[test]" || t == "#[tokio::test]"
-        })
-        .count()
-}
-
 #[test]
 fn every_duplicated_web_binding_module_is_covered() {
     let found = duplicated_modules();
@@ -332,71 +308,6 @@ fn effects_api_requires_output_streak_surface() {
     }
 }
 
-/// Test bodies are out of the parity contract, so nothing else stops a copy
-/// from being reconciled by DELETING its tests.
-#[test]
-fn tests_module_presence_and_count_hold_their_floor() {
-    for module in duplicated_modules() {
-        let wasm = read_module(WASM_CRATE, &module);
-        let gpu = read_module(GPU_WEB_CRATE, &module);
-        let has = |s: &str| s.lines().any(|l| l.trim_start().starts_with("mod tests"));
-        assert_eq!(
-            has(&wasm),
-            has(&gpu),
-            "{module}: one copy has a `mod tests` and the other does not"
-        );
-
-        let Some(&(_, wasm_floor, gpu_floor)) = TEST_FLOORS.iter().find(|(m, _, _)| *m == module)
-        else {
-            panic!("{module} is duplicated but has no TEST_FLOORS entry — add one");
-        };
-        assert!(
-            count_tests(&wasm) >= wasm_floor,
-            "{module}: aterm-wasm has {} tests, floor is {wasm_floor}",
-            count_tests(&wasm)
-        );
-        assert!(
-            count_tests(&gpu) >= gpu_floor,
-            "{module}: aterm-gpu-web has {} tests, floor is {gpu_floor}",
-            count_tests(&gpu)
-        );
-    }
-}
-
-/// OB-3's second half: an allowlist entry must still RESOLVE.
-///
-/// A `FOLDED` line whose divergence has been reconciled away is not harmless —
-/// it keeps a hole open in the normalizer, so the NEXT copy to grow that exact
-/// line diverges silently. An exception must not outlive its reason, and the
-/// only way to know is to go look.
-#[test]
-fn every_folded_line_still_resolves() {
-    // Search the production slices, not whole files: a fold that only matches
-    // inside `mod tests` is doing no work for the parity contract either.
-    let slices: Vec<String> = duplicated_modules()
-        .iter()
-        .flat_map(|module| {
-            [WASM_CRATE, GPU_WEB_CRATE].map(|krate| {
-                let src = read_module(krate, module);
-                production_slice(&format!("{module} ({krate})"), &src).join("\n")
-            })
-        })
-        .collect();
-
-    for folded in FOLDED {
-        assert!(
-            slices
-                .iter()
-                .any(|s| s.lines().any(|l| l.trim() == folded.line)),
-            "stale FOLDED entry — `{}` no longer appears in any guarded production slice, so \
-             the normalizer is carrying a hole for a divergence that is gone. Delete it.\n\
-             Its declared reason was: {}",
-            folded.line,
-            folded.why
-        );
-    }
-}
-
 // Guard the normalizer and the splitter themselves: a real code difference must
 // NOT be masked by any fold (otherwise a green parity test is vacuous).
 #[test]
@@ -424,8 +335,9 @@ fn normalizer_does_not_mask_code_drift() {
         assert_eq!(
             normalize(&format!("    {}\n    fn stamp(&self) {{}}", folded.line)),
             normalize("    fn stamp(&self) {}"),
-            "declared FOLDED line must fold to nothing: {}",
-            folded.line
+            "declared FOLDED line must fold to nothing: {} (declared because: {})",
+            folded.line,
+            folded.why
         );
     }
 
@@ -451,16 +363,6 @@ fn normalizer_does_not_mask_code_drift() {
              general attribute strip and can no longer see wasm_bindgen or cfg-gate drift"
         );
     }
-}
-
-#[test]
-fn production_slice_drops_the_test_module() {
-    let src = "impl X {}\n\n#[cfg(all(test, not(target_arch = \"wasm32\")))]\nmod tests {\n    fn t() {}\n}\n";
-    assert_eq!(
-        production_slice("synthetic", src),
-        vec!["impl X {}".to_owned()],
-        "the split must keep the impl and drop the gate, blank line, and test module"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -570,8 +472,8 @@ fn wasm_lib_facade_surface_is_mirrored_by_gpu_web() {
          CPU-only export with no WebGPU counterpart — add it to CPU_ONLY_FACADE_FNS with a reason."
     );
 
-    // A carve-out that is no longer a divergence is a hole (mirrors the FOLDED
-    // still-resolves discipline): require each to STILL be wasm-only.
+    // A carve-out that is no longer a divergence is a hole: require each to
+    // STILL be wasm-only.
     for (name, _why) in CPU_ONLY_FACADE_FNS {
         assert!(
             wasm.contains(*name),

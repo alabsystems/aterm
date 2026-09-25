@@ -319,145 +319,146 @@ impl std::ops::Not for CellFlags {
 mod tests {
     use super::*;
 
-    // ---- Default / empty state ----
+    // ---- Bit layout ----
+    //
+    // Persisted: checkpoints and the render path read these bits raw, so every
+    // position is pinned. One row per former `*_flag_bit`, combo and mask test.
 
     #[test]
-    fn default_is_empty() {
-        let f = CellFlags::default();
-        assert!(f.is_empty());
-        assert_eq!(f.bits(), 0);
+    fn bit_layout_is_pinned() {
+        let rows: &[(&str, u16, u16)] = &[
+            ("BOLD", CellFlags::BOLD.bits(), 1 << 0),
+            ("DIM", CellFlags::DIM.bits(), 1 << 1),
+            ("ITALIC", CellFlags::ITALIC.bits(), 1 << 2),
+            ("UNDERLINE", CellFlags::UNDERLINE.bits(), 1 << 3),
+            ("BLINK", CellFlags::BLINK.bits(), 1 << 4),
+            ("INVERSE", CellFlags::INVERSE.bits(), 1 << 5),
+            ("HIDDEN", CellFlags::HIDDEN.bits(), 1 << 6),
+            ("STRIKETHROUGH", CellFlags::STRIKETHROUGH.bits(), 1 << 7),
+            (
+                "DOUBLE_UNDERLINE",
+                CellFlags::DOUBLE_UNDERLINE.bits(),
+                1 << 8,
+            ),
+            ("WIDE", CellFlags::WIDE.bits(), 1 << 9),
+            (
+                "WIDE_CONTINUATION",
+                CellFlags::WIDE_CONTINUATION.bits(),
+                1 << 10,
+            ),
+            // PROTECTED shares WIDE_CONTINUATION's bit.
+            ("PROTECTED", CellFlags::PROTECTED.bits(), 1 << 10),
+            ("SUPERSCRIPT", CellFlags::SUPERSCRIPT.bits(), 1 << 11),
+            ("SUBSCRIPT", CellFlags::SUBSCRIPT.bits(), 1 << 12),
+            (
+                "CURLY_UNDERLINE",
+                CellFlags::CURLY_UNDERLINE.bits(),
+                1 << 13,
+            ),
+            ("USES_STYLE_ID", CellFlags::USES_STYLE_ID.bits(), 1 << 14),
+            ("COMPLEX", CellFlags::COMPLEX.bits(), 1 << 15),
+            // Combo encodings: two bits each, no bit of their own.
+            (
+                "OVERLINE = SUPERSCRIPT | SUBSCRIPT",
+                CellFlags::OVERLINE.bits(),
+                (1 << 11) | (1 << 12),
+            ),
+            (
+                "DOTTED_UNDERLINE = UNDERLINE | CURLY_UNDERLINE",
+                CellFlags::DOTTED_UNDERLINE.bits(),
+                (1 << 3) | (1 << 13),
+            ),
+            (
+                "DASHED_UNDERLINE = DOUBLE_UNDERLINE | CURLY_UNDERLINE",
+                CellFlags::DASHED_UNDERLINE.bits(),
+                (1 << 8) | (1 << 13),
+            ),
+            // Masks.
+            (
+                "EXTENDED_FLAGS_MASK = bits 11-13",
+                CellFlags::EXTENDED_FLAGS_MASK,
+                0x3800,
+            ),
+            (
+                "VISUAL_FLAGS_MASK = bits 0-13",
+                CellFlags::VISUAL_FLAGS_MASK,
+                0x3FFF,
+            ),
+        ];
+        for &(name, bits, want) in rows {
+            assert_eq!(bits, want, "{name}");
+        }
     }
+
+    // ---- Methods ----
 
     #[test]
-    fn empty_is_empty() {
-        let f = CellFlags::empty();
-        assert!(f.is_empty());
-        assert_eq!(f, CellFlags::default());
+    fn methods_agree_with_raw_bit_arithmetic() {
+        // One loop in place of the one-case tests of default/empty, from_bits,
+        // contains, intersects, union, difference, insert/remove, is_complex,
+        // uses_style_id, core_flags, extended_flags, has_extended_flags and Copy:
+        // each method is checked against the u16 arithmetic it stands for, for
+        // every pair drawn from the sixteen single bits, the combos, the masks,
+        // a few mixes, 0 and 0xFFFF.
+        assert!(CellFlags::default().is_empty());
+        assert_eq!(CellFlags::empty(), CellFlags::default());
+
+        let mut values: Vec<u16> = (0..16).map(|bit| 1u16 << bit).collect();
+        values.extend([
+            0,
+            0xFFFF,
+            CellFlags::OVERLINE.bits(),
+            CellFlags::DOTTED_UNDERLINE.bits(),
+            CellFlags::DASHED_UNDERLINE.bits(),
+            CellFlags::EXTENDED_FLAGS_MASK,
+            CellFlags::VISUAL_FLAGS_MASK,
+            0x00FF,
+            (CellFlags::BOLD | CellFlags::ITALIC).bits(),
+            (CellFlags::BOLD | CellFlags::COMPLEX | CellFlags::USES_STYLE_ID).bits(),
+            (CellFlags::BOLD | CellFlags::SUPERSCRIPT | CellFlags::CURLY_UNDERLINE).bits(),
+        ]);
+
+        for &a in &values {
+            let f = CellFlags::from_bits(a);
+            let copy = f;
+            assert_eq!(copy, f, "{a:#06x}: Copy");
+            assert_eq!(f.bits(), a, "{a:#06x}: from_bits round trip");
+            assert_eq!(f.is_empty(), a == 0, "{a:#06x}: is_empty");
+            assert_eq!(f.is_complex(), a & 0x8000 != 0, "{a:#06x}: is_complex");
+            assert_eq!(
+                f.uses_style_id(),
+                a & 0x4000 != 0,
+                "{a:#06x}: uses_style_id"
+            );
+            assert_eq!(f.core_flags().bits(), a & 0x3FFF, "{a:#06x}: core_flags");
+            assert_eq!(
+                f.extended_flags().bits(),
+                a & 0x3800,
+                "{a:#06x}: extended_flags"
+            );
+            assert_eq!(
+                f.has_extended_flags(),
+                a & 0x3800 != 0,
+                "{a:#06x}: has_extended_flags"
+            );
+            for &b in &values {
+                let g = CellFlags::from_bits(b);
+                let pair = format!("{a:#06x}, {b:#06x}");
+                assert_eq!(f.contains(g), a & b == b, "{pair}: contains");
+                assert_eq!(f.intersects(g), a & b != 0, "{pair}: intersects");
+                assert_eq!(f.union(g).bits(), a | b, "{pair}: union");
+                assert_eq!(f.difference(g).bits(), a & !b, "{pair}: difference");
+                let mut inserted = f;
+                inserted.insert(g);
+                assert_eq!(inserted.bits(), a | b, "{pair}: insert");
+                let mut removed = f;
+                removed.remove(g);
+                assert_eq!(removed.bits(), a & !b, "{pair}: remove");
+            }
+        }
     }
 
-    #[test]
-    fn from_bits_roundtrip() {
-        let f = CellFlags::from_bits(0x00FF);
-        assert_eq!(f.bits(), 0x00FF);
-    }
-
-    // ---- Individual flag constants ----
-
-    #[test]
-    fn bold_flag_bit() {
-        assert_eq!(CellFlags::BOLD.bits(), 1 << 0);
-    }
-
-    #[test]
-    fn dim_flag_bit() {
-        assert_eq!(CellFlags::DIM.bits(), 1 << 1);
-    }
-
-    #[test]
-    fn italic_flag_bit() {
-        assert_eq!(CellFlags::ITALIC.bits(), 1 << 2);
-    }
-
-    #[test]
-    fn underline_flag_bit() {
-        assert_eq!(CellFlags::UNDERLINE.bits(), 1 << 3);
-    }
-
-    #[test]
-    fn blink_flag_bit() {
-        assert_eq!(CellFlags::BLINK.bits(), 1 << 4);
-    }
-
-    #[test]
-    fn inverse_flag_bit() {
-        assert_eq!(CellFlags::INVERSE.bits(), 1 << 5);
-    }
-
-    #[test]
-    fn hidden_flag_bit() {
-        assert_eq!(CellFlags::HIDDEN.bits(), 1 << 6);
-    }
-
-    #[test]
-    fn strikethrough_flag_bit() {
-        assert_eq!(CellFlags::STRIKETHROUGH.bits(), 1 << 7);
-    }
-
-    #[test]
-    fn double_underline_flag_bit() {
-        assert_eq!(CellFlags::DOUBLE_UNDERLINE.bits(), 1 << 8);
-    }
-
-    #[test]
-    fn wide_flag_bit() {
-        assert_eq!(CellFlags::WIDE.bits(), 1 << 9);
-    }
-
-    #[test]
-    fn wide_continuation_shares_bit_with_protected() {
-        assert_eq!(CellFlags::WIDE_CONTINUATION, CellFlags::PROTECTED);
-        assert_eq!(CellFlags::WIDE_CONTINUATION.bits(), 1 << 10);
-    }
-
-    #[test]
-    fn superscript_flag_bit() {
-        assert_eq!(CellFlags::SUPERSCRIPT.bits(), 1 << 11);
-    }
-
-    #[test]
-    fn subscript_flag_bit() {
-        assert_eq!(CellFlags::SUBSCRIPT.bits(), 1 << 12);
-    }
-
-    #[test]
-    fn curly_underline_flag_bit() {
-        assert_eq!(CellFlags::CURLY_UNDERLINE.bits(), 1 << 13);
-    }
-
-    #[test]
-    fn uses_style_id_flag_bit() {
-        assert_eq!(CellFlags::USES_STYLE_ID.bits(), 1 << 14);
-    }
-
-    #[test]
-    fn complex_flag_bit() {
-        assert_eq!(CellFlags::COMPLEX.bits(), 1 << 15);
-    }
-
-    // ---- Combo-encoded flags ----
-
-    #[test]
-    fn overline_is_superscript_or_subscript() {
-        assert_eq!(
-            CellFlags::OVERLINE,
-            CellFlags(CellFlags::SUPERSCRIPT.0 | CellFlags::SUBSCRIPT.0)
-        );
-    }
-
-    #[test]
-    fn dotted_underline_is_underline_or_curly() {
-        assert_eq!(
-            CellFlags::DOTTED_UNDERLINE,
-            CellFlags(CellFlags::UNDERLINE.0 | CellFlags::CURLY_UNDERLINE.0)
-        );
-    }
-
-    #[test]
-    fn dashed_underline_is_double_or_curly() {
-        assert_eq!(
-            CellFlags::DASHED_UNDERLINE,
-            CellFlags(CellFlags::DOUBLE_UNDERLINE.0 | CellFlags::CURLY_UNDERLINE.0)
-        );
-    }
-
-    // ---- contains ----
-
-    #[test]
-    fn contains_single_flag() {
-        let f = CellFlags::BOLD;
-        assert!(f.contains(CellFlags::BOLD));
-        assert!(!f.contains(CellFlags::ITALIC));
-    }
+    // ---- contains: the combo flags need every one of their bits ----
 
     #[test]
     fn contains_requires_all_bits() {
@@ -474,86 +475,7 @@ mod tests {
         assert!(f.contains(CellFlags::OVERLINE));
     }
 
-    #[test]
-    fn contains_empty_always_true() {
-        let f = CellFlags::BOLD;
-        assert!(f.contains(CellFlags::empty()));
-        assert!(CellFlags::empty().contains(CellFlags::empty()));
-    }
-
-    // ---- intersects ----
-
-    #[test]
-    fn intersects_single_flag() {
-        let f = CellFlags::BOLD;
-        assert!(f.intersects(CellFlags::BOLD));
-        assert!(!f.intersects(CellFlags::ITALIC));
-    }
-
-    #[test]
-    fn intersects_partial_overlap() {
-        let f = CellFlags::SUPERSCRIPT;
-        // OVERLINE = SUPERSCRIPT | SUBSCRIPT -- shares SUPERSCRIPT bit
-        assert!(f.intersects(CellFlags::OVERLINE));
-    }
-
-    #[test]
-    fn intersects_empty_always_false() {
-        let f = CellFlags::BOLD;
-        assert!(!f.intersects(CellFlags::empty()));
-    }
-
-    // ---- union / difference ----
-
-    #[test]
-    fn union_combines_flags() {
-        let f = CellFlags::BOLD.union(CellFlags::ITALIC);
-        assert!(f.contains(CellFlags::BOLD));
-        assert!(f.contains(CellFlags::ITALIC));
-        assert!(!f.contains(CellFlags::UNDERLINE));
-    }
-
-    #[test]
-    fn difference_removes_flags() {
-        let f = CellFlags::BOLD
-            .union(CellFlags::ITALIC)
-            .difference(CellFlags::BOLD);
-        assert!(!f.contains(CellFlags::BOLD));
-        assert!(f.contains(CellFlags::ITALIC));
-    }
-
-    #[test]
-    fn difference_of_absent_flag_is_noop() {
-        let f = CellFlags::BOLD;
-        let f2 = f.difference(CellFlags::ITALIC);
-        assert_eq!(f, f2);
-    }
-
-    // ---- insert / remove (mutating) ----
-
-    #[test]
-    fn insert_sets_flag() {
-        let mut f = CellFlags::empty();
-        f.insert(CellFlags::BLINK);
-        assert!(f.contains(CellFlags::BLINK));
-    }
-
-    #[test]
-    fn remove_clears_flag() {
-        let mut f = CellFlags::BLINK;
-        f.remove(CellFlags::BLINK);
-        assert!(!f.contains(CellFlags::BLINK));
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn insert_is_idempotent() {
-        let mut f = CellFlags::BOLD;
-        f.insert(CellFlags::BOLD);
-        assert_eq!(f, CellFlags::BOLD);
-    }
-
-    // ---- Bitwise operators ----
+    // ---- Bitwise operators (the std traits, for Alacritty compatibility) ----
 
     #[test]
     fn bitor_operator() {
@@ -597,131 +519,5 @@ mod tests {
         f &= CellFlags::BOLD;
         assert!(f.contains(CellFlags::BOLD));
         assert!(!f.contains(CellFlags::ITALIC));
-    }
-
-    // ---- is_complex / uses_style_id ----
-
-    #[test]
-    fn is_complex_only_when_complex_set() {
-        assert!(!CellFlags::empty().is_complex());
-        assert!(!CellFlags::BOLD.is_complex());
-        assert!(CellFlags::COMPLEX.is_complex());
-        assert!((CellFlags::BOLD | CellFlags::COMPLEX).is_complex());
-    }
-
-    #[test]
-    fn uses_style_id_only_when_set() {
-        assert!(!CellFlags::empty().uses_style_id());
-        assert!(!CellFlags::BOLD.uses_style_id());
-        assert!(CellFlags::USES_STYLE_ID.uses_style_id());
-    }
-
-    // ---- core_flags / extended_flags / has_extended_flags ----
-
-    #[test]
-    fn core_flags_strips_complex_and_style_id() {
-        let f = CellFlags::BOLD | CellFlags::COMPLEX | CellFlags::USES_STYLE_ID;
-        let core = f.core_flags();
-        assert!(core.contains(CellFlags::BOLD));
-        assert!(!core.is_complex());
-        assert!(!core.uses_style_id());
-    }
-
-    #[test]
-    fn core_flags_preserves_visual_flags() {
-        let all_visual = CellFlags::from_bits(CellFlags::VISUAL_FLAGS_MASK);
-        assert_eq!(all_visual.core_flags(), all_visual);
-    }
-
-    #[test]
-    fn extended_flags_mask_covers_bits_11_to_13() {
-        assert_eq!(CellFlags::EXTENDED_FLAGS_MASK, 0x3800);
-        // Bits 11, 12, 13
-        assert_eq!(
-            CellFlags::EXTENDED_FLAGS_MASK,
-            (1 << 11) | (1 << 12) | (1 << 13)
-        );
-    }
-
-    #[test]
-    fn extended_flags_extracts_only_bits_11_13() {
-        let f = CellFlags::BOLD | CellFlags::SUPERSCRIPT | CellFlags::CURLY_UNDERLINE;
-        let ext = f.extended_flags();
-        assert!(ext.contains(CellFlags::SUPERSCRIPT));
-        assert!(ext.contains(CellFlags::CURLY_UNDERLINE));
-        assert!(!ext.contains(CellFlags::BOLD));
-    }
-
-    #[test]
-    fn has_extended_flags_detects_superscript() {
-        assert!(CellFlags::SUPERSCRIPT.has_extended_flags());
-    }
-
-    #[test]
-    fn has_extended_flags_detects_subscript() {
-        assert!(CellFlags::SUBSCRIPT.has_extended_flags());
-    }
-
-    #[test]
-    fn has_extended_flags_detects_overline() {
-        assert!(CellFlags::OVERLINE.has_extended_flags());
-    }
-
-    #[test]
-    fn has_extended_flags_detects_curly_underline() {
-        assert!(CellFlags::CURLY_UNDERLINE.has_extended_flags());
-    }
-
-    #[test]
-    fn has_extended_flags_false_for_basic() {
-        assert!(!CellFlags::BOLD.has_extended_flags());
-        assert!(!CellFlags::DIM.has_extended_flags());
-        assert!(!CellFlags::UNDERLINE.has_extended_flags());
-        assert!(!CellFlags::DOUBLE_UNDERLINE.has_extended_flags());
-    }
-
-    // ---- All visual flags are distinct single-bit (bits 0-9 only) ----
-
-    #[test]
-    fn basic_flags_are_distinct_single_bits() {
-        let singles = [
-            CellFlags::BOLD,
-            CellFlags::DIM,
-            CellFlags::ITALIC,
-            CellFlags::UNDERLINE,
-            CellFlags::BLINK,
-            CellFlags::INVERSE,
-            CellFlags::HIDDEN,
-            CellFlags::STRIKETHROUGH,
-            CellFlags::DOUBLE_UNDERLINE,
-            CellFlags::WIDE,
-        ];
-        for (i, a) in singles.iter().enumerate() {
-            for (j, b) in singles.iter().enumerate() {
-                if i != j {
-                    assert!(
-                        !a.intersects(*b),
-                        "flags at indices {i} and {j} should not overlap"
-                    );
-                }
-            }
-            // Each is a single bit
-            assert_eq!(
-                a.bits().count_ones(),
-                1,
-                "flag at index {i} should be a single bit"
-            );
-        }
-    }
-
-    // ---- Copy semantics ----
-
-    #[test]
-    fn copy_semantics() {
-        let f = CellFlags::BOLD | CellFlags::ITALIC;
-        let f2 = f; // Copy
-        assert_eq!(f, f2);
-        // Original still usable after copy
-        assert!(f.contains(CellFlags::BOLD));
     }
 }

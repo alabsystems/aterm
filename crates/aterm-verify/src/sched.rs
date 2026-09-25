@@ -20,8 +20,9 @@
 //!   whose cargo lock is nevertheless its own — so all are real lanes that
 //!   genuinely overlap the main build.
 //!
-//! * An EXCLUSIVE stage runs with nothing else in flight. The two smokes MEASURE:
-//!   frames per second, input→present latency, sync timeout-releases. A gate that
+//! * An EXCLUSIVE stage runs with nothing else in flight. The measuring tests and
+//!   the two smokes MEASURE: paint takes, launchd deadlines, frames per second,
+//!   input→present latency, sync timeout-releases. A gate that
 //!   decided "present starvation — frames=12 (< 15)" while a lint saturated the
 //!   other cores would be reporting the gate, not the build. Exclusivity is what
 //!   keeps a ported stage's decision identical to the sequential one.
@@ -415,10 +416,10 @@ mod tests {
         }
     }
 
-    /// The test run measures (paint, spin), and before 2026-09-13 the regex
-    /// lane, the xtask verbs and the driver builds queued behind it in
-    /// `target/`. In their own lanes they must still never overlap it — and the
-    /// driver stages behind the smokes' barrier must still come after it.
+    /// Before 2026-09-13 the regex lane, the xtask verbs and the driver builds
+    /// queued behind the test run in `target/`. In their own lanes they must
+    /// still never overlap it — and the driver stages behind the smokes'
+    /// barrier must still come after it.
     #[test]
     fn the_test_run_never_overlaps_a_side_lane() {
         let specs = plan_shape();

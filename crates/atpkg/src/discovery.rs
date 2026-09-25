@@ -7,8 +7,8 @@
 //! (R3, default `alabsystems`) by reusing `aterm-update-core`'s URL-safety slug
 //! resolution verbatim — [`pick_slug`](aterm_update_core::pick_slug) /
 //! [`is_valid_slug`](aterm_update_core::is_valid_slug), the same gate that keeps a
-//! stray/hostile config value from redirecting fetches off the GitHub API — and then
-//! fetches exactly one asset: `index.toml` on `<account>/aterm`
+//! stray/hostile config value from redirecting fetches off GitHub — and then reads the
+//! signed index from `<account>/aterm`'s release download host
 //! ([`crate::manifest::INDEX_REPO`]). Everything installable flows from that one
 //! root-signed document; an unlisted repo is unreachable by construction (§5,
 //! [`crate::manifest::Index::installable`]).
@@ -35,7 +35,7 @@ pub struct IndexRepo {
 }
 
 impl IndexRepo {
-    /// `<owner>/<repo>` — the slug used to build the Releases API URL for the index.
+    /// `<owner>/<repo>` — the slug the index's release download URLs are built from.
     #[must_use]
     pub fn slug(&self) -> String {
         // Manual concat of the previous `format!("{}/{}", self.owner, self.repo)`

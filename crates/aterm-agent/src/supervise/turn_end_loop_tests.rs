@@ -1087,27 +1087,59 @@ fn the_no_break_space_composer_takes_the_fenced_continuation() {
     );
 }
 
-/// Run `run_hosted` over `m` until a stop set 150 ms in — with the hand-over
-/// flag raised first when `hand_over` — and return its printed lines.
+/// The transport `hosted_until_stopped` runs the loop over: the `Mock`,
+/// with the host's stop raised on EVIDENCE, never on a clock. The loop's
+/// first `await seq` is its wait for the screen to move past the point it
+/// has just handed over (`Session::wait_for_next` → `moved_past`) — no
+/// earlier request of these scripts is one (a busy read with the footer up
+/// waits with `await gone`) — so by then the point was decided and
+/// escalated, or adopted. There the hand-over flag is raised (when
+/// `hand_over`) and THEN the stop, as the host does. A fixed 150 ms timer
+/// raced that whole first look (claim, reconcile, two waits, two reads, the
+/// decision): on a host loaded to ~39 with 662 tests in the process, the
+/// stop landed first and the run ended `EXIT stopped` with nothing raised.
+struct StopAtPoint<'a> {
+    inner: &'a mut Mock,
+    stop: Arc<AtomicBool>,
+    handover: Arc<AtomicBool>,
+    hand_over: bool,
+}
+
+impl Ctl for StopAtPoint<'_> {
+    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        let r = self.inner.call(args);
+        let mut words = args.iter().filter(|a| !a.starts_with('@'));
+        if words.next() == Some(&"await") && words.next() == Some(&"seq") {
+            self.handover.store(self.hand_over, Ordering::SeqCst);
+            self.stop.store(true, Ordering::SeqCst);
+        }
+        r
+    }
+}
+
+/// Run `run_hosted` over `m` until it has handed its first point over
+/// (`StopAtPoint`), then stop it — with the hand-over flag raised first
+/// when `hand_over` — and return its printed lines. The 30 s budget bounds
+/// a loop that never reaches a point (it ends `TIMEOUT`, not `EXIT
+/// stopped`, and the caller's first assertion says so).
 fn hosted_until_stopped(m: &mut Mock, hand_over: bool) -> Vec<String> {
     m.stall_sleep = Some(Duration::from_millis(5));
     let stop = Arc::new(AtomicBool::new(false));
     let handover = Arc::new(AtomicBool::new(false));
-    let (flag, over) = (Arc::clone(&stop), Arc::clone(&handover));
-    let setter = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        over.store(hand_over, Ordering::SeqCst);
-        flag.store(true, Ordering::SeqCst);
-    });
+    let mut ctl = StopAtPoint {
+        inner: m,
+        stop: Arc::clone(&stop),
+        handover: Arc::clone(&handover),
+        hand_over,
+    };
     let mut out: Vec<u8> = Vec::new();
-    let mut s = Session::new(m, Some("@s-1".to_string()));
+    let mut s = Session::new(&mut ctl, Some("@s-1".to_string()));
     s.set_handover(handover);
     // Never the real state root's ledger.
     s.set_approval_ledger(Some(
         std::env::temp_dir().join(format!("aterm-hand-over-{}.jsonl", std::process::id())),
     ));
     let r = s.run_hosted(&hosted(30), stop, &mut out);
-    setter.join().expect("setter");
     assert_eq!(r, Ok(()));
     String::from_utf8(out)
         .expect("utf-8")
@@ -1133,7 +1165,10 @@ fn a_handed_over_idle_escalation_survives_the_restart() {
         Some("EXIT stopped"),
         "{first:?}"
     );
-    let raised = m.attention.clone().expect("the idle point escalated");
+    let raised = m
+        .attention
+        .clone()
+        .unwrap_or_else(|| panic!("the idle point escalated: {first:?}\n{:#?}", m.requests));
     assert!(
         raised.starts_with("claude idle: I need your decision"),
         "{raised}"
@@ -1160,6 +1195,11 @@ fn a_handed_over_idle_escalation_survives_the_restart() {
     let _ = hosted_until_stopped(&mut m, false);
     assert_eq!(m.attention, None);
     assert_eq!(count(&m, "@s-1 meta set attention owner=supervisor"), 1);
+    // The ledger `hosted_until_stopped`'s runs share lives in the process temp
+    // dir: leave nothing behind (it used to accumulate one empty file per run).
+    let _ = std::fs::remove_file(
+        std::env::temp_dir().join(format!("aterm-hand-over-{}.jsonl", std::process::id())),
+    );
 }
 
 /// A ledger holding one `/model` switch row (as the loop that switched wrote

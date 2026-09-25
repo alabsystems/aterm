@@ -1033,14 +1033,14 @@ fn vs_blit(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_samp: sampler;
-// std140 layout — must match the Rust `BlitUniform` byte-for-byte (96 bytes).
+// std140 layout — must match the Rust `BlitUniform` byte-for-byte (112 bytes).
 struct Blit {
     flag: u32,        // bell-flash invert
     overlay: u32,     // drop-target highlight enabled
     border_px: f32,   // inset border thickness, device px
     encode_srgb: f32, // !=0: re-encode linear->sRGB (downlevel WebGL2 blit)
     accent: vec3<f32>,// overlay accent rgb, normalized 0..1
-    chrome_y1: f32,   // source rows [0, chrome_y1) are host chrome: their bands continue the frame's edge pixels
+    chrome_y1: f32,   // source rows [chrome_y0, chrome_y1) are host chrome: their bands continue the frame's edge pixels
     dims: vec2<f32>,  // OFFSCREEN frame width,height in px
     wash_a: f32,      // interior wash alpha 0..1
     border_a: f32,    // border alpha 0..1
@@ -1052,6 +1052,10 @@ struct Blit {
     visible_y: f32,   // first source row exposed by the frontend crop
     visible_h: f32,   // exposed source height; rows outside are remainder bands
     premult: f32,     // H1: !=0: multiply output rgb by the emitted alpha (DComp visual swapchain)
+    chrome_y0: f32,   // first host-chrome source row (rows above it keep flat bands)
+    chrome_pad0: f32, // std140: pad the struct to a 16-byte multiple (112)
+    chrome_pad1: f32,
+    chrome_pad2: f32,
 };
 @group(0) @binding(2) var<uniform> b: Blit;
 
@@ -1090,13 +1094,15 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
     var p = in.pos.xy - b.content_off;
     let visible_y1 = b.visible_y + b.visible_h;
     // CHROME REACHES THE WINDOW EDGE: beside a host-chrome source row
-    // (`p.y < chrome_y1`, `aterm_render::Renderer::chrome_extent_px`) the
-    // horizontal remainder bands CONTINUE the frame's own edge pixel instead of
-    // the band colour — the CPU twin is `place_frame_bands`' `edge_rows`. The
+    // (`chrome_y0 <= p.y < chrome_y1`, `aterm_render::Renderer::chrome_extent_px`)
+    // the horizontal remainder bands CONTINUE the frame's own edge pixel instead
+    // of the band colour — the CPU twin is `place_frame_bands`' `edge_rows`. The
     // fetched texel is still a BAND pixel: never inverted, never washed.
-    // `chrome_y1 == 0` (every frame without chrome) never takes this arm.
+    // `chrome_y1 == 0` (every frame without chrome) never takes this arm, and
+    // the rows above `chrome_y0` (a surfaceless strip that keeps the padding)
+    // keep the band colour like any terminal row.
     var chrome_edge = false;
-    if ((p.x < 0.0 || p.x >= b.dims.x) && p.y >= b.visible_y && p.y < min(visible_y1, b.chrome_y1)) {
+    if ((p.x < 0.0 || p.x >= b.dims.x) && p.y >= max(b.visible_y, b.chrome_y0) && p.y < min(visible_y1, b.chrome_y1)) {
         p.x = clamp(p.x, 0.0, b.dims.x - 1.0);
         chrome_edge = true;
     }
@@ -1633,7 +1639,7 @@ impl_pod_zeroable!(ShimmerUniform {
 
 /// Blit uniform: the bell-flash invert flag plus the drag-and-drop drop-target
 /// highlight parameters plus the W1 band placement (frame offset + band colour).
-/// `#[repr(C)]` with a std140-compatible 96-byte layout matching the WGSL `Blit`
+/// `#[repr(C)]` with a std140-compatible 112-byte layout matching the WGSL `Blit`
 /// struct exactly (vec3 + f32 at 16/28, vec4 at 48, vec2 at 32 and 64).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
@@ -1650,7 +1656,7 @@ pub(crate) struct BlitUniform {
     encode_srgb: f32,
     /// Overlay accent, normalized 0..1 (rgb).
     accent: [f32; 3],
-    /// Source rows `[0, chrome_y1)` are host chrome
+    /// Source rows `[chrome_y0, chrome_y1)` are host chrome
     /// (`aterm_render::Renderer::chrome_extent_px`): beside them the horizontal
     /// remainder bands continue the frame's own edge pixel, so a chrome band
     /// reaches the true window edge. This slot WAS the accent's unused alpha
@@ -1706,6 +1712,14 @@ pub(crate) struct BlitUniform {
     /// with `translucent == 0` the emitted alpha is 1.0 and the multiply is
     /// identity, so this is only ever consulted on a translucent present.
     premult: f32,
+    /// The first host-chrome source row (`aterm_render::Renderer::chrome_extent_px`'s
+    /// start): the rows above it — a strip with no surface of its own that
+    /// keeps the frame's padding (`aterm_render::ChromeBleed::first`) — keep
+    /// the flat band colour beside them. `0.0` — chrome from the top, or none —
+    /// is the pre-`first` behaviour. Appended (no free slot remained), so the
+    /// uniform grew 96 → 112 bytes with three explicit pads.
+    chrome_y0: f32,
+    chrome_pad: [f32; 3],
 }
 impl_pod_zeroable!(BlitUniform {
     flag: u32,
@@ -1725,6 +1739,8 @@ impl_pod_zeroable!(BlitUniform {
     visible_y: f32,
     visible_h: f32,
     premult: f32,
+    chrome_y0: f32,
+    chrome_pad: [f32; 3],
 });
 
 impl BlitUniform {
@@ -1749,7 +1765,9 @@ impl BlitUniform {
             sdr_white_scale: 1.0, // 1.0 = no scaling (SDR / macOS); set on the Windows EDR present
             visible_y: 0.0,
             visible_h: 0.0,
-            premult: 0.0, // set by the present path on the DComp visual swapchain (H1)
+            premult: 0.0,   // set by the present path on the DComp visual swapchain (H1)
+            chrome_y0: 0.0, // set by the present path from the chrome extent
+            chrome_pad: [0.0; 3],
         }
     }
 
@@ -2113,7 +2131,9 @@ const GROUP_SRGB: [bool; FRAME_GROUPS] = {
 /// dirty-row scissor cannot restrict — ~23 MB each at 3024x1964x4B, paid even by a
 /// pass that draws nothing. ENUMERATED reach: 0-3 passes saved depending on which
 /// effects are live, 0-1 on the typing frames the review measured (the tally is
-/// in `encode_frame`, pinned by `pass_count_versus_the_pre_coalescer_shape`) —
+/// in `encode_frame`; it was pinned against an executable model of the retired
+/// shape until 2026-09-24, see `pass_count_versus_the_pre_coalescer_shape` at
+/// `e8a8c80ab`) —
 /// the shape this replaced already fused the base halves and already skipped
 /// empty groups, so this is never a collapse of the whole group count.
 /// Merging two neighbours that already write the SAME
@@ -4269,14 +4289,15 @@ pub struct WindowGpu {
     // same transform DWM applies to SDR windows. `Default` 0.0 is clamped to 1.0 at
     // present (never set / macOS / SDR ⇒ no scaling, byte-identical).
     pub(crate) sdr_white_scale: f32,
-    // How many rows from the top of THIS window's offscreen are host chrome
-    // (`aterm_render::Renderer::chrome_extent_px`), stamped by `encode_frame`
-    // when the offscreen is drawn and read by every present into the blit's
-    // `chrome_y1`: beside those rows the remainder bands continue the frame's
+    // Which source rows `[chrome_y0, chrome_y1)` of THIS window's offscreen are
+    // host chrome (`aterm_render::Renderer::chrome_extent_px`), stamped by
+    // `encode_frame` when the offscreen is drawn and read by every present into
+    // the blit's `chrome_y0`/`chrome_y1`: beside those rows the remainder bands continue the frame's
     // edge pixels, so the chrome band reaches the true window edge. Per window
     // and stamped at encode, never read live off the shared inner renderer at
     // present time — that holds whichever window composed LAST. `Default` 0 is
     // the historical present (no chrome ⇒ byte-identical).
+    pub(crate) chrome_y0: u32,
     pub(crate) chrome_y1: u32,
     // Colour-space tag the platform compositor applies to this window's
     // presented texture. Unlike the texture format, this distinguishes an
@@ -4388,15 +4409,19 @@ pub struct WindowGpu {
     // armed present-copy frame copies the STALE RECT, never the whole frame.
     #[cfg(all(target_os = "macos", test))]
     pub(crate) metal_last_compose_rect: Option<[u32; 4]>,
-    // The last ARMED Submit B that composed `metal_present_off`, held until it
-    // resolves. WHY: Submit B is NOT waited, and the compose bookkeeping records
-    // the copy as synced when the ENCODE succeeds — a command buffer that then
-    // ends `Retryable` (loss.rs: no latch, no window reset) leaves the copy
-    // UNWRITTEN where the trackers say it is clean. The full copy used to
-    // self-heal that next frame; the tracked rect does not, so a non-Completed
-    // resolution degrades both trackers to "everything".
+    // EVERY armed Submit B that composed `metal_present_off` and has not
+    // resolved yet, each held until it does. WHY: Submit B is NOT waited, and
+    // the compose bookkeeping records the copy as synced when the ENCODE
+    // succeeds — a command buffer that then ends `Retryable` (loss.rs: no
+    // latch, no window reset) leaves the copy UNWRITTEN where the trackers say
+    // it is clean. The full copy used to self-heal that next frame; the tracked
+    // rect does not, so a non-Completed resolution degrades both trackers to
+    // "everything". A LIST, not one slot (audit, 2026-09-24): during a glide
+    // every frame composes and frame N's buffer is usually still running when
+    // N+1 encodes, so a single slot dropped N's probe unresolved and a failed
+    // N went unseen. The pending ring's depth-3 backpressure bounds it.
     #[cfg(target_os = "macos")]
-    pub(crate) metal_present_off_pending: Option<crate::metal::encoder::CbProbe>,
+    pub(crate) metal_present_off_pending: Vec<crate::metal::encoder::CbProbe>,
     // The ARMED arm's resident band-shift scratch (the `shift_scratch` twin):
     // the Submit B sub-row translate and the E7 whole-row rescue both stage
     // through it. Reused at the offscreen's dims, recreated on resize. It used
@@ -4746,6 +4771,9 @@ impl WindowGpu {
     /// would leave them painted in the OLD theme until cell content changes.
     pub fn invalidate_present(&mut self) {
         self.present_prev = None;
+        // The incoming-row raster reads renderer state its key cannot see
+        // (blending, contrast, font knobs): drop it with the present cache.
+        self.apron_scratch.invalidate();
         self.advance_resident_input_epoch();
     }
 
@@ -8099,7 +8127,8 @@ impl GpuRenderer {
     /// booked (`MetalArmLive::encode_inline_waits`) — a `waitUntilCompleted`
     /// on a command buffer the same present committed. A rescued scroll
     /// present books NONE (its band copies ride Submit A); the in-place
-    /// effect buffers and the capture oracle's translate still book one each.
+    /// effect buffers and the capture oracle's translate still book one each (two
+    /// when the translate also lays the incoming-row strip).
     #[doc(hidden)]
     #[must_use]
     #[cfg(target_os = "macos")]
@@ -8252,7 +8281,7 @@ impl GpuRenderer {
     /// ([`aterm_render::Renderer::chrome_extent_px`]) — what `encode_frame`
     /// stamps on a window for its present's blit to continue.
     #[must_use]
-    pub fn chrome_extent_px(&self, frame_h: usize) -> usize {
+    pub fn chrome_extent_px(&self, frame_h: usize) -> std::ops::Range<usize> {
         self.cpu.chrome_extent_px(frame_h)
     }
 
@@ -10485,13 +10514,13 @@ impl GpuRenderer {
         y0: usize,
         y1: usize,
         delta: i64,
-    ) {
+    ) -> bool {
         use crate::device_layer::{FrameEncoder, SubmittedFrame};
         let Some(shift) = self.metal_band_shift_plan(win, y0, y1, delta) else {
-            return;
+            return false;
         };
         let Some(scratch) = win.metal_shift_scratch.as_ref().map(|t| t.clone_handle()) else {
-            return;
+            return false;
         };
         // This MUTATES the offscreen outside any encode scissor, so the resident
         // present copy can no longer be trusted anywhere: force a full re-copy on
@@ -10503,11 +10532,11 @@ impl GpuRenderer {
             note_offscreen_written(win, None, dims);
         }
         let Some(off) = win.metal_offscreen.as_ref() else {
-            return;
+            return false;
         };
         let w = off.w;
         let Some(cell) = self.metal_arm.as_mut() else {
-            return;
+            return false;
         };
         let live = cell.live_mut();
         let _pool = crate::metal::ffi::AutoreleasePool::new();
@@ -10526,8 +10555,12 @@ impl GpuRenderer {
                 SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
             }
         })();
-        if let Err(e) = staged {
-            metal_arm_note(&format!("armed scroll shift failed ({e}); band unshifted"));
+        match staged {
+            Ok(()) => true,
+            Err(e) => {
+                metal_arm_note(&format!("armed scroll shift failed ({e}); band unshifted"));
+                false
+            }
         }
     }
 
@@ -11251,6 +11284,7 @@ impl GpuRenderer {
         };
         // The blit uniform — the production formula, spelling for spelling.
         let mut want = present_blit_uniform(invert, overlay, source_crop, fw, fh, dw, dh, live_bg);
+        want.chrome_y0 = win.chrome_y0 as f32;
         want.chrome_y1 = win.chrome_y1 as f32;
         want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
         want.hdr = if plan.blit_linear_encode { 1.0 } else { 0.0 };
@@ -11617,22 +11651,23 @@ impl GpuRenderer {
         // B's halo, haze, band shift and card wrote over the copy. Both trackers
         // are `None` for the first sync into a fresh copy (the mint above), so
         // that one — and only that one — is the full frame.
-        // Resolve the previous compose's fate BEFORE trusting the trackers.
+        // Resolve every earlier compose's fate BEFORE trusting the trackers.
         // Still unfinished ⇒ keep it (queue order runs it before this one; it
         // is re-polled next frame); Completed ⇒ forget it; anything else ⇒ the
         // copy is unknown everywhere (see `metal_present_off_pending`).
-        if let Some(probe) = win.metal_present_off_pending.as_ref() {
-            match probe.try_terminal() {
-                None => {}
-                Some(crate::metal::loss::CbOutcome::Completed) => {
-                    win.metal_present_off_pending = None;
-                }
+        let mut lost_compose = false;
+        win.metal_present_off_pending
+            .retain(|probe| match probe.try_terminal() {
+                None => true,
+                Some(crate::metal::loss::CbOutcome::Completed) => false,
                 Some(_) => {
-                    win.metal_present_off_pending = None;
-                    win.offscreen_dirty_since_sync = None;
-                    win.present_offscreen_fx = None;
+                    lost_compose = true;
+                    false
                 }
-            }
+            });
+        if lost_compose {
+            win.offscreen_dirty_since_sync = None;
+            win.present_offscreen_fx = None;
         }
         let copy_rect = present_copy_rect(
             win.offscreen_dirty_since_sync,
@@ -11824,7 +11859,10 @@ impl GpuRenderer {
         }
         let submitted = cb.commit();
         if use_present_off {
-            win.metal_present_off_pending = Some(crate::metal::encoder::CbProbe::of(&submitted));
+            // APPEND, never replace: an older compose still in flight keeps
+            // its probe until it resolves.
+            win.metal_present_off_pending
+                .push(crate::metal::encoder::CbProbe::of(&submitted));
         }
         if let Some(tap) = win.video.as_mut() {
             tap.metal_note_submitted(crate::metal::encoder::CbProbe::of(&submitted));
@@ -12065,10 +12103,13 @@ impl GpuRenderer {
                 input.grid_bot_row,
                 h as usize,
             );
-            self.metal_shift_offscreen_band_px(win, y0, y1, frac);
             // The incoming row over the strip the shift exposed — the CPU
-            // `paint_incoming_strip` order, on the armed offscreen.
-            self.apron_into_offscreen_metal(win, input);
+            // `paint_incoming_strip` order, on the armed offscreen — and ONLY
+            // when the shift really ran: over an unshifted band the strip would
+            // paste the incoming row across the bottom of the last visible row.
+            if self.metal_shift_offscreen_band_px(win, y0, y1, frac) {
+                self.apron_into_offscreen_metal(win, input);
+            }
         }
         #[cfg(wgpu_arm)]
         {
@@ -13715,13 +13756,13 @@ impl GpuRenderer {
         // (compounding) and a moved/closed card would strand stale pixels. The
         // budget that justified it ("a card shows only during settings UI, never on
         // the typing hot path") does not hold: the frontend's composite slot is
-        // `route_card.or(settings_card).or(level_up_card).or(notice_card)
+        // `route_card.or(settings_card).or(conn_wire_card).or(bubble_card)
         //  .or(badge_card)`, and `badge_card` is the STATIC top-right version pill —
         // `Some` for the ENTIRE SESSION once `show_build_badge` is on. Flipping one
         // cosmetic ~200x40 px toggle therefore converted every keystroke echo and
         // every cursor blink from a one-row scissor into a full O(rows·cols) grid
-        // re-encode + full-target Clear + full present-offscreen re-copy. The update
-        // notice and the level-up burst did the same for their lifetimes.
+        // re-encode + full-target Clear + full present-offscreen re-copy. Every
+        // transient card did the same for its lifetime.
         //
         // So route the card exactly the way the comet halo is already routed: over
         // the THROWAWAY `present_offscreen` copy, never into the scissor base. That
@@ -13963,6 +14004,7 @@ impl GpuRenderer {
             live_bg,
         );
         // The chrome rows this window's offscreen holds (stamped at encode).
+        want.chrome_y0 = win.chrome_y0 as f32;
         want.chrome_y1 = win.chrome_y1 as f32;
         // Downlevel (sRGB-typed offscreen): the blit samples a view that auto-decodes to
         // linear, so it must re-encode to sRGB for the non-sRGB swapchain.
@@ -14578,7 +14620,10 @@ impl GpuRenderer {
             )?;
             match enc.submit() {
                 SubmittedFrame::Metal(sub) => {
-                    let outcome = sub.wait_outcome();
+                    // Booked like every inline park on the offscreen-writing path
+                    // (`MetalArmLive::encode_inline_waits`): the count is every
+                    // such site, not the ones someone remembered to tag.
+                    let outcome = live.wait_inline(&sub);
                     if outcome != crate::metal::loss::CbOutcome::Completed {
                         return Err(format!("apron strip command buffer ended {outcome:?}"));
                     }
@@ -16461,7 +16506,7 @@ impl GpuRenderer {
     /// anything if both sides consume the same inputs. Reconstructing the
     /// uniform on the Metal side would let the two drift and quietly turn a
     /// real divergence into two matching bugs, so the Metal arm reads the
-    /// literal 96 bytes this arm wrote instead. `aterm_bits::bytes_of` on the
+    /// literal 112 bytes this arm wrote instead. `aterm_bits::bytes_of` on the
     /// `Pod` struct is the same view `write_buffer` above took.
     #[cfg(all(target_os = "macos", test))]
     pub(crate) fn last_blit_uniform_bytes(&self) -> Option<Vec<u8>> {
@@ -16637,6 +16682,7 @@ impl GpuRenderer {
         // shared buffer and keep its memo coherent for the next present.
         let mut want =
             present_blit_uniform(invert, overlay, source_crop, fw, fh, w, h, self.theme.bg);
+        want.chrome_y0 = win.chrome_y0 as f32;
         want.chrome_y1 = win.chrome_y1 as f32;
         if let Some(band_a) = fx.translucent {
             want = want.with_translucency(band_a);
@@ -16805,120 +16851,6 @@ impl GpuRenderer {
         out
     }
 
-    /// TEST HELPER (P4, the Bg differential): draw a fixed instance stream
-    /// through the REAL bg machinery — `self.bg_pipeline` (built by
-    /// [`build_table_pipeline`] from `Pipeline::Bg`'s row), the REAL shared
-    /// `uniform_buf`/`uniform_bg` at group 0, the REAL `BgInstance` vertex
-    /// layout at slot 0, and the production draw shape (`draw(0..6, 0..n)`,
-    /// one instanced call, exactly like `draw_stream!`) — into a fresh
-    /// readable texture of the row's OWN resolved target format, read back as
-    /// tightly packed bytes.
-    ///
-    /// Production-inert in the same sense as
-    /// [`Self::blit_effect_target_for_test`]: the one shared object it writes
-    /// is the 16-byte uniform buffer, and it keeps the `uniform_written` memo
-    /// coherent so the next real frame rewrites it iff it differs.
-    ///
-    /// Instances arrive as `(rect, colour)` pairs rather than [`BgInstance`]
-    /// so the Metal arm of the differential can state the SAME fixture in
-    /// neutral terms and pack its own bytes against the table's layout law —
-    /// each side spells the layout independently, which is what the
-    /// differential exists to compare.
-    #[cfg(all(target_os = "macos", test))]
-    pub(crate) fn bg_row_bytes_for_test(
-        &mut self,
-        instances: &[([u16; 4], [u8; 4])],
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        assert!(
-            !instances.is_empty() && w > 0 && h > 0,
-            "an empty bg differential compares two clears and arms nothing"
-        );
-        let spec = Pipeline::Bg.spec();
-        // The row's own target role through the ONE resolver (C1/C2: pipeline
-        // format == attachment format by construction). Both of its possible
-        // resolutions are 4-byte formats, which the readback below relies on.
-        let format = self.ctx.pipeline_targets().resolve(spec.target);
-
-        let dst = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test bg dst (offscreen stand-in)"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // The REAL shared uniform buffer, under the same renderer-level memo
-        // discipline as the production write: the screen size is the test
-        // target's, so `to_ndc` maps pixel rects exactly as a frame would.
-        if self.uniform_written != Some((w, h, 0)) {
-            self.ctx.queue.write_buffer(
-                &self.uniform_buf,
-                0,
-                aterm_bits::bytes_of(&Uniforms {
-                    screen: [w as f32, h as f32],
-                    text_blend: 0.0,
-                    _pad: 0.0,
-                }),
-            );
-            self.uniform_written = Some((w, h, 0));
-        }
-
-        let insts: Vec<BgInstance> = instances
-            .iter()
-            .map(|&(rect, color)| BgInstance { rect, color })
-            .collect();
-        let bytes: &[u8] = aterm_bits::cast_slice(&insts);
-        let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-gpu test bg instances"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
-        buf.unmap();
-
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test bg draw"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test bg pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Opaque black, the Metal arm's ClearColor twin.
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.bg_pipeline);
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..6, 0..insts.len() as u32);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, 4)
-    }
     /// TEST HELPER (W2, the Glyph differential — the ladder's first TEXTURED
     /// row): draw a fixed `GlyphInstance` stream through the REAL glyph
     /// machinery — `self.glyph_pipeline` (built by [`build_table_pipeline`]
@@ -18605,7 +18537,9 @@ impl GpuRenderer {
         // The chrome rows this offscreen will hold, for the present's blit
         // (`WindowGpu::chrome_y1`): stamped with the pixels, so a later present of
         // this retained offscreen continues exactly the chrome it contains.
-        win.chrome_y1 = u32::try_from(self.cpu.chrome_extent_px(h as usize)).unwrap_or(h);
+        let chrome = self.cpu.chrome_extent_px(h as usize);
+        win.chrome_y0 = u32::try_from(chrome.start).unwrap_or(h);
+        win.chrome_y1 = u32::try_from(chrome.end).unwrap_or(h);
         // BOUND THE PER-FRAME INSTANCE STREAMS to the clamped framebuffer. The encode
         // loops below iterate the FULL `input.rows × input.cols`; a cell whose pixel
         // ORIGIN lies outside the clamped framebuffer emits no visible pixels (it is
@@ -19394,7 +19328,7 @@ impl GpuRenderer {
                 && self
                     .cpu
                     .chrome_bleed()
-                    .is_some_and(|b| b.rows > 0 && b.top_extends_cells)
+                    .is_some_and(|b| b.first == 0 && b.rows > 0 && b.top_extends_cells)
             {
                 (0u16, sat_pos_u16(grid_top + ch))
             } else {
@@ -19409,7 +19343,11 @@ impl GpuRenderer {
             // just above (bg is REPLACE and instance order is rasterization order, the
             // same guarantee those resets already rely on) and never overlap the
             // per-cell quads below, which start at `pad`. No-op with no bleed declared.
-            if let Some(bleed) = self.cpu.chrome_bleed().filter(|b| r < b.rows) {
+            if let Some(bleed) = self
+                .cpu
+                .chrome_bleed()
+                .filter(|b| (b.first..b.rows).contains(&r))
+            {
                 // H1: with the backdrop margins live, the bleed's gutter/strip
                 // fills carry the margin alpha — the strip band's flanks and the
                 // sliver above it become real material, tinted the band colour
@@ -21974,8 +21912,10 @@ impl GpuRenderer {
             //     literals, same order);
             //   * the coalescing rationale and its ENUMERATED tally (0-3 passes
             //     saved depending on which effects are live; the add/over
-            //     non-commutation that forbids hoisting) are unchanged and still
-            //     pinned by `pass_count_versus_the_pre_coalescer_shape`.
+            //     non-commutation that forbids hoisting) are unchanged (the
+            //     retired-shape comparison that pinned the tally is at
+            //     `e8a8c80ab`; `effects_free_frame_is_a_single_pass` still pins
+            //     the quiet frame).
             //
             // Stage the uploaded slices + instance counts by [`StreamId`]. The
             // `Some`-ness mirrors `upload`'s gate exactly (empty stream or
@@ -23280,7 +23220,9 @@ impl GpuRenderer {
         let mut want = present_blit_uniform(false, None, source_crop, fw, fh, dw, dh, live_bg);
         // The production present reads the extent its window stamped at encode;
         // the replay has no window, so it asks the inner renderer that encoded.
-        want.chrome_y1 = self.cpu.chrome_extent_px(fh as usize) as f32;
+        let chrome = self.cpu.chrome_extent_px(fh as usize);
+        want.chrome_y0 = chrome.start as f32;
+        want.chrome_y1 = chrome.end as f32;
         want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
         let bu = mint.buffer(std::mem::size_of::<BlitUniform>())?;
         // SAFETY: Pod into an exactly-sized fresh shared buffer.
@@ -23483,53 +23425,6 @@ impl GpuRenderer {
         (tex, view)
     }
 
-    /// Upload `bytes` as a sampleable fixture texture (tight stride).
-    fn sampled_fixture_for_test(
-        &self,
-        format: wgpu::TextureFormat,
-        bytes: &[u8],
-        w: u32,
-        h: u32,
-        texel: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        assert_eq!(bytes.len(), (w * h * texel) as usize, "tight fixture");
-        let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test sampled fixture"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * texel),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        (tex, view)
-    }
-
     /// A vertex buffer holding `bytes` (test stream).
     fn stream_buffer_for_test(&self, bytes: &[u8]) -> wgpu::Buffer {
         let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -23541,215 +23436,6 @@ impl GpuRenderer {
         buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
         buf.unmap();
         buf
-    }
-
-    /// TEST HELPER (W5, row 12 `bloom`): the "bloom composite pass" through
-    /// the REAL machinery — `self.bloom_pipeline` (built by the table row at
-    /// construction), a bind group on the REAL `bloom_bgl` carrying the
-    /// half-res source + the REAL LINEAR `bloom_sampler` + the REAL
-    /// `bloom_uniform_buf` (written with the live strength/radius knobs) —
-    /// onto a SEEDED `LoadOp::Load` target of the row's own resolved format,
-    /// scissored, fullscreen triangle, read back tight.
-    ///
-    /// The half-res source vs the full-res target is what makes the LINEAR
-    /// sampler axis load-bearing (the W2 lesson): every gaussian tap lands at
-    /// a sub-texel position of the minified source.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the row fixture states the tunables explicitly so both arms spell them"
-    )]
-    pub(crate) fn bloom_row_bytes_for_test(
-        &mut self,
-        half_src: (&[u8], u32, u32),
-        seed: &[u8],
-        strength: f32,
-        radius: f32,
-        scissor: Option<[u32; 4]>,
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        let (src_bytes, bw, bh) = half_src;
-        let (_src_tex, src_view) =
-            self.sampled_fixture_for_test(wgpu::TextureFormat::Rgba8Unorm, src_bytes, bw, bh, 4);
-        let format = self
-            .ctx
-            .pipeline_targets()
-            .resolve(Pipeline::Bloom.spec().target);
-        let (dst, dst_view) = self.seeded_target_for_test(format, seed, w, h, 4);
-        self.ctx.queue.write_buffer(
-            &self.bloom_uniform_buf,
-            0,
-            aterm_bits::bytes_of(&BloomUniform {
-                texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                strength,
-                radius,
-                chroma_radius: bloom_chroma_radius(radius),
-                _pad: [0.0; 3],
-            }),
-        );
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test bloom bind"),
-                layout: &self.bloom_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&src_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.bloom_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test bloom draw"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test bloom composite pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.bloom_pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            if let Some([x0, y0, x1, y1]) = scissor {
-                pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
-            }
-            pass.draw(0..3, 0..1);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, 4)
-    }
-
-    /// TEST HELPER (W5, row 13 `shimmer`): the scissored refraction pass
-    /// through the REAL machinery — `ensure_shimmer_resources`' pipeline,
-    /// a bind group on its REAL `bgl` (scratch view + the LINEAR
-    /// `bloom_sampler` + the REAL shared `uniform_buf`), the REAL
-    /// `ShimmerUniform` layout with amp/period/rolloff derived from the cell
-    /// size exactly as `encode_shimmer` derives them and the phase from the
-    /// PINNED `shimmer_phase()` — onto a seeded Load target, scissored to the
-    /// region. The scratch is the DISPLACED-sample source, so the LINEAR
-    /// sub-texel axis is load-bearing by construction.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the row fixture states the region's independent axes explicitly"
-    )]
-    pub(crate) fn shimmer_row_bytes_for_test(
-        &mut self,
-        scratch_bytes: &[u8],
-        seed: &[u8],
-        region: [u32; 4],
-        hot_top: f32,
-        rise: f32,
-        heat64: &[f32; SHIMMER_BANDS],
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        self.ensure_shimmer_resources();
-        let (_scratch_tex, scratch_view) =
-            self.sampled_fixture_for_test(wgpu::TextureFormat::Rgba8Unorm, scratch_bytes, w, h, 4);
-        let format = self
-            .ctx
-            .pipeline_targets()
-            .resolve(Pipeline::Shimmer.spec().target);
-        let (dst, dst_view) = self.seeded_target_for_test(format, seed, w, h, 4);
-        let (cw, ch) = self.cpu.cell_size();
-        let mut heat = [[0f32; 4]; SHIMMER_BANDS / 4];
-        for (i, v) in heat64.iter().enumerate() {
-            heat[i / 4][i % 4] = *v;
-        }
-        let [x0, y0, x1, y1] = region;
-        let su = ShimmerUniform {
-            frame: [w as f32, h as f32],
-            region_min: [x0 as f32, y0 as f32],
-            region_max: [x1 as f32, y1 as f32],
-            hot_top,
-            rise,
-            amp: (ch as f32 / 18.0).clamp(0.75, SHIMMER_AMP_PX),
-            period: (ch as f32).max(4.0),
-            phase: self.shimmer_phase(),
-            band_x0: x0 as f32,
-            band_w: ((x1 - x0) as f32 / SHIMMER_BANDS as f32).max(1e-3),
-            rolloff: (cw as f32).max(1.0),
-            _pad: [0.0; 2],
-            heat,
-        };
-        let sr = self.shimmer.as_ref().expect("ensured above");
-        self.ctx
-            .queue
-            .write_buffer(&sr.uniform_buf, 0, aterm_bits::bytes_of(&su));
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test shimmer bind"),
-                layout: &sr.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&scratch_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: sr.uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test shimmer draw"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test shimmer pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&sr.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
-            pass.draw(0..3, 0..1);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, 4)
     }
 
     /// TEST HELPER (W5, rows 14/15 — the crown pair, ONE construction site):
@@ -23854,88 +23540,6 @@ impl GpuRenderer {
         }
         self.ctx.queue.submit([enc.finish()]);
         self.texture_bytes_tight_for_test(&dst, w, h, texel as usize)
-    }
-
-    /// TEST HELPER (W5, row 17 `tray`): the card composite through the REAL
-    /// machinery — `ensure_tray_pipeline` for the production attachment
-    /// format (the present copy's — the offscreen format), a bind group on
-    /// the REAL `tray_bgl` (card view + the LINEAR `tray_sampler` + the REAL
-    /// `tray_uniform_buf`), the production 1:1 device-px placement (the tray
-    /// only ever draws unscaled — `TrayUniform.rect = [dx, dy, pw, ph]`), a
-    /// 4-vertex strip, straight-alpha src-over onto a seeded Load target.
-    pub(crate) fn tray_row_bytes_for_test(
-        &mut self,
-        card: (&[u8], u32, u32),
-        (dx, dy): (u32, u32),
-        seed: &[u8],
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        let (card_bytes, pw, ph) = card;
-        let format = self.ctx.offscreen_format();
-        self.ensure_tray_pipeline(format);
-        let (_card_tex, card_view) =
-            self.sampled_fixture_for_test(wgpu::TextureFormat::Rgba8Unorm, card_bytes, pw, ph, 4);
-        let (dst, dst_view) = self.seeded_target_for_test(format, seed, w, h, 4);
-        self.ctx.queue.write_buffer(
-            &self.tray_uniform_buf,
-            0,
-            aterm_bits::bytes_of(&TrayUniform {
-                rect: [dx as f32, dy as f32, pw as f32, ph as f32],
-                fb: [w as f32, h as f32],
-                _pad: [0.0, 0.0],
-            }),
-        );
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test tray bind"),
-                layout: &self.tray_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&card_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.tray_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.tray_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test tray draw"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test tray pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.tray_pipelines[&format]);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..4, 0..1);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, 4)
     }
 }
 
@@ -25009,91 +24613,6 @@ mod tests {
         assert!(
             pass_of[G_GLOW] < pass_of[G_WDECO_OVER] && pass_of[G_WDECO_OVER] < pass_of[G_WDECO_ADD],
             "draw order must survive the split verbatim"
-        );
-    }
-
-    /// The pass shape this replaced (renderer.rs at 5bf3b421), as a model: ONE
-    /// fused sRGB pass when no additive stream is live, otherwise one pass per
-    /// non-empty group with the base halves fused unless `glow_under` parts them.
-    /// Here so the efficacy numbers in `encode_frame`'s comment are executable
-    /// rather than remembered.
-    fn pre_coalescer_passes(enabled: &[bool; FRAME_GROUPS]) -> usize {
-        if !(enabled[G_GLOW_UNDER] || enabled[G_GLOW] || enabled[G_WDECO_ADD]) {
-            return 1;
-        }
-        let mut passes = if enabled[G_GLOW_UNDER] {
-            // A1 (bg) + A2 (the flame body) + A3 (glyph ink, gated).
-            2 + usize::from(enabled[G_BASE_FG])
-        } else {
-            1 // the fused base pass
-        };
-        for g in [G_GLOW, G_WDECO_OVER, G_WDECO_ADD, G_FREE_OVER, G_CURSOR] {
-            passes += usize::from(enabled[g]);
-        }
-        passes
-    }
-
-    /// PIN THE EFFICACY CLAIM. A perf comment that overstates its win is a trap
-    /// for whoever budgets against it, so the per-style tally in `encode_frame`
-    /// is asserted, not asserted-in-prose: coalescing NEVER costs a pass, saves
-    /// nothing at all on the quiet frames, and the headline "one pass off the
-    /// sparkle-words echo" is exactly one — while a free-sprite frame, where the
-    /// old shape split adjacent source-over groups, is worth two. The exhaustive
-    /// half also caps the whole claim at 3, so nobody can restate this as a
-    /// collapse of the group count.
-    #[test]
-    fn pass_count_versus_the_pre_coalescer_shape() {
-        let frame = |groups: &[usize]| {
-            let mut enabled = [false; FRAME_GROUPS];
-            enabled[G_BASE_BG] = true; // always on: it anchors pass 0's load_op
-            for &g in groups {
-                enabled[g] = true;
-            }
-            let (_, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
-            (pre_coalescer_passes(&enabled), passes)
-        };
-        // Effects off — the parity tests and ordinary typing. One pass, always.
-        assert_eq!(frame(&[G_BASE_FG, G_CURSOR]), (1, 1));
-        // Aurora + cursor: every neighbour pair already changes view.
-        assert_eq!(frame(&[G_BASE_FG, G_GLOW, G_CURSOR]), (3, 3));
-        // Sparkle words emitting only the additive layer — the headline frame.
-        assert_eq!(frame(&[G_BASE_FG, G_GLOW, G_WDECO_ADD, G_CURSOR]), (4, 3));
-        // ... and with the paw between the two additive groups, nothing fuses.
-        assert_eq!(
-            frame(&[G_BASE_FG, G_GLOW, G_WDECO_OVER, G_WDECO_ADD, G_CURSOR]),
-            (5, 5)
-        );
-        // EMBERFORGE's under-glyph light parts the base in both shapes alike.
-        assert_eq!(frame(&[G_GLOW_UNDER, G_BASE_FG, G_GLOW, G_CURSOR]), (5, 5));
-        // A free sprite (the cat) rides just before the cursor: two adjacent
-        // source-over groups the old shape split into two full tile round-trips.
-        assert_eq!(
-            frame(&[G_BASE_FG, G_GLOW, G_WDECO_ADD, G_FREE_OVER, G_CURSOR]),
-            (5, 3)
-        );
-
-        // Exhaustive: the coalescer can never open MORE passes than the shape it
-        // replaced, and the most it can ever remove is 3.
-        let mut worst = 0;
-        for bits in 0u32..(1 << FRAME_GROUPS) {
-            let mut enabled = [false; FRAME_GROUPS];
-            for (g, e) in enabled.iter_mut().enumerate() {
-                *e = bits & (1 << g) != 0;
-            }
-            enabled[G_BASE_BG] = true;
-            let (_, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
-            let before = pre_coalescer_passes(&enabled);
-            assert!(
-                passes <= before,
-                "coalescing must never ADD a full-framebuffer tile round-trip \
-                 (bits {bits:#010b}: {before} -> {passes})"
-            );
-            worst = worst.max(before - passes);
-        }
-        assert_eq!(
-            worst, 3,
-            "the tally in `encode_frame` claims a 3-pass maximum; if this moved, \
-             the comment is now wrong and a reader is budgeting against fiction"
         );
     }
 
@@ -27584,11 +27103,12 @@ ab\r\n",
         let t = BlitUniform::bell(false).with_translucency(0.5);
         assert_eq!(t.translucent, 1.0, "translucent flag set");
         assert_eq!(t.band[3], 0.5, "band alpha threaded");
-        // The std140 layout is 96 bytes: the M3 `sdr_white_scale` (Windows scRGB
-        // reference-white scale) added a 16-byte block after `translucent`. The
-        // uniform stays `Pod` + upload-compatible, and the WGSL `Blit` struct matches
+        // The std140 layout is 112 bytes: the M3 `sdr_white_scale` (Windows scRGB
+        // reference-white scale) added a 16-byte block after `translucent`, and
+        // `chrome_y0` (+ three pads) another after `premult`. The uniform stays
+        // `Pod` + upload-compatible, and the WGSL `Blit` struct matches
         // byte-for-byte (the CPU/GPU parity test guards that).
-        assert_eq!(std::mem::size_of::<BlitUniform>(), 96);
+        assert_eq!(std::mem::size_of::<BlitUniform>(), 112);
     }
 
     /// A failed f16 re-tag changes more than the surface format: capture's live
@@ -27984,23 +27504,6 @@ impl Rasterizer for GpuRenderer {
     }
 }
 
-#[cfg(test)]
-mod rasterizer_di_tests {
-    use super::*;
-
-    // Locks the WS-F injected-rasterizer abstraction: both the CPU and GPU
-    // renderers must satisfy `Rasterizer`, so a frontend can hold either behind
-    // one trait. Compile-time only — no GPU/font needed.
-    #[test]
-    fn both_renderers_implement_rasterizer() {
-        fn assert_rasterizer<R: Rasterizer>() {}
-        assert_rasterizer::<Renderer>();
-        assert_rasterizer::<GpuRenderer>();
-        // And the trait is object-safe (dyn dispatch = the DI the design wants).
-        fn _takes_dyn(_: &mut dyn Rasterizer) {}
-    }
-}
-
 /// A window a GPU backend can attach a swapchain to.
 ///
 /// THE ROW's one public leak, closed. `create_window_surface` used to take
@@ -28122,7 +27625,7 @@ fn wgsl_entry_points(src: &str) -> Vec<&str> {
 #[cfg(test)]
 mod pipeline_table_wgsl_tests {
     use super::{ShaderLibrary, wgsl_entry_points, wgsl_source};
-    use crate::pipeline_table::{ALL_PIPELINES, entry_points};
+    use crate::pipeline_table::entry_points;
 
     /// THE ENTRY-POINT ROSTER GUARD, wgpu half — the twin of
     /// `crate::metal::shaders::tests::the_msl_defines_exactly_the_entry_points_the_table_asks_for`.
@@ -28159,25 +27662,6 @@ mod pipeline_table_wgsl_tests {
                 "{} WGSL defines {have:?} but the pipeline table asks for {want:?}",
                 lib.name()
             );
-        }
-    }
-
-    /// Every row's shader module is fetched through `wgsl_source(row.library)`,
-    /// so the row's `library` field has to actually contain the row's entry
-    /// points — this is the assertion that says so without building a device.
-    #[test]
-    fn every_row_finds_both_entry_points_in_its_own_library() {
-        for row in ALL_PIPELINES {
-            let spec = row.spec();
-            let defined = wgsl_entry_points(wgsl_source(spec.library));
-            for e in [spec.vs, spec.fs] {
-                assert!(
-                    defined.contains(&e),
-                    "`{}` names library {} but `{e}` is not defined there",
-                    row.name(),
-                    spec.library.name()
-                );
-            }
         }
     }
 

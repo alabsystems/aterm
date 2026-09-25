@@ -819,67 +819,31 @@ mod tests {
     }
 
     #[test]
-    fn ascii_full_range() {
-        // "Hello" cols 0..4 → all 5 chars
-        let (s, e) = column_range_to_byte_offsets("Hello", 0, 4);
-        assert_eq!(&"Hello"[s..e], "Hello");
-    }
-
-    #[test]
-    fn ascii_sub_range() {
-        // "Hello World" cols 0..4 → "Hello"
-        let (s, e) = column_range_to_byte_offsets("Hello World", 0, 4);
-        assert_eq!(&"Hello World"[s..e], "Hello");
-    }
-
-    #[test]
-    fn ascii_mid_range() {
-        // "Hello World" cols 6..10 → "World"
-        let (s, e) = column_range_to_byte_offsets("Hello World", 6, 10);
-        assert_eq!(&"Hello World"[s..e], "World");
-    }
-
-    #[test]
-    fn wide_char_single() {
-        // "你好" — each CJK char is width 2: cols 0..1 → "你"
-        let (s, e) = column_range_to_byte_offsets("你好", 0, 1);
-        assert_eq!(&"你好"[s..e], "你");
-    }
-
-    #[test]
-    fn wide_char_both() {
-        // "你好" cols 0..3 → "你好" (col 0-1 = 你, col 2-3 = 好)
-        let (s, e) = column_range_to_byte_offsets("你好", 0, 3);
-        assert_eq!(&"你好"[s..e], "你好");
-    }
-
-    #[test]
-    fn mixed_ascii_wide() {
-        // "A你B" — A=col0, 你=col1-2, B=col3. Extract cols 1..2 → "你"
-        let (s, e) = column_range_to_byte_offsets("A你B", 1, 2);
-        assert_eq!(&"A你B"[s..e], "你");
-    }
-
-    #[test]
-    fn start_past_content() {
-        let s = "Hi";
-        let (start, end) = column_range_to_byte_offsets(s, 10, 20);
-        assert_eq!(start, s.len());
-        assert_eq!(end, s.len());
-    }
-
-    #[test]
-    fn empty_string() {
-        let (s, e) = column_range_to_byte_offsets("", 0, 5);
-        assert_eq!(s, 0);
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn single_column() {
-        // "abc" col 1..1 → "b"
-        let (s, e) = column_range_to_byte_offsets("abc", 1, 1);
-        assert_eq!(&"abc"[s..e], "b");
+    fn column_range_to_byte_offsets_rows() {
+        // (text, start col, end col inclusive, expected substring). Each row was
+        // its own test. An empty expectation means both offsets sit at the end
+        // of the text.
+        let rows = [
+            ("Hello", 0, 4, "Hello"),
+            ("Hello World", 0, 4, "Hello"),
+            ("Hello World", 6, 10, "World"),
+            // Each CJK char is two columns: cols 0-1 = 你, cols 2-3 = 好.
+            ("你好", 0, 1, "你"),
+            ("你好", 0, 3, "你好"),
+            // A = col 0, 你 = cols 1-2, B = col 3.
+            ("A你B", 1, 2, "你"),
+            ("abc", 1, 1, "b"),
+            // Start past the content.
+            ("Hi", 10, 20, ""),
+            ("", 0, 5, ""),
+        ];
+        for (text, start_col, end_col, want) in rows {
+            let (s, e) = column_range_to_byte_offsets(text, start_col, end_col);
+            assert_eq!(&text[s..e], want, "{text:?} cols {start_col}..={end_col}");
+            if want.is_empty() {
+                assert_eq!((s, e), (text.len(), text.len()), "{text:?}");
+            }
+        }
     }
 
     // ── selection_to_string absolute caps (rigorous DoS bound) ──────────────

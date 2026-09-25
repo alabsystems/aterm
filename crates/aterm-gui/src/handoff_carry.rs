@@ -110,6 +110,16 @@ pub(crate) struct CarrySource {
     head: AltArchiveCarry,
 }
 
+impl CarrySource {
+    /// The session this capture belongs to — what the park's capture matches
+    /// against its carried screens, so a session whose screen it lowered below
+    /// VisibleOnly after the fact goes without its control carry too (the
+    /// 2026-09-22/23 update audit, plan P0-1e).
+    pub(crate) fn local_id(&self) -> u64 {
+        self.local_id
+    }
+}
+
 /// THE FREEZE'S SHARE: the archive's fence and counters, and — with `differ`
 /// — the differ's screen-sized state, under the terminal lock the caller
 /// already holds for this session's checkpoint (so both describe the same

@@ -52,7 +52,7 @@ use crate::glob::glob_match;
 use crate::ladder::Report;
 use crate::smoke::{
     debug_bin, is_socket_or_symlink, metric_ms_whole, metric_u64, retire_smoke_child,
-    smoke_helpers_selftest, smoke_log_tail,
+    smoke_helpers_selftest, smoke_log_tail, socket_listening,
 };
 
 /// `targo --unverified build -q -p aterm-gui -p aterm-ctl`
@@ -332,21 +332,24 @@ fn bring_up(
     }
 
     let sock = sb.sock();
+    // Up means LISTENING, not bound: the file appears at bind(2), before
+    // listen(2), and a first ctl call in that gap is refused.
+    let up = |sock: &Path| is_socket_or_symlink(sock) && socket_listening(sock);
     for _ in 0..SOCKET_POLLS {
         if child_exited(sb) {
             r.fail(format!("{tag}: aterm-gui exited early"));
             r.raw(smoke_log_tail(log_label, &sb.gui_log));
             return Ready::Stopped;
         }
-        if is_socket_or_symlink(&sock) {
+        if up(&sock) {
             return Ready::Up { ctl };
         }
         std::thread::sleep(POLL_GAP);
     }
-    if is_socket_or_symlink(&sock) {
+    if up(&sock) {
         return Ready::Up { ctl };
     }
-    r.fail(format!("{tag}: control socket never appeared"));
+    r.fail(format!("{tag}: control socket never started listening"));
     r.raw(smoke_log_tail(log_label, &sb.gui_log));
     Ready::Stopped
 }

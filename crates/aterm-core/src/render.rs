@@ -1594,14 +1594,14 @@ pub struct RenderInput {
     /// apron-only change must not dirty a viewport row; the strip is re-rastered
     /// from this field on every sub-row frame that shows one).
     pub apron_row: ApronRow,
-    /// The facts `apron_row` was last extracted under — `(display_offset,
-    /// content_gen, history_renumber_epoch, rows, cols)` — so a fill that
-    /// finds them unchanged keeps the row instead of re-reading history
-    /// (`Terminal::apron_row_into`). The cursor scalar is deliberately absent:
-    /// it is refreshed even when this content memo hits. Present-time bookkeeping
-    /// like the row itself: excluded from `PartialEq`, copied with the row by
-    /// `copy_from`.
-    pub apron_stamp: Option<(usize, u64, u64, usize, usize)>,
+    /// The facts `apron_row` was last extracted under ([`ApronStamp`]), so a
+    /// fill that finds them unchanged keeps the row instead of re-reading
+    /// history (`Terminal::apron_row_into`). The cursor scalar is deliberately
+    /// absent: it is refreshed even when this content memo hits. Present-time
+    /// bookkeeping like the row itself: excluded from `PartialEq`, copied with
+    /// the row by `copy_from`. A writer that changes `apron_row` without an
+    /// extraction (the split compositor's clear) must clear this too.
+    pub apron_stamp: Option<ApronStamp>,
     /// FOCUSED-PANE effect-clip box `(x0, y0, x1, y1)` in WINDOW-ABSOLUTE
     /// device pixels — the same space as the `cursor_glow_add` stream (split
     /// composition sets it to the focused pane's box; `None` = single-pane /
@@ -2412,6 +2412,35 @@ impl PartialEq for RenderInput {
 }
 
 impl Eq for RenderInput {}
+
+/// What [`RenderInput::apron_row`] was last extracted under: when a fill finds
+/// every term unchanged it keeps the row instead of re-reading history.
+///
+/// The row holds RESOLVED colours, so its identity is more than its content:
+/// the palette, the default colours, reverse video, the style policy and the
+/// BiDi modes all change the row without moving `content_gen` (their mutators
+/// only mark `Damage::Full`), and tabs of one window share a scratch while
+/// per-grid counters collide numerically (every grid's `content_gen` starts
+/// at 1), so the terminal that filled it is part of the memo too — DMG-1's
+/// `terminal_id` lesson for the viewport rows, applied to this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApronStamp {
+    /// `display_offset` at extraction.
+    pub offset: usize,
+    /// The grid's content generation.
+    pub content_gen: u64,
+    /// The history renumbering epoch.
+    pub renumber_epoch: u64,
+    /// Frame shape.
+    pub rows: usize,
+    /// Frame shape.
+    pub cols: usize,
+    /// A fingerprint of every presentation input the row is resolved against
+    /// that moves no `content_gen` (`Terminal::apron_presentation_fingerprint`).
+    pub presentation: u64,
+    /// The extracting terminal's identity nonce (`RenderInput::terminal_id`).
+    pub terminal: u64,
+}
 
 /// M1b INCOMING-ROW APRON — the one row just below the viewport, carried on
 /// [`RenderInput::apron_row`]. A plain struct rather than an `Option` so the
@@ -5311,99 +5340,6 @@ mod rain_channel_tests {
                 .same_content(&changed.glow_under_damage),
             Some(false),
             "the compact damage revision must detect a payload change"
-        );
-    }
-
-    /// Manual release-mode yardstick for the producer metadata path and the
-    /// exact work it supersedes.  It deliberately prints measurements without
-    /// asserting a wall-clock threshold: CPU frequency and thermal state make
-    /// such thresholds flaky.  Run with
-    /// `cargo test -p aterm-core --release --lib measure_8k_glow_under_damage_work -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "manual release microbenchmark"]
-    fn measure_8k_glow_under_damage_work() {
-        use std::{hint::black_box, time::Instant};
-
-        const QUADS: usize = 8_191;
-        const ROWS: usize = 128;
-        const SAMPLES: usize = 10_000;
-
-        let payload: Vec<GlowQuad> = (0..QUADS)
-            .map(|index| GlowQuad {
-                row: (index % ROWS) as u16,
-                x: index as u16,
-                y: (index % ROWS * 16) as u16,
-                w: 12,
-                h: 10,
-                color: 0x0060_2008,
-                alpha: 0,
-                color2: 0x0060_2008,
-                alpha2: 0,
-            })
-            .collect();
-        let mut source = RenderInput::empty();
-        source.rows = ROWS;
-        source.glow_under.clone_from(&payload);
-        source.refresh_cursor_effect_damage();
-        let mut changed = source.clone();
-        changed.glow_under[QUADS - 1].color ^= 1;
-        changed.refresh_cursor_effect_damage();
-
-        let start = Instant::now();
-        for _ in 0..SAMPLES {
-            let input = black_box(&mut source);
-            input.refresh_cursor_effect_damage();
-            black_box(
-                input
-                    .glow_under_damage
-                    .same_content(&changed.glow_under_damage),
-            );
-        }
-        let metadata_refresh = start.elapsed();
-
-        let mut exact_prev = Vec::new();
-        let start = Instant::now();
-        for _ in 0..SAMPLES {
-            let current = black_box(&payload);
-            exact_prev.clone_from(current);
-            black_box(exact_prev == *current);
-        }
-        let exact_clone_compare = start.elapsed();
-
-        let start = Instant::now();
-        for _ in 0..SAMPLES {
-            let previous = black_box(&payload);
-            let current = black_box(&changed.glow_under);
-            black_box(
-                previous
-                    .iter()
-                    .chain(current.iter())
-                    .fold(0_u32, |rows, quad| rows | (1 << (quad.row % 32))),
-            );
-        }
-        let exact_changed_row_scan = start.elapsed();
-
-        let mut dirty = vec![false; ROWS];
-        let start = Instant::now();
-        for _ in 0..SAMPLES {
-            dirty.fill(false);
-            source.glow_under_damage.mark_rows(&mut dirty);
-            changed.glow_under_damage.mark_rows(&mut dirty);
-            black_box(dirty.iter().filter(|&&row| row).count());
-        }
-        let metadata_row_mark = start.elapsed();
-
-        let ns_per = |duration: std::time::Duration| duration.as_nanos() / SAMPLES as u128;
-        eprintln!(
-            "8k glow_under, {QUADS} quads / {ROWS} rows: metadata refresh={} ns, \
-             exact clone+equal-compare={} ns, exact changed-row scan={} ns, \
-             metadata prev+current row mark={} ns ({} B bitmap vs {} B payload)",
-            ns_per(metadata_refresh),
-            ns_per(exact_clone_compare),
-            ns_per(exact_changed_row_scan),
-            ns_per(metadata_row_mark),
-            source.glow_under_damage.rows.len() * std::mem::size_of::<u64>(),
-            payload.len() * std::mem::size_of::<GlowQuad>(),
         );
     }
 }

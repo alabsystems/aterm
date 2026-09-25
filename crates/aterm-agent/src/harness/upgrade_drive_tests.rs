@@ -92,6 +92,12 @@ fn every_phase_survives_the_state_file() {
                 .to_string(),
             last_seq: 232_803,
             noted: "terminal:tmux".to_string(),
+            model_before: "claude-opus-5-5".to_string(),
+            mark: 45_092_357,
+            launch_model: "claude-sonnet-5".to_string(),
+            confirm_by: 1_790_000_120,
+            resumed_on: "2.1.282".to_string(),
+            resumed_pid: 9163,
             ..St::fresh(&from, &to, 1_790_000_000)
         };
         assert_eq!(St::from_json(&st.to_json()), Some(st));
@@ -200,6 +206,80 @@ fn host_filters_foreign_groups_before_expensive_process_reads() {
         found.is_empty(),
         "a readable conflicting env vetoes the claim"
     );
+}
+
+/// A normal shell tab should not make the minute host parse every old Claude
+/// session. A matching process, an unfamiliar filename, or an unfinished
+/// restart still takes the complete scan so the fast path cannot authorize an
+/// act or strand a relaunch.
+#[test]
+fn host_skips_quiet_session_history_but_preserves_candidate_and_orphan_scans() {
+    let dir = scratch("host-quiet-history");
+    let opts = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let mut child = parked().spawn().expect("session process");
+    wait_exec(child.id());
+    register(&opts.home, child.id(), SESSION);
+    let mut tabs = [LiveTab {
+        sid: "s-mine".to_string(),
+        fgpgid: Some(i64::MAX),
+    }];
+    SESSION_FILE_SCANS.with(|count| count.set(0));
+    assert!(sweep_with_roster(&opts, Some(&tabs)).is_empty());
+    assert_eq!(SESSION_FILE_SCANS.with(std::cell::Cell::get), 0);
+
+    tabs[0].fgpgid = process_group(child.id());
+    assert!(host_may_have_work(&opts, &tabs));
+    SESSION_FILE_SCANS.with(|count| count.set(0));
+    let _ = sweep_with_roster(&opts, Some(&tabs));
+    assert_eq!(SESSION_FILE_SCANS.with(std::cell::Cell::get), 1);
+
+    tabs[0].fgpgid = None;
+    SESSION_FILE_SCANS.with(|count| count.set(0));
+    let _ = sweep_with_roster(&opts, Some(&tabs));
+    assert_eq!(
+        SESSION_FILE_SCANS.with(std::cell::Cell::get),
+        1,
+        "an unknown foreground group cannot prove this tab is quiet"
+    );
+
+    tabs[0].fgpgid = Some(i64::MAX);
+    let unknown = opts.home.join(".claude/sessions/unknown.json");
+    std::fs::write(&unknown, "not a session").expect("unknown filename");
+    SESSION_FILE_SCANS.with(|count| count.set(0));
+    let reports = sweep_with_roster(&opts, Some(&tabs));
+    assert_eq!(SESSION_FILE_SCANS.with(std::cell::Cell::get), 1);
+    assert_eq!(reports[0].step, "wait:session-files-unreadable");
+    std::fs::remove_file(unknown).expect("remove malformed test entry");
+
+    let state = St {
+        phase: Phase::Exiting { at_s: now_s() },
+        pid: u32::MAX,
+        shell: std::process::id(),
+        tab: tabs[0].sid.clone(),
+        ..St::default()
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state directory");
+    // The live file above still owns SESSION; an orphan must be a distinct
+    // conversation with no current session file.
+    let orphan_session = format!("{SESSION}-orphan");
+    std::fs::write(state_path(&opts, &orphan_session), state.to_json()).expect("in-flight state");
+    SESSION_FILE_SCANS.with(|count| count.set(0));
+    let reports = sweep_with_roster(&opts, Some(&tabs));
+    assert_eq!(SESSION_FILE_SCANS.with(std::cell::Cell::get), 1);
+    assert_eq!(
+        reports.len(),
+        1,
+        "the orphan restart must reach its handler"
+    );
+    assert_eq!(reports[0].session, orphan_session);
+    assert_eq!(reports[0].step, "would-resume:exiting");
+
+    child.kill().expect("stop child");
+    child.wait().expect("reap child");
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The one-minute host tick should pay no `ps` or argv cost for a current
@@ -509,8 +589,8 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
         dry_run: false,
     };
     let session = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
-    let exe = Path::new("/Users//_me/Library/Application Support/aterm/pkg/agents/claude");
-    let hook = Path::new("/Users//_me/.aterm/shell.d/00-atpkg.zsh");
+    let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
+    let hook = Path::new("/Users/_me/.aterm/shell.d/00-atpkg.zsh");
     let launch = |extra: &[&str]| -> Vec<String> {
         ["claude", "--dangerously-skip-permissions"]
             .iter()
@@ -839,10 +919,11 @@ fn ready_from_tab_a_never_announces_or_terminates_tab_b() {
     )
     .expect("READY transcript");
     assert!(upgrade::transcript_has_ready(
-        &tail(
+        &tail_to_end(
             &transcript(&opts.home, SESSION).expect("transcript"),
-            262_144
-        ),
+            TAIL_BYTES
+        )
+        .0,
         marker
     ));
     let st = St {
@@ -973,7 +1054,11 @@ fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("state file");
-    let sibling = opts.home.join(".claude/sessions/other.json");
+    let sibling_pid = dead_pid();
+    assert_ne!(sibling_pid, sf.pid);
+    let sibling = opts
+        .home
+        .join(format!(".claude/sessions/{sibling_pid}.json"));
     let args = atpkg::caller_shell::ProcArgs {
         env: vec![format!("ATERM_PARENT_SESSION_ID={TAB}")],
         ..atpkg::caller_shell::ProcArgs::default()
@@ -1012,6 +1097,16 @@ fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
             std::fs::remove_file(&sibling).expect("remove partial JSON");
         }
     }
+    std::fs::copy(
+        opts.home.join(format!(".claude/sessions/{}.json", sf.pid)),
+        &sibling,
+    )
+    .expect("valid JSON under the wrong PID filename");
+    assert!(
+        session_files(&opts.home).is_none(),
+        "a numeric filename cannot attest another process's record"
+    );
+    std::fs::remove_file(&sibling).expect("remove mismatched record");
     assert!(session_files(&opts.home).is_some());
     agent.kill().expect("stop agent");
     agent.wait().expect("reap agent");
@@ -1080,14 +1175,38 @@ fn a_ready_answer_is_read_when_the_tail_window_starts_inside_a_character() {
         "the window starts mid-character"
     );
     assert!(std::str::from_utf8(&bytes[bytes.len() - 256..]).is_err());
-    assert!(upgrade::transcript_has_ready(&tail(&path, 256), marker));
+    assert!(upgrade::transcript_has_ready(
+        &tail_to_end(&path, 256).0,
+        marker
+    ));
     // Controls: the window on the character's lead byte, on ASCII, and whole.
-    assert!(upgrade::transcript_has_ready(&tail(&path, 257), marker));
-    assert!(upgrade::transcript_has_ready(&tail(&path, 255), marker));
-    assert!(upgrade::transcript_has_ready(&tail(&path, 1 << 20), marker));
+    assert!(upgrade::transcript_has_ready(
+        &tail_to_end(&path, 257).0,
+        marker
+    ));
+    assert!(upgrade::transcript_has_ready(
+        &tail_to_end(&path, 255).0,
+        marker
+    ));
+    assert!(upgrade::transcript_has_ready(
+        &tail_to_end(&path, 1 << 20).0,
+        marker
+    ));
+    // The mark is where the bytes read end, whatever the window.
+    assert_eq!(tail_to_end(&path, 256).1, bytes.len() as u64);
+    assert_eq!(tail_to_end(&path, 1 << 20).1, bytes.len() as u64);
+    assert_eq!(
+        tail_to_end(&dir.join("absent.jsonl"), 256),
+        (String::new(), 0)
+    );
+    // What is read past a mark: the rest, and nothing from a file that shrank.
+    let end = bytes.len() as u64;
+    assert_eq!(since(&path, end - 4, 1 << 20), "]}}\n");
+    assert_eq!(since(&path, end + 1, 1 << 20), "");
+    assert_eq!(since(&path, 0, 3), r#"{"t"#);
     // Lossy never invents an answer: another marker is still absent.
     assert!(!upgrade::transcript_has_ready(
-        &tail(&path, 256),
+        &tail_to_end(&path, 256).0,
         "ATERM-UPGRADE-READY-00000000"
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1137,6 +1256,123 @@ fn fake_tab(replies: Vec<&'static str>) -> (Client, std::thread::JoinHandle<Vec<
         asked
     });
     (RelayClient::new(ours), server)
+}
+
+#[cfg(unix)]
+const TAIL_DRAFT: &str = r#"OK {"rows":["────────────","❯ draft","────────────"],"cursor":{"row":57,"col":7},"first":56}"#;
+#[cfg(unix)]
+const TAIL_EMPTY: &str =
+    r#"OK {"rows":["────────────","❯ ","────────────"],"cursor":{"row":57,"col":2},"first":56}"#;
+#[cfg(unix)]
+const FULL_DRAFT: &str =
+    r#"OK {"rows":["────────────","❯ draft","────────────"],"cursor":{"row":1,"col":7},"first":0}"#;
+#[cfg(unix)]
+const FULL_EMPTY: &str =
+    r#"OK {"rows":["────────────","❯ ","────────────"],"cursor":{"row":1,"col":2},"first":0}"#;
+
+#[cfg(unix)]
+#[test]
+fn continuation_poll_uses_only_the_tail_while_a_draft_remains() {
+    let (mut c, server) = fake_tab(vec![TAIL_DRAFT, TAIL_DRAFT]);
+    let mut tail_available = true;
+    assert!(!continuation_composer_empty(
+        &mut c,
+        "s-x",
+        &mut tail_available
+    ));
+    assert!(!continuation_composer_empty(
+        &mut c,
+        "s-x",
+        &mut tail_available
+    ));
+    assert!(tail_available);
+    drop(c);
+    assert_eq!(
+        server.join().expect("server"),
+        vec!["@s-x text --json tail=20"; 2],
+        "a draft never needs a full-grid read or a cell probe"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_poll_confirms_an_empty_tail_with_the_full_screen() {
+    let (mut c, server) = fake_tab(vec![
+        TAIL_EMPTY,
+        "OK %20 d0d0d0 111318 none",
+        FULL_DRAFT,
+        TAIL_EMPTY,
+        "OK %20 d0d0d0 111318 none",
+        FULL_EMPTY,
+        "OK %20 d0d0d0 111318 none",
+    ]);
+    let mut tail_available = true;
+    assert!(
+        !continuation_composer_empty(&mut c, "s-x", &mut tail_available),
+        "a blank tail alone cannot authorize continuation"
+    );
+    assert!(continuation_composer_empty(
+        &mut c,
+        "s-x",
+        &mut tail_available
+    ));
+    drop(c);
+    assert_eq!(
+        server.join().expect("server"),
+        vec![
+            "@s-x text --json tail=20",
+            "@s-x cell 57 2",
+            "@s-x text --json",
+            "@s-x text --json tail=20",
+            "@s-x cell 57 2",
+            "@s-x text --json",
+            "@s-x cell 1 2",
+        ],
+        "tail `first` and full-screen cell coordinates stay distinct"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_poll_falls_back_on_an_unreadable_or_inconclusive_tail() {
+    const NO_CARET: &str =
+        r#"OK {"rows":["continuation of a long draft"],"cursor":{"row":58,"col":2},"first":56}"#;
+    let (mut c, server) = fake_tab(vec![
+        NO_CARET,
+        FULL_DRAFT,
+        "ERR usage: text [--json] [tail=<n>]",
+        FULL_DRAFT,
+        FULL_DRAFT,
+    ]);
+    let mut tail_available = true;
+    assert!(!continuation_composer_empty(
+        &mut c,
+        "s-x",
+        &mut tail_available
+    ));
+    assert!(tail_available, "a truncated slice may resolve next poll");
+    assert!(!continuation_composer_empty(
+        &mut c,
+        "s-x",
+        &mut tail_available
+    ));
+    assert!(!tail_available, "an unsupported tail is probed only once");
+    assert!(!continuation_composer_empty(
+        &mut c,
+        "s-x",
+        &mut tail_available
+    ));
+    drop(c);
+    assert_eq!(
+        server.join().expect("server"),
+        vec![
+            "@s-x text --json tail=20",
+            "@s-x text --json",
+            "@s-x text --json tail=20",
+            "@s-x text --json",
+            "@s-x text --json",
+        ]
+    );
 }
 
 /// THE COMPOSER CHECK trusts only an `OK … dim` at the caret row's column 2.
@@ -1651,6 +1887,7 @@ fn carry_on_rechecks_tab_ownership_at_the_turn() {
         &mut c,
         SESSION,
         &sf,
+        MODEL_WAIT,
         |_, pid, tab| {
             assert_eq!((pid, tab), (sf.pid, TAB));
             reads += 1;
@@ -2055,4 +2292,573 @@ fn a_restart_in_flight_too_long_or_without_its_shell_never_acts_on_the_tab() {
     // Said once: a failed restart is no longer in flight.
     assert_eq!(steps(&opts), ["wait:no-socket"]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- the model
+
+/// An assistant row naming `model`, as Claude Code 2.1.282 writes one
+/// (measured 2026-09-24 in the owner's transcript), saying `text`.
+fn turn_by(model: &str, text: &str) -> String {
+    format!(
+        r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"{model}","role":"assistant","content":[{{"type":"text","text":"{text}"}}]}},"version":"2.1.282"}}"#
+    )
+}
+
+/// A user row saying `text`.
+fn user_row(text: &str) -> String {
+    format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#)
+}
+
+/// A restart relaunched on 2.1.282 from 2.1.281 over a stand-in agent in
+/// [`TAB`], at the moment its new process holds the conversation: the state as
+/// [`relaunch`] leaves it, ON DISK, with what the restart recorded of the
+/// transcript — through the sweep's own read, [`tail_to_end`] and
+/// [`model_and_mark`] — when it was `before`. Dropped, it stops the agent and
+/// removes its directory.
+#[cfg(unix)]
+struct Rig {
+    dir: PathBuf,
+    opts: Opts,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    agent: std::process::Child,
+    sf: SessionFile,
+    path: PathBuf,
+    st: St,
+}
+
+#[cfg(unix)]
+impl Rig {
+    fn new(name: &str, before: &[String]) -> Rig {
+        let dir = scratch(name);
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        let agent = parked().spawn().expect("agent");
+        wait_exec(agent.id());
+        let file = opts
+            .home
+            .join(format!(".claude/sessions/{}.json", agent.id()));
+        register(&opts.home, agent.id(), SESSION);
+        let relaunched = std::fs::read_to_string(&file)
+            .expect("session file")
+            .replace(r#""version":"1.0.0""#, r#""version":"2.1.282""#);
+        std::fs::write(&file, relaunched).expect("relaunched version");
+        let sf = session_file_of(&opts.home, agent.id()).expect("parses");
+        let project = opts.home.join(".claude/projects/p");
+        std::fs::create_dir_all(&project).expect("project");
+        let path = project.join(format!("{SESSION}.jsonl"));
+        std::fs::write(&path, before.join("\n") + "\n").expect("transcript");
+        let (model_before, mark) = model_and_mark(Some(&tail_to_end(&path, TAIL_BYTES)));
+        let st = St {
+            phase: Phase::Relaunched { at_s: now_s() },
+            from: "2.1.281".to_string(),
+            to: "2.1.282".to_string(),
+            source: "managed".to_string(),
+            tab: TAB.to_string(),
+            model_before,
+            mark,
+            ..St::default()
+        };
+        save(&opts, SESSION, &st);
+        Rig {
+            dir,
+            opts,
+            asked,
+            agent,
+            sf,
+            path,
+            st,
+        }
+    }
+
+    /// The transcript gains `rows`.
+    fn append(&self, rows: &[String]) {
+        let mut more = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .expect("append");
+        for row in rows {
+            writeln!(more, "{row}").expect("row");
+        }
+    }
+
+    /// Carry `st` on, the resumed answer waited for at most `wait`.
+    fn carry_on_from(&self, st: &mut St, wait: Duration) -> Report {
+        let mut c = connect(&self.opts, TAB).expect("control connection");
+        carry_on_with_tab_probe(
+            &self.opts,
+            blank(&self.sf),
+            st,
+            &mut c,
+            SESSION,
+            &self.sf,
+            wait,
+            |_, _, _| true,
+        )
+    }
+
+    /// Every line typed into the tab.
+    fn typed(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .map(|a| a.iter().filter(|l| l.contains(" turn ")).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The details of the ledger's rows whose step is `step`.
+    fn details(&self, step: &str) -> Vec<String> {
+        std::fs::read_to_string(state_dir(&self.opts).join("ledger.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("step").and_then(Value::as_str) == Some(step))
+            .filter_map(|v| v.get("detail").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = self.agent.kill();
+        let _ = self.agent.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// What one carried-on restart left: the report, every line typed into the
+/// tab, the ledger's detail for the report's step and the state.
+struct Carried {
+    report: Report,
+    typed: Vec<String>,
+    detail: String,
+    st: St,
+}
+
+/// A restart carried on END TO END ([`Rig`]): its transcript is `before` when
+/// the restart records what the agent ran, and gains `after` since, and the
+/// resumed answer is waited for at most `wait`.
+#[cfg(unix)]
+fn carried_on(name: &str, before: &[String], after: &[String], wait: Duration) -> Carried {
+    let rig = Rig::new(name, before);
+    rig.append(after);
+    let mut st = rig.st.clone();
+    let report = rig.carry_on_from(&mut st, wait);
+    let detail = rig.details(&report.step);
+    assert_eq!(detail.len(), 1, "the outcome is recorded once: {detail:?}");
+    Carried {
+        typed: rig.typed(),
+        report,
+        detail: detail[0].clone(),
+        st,
+    }
+}
+
+/// THE MODEL, BEFORE AND AFTER: the continuation names the model the agent's
+/// READY answer ran, and the resumed session's first answer — past the
+/// restart's mark, Claude's own `<synthetic>` row skipped (measured just after
+/// a 2026-09-23 restart) — is the model after. A change is words only: the
+/// step is `done`.
+#[cfg(unix)]
+#[test]
+fn a_restart_says_the_model_before_and_confirms_the_one_after() {
+    let marker = "ATERM-UPGRADE-READY-0badf00d";
+    let before = [
+        user_row("prepare"),
+        turn_by("claude-opus-5", "Earlier work."),
+        user_row("[aterm harness] Claude Code 2.1.282 (managed) is installed"),
+        turn_by("claude-opus-5", &format!("Saved.\\n{marker}")),
+    ];
+    let after = [
+        user_row("[aterm harness] Upgraded: carry on"),
+        r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"No response requested."}]}}"#.to_string(),
+        turn_by("claude-opus-5-5", "Resumed."),
+        turn_by("claude-fable-5-1", "A later turn."),
+    ];
+    let changed = carried_on("model-changed", &before, &after, MODEL_WAIT);
+    assert_eq!(changed.report.step, "done", "{:?}", changed.report);
+    assert_eq!(changed.st.phase, Phase::Done);
+    assert_eq!(
+        changed.typed.len(),
+        1,
+        "one continuation: {:?}",
+        changed.typed
+    );
+    assert!(
+        changed.typed[0].contains(
+            "restarted on Claude Code 2.1.282 (from 2.1.281); it ran claude-opus-5 before the \
+             restart and was resumed."
+        ),
+        "{:?}",
+        changed.typed
+    );
+    assert_eq!(
+        changed.detail,
+        "claude restarted on 2.1.282 · model claude-opus-5 -> claude-opus-5-5 (a session \
+         launched without --model takes the current default; /model changes it)"
+    );
+    // The same model on both sides: the model, and nothing about a change.
+    let before_same = [before[0].clone(), turn_by("claude-opus-5-5", marker)];
+    let same = carried_on(
+        "model-same",
+        &before_same,
+        &[turn_by("claude-opus-5-5", "Resumed.")],
+        MODEL_WAIT,
+    );
+    assert_eq!(same.report.step, "done");
+    assert!(same.typed[0].contains("it ran claude-opus-5-5 before the restart"));
+    assert_eq!(
+        same.detail,
+        "claude restarted on 2.1.282 · model claude-opus-5-5"
+    );
+}
+
+/// UNCONFIRMED: a resumed session that has not answered by the first sweep
+/// past the bound is said to be, and it is the one outcome whose step says so.
+/// The turns BEFORE the mark name a model: read from the start, they would have
+/// "confirmed" it — the mark is what keeps the old process's model from
+/// standing in for the new one's.
+#[cfg(unix)]
+#[test]
+fn a_resumed_session_that_has_not_answered_is_unconfirmed() {
+    let before = [
+        user_row("prepare"),
+        turn_by("claude-opus-5-5", "ATERM-UPGRADE-READY-0badf00d"),
+    ];
+    let rig = Rig::new("model-unconfirmed", &before);
+    rig.append(&[user_row("[aterm harness] Upgraded: carry on")]);
+    let mut st = rig.st.clone();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "continued");
+    assert!(rig.typed()[0].contains("it ran claude-opus-5-5 before the restart"));
+    // Within the bound, a sweep reads again and says nothing.
+    assert_eq!(confirmations(&rig.opts), []);
+    assert!(load(&rig.opts, SESSION).is_some_and(|st| st.confirming()));
+    // Past it, still no answer: unconfirmed, once.
+    let late = St {
+        confirm_by: now_s() - 1,
+        ..load(&rig.opts, SESSION).expect("state")
+    };
+    save(&rig.opts, SESSION, &late);
+    let said = confirmations(&rig.opts);
+    assert_eq!(
+        said.iter().map(|r| r.step.as_str()).collect::<Vec<_>>(),
+        ["done:model-unconfirmed"]
+    );
+    assert!(said[0].is_act());
+    assert_eq!(
+        (said[0].pid, said[0].to.as_str()),
+        (rig.sf.pid, "2.1.282(managed)")
+    );
+    assert_eq!(
+        rig.details("done:model-unconfirmed"),
+        [
+            "claude restarted on 2.1.282 · model unconfirmed (it ran claude-opus-5-5 before the \
+          restart)"
+        ]
+    );
+    let saved = load(&rig.opts, SESSION).expect("state");
+    assert_eq!(saved.phase, Phase::Done, "said once, never re-asked");
+    assert!(!saved.confirming());
+    assert_eq!(confirmations(&rig.opts), []);
+    assert_eq!(rig.typed().len(), 1);
+}
+
+/// A restart an older aterm began took no mark: nothing past it can be told to
+/// be the resumed session's, so the model is unconfirmed at once — never read
+/// from the start of the conversation, and never left pending.
+#[cfg(unix)]
+#[test]
+fn a_restart_without_a_mark_is_unconfirmed_at_once() {
+    let before = [turn_by("claude-opus-5-5", "ATERM-UPGRADE-READY-0badf00d")];
+    let rig = Rig::new("model-no-mark", &before);
+    rig.append(&[turn_by("claude-opus-5-5", "Resumed.")]);
+    let mut st = St {
+        mark: 0,
+        ..rig.st.clone()
+    };
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "done:model-unconfirmed");
+    assert!(!st.confirming());
+    assert_eq!(rig.typed().len(), 1);
+}
+
+/// THE MODEL BEFORE is read from the tail that proved the READY answer, at
+/// the restart itself: a sweep that reaches the restart records the model the
+/// answer ran and where that read ended, even when its last look then waits
+/// (the next restart takes both again). The READY answer is not the last row
+/// here — Claude's own `<synthetic>` row follows it and names no model.
+#[cfg(unix)]
+#[test]
+fn a_restart_records_the_model_its_ready_answer_ran_and_where_that_read_ended() {
+    let dir = scratch("model-before");
+    let (sock, _asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    // An argv a resume carries (the filter alone: a positional, dropped).
+    let mut agent = Command::new(std::env::current_exe().expect("exe"))
+        .arg(PARK[0])
+        .env(PARK_ENV, "1")
+        .env("ATERM_PARENT_SESSION_ID", TAB)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pid = agent.id();
+    wait_exec(pid);
+    let sf = register(&opts.home, pid, SESSION);
+    let marker = "ATERM-UPGRADE-READY-0badf00d";
+    let project = opts.home.join(".claude/projects/p");
+    std::fs::create_dir_all(&project).expect("project");
+    let path = project.join(format!("{SESSION}.jsonl"));
+    let body = [
+        turn_by("claude-fable-5-1", "Earlier."),
+        turn_by("claude-opus-5-5", &format!("Saved.\\n{marker}")),
+        r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#.to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(&path, &body).expect("transcript");
+    let shell = dead_pid();
+    let t = vec![(shell, 1, "zsh".to_string())];
+    let now = now_s();
+    let st = St {
+        phase: Phase::Announced {
+            at_s: now - 60,
+            asks: 1,
+        },
+        marker: marker.to_string(),
+        tab: TAB.to_string(),
+        notice_pid: sf.pid,
+        notice_start: squash(&sf.proc_start),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        last_seq: 77,
+        seq_since_s: now - 3600,
+        ..St::default()
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
+    // The launch named a model: the relaunch keeps it, and the restart says so.
+    let mut args = atpkg::caller_shell::process_args(pid).expect("agent argv");
+    args.argv
+        .extend(["--model".to_string(), "claude-sonnet-5".to_string()]);
+    // Foreground for the first three job reads — the visit's two and the
+    // restart's own — then suspended: the restart's last look waits.
+    let files = session_files(&opts.home);
+    let r = visit_with_claim(
+        &opts,
+        &sf,
+        files.as_deref(),
+        &t,
+        &newer(),
+        &Script::new(shell, 3, None),
+        Some(&args),
+        None,
+    );
+    let saved = load(&opts, SESSION).expect("state");
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert_eq!(r.step, "wait:changed", "the restart was reached: {r:?}");
+    assert_eq!(saved.model_before, "claude-opus-5-5");
+    assert_eq!(saved.mark, body.len() as u64, "the read ended at the end");
+    assert_eq!(saved.launch_model, "claude-sonnet-5", "the kept --model");
+    assert!(
+        matches!(saved.phase, Phase::Announced { .. }),
+        "never signalled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TYPED ONCE: the sweep that types the continuation can die before the
+/// resumed session has answered — the window quits or hands itself over, a
+/// hand-run `aterm harness upgrade` is interrupted — and what it leaves on
+/// disk must not read as a restart still in flight, or the next sweep carries
+/// on again and the agent is told twice. Read here the moment the continuation
+/// has been typed, while the resumed session has not answered.
+#[cfg(unix)]
+#[test]
+fn a_sweep_that_dies_after_the_continuation_never_types_it_again() {
+    let before = [
+        user_row("prepare"),
+        turn_by("claude-opus-5-5", "Saved.\\nATERM-UPGRADE-READY-0badf00d"),
+    ];
+    let rig = Rig::new("continued-once", &before);
+    rig.append(&[user_row("[aterm harness] Upgraded: carry on")]);
+    // What the disk holds 300 ms after the continuation was typed.
+    let snapshot = {
+        let (asked, opts) = (std::sync::Arc::clone(&rig.asked), rig.opts.clone());
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while turns(&asked) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            load(&opts, SESSION).expect("state")
+        })
+    };
+    let mut st = rig.st.clone();
+    let _ = rig.carry_on_from(&mut st, Duration::from_secs(2));
+    let on_disk = snapshot.join().expect("snapshot");
+    assert_eq!(rig.typed().len(), 1, "one continuation: {:?}", rig.typed());
+    // A sweep resumed from that disk: a restart in flight is carried on.
+    let mut resumed = on_disk.clone();
+    if resumed.in_flight() {
+        let _ = rig.carry_on_from(&mut resumed, Duration::from_millis(300));
+    }
+    assert_eq!(
+        rig.typed().len(),
+        1,
+        "state on disk once the continuation was typed is {:?}; a sweep resumed from it typed \
+         {} more continuation(s)",
+        on_disk.phase,
+        rig.typed().len() - 1
+    );
+    // What that sweep still owed — the model — the next one says.
+    rig.append(&[turn_by("claude-opus-5-5", "Resumed.")]);
+    let said = confirmations(&rig.opts);
+    assert_eq!(
+        said.iter().map(|r| r.step.as_str()).collect::<Vec<_>>(),
+        ["done"]
+    );
+    assert_eq!(
+        rig.details("done"),
+        ["claude restarted on 2.1.282 · model claude-opus-5-5"]
+    );
+}
+
+/// THE VISIT DOES NOT WAIT OUT THE ANSWER: a sweep runs its visits one after
+/// another under one lock, and the orphan pass that relaunches a restart left
+/// exiting runs after all of them, so every second one visit blocks ages that
+/// restart toward [`STALE_S`] — past it, the agent is never relaunched and sits
+/// dead at a shell prompt. The resumed session's first answer can take the
+/// whole bound (a long first thought, retries, a usage limit that writes only
+/// `<synthetic>` rows); the visit that types the continuation must not wait
+/// for it.
+#[cfg(unix)]
+#[test]
+fn the_sweep_that_types_the_continuation_does_not_wait_for_the_answer() {
+    let before = [
+        user_row("prepare"),
+        turn_by("claude-opus-5-5", "Saved.\\nATERM-UPGRADE-READY-0badf00d"),
+    ];
+    let rig = Rig::new("continued-no-wait", &before);
+    rig.append(&[user_row("[aterm harness] Upgraded: carry on")]);
+    let mut st = rig.st.clone();
+    let started = Instant::now();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    let blocked = started.elapsed();
+    assert!(
+        blocked < Duration::from_secs(20),
+        "the visit blocked {blocked:?} for an answer that had not come (STALE_S {STALE_S}s)"
+    );
+    assert_eq!(rig.typed().len(), 1);
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert!(r.is_act(), "the continuation typed is said");
+    assert_eq!(rig.details("continued").len(), 1);
+    let saved = load(&rig.opts, SESSION).expect("state");
+    assert_eq!(saved.phase, Phase::Done, "never in flight again");
+    assert!(saved.confirming());
+    // The next sweep, before the answer: nothing to say, still owed.
+    assert_eq!(confirmations(&rig.opts), []);
+    // The answer is written — past the old build's one more row, which is not
+    // it — and the sweep after says the model.
+    let old_build = turn_by("claude-opus-5", "One more.").replace("2.1.282", "2.1.281");
+    rig.append(&[old_build, turn_by("claude-opus-5-5", "Resumed.")]);
+    let said = confirmations(&rig.opts);
+    assert_eq!(
+        said.iter().map(|r| r.step.as_str()).collect::<Vec<_>>(),
+        ["done"]
+    );
+    assert_eq!(
+        rig.details("done"),
+        ["claude restarted on 2.1.282 · model claude-opus-5-5"]
+    );
+    assert!(!load(&rig.opts, SESSION).expect("state").confirming());
+    assert_eq!(confirmations(&rig.opts), [], "said once");
+    // A sweep for another tab leaves it alone.
+    let mut other = load(&rig.opts, SESSION).expect("state");
+    other.confirm_by = now_s() + 60;
+    save(&rig.opts, SESSION, &other);
+    let scoped = Opts {
+        only_sid: Some("s-0000000000000000beef".to_string()),
+        ..rig.opts.clone()
+    };
+    assert_eq!(confirmations(&scoped), []);
+    assert_eq!(rig.typed().len(), 1);
+}
+
+/// THE REASON, END TO END: a session launched with `--model claude-sonnet-5`
+/// and moved to opus with `/model` comes back on sonnet — the kept flag did it,
+/// and the outcome says so rather than blaming the default.
+#[cfg(unix)]
+#[test]
+fn a_kept_model_flag_is_the_reason_a_launch_with_one_changed_model() {
+    let before = [
+        user_row("prepare"),
+        turn_by("claude-opus-5-5", "Saved.\\nATERM-UPGRADE-READY-0badf00d"),
+    ];
+    let rig = Rig::new("model-flag", &before);
+    rig.append(&[turn_by("claude-sonnet-5", "Resumed.")]);
+    let mut st = St {
+        launch_model: "claude-sonnet-5".to_string(),
+        ..rig.st.clone()
+    };
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "done", "{r:?}");
+    assert_eq!(
+        rig.details("done"),
+        [
+            "claude restarted on 2.1.282 · model claude-opus-5-5 -> claude-sonnet-5 (the relaunch \
+          kept the launch's --model claude-sonnet-5; /model changes it)"
+        ]
+    );
+}
+
+/// ONE OUTCOME PER RESTART: a newer build landing while the last restart's
+/// model is still owed waits for that `done` row — a new upgrade starts from a
+/// fresh state, and would lose it.
+#[cfg(unix)]
+#[test]
+fn a_new_upgrade_waits_for_the_last_restarts_model() {
+    let dir = scratch("confirm-before-next");
+    let opts = drive(&dir);
+    let mut agent = parked().spawn().expect("agent");
+    wait_exec(agent.id());
+    let sf = register(&opts.home, agent.id(), SESSION);
+    let pending = St {
+        phase: Phase::Done,
+        from: "0.9.0".to_string(),
+        to: "1.0.0".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        mark: 1,
+        confirm_by: now_s() + 60,
+        resumed_on: "1.0.0".to_string(),
+        ..St::default()
+    };
+    save(&opts, SESSION, &pending);
+    let r = visit(&opts, &sf, &[], &newer(), &Script::new(1, usize::MAX, None));
+    assert_eq!(r.step, "wait:confirming", "{r:?}");
+    assert_eq!(
+        load(&opts, SESSION),
+        Some(pending),
+        "the owed outcome is kept"
+    );
+    // Once it is said, the next build is upgraded to as ever.
+    let said = St {
+        confirm_by: 0,
+        ..load(&opts, SESSION).expect("state")
+    };
+    save(&opts, SESSION, &said);
+    let r = visit(&opts, &sf, &[], &newer(), &Script::new(1, usize::MAX, None));
+    assert_ne!(r.step, "wait:confirming", "{r:?}");
+    agent.kill().expect("stop agent");
+    agent.wait().expect("reap agent");
+    let _ = std::fs::remove_dir_all(dir);
 }

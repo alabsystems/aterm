@@ -1,19 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-member apply dispatch (§16.4 / §10.1 / §17) — the decision of *how* a staged,
-//! verified artifact is made live, keyed on BOTH halves of the row: its `kind` (the
-//! payload / apply shape) and its `protocol` (how the bytes are obtained).
+//! Per-member apply dispatch (§16.4 / §10.1) — the decision of *how* a staged, verified
+//! artifact is made live, keyed on BOTH halves of the row: its `kind` (the payload /
+//! apply shape) and its `protocol` (how the bytes are obtained).
 //!
 //! The two axes are deliberately separate. `kind` says what lands and how it goes live —
-//! a `binary` shims, a `sysroot-bundle` relocates, an `app-bundle` is a `.app`, an
-//! `installer-pkg` runs Apple's installer, a `system-package` is another manager's
-//! business. `protocol` says where the bytes come from — a `github-release` asset under
-//! the account slug, an `https` download from a vendor host pinned by the signed row, a
-//! signed `pkg` the OS installer applies with elevation, or a `system-pm` package the
-//! platform's own manager resolves. The retired `kind = "vendor-fetch"` conflated the
-//! two; it is refused at parse ([`crate::sig::Reject::RetiredKind`]) and never reaches
-//! here.
+//! a `binary` shims, a `sysroot-bundle` relocates, an `app-bundle` is a `.app`.
+//! `protocol` says where the bytes come from — a `github-release` asset under the account
+//! slug, or an `https` download from a vendor host pinned by the signed row. The retired
+//! `kind = "vendor-fetch"` conflated the two; it is refused at parse
+//! ([`crate::sig::Reject::RetiredKind`]) and never reaches here. The OS-installer
+//! protocols (`pkg`, `system-pm`, `softwareupdate`) were deleted 2026-09-24 (design
+//! 2026-09-22 §5.3(b)); a row naming one is an unknown pair like any other, refused.
 //!
 //! The design deliberately does **not** apply every member the same way (§16.4): a CLI
 //! tool flips immediately (a `bin/` shim), `trust`/`trust-mc` need a sysroot relocation
@@ -21,7 +20,7 @@
 //! app's own updater applies IN-SESSION by the overlap handoff (a successor is spawned and
 //! every PTY is handed across; the cold-launch swap is only the fallback), never the
 //! immediate shim flip — atpkg refuses it, always (§16.4). A
-//! VENDOR's `.app` (Emacs from its DMG) is a different thing again:
+//! VENDOR's `.app` (a DMG from the vendor's host) is a different thing again:
 //! it lands in the store and is shimmed through its `links`, and it must never be confused
 //! with the self-update topology — so it gets its own variant. [`strategy_for`] is that
 //! pure mapping; an unknown pair is **fail-closed** ([`Unknown`]) so a member the client
@@ -58,25 +57,6 @@ pub enum ApplyStrategy {
     ///
     /// [`Shim`]: ApplyStrategy::Shim
     VendorApp,
-    /// A signed `installer-pkg` over the `pkg` protocol (macOS): downloaded through the
-    /// vendor lane, its Developer ID Installer team checked with `pkgutil`, then applied
-    /// by Apple's `installer` WITH ELEVATION ([`crate::installer_pkg`]); nothing lands in
-    /// the store, and the row's `provides` paths prove the install. The unattended pass
-    /// never elevates — it records `needs admin` and waits for the explicit door.
-    Pkg,
-    /// A `system-package` over the `system-pm` protocol: the platform's own manager (one
-    /// row of [`crate::vendor::MANAGER_TABLE`]) resolves `package` ([`crate::system_pm`]);
-    /// no bytes, no digest, the row's `provides` prove the install. A system-wide
-    /// manager (`apt`, `dnf`) runs WITH ELEVATION and the unattended pass defers it; a
-    /// user-scoped one (`brew`, `winget`, `scoop`, `cargo`, `pipx`) runs as the user. A
-    /// machine without the manager reads the member as `unavailable on <target>` —
-    /// atpkg never installs a manager.
-    SystemPm,
-    /// A `system-package` over the `softwareupdate` protocol (macOS): Apple's
-    /// `softwareupdate` installs the newest label under the row's `label_prefix` — the
-    /// Command Line Tools — WITH ELEVATION ([`crate::softwareupdate`]); the row's
-    /// `provides` paths prove the install, and a `git` anywhere else never does.
-    SoftwareUpdate,
     /// An unrecognized `(kind, protocol)` pair — fail closed: the client refuses to apply an
     /// artifact it does not know how to install (never default to
     /// [`Shim`](ApplyStrategy::Shim)).
@@ -84,18 +64,13 @@ pub enum ApplyStrategy {
 }
 
 /// The protocols a row may declare, in the spelling the schema signs.
-pub const PROTOCOLS: &[&str] = &[
-    "github-release",
-    "https",
-    "pkg",
-    "system-pm",
-    "softwareupdate",
-];
+pub const PROTOCOLS: &[&str] = &["github-release", "https"];
 
 /// Map a row's `kind` and `protocol` to its [`ApplyStrategy`]. Fail-closed on anything
 /// unrecognized — including a known kind over a protocol that cannot carry it (a
-/// `sysroot-bundle` over `https`, a `binary` over `pkg`) — so a future/garbled row is
-/// never mis-applied as a plain binary.
+/// `sysroot-bundle` over `https`) and every row of a deleted protocol (`pkg`,
+/// `system-pm`, `softwareupdate`) — so a future/garbled row is never mis-applied as a
+/// plain binary.
 #[must_use]
 pub fn strategy_for(kind: &str, protocol: &str) -> ApplyStrategy {
     match (protocol, kind) {
@@ -104,9 +79,6 @@ pub fn strategy_for(kind: &str, protocol: &str) -> ApplyStrategy {
         ("github-release", "app-bundle") => ApplyStrategy::AppBundle,
         ("https", "binary") => ApplyStrategy::Shim,
         ("https", "app-bundle") => ApplyStrategy::VendorApp,
-        ("pkg", "installer-pkg") => ApplyStrategy::Pkg,
-        ("system-pm", "system-package") => ApplyStrategy::SystemPm,
-        ("softwareupdate", "system-package") => ApplyStrategy::SoftwareUpdate,
         _ => ApplyStrategy::Unknown,
     }
 }
@@ -138,19 +110,23 @@ mod tests {
             strategy_for("app-bundle", "https"),
             ApplyStrategy::VendorApp
         );
-        assert_eq!(strategy_for("installer-pkg", "pkg"), ApplyStrategy::Pkg);
-        assert_eq!(
-            strategy_for("system-package", "system-pm"),
-            ApplyStrategy::SystemPm
-        );
-        assert_eq!(
-            strategy_for("system-package", "softwareupdate"),
-            ApplyStrategy::SoftwareUpdate
-        );
-        // The two OS-installer lanes are distinct strategies from each other and from
-        // the platform-manager lane: each runs a different tool with a different proof.
-        assert_ne!(ApplyStrategy::SoftwareUpdate, ApplyStrategy::SystemPm);
-        assert_ne!(ApplyStrategy::SoftwareUpdate, ApplyStrategy::Pkg);
+    }
+
+    /// The OS-installer protocols were deleted (design 2026-09-22 §5.3(b)): the pairs
+    /// they carried are Unknown, so an index naming one is refused, never applied.
+    #[test]
+    fn the_deleted_os_installer_pairs_fail_closed() {
+        for (kind, protocol) in [
+            ("installer-pkg", "pkg"),
+            ("system-package", "system-pm"),
+            ("system-package", "softwareupdate"),
+        ] {
+            assert_eq!(
+                strategy_for(kind, protocol),
+                ApplyStrategy::Unknown,
+                "{kind}/{protocol}"
+            );
+        }
     }
 
     /// The vendor `.app` and the aterm self-update are DIFFERENT strategies: the former

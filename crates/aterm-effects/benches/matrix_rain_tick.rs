@@ -9,8 +9,10 @@
 //   (a) The DAMAGE-GATED half — `rescan_from_cells` + `sample_material` +
 //       `rain_atlas` — runs on every frame whose terminal damage epoch moved,
 //       i.e. essentially EVERY present while a shell or an agent is streaming
-//       output. The only existing gate for it (`bench_literal_material_refresh`)
-//       forces a 100 % charset change and then calls the result "not the
+//       output. The only other instrument for it (the `#[ignore]`d
+//       `bench_literal_material_refresh`, retired 2026-09-24 — source at
+//       `e8a8c80ab:crates/aterm-effects/tests/rain_bench.rs`) forced a 100 %
+//       charset change and then called the result "not the
 //       steady-state frame path". That assumption is what `stream_*` below
 //       tests: it slides a real scrolling text viewport past the engine and
 //       counts how many of those ORDINARY frames pay the ROM re-author + 64-tile
@@ -179,8 +181,9 @@ fn blank_grid() -> Vec<Vec<RenderCell>> {
 }
 
 /// Two full rows of distinct printable ASCII over an otherwise empty field —
-/// the shape `bench_semantic_literal_tick_worstcase` uses, so the literal
-/// anchor here is comparable with the number already published for it.
+/// the shape the retired `bench_semantic_literal_tick_worstcase` used (source
+/// at `e8a8c80ab`), so the literal anchor here is comparable with the number
+/// published for it.
 fn mixed_material_grid() -> Vec<Vec<RenderCell>> {
     let mut cells = blank_grid();
     for (i, cell) in cells[0].iter_mut().enumerate() {
@@ -891,7 +894,8 @@ fn bench_rescan_prose(group: &mut BenchmarkGroup<'_, WallTime>) {
 /// viewport that SCROLLS, which is what ordinary output does. Reports the
 /// rebake RATE — what fraction of ordinary streaming frames pay the ROM
 /// re-author + 64-tile atlas rebake + full-atlas clone that
-/// `bench_literal_material_refresh` prices at ~2 ms and calls a rare edge.
+/// the retired `bench_literal_material_refresh` priced at ~2 ms and called a
+/// rare edge.
 fn bench_stream_material(group: &mut BenchmarkGroup<'_, WallTime>) {
     let name = "stream_sample_material";
     let buf = stream_buffer();

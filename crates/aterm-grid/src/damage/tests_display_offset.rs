@@ -8,68 +8,50 @@ use super::Damage;
 use super::display_offset::{DisplayOffsetDamage, compute_display_offset_damage};
 
 #[test]
-fn test_no_damage_when_offset_unchanged() {
-    let result = compute_display_offset_damage(5, 5, 24);
-    assert_eq!(result, DisplayOffsetDamage::None);
-}
-
-#[test]
-fn test_no_damage_zero_offsets() {
-    let result = compute_display_offset_damage(0, 0, 24);
-    assert_eq!(result, DisplayOffsetDamage::None);
-}
-
-#[test]
-fn test_full_damage_when_delta_exceeds_rows() {
-    let result = compute_display_offset_damage(0, 30, 24);
-    assert_eq!(result, DisplayOffsetDamage::Full);
-}
-
-#[test]
-fn test_full_damage_when_delta_equals_rows() {
-    let result = compute_display_offset_damage(0, 24, 24);
-    assert_eq!(result, DisplayOffsetDamage::Full);
-}
-
-#[test]
-fn test_top_rows_on_scroll_up() {
-    // Scrolling up: new_offset > old_offset → top rows are new from scrollback.
-    let result = compute_display_offset_damage(0, 5, 24);
-    assert_eq!(result, DisplayOffsetDamage::TopRows(5));
-}
-
-#[test]
-fn test_bottom_rows_on_scroll_down() {
-    // Scrolling down: new_offset < old_offset → bottom rows are new live content.
-    let result = compute_display_offset_damage(10, 3, 24);
-    assert_eq!(
-        result,
-        DisplayOffsetDamage::BottomRows { start: 17, end: 24 }
-    );
-}
-
-#[test]
-fn test_bottom_rows_on_offset_reset() {
-    // Reset to 0: old_offset > 0, new_offset = 0 → bottom rows.
-    let result = compute_display_offset_damage(5, 0, 24);
-    assert_eq!(
-        result,
-        DisplayOffsetDamage::BottomRows { start: 19, end: 24 }
-    );
-}
-
-#[test]
-fn test_edge_case_delta_equals_rows_minus_one() {
-    // Scroll by visible_rows - 1: still partial, not full.
-    let result = compute_display_offset_damage(0, 23, 24);
-    assert_eq!(result, DisplayOffsetDamage::TopRows(23));
-}
-
-#[test]
-fn test_zero_visible_rows() {
-    // Edge case: zero visible rows → any non-zero delta is full.
-    let result = compute_display_offset_damage(0, 1, 0);
-    assert_eq!(result, DisplayOffsetDamage::Full);
+fn compute_display_offset_damage_rows() {
+    // (label, old offset, new offset, visible rows, expected damage).
+    // Each row was its own test.
+    let rows = [
+        ("offset unchanged", 5, 5, 24, DisplayOffsetDamage::None),
+        ("both offsets zero", 0, 0, 24, DisplayOffsetDamage::None),
+        ("delta exceeds rows", 0, 30, 24, DisplayOffsetDamage::Full),
+        ("delta equals rows", 0, 24, 24, DisplayOffsetDamage::Full),
+        // Scrolling up: the top rows are new from scrollback.
+        ("scroll up by 5", 0, 5, 24, DisplayOffsetDamage::TopRows(5)),
+        // Scrolling down: the bottom rows are new live content.
+        (
+            "scroll down 10 -> 3",
+            10,
+            3,
+            24,
+            DisplayOffsetDamage::BottomRows { start: 17, end: 24 },
+        ),
+        (
+            "reset 5 -> 0",
+            5,
+            0,
+            24,
+            DisplayOffsetDamage::BottomRows { start: 19, end: 24 },
+        ),
+        // visible_rows - 1 is still partial, not full.
+        (
+            "delta = rows - 1",
+            0,
+            23,
+            24,
+            DisplayOffsetDamage::TopRows(23),
+        ),
+        // Zero visible rows: any non-zero delta is full.
+        ("zero visible rows", 0, 1, 0, DisplayOffsetDamage::Full),
+        ("large scroll down", 100, 0, 24, DisplayOffsetDamage::Full),
+    ];
+    for (label, old, new, visible, want) in rows {
+        assert_eq!(
+            compute_display_offset_damage(old, new, visible),
+            want,
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -103,10 +85,4 @@ fn test_apply_bottom_rows_marks_correct_rows() {
     assert!(!damage.is_row_damaged(19));
     assert!(damage.is_row_damaged(20));
     assert!(damage.is_row_damaged(23));
-}
-
-#[test]
-fn test_full_damage_on_large_down_scroll() {
-    let result = compute_display_offset_damage(100, 0, 24);
-    assert_eq!(result, DisplayOffsetDamage::Full);
 }

@@ -74,7 +74,7 @@ pub const SING_BPM: f32 = 150.0;
 pub const SING_BEAT_SECONDS: f32 = 60.0 / SING_BPM;
 
 /// Beats per riff bar. The audio riff is scheduled one bar at a time
-/// (`trail_sound::CELEBRATION_BAR_SECONDS` — pinned equal by a test there),
+/// (`trail_sound::CELEBRATION_BAR_SECONDS` — pinned equal at compile time there),
 /// so the host pushes one `RiffBar` gesture per visual bar boundary.
 pub const SING_BAR_BEATS: f32 = 4.0;
 
@@ -1789,15 +1789,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The documented tempo constants ARE the contract the audio riff pins
-    /// against (`trail_sound::celebration_bar_matches_the_visual_clock`).
-    #[test]
-    fn tempo_constants_are_pinned() {
-        assert_eq!(SING_BEAT_SECONDS, 0.4);
-        assert_eq!(SING_BAR_SECONDS, 1.6);
-        assert_eq!(SING_ARM_REPEATS, 16);
     }
 
     /// THE MIXER IS A BIJECTION — the zero-collision proof. Each stage of

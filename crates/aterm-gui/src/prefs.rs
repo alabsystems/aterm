@@ -384,6 +384,11 @@ pub(crate) const EDIT_TAB_STATUS_BADGE: &str = "tab_status_badge";
 /// status classifier quartet above: it gates only the fourth tab mark, never
 /// the connections themselves.
 pub(crate) const EDIT_TAB_CONNECTION_BADGE: &str = "tab_connection_badge";
+/// The strain row's switch (`Config::explain_heavy_load`, design §10.14,
+/// ruling 212): the band says what is loading the machine when typing slows.
+/// Rendered on Settings ▸ Messages (`settings/messages/explain-load`); its
+/// registry section is Performance, which no ordinary page lists.
+pub(crate) const EDIT_EXPLAIN_HEAVY_LOAD: &str = "explain_heavy_load";
 pub(crate) const EDIT_SEARCH_HISTORY_LINES: &str = "search_history_lines";
 pub(crate) const EDIT_ALLOW_OSC52_QUERY: &str = "allow_osc52_query";
 /// macOS Secure Keyboard Entry (`Config::secure_keyboard_entry`, default OFF):
@@ -1322,6 +1327,9 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // The connection mark shares the tab-chrome rationale above: it lives on
     // the tab strip, not in any workbench grid cell.
     EDIT_TAB_CONNECTION_BADGE,
+    // The strain row is a message-band row raised by a loaded MACHINE: the
+    // workbench scene has no band and no load to explain.
+    EDIT_EXPLAIN_HEAVY_LOAD,
     EDIT_STREAM_FADE,
     EDIT_STREAM_FADE_MS,
     // The split's focus mark is a RELATION between panes — it inks the divider
@@ -1721,6 +1729,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_BADGE
         | EDIT_TAB_CONNECTION_BADGE
+        | EDIT_EXPLAIN_HEAVY_LOAD
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION
         | EDIT_CURSOR_TRAIL_RING
@@ -2684,7 +2693,9 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_PREDICTIVE_ECHO => Section::Input,
         // Focus-linked QoS is a performance knob, not an input one — as are the
         // launch-time renderer choice and the opt-in replay recorder.
-        EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => Section::Performance,
+        EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING | EDIT_EXPLAIN_HEAVY_LOAD => {
+            Section::Performance
+        }
         // The [packages] maintenance switches live on the special Packages page;
         // this section keeps them findable (Search/Modified) without also
         // duplicating them onto an ordinary registry page.
@@ -2914,7 +2925,11 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_CONFIRM_MULTILINE_PASTE => ("Paste safety", 0),
         EDIT_OPTION_AS_META | EDIT_PREDICTIVE_ECHO => ("Keyboard", 1),
         // Performance › focus-linked QoS, launch-time renderer choice, and replay.
-        EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => ("System", 1),
+        // …and the band's account of a loaded machine (rendered on Settings ▸
+        // Messages; found here by Search and Modified).
+        EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING | EDIT_EXPLAIN_HEAVY_LOAD => {
+            ("System", 1)
+        }
         // Packages › the ALab tools switches ride together.
         EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_INSTALL | EDIT_REROUTE_ANNOUNCE => {
             ("ALab Tools", 0)
@@ -3489,6 +3504,9 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "photo",
         ],
         EDIT_TEMPORAL_RECORDING => &["temporal", "recording", "replay", "history", "time"],
+        EDIT_EXPLAIN_HEAVY_LOAD => &[
+            "load", "cpu", "memory", "heat", "slow", "typing", "lag", "strain", "messages",
+        ],
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => {
             &["padding", "margin", "border", "spacing", "inset", "edge"]
         }
@@ -5129,6 +5147,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 .clone()
                 .unwrap_or_else(|| "none (default)".to_string()),
             seed: background_material,
+        },
+        EditField {
+            label: "Explain heavy load",
+            key: EDIT_EXPLAIN_HEAVY_LOAD,
+            kind: EditKind::Bool,
+            // The RESOLVED state (default ON): the owner asked for the row.
+            seed: Some(cfg.explain_heavy_load_or_default().to_string()),
+            placeholder: String::new(),
         },
         EditField {
             label: "Temporal recording",

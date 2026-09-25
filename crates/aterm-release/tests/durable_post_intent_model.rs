@@ -92,6 +92,7 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         // this test has no business needing.
         apple: sign::AppleTier::Inactive,
         repo: root.to_path_buf(),
+        tree: root.to_path_buf(),
         dist: root.join("nested/dist"),
         journal_path,
         slug: "owner/repo".into(),

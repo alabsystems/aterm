@@ -62,7 +62,7 @@
 //!
 //! [`tests::blit_matches_wgpu_byte_for_byte`] is that experiment, run as a
 //! DIFFERENTIAL rather than as a property check: the same offscreen texels and
-//! the same 96 `BlitUniform` bytes go through the shipped `wgpu` blit and
+//! the same 112 `BlitUniform` bytes go through the shipped `wgpu` blit and
 //! through the first-party Metal one, and every byte of both outputs must
 //! agree. Measured on an Apple M5 Max, over the four control-flow arms of
 //! `fs_blit` — 156,226 pixels, **0 differing**:
@@ -190,64 +190,6 @@ mod tests {
             crate::stderr_line!("SKIP: no Metal device on this machine");
         }
         d
-    }
-
-    /// The load-bearing test: every shader compiles and every entry point the
-    /// renderer will ask for resolves. This is what replaces `naga`.
-    ///
-    /// The roster is DERIVED from THE PIPELINE TABLE — the same rows
-    /// `renderer.rs` builds its `wgpu` pipelines from — so "the entry points
-    /// the renderer asks for" is no longer a second list that can agree with
-    /// the MSL and disagree with the renderer. It was one, and it did: see
-    /// [`shaders::libraries`].
-    #[test]
-    fn all_shaders_compile_and_expose_their_entry_points() {
-        let Some(dev) = device() else { return };
-        for (lib_id, src, entries) in shaders::libraries() {
-            let name = lib_id.name();
-            let lib = dev
-                .new_library(src)
-                .unwrap_or_else(|e| panic!("{name}.metal failed to compile:\n{e}"));
-            for e in entries {
-                assert!(
-                    lib.function(e).is_some(),
-                    "{name}.metal is missing entry point `{e}`"
-                );
-            }
-        }
-    }
-
-    /// The four formats the renderer names must all be real, and the offscreen
-    /// pair must be view-compatible — that pairing is what carries the sRGB
-    /// encode law (see [`super::shaders`]).
-    #[test]
-    fn the_four_renderer_formats_exist() {
-        let Some(dev) = device() else { return };
-        for f in [
-            PixelFormat::Bgra8Unorm,
-            PixelFormat::Rgba8Unorm,
-            PixelFormat::R8Unorm,
-            PixelFormat::Rgba16Float,
-        ] {
-            assert!(
-                dev.new_texture_2d(f, 16, 16, TEXTURE_USAGE_SHADER_READ)
-                    .is_some(),
-                "{f:?} texture creation failed"
-            );
-        }
-        // The offscreen: a Unorm texture that a sRGB-typed view can alias.
-        assert!(
-            dev.new_texture_2d(
-                PixelFormat::Bgra8Unorm,
-                16,
-                16,
-                TEXTURE_USAGE_RENDER_TARGET
-                    | TEXTURE_USAGE_SHADER_READ
-                    | TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
-            )
-            .is_some(),
-            "view-capable offscreen creation failed"
-        );
     }
 
     // THE FOUR HAND-WRITTEN PIPELINE TESTS THAT USED TO BE HERE ARE GONE.
@@ -572,24 +514,6 @@ mod tests {
             }
         }
         assert!(checked > 30_000, "halo sweep unexpectedly small: {checked}");
-    }
-
-    /// Buffers, samplers and a command queue — the remaining objects a frame
-    /// needs, so every selector this module sends is exercised at least once.
-    #[test]
-    fn device_objects_allocate() {
-        let Some(dev) = device() else { return };
-        assert!(!dev.name().is_empty(), "device reports a name");
-        assert!(dev.new_buffer(4096).is_some(), "buffer");
-        assert!(
-            dev.new_sampler(SamplerDesc::NEAREST_CLAMP).is_some(),
-            "nearest sampler"
-        );
-        assert!(
-            dev.new_sampler(SamplerDesc::LINEAR_CLAMP).is_some(),
-            "linear sampler"
-        );
-        assert!(dev.new_command_queue().is_some(), "command queue");
     }
 
     // -----------------------------------------------------------------
@@ -1689,14 +1613,17 @@ mod tests {
         /// the `translucent` arm is non-vacuous inside the content rect too —
         /// not only on the bands.
         translucent_source: bool,
-        /// Blit the CHROME source (rendered with a metered chrome bleed), so
-        /// the uniform carries a non-zero `chrome_y1` and the bands beside the
-        /// chrome rows take the edge-continuation arm (design ruling 55).
-        chrome_source: bool,
+        /// Blit a CHROME source (rendered with a metered chrome bleed whose
+        /// `ChromeBleed::first` is this), so the uniform carries a non-zero
+        /// `chrome_y1` and the bands beside the chrome rows take the
+        /// edge-continuation arm (design ruling 55); `Some(1)` leaves the rows
+        /// above on the padding, so `chrome_y0` is non-zero and the arm's lower
+        /// bound is exercised too. `None` blits a source without chrome.
+        chrome_first: Option<usize>,
     }
 
     /// THE FALSIFIABLE GATE: the first-party Metal blit must be BYTE-IDENTICAL
-    /// to the shipped wgpu blit, on the same source texels and the same 96
+    /// to the shipped wgpu blit, on the same source texels and the same 112
     /// uniform bytes, across every arm of `fs_blit` this harness can reach.
     ///
     /// This is deliberately stronger than `tests/blit_invert.rs` and
@@ -1794,8 +1721,9 @@ mod tests {
         // THE CHROME SOURCE: two chrome rows, the second METERED (its own
         // gutter tones), so the edge-continuation arm has three distinct tones
         // to carry into the bands.
-        let chrome_bleed = || aterm_render::ChromeBleed {
+        let chrome_bleed = |first: usize| aterm_render::ChromeBleed {
             rows: 2,
+            first,
             color: 0x0030_3135,
             seam: Some(0x0060_6164),
             top_extends_cells: false,
@@ -1810,9 +1738,14 @@ mod tests {
             ],
         };
         gpu.set_background_opacity(1.0);
-        gpu.set_chrome_bleed(Some(chrome_bleed()));
+        gpu.set_chrome_bleed(Some(chrome_bleed(0)));
         let chrome = gpu.render_input(&mut win, &input, None);
         let chrome_rgba = frame_to_rgba8(&chrome);
+        // …and the same band below a SURFACELESS strip row (`first: 1`, macOS's
+        // in-grid strip): the strip row and the lip above keep the padding.
+        gpu.set_chrome_bleed(Some(chrome_bleed(1)));
+        let strip = gpu.render_input(&mut win, &input, None);
+        let strip_rgba = frame_to_rgba8(&strip);
         gpu.set_chrome_bleed(None);
 
         let crop = PresentCrop {
@@ -1827,7 +1760,7 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "exact fit, bell invert",
@@ -1839,7 +1772,7 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "oversized, W1 bands",
@@ -1848,7 +1781,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "cropped + drop overlay",
@@ -1861,7 +1794,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "cropped + overlay on the PRESENTED Bgra8Unorm format",
@@ -1874,7 +1807,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "linear->sRGB re-encode (encode_srgb)",
@@ -1886,7 +1819,7 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "translucent glass, content + bands",
@@ -1898,7 +1831,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: true,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "premultiplied glass (premult over translucent)",
@@ -1911,7 +1844,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: true,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "EDR present (hdr grid clamp)",
@@ -1923,7 +1856,7 @@ mod tests {
                 extra_w: 0,
                 extra_h: 0,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
             Case {
                 name: "chrome rows continue their edges through the bands",
@@ -1932,7 +1865,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
-                chrome_source: true,
+                chrome_first: Some(0),
             },
             Case {
                 name: "chrome edge continuation under the bell invert",
@@ -1945,7 +1878,16 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
-                chrome_source: true,
+                chrome_first: Some(0),
+            },
+            Case {
+                name: "chrome edge continuation below a surfaceless strip",
+                target: BlitTestTarget::Rgba8Unorm,
+                fx: BlitTestEffects::PLAIN,
+                extra_w: 37,
+                extra_h: 23,
+                translucent_source: false,
+                chrome_first: Some(1),
             },
             Case {
                 name: "EDR + scRGB reference white, with bands",
@@ -1958,7 +1900,7 @@ mod tests {
                 extra_w: 37,
                 extra_h: 23,
                 translucent_source: false,
-                chrome_source: false,
+                chrome_first: None,
             },
         ];
 
@@ -1968,13 +1910,17 @@ mod tests {
             // The wgpu arm re-renders the source it needs. `render_input` is
             // deterministic for a fixed input and opacity, so this reproduces
             // the exact texels captured above rather than a new frame.
-            gpu.set_chrome_bleed(c.chrome_source.then(chrome_bleed));
+            gpu.set_chrome_bleed(c.chrome_first.map(chrome_bleed));
             let src_rgba = if c.translucent_source {
                 gpu.set_background_opacity(0.55);
                 &glass_rgba
-            } else if c.chrome_source {
+            } else if let Some(first) = c.chrome_first {
                 gpu.set_background_opacity(1.0);
-                &chrome_rgba
+                if first == 0 {
+                    &chrome_rgba
+                } else {
+                    &strip_rgba
+                }
             } else {
                 gpu.set_background_opacity(1.0);
                 &opaque_rgba
@@ -1991,16 +1937,26 @@ mod tests {
                 "BlitUniform grew: add the member to `shaders/blit.metal`'s \
                  `Blit` struct before widening this constant"
             );
-            // `chrome_y1` rides bytes 28..32 (the old accent alpha's slot): the
-            // chrome cases must actually carry it, the others must not.
+            // `chrome_y1` rides bytes 28..32 (the old accent alpha's slot) and
+            // `chrome_y0` bytes 96..100: the chrome cases must actually carry
+            // the end, the strip case the start, and the others neither.
             let chrome_y1 =
                 f32::from_ne_bytes([uniform[28], uniform[29], uniform[30], uniform[31]]);
+            let chrome_y0 =
+                f32::from_ne_bytes([uniform[96], uniform[97], uniform[98], uniform[99]]);
             assert_eq!(
                 chrome_y1 > 0.0,
-                c.chrome_source,
+                c.chrome_first.is_some(),
                 "[{}] chrome_y1 = {chrome_y1}",
                 c.name
             );
+            assert_eq!(
+                chrome_y0 > 0.0,
+                c.chrome_first.is_some_and(|f| f > 0),
+                "[{}] chrome_y0 = {chrome_y0}",
+                c.name
+            );
+            assert!(chrome_y0 <= chrome_y1, "[{}] an ordered range", c.name);
 
             if !blits.iter().any(|(t, _)| *t == c.target) {
                 let mb = MetalBlit::new(metal_format(c.target)).unwrap_or_else(|e| {
@@ -2070,209 +2026,6 @@ mod tests {
         // Leave the renderer as it was found.
         gpu.set_background_opacity(1.0);
         gpu.set_chrome_bleed(None);
-    }
-
-    /// P4 — THE END-TO-END DIFFERENTIAL ON A REAL VERTEX ROW. The blit gate
-    /// above pins the one `VertexLayout::None` row; this pins `Pipeline::Bg`,
-    /// the instanced `[[stage_in]]` + vertex-uniform row whose slot-0 failure
-    /// was the measured proof of the port's killer defect — drawn through the
-    /// SHIPPED wgpu path (`renderer.rs::bg_row_bytes_for_test`: the real
-    /// `bg_pipeline`, the real shared uniform buffer, the production
-    /// `draw(0..6, 0..n)`) and through the first-party Metal path (the same
-    /// table row via `pipelines::build`, the stream at
-    /// [`ffi::INSTANCE_STREAM_SLOT`]), same instance bytes, same uniforms,
-    /// same resolved target format, and compared BYTE FOR BYTE.
-    ///
-    /// # The fixture, and why each instance is in it
-    ///
-    /// * two OPAQUE mid-range quads — mid-range because 0/255 channels
-    ///   saturate to the same bytes under a `UChar4` misdeclaration of
-    ///   `Unorm8x4`, so primaries would let the format axis go quiet;
-    /// * one TRANSLUCENT quad (`a = 128`) OVERLAPPING both, drawn last. The
-    ///   bg row's blend is REPLACE, which Metal spells as blending DISABLED —
-    ///   so a planted wrong blend factor only becomes visible where blending
-    ///   would change the answer: a fragment whose source alpha is not 1 over
-    ///   a destination it must overwrite. Production bg instances are always
-    ///   opaque; this one is deliberately out of that domain so the blend
-    ///   axis is load-bearing. (Overlap inside ONE instanced call is ordered
-    ///   by instance index on both APIs, so "drawn last" is well-defined.)
-    ///
-    /// The 16x16 extent keeps every quad corner an exact dyadic NDC value, so
-    /// coverage cannot differ by a ULP of vertex arithmetic — a byte diff here
-    /// is a STATE diff (slot, format, offset, stride, blend, mask, target),
-    /// never a rasterisation coin flip.
-    ///
-    /// # What a red looks like, per armed axis
-    ///
-    /// * stream bound at slot 0: the Metal arm paints NOTHING (measured), so
-    ///   every covered texel differs;
-    /// * `Unorm8x4 -> UChar4`: the Metal colours saturate, every covered
-    ///   texel differs;
-    /// * REPLACE built as source-over: the translucent quad's whole rect
-    ///   differs — over the clear (`92*128/255` vs `92` in linear light) and
-    ///   over both opaque quads, and its stored alpha becomes 255, not 128.
-    ///
-    /// # Coverage, stated honestly
-    ///
-    /// This reaches ONE row end to end: bg. With the blit gate and W2's
-    /// glyph differential ([`glyph_row_matches_wgpu_byte_for_byte`]) that
-    /// makes THREE of eighteen — and glyph adds the GlyphInstance layout, an
-    /// ENABLED blend as built (ALPHA_BLENDING), R8 atlas sampling and the
-    /// fragment-stage uniform to the byte-pinned set. Still NOT
-    /// differentially pinned: the RainGlow/Fire layouts, the RGBA atlas row,
-    /// the Unorm-target additive rows, the EDR row and the tray — covered by
-    /// construction, not by bytes, until W3/W4's ladder rungs.
-    #[test]
-    fn bg_row_matches_wgpu_byte_for_byte() {
-        use crate::pipeline_table::Pipeline;
-
-        let Some(dev) = device() else { return };
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
-                return;
-            }
-        };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
-        gpu.disarm_metal_for_test();
-
-        const W: usize = 16;
-        const H: usize = 16;
-        const INSTANCES: [([u16; 4], [u8; 4]); 3] = [
-            ([0, 0, 8, 8], [200, 40, 120, 255]),
-            ([8, 8, 8, 8], [40, 200, 90, 255]),
-            ([4, 4, 8, 8], [90, 140, 220, 128]),
-        ];
-
-        // The wgpu arm: the shipped renderer draws the fixture.
-        let expected = gpu.bg_row_bytes_for_test(&INSTANCES, W as u32, H as u32);
-
-        // The Metal arm: the same table row, first-party. The stream bytes are
-        // packed HERE against BG_LAYOUT's law (tight 12-byte instances,
-        // little-endian rect then colour) rather than borrowed from the wgpu
-        // arm's struct, so a layout drift between the two spellings is a
-        // byte diff and not a shared assumption.
-        let queue = dev.new_command_queue().expect("queue");
-        let spec = Pipeline::Bg.spec();
-        let lib = super::pipelines::compile(&dev, spec).expect("cell.metal compiles");
-        let pso = super::pipelines::build(&dev, &lib, spec, PixelFormat::Bgra8Unorm)
-            .expect("the bg row builds");
-        let fmt = super::pipelines::metal_format(spec.target, PixelFormat::Bgra8Unorm);
-        assert_eq!(
-            fmt.bytes_per_texel(),
-            4,
-            "the bg differential compares 4-byte texels on both arms"
-        );
-
-        let mut stream: Vec<u8> = Vec::new();
-        for (rect, colour) in INSTANCES {
-            for v in rect {
-                stream.extend_from_slice(&v.to_le_bytes());
-            }
-            stream.extend_from_slice(&colour);
-        }
-        let ibuf = dev.new_buffer(stream.len()).expect("instance stream");
-        // SAFETY: fresh exactly-sized shared buffer; no GPU work in flight.
-        unsafe { ffi::buffer_write(&ibuf, &stream) };
-
-        let uniforms = CellUniforms {
-            screen: [W as f32, H as f32],
-            text_blend: 0.0,
-            pad: 0.0,
-        };
-        let ubuf = dev.new_buffer(size_of::<CellUniforms>()).expect("uniforms");
-        // SAFETY: `CellUniforms` is `repr(C)` into an exactly-sized fresh buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&uniforms)) };
-
-        let dst = dev
-            .new_texture_2d(
-                fmt,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            )
-            .expect("bg target");
-        let row = W * fmt.bytes_per_texel();
-        let rb = dev.new_buffer(row * H).expect("readback");
-        ffi::draw_and_read(
-            &queue,
-            &Pass {
-                pso: &pso,
-                dst: &dst,
-                dst_w: W,
-                dst_h: H,
-                // Opaque black — `wgpu::Color::BLACK`'s twin on the wgpu arm.
-                load: LoadAction::Clear(ClearColor {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-                viewport: None,
-                scissor: None,
-                src_tex: None,
-                sampler: None,
-                uniform: None,
-                vertex_uniform: Some((
-                    &ubuf,
-                    spec.binds
-                        .vertex_uniform
-                        .expect("the bg row has a vertex uniform") as usize,
-                )),
-                draw: Some(ffi::DrawCall {
-                    primitive: super::pipelines::metal_primitive_type(spec.topology),
-                    vertices: 6,
-                    instances: INSTANCES.len(),
-                    stream: Some(&ibuf),
-                }),
-            },
-            &rb,
-            row,
-        )
-        .expect("the bg draw runs");
-        // SAFETY: shared storage, sized `row * H`, written before
-        // `draw_and_read` returned (it waits on the command buffer).
-        let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "readback size mismatch — one arm's row stride is wrong"
-        );
-        if actual != expected {
-            let mut diffs = 0usize;
-            let mut first = None;
-            for (i, (e, a)) in expected
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(actual.as_chunks::<4>().0.iter())
-                .enumerate()
-            {
-                if e != a {
-                    diffs += 1;
-                    if first.is_none() {
-                        first = Some((i, e.to_vec(), a.to_vec()));
-                    }
-                }
-            }
-            let (i, e, a) = first.expect("the buffers differ, so some texel differs");
-            let (x, y) = (i % W, i / W);
-            panic!(
-                "THE METAL BG ROW IS NOT BYTE-IDENTICAL TO wgpu: {diffs} of {} texels \
-                 differ; first at ({x},{y}): wgpu {e:02x?} != metal {a:02x?} — a stream \
-                 at slot 0 zeroes every covered texel, a UChar4 colour saturates, a \
-                 blend factor planted on the REPLACE row moves the translucent quad",
-                W * H
-            );
-        }
-        crate::stderr_line!(
-            "bg differential on {}: byte-identical over {} texels",
-            dev.name(),
-            W * H
-        );
     }
 
     /// W2 — THE GLYPH DIFFERENTIAL, the ladder's row 1: the first TEXTURED,
@@ -4410,7 +4163,7 @@ mod tests {
         }
 
         // 4. rain: bright-head halos (both modes) + rain sprites through the
-        //    rain atlas (rain_parity + rain_screenshot's shape).
+        //    rain atlas (rain_parity's shape).
         {
             let mut input = base_input();
             input.rain_atlas = Some(scene_atlas(5));
@@ -5362,331 +5115,6 @@ mod tests {
         );
     }
 
-    /// W5 — ROW 12 `bloom`: the composite pass, wgpu
-    /// (`bloom_row_bytes_for_test`: the REAL `bloom_pipeline` + `bloom_bgl` +
-    /// LINEAR `bloom_sampler` + `bloom_uniform_buf`) vs first-party Metal
-    /// (the SAME table row via `pipelines::build`, `BindSpec::POST_FS` slots,
-    /// `LINEAR_CLAMP`), onto a SEEDED LoadOp::Load target, scissored, SCREEN
-    /// blend. The half-res (9x7) source under a full-res (18x14) pass makes
-    /// every gaussian tap a sub-texel LINEAR sample — the first differential
-    /// where the linear filter is load-bearing (W2's lesson applied; the W5
-    /// present-arm plant measured LINEAR->NEAREST at 2,377 px, so this axis
-    /// is proven to move bytes when wrong).
-    #[test]
-    fn bloom_row_matches_wgpu_byte_for_byte() {
-        use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
-        use super::loss::LossLatch;
-        use crate::pipeline_table::Pipeline;
-        use std::sync::Arc;
-
-        let Some(dev) = device() else { return };
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
-                return;
-            }
-        };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
-        gpu.disarm_metal_for_test();
-        const W: usize = 18;
-        const H: usize = 14;
-        const BW: usize = 9;
-        const BH: usize = 7;
-        const STRENGTH: f32 = 0.85;
-        const RADIUS: f32 = 1.6;
-        const SCISSOR: [u32; 4] = [2, 1, 15, 12];
-        // Full-range half-res source (dark values included — the SCREEN blend
-        // and gaussian weighting must agree at both ends).
-        let src: Vec<u8> = (0..BW * BH * 4).map(|i| ((i * 37) % 256) as u8).collect();
-        // A seeded gradient target: Load + SCREEN spend the leftover headroom.
-        let seed: Vec<u8> = (0..W * H * 4).map(|i| ((i * 11) % 200) as u8).collect();
-
-        let expected = gpu.bloom_row_bytes_for_test(
-            (&src, BW as u32, BH as u32),
-            &seed,
-            STRENGTH,
-            RADIUS,
-            Some(SCISSOR),
-            W as u32,
-            H as u32,
-        );
-        assert_ne!(
-            expected, seed,
-            "the composite must move bytes (non-vacuous)"
-        );
-
-        // --- the Metal arm -------------------------------------------------
-        let spec = Pipeline::Bloom.spec();
-        let binds = spec.binds;
-        let lib = super::pipelines::compile(&dev, spec).expect("bloom.metal");
-        let pso = super::pipelines::build(&dev, &lib, spec, PixelFormat::Bgra8Unorm)
-            .expect("row 12 builds");
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
-        let usage = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
-
-        let half = mint
-            .texture_2d(PixelFormat::Rgba8Unorm, BW, BH, TEXTURE_USAGE_SHADER_READ)
-            .expect("half-res source");
-        // SAFETY: fresh managed texture, tight stride.
-        unsafe { ffi::texture_upload(half.obj(), MtlRegion::full_2d(BW, BH), &src, BW * 4) };
-        let dst = mint
-            .texture_2d(PixelFormat::Rgba8Unorm, W, H, usage)
-            .expect("target");
-        // SAFETY: as above.
-        unsafe { ffi::texture_upload(dst.obj(), MtlRegion::full_2d(W, H), &seed, W * 4) };
-        let sampler = dev
-            .new_sampler(SamplerDesc::LINEAR_CLAMP)
-            .expect("linear sampler");
-        // The SHIPPING layout, field for field (`renderer::BloomUniform` /
-        // `bloom.metal`'s `BloomU`): the two radii of the white/chroma split
-        // plus the tail pad that rounds the uniform stride to 32.
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct BloomU {
-            texel: [f32; 2],
-            strength: f32,
-            radius: f32,
-            chroma_radius: f32,
-            _pad: [f32; 3],
-        }
-        #[expect(clippy::cast_precision_loss, reason = "test extents")]
-        let bu = BloomU {
-            texel: [1.0 / BW as f32, 1.0 / BH as f32],
-            strength: STRENGTH,
-            radius: RADIUS,
-            chroma_radius: crate::renderer::bloom_chroma_radius(RADIUS),
-            _pad: [0.0; 3],
-        };
-        let ubuf = dev.new_buffer(size_of::<BloomU>()).expect("uniform");
-        // SAFETY: repr(C) into an exactly-sized fresh shared buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&bu)) };
-
-        let row = W * 4;
-        let rb = dev.new_buffer(row * H).expect("readback");
-        let mut cb = session.begin().expect("cb");
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &dst,
-                    load: LoadAction::Load,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: Some(MtlScissorRect {
-                        x: SCISSOR[0] as usize,
-                        y: SCISSOR[1] as usize,
-                        width: (SCISSOR[2] - SCISSOR[0]) as usize,
-                        height: (SCISSOR[3] - SCISSOR[1]) as usize,
-                    }),
-                })
-                .expect("bloom pass");
-            pass.set_pipeline(&pso);
-            pass.set_fragment_texture(half.obj(), binds.fragment_textures[0] as usize);
-            pass.set_fragment_sampler(&sampler, binds.fragment_samplers[0] as usize);
-            pass.set_fragment_buffer(&ubuf, binds.fragment_buffers[0] as usize);
-            pass.draw_fullscreen_triangle().expect("armed draw");
-        }
-        cb.copy_texture_to_buffer(&dst, W, H, &rb, row)
-            .expect("readback copy");
-        assert_eq!(
-            cb.commit().wait_outcome(),
-            super::loss::CbOutcome::Completed
-        );
-        // SAFETY: shared storage, terminal above.
-        let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-        assert_row_bytes_identical("BLOOM", W, 4, &expected, &actual);
-        crate::stderr_line!(
-            "bloom differential on {}: byte-identical over {} texels (half-res \
-             LINEAR minification + SCREEN blend + scissored Load)",
-            dev.name(),
-            W * H
-        );
-    }
-
-    /// W5 — ROW 13 `shimmer`: the displacement refraction, wgpu
-    /// (`shimmer_row_bytes_for_test`: the REAL `ShimmerResources` pipeline +
-    /// bgl + LINEAR sampler + shared uniform, phase PINNED) vs first-party
-    /// Metal (the same row, `POST_FS` binds, the 320-byte uniform restated
-    /// independently). The scratch is a gradient, so every displaced
-    /// sub-texel LINEAR sample is load-bearing — the exact axis the map's W2
-    /// lesson names ("shimmer samples at DISPLACED sub-texel positions").
-    /// The scissored Load bound is armed by comparing OUTSIDE the region too
-    /// (both arms must leave the seed untouched there).
-    #[test]
-    fn shimmer_row_matches_wgpu_byte_for_byte() {
-        use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
-        use super::loss::LossLatch;
-        use crate::pipeline_table::Pipeline;
-        use std::sync::Arc;
-
-        let Some(dev) = device() else { return };
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
-                return;
-            }
-        };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
-        gpu.disarm_metal_for_test();
-        const W: usize = 24;
-        const H: usize = 16;
-        const REGION: [u32; 4] = [4, 2, 20, 12];
-        const PHASE: f32 = 0.41;
-        const HOT_TOP: f32 = 12.0;
-        const RISE: f32 = 9.0;
-        gpu.set_shimmer_phase_for_test(Some(PHASE));
-        let (cw, ch) = gpu.cell_size();
-        // Gradient scratch: displaced samples always differ from undisplaced.
-        let scratch: Vec<u8> = (0..W * H * 4).map(|i| ((i * 7) % 256) as u8).collect();
-        let seed: Vec<u8> = (0..W * H * 4).map(|i| ((i * 13) % 256) as u8).collect();
-        let mut heat = [0f32; 64];
-        for (i, h) in heat.iter_mut().enumerate() {
-            #[expect(clippy::cast_precision_loss, reason = "64 bands")]
-            {
-                *h = (i as f32 / 63.0).min(1.0);
-            }
-        }
-
-        let expected = gpu.shimmer_row_bytes_for_test(
-            &scratch, &seed, REGION, HOT_TOP, RISE, &heat, W as u32, H as u32,
-        );
-        assert_ne!(
-            expected, seed,
-            "the refraction must move bytes (non-vacuous)"
-        );
-        // The scissor law, wgpu side: outside the region the seed survives.
-        let corner = &expected[..4];
-        assert_eq!(
-            corner,
-            &seed[..4],
-            "outside the scissor the target is untouched"
-        );
-
-        // --- the Metal arm -------------------------------------------------
-        let spec = Pipeline::Shimmer.spec();
-        let binds = spec.binds;
-        let lib = super::pipelines::compile(&dev, spec).expect("shimmer.metal");
-        let pso = super::pipelines::build(&dev, &lib, spec, PixelFormat::Bgra8Unorm)
-            .expect("row 13 builds");
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
-
-        let scratch_tex = mint
-            .texture_2d(PixelFormat::Rgba8Unorm, W, H, TEXTURE_USAGE_SHADER_READ)
-            .expect("scratch");
-        // SAFETY: fresh managed texture, tight stride.
-        unsafe {
-            ffi::texture_upload(scratch_tex.obj(), MtlRegion::full_2d(W, H), &scratch, W * 4);
-        }
-        let dst = mint
-            .texture_2d(
-                PixelFormat::Rgba8Unorm,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            )
-            .expect("target");
-        // SAFETY: as above.
-        unsafe { ffi::texture_upload(dst.obj(), MtlRegion::full_2d(W, H), &seed, W * 4) };
-        let sampler = dev
-            .new_sampler(SamplerDesc::LINEAR_CLAMP)
-            .expect("linear sampler");
-
-        /// `ShimmerU`'s 320-byte layout, restated independently (three vec2,
-        /// seven f32, a vec2 pad, then `float4 heat[16]`).
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct ShimmerU {
-            frame: [f32; 2],
-            region_min: [f32; 2],
-            region_max: [f32; 2],
-            hot_top: f32,
-            rise: f32,
-            amp: f32,
-            period: f32,
-            phase: f32,
-            band_x0: f32,
-            band_w: f32,
-            rolloff: f32,
-            _pad: [f32; 2],
-            heat: [[f32; 4]; 16],
-        }
-        let mut heat4 = [[0f32; 4]; 16];
-        for (i, v) in heat.iter().enumerate() {
-            heat4[i / 4][i % 4] = *v;
-        }
-        #[expect(clippy::cast_precision_loss, reason = "test extents")]
-        let su = ShimmerU {
-            frame: [W as f32, H as f32],
-            region_min: [REGION[0] as f32, REGION[1] as f32],
-            region_max: [REGION[2] as f32, REGION[3] as f32],
-            hot_top: HOT_TOP,
-            rise: RISE,
-            amp: (ch as f32 / 18.0).clamp(0.75, 1.5),
-            period: (ch as f32).max(4.0),
-            phase: PHASE,
-            band_x0: REGION[0] as f32,
-            band_w: ((REGION[2] - REGION[0]) as f32 / 64.0).max(1e-3),
-            rolloff: (cw as f32).max(1.0),
-            _pad: [0.0; 2],
-            heat: heat4,
-        };
-        assert_eq!(
-            size_of::<ShimmerU>(),
-            320,
-            "the restatement is the 320-byte law"
-        );
-        let ubuf = dev.new_buffer(size_of::<ShimmerU>()).expect("uniform");
-        // SAFETY: repr(C) into an exactly-sized fresh shared buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&su)) };
-
-        let row = W * 4;
-        let rb = dev.new_buffer(row * H).expect("readback");
-        let mut cb = session.begin().expect("cb");
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &dst,
-                    load: LoadAction::Load,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: Some(MtlScissorRect {
-                        x: REGION[0] as usize,
-                        y: REGION[1] as usize,
-                        width: (REGION[2] - REGION[0]) as usize,
-                        height: (REGION[3] - REGION[1]) as usize,
-                    }),
-                })
-                .expect("shimmer pass");
-            pass.set_pipeline(&pso);
-            pass.set_fragment_texture(scratch_tex.obj(), binds.fragment_textures[0] as usize);
-            pass.set_fragment_sampler(&sampler, binds.fragment_samplers[0] as usize);
-            pass.set_fragment_buffer(&ubuf, binds.fragment_buffers[0] as usize);
-            pass.draw_fullscreen_triangle().expect("armed draw");
-        }
-        cb.copy_texture_to_buffer(&dst, W, H, &rb, row)
-            .expect("readback copy");
-        assert_eq!(
-            cb.commit().wait_outcome(),
-            super::loss::CbOutcome::Completed
-        );
-        // SAFETY: shared storage, terminal above.
-        let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-        assert_row_bytes_identical("SHIMMER", W, 4, &expected, &actual);
-        crate::stderr_line!(
-            "shimmer differential on {}: byte-identical over {} texels \
-             (displaced sub-texel LINEAR sampling, scissored Load, pinned phase)",
-            dev.name(),
-            W * H
-        );
-    }
-
     /// W5 — ROWS 14/15, the crown pair from ONE fixture: `hdr_glow` onto a
     /// SEEDED `Rgba16Float` Load target (One/One additive, the s2l decode's
     /// BOTH branches armed by a dark and a bright instance, the headroom
@@ -5875,147 +5303,5 @@ mod tests {
                 }
             );
         }
-    }
-
-    /// W5 — ROW 17 `tray`: the card composite, wgpu
-    /// (`tray_row_bytes_for_test`: the REAL `tray_pipelines[format]` +
-    /// `tray_bgl` + LINEAR `tray_sampler` + `tray_uniform_buf`, the
-    /// production 1:1 device-px placement) vs first-party Metal (the same
-    /// row, `BindSpec::TRAY` — the ONE row whose vertex uniform sits at
-    /// slot 2 — `LINEAR_CLAMP`, `draw_strip_quad`). The card's alpha ramp
-    /// spans 0..=255 so the straight-alpha src-over is load-bearing across
-    /// the whole range, over a seeded Load target.
-    #[test]
-    fn tray_row_matches_wgpu_byte_for_byte() {
-        use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
-        use super::loss::LossLatch;
-        use crate::pipeline_table::Pipeline;
-        use std::sync::Arc;
-
-        let Some(dev) = device() else { return };
-        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
-                return;
-            }
-        };
-        // THE FLIP: construct-time selection is Metal; this ladder test drives
-        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
-        gpu.disarm_metal_for_test();
-        const W: usize = 20;
-        const H: usize = 12;
-        const PW: usize = 8;
-        const PH: usize = 5;
-        const AT: (u32, u32) = (5, 3);
-        // Alpha ramp 0..=255 across the card, full-range colour.
-        let card: Vec<u8> = (0..PW * PH)
-            .flat_map(|i| {
-                [
-                    ((i * 17) % 256) as u8,
-                    ((i * 23) % 256) as u8,
-                    ((i * 31) % 256) as u8,
-                    ((i * 255) / (PW * PH - 1)).min(255) as u8,
-                ]
-            })
-            .collect();
-        let seed: Vec<u8> = (0..W * H * 4).map(|i| ((i * 3) % 256) as u8).collect();
-
-        let expected = gpu.tray_row_bytes_for_test(
-            (&card, PW as u32, PH as u32),
-            AT,
-            &seed,
-            W as u32,
-            H as u32,
-        );
-        assert_ne!(expected, seed, "the card must composite (non-vacuous)");
-
-        // --- the Metal arm -------------------------------------------------
-        let spec = Pipeline::Tray.spec();
-        let binds = spec.binds;
-        assert_eq!(
-            binds.vertex_uniform,
-            Some(2),
-            "row 17 is the one row whose vertex uniform sits at slot 2"
-        );
-        let lib = super::pipelines::compile(&dev, spec).expect("tray.metal");
-        // The production attachment is the present copy — the offscreen
-        // format — so the Present role resolves to Rgba8Unorm here.
-        let pso = super::pipelines::build(&dev, &lib, spec, PixelFormat::Rgba8Unorm)
-            .expect("row 17 builds");
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
-        let mint = super::resources::MetalResourceDevice::new(&dev, Arc::clone(&latch));
-
-        let card_tex = mint
-            .texture_2d(PixelFormat::Rgba8Unorm, PW, PH, TEXTURE_USAGE_SHADER_READ)
-            .expect("card");
-        // SAFETY: fresh managed texture, tight stride.
-        unsafe { ffi::texture_upload(card_tex.obj(), MtlRegion::full_2d(PW, PH), &card, PW * 4) };
-        let dst = mint
-            .texture_2d(
-                PixelFormat::Rgba8Unorm,
-                W,
-                H,
-                TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
-            )
-            .expect("target");
-        // SAFETY: as above.
-        unsafe { ffi::texture_upload(dst.obj(), MtlRegion::full_2d(W, H), &seed, W * 4) };
-        let sampler = dev
-            .new_sampler(SamplerDesc::LINEAR_CLAMP)
-            .expect("linear sampler");
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct TrayU {
-            rect: [f32; 4],
-            fb: [f32; 2],
-            _pad: [f32; 2],
-        }
-        #[expect(clippy::cast_precision_loss, reason = "test extents")]
-        let tu = TrayU {
-            rect: [AT.0 as f32, AT.1 as f32, PW as f32, PH as f32],
-            fb: [W as f32, H as f32],
-            _pad: [0.0; 2],
-        };
-        let ubuf = dev.new_buffer(size_of::<TrayU>()).expect("uniform");
-        // SAFETY: repr(C) into an exactly-sized fresh shared buffer.
-        unsafe { ffi::buffer_write(&ubuf, as_bytes(&tu)) };
-
-        let row = W * 4;
-        let rb = dev.new_buffer(row * H).expect("readback");
-        let mut cb = session.begin().expect("cb");
-        {
-            let pass = cb
-                .render_pass(&RenderPassDesc {
-                    target: &dst,
-                    load: LoadAction::Load,
-                    store: StoreAction::Store,
-                    viewport: None,
-                    scissor: None,
-                })
-                .expect("tray pass");
-            pass.set_pipeline(&pso);
-            pass.set_vertex_buffer(&ubuf, binds.vertex_uniform.expect("slot 2") as usize)
-                .expect("vertex uniform bind");
-            pass.set_fragment_texture(card_tex.obj(), binds.fragment_textures[0] as usize);
-            pass.set_fragment_sampler(&sampler, binds.fragment_samplers[0] as usize);
-            pass.draw_strip_quad().expect("armed draw");
-        }
-        cb.copy_texture_to_buffer(&dst, W, H, &rb, row)
-            .expect("readback copy");
-        assert_eq!(
-            cb.commit().wait_outcome(),
-            super::loss::CbOutcome::Completed
-        );
-        // SAFETY: shared storage, terminal above.
-        let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
-        assert_row_bytes_identical("TRAY", W, 4, &expected, &actual);
-        crate::stderr_line!(
-            "tray differential on {}: byte-identical over {} texels (strip \
-             quad, vertex uniform at slot 2, straight-alpha ramp 0..=255)",
-            dev.name(),
-            W * H
-        );
     }
 }

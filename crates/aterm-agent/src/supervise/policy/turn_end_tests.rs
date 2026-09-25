@@ -1161,7 +1161,7 @@ fn a_point_that_answers_the_upgrade_announcement_is_the_sweeps() {
     assert_eq!(a, TurnEndAction::Nothing);
     // Negative controls.
     let (owned, a) = decide(
-        &continue_prompt(&from, &to),
+        &continue_prompt(&from, &to, Some("claude-opus-5-5")),
         &["⏺ Resumed; stage 3 is done."],
     );
     assert!(!owned);

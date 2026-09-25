@@ -76,21 +76,45 @@ fn tile_coordinates_increase_across_the_footprint() {
 }
 
 #[test]
-fn inline_zero_draws_nothing() {
-    let mut term = Terminal::new(10, 20);
+fn malformed_or_non_inline_draws_nothing() {
+    // Each row was its own test: none of these may place an image, or panic.
     let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
-    // inline=0 means "download to disk" — no on-screen effect.
-    term.process(&osc_1337_file("inline=0;width=4;height=3", &payload));
-    assert_eq!(image_cell_count(&term), 0);
-}
-
-#[test]
-fn missing_inline_draws_nothing() {
-    let mut term = Terminal::new(10, 20);
-    let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
-    // No inline= argument at all — default is "not inline".
-    term.process(&osc_1337_file("width=4;height=3", &payload));
-    assert_eq!(image_cell_count(&term), 0);
+    let rows: [(&str, Vec<u8>); 6] = [
+        // inline=0 means "download to disk": no on-screen effect.
+        (
+            "inline=0",
+            osc_1337_file("inline=0;width=4;height=3", &payload),
+        ),
+        // No inline= argument at all: the default is "not inline".
+        (
+            "inline missing",
+            osc_1337_file("width=4;height=3", &payload),
+        ),
+        // No ':' means no payload.
+        (
+            "no payload separator",
+            b"\x1b]1337;File=inline=1;width=4;height=3\x1b\\".to_vec(),
+        ),
+        // '!' is not base64, so decoding fails.
+        (
+            "bad base64",
+            b"\x1b]1337;File=inline=1;width=4;height=3:!!!!\x1b\\".to_vec(),
+        ),
+        (
+            "empty payload",
+            b"\x1b]1337;File=inline=1;width=4;height=3:\x1b\\".to_vec(),
+        ),
+        // A different OSC 1337 sub-command is not an image.
+        (
+            "SetUserVar",
+            b"\x1b]1337;SetUserVar=foo=YmFy\x1b\\".to_vec(),
+        ),
+    ];
+    for (label, bytes) in rows {
+        let mut term = Terminal::new(10, 20);
+        term.process(&bytes);
+        assert_eq!(image_cell_count(&term), 0, "{label}");
+    }
 }
 
 #[test]
@@ -104,37 +128,6 @@ fn footprint_clamps_to_grid_width() {
         .filter(|&c| grid.cell_extra(0, c).is_some_and(|e| e.image().is_some()))
         .count();
     assert_eq!(row0, 8, "width clamped to the 8-col grid");
-}
-
-#[test]
-fn malformed_no_payload_separator_is_ignored() {
-    let mut term = Terminal::new(10, 20);
-    // No ':' → no payload → nothing drawn, no panic.
-    term.process(b"\x1b]1337;File=inline=1;width=4;height=3\x1b\\");
-    assert_eq!(image_cell_count(&term), 0);
-}
-
-#[test]
-fn malformed_bad_base64_is_ignored() {
-    let mut term = Terminal::new(10, 20);
-    // '!' is not a valid base64 char → decode fails → nothing drawn.
-    term.process(b"\x1b]1337;File=inline=1;width=4;height=3:!!!!\x1b\\");
-    assert_eq!(image_cell_count(&term), 0);
-}
-
-#[test]
-fn empty_payload_is_ignored() {
-    let mut term = Terminal::new(10, 20);
-    term.process(b"\x1b]1337;File=inline=1;width=4;height=3:\x1b\\");
-    assert_eq!(image_cell_count(&term), 0);
-}
-
-#[test]
-fn non_file_subcommand_is_ignored_gracefully() {
-    let mut term = Terminal::new(10, 20);
-    // A different OSC 1337 sub-command must not be treated as an image.
-    term.process(b"\x1b]1337;SetUserVar=foo=YmFy\x1b\\");
-    assert_eq!(image_cell_count(&term), 0);
 }
 
 #[test]

@@ -397,173 +397,16 @@ impl GraphemeClusters for str {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests (module-local smoke coverage; the broad UAX #29 suite lives in
-// `tests/uax29.rs` and cross-validates against unicode-segmentation).
+// Unit tests. The UAX #29 behaviour itself is pinned by
+// `tests/uax29_conformance.rs` (the official GraphemeBreakTest file plus a
+// unicode-segmentation cross-check); only what that suite cannot reach stays
+// here — code points the official file never uses (U+135D, U+1F91D) and two
+// regressions in this iterator's own state threading and tables.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_ascii() {
-        let g: Vec<&str> = "hello".graphemes().collect();
-        assert_eq!(g, &["h", "e", "l", "l", "o"]);
-    }
-
-    #[test]
-    fn test_empty() {
-        let g: Vec<&str> = "".graphemes().collect();
-        assert!(g.is_empty());
-    }
-
-    #[test]
-    fn test_combining_accent() {
-        // "café" with combining acute on 'e'
-        let g: Vec<&str> = "cafe\u{0301}".graphemes().collect();
-        assert_eq!(g, &["c", "a", "f", "e\u{0301}"]);
-    }
-
-    #[test]
-    fn test_multiple_combining() {
-        // 'a' + combining diaeresis + combining acute
-        let g: Vec<&str> = "a\u{0308}\u{0301}b".graphemes().collect();
-        assert_eq!(g, &["a\u{0308}\u{0301}", "b"]);
-    }
-
-    #[test]
-    fn test_emoji_simple() {
-        let g: Vec<&str> = "\u{1F600}".graphemes().collect();
-        assert_eq!(g, &["\u{1F600}"]);
-    }
-
-    #[test]
-    fn test_emoji_with_skin_tone() {
-        // Wave + skin tone modifier
-        let g: Vec<&str> = "\u{1F44B}\u{1F3FD}".graphemes().collect();
-        assert_eq!(g, &["\u{1F44B}\u{1F3FD}"]);
-    }
-
-    #[test]
-    fn test_emoji_zwj_family() {
-        // Man + ZWJ + Woman + ZWJ + Girl + ZWJ + Boy
-        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
-        let g: Vec<&str> = family.graphemes().collect();
-        assert_eq!(g, &[family]);
-    }
-
-    #[test]
-    fn test_flag_emoji() {
-        // US flag: regional indicator U + regional indicator S
-        let flag = "\u{1F1FA}\u{1F1F8}";
-        let g: Vec<&str> = flag.graphemes().collect();
-        assert_eq!(g, &[flag]);
-    }
-
-    #[test]
-    fn test_three_regional_indicators() {
-        // Three RI symbols: should pair as (RI+RI) + (RI)
-        let three = "\u{1F1FA}\u{1F1F8}\u{1F1EC}";
-        let g: Vec<&str> = three.graphemes().collect();
-        assert_eq!(g.len(), 2);
-        assert_eq!(g[0], "\u{1F1FA}\u{1F1F8}");
-        assert_eq!(g[1], "\u{1F1EC}");
-    }
-
-    #[test]
-    fn test_four_regional_indicators() {
-        // Four RI symbols: (RI+RI) + (RI+RI) = two flags
-        let four = "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}";
-        let g: Vec<&str> = four.graphemes().collect();
-        assert_eq!(g.len(), 2);
-    }
-
-    #[test]
-    fn test_variation_selector_16() {
-        // Digit 1 + VS16 + combining enclosing keycap = keycap "1️⃣"
-        let keycap = "1\u{FE0F}\u{20E3}";
-        let g: Vec<&str> = keycap.graphemes().collect();
-        assert_eq!(g, &[keycap]);
-    }
-
-    #[test]
-    fn test_cjk() {
-        let g: Vec<&str> = "中文".graphemes().collect();
-        assert_eq!(g, &["中", "文"]);
-    }
-
-    #[test]
-    fn test_mixed() {
-        let g: Vec<&str> = "a中b".graphemes().collect();
-        assert_eq!(g, &["a", "中", "b"]);
-    }
-
-    #[test]
-    fn test_crlf() {
-        let g: Vec<&str> = "a\r\nb".graphemes().collect();
-        assert_eq!(g, &["a", "\r\n", "b"]);
-    }
-
-    #[test]
-    fn test_cr_alone() {
-        let g: Vec<&str> = "a\rb".graphemes().collect();
-        assert_eq!(g, &["a", "\r", "b"]);
-    }
-
-    #[test]
-    fn test_grapheme_indices_offsets() {
-        let indices: Vec<(usize, &str)> = "cafe\u{0301}!".grapheme_indices().collect();
-        assert_eq!(indices[0], (0, "c"));
-        assert_eq!(indices[1], (1, "a"));
-        assert_eq!(indices[2], (2, "f"));
-        assert_eq!(indices[3], (3, "e\u{0301}"));
-        // 'e' is 1 byte, combining acute is 2 bytes => next at 3+1+2 = 6
-        assert_eq!(indices[4], (6, "!"));
-    }
-
-    #[test]
-    fn test_grapheme_indices_cjk() {
-        let indices: Vec<(usize, &str)> = "a中b".grapheme_indices().collect();
-        assert_eq!(indices[0], (0, "a"));
-        assert_eq!(indices[1], (1, "中")); // 'a' is 1 byte
-        assert_eq!(indices[2], (4, "b")); // '中' is 3 bytes
-    }
-
-    #[test]
-    fn test_hangul_jamo() {
-        // Hangul syllable: composed form is a single codepoint = 1 grapheme.
-        let g: Vec<&str> = "한".graphemes().collect();
-        assert_eq!(g, &["한"]);
-    }
-
-    #[test]
-    fn test_hangul_jamo_sequence() {
-        // Hangul L + V + T (decomposed): forms a single syllable via GB6-GB8.
-        let g: Vec<&str> = "\u{1100}\u{1161}\u{11A8}".graphemes().collect();
-        assert_eq!(g, &["\u{1100}\u{1161}\u{11A8}"]);
-    }
-
-    #[test]
-    fn test_devanagari_combining() {
-        // Devanagari: ka + vowel sign aa (combining) = 1 grapheme
-        let g: Vec<&str> = "\u{0915}\u{093E}".graphemes().collect();
-        assert_eq!(g, &["\u{0915}\u{093E}"]);
-    }
-
-    #[test]
-    fn test_tag_sequence_flag() {
-        // England flag: black flag + tag G + tag B + tag E + tag N + tag G + cancel tag
-        let england = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
-        let g: Vec<&str> = england.graphemes().collect();
-        assert_eq!(g, &[england]);
-    }
-
-    #[test]
-    fn test_khmer_combining() {
-        // Khmer: base consonant + dependent vowel sign (Mc)
-        let g: Vec<&str> = "\u{1780}\u{17B6}".graphemes().collect();
-        assert_eq!(g, &["\u{1780}\u{17B6}"]);
-    }
 
     #[test]
     fn test_ethiopic_combining() {
@@ -573,104 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn test_zwnj_breaks() {
-        // ZWNJ (U+200C) has GCB class Extend and should NOT start a new cluster.
-        let g: Vec<&str> = "a\u{200C}b".graphemes().collect();
-        assert_eq!(g, &["a\u{200C}", "b"]);
-    }
-
-    #[test]
-    fn test_zwj_standalone() {
-        // ZWJ at start — there is no preceding ExtPict, so the following
-        // Extended_Pictographic is a separate cluster.
-        let g: Vec<&str> = "\u{200D}\u{1F600}".graphemes().collect();
-        // ZWJ is GCB::ZWJ; followed by ExtPict, GB11 requires a prior
-        // ExtPict Extend* prefix. Since there is none, the rule that wins
-        // is still "ZWJ × ExtPict = no break" via GRAPHEME_BREAK[ZWJ][ExtPict]
-        // unless we gate it on state.in_ext_pict_zwj (which we do).
-        // Result: break between ZWJ and the emoji.
-        assert_eq!(g.len(), 2);
-    }
-
-    #[test]
     fn test_extpict_zwj_extpict() {
         // Pure GB11: ExtPict × ZWJ × ExtPict (no intervening Extend).
         // 🤝 ZWJ 🤝
         let s = "\u{1F91D}\u{200D}\u{1F91D}";
         let g: Vec<&str> = s.graphemes().collect();
         assert_eq!(g, &[s]);
-    }
-
-    #[test]
-    fn test_extpict_extend_zwj_extpict() {
-        // GB11 with Extend between ExtPict and ZWJ: ExtPict Extend+ ZWJ ExtPict.
-        // eye + VS15 (Extend) + ZWJ + speech balloon
-        let s = "\u{1F441}\u{FE0F}\u{200D}\u{1F5E8}";
-        let g: Vec<&str> = s.graphemes().collect();
-        assert_eq!(g, &[s]);
-    }
-
-    #[test]
-    fn test_six_regional_indicators() {
-        // Six RIs = three flags, not two (RI pairs left-to-right).
-        let six = "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}\u{1F1EB}\u{1F1F7}";
-        let g: Vec<&str> = six.graphemes().collect();
-        assert_eq!(g.len(), 3);
-    }
-
-    #[test]
-    fn test_ri_followed_by_letter() {
-        // RI + letter: RI is a singleton, letter starts its own cluster.
-        let g: Vec<&str> = "\u{1F1FA}a".graphemes().collect();
-        assert_eq!(g, &["\u{1F1FA}", "a"]);
-    }
-
-    #[test]
-    fn test_empty_iteration() {
-        let mut iter = "".graphemes();
-        assert_eq!(iter.next(), None);
-        let mut iter = "".grapheme_indices();
-        assert_eq!(iter.next(), None);
-    }
-
-    #[test]
-    fn test_gb9c_devanagari_conjunct() {
-        // GB9c: Devanagari ka + virama (Linker) + ya = single conjunct cluster.
-        // KA=U+0915 (InCB=Consonant), VIRAMA=U+094D (InCB=Linker),
-        // YA=U+092F (InCB=Consonant).
-        let s = "\u{0915}\u{094D}\u{092F}";
-        let g: Vec<&str> = s.graphemes().collect();
-        assert_eq!(g, &[s], "GB9c: ka + virama + ya should be one cluster");
-    }
-
-    #[test]
-    fn test_gb9c_malayalam_conjunct() {
-        // GB9c: Malayalam ka + virama (Linker) + sa = single conjunct cluster.
-        // KA=U+0D15 (InCB=Consonant), VIRAMA=U+0D4D (InCB=Linker),
-        // SA=U+0D38 (InCB=Consonant).
-        let s = "\u{0D15}\u{0D4D}\u{0D38}";
-        let g: Vec<&str> = s.graphemes().collect();
-        assert_eq!(g, &[s], "GB9c: ka + virama + sa should be one cluster");
-    }
-
-    #[test]
-    fn test_gb9c_consonant_without_linker_breaks() {
-        // Without the linker, two Consonants form two clusters
-        // (no Extend or Linker between them).
-        let s = "\u{0915}\u{092F}";
-        let g: Vec<&str> = s.graphemes().collect();
-        assert_eq!(g.len(), 2, "Consonants without linker should break");
-    }
-
-    #[test]
-    fn test_gb9c_linker_requires_consonant_start() {
-        // Linker alone at the start does not set up a conjunct chain.
-        let s = "\u{094D}\u{0915}";
-        let g: Vec<&str> = s.graphemes().collect();
-        // Linker is InCB=Extend-class so it clings to preceding text,
-        // but here there is no preceding base in the same cluster.
-        // The leading linker becomes its own cluster; ka starts fresh.
-        assert_eq!(g.len(), 2);
     }
 
     #[test]

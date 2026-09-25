@@ -184,18 +184,6 @@
 //   derivable_impls, iter_without_into_iter, elidable_lifetime_names
 // -----------------------------------------------------------------------------
 
-/// Catch panics at an FFI boundary, returning `$default` on unwind.
-///
-/// Thin wrapper over [`aterm_ffi_types::aterm_ffi_catch_panic`] with the
-/// crate's standard `"[aterm-ffi]"` log prefix. Used by the test-only
-#[cfg(test)]
-#[macro_export]
-macro_rules! ffi_catch_panic {
-    ($default:expr_2021, $fn_name:literal, $body:expr_2021) => {
-        ::aterm_ffi_types::aterm_ffi_catch_panic!("[aterm-ffi]", $default, $fn_name, $body)
-    };
-}
-
 // Used by test code in feature-gated modules (media, gpu).
 #[cfg(test)]
 #[allow(
@@ -285,12 +273,6 @@ pub mod testing;
 ///
 /// Re-exported from the standalone `aterm-shell-integration` crate.
 pub use aterm_shell_integration as shell_integration;
-
-// Trigger evaluation is test-only support after the production engine removal.
-// Physical files relocated to test_support/triggers/ (Part of #6814).
-#[cfg(test)]
-#[path = "../test_support/triggers/mod.rs"]
-pub(crate) mod triggers;
 
 // Property tests module (only compiled when testing)
 #[cfg(test)]

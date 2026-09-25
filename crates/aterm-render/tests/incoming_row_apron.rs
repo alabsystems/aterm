@@ -10,7 +10,11 @@
 //! whole-row frame at offset `d - 1`. Against today's placeholder the strip
 //! holds the bottom row's own BOTTOM `frac` px, so the first assertion FAILS.
 //!
-//! Gated: no system font ⇒ no-op.
+//! Machine-independent: the bundled DejaVu face with runtime font discovery
+//! off. It used `Renderer::from_system` and RETURNED — reporting PASS having
+//! rastered nothing — on any box with no system font (a Linux container), so
+//! a regression that brought the placeholder back read green there (audit,
+//! 2026-09-24). The fixture text is ASCII caps and digits, which DejaVu covers.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme, WindowCpu};
@@ -19,10 +23,16 @@ const ROWS: usize = 8;
 const COLS: usize = 20;
 const BG: u32 = 0x0011_1318; // Theme::default().bg
 
-fn renderer() -> Option<Renderer> {
-    let mut r = Renderer::from_system(18.0, Theme::default())?;
+fn renderer() -> Renderer {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/DejaVuSansMono.ttf"
+    ))
+    .expect("bundled DejaVu asset");
+    let mut r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).expect("fixture parses");
+    r.set_runtime_font_discovery(false);
     r.debug_block_on_lazy_fallbacks();
-    Some(r)
+    r
 }
 
 /// Distinct, DESCENDER-FREE text per line (caps + digits only), so a row's
@@ -58,9 +68,7 @@ fn rows_of_px(px: &[u32], w: usize, y0: usize, n: usize) -> &[u32] {
 
 #[test]
 fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
-    let Some(mut r) = renderer() else {
-        return;
-    };
+    let mut r = renderer();
     let (_cw, ch) = r.cell_size();
     let grid_top = r.grid_top();
     let frac = (ch / 2).max(1) as i32;
@@ -131,9 +139,7 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
 /// damage-step). Same oracle as above.
 #[test]
 fn cached_gate_hit_frame_still_paints_the_strip() {
-    let Some(mut r) = renderer() else {
-        return;
-    };
+    let mut r = renderer();
     let (_cw, ch) = r.cell_size();
     let grid_top = r.grid_top();
     let frac = (ch / 2).max(1) as i32;
@@ -158,6 +164,25 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
         rows_of(&oracle, y1 - ch, n),
         "the gate-hit re-present paints the incoming row's top {n} px"
     );
+    // THE PRESENTER READS WHAT THE RENDER HANDED BACK (audit, 2026-09-24): the
+    // CPU window ends the exclusive render borrow and re-borrows the pixels, and
+    // it re-borrowed the untranslated CACHE — throwing the band shift and this
+    // strip away, so the CPU backend scrolled in whole-row jumps. The shared
+    // re-borrow is the translated frame, and it says it is one.
+    assert!(
+        wc.last_translated(),
+        "a sub-row frame is a translated frame"
+    );
+    assert_eq!(
+        wc.presented_pixels(),
+        px.as_slice(),
+        "the presenter's pixels ARE the view's"
+    );
+    assert_ne!(
+        wc.presented_pixels(),
+        wc.frame_pixels(),
+        "control: the untranslated cache is a different frame"
+    );
     // And landing the row (frac 0) hands back the pristine cache: the strip is
     // then the ordinary bottom row of the offset-d frame, untouched by the apron.
     let landed = r.render_input_cached(&mut wc, &partitioned(&mut t, 0));
@@ -167,6 +192,11 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
         flat.pixels.as_slice(),
         "frac 0 is the identity"
     );
+    assert!(
+        !wc.last_translated(),
+        "a whole-row frame is the cache itself"
+    );
+    assert_eq!(wc.presented_pixels(), wc.frame_pixels());
 }
 
 /// A DOWN-bounce (negative residual) owes NO apron: the top strip stays the
@@ -174,9 +204,7 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
 /// band translate of the untranslated frame.
 #[test]
 fn down_bounce_keeps_the_placeholder() {
-    let Some(mut r) = renderer() else {
-        return;
-    };
+    let mut r = renderer();
     let (_cw, ch) = r.cell_size();
     let grid_top = r.grid_top();
     let frac = -((ch / 2).max(1) as i32);

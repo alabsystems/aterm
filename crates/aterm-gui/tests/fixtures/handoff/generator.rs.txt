@@ -1,0 +1,789 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+//
+// THE HANDOFF FIXTURE GENERATOR — not compiled here. This is the exact code
+// that wrote `v0.92.0/`: it was appended, uncommitted, to
+// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at the v0.92.0
+// tag, where it reuses that file's `FakeApp`, `old_session`, `ENV_LOCK`,
+// `RestoreVar` and `pipe_pair`, and runs that release's own capture, writer
+// and consumer. It differs from what wrote `v0.91.0/` in the release strings
+// and nonce seeds, v0.92.0's window carry (messages, not status bars), the
+// layout writer (`write_once_to`), the per-session shell-integration posture
+// in `parent.toml` and the self-check, and a fifth desk,
+// `shell-integration`, for the nonce carry v0.92.0 added. README.md in this
+// directory says how to adapt it for the next release.
+
+// ------------------------------------------ HANDOFF FIXTURE GENERATOR (P0-7)
+//
+// Appended, uncommitted, to a RELEASE worktree's `seamless_carry_tests.rs`:
+// writes that release's producer bytes for four desks into
+// `$ATERM_HANDOFF_FIXTURE_OUT/<desk>/` for the main tree's cross-version
+// guard (`seamless_fixture_tests.rs`). See the fixture README.
+const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
+const FIXTURE_TARGET_BUILD: u64 = 1_790_200_000;
+const FIXTURE_TARGET_COMMIT: &str = "fedcba987654";
+
+fn fx_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+struct FxSession {
+    record: SessionRecord,
+    term: Arc<Mutex<Terminal>>,
+    turns: Arc<Mutex<TurnLedger>>,
+}
+
+struct FxDesk {
+    name: &'static str,
+    nonce_seed: u128,
+    window: WindowCarry,
+    sessions: Vec<FxSession>,
+    layout: crate::restore::RestoreManifest,
+    connections: Vec<ConnectionCarry>,
+    next_turn_id: Option<u64>,
+}
+
+fn fx_record(local_id: u64, title: &str) -> SessionRecord {
+    SessionRecord {
+        local_id,
+        sid: format!("s-{:020x}", 0x0092_0000_0000_u64 + local_id * 0x1_0101),
+        parent: None,
+        state: "alive".to_string(),
+        title: title.to_string(),
+        screen: None,
+        user_title: None,
+        description: None,
+        icon: None,
+        role: None,
+        attention: None,
+        control: None,
+        frozen_path: false,
+        identity: None,
+        topics: Vec::new(),
+    }
+}
+
+fn fx_session(local_id: u64, title: &str, t: Terminal) -> FxSession {
+    FxSession {
+        record: fx_record(local_id, title),
+        term: Arc::new(Mutex::new(t)),
+        turns: Arc::new(Mutex::new(TurnLedger::default())),
+    }
+}
+
+fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::RestoredSplitTree {
+    use crate::restore::{RestoredSplitTree, RestoredView, TerminalLeafRestore};
+    RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+        cwd: cwd.map(str::to_string),
+        title: title.to_string(),
+        profile: None,
+        local_id: Some(local_id),
+        user_title: None,
+        description: None,
+        icon: None,
+        role: None,
+        attention: None,
+        identity: None,
+    }))
+}
+
+fn fx_split(
+    axis: crate::restore::SplitKind,
+    first: crate::restore::RestoredSplitTree,
+    second: crate::restore::RestoredSplitTree,
+) -> crate::restore::RestoredSplitTree {
+    crate::restore::RestoredSplitTree::Split {
+        axis,
+        ratio: 0.5,
+        first: Box::new(first),
+        second: Box::new(second),
+    }
+}
+
+/// A tab focused on its first leaf, as a live tab always names one.
+fn fx_tab(root: crate::restore::RestoredSplitTree) -> crate::restore::RestoredTab {
+    let mut focused_path = Vec::new();
+    let mut node = &root;
+    while let crate::restore::RestoredSplitTree::Split { first, .. } = node {
+        focused_path.push(crate::restore::RestoreBranch::First);
+        node = first;
+    }
+    crate::restore::RestoredTab {
+        root,
+        focused_path,
+        zoomed: false,
+    }
+}
+
+fn fx_window(
+    rows: u16,
+    cols: u16,
+    tabs: Vec<crate::restore::RestoredTab>,
+) -> crate::restore::WindowLayout {
+    crate::restore::WindowLayout {
+        rows,
+        cols,
+        active_tab: 0,
+        outer_x: Some(96),
+        outer_y: Some(48),
+        maximized: None,
+        tabs: Vec::new(),
+        native_tabs: Vec::new(),
+        tab_order: Vec::new(),
+        active_item: Some(0),
+        restored_tabs: tabs,
+    }
+}
+
+fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
+    // v0.92.0 carries the unified messages, not status bars: the update's
+    // flow row as the real App posts it and hands it over.
+    let carried = if installing {
+        let mut app = crate::App::headless_for_test();
+        app.post_message(crate::update_words::installing("0.93.0"));
+        app.carried_messages()
+    } else {
+        crate::session_store::MessagesCarry::default()
+    };
+    WindowCarry {
+        rows,
+        cols,
+        outer_x: Some(96),
+        outer_y: Some(48),
+        status_bar_rows: u16::from(installing),
+        bars: Vec::new(),
+        update_verified_unix_ms: installing.then_some(1_790_270_000_000),
+        messages: carried.messages,
+        next_message_id: carried.next_message_id,
+    }
+}
+
+/// A shell with `lines` of styled history, a cwd and a title.
+fn fx_shell(rows: u16, cols: u16, lines: usize, cwd: &str, flavour: u8) -> Terminal {
+    let mut t = Terminal::new(rows, cols);
+    t.set_alt_archive_enabled(true);
+    t.set_alt_archive_origin(0x5eed_0100 + u64::from(flavour));
+    t.process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
+    for i in 0..lines {
+        let row = match (i + usize::from(flavour)) % 9 {
+            0 => format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % make test-{i}\r\n"),
+            1 => format!("\x1b[32mok\x1b[0m  crate::module::case_{i:04} \x1b[2m({i} ms)\x1b[0m\r\n"),
+            2 => format!("\x1b[38;2;120;200;255mtruecolor\x1b[0m \x1b[4:3m\x1b[58;5;196mcurly\x1b[0m line {i}\r\n"),
+            3 => format!("日本語テキスト {i} 🎉 wide\r\n"),
+            4 => format!("cafe\u{0301} na\u{0308}ive {i}\r\n"),
+            5 => format!("\x1b]8;id=l{i};https://example.invalid/doc/{i}\x1b\\link {i}\x1b]8;;\x1b\\ tail\r\n"),
+            6 => format!("\x1b[7mreverse\x1b[27m \x1b[3mitalic\x1b[23m \x1b[9mstrike\x1b[29m {i}\r\n"),
+            7 => format!("{}\r\n", "-".repeat(usize::from(cols).min(40 + i % 30))),
+            _ => format!("drwxr-xr-x  12 dev  staff   384 Sep 23 10:{:02} dir{i}\r\n", i % 60),
+        };
+        t.process(row.as_bytes());
+    }
+    t.process(format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ").as_bytes());
+    t
+}
+
+/// A full-screen editor in 1049, shaped like vim.
+fn fx_editor(rows: u16, cols: u16, flavour: u8) -> Terminal {
+    let mut t = fx_shell(rows, cols, 40, "/home/dev/src", flavour);
+    t.process(b"vim notes.md\r\n\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
+    for r in 1..rows {
+        t.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
+    }
+    t.process(format!("\x1b[1;1H# notes {flavour}\x1b[{rows};1H\x1b[7m notes.md \x1b[0m\x1b[2;1H").as_bytes());
+    t
+}
+
+/// Claude Code at `rows`x`cols`: 1049, a transcript, and a turn in the ledger.
+fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
+    let mut app = FakeApp::new();
+    let mut t = Terminal::new(rows, cols);
+    t.set_alt_archive_enabled(true);
+    t.set_alt_archive_origin(ORIGIN + local_id);
+    for i in 0..before {
+        t.process(format!("$ command {i}\r\n").as_bytes());
+    }
+    t.process(b"$ claude");
+    t.process(b"\x1b[?1049h\x1b[?2004h\x1b[>1u");
+    t.process(&app.frame(rows, cols));
+    let mut ledger = TurnLedger::default();
+    let arch = ArchMark::of(&t);
+    app.say(&mut t, [format!("\u{276f} {TURN_TEXT}")]);
+    app.say(&mut t, numbered(1..=24));
+    ledger.push(TurnRecord {
+        id: 41,
+        started_ms: 100,
+        dur_ms: 2000,
+        submitted: true,
+        status: "settled",
+        text: TURN_TEXT.to_string(),
+        screen_hash: 2,
+        seq: t.content_seq(),
+        arch,
+        carried: false,
+    });
+    FxSession {
+        record: fx_record(local_id, "claude"),
+        term: Arc::new(Mutex::new(t)),
+        turns: Arc::new(Mutex::new(ledger)),
+    }
+}
+
+/// The v0.92.0 capture loop (`capture_parked_screens`, unchanged from v0.91.0
+/// but for the shell-integration nonce `checkpoint_carry` now carries), for desks whose
+/// budgets are ample: history 256 when admitted, else visible-only; a shape
+/// refusal lowers to visible-only; and the park's own `screen_digest`.
+fn fx_capture(
+    sessions: &[FxSession],
+) -> (
+    Vec<(u64, TerminalCheckpoint)>,
+    Vec<crate::handoff_carry::CarrySource>,
+) {
+    let mut screens = Vec::new();
+    let mut sources = Vec::new();
+    let mut cells = 0_u64;
+    let mut latched = false;
+    for s in sessions {
+        let id = s.record.local_id;
+        let guard = s.term.lock().unwrap();
+        let (rows, cols) = (guard.rows(), guard.cols());
+        let mut history = if latched { 0 } else { max_handoff_history_lines() };
+        let mut per = admit_checkpoint_dimensions(&mut cells, rows, cols, history, true);
+        if per.is_none() && history != 0 {
+            history = 0;
+            latched = true;
+            per = admit_checkpoint_dimensions(&mut cells, rows, cols, 0, true);
+        }
+        assert!(per.is_some(), "session {id} admitted by v0.92.0");
+        let mut cp = guard.checkpoint_carry(history as usize).expect("Ground");
+        if let Some(refusal) = checkpoint_shape_refusal(id, &cp) {
+            assert_ne!(history, 0, "session {id}: {refusal}");
+            latched = true;
+            cp = guard.checkpoint_carry(0).expect("Ground");
+            assert!(checkpoint_shape_refusal(id, &cp).is_none());
+        }
+        sources.push(handoff_carry::capture_head(id, &guard, &s.term, &s.turns, true));
+        drop(guard);
+        screens.push((id, cp));
+    }
+    screen_digest(&screens).expect("the v0.92.0 park commits this desk");
+    (screens, sources)
+}
+
+fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
+    let scratch = scratch_root.join(desk.name);
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    aterm_log::env::set("XDG_RUNTIME_DIR", &scratch);
+    aterm_log::env::set("HOME", &scratch);
+    let dir = crate::control_auth::socket_dir().expect("control dir");
+
+    let (screens, sources) = fx_capture(&desk.sessions);
+    let controls = handoff_carry::export(&sources);
+    drop(sources);
+    // Real PTYs: the self-check below adopts them with this release's own
+    // consumer, which refuses a master that is not a tty.
+    let mut masters = Vec::new();
+    let mut slaves = Vec::new();
+    for _ in &desk.sessions {
+        let (mut master, mut slave) = (0i32, 0i32);
+        // SAFETY: valid out-params; openpty fills them on success.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+        masters.push(master);
+        slaves.push(slave);
+    }
+    let fds = HandoffFds {
+        entries: desk
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    s.record.local_id,
+                    masters[i],
+                    40_000 + i32::try_from(i).unwrap(),
+                )
+            })
+            .collect(),
+    };
+    let manifest = SessionHandoff {
+        schema: SessionHandoff::SCHEMA,
+        sessions: desk.sessions.iter().map(|s| s.record.clone()).collect(),
+        window: None,
+        connections: desk.connections.clone(),
+        next_turn_id: desk.next_turn_id,
+        outgoing_build: Some(crate::running_build_number()),
+    };
+    let nonce = format!("{:032x}", desk.nonce_seed);
+    let outgoing = write_outgoing(
+        &manifest,
+        &fds,
+        &screens,
+        Some(desk.window.clone()),
+        &controls,
+        &nonce,
+    )
+    .expect("the v0.92.0 writer publishes this desk");
+    let manifest_path = std::path::PathBuf::from(&outgoing.manifest_path);
+    let layout_path = manifest_path.with_extension("layout.toml");
+    crate::restore::write_once_to(&layout_path, &desk.layout).expect("layout sidecar");
+    let layout_wire = std::fs::read_to_string(&layout_path).unwrap();
+    let layout = layout_wire_digest(&layout_wire).unwrap();
+    assert_eq!(Some(layout), layout_digest(&desk.layout));
+    let proof = adoption_proof(
+        &nonce,
+        FIXTURE_TARGET_BUILD,
+        FIXTURE_TARGET_COMMIT,
+        &layout,
+        &outgoing.screen_digest,
+        &fds.entries,
+    )
+    .unwrap();
+
+    let out = std::path::PathBuf::from(
+        std::env::var_os("ATERM_HANDOFF_FIXTURE_OUT")
+            .expect("set ATERM_HANDOFF_FIXTURE_OUT to tests/fixtures/handoff/v<release>"),
+    )
+    .join(desk.name);
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    let stem = manifest_path
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let manifest_name = manifest_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let dir_text = dir.to_string_lossy().into_owned();
+    let mut copied = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&stem) {
+            continue;
+        }
+        let keep = name == manifest_name
+            || name.ends_with(".layout.toml")
+            || name.ends_with(".grid")
+            || name.ends_with(".altgrid")
+            || name.ends_with(".ctl");
+        if !keep {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).unwrap();
+        if name == manifest_name {
+            let text = String::from_utf8(bytes).unwrap();
+            let paths = text.matches(&dir_text).count();
+            let grids = screens.len()
+                + screens.iter().filter(|(_, cp)| cp.alt_grid.is_some()).count();
+            assert_eq!(paths, grids, "only the sidecar paths name the private dir");
+            std::fs::write(
+                out.join(&name),
+                text.replace(&dir_text, FIXTURE_DIR_PLACEHOLDER),
+            )
+            .unwrap();
+        } else {
+            std::fs::write(out.join(&name), bytes).unwrap();
+        }
+        copied.push(name);
+    }
+    copied.sort();
+    // Each session's meta JSON, extracted for review (the manifest holds the
+    // hashed copy).
+    let body = std::fs::read_to_string(&manifest_path).unwrap();
+    let (_, toml) = body.split_once('\n').unwrap();
+    let published = SessionHandoff::from_toml(toml).unwrap();
+    let mut session_rows = String::new();
+    for rec in &published.sessions {
+        let carry = rec.screen.as_ref().unwrap();
+        std::fs::write(
+            out.join(format!("s{}.meta.json", rec.local_id)),
+            carry.meta.as_bytes(),
+        )
+        .unwrap();
+        let cp = &screens.iter().find(|(id, _)| *id == rec.local_id).unwrap().1;
+        session_rows.push_str(&format!(
+            "[[session]]\nlocal_id = {}\nrows = {}\ncols = {}\nhistory_lines = {}\nalt_grid = {}\ncontrol = {}\nrequire_shell_integration_nonce = {}\n",
+            rec.local_id,
+            cp.rows,
+            cp.cols,
+            cp.history_lines,
+            cp.alt_grid.is_some(),
+            rec.control.is_some(),
+            cp.modes.require_shell_integration_nonce,
+        ));
+        if let Some(nonce) = cp.shell_integration_nonce {
+            session_rows.push_str(&format!("shell_integration_nonce = \"{}\"\n", nonce.to_hex()));
+        }
+        session_rows.push('\n');
+    }
+    let identities = fds
+        .entries
+        .iter()
+        .map(|(id, fd, pid)| format!("[{id}, {fd}, {pid}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parent = format!(
+        "# What the v0.92.0 producer committed to for this desk. Generated by a\n\
+         # throwaway test in a v0.92.0 worktree; see ../../README.md.\n\
+         producer_version = \"0.92.0\"\n\
+         producer_commit = \"{commit}\"\n\
+         outgoing_build = {build}\n\
+         manifest = \"{manifest_name}\"\n\
+         nonce = \"{nonce}\"\n\
+         dir_placeholder = \"{FIXTURE_DIR_PLACEHOLDER}\"\n\
+         screen_digest = \"{screen}\"\n\
+         layout_digest = \"{layout}\"\n\
+         proof_target_build = {FIXTURE_TARGET_BUILD}\n\
+         proof_target_commit = \"{FIXTURE_TARGET_COMMIT}\"\n\
+         proof_identities = [{identities}]\n\
+         proof_count = {count}\n\
+         proof_digest = \"{digest}\"\n\
+         ready_wire = \"{ready}\"\n\
+         commit_wire = \"{commit_wire}\"\n\
+         files = [{files}]\n\n\
+         {session_rows}",
+        commit = crate::build_info::GIT_COMMIT,
+        build = crate::running_build_number(),
+        screen = fx_hex(&outgoing.screen_digest),
+        layout = fx_hex(&layout),
+        count = proof.count,
+        digest = fx_hex(&proof.digest),
+        ready = fx_hex(&proof.to_wire()),
+        commit_wire = fx_hex(&proof.to_commit_wire()),
+        files = copied
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    std::fs::write(out.join("parent.toml"), parent).unwrap();
+
+    // SELF-CHECK: this release's OWN consumer adopts its own desk exactly —
+    // every session, the layout placed, the same digests — so the fixture is
+    // an honest desk and not one the release itself would have refused.
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    aterm_log::env::set(ENV_MANIFEST, &manifest_path);
+    aterm_log::env::set(ENV_NONCE, &nonce);
+    aterm_log::env::set(ENV_FDS, fds.encode());
+    aterm_log::env::set(ENV_LAYOUT, &layout_path);
+    aterm_log::env::set(ENV_READY_FD, ready_write.to_string());
+    aterm_log::env::set(ENV_COMMIT_FD, commit_read.to_string());
+    let incoming = take_incoming();
+    assert_eq!(incoming.adopted.len(), desk.sessions.len(), "{}", desk.name);
+    assert!(incoming.layout.is_some(), "{}: the layout places every session", desk.name);
+    assert_eq!(incoming.screen_digest, Some(outgoing.screen_digest), "{}", desk.name);
+    assert_eq!(incoming.layout_digest, Some(layout), "{}", desk.name);
+    for adopted in &incoming.adopted {
+        let rec = published
+            .sessions
+            .iter()
+            .find(|rec| rec.local_id == adopted.local_id)
+            .unwrap();
+        assert!(adopted.checkpoint.is_some(), "{}", desk.name);
+        let carried = &screens.iter().find(|(id, _)| *id == adopted.local_id).unwrap().1;
+        let restored = adopted.checkpoint.as_ref().unwrap();
+        assert_eq!(restored.shell_integration_nonce, carried.shell_integration_nonce, "{}", desk.name);
+        assert_eq!(
+            restored.modes.require_shell_integration_nonce,
+            carried.modes.require_shell_integration_nonce,
+            "{}",
+            desk.name
+        );
+        assert_eq!(adopted.control.is_some(), rec.control.is_some(), "{}", desk.name);
+    }
+    for fd in masters
+        .into_iter()
+        .chain(slaves)
+        .chain([ready_read, ready_write, commit_read, commit_write])
+    {
+        aterm_pty::close_fd(fd);
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+fn fx_incident_desk() -> FxDesk {
+    use crate::restore::RestoreManifest;
+    // Session 0: Claude Code entered 1049 from a prompt on the LAST row of a
+    // 56-row grid, then the message band's row took one row away: the DECSC
+    // slot sits on row 55 of a 55-row grid (the 2026-09-22 incident).
+    let mut claude = fx_claude(0, 56, 149, 60);
+    {
+        let mut t = claude.term.lock().unwrap();
+        t.resize(55, 149);
+        let frame = FakeApp::new().frame(55, 149);
+        t.process(&frame);
+        let cp = t.checkpoint_carry(256).expect("Ground");
+        let meta = CheckpointMeta::from_checkpoint(&cp);
+        assert_eq!(meta.rows, 55);
+        assert_eq!(
+            meta.saved_cursor_main.map(|saved| saved.cursor_row),
+            Some(55),
+            "the incident's slot rides raw"
+        );
+    }
+    claude.record.title = "claude".to_string();
+    let shell = fx_session(1, "zsh", fx_shell(55, 149, 400, "/home/dev/src/aterm", 1));
+    FxDesk {
+        name: "incident-55x149",
+        nonce_seed: 0x0092_0001,
+        window: fx_window_carry(55, 149, true),
+        sessions: vec![claude, shell],
+        layout: RestoreManifest::new(vec![fx_window(
+            55,
+            149,
+            vec![
+                fx_tab(fx_leaf(0, "claude", Some("/home/dev/src/aterm"))),
+                fx_tab(fx_leaf(1, "zsh", Some("/home/dev/src/aterm"))),
+            ],
+        )]),
+        connections: Vec::new(),
+        next_turn_id: Some(41),
+    }
+}
+
+fn fx_claude_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, SplitKind};
+    let mut app = FakeApp::new();
+    let (term, turns) = old_session(&mut app, 60);
+    let claude = FxSession {
+        record: fx_record(0, "claude"),
+        term,
+        turns,
+    };
+    let shell = fx_session(1, "zsh", fx_shell(ROWS, COLS, 120, "/home/dev/src/aterm", 2));
+    FxDesk {
+        name: "claude-code-1049",
+        nonce_seed: 0x0092_0002,
+        window: fx_window_carry(ROWS, COLS * 2 + 1, false),
+        sessions: vec![claude, shell],
+        layout: RestoreManifest::new(vec![fx_window(
+            ROWS,
+            COLS * 2 + 1,
+            vec![fx_tab(fx_split(
+                SplitKind::Vertical,
+                fx_leaf(0, "claude", Some("/home/dev/src/aterm")),
+                fx_leaf(1, "zsh", Some("/home/dev/src/aterm")),
+            ))],
+        )]),
+        connections: vec![ConnectionCarry {
+            src: fx_record(1, "").sid,
+            dst: fx_record(0, "").sid,
+            op: "read-screen".to_string(),
+        }],
+        next_turn_id: Some(42),
+    }
+}
+
+fn fx_history_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, SplitKind};
+    let mut h0 = fx_shell(40, 120, 1200, "/home/dev/src/aterm", 3);
+    h0.process(b"\x1b[?2004h\x1b[>1u\x1b[5 q");
+    let mut h1 = fx_shell(40, 119, 900, "/home/dev/logs", 4);
+    h1.process(b"\x1b[3g\x1b[1;9H\x1bH\x1b[1;17H\x1bH\x1b[40;1H\x1b[5;35r\x1b[35;1H");
+    let h2 = fx_shell(24, 80, 10, "/home/dev", 5);
+    let mut sessions = vec![
+        fx_session(0, "zsh", h0),
+        fx_session(1, "tail", h1),
+        fx_session(2, "zsh", h2),
+    ];
+    sessions[1].record.user_title = Some("logs".to_string());
+    FxDesk {
+        name: "history",
+        nonce_seed: 0x0092_0003,
+        window: fx_window_carry(40, 240, false),
+        sessions,
+        layout: RestoreManifest::new(vec![fx_window(
+            40,
+            240,
+            vec![
+                fx_tab(fx_split(
+                    SplitKind::Vertical,
+                    fx_leaf(0, "zsh", Some("/home/dev/src/aterm")),
+                    fx_leaf(1, "tail", Some("/home/dev/logs")),
+                )),
+                fx_tab(fx_leaf(2, "zsh", Some("/home/dev"))),
+            ],
+        )]),
+        connections: Vec::new(),
+        next_turn_id: None,
+    }
+}
+
+fn fx_twelve_pane_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, SplitKind};
+    // Window A (46x168): a 2x2 tab, a three-column tab, one full tab.
+    // Window B (40x140): a three-pane tab, one full tab.
+    let geometry: [(u16, u16); 12] = [
+        (22, 83),
+        (23, 83),
+        (22, 84),
+        (23, 84),
+        (46, 55),
+        (46, 56),
+        (46, 55),
+        (46, 168),
+        (40, 70),
+        (19, 69),
+        (20, 69),
+        (40, 140),
+    ];
+    let mut sessions = Vec::new();
+    for (i, (rows, cols)) in geometry.into_iter().enumerate() {
+        let id = u64::try_from(i).unwrap();
+        let flavour = u8::try_from(i).unwrap();
+        let session = match i {
+            2 | 9 => fx_session(id, "vim", fx_editor(rows, cols, flavour)),
+            5 => fx_claude(id, rows, cols, 30),
+            _ => fx_session(
+                id,
+                "zsh",
+                fx_shell(rows, cols, 60 + i * 37, "/home/dev/src/aterm", flavour),
+            ),
+        };
+        sessions.push(session);
+    }
+    sessions[3].record.user_title = Some("build".to_string());
+    sessions[3].record.role = Some("worker".to_string());
+    sessions[7].record.description = Some("release notes".to_string());
+    let v = SplitKind::Vertical;
+    let h = SplitKind::Horizontal;
+    let leaf = |id: u64, title: &str| fx_leaf(id, title, Some("/home/dev/src/aterm"));
+    let window_a = fx_window(
+        46,
+        168,
+        vec![
+            fx_tab(fx_split(
+                v,
+                fx_split(h, leaf(0, "zsh"), leaf(1, "zsh")),
+                fx_split(h, leaf(2, "vim"), leaf(3, "zsh")),
+            )),
+            fx_tab(fx_split(
+                v,
+                leaf(4, "zsh"),
+                fx_split(v, leaf(5, "claude"), leaf(6, "zsh")),
+            )),
+            fx_tab(leaf(7, "zsh")),
+        ],
+    );
+    let window_b = fx_window(
+        40,
+        140,
+        vec![
+            fx_tab(fx_split(
+                v,
+                leaf(8, "zsh"),
+                fx_split(h, leaf(9, "vim"), leaf(10, "zsh")),
+            )),
+            fx_tab(leaf(11, "zsh")),
+        ],
+    );
+    let connections = ["read-screen", "signal", "write-input"]
+        .into_iter()
+        .map(|op| ConnectionCarry {
+            src: fx_record(3, "").sid,
+            dst: fx_record(5, "").sid,
+            op: op.to_string(),
+        })
+        .collect();
+    FxDesk {
+        name: "twelve-panes",
+        nonce_seed: 0x0092_0004,
+        window: fx_window_carry(46, 168, false),
+        sessions,
+        layout: RestoreManifest::new(vec![window_a, window_b]),
+        connections,
+        next_turn_id: Some(7),
+    }
+}
+
+/// A shell signing its OSC 133/633 marks with its tab's nonce: what `spawn`
+/// installs for a shell with integration, and what v0.92.0's carry sends.
+fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8) -> Terminal {
+    let mut t = Terminal::new(rows, cols);
+    t.authorize_shell_integration(nonce);
+    t.set_require_shell_integration_nonce(true);
+    let id = fx_hex(&nonce);
+    t.process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
+    for i in 0..(20 + usize::from(flavour) * 7) {
+        t.process(
+            format!(
+                "\x1b]133;A;id={id}\x07dev@devhost {cwd} % \x1b]633;E;make test-{i};id={id}\x07\
+                 \x1b]133;B;id={id}\x07make test-{i}\r\n\x1b]133;C;id={id}\x07\
+                 \x1b[32mok\x1b[0m case_{i:04}\r\n\x1b]133;D;{};id={id}\x07",
+                i % 3
+            )
+            .as_bytes(),
+        );
+    }
+    t.process(format!("\x1b]133;A;id={id}\x07dev@devhost {cwd} % \x1b]133;B;id={id}\x07").as_bytes());
+    t
+}
+
+/// THE SHAPE v0.92.0 CHANGED: each shell's authorized shell-integration nonce
+/// rides the carry (meta key `shell_integration_nonce`), so the successor
+/// authorizes the same value and the shells' marks keep counting. Two shells
+/// with different nonces (the nonce is per tab), one of them in 1049 with an
+/// editor, split side by side.
+fn fx_shell_integration_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, SplitKind};
+    let a = fx_signed_shell(30, 100, [0x92; 32], "/home/dev/src/aterm", 1);
+    let mut b = fx_signed_shell(30, 99, [0x29; 32], "/home/dev/notes", 2);
+    b.process(b"vim notes.md\r\n\x1b[?1049h\x1b[H\x1b[2J# notes\x1b[30;1H\x1b[7m notes.md \x1b[0m\x1b[2;1H");
+    FxDesk {
+        name: "shell-integration",
+        nonce_seed: 0x0092_0005,
+        window: fx_window_carry(30, 200, false),
+        sessions: vec![fx_session(0, "zsh", a), fx_session(1, "vim", b)],
+        layout: RestoreManifest::new(vec![fx_window(
+            30,
+            200,
+            vec![fx_tab(fx_split(
+                SplitKind::Vertical,
+                fx_leaf(0, "zsh", Some("/home/dev/src/aterm")),
+                fx_leaf(1, "vim", Some("/home/dev/notes")),
+            ))],
+        )]),
+        connections: Vec::new(),
+        next_turn_id: None,
+    }
+}
+
+#[test]
+#[ignore = "writes release fixtures; run by name with --ignored"]
+fn generate_handoff_fixtures() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = [
+        RestoreVar::new("XDG_RUNTIME_DIR"),
+        RestoreVar::new("HOME"),
+        RestoreVar::new(ENV_MANIFEST),
+        RestoreVar::new(ENV_NONCE),
+        RestoreVar::new(ENV_FDS),
+        RestoreVar::new(ENV_LAYOUT),
+        RestoreVar::new(ENV_READY_FD),
+        RestoreVar::new(ENV_COMMIT_FD),
+    ];
+    let scratch =
+        std::env::temp_dir().join(format!("aterm-handoff-fixture-gen-{}", std::process::id()));
+    for desk in [
+        fx_incident_desk(),
+        fx_claude_desk(),
+        fx_history_desk(),
+        fx_twelve_pane_desk(),
+        fx_shell_integration_desk(),
+    ] {
+        fx_write(&desk, &scratch);
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}

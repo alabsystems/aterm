@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 ///
 /// §6.4 / R8: "the ASKER's own bridge" records `expired re=<off> dl=<ms>` when
 /// the deadline passes — the broker holds no timers. This is the list that
-/// bridge checks on its tick. `at` is the ABSOLUTE deadline (the publish clock
-/// plus `dl`), so a relaunched bridge does not restart the clock.
+/// bridge arms toward the earliest deadline. `at` is the ABSOLUTE deadline
+/// (the publish clock plus `dl`), so a relaunched bridge does not restart it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deadline {
     /// The bus offset of the ask (what a reply carries back as `re=`).

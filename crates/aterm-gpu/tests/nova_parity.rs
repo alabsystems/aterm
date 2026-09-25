@@ -6,7 +6,9 @@
 // must match the CPU integer `add_sat` exactly like the LUMEN aurora —
 // BYTE-EXACT (delta 0) over an opaque background, within the base glyph
 // tolerance (<=8) over anti-aliased text, and an empty vec (the Settled nova,
-// also `clear_overlays`) is byte-identical to the pre-nova path.
+// also `clear_overlays`) is byte-identical to the pre-nova path (the nova_add
+// row of `tests/empty_channels_gpu.rs`, which renders the populated frame
+// before every drain).
 //
 // SUPERNOVA arm (Sparkle Words v3 §3.2/§3.4): the FUCK SUPER NOVA rides the
 // SAME channels (`nova_add` + `word_decorations`), driven here straight from
@@ -163,91 +165,6 @@ fn nova_over_text_matches_within_tolerance() {
     } else {
         eprintln!("SKIP nova-over-text parity gate: downlevel sRGB offscreen (linear add)");
     }
-}
-
-/// (c) The EMPTY-nova code path is a TRUE no-op on both backends: a render with
-/// an empty `nova_add` is byte-identical to one where quads were pushed,
-/// RENDERED, and then cleared — including via `clear_overlays` (the `image
-/// plain` contract).
-///
-/// THE RENDER BETWEEN THE PUSH AND THE CLEAR IS THE WHOLE TEST. All four legs
-/// used to push and clear back-to-back, so no `render_input` ever received a
-/// populated `nova_add` and the pixel assertions reduced to "the same empty
-/// input renders the same twice". The CPU twin
-/// (crates/aterm-render/tests/nova.rs) always had the honest form; this file
-/// looked like a faithful mirror and was not. Each leg now renders the
-/// populated frame and asserts it DIFFERS from base before draining, so a
-/// silently-dropped nova stream cannot make the drain look clean.
-#[test]
-fn empty_nova_is_byte_identical_to_no_nova() {
-    let theme = Theme::default();
-    let px = 18.0;
-    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
-        return;
-    };
-    let (rows, cols) = (4usize, 16usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"hello aterm");
-    let (cw, ch) = cpu.cell_size();
-    let mut input = term.cell_frame(rows, cols);
-    assert!(input.nova_add.is_empty());
-
-    // CPU: baseline (empty) -> painted -> drained -> painted -> stripped.
-    let cpu_base = cpu.render_input(&input).pixels.clone();
-    push_nova(&mut input, cw, ch);
-    let cpu_painted = cpu.render_input(&input).pixels.clone();
-    assert_ne!(
-        cpu_base, cpu_painted,
-        "NON-VACUITY: a live nova_add frame must paint on the CPU"
-    );
-    input.nova_add.clear();
-    let cpu_after = cpu.render_input(&input).pixels.clone();
-    assert_eq!(
-        max_channel_delta(&cpu_base, &cpu_after),
-        0,
-        "empty-nova path is not a no-op on the CPU"
-    );
-    push_nova(&mut input, cw, ch);
-    let _ = cpu.render_input(&input);
-    input.clear_overlays();
-    assert!(
-        input.nova_add.is_empty(),
-        "clear_overlays must strip nova_add"
-    );
-    let cpu_stripped = cpu.render_input(&input).pixels.clone();
-    assert_eq!(
-        max_channel_delta(&cpu_base, &cpu_stripped),
-        0,
-        "clear_overlays must restore the bare frame on the CPU"
-    );
-
-    // GPU: the same painted-then-emptied-then-stripped invariant, on ONE
-    // renderer+window so any per-frame instance-stream residue would survive
-    // into the drained frame.
-    let mut win = aterm_gpu::WindowGpu::new();
-    let gpu_base = gpu.render_input(&mut win, &input, None).pixels;
-    push_nova(&mut input, cw, ch);
-    let gpu_painted = gpu.render_input(&mut win, &input, None).pixels;
-    assert_ne!(
-        gpu_base, gpu_painted,
-        "NON-VACUITY: a live nova_add frame must paint on the GPU"
-    );
-    input.nova_add.clear();
-    let gpu_after = gpu.render_input(&mut win, &input, None).pixels;
-    assert_eq!(
-        max_channel_delta(&gpu_base, &gpu_after),
-        0,
-        "empty-nova path is not a no-op on the GPU"
-    );
-    push_nova(&mut input, cw, ch);
-    let _ = gpu.render_input(&mut win, &input, None);
-    input.clear_overlays();
-    let gpu_stripped = gpu.render_input(&mut win, &input, None).pixels;
-    assert_eq!(
-        max_channel_delta(&gpu_base, &gpu_stripped),
-        0,
-        "clear_overlays must restore the bare frame on the GPU"
-    );
 }
 
 /// (d) DAMAGED/CACHED-PATH nova parity with a MULTI-ROW shape: frame A places

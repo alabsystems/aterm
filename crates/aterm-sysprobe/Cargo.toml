@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-sysprobe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's system samplers for the strain row: one reading of the machine (CPU busy ticks, memory pressure, swap, heat, Low Power Mode) and one bounded process sweep, as the aterm-messages strain engine's plain data. Every platform cfg of the strain feature lives here; it holds no timer."
+
+[dependencies]
+# The strain engine's input types (`Reading`, `ProcRow`, `MemoryLevel`,
+# `Thermal`) and its `Instant`. The policy lives there; this crate only reads.
+aterm-messages = { workspace = true }
+
+# The macOS arm: Mach host statistics, `sysctlbyname`, libproc (declared in the
+# first-party `libc`, each with its oracle row) and `NSProcessInfo` through the
+# first-party Objective-C layer. No other platform links anything: the Linux
+# parsers are pure over `&str`, and there is no live Linux sampler yet.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+aterm-objc = { workspace = true }
+
+[lints]
+workspace = true

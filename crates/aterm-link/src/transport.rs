@@ -33,48 +33,52 @@
 //! `--identity` are refused BY NAME with that reason rather than silently
 //! absent — see the deviation note in `serve`'s usage.
 //!
-//! ## The erased stream, and why the closer is built here
+//! ## The erased stream and its closer — astream's
 //!
-//! `Client<S>` and `Subscription<S>` are generic over the byte stream, but
-//! [`astream_broker::Subscription::closer`] exists only for the concrete
-//! `UnixStream` case. The bridge MUST be able to end a subscription from
-//! another thread — `recv` blocks in a socket read with no timeout, and a
-//! reconnect that left the old group subscription running would deliver every
-//! record twice and could walk the commit backwards. So the closer is made at
-//! CONNECT time, from a duplicate of the socket underneath whatever wrapper the
-//! transport put on top of it, and it outlives the `subscribe` that consumes
-//! the client.
+//! `Client<S>` and `Subscription<S>` are generic over the byte stream, and the
+//! bridge MUST be able to end a subscription from another thread — `recv` blocks
+//! in a socket read with no timeout, and a reconnect that left the old group
+//! subscription running would deliver every record twice and could walk the
+//! commit backwards. So the closer is made at CONNECT time, from a duplicate of
+//! the socket underneath whatever wrapper the transport put on top of it, and it
+//! outlives the `subscribe` that consumes the client.
+//!
+//! This module used to build that itself — the erased stream, the closer, the
+//! per-transport connect — because astream's own `SubscriptionCloser` existed
+//! only for a Unix socket. It is astream's now ([`astream_broker::connect`],
+//! [`astream_broker::Closer`]), closer and read/write deadlines for every
+//! transport; what stays here is the fabric's POLICY: which transports a node may
+//! use, and the refusal of the sealed wire by name in a build without it.
 
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
+use std::io;
 
-use astream_broker::{Client, Record};
+use astream_broker::Record;
 
-/// Any byte stream a broker connection can ride. `Send` is a supertrait because
-/// each subscription is pumped by its own thread.
-pub trait Stream: Read + Write + Send {}
-impl<T: Read + Write + Send> Stream for T {}
+/// Any byte stream a broker connection can ride — astream's [`AnyStream`](astream_broker::AnyStream).
+/// `Send` is a supertrait because each subscription is pumped by its own thread.
+pub use astream_broker::AnyStream as Stream;
+
+/// Ends a subscription from outside its reading thread, and bounds a
+/// connection's reads and writes — astream's [`Closer`](astream_broker::Closer),
+/// made at connect time from a duplicate of the socket under the transport's
+/// wrapper. A read deadline on a request/reply connection is a deadline and
+/// nothing more: past it the stream is no longer framed (the late reply may still
+/// arrive), so the caller drops the connection rather than retrying on it; a
+/// subscription wants `None`, because parking in `recv` is its normal state.
+pub use astream_broker::Closer;
 
 /// One broker connection, with its transport erased so the bridge has ONE code
 /// path per verb rather than one per wire.
-pub type Conn = Client<Box<dyn Stream>>;
+pub type Conn = astream_broker::AnyClient;
 
-/// How many rows one `Last` page asks the broker for.
-///
-/// The broker CLAMPS this to its own `LAST_PAGE_MAX`, so asking for more is not
-/// an error and asking for fewer only costs round trips — which is exactly why
-/// it must not be read as "the answer fits in one page".
-pub const LAST_PAGE_ROWS: u32 = 256;
-
-/// The most pages one last-value walk may take before it is called a FAILURE.
+/// The most pages one last-value walk may take before it is called a FAILURE —
+/// astream's own bound, now that the walk itself lives there.
 ///
 /// A liveness bound, not a size one: the resume cursor advances every page, so a
 /// walk that has not finished in this many has met something pathological, and
 /// the honest answer to a caller that must not read absence as evidence is an
-/// error rather than a short list. At [`LAST_PAGE_ROWS`] a page the ceiling is a
-/// million rows.
-pub const LAST_PAGES_MAX: usize = 4096;
+/// error rather than a short list.
+pub use astream_broker::LAST_WALK_PAGES_MAX as LAST_PAGES_MAX;
 
 /// WALK EVERY ROW OF A LAST-VALUE FACE, paging on the RESUME CURSOR — the one
 /// place in this crate that knows how a `Last` answer ends.
@@ -84,15 +88,14 @@ pub const LAST_PAGES_MAX: usize = 4096;
 /// request may VISIT, matched or not, so a page shorter than `max` — AN EMPTY
 /// ONE INCLUDED — is not the end of the answer. Only an empty `resume` is.
 ///
-/// [`astream_broker::Client::last`] is the wrong verb for a walk and cannot be
-/// made right by its caller: it is `last_page(..).map(|(page, mark, _)| ..)`,
-/// so the cursor that carries the answer is thrown away before the caller sees
-/// it, and the only cursor left to page on is the last ROW — which an empty page
-/// does not have. Every reader in this crate that pages a `Last` face calls
-/// THIS, and the reason it is here rather than in one of them is that the crate
-/// has now paid twice for the same rule being restated per reader: four bridge
+/// The walk is astream's [`astream_broker::Client::last_walk`]. It used to be
+/// written out here, and again in `bridge.rs`, and a third time in `asb`: the
+/// rule was restated per reader, and this crate paid for that twice — four bridge
 /// readers in round 2, and `aterm-link ls` — §9.3's cross-host escalation view,
-/// where a silently short answer is a missed 3 a.m. escalation — in round 3.
+/// where a silently short answer is a missed 3 a.m. escalation — in round 3. It
+/// now lives with the `Last` verb it walks. Each request asks for every row still
+/// owed and the broker clamps the page to its own bound, so a page is at most
+/// the broker's `LAST_PAGE_MAX` rows.
 ///
 /// STREAMING, not collecting: `on_row` sees each row as its page arrives, so a
 /// fleet-sized answer costs one page of memory rather than the whole roster.
@@ -101,84 +104,25 @@ pub const LAST_PAGES_MAX: usize = 4096;
 /// # Errors
 ///
 /// Any broker or transport failure, an `on_row` that fails, or a walk that did
-/// not FINISH within [`LAST_PAGES_MAX`] pages — because a caller that cannot
-/// tell "no rows" from "I stopped looking" is the caller that reports an empty
-/// fleet while a node is escalating.
+/// not END within [`LAST_PAGES_MAX`] pages — because a caller that cannot tell
+/// "no rows" from "I stopped looking" is the caller that reports an empty fleet
+/// while a node is escalating.
 pub fn walk_last<F>(conn: &mut Conn, filter: &str, mut on_row: F) -> io::Result<()>
 where
     F: FnMut(&Record) -> io::Result<()>,
 {
-    let mut after = String::new();
-    for _ in 0..LAST_PAGES_MAX {
-        let (page, _, resume) = conn.last_page(filter, &after, LAST_PAGE_ROWS)?;
-        for row in &page {
-            on_row(row)?;
-        }
-        if resume.is_empty() {
-            return Ok(());
-        }
-        after = resume;
-    }
-    Err(io::Error::other(format!(
-        "the last-value walk of {filter} did not finish within {LAST_PAGES_MAX} pages"
-    )))
-}
-
-/// Ends a subscription from outside its reading thread by shutting the socket
-/// underneath it down in both directions: the parked `recv` returns `Ok(None)`
-/// and the broker sees the peer go away. Idempotent.
-///
-/// It is also the ONE handle to the socket under the erased stream, so it is
-/// where a read deadline is set: `Conn` is `Client<Box<dyn Stream>>` and the
-/// socket cannot be reached through it, while a bridge must bound how long a
-/// request may wait for the broker's answer ([`Closer::set_read_timeout`]) — a
-/// broker that accepts the connection and never acks is otherwise a bridge
-/// parked forever in `attach`, reporting nothing.
-pub struct Closer {
-    close: Box<dyn Fn() + Send>,
-    timeout: Box<dyn Fn(Option<std::time::Duration>) -> io::Result<()> + Send>,
-}
-
-impl Closer {
-    /// Shut the connection down.
-    pub fn close(&self) {
-        (self.close)();
-    }
-
-    /// Bound how long a read on this connection parks with nothing arriving —
-    /// `SO_RCVTIMEO` on the socket under whatever wrapper the transport put on
-    /// top, so it applies to every frame the `Conn` reads from now on. Past it
-    /// the read fails `WouldBlock`/`TimedOut` and, on a request/reply
-    /// connection, the stream is no longer framed (the late reply may still
-    /// arrive): the caller drops the connection, it does not retry on it. A
-    /// subscription that has been opened wants `None` here, because parking in
-    /// `recv` with nothing to deliver is its normal state.
-    ///
-    /// # Errors
-    ///
-    /// The `setsockopt`.
-    pub fn set_read_timeout(&self, d: Option<std::time::Duration>) -> io::Result<()> {
-        (self.timeout)(d)
-    }
-
-    fn unix(dup: UnixStream) -> io::Result<Self> {
-        let timeout_dup = dup.try_clone()?;
-        Ok(Self {
-            close: Box::new(move || {
-                let _ = dup.shutdown(std::net::Shutdown::Both);
-            }),
-            timeout: Box::new(move |d| timeout_dup.set_read_timeout(d)),
-        })
-    }
-
-    fn tcp(dup: TcpStream) -> io::Result<Self> {
-        let timeout_dup = dup.try_clone()?;
-        Ok(Self {
-            close: Box::new(move || {
-                let _ = dup.shutdown(std::net::Shutdown::Both);
-            }),
-            timeout: Box::new(move |d| timeout_dup.set_read_timeout(d)),
-        })
+    let (_, rest) = conn.last_walk(filter, "", u32::MAX, |row| {
+        on_row(&row)?;
+        Ok(astream_broker::Walk::Continue)
+    })?;
+    match rest {
+        None => Ok(()),
+        // Only a u32::MAX-row answer ends here, and it is still not a reason to
+        // report a short roster as the whole one.
+        Some(_) => Err(io::Error::other(format!(
+            "the last-value walk of {filter} did not end within {} rows",
+            u32::MAX
+        ))),
     }
 }
 
@@ -223,51 +167,50 @@ impl Transport {
 
 /// Open one connection, answering it and the closer that can end it.
 ///
+/// astream's [`astream_broker::connect`] does the work; this maps the fabric's
+/// transport onto it and refuses the sealed wire BY NAME in a build without it.
+///
 /// # Errors
 ///
 /// The connect itself, the sealed handshake (a peer that lacks the key fails
 /// HERE, not on the first verb), or the descriptor duplication the closer needs.
 pub fn connect(transport: &Transport, endpoint: &str) -> io::Result<(Conn, Closer)> {
-    match transport {
-        Transport::Unix => {
-            let s = UnixStream::connect(endpoint)?;
-            let closer = Closer::unix(s.try_clone()?)?;
-            Ok((Client::from_stream(Box::new(s)), closer))
-        }
-        Transport::Tcp => {
-            let s = TcpStream::connect(endpoint)?;
-            s.set_nodelay(true)?;
-            let closer = Closer::tcp(s.try_clone()?)?;
-            Ok((Client::from_stream(Box::new(s)), closer))
-        }
+    connect_within(transport, endpoint, None)
+}
+
+/// [`connect`] with a bound on ESTABLISHING the connection (every resolved TCP
+/// address in turn; on the sealed wire it also replaces the handshake's own
+/// deadline). A Unix connect is not bounded — std has no bounded one.
+///
+/// # Errors
+///
+/// As [`connect`], and `TimedOut` past the bound.
+pub fn connect_within(
+    transport: &Transport,
+    endpoint: &str,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<(Conn, Closer)> {
+    let wire = match transport {
+        Transport::Unix => astream_broker::Transport::Unix,
+        Transport::Tcp => astream_broker::Transport::Tcp,
         #[cfg(not(feature = "sealed"))]
-        Transport::Sealed(key) => {
+        Transport::Sealed(_) => {
             // REFUSED BY NAME, WITH THE REASON — the idiom `main.rs` already uses
             // for `--handshake`/`--identity`. The variant stays in the enum so
             // `--key-file` still parses, `Debug` still redacts it and `ls` still
-            // prints the transport's name; only the CONNECT is absent, because
-            // `Client::connect_tcp_sealed` lives behind the `sealed` feature and
-            // a default build does not enable it. This crate's Cargo.toml says
-            // why a shipped binary carries no cipher tree.
-            let _ = (key, endpoint);
-            Err(io::Error::new(
+            // prints the transport's name; only the CONNECT is absent, because the
+            // sealed wire is astream's `aead` feature, which a default build does
+            // not enable. This crate's Cargo.toml says why a shipped binary carries
+            // no cipher tree.
+            return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 SEALED_UNAVAILABLE,
-            ))
+            ));
         }
         #[cfg(feature = "sealed")]
-        Transport::Sealed(key) => {
-            let sealed = Client::connect_tcp_sealed(endpoint, **key)?.into_stream();
-            // The DUP IS OF THE SOCKET, not of the sealed wrapper: shutting the
-            // socket down is what unparks the reader, and a read deadline set on
-            // it lands under the record layer, which resumes a partial record
-            // exactly as a partial frame. A second `SealedStream` over the same
-            // socket would be a second record-layer sequence and is exactly what
-            // must not exist.
-            let closer = Closer::tcp(sealed.get_ref().try_clone()?)?;
-            Ok((Client::from_stream(Box::new(sealed)), closer))
-        }
-    }
+        Transport::Sealed(key) => astream_broker::Transport::Sealed(key.clone()),
+    };
+    astream_broker::connect(&wire, endpoint, timeout)
 }
 
 /// Read a `--key-file`: 64 hex characters, surrounding whitespace ignored — the

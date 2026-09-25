@@ -24,7 +24,7 @@ target-trust
 #.idea/
 .claude/
 
-# Release-cut output (`cargo ship cut` / `--dry-run`): dist/cut-app.noindex/, the DMG +
+# Release-cut output (`ship cut` / `--dry-run`): dist/cut-<build>.noindex/, the DMG +
 # dSYM + build.txt artifacts, and the resumable cut journal dist/cut-state.toml.
 # All regenerable/local — the committed release record is RELEASES.ledger + the
 # published GitHub Release, never dist/.

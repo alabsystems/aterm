@@ -68,6 +68,13 @@ fn file_type_name(t: std::fs::FileType) -> &'static str {
 /// tool in open(2) itself — POSIX blocks there until a writer arrives — but past open,
 /// nothing can hang or overallocate.)
 pub fn read_bytes(path: &str) -> std::io::Result<Vec<u8>> {
+    read_bytes_up_to(path, READ_CAP)
+}
+
+/// [`read_bytes`] with a larger bound, for the one input that is not a key or a manifest:
+/// a release's `SHA256SUMS`, which lists every file of a source tree (the `trust` repo's
+/// runs to ~9 MB) and which `verify-signed` must read whole to check its signature.
+pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let f = std::fs::File::open(path)?;
     let ft = f.metadata()?.file_type();
@@ -80,13 +87,15 @@ pub fn read_bytes(path: &str) -> std::io::Result<Vec<u8>> {
         ])));
     }
     let mut bytes = Vec::new();
-    f.take(READ_CAP + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > READ_CAP {
+    f.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             concat(&[
                 path,
-                " exceeds the 1 MiB read cap (keys and manifests are tiny)",
+                " exceeds the ",
+                &(cap / (1024 * 1024)).to_string(),
+                " MiB read cap",
             ]),
         ));
     }

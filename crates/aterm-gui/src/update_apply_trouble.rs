@@ -214,9 +214,44 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "the handover was called off before it finished",
         "handover called off",
     ),
+    // ── The park's capture REFUSED the desk (the 2026-09-22/23 update audit,
+    // plan P0-3): `CaptureRefusal`'s Display, "the park's capture refused session
+    // 3: …" or "the park's capture refused: handoff layout could not be committed
+    // canonically; …", on both lanes. Ahead of the preparation rows on purpose —
+    // the layout refusal also contains "handoff layout", and it is not a set-up
+    // failure: the lane is waiting for the desk to change.
+    (
+        "the park's capture refused session",
+        "a session\u{2019}s screen could not be captured for the handover",
+        "couldn\u{2019}t capture a session",
+    ),
+    (
+        "the park's capture refused",
+        "the open tabs could not be captured for the handover",
+        "couldn\u{2019}t capture the tabs",
+    ),
+    // ── THIS process could not hold the park long enough: the fork lane's
+    // worker gave up waiting for it ("the outgoing process did not park within
+    // 240 s"), typed TimedOut since plan P1-2. The terminal never went quiet.
+    (
+        "did not park within",
+        "the terminal was too busy to hand over",
+        "terminal too busy",
+    ),
+    // ── More tabs than one descriptor message carries at the park (the user
+    // opened more while the successor held): something a person can act on.
+    (
+        "descriptor message carries",
+        "more tabs were open than one handover can carry",
+        "too many tabs",
+    ),
     // ── Preparation, all of it BEFORE any successor existed
-    // (`send_handoff_preparation_failure`, plus the descriptor transfer on the
-    // out-of-band lane). Nothing was started, so nothing "failed to start".
+    // (`send_handoff_preparation_failure` for the candidate's pre-park
+    // verification; `send_handoff_producer_failure` and the park's own
+    // `ProducerFailed` stand-downs for this process's writes and descriptors,
+    // each carrying its `io::ErrorKind` since plan P1-2; plus the descriptor
+    // transfer on the out-of-band lane). Nothing was started, so nothing
+    // "failed to start".
     // ── The INSTALLED copy cannot be the swap's rollback source (2026-09-14):
     // `install::rollback_source_refusal`, both lanes. This is the historical
     // failure, not evidence that the source is still broken. Only the current
@@ -273,6 +308,31 @@ const CAUSES: &[(&str, &str, &str)] = &[
     ),
     (
         "descriptors could not be delivered",
+        "the handover could not be set up",
+        "couldn\u{2019}t be set up",
+    ),
+    (
+        "child-only PTY descriptors",
+        "the handover could not be set up",
+        "couldn\u{2019}t be set up",
+    ),
+    (
+        "would not answer fstat",
+        "the handover could not be set up",
+        "couldn\u{2019}t be set up",
+    ),
+    (
+        "identity space is exhausted",
+        "the handover could not be set up",
+        "couldn\u{2019}t be set up",
+    ),
+    (
+        "private control directory",
+        "the handover could not be set up",
+        "couldn\u{2019}t be set up",
+    ),
+    (
+        "before the park",
         "the handover could not be set up",
         "couldn\u{2019}t be set up",
     ),
@@ -522,6 +582,38 @@ mod tests {
         "overlap handoff failed safely: could not create the handoff-commit channel",
         "overlap handoff failed safely: handoff process could not start: \
          Resource temporarily unavailable (os error 35)",
+        // `ProducerFailed` (plan P1-2): this process's own writes, pipes and
+        // descriptors, each carrying its `io::ErrorKind`, and the park's own
+        // stand-downs.
+        "overlap handoff failed safely: could not write the authenticated handoff manifest \
+         (storage full)",
+        "overlap handoff failed safely: could not write the attempt-bound handoff layout \
+         (write restore manifest: No space left on device (os error 28))",
+        "overlap handoff failed safely: could not create the adoption-proof channel \
+         (too many open files)",
+        "overlap handoff failed safely: could not reserve child-only PTY descriptors \
+         (too many open files)",
+        "overlap handoff failed safely: more sessions opened than one descriptor message \
+         carries",
+        "overlap handoff failed safely: a handed-off PTY would not answer fstat, so the \
+         out-of-band proof term cannot be computed",
+        "overlap handoff failed safely: handoff activity identity space is exhausted",
+        "overlap handoff failed safely: no private control directory to write the handoff \
+         manifest into",
+        "overlap handoff failed safely: event loop closed before the park",
+        "overlap handoff failed safely: the attempt record was dropped before the park",
+        // The fork lane's hold deadline, `TimedOut` since plan P1-2.
+        "overlap handoff failed safely: the outgoing process did not park within 120 s",
+        // `CaptureRefused` (plan P0-3): the launched lane's stand-down detail,
+        // and the fork lane's synchronous message (no prefix), both from
+        // `CaptureRefusal`'s Display.
+        "overlap handoff failed safely: the park's capture refused session 3: visible \
+         checkpoint set could not be committed canonically: too many sessions; update \
+         handoff stayed in place; the lane retries once the desk changes",
+        "overlap handoff failed safely: the park's capture refused: handoff layout could not \
+         be committed canonically; the lane retries once the desk changes",
+        "the park's capture refused session 7: visible checkpoint set could not be committed \
+         canonically: duplicate local id 7; update handoff stayed in place",
         // `screen_digest_refs`, via the park: the refusal names the session, the
         // field and the bound (measured 2026-09-22).
         "overlap handoff failed safely: visible checkpoint set could not be committed \
@@ -659,6 +751,51 @@ mod tests {
                  to keep updates possible"
             ),
             "the new version would not run and aterm went back to this one"
+        );
+        // THIS PROCESS'S OWN FAILURES (plan P1-2) are set-up failures, not a
+        // candidate that did not start…
+        for producer in [
+            "overlap handoff failed safely: could not write the authenticated handoff manifest \
+             (storage full)",
+            "overlap handoff failed safely: could not reserve child-only PTY descriptors \
+             (too many open files)",
+            "overlap handoff failed safely: no private control directory to write the handoff \
+             manifest into",
+        ] {
+            assert_eq!(
+                full(producer),
+                "the handover could not be set up",
+                "{producer}"
+            );
+        }
+        // …except the one a person can act on, and the hold that timed out.
+        assert_eq!(
+            short(
+                "overlap handoff failed safely: more sessions opened than one descriptor \
+                 message carries"
+            ),
+            "too many tabs"
+        );
+        assert_eq!(
+            full("overlap handoff failed safely: the outgoing process did not park within 120 s"),
+            "the terminal was too busy to hand over"
+        );
+        // A CAPTURE REFUSAL (plan P0-3) says it could not capture — never "could
+        // not be set up", which is what its layout half used to match — and
+        // never "too busy", which is what v0.91 told the user about it.
+        assert_eq!(
+            full(
+                "overlap handoff failed safely: the park's capture refused session 3: visible \
+                 checkpoint set could not be committed canonically: too many sessions"
+            ),
+            "a session\u{2019}s screen could not be captured for the handover"
+        );
+        assert_eq!(
+            full(
+                "overlap handoff failed safely: the park's capture refused: handoff layout could \
+                 not be committed canonically"
+            ),
+            "the open tabs could not be captured for the handover"
         );
     }
 

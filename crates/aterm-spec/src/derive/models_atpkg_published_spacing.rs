@@ -10,8 +10,9 @@ use super::*;
 /// end time in one durable record. `target` is 0 unknown, 1 old build 44, or 2
 /// current build 45. `current` says that witness belongs to the latest attempt;
 /// older schemas and a later unrelated attempt fail closed. Both readers run
-/// for a strictly newer 45 only with that witness, no live holder and no
-/// metered hold. `Buggy=1` reverses the run/wait verdict at the shared reader
+/// for a strictly newer 45 only with that witness and no live holder (there is
+/// no metered hold: the pass makes no metered request, owner ruling R3).
+/// `Buggy=1` reverses the run/wait verdict at the shared reader
 /// boundary: it catches both the old blanket wait for a fresh higher target
 /// and unsafe bypasses of each spacing guard. `Buggy=2` bypasses every target
 /// independently (catches duplicate failed 45).
@@ -28,7 +29,6 @@ pub fn atpkg_published_spacing_model() -> Model {
             var outcome = 0;
             var current = 0;
             var in_flight = 0;
-            var metered_hold = 0;
             var published_45 = 0;
             // 0 undecided, 1 run, 2 wait.
             var gui = 0;
@@ -70,23 +70,18 @@ pub fn atpkg_published_spacing_model() -> Model {
             action LiveHolder when (in_flight == 0 && gui == 0 && queued == 0) {
                 in_flight = 1;
             }
-            action RateHold when (metered_hold == 0 && gui == 0 && queued == 0) {
-                metered_hold = 1;
-            }
             action Publish45 when (published_45 == 0) {
                 published_45 = 1;
             }
             action DecideGui when (published_45 == 1 && gui == 0) {
-                gui = if target == 1 && outcome > 0 && current == 1 &&
-                    in_flight == 0 && metered_hold == 0 {
+                gui = if target == 1 && outcome > 0 && current == 1 && in_flight == 0 {
                     if Buggy == 1 { 2 } else { 1 }
                 } else {
                     if Buggy == 1 || Buggy == 2 { 1 } else { 2 }
                 };
             }
             action DecideQueued when (published_45 == 1 && queued == 0) {
-                queued = if target == 1 && outcome > 0 && current == 1 &&
-                    in_flight == 0 && metered_hold == 0 {
+                queued = if target == 1 && outcome > 0 && current == 1 && in_flight == 0 {
                     if Buggy == 1 { 2 } else { 1 }
                 } else {
                     if Buggy == 1 || Buggy == 2 { 1 } else { 2 }
@@ -95,7 +90,7 @@ pub fn atpkg_published_spacing_model() -> Model {
 
             invariant FreshHigherRuns:
                 target == 0 || target == 2 || outcome == 0 || current == 0 ||
-                in_flight == 1 || metered_hold == 1 ||
+                in_flight == 1 ||
                 ((gui == 0 || gui == 1) && (queued == 0 || queued == 1));
             invariant SameTargetWaits:
                 target == 0 || target == 1 ||
@@ -105,9 +100,6 @@ pub fn atpkg_published_spacing_model() -> Model {
                 ((gui == 0 || gui == 2) && (queued == 0 || queued == 2));
             invariant LiveHolderWaits:
                 in_flight == 0 ||
-                ((gui == 0 || gui == 2) && (queued == 0 || queued == 2));
-            invariant MeteredHoldWaits:
-                metered_hold == 0 ||
                 ((gui == 0 || gui == 2) && (queued == 0 || queued == 2));
             invariant StaleWitnessWaits:
                 current == 1 ||

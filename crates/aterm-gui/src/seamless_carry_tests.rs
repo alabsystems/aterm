@@ -667,6 +667,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         meta: "{\"rows\":24}".to_string(),
         grid_file: "/x/seamless-1-n.s0.grid".to_string(),
         alt_grid_file: None,
+        repaint: false,
     };
     let new = SessionHandoff {
         schema: SessionHandoff::SCHEMA,

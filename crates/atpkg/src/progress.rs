@@ -160,13 +160,6 @@ pub struct ProgramProgress {
     /// renders it as "bumped — you asked for this".
     #[serde(default)]
     pub bumped: bool,
-    /// When the bump pulled this program forward NOT because a user asked for it but
-    /// because a program they DID ask for `requires` it (§17.10): that program's name.
-    /// The GUI renders it as "bumped with <name>". `None` for a plain bump and for every
-    /// other row; absent from the file when `None`, so an older reader sees the row it
-    /// always did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bumped_with: Option<String>,
     /// Why `phase` is `failed`, when it is. UNTRUSTED for display: control-strip and
     /// length-cap before any TTY (see the module docs).
     #[serde(default)]
@@ -376,7 +369,6 @@ impl ProgressSink {
                         bytes_total: *size,
                         build: None,
                         bumped: false,
-                        bumped_with: None,
                         error: None,
                     },
                 );
@@ -401,7 +393,6 @@ impl ProgressSink {
                     bytes_total: 0,
                     build: None,
                     bumped: false,
-                    bumped_with: None,
                     error: None,
                 });
             if row.phase != phase {
@@ -506,21 +497,6 @@ impl ProgressSink {
                 && !row.bumped
             {
                 row.bumped = true;
-                s.dirty = true;
-            }
-        });
-    }
-
-    /// Mark `program` bumped ALONG WITH `with` — the bumped program that requires it — so
-    /// the row can say why it moved ("bumped with brew"). A row already bumped in its
-    /// own right keeps that: the user's own ask outranks the pull.
-    pub fn bumped_with(&self, program: &str, with: &str) {
-        self.with(|s| {
-            if let Some(row) = s.file.programs.get_mut(program)
-                && !row.bumped
-            {
-                row.bumped = true;
-                row.bumped_with = Some(with.to_string());
                 s.dirty = true;
             }
         });
@@ -1112,8 +1088,8 @@ pub fn pass_running(layout: &crate::store::Layout, now_unix: u64) -> bool {
 /// This used to fork `/bin/kill -0 <pid>` and wait for it, "keeping atpkg's non-test
 /// code `unsafe`-free". That reason had already lapsed — this very file calls
 /// `libc::poll` and `libc::dup2` a few hundred lines up, and the crate probes a pid
-/// exactly this way in [`crate::stage_helper`] — while the cost was real and repeated:
-/// [`snapshot_running`] runs on every `__pending` stub invocation while a pass is live,
+/// exactly this way in [`crate::provenance`]'s heal job — while the cost was real and
+/// repeated: [`snapshot_running`] runs on every `__pending` stub invocation while a pass is live,
 /// and the GUI tailer's foreign-pid probe calls it every 2 s for as long as ANOTHER
 /// installer holds the store lock (a multi-GB pass queued behind `--wait-lock` for 40
 /// minutes = ~1200 fork+execs on a GUI worker thread) to learn a fact one syscall
@@ -1550,7 +1526,7 @@ mod writer_tests {
     /// A pid we may not SIGNAL is still a pid that EXISTS. The probe used to fork
     /// `/bin/kill -0 <pid>`, which exits non-zero on `EPERM`, so an installer owned by
     /// another user (pid 1 — launchd/init — stands in for one here, and is the same
-    /// witness `stage_helper`'s twin probe uses) read as DEAD under a fresh heartbeat.
+    /// witness the heal job's own probe uses) read as DEAD under a fresh heartbeat.
     /// The syscall spelling answers "exists", which is what the staleness gate asks.
     #[cfg(unix)]
     #[test]

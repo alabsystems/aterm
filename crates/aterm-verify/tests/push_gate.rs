@@ -202,7 +202,6 @@ impl Push {
 fn green(sha: &str) -> Receipt {
     Receipt {
         head: sha.to_string(),
-        dirty: None,
         mode: "fast".into(),
         scope: "workspace".into(),
         verdict: "PASS".into(),
@@ -212,12 +211,21 @@ fn green(sha: &str) -> Receipt {
     }
 }
 
+/// A clean, unskipped `--changed` PASS: everything a narrowed run can say.
+fn changed_pass(sha: &str) -> Receipt {
+    Receipt {
+        scope: "changed".into(),
+        merge_contract: false,
+        ..green(sha)
+    }
+}
+
 /// THE RELEASE CUTTER'S CLAIM. `crates/aterm-release` claims a build number by
-/// pushing "release: vX.Y.Z (build N)" from this checkout: origin's tip plus
+/// pushing "release: vX.Y.Z (build N)" from its cut tree: origin's tip plus
 /// one `RELEASES.ledger` line and the rolled `CHANGELOG.md`, and nothing else
-/// (`ledger::claim`, `publish::regen_release_files`). No gate ran on that
-/// commit and none needs to — no code enters — so the hook admits it, judged
-/// against the remote's CURRENT tip, the sha git hands the hook.
+/// (`ledger::claim`). No gate ran on that commit and none needs to — no code
+/// enters — so the hook admits it, judged against the remote's CURRENT tip, the
+/// sha git hands the hook.
 #[test]
 fn a_release_claim_over_the_remote_tip_is_admitted_without_a_receipt() {
     let p = Push::new("atv-push-claim-admitted");
@@ -229,9 +237,71 @@ fn a_release_claim_over_the_remote_tip_is_admitted_without_a_receipt() {
     );
     assert_eq!(code, 0, "a claim over the remote's tip is admitted: {err}");
     assert!(
-        err.contains("release claim") && err.contains("RELEASES.ledger"),
+        err.contains("bookkeeping over the remote's tip") && err.contains("RELEASES.ledger"),
         "…and the hook says what it admitted and why: {err}"
     );
+}
+
+/// THE CLAIM A CUT LANDS ON A MAIN THAT MOVED (2026-09-23). The cutter builds
+/// the PUBLISHED commit; when peers pushed after `pub publish`, its release
+/// commit (the published commit + the two claim files) reaches main as a merge
+/// onto the tip, whose tree is the tip's plus the same two files
+/// (`ledger::landing_commit`). Against the remote's tip that merge moves only
+/// `CHANGELOG.md` and `RELEASES.ledger`, so the hook admits it as a claim; the
+/// peer's code it sits on is already on the remote. NEGATIVE CONTROL: the same
+/// merge carrying a code change too is refused.
+#[test]
+fn a_release_claim_landing_as_a_merge_onto_a_moved_tip_is_admitted() {
+    let p = Push::new("atv-push-claim-merge");
+    let published = p.sha.clone();
+    let tip = p.commit(&["a.txt"]); // a peer's push after the publish
+    p.git(&["checkout", "-q", "-b", "release", &published]);
+    let release = p.commit(&["CHANGELOG.md", "RELEASES.ledger"]);
+    p.git(&["checkout", "-q", "main"]);
+    for f in ["CHANGELOG.md", "RELEASES.ledger"] {
+        let body = p.git(&["show", &format!("{release}:{f}")]);
+        fs::write(p.root.join(f), format!("{body}\n")).expect("write");
+    }
+    p.git(&["add", "CHANGELOG.md", "RELEASES.ledger"]);
+    let tree = p.git(&["write-tree"]);
+    let landed = p.git(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &tip,
+        "-p",
+        &release,
+        "-m",
+        "lands",
+    ]);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {landed} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(
+        code, 0,
+        "a merge-shaped claim over the tip is admitted: {err}"
+    );
+    assert!(err.contains("bookkeeping over the remote's tip"), "{err}");
+
+    fs::write(p.root.join("a.txt"), "code the merge sneaks in\n").expect("write");
+    p.git(&["add", "a.txt"]);
+    let tree = p.git(&["write-tree"]);
+    let sneaky = p.git(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &tip,
+        "-p",
+        &release,
+        "-m",
+        "sneaks",
+    ]);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {sneaky} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "code in the merge owes a receipt: {err}");
 }
 
 /// The claim's shape is the whole admission: one more path in that diff is
@@ -300,6 +370,23 @@ fn a_clean_automatic_merge_of_a_receipted_commit_onto_the_remote_tip_is_admitted
     );
 }
 
+/// …and the gated side must be FULLY receipted: a merge standing on a
+/// narrowed run is refused, even with a full receipt on the base under it.
+#[test]
+fn a_clean_merge_of_a_narrowly_receipted_commit_is_refused() {
+    let p = Push::new("atv-push-merge-changed");
+    let base = p.sha.clone();
+    let (tip, gated, merge) = p.peer_tip_and_gated_merge();
+    p.receipt(&green(&base));
+    p.receipt(&changed_pass(&gated));
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {merge} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "the gated side ran only a narrowed gate: {err}");
+    assert!(err.contains("no gate receipt"), "{err}");
+}
+
 /// The receipted side is the whole admission: the same merge with no receipt
 /// on its side is a merge of two ungated commits, and is refused.
 #[test]
@@ -352,6 +439,129 @@ fn a_merge_that_does_not_sit_on_the_remote_tip_is_refused() {
         false,
     );
     assert_eq!(code, 1, "neither parent is the remote's tip: {err}");
+}
+
+/// A NARROWED PASS ADMITS NOTHING, even stacked on a fully receipted parent.
+/// The `--changed` cone is the change's dependency closure, and other crates'
+/// tests read files no dependency edge names (aterm-census reads aterm-gui's
+/// app_render.rs; aterm-release reads tools/ and CHANGELOG.md), so its PASS
+/// is not a claim about the tree the push sends. The control: the same
+/// commit with a whole-tree receipt goes.
+#[test]
+fn a_change_scoped_pass_admits_nothing_even_over_a_fully_receipted_parent() {
+    let p = Push::new("atv-push-changed");
+    p.receipt(&green(&p.sha));
+    let head = p.commit(&["b.txt"]);
+    p.receipt(&changed_pass(&head));
+    let (code, err) = p.push(&head, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("did NOT discharge the merge contract") && err.contains("scope changed"),
+        "the refusal names the narrowed scope: {err}"
+    );
+    assert!(err.contains("tools/verify.sh --fast"), "{err}");
+    assert!(
+        !err.contains("--changed"),
+        "the remedy offers no narrowed run: {err}"
+    );
+
+    p.receipt(&green(&head));
+    let (code, err) = p.push(&head, false);
+    assert_eq!(code, 0, "{err}");
+}
+
+/// ONE RECEIPT STORE PER REPOSITORY (2026-09-23). A gate run in one worktree
+/// admits the push from another, because both resolve the same git common dir
+/// — until then each checkout kept its own `.aterm-verify/receipts/` and a
+/// PASS never reached the checkout that pushed. The negative control is a
+/// receipt for a different commit, which admits nothing.
+#[test]
+fn a_receipt_written_in_one_worktree_admits_the_push_from_another() {
+    let p = Push::new("atv-push-worktree");
+    let linked = p.root.parent().expect("scratch").join("linked");
+    p.git(&[
+        "worktree",
+        "add",
+        "-q",
+        linked.to_str().expect("utf-8"),
+        "-b",
+        "side",
+    ]);
+    receipt::write(&linked, &green(&"f".repeat(40))).expect("written from the linked worktree");
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(
+        code, 1,
+        "a receipt for another commit admits nothing: {err}"
+    );
+
+    receipt::write(&linked, &green(&p.sha)).expect("written from the linked worktree");
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("carry a passing gate receipt"), "{err}");
+}
+
+/// A PURE VERSION BUMP OVER THE REMOTE'S TIP IS BOOKKEEPING (2026-09-23): the
+/// workspace version moved in Cargo.toml and every member's Cargo.lock entry,
+/// one old value to one new one, and nothing else. The negative controls: the
+/// same bump carrying a third-party version change, and the same bump
+/// carrying code.
+#[test]
+fn a_pure_version_bump_over_the_remote_tip_owes_no_receipt() {
+    let manifest = |v: &str| {
+        format!("[workspace]\nmembers = [\"a\"]\n\n[workspace.package]\nversion = \"{v}\"\n")
+    };
+    let lock = |v: &str, dep: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"{v}\"\n\n[[package]]\n\
+             name = \"b\"\nversion = \"{v}\"\n\n[[package]]\nname = \"dep\"\nversion = \"{dep}\"\n"
+        )
+    };
+    let setup = |name: &str| {
+        let p = Push::new(name);
+        fs::write(p.root.join("Cargo.toml"), manifest("0.91.0")).expect("write");
+        fs::write(p.root.join("Cargo.lock"), lock("0.91.0", "1.0.0")).expect("write");
+        p.git(&["add", "-A"]);
+        p.git(&["commit", "-q", "-m", "base"]);
+        let tip = p.git(&["rev-parse", "HEAD"]);
+        (p, tip)
+    };
+    let bump = |p: &Push, dep: &str, code_too: bool| {
+        fs::write(p.root.join("Cargo.toml"), manifest("0.92.0")).expect("write");
+        fs::write(p.root.join("Cargo.lock"), lock("0.92.0", dep)).expect("write");
+        if code_too {
+            fs::write(p.root.join("a.txt"), "code\n").expect("write");
+        }
+        p.git(&["add", "-A"]);
+        p.git(&["commit", "-q", "-m", "bump"]);
+        p.git(&["rev-parse", "HEAD"])
+    };
+
+    let (p, tip) = setup("atv-push-bump");
+    let bumped = bump(&p, "1.0.0", false);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {bumped} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 0, "a pure version bump is bookkeeping: {err}");
+    assert!(err.contains("workspace version"), "{err}");
+
+    let (p, tip) = setup("atv-push-bump-dep");
+    let bumped = bump(&p, "1.0.1", false);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {bumped} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "a dependency moved too: {err}");
+    assert!(err.contains("no gate receipt"), "{err}");
+
+    let (p, tip) = setup("atv-push-bump-code");
+    let bumped = bump(&p, "1.0.0", true);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {bumped} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "code moved too: {err}");
+    assert!(err.contains("no gate receipt"), "{err}");
 }
 
 /// A tag moves no branch: the commit it names either already sits on the
@@ -425,16 +635,34 @@ fn git_chatter_on_a_successful_command_does_not_become_the_repository_root() {
     }
 }
 
-/// A PASS over HEAD **plus uncommitted work** verified bytes nobody is pushing.
+/// AN OLDER GATE'S RECEIPT ADMITS NOTHING, and the refusal says so in one
+/// sentence: format 1 carried `tree dirty …` receipts that format 2 never
+/// writes, so a format-1 file cannot be read as today's claim. The control is
+/// the same commit with a format-2 receipt, which goes.
 #[test]
-fn a_pass_on_a_dirty_tree_is_refused() {
-    let p = Push::new("atv-push-dirty");
-    let mut r = green(&p.sha);
-    r.dirty = Some("f00dcafe1234".into());
-    p.receipt(&r);
+fn a_receipt_in_an_older_format_is_refused_in_one_sentence() {
+    let p = Push::new("atv-push-format-1");
+    let dir = receipt::dir(&p.root).expect("the store");
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::write(
+        dir.join(&p.sha),
+        format!(
+            "aterm-verify receipt 1\nhead {}\ntree clean\nmode fast\nscope workspace\n\
+             verdict PASS\nmerge-contract yes\nskipped none\nwhen 1\n",
+            p.sha
+        ),
+    )
+    .expect("write");
     let (code, err) = p.push(&p.sha, false);
     assert_eq!(code, 1, "{err}");
-    assert!(err.contains("uncommitted work"), "{err}");
+    assert!(
+        err.contains("not in this gate's receipt format") && err.contains("an older gate's"),
+        "{err}"
+    );
+
+    p.receipt(&green(&p.sha));
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 0, "{err}");
 }
 
 /// A narrowed, skipping or failing run never discharged the contract, whatever
@@ -479,7 +707,7 @@ fn a_skipping_run_is_refused_and_the_refusal_names_the_skip() {
 #[test]
 fn a_receipt_the_hook_cannot_parse_refuses_the_push() {
     let p = Push::new("atv-push-garbage");
-    let dir = receipt::dir(&p.root);
+    let dir = receipt::dir(&p.root).expect("the store");
     fs::create_dir_all(&dir).expect("mkdir");
     fs::write(dir.join(&p.sha), "merge-contract yes\ntree clean\n").expect("write");
     let (code, err) = p.push(&p.sha, false);
@@ -487,6 +715,7 @@ fn a_receipt_the_hook_cannot_parse_refuses_the_push() {
         code, 1,
         "a file without the magic line is no receipt: {err}"
     );
+    assert!(err.contains("or no receipt at all"), "{err}");
 }
 
 /// A HOOK THAT CANNOT JUDGE REFUSES. MEASURED 2026-09-21, before the fix: the
@@ -574,13 +803,14 @@ fn a_receipts_path_that_is_not_a_readable_directory_refuses_as_unjudgeable() {
 
     // A regular file where the receipts directory should be.
     let p = Push::new("atv-push-receipts-file");
-    fs::create_dir_all(p.root.join(".aterm-verify")).expect("mkdir");
-    fs::write(receipt::dir(&p.root), "not a directory\n").expect("write");
+    let store = receipt::dir(&p.root).expect("the store");
+    fs::create_dir_all(store.parent().expect("aterm-verify/")).expect("mkdir");
+    fs::write(&store, "not a directory\n").expect("write");
     let (code, err) = p.push(&p.sha, false);
     assert_eq!(code, 1, "{err}");
     assert!(
         err.contains("could not be checked")
-            && err.contains(".aterm-verify/receipts/ is not a directory"),
+            && err.contains("aterm-verify/receipts/ is not a directory"),
         "{err}"
     );
     assert!(
@@ -588,24 +818,27 @@ fn a_receipts_path_that_is_not_a_readable_directory_refuses_as_unjudgeable() {
         "the refusal names the environment, not a missing receipt: {err}"
     );
 
-    // The state directory itself as a file.
+    // The store's own directory as a file.
     let p = Push::new("atv-push-state-file");
-    fs::write(p.root.join(".aterm-verify"), "not a directory\n").expect("write");
+    fs::write(p.root.join(".git/aterm-verify"), "not a directory\n").expect("write");
     let (code, err) = p.push(&p.sha, false);
     assert_eq!(code, 1, "{err}");
-    assert!(err.contains(".aterm-verify/ is not a directory"), "{err}");
+    assert!(
+        err.contains(".git/aterm-verify/ is not a directory"),
+        "{err}"
+    );
 
     // A receipts directory the hook cannot read, holding a receipt that would
     // admit the push — the one direction that must never open.
     let p = Push::new("atv-push-receipts-unreadable");
     p.receipt(&green(&p.sha));
-    let dir = receipt::dir(&p.root);
+    let dir = receipt::dir(&p.root).expect("the store");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).expect("chmod");
     let (code, err) = p.push(&p.sha, false);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod back");
     assert_eq!(code, 1, "{err}");
     assert!(
-        err.contains(".aterm-verify/receipts/ is not a readable directory"),
+        err.contains("aterm-verify/receipts/ is not a readable directory"),
         "{err}"
     );
     assert!(!err.contains("no gate receipt"), "{err}");
@@ -626,7 +859,7 @@ fn a_receipt_the_hook_cannot_read_refuses_as_unjudgeable() {
 
     let p = Push::new("atv-push-receipt-unreadable");
     p.receipt(&green(&p.sha));
-    let file = receipt::dir(&p.root).join(&p.sha);
+    let file = receipt::dir(&p.root).expect("the store").join(&p.sha);
     fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("chmod");
     let (code, err) = p.push(&p.sha, false);
     fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("chmod back");
@@ -661,7 +894,7 @@ fn a_git_failure_inside_the_judgement_refuses_as_unjudgeable() {
         err.contains("could not be checked") && err.contains("merge-base --is-ancestor failed"),
         "{err}"
     );
-    assert!(err.contains("is that tip fetched?"), "{err}");
+    assert!(err.contains("is it fetched?"), "{err}");
     assert!(!err.contains("no gate receipt"), "{err}");
 }
 

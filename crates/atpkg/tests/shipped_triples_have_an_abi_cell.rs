@@ -4,8 +4,8 @@
 //! Shipped triple => compilable triple: every target this client publishes rows for must be
 //! one `crates/aterm-libc` will compile at all.
 //!
-//! [`atpkg::TARGETS`] is quoted in three lanes nobody compiles — `cli::current_triple`,
-//! `tools/atpkg-auto-vendor.sh`'s vendor-platform map, `apps/aterm-win/build.ps1` — and none
+//! [`atpkg::TARGETS`] is quoted in lanes nobody compiles — `cli::current_triple`,
+//! the vendor-direct asset rules, `apps/aterm-win/build.ps1` — and none
 //! of them can tell whether the triple it names can be built. `crates/aterm-libc` (published
 //! into the build as `libc`, which `[patch.crates-io]` puts under every consumer) admits a
 //! fixed list of targets and answers every other one with `compile_error!`, so a shipped
@@ -403,7 +403,7 @@ fn every_shipped_triple_is_one_aterm_libc_will_compile() {
         "crates/aterm-libc/src/lib.rs:{line} refuses {refused:?} with \
          `compile_error!(\"{REFUSAL}\")`, and atpkg::TARGETS publishes artifact rows for \
          them. Nothing first-party can be built for a refused triple, so the index, \
-         `cli::current_triple` and tools/atpkg-auto-vendor.sh would all be serving a target \
+         `cli::current_triple` and the vendor-direct asset rules would all be serving a target \
          that does not compile. Either add the target to the escape list (with a generated \
          cell if it is a Unix target — see law 2) or take it out of TARGETS. One story, not \
          two.\n\nescape predicate: {escape}"

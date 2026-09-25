@@ -137,31 +137,6 @@ mod tests {
     }
 
     #[test]
-    fn line_count_empty() {
-        let buf = make_buffer(&[]);
-        assert_eq!(buf.line_count(), 0);
-    }
-
-    #[test]
-    fn line_count_nonempty() {
-        let buf = make_buffer(&["a", "b", "c"]);
-        assert_eq!(buf.line_count(), 3);
-    }
-
-    #[test]
-    fn line_text_valid() {
-        let buf = make_buffer(&["hello", "world"]);
-        assert_eq!(buf.line_text(0).unwrap().as_ref(), "hello");
-        assert_eq!(buf.line_text(1).unwrap().as_ref(), "world");
-    }
-
-    #[test]
-    fn line_text_out_of_range() {
-        let buf = make_buffer(&["hello"]);
-        assert!(buf.line_text(1).is_none());
-    }
-
-    #[test]
     fn text_range_joins_with_newlines() {
         let buf = make_buffer(&["line1", "line2", "line3"]);
         assert_eq!(buf.text_range(0, 3), "line1\nline2\nline3");

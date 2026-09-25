@@ -970,6 +970,8 @@ mod tests {
             ),
             ("key=abc", "key=[redacted]"),
             ("api key sk-proj-XYZsecret", "api key [redacted]"),
+            // Split so the export's forbidden-content guard (`AKIA[0-9A-Z]{16}`)
+            // reads no key-shaped literal; the sanitized string is the same.
             (
                 concat!("AKIA", "IOSFODNN7EXAMPLE leaked"),
                 "[redacted] leaked",

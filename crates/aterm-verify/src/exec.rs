@@ -118,7 +118,7 @@ impl Cmd {
     /// everything the child starts, and docs/RELEASING.md measured what that
     /// does to a child the gate MEASURES: an aterm launched under UTILITY had
     /// its paint probe's 50 ms timer fire 75 ms late, and the smoke went red 11
-    /// times in 30. So the test run (`--tests`, which runs the paint and spin
+    /// times in 30. So the test run, the measuring tests (the paint and spin
     /// guards), the smokes, the drives and every other child that RUNS code keep
     /// the inherited tier. That is why this is opt-in per child, not a default.
     #[must_use]
@@ -365,6 +365,15 @@ impl Run {
     /// prints it for its own reasons is misread as an environment failure —
     /// COULD NOT RUN instead of FAIL, both red, neither the merge contract; the
     /// cost is a severity, never a green. A passing child is never asked.
+    ///
+    /// THE THIRD SHAPE (2026-09-23): a `targo test` child whose every failed
+    /// test says the MACHINE refused it — [`crate::libtest::COULD_NOT_RUN_SENTINEL`],
+    /// printed by aterm-link's stray-daemon guard and by a starved paint take.
+    /// 4 of the 13 red full ladders on m3 between 2026-09-18 and 09-22 held no
+    /// finding about the tree at all (the stray guard firing on a leftover
+    /// `aterm-gui --headless` was one shape), and each wrote `verdict FAIL`.
+    /// One failure without the sentinel keeps the whole child a finding
+    /// ([`crate::libtest::environment_refusals`]).
     #[must_use]
     pub fn environment_failure(&self) -> Option<String> {
         if self.ok {
@@ -373,9 +382,24 @@ impl Run {
         if let Some(e) = &self.spawn_error {
             return Some(e.clone());
         }
-        self.output
-            .contains(ENOSPC_SENTENCE)
-            .then(|| format!("the child ran out of disk ({ENOSPC_SENTENCE})"))
+        if self.output.contains(ENOSPC_SENTENCE) {
+            return Some(format!("the child ran out of disk ({ENOSPC_SENTENCE})"));
+        }
+        crate::libtest::environment_refusals(&self.output).map(|names| {
+            let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
+            let more = names.len().saturating_sub(shown.len());
+            format!(
+                "every failing test refused the machine, not the tree ({}{}) — see `{}` in \
+                 their output",
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                },
+                crate::libtest::COULD_NOT_RUN_SENTINEL
+            )
+        })
     }
 }
 
@@ -459,14 +483,14 @@ impl Run {
 ///
 /// A deadlock does not get faster with patience; honest work does finish.
 ///
-/// WHAT THE KILL DOES NOT DO — stated plainly, because a backstop that oversells
-/// itself is worse than none. [`std::process::Child::kill`] sends `SIGKILL` to
-/// the DIRECT child and nothing else. A `targo` that had already forked `trustc`
-/// processes, or a harness that spawned an aterm under a PTY, leaves those
-/// GRANDCHILDREN running: they are not in a process group we created and we do
-/// not track their pids. What the ceiling guarantees is that the GATE reaches a
-/// verdict and exits; it does not guarantee the machine is idle afterwards, and
-/// the diagnostic says so where an operator will read it.
+/// WHAT THE KILL REACHES (2026-09-23). Every stage child leads a process group
+/// of its own ([`group`]), and the ceiling sends `SIGKILL` to that whole group:
+/// the `trustc`s a `targo` forked and the aterms a test harness launched go
+/// with it. Until then the kill reached the DIRECT child only, and those
+/// grandchildren kept running — holding sockets and CPU, and tripping the next
+/// run's stray-daemon guard. What still escapes is a process that left the
+/// group on purpose (one that started its own session, as a PTY-hosted shell
+/// does), and the diagnostic says so where an operator will read it.
 pub const DEFAULT_CHILD_CEILING: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// The environment variable that moves, or removes, [`DEFAULT_CHILD_CEILING`].
@@ -609,6 +633,10 @@ fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
 /// (measured: the program's parent is the process that ran `taskpolicy`), so the
 /// pid [`over_ceiling`] kills is the tool's own. The timing rows and the ceiling
 /// diagnostic name `cmd`'s argv, so neither ever mentions the wrapper.
+///
+/// The child LEADS A PROCESS GROUP OF ITS OWN ([`group`]) and reads no stdin:
+/// a process in a background group that reads the terminal is stopped by
+/// `SIGTTIN`, which would be a hang, and no stage child reads stdin anyway.
 fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     let mut c = if cmd.demoted && crate::is_executable_file(taskpolicy) && resolves(cmd, env) {
         let mut c = Command::new(taskpolicy);
@@ -617,7 +645,12 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     } else {
         Command::new(&cmd.program)
     };
-    c.args(&cmd.args);
+    c.args(&cmd.args).stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        c.process_group(0);
+    }
     c
 }
 
@@ -651,10 +684,13 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
 /// returned beside the `Run`: the ceiling diagnostic needs it to name the test a
 /// killed `targo test` child was still running ([`crate::libtest`]) and the
 /// caller needs the same bytes to splice in front of that diagnostic. Reading it
-/// twice would let a surviving grandchild — the kill reaches the direct child
-/// only — append between the reads, and then the note's line numbers would
+/// twice would let a surviving grandchild — one that left the child's process
+/// group — append between the reads, and then the note's line numbers would
 /// describe text the ladder does not show. Lossy, so one stray byte costs
 /// neither the log nor the note.
+///
+/// While the child runs, its process group is on [`group`]'s live list, so an
+/// interrupted gate takes it down too.
 fn finish(
     mut c: Command,
     cmd: &Cmd,
@@ -668,6 +704,8 @@ fn finish(
         Ok(ch) => ch,
         Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
     };
+    #[cfg(unix)]
+    let _live = group::Live::enter(child.id());
     let Some(limit) = ceiling else {
         let r = reaped(child.wait());
         return (r, read_log(log));
@@ -723,13 +761,26 @@ fn finish(
     }
 }
 
-/// The ceiling fired. Kill, reap, and return a FAILURE that says so out loud —
-/// never a skip, never a pass, and never something a caller could mistake for a
-/// child that merely exited nonzero.
-/// SIGKILL the child and reap it, reporting only a kill that itself failed.
-/// Separate from [`over_ceiling`] so the log is read AFTER the process is gone
-/// and the same bytes serve the note and the ladder.
+/// SIGKILL the child's whole process group and reap the child, reporting only
+/// a kill that itself failed. Separate from [`over_ceiling`] so the log is read
+/// AFTER the processes are gone and the same bytes serve the note and the
+/// ladder.
+///
+/// The group goes FIRST, while the unreaped child still holds its id, so the
+/// signal cannot land on a group some later process was given.
 fn kill_and_reap(child: &mut std::process::Child) -> String {
+    #[cfg(unix)]
+    let kill = match group::kill(child.id()) {
+        Ok(()) => String::new(),
+        Err(e) => match child.kill() {
+            Ok(()) => format!(
+                "  (killing its process group failed: {e} — SIGKILL reached the direct child \
+                 only)\n"
+            ),
+            Err(k) => format!("  (SIGKILL itself failed: {e}; {k})\n"),
+        },
+    };
+    #[cfg(not(unix))]
     let kill = match child.kill() {
         Ok(()) => String::new(),
         Err(e) => format!("  (SIGKILL itself failed: {e})\n"),
@@ -741,6 +792,9 @@ fn kill_and_reap(child: &mut std::process::Child) -> String {
     kill
 }
 
+/// The ceiling fired: a FAILURE that says so out loud — never a skip, never a
+/// pass, and never something a caller could mistake for a child that merely
+/// exited nonzero.
 fn over_ceiling(
     cmd: &Cmd,
     elapsed: Duration,
@@ -770,14 +824,132 @@ fn over_ceiling(
              and never a skip.\n\
              \x20 Raise the ceiling with {CEILING_ENV}=<seconds>, or remove it with \
              {CEILING_ENV}=off.\n\
-             \x20 The kill reached the DIRECT child only — anything it had already spawned (a \
-             targo's trustc processes, a harness's own children) may still be running.\n"
+             \x20 The kill reached the child's whole process group (a targo's trustc \
+             processes, a harness's own children); only a process that left the group — one \
+             that started its own session, as a PTY-hosted shell does — may still be running.\n"
         ),
         // A signal death, which is what this is, and what the shell would have
         // reported too. `spawn_error` stays `None`: the child ran fine, it just
         // never finished.
         code: None,
         spawn_error: None,
+    }
+}
+
+/// EVERY STAGE CHILD LEADS A PROCESS GROUP OF ITS OWN (2026-09-23), so the
+/// gate can end everything a stage started rather than only the process it
+/// spawned: the wall-clock ceiling kills the whole group ([`kill_and_reap`]),
+/// and an interrupted gate kills every group still running
+/// ([`group::kill_on_interrupt`]).
+///
+/// WHY. A ceiling kill used to reach the DIRECT child only, so a hung `targo
+/// test`'s test binaries and the `aterm-gui --headless` daemons they had
+/// launched survived it; so did every child of a gate stopped with `Ctrl-C` or
+/// `kill`. A survivor of that shape is exactly what aterm-link's stray-daemon
+/// guard refuses the NEXT run over: one leftover `aterm-gui --headless`
+/// (running from `~/aterm/target/release` since 2026-09-22, origin
+/// unrecorded) failed the aterm-link suites of every later gate on m3.
+///
+/// THE INTERRUPT HALF IS WHY THIS NEEDS `unsafe`. A child in a group of its own
+/// no longer receives the terminal's `SIGINT` — the terminal signals its
+/// foreground group, and that is the gate's — so the gate must forward it, and
+/// std has no signal handling. The handler does only async-signal-safe work:
+/// atomic loads, `killpg`, then `signal(SIG_DFL)` and `raise`, so the gate still
+/// dies of the signal it was sent, with the exit status that says so. This crate
+/// has no dependencies on purpose (Cargo.toml), and three libc symbols declared
+/// here are not one.
+#[cfg(unix)]
+pub mod group {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    const SIGHUP: i32 = 1;
+    const SIGINT: i32 = 2;
+    const SIGKILL: i32 = 9;
+    const SIGTERM: i32 = 15;
+    /// `SIG_DFL`, as the handler-pointer value `signal(3)` takes.
+    const SIG_DFL: usize = 0;
+
+    unsafe extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+        fn signal(sig: i32, handler: usize) -> usize;
+        fn raise(sig: i32) -> i32;
+    }
+
+    /// The process groups of the stage children running right now, `0` for a
+    /// free slot. Fixed-size and lock-free because a signal handler reads it.
+    /// Stages run their children one at a time, so a few dozen are ever live;
+    /// a child that finds every slot taken still runs, and only an interrupt
+    /// would miss it.
+    static LIVE: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
+
+    /// A child's group on the live list, for as long as this value lives.
+    pub struct Live(Option<usize>);
+
+    impl Live {
+        /// Put `pgid` — the child's pid, which leads its group — on the list.
+        #[must_use]
+        pub fn enter(pgid: u32) -> Self {
+            let Ok(g) = i32::try_from(pgid) else {
+                return Self(None);
+            };
+            Self(LIVE.iter().position(|slot| {
+                slot.compare_exchange(0, g, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            }))
+        }
+    }
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            if let Some(i) = self.0 {
+                LIVE[i].store(0, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// `SIGKILL` every process in group `pgid`.
+    ///
+    /// # Errors
+    /// The OS's reason, when no process was signalled.
+    pub fn kill(pgid: u32) -> std::io::Result<()> {
+        let g = i32::try_from(pgid).map_err(std::io::Error::other)?;
+        // SAFETY: `killpg` takes two integers and touches no memory of ours.
+        if unsafe { killpg(g, SIGKILL) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    extern "C" fn on_signal(sig: i32) {
+        for slot in &LIVE {
+            let g = slot.load(Ordering::SeqCst);
+            if g > 0 {
+                // SAFETY: async-signal-safe, and touches no memory of ours.
+                unsafe {
+                    killpg(g, SIGKILL);
+                }
+            }
+        }
+        // SAFETY: both are async-signal-safe. Restoring the default action and
+        // re-raising ends the gate by the signal it was sent, as before.
+        unsafe {
+            signal(sig, SIG_DFL);
+            raise(sig);
+        }
+    }
+
+    /// On `SIGINT`, `SIGTERM` or `SIGHUP`, kill every live stage child's group,
+    /// then die of the signal. Idempotent: it installs the same handler.
+    pub fn kill_on_interrupt() {
+        let handler = on_signal as extern "C" fn(i32) as usize;
+        for sig in [SIGHUP, SIGINT, SIGTERM] {
+            // SAFETY: `on_signal` is an `extern "C" fn(i32)` that lives for the
+            // whole program and does only async-signal-safe work.
+            unsafe {
+                signal(sig, handler);
+            }
+        }
     }
 }
 
@@ -1211,7 +1383,167 @@ mod tests {
         assert!(out.contains("over the 0.3s wall-clock ceiling"), "{out}");
         assert!(out.contains(CEILING_ENV), "{out}");
         assert!(out.contains("=off"), "{out}");
-        assert!(out.contains("DIRECT child only"), "{out}");
+        assert!(out.contains("whole process group"), "{out}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Is `pid` still a live (not zombie) process? Polls up to five seconds for
+    /// it to go, because a killed grandchild is reaped by launchd, not by us.
+    #[cfg(unix)]
+    fn gone_within_5s(pid: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if stat.is_empty() || stat.starts_with('Z') {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The pid a stage child's shell wrote for the `sleep` it backgrounded.
+    #[cfg(unix)]
+    fn read_pid(file: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(t) = std::fs::read_to_string(file)
+                && t.ends_with('\n')
+            {
+                return t.trim().to_string();
+            }
+            assert!(Instant::now() < deadline, "no pid in {}", file.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A shell that backgrounds a long `sleep` — the grandchild — writes its
+    /// pid to `file`, and waits on it: the shape of a `targo test` that has
+    /// launched a daemon, one level down.
+    #[cfg(unix)]
+    fn with_grandchild(file: &Path) -> Cmd {
+        Cmd::new("/bin/sh").args([
+            "-c",
+            &format!("sleep 600 & echo $! > '{}'; wait", file.display()),
+        ])
+    }
+
+    /// THE CEILING ENDS THE WHOLE GROUP (2026-09-23). A grandchild the stage
+    /// child started is gone once the ceiling fires — and the negative control
+    /// is the kill this replaced, `Child::kill` on the direct child, which
+    /// leaves the same grandchild running.
+    #[cfg(unix)]
+    #[test]
+    fn a_ceiling_kill_takes_the_childs_whole_process_group() {
+        let tmp = crate::mktemp_dir("atv-ceil-group").expect("mktemp");
+        let pidfile = tmp.join("grandchild.pid");
+        let r = run(
+            &with_grandchild(&pidfile),
+            ceiled(&tmp, Some(Duration::from_millis(500))),
+        );
+        assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
+        let grandchild = read_pid(&pidfile);
+        assert!(
+            gone_within_5s(&grandchild),
+            "the grandchild {grandchild} outlived the ceiling kill"
+        );
+
+        // The negative control: the direct child killed alone.
+        let pidfile = tmp.join("control.pid");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("sleep 600 & echo $! > '{}'; wait", pidfile.display()),
+            ])
+            .spawn()
+            .expect("spawn");
+        let orphan = read_pid(&pidfile);
+        child.kill().expect("kill");
+        let _ = child.wait();
+        let survived = !gone_within_5s(&orphan);
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &orphan])
+            .status();
+        assert!(
+            survived,
+            "a direct-child kill left no orphan, so this test cannot tell the two apart"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// AN INTERRUPTED GATE TAKES ITS STAGE CHILDREN WITH IT (2026-09-23). The
+    /// test re-executes itself as a stand-in gate that installs
+    /// [`group::kill_on_interrupt`] (or, for the negative control, does not),
+    /// runs a stage child that has a grandchild, and is sent `SIGINT` the way a
+    /// terminal's Ctrl-C would reach it. With the handler the grandchild is
+    /// gone and the stand-in died of `SIGINT`; without it, the child's own
+    /// process group never heard the signal and the grandchild is still there.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_gate_kills_every_live_stage_group() {
+        use std::os::unix::process::ExitStatusExt as _;
+        const PIDFILE: &str = "ATV_INTERRUPT_PIDFILE";
+        const NO_HANDLER: &str = "ATV_INTERRUPT_NO_HANDLER";
+        if let Some(pidfile) = std::env::var_os(PIDFILE) {
+            if std::env::var_os(NO_HANDLER).is_none() {
+                group::kill_on_interrupt();
+            }
+            let dir = Path::new(&pidfile).parent().expect("a dir").to_path_buf();
+            let _ = run(&with_grandchild(Path::new(&pidfile)), ceiled(&dir, None));
+            return;
+        }
+        let tmp = crate::mktemp_dir("atv-interrupt").expect("mktemp");
+        let me = std::env::current_exe().expect("the test binary");
+        let stand_in = |pidfile: &Path, handler: bool| {
+            let mut c = std::process::Command::new(&me);
+            c.args([
+                "--exact",
+                "exec::tests::an_interrupted_gate_kills_every_live_stage_group",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PIDFILE, pidfile)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            if !handler {
+                c.env(NO_HANDLER, "1");
+            }
+            let mut child = c.spawn().expect("the stand-in gate starts");
+            let grandchild = read_pid(pidfile);
+            std::process::Command::new("/bin/kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .expect("kill -INT");
+            let status = child.wait().expect("the stand-in exits");
+            (status, grandchild)
+        };
+
+        let (status, grandchild) = stand_in(&tmp.join("handled.pid"), true);
+        assert_eq!(
+            status.signal(),
+            Some(2),
+            "it still dies of SIGINT: {status:?}"
+        );
+        assert!(
+            gone_within_5s(&grandchild),
+            "the grandchild {grandchild} outlived the interrupted gate"
+        );
+
+        let (_, orphan) = stand_in(&tmp.join("unhandled.pid"), false);
+        let survived = !gone_within_5s(&orphan);
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &orphan])
+            .status();
+        assert!(
+            survived,
+            "without the handler the grandchild died anyway, so this test cannot see it"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1244,7 +1576,7 @@ mod tests {
         assert!(out.contains("over the 0.3s wall-clock ceiling"), "{out}");
         assert!(out.contains(CEILING_ENV), "{out}");
         assert!(out.contains("=off"), "{out}");
-        assert!(out.contains("DIRECT child only"), "{out}");
+        assert!(out.contains("whole process group"), "{out}");
 
         // The order: the child's bytes, the TIMEOUT line, the name, the verdict
         // sentence — the note sits inside the block, not in front of it.

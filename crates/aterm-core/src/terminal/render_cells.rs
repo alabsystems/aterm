@@ -1096,7 +1096,15 @@ impl Terminal {
             // the masked fill just read.
             #[cfg(debug_assertions)]
             {
-                let mut oracle = crate::render::RenderInput::empty();
+                // Seeded from the scratch, never `empty()`: the fill never writes
+                // the HOST-owned overlay channels (effect streams, sprites,
+                // wallpaper and atlas handles, ink, word decorations) the GUI
+                // stamps after it, yet content `PartialEq` compares them — an
+                // empty oracle made every scrolled step with a wallpaper, a pet
+                // or an effect up panic a debug build. A `None`-mask refill of
+                // the clone rewrites every ENGINE-owned channel, so only an
+                // engine divergence can make the two differ.
+                let mut oracle = scratch.clone();
                 self.cell_frame_fill(&mut oracle, rows, cols, None);
                 debug_assert!(
                     *scratch == oracle,
@@ -1395,19 +1403,28 @@ impl Terminal {
         let cursor_col = (self.cursor_visible() && self.projected_cursor_row() == rows)
             .then(|| self.cursor().col as usize);
         // THE STAMP (the SCR-1 memo's discipline for one more row): the apron
-        // ROW CONTENT is a pure function of the offset, content generation,
-        // history renumbering and frame shape; the caret scalar above is not.
-        // Thus a stationary repaint —
-        // a blink, a pill tick, a sub-row band frame inside one engine row —
-        // re-reads nothing. Without it every scrolled frame materialized one
-        // history row (`scrolled_back_frame_materialize_count` caught it).
-        let stamp = (
-            d,
-            self.grid().content_gen(),
-            self.grid().history_renumber_epoch(),
+        // ROW is a pure function of the offset, content generation, history
+        // renumbering, frame shape, the PRESENTATION it is resolved against and
+        // the terminal that filled it; the caret scalar above is not. Thus a
+        // stationary repaint — a blink, a pill tick, a sub-row band frame inside
+        // one engine row — re-reads nothing (without the memo every scrolled
+        // frame materialized one history row: `scrolled_back_frame_materialize_count`),
+        // while a recolor or another tab's fill into this shared scratch cannot
+        // leave the strip in yesterday's colours or another terminal's text.
+        let stamp = crate::render::ApronStamp {
+            offset: d,
+            content_gen: self.grid().content_gen(),
+            renumber_epoch: self.grid().history_renumber_epoch(),
             rows,
-            scratch.cols,
-        );
+            cols: scratch.cols,
+            // Nothing below the live bottom to resolve: skip the fingerprint.
+            presentation: if d == 0 {
+                0
+            } else {
+                self.apron_presentation_fingerprint()
+            },
+            terminal: self.extract_identity,
+        };
         if scratch.apron_stamp == Some(stamp) {
             // An absent apron (live bottom or a BiDi row) must stay absent.
             if scratch.apron_row.present {
@@ -1478,6 +1495,33 @@ impl Terminal {
         }
         ap.cursor_col = cursor_col;
         ap.present = true;
+    }
+
+    /// Everything the apron row is RESOLVED against that moves no
+    /// `content_gen` — every mutator here only marks `Damage::Full`, which a
+    /// memo cannot key on (a caller that never takes damage stays in one Full
+    /// session across fills, and another consumer can take it first): the live
+    /// palette, the default colours, DECSCNM, the style policy and the BiDi
+    /// modes the visual-order veto reads.
+    fn apron_presentation_fingerprint(&self) -> u64 {
+        use std::hash::Hasher as _;
+        let rgb =
+            |c: aterm_types::Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
+        let mut h = aterm_hash::FxHasher::default();
+        let palette = self.color_palette();
+        for i in 0..=u8::MAX {
+            h.write_u32(rgb(palette.get(i)));
+        }
+        h.write_u32(rgb(self.default_foreground()));
+        h.write_u32(rgb(self.default_background()));
+        let modes = self.modes();
+        h.write_u8(u8::from(modes.reverse_video()));
+        h.write_u8(u8::from(self.color.bold_is_bright));
+        h.write_u32(self.color.faint_opacity.to_bits());
+        h.write_u8(modes.bidi_mode as u8);
+        h.write_u8(modes.bidi_direction as u8);
+        h.write_u8(u8::from(modes.bidi_autodetection));
+        h.finish()
     }
 
     /// The one shared fill body behind [`cell_frame_into`](Self::cell_frame_into)
@@ -3122,6 +3166,141 @@ mod tests {
         }
     }
 
+    /// THE APRON IS RESOLVED COLOUR (audit, 2026-09-24). A recolor — a host
+    /// palette push, OSC 4 on a colour the row uses, a default-background
+    /// change, DECSCNM — moves no `content_gen` (each mutator only marks
+    /// `Damage::Full`), so a memo keyed on content alone kept the incoming row
+    /// in the OLD colours while the viewport repainted in the new ones, and the
+    /// strip slid in wrong. After each recolor the kept apron must equal a
+    /// fresh extraction; between recolors a stationary fill keeps the memo.
+    #[test]
+    fn apron_memo_rematerializes_on_every_recolor() {
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        for i in 0..30 {
+            term.process(format!("\x1b[31mline {i:02}\x1b[0m\r\n").as_bytes());
+        }
+        term.scroll_display(2);
+        // A themeable host opts in to OSC 4 SET (it fails closed by default).
+        term.set_allow_palette_reconfigure(true);
+        let mut scratch = crate::render::RenderInput::empty();
+        let _ = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        assert!(scratch.apron_row.present, "precondition: an apron at d=2");
+        let fresh = |t: &mut Terminal| t.cell_frame(rows, cols).apron_row;
+        assert_eq!(scratch.apron_row, fresh(&mut term));
+        let recolors: [(&str, &dyn Fn(&mut Terminal)); 4] = [
+            // OSC 4 first: a later host palette push takes precedence over it
+            // for that index, so after one it would change nothing to see.
+            ("OSC 4", &|t: &mut Terminal| {
+                t.process(b"\x1b]4;1;rgb:00/ff/00\x07")
+            }),
+            ("palette red", &|t: &mut Terminal| {
+                t.set_palette_color(1, aterm_types::Rgb::new(0x12, 0x34, 0x56))
+            }),
+            ("default bg", &|t: &mut Terminal| {
+                t.set_default_background(aterm_types::Rgb::new(0xFA, 0xFA, 0xFA))
+            }),
+            ("DECSCNM", &|t: &mut Terminal| t.process(b"\x1b[?5h")),
+        ];
+        for (name, recolor) in recolors {
+            let before = scratch.apron_row.clone();
+            let content_gen = term.grid().content_gen();
+            recolor(&mut term);
+            assert_eq!(
+                term.grid().content_gen(),
+                content_gen,
+                "{name}: a recolor moves no content_gen"
+            );
+            let _ = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+            assert_eq!(
+                scratch.apron_row,
+                fresh(&mut term),
+                "{name}: the apron follows the recolor"
+            );
+            assert_ne!(
+                scratch.apron_row, before,
+                "{name}: non-vacuous — the colours moved"
+            );
+            let stamp = scratch.apron_stamp;
+            let _ = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+            assert_eq!(
+                scratch.apron_stamp, stamp,
+                "{name}: a stationary fill keeps the memo"
+            );
+        }
+    }
+
+    /// A DEC LINE-SIZE CHANGE IS A CONTENT CHANGE (audit of the audit,
+    /// 2026-09-24). DECSWL (`ESC # 5`) wrote only the row flag — no damage, no
+    /// `content_gen` — so an apron memoized while its live row was double-width
+    /// kept `DoubleWidth` and the strip slid in wide after the program narrowed
+    /// the row. The handler now marks the row's content when its size changes.
+    #[test]
+    fn the_apron_follows_a_dec_line_size_change() {
+        use crate::grid::LineSize;
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        for i in 0..30 {
+            term.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        term.scroll_display(2);
+        let mut scratch = crate::render::RenderInput::empty();
+        // The apron at d = 2 is live screen row rows - d = 4 (CUP row 5).
+        term.process(b"\x1b[5;1H\x1b#6");
+        let _ = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        assert_eq!(
+            term.grid().display_offset(),
+            2,
+            "precondition: still parked"
+        );
+        assert_eq!(scratch.apron_row.line_size, LineSize::DoubleWidth);
+        let before = term.grid().content_gen();
+        term.process(b"\x1b#5");
+        assert_ne!(
+            term.grid().content_gen(),
+            before,
+            "DECSWL is a content change"
+        );
+        let _ = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        assert_eq!(scratch.apron_row.line_size, LineSize::SingleWidth);
+        assert_eq!(scratch.apron_row, term.cell_frame(rows, cols).apron_row);
+    }
+
+    /// ONE SCRATCH, TWO TERMINALS (audit, 2026-09-24): the tabs of a window
+    /// share `input_scratch`, and two grids fed the same shape of output park
+    /// at equal `(offset, content_gen, epoch, rows, cols)` — every grid's
+    /// `content_gen` starts at 1 and counts marks, not bytes. The memo must not
+    /// hand terminal B the apron terminal A filled (DMG-1's `terminal_id`
+    /// lesson, for the one row outside the viewport).
+    #[test]
+    fn apron_memo_never_carries_another_terminals_row() {
+        let (rows, cols) = (6usize, 12usize);
+        let fed = |ch: char| {
+            let mut t = Terminal::new(rows as u16, cols as u16);
+            for _ in 0..30 {
+                t.process(format!("{}\r\n", ch.to_string().repeat(8)).as_bytes());
+            }
+            t.scroll_display(2);
+            t
+        };
+        let (mut a, mut b) = (fed('a'), fed('b'));
+        assert_eq!(
+            a.grid().content_gen(),
+            b.grid().content_gen(),
+            "precondition: the counters collide"
+        );
+        let mut scratch = crate::render::RenderInput::empty();
+        let _ = a.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        let _ = b.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
+        assert_eq!(
+            scratch.apron_row,
+            b.cell_frame(rows, cols).apron_row,
+            "B's strip shows B's row"
+        );
+        let text: String = scratch.apron_row.cells.iter().map(|c| c.ch).collect();
+        assert!(text.starts_with("bbbb"), "{text:?}");
+    }
+
     /// `render_row_at_screen` is the LIVE-frame twin of `render_row`: identical at
     /// `display_offset == 0`, but IGNORES a GUI scroll-back — so a socket `cell`/
     /// `screen`/`cells` read never pairs a scrolled-back row's colours/attrs with the
@@ -4151,6 +4330,30 @@ mod tests {
         (term, scratch)
     }
 
+    /// THE SCR-2 DEBUG NET MEASURES THE ENGINE, NOT THE HOST (audit,
+    /// 2026-09-24). The GUI stamps host-owned overlay channels (wallpaper and
+    /// atlas handles, effect streams, sprites, ink, cursor overrides) into the
+    /// resident scratch AFTER each fill, and content `PartialEq` compares them.
+    /// The net built its oracle from `RenderInput::empty()`, so a debug build
+    /// panicked on the first scrolled wheel step with any overlay up. A
+    /// scrolled step over a scratch carrying host overlays must refill scoped,
+    /// and leave the overlays as the host set them.
+    #[test]
+    fn scr2_debug_net_ignores_host_overlays() {
+        use crate::render::FrameRefill;
+        let (mut term, mut scratch) = scr2_parked_in_history(8, 20, 3);
+        scratch.cursor_fill_override = Some(0x0012_3456);
+        scratch.cursor_trail_color = 0x00AB_CDEF;
+        term.scroll_display(1);
+        let r = term.cell_frame_damage_scoped_into(&mut scratch, 8, 20);
+        assert_eq!(r, FrameRefill::Scoped { rows_refilled: 1 });
+        assert_eq!(
+            scratch.cursor_fill_override,
+            Some(0x0012_3456),
+            "host overlays untouched"
+        );
+    }
+
     /// One SCR-2 oracle step: fresh full extract first (allocation-per-call,
     /// no continuity, no damage consume), then the scoped refill, then
     /// content equality — the exact compare the CPU renderer's damage cache
@@ -4178,13 +4381,6 @@ mod tests {
         refill
     }
 
-    /// SCR-2 REACH. A 1:1 tracked trackpad scrub presents on every delta
-    /// (~120/s) and every anchored glide tick, and each of those frames used
-    /// to be a whole-viewport re-extraction under `EngineScrolled`. The strip
-    /// must be exactly the rows the OFFSET moved — one for a one-row step,
-    /// three for two steps of one and two between fills (whose tracker bits
-    /// say `0..2`), zero for a frame that moved nothing — and the three
-    /// corpus labels around the arm must keep meaning what they mean.
     /// SCR-2: history evicted from UNDER a viewport parked at the top. The
     /// grid re-clamps the offset (`clamp_display_offset`) and every survivor
     /// keeps its absolute number, so the rotation stays right whether or not
@@ -4224,6 +4420,13 @@ mod tests {
         );
     }
 
+    /// SCR-2 REACH. A 1:1 tracked trackpad scrub presents on every delta
+    /// (~120/s) and every anchored glide tick, and each of those frames used
+    /// to be a whole-viewport re-extraction under `EngineScrolled`. The strip
+    /// must be exactly the rows the OFFSET moved — one for a one-row step,
+    /// three for two steps of one and two between fills (whose tracker bits
+    /// say `0..2`), zero for a frame that moved nothing — and the three
+    /// corpus labels around the arm must keep meaning what they mean.
     #[test]
     fn scr2_scrolled_wheel_step_refills_only_the_exposed_strip() {
         use crate::render::{FrameRefill, FullRefillCause};

@@ -291,9 +291,8 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
 /// §5.2 on the DAMAGED path, both backends: prime the caches with the rect at
 /// bands 1..=3, move it to 2..=4, and compare the cached repaint against the
 /// SAME move expressed as legacy per-row `cat_quads` slices — byte-exact on
-/// the CPU, <= 2 on the GPU. (The full-path GPU twin is
-/// free_sprite_gpu.rs::free_multirow_rect_matches_legacy_perrow_slices_on_gpu;
-/// the full-path CPU twin is in aterm-render's free_composite.rs.)
+/// the CPU, <= 2 on the GPU. (The full-path CPU twin is in aterm-render's
+/// free_composite.rs.)
 #[test]
 fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
     let theme = Theme::default();

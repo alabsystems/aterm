@@ -364,7 +364,10 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
         },
         Ok(false) => Outcome::Waiting {
             what: "declined to generate a certificate signing request".into(),
-            next: format!("re-run `cargo ship provision --id {id}` when ready to spend a slot"),
+            next: format!(
+                "re-run `{} provision --id {id}` when ready to spend a slot",
+                crate::publish::SHIP_COMMAND
+            ),
         },
         Err(e) => Outcome::Blocked {
             what: format!("could not ask before spending a Developer ID slot: {e}"),
@@ -2256,12 +2259,12 @@ pub(crate) fn write_credentials_profile(
         .map_err(|_| "this machine's key is too large to encode".to_string())?;
 
     let mut body = String::new();
-    body.push_str("# Written by `cargo ship provision --id ");
-    body.push_str(id);
-    body.push_str(
-        "`. 0600, owner-only: it carries this\n\
-         # machine's release signing key. Name it with `cargo ship cut --release-credentials`.\n\n",
-    );
+    body.push_str(&format!(
+        "# Written by `{} provision --id {id}`. 0600, owner-only: it carries this\n\
+         # machine's release signing key. Name it with `{} --release-credentials`.\n\n",
+        crate::publish::SHIP_COMMAND,
+        crate::publish::CUT_COMMAND
+    ));
     body.push_str(&format!("signing_key = \"{signing_key}\"\n"));
     body.push_str(&format!("machine_id = \"{id}\"\n"));
     body.push_str(&format!("machine_roster = \"{}\"\n", roster.display()));

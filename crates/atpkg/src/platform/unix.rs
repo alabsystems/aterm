@@ -749,8 +749,7 @@ pub fn install_shim_to_env(
     target: &Path,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<()> {
-    let file = shim_executable_to_env(shim, target, env)?;
-    crate::lay::lay_executables(&[file])
+    crate::lay::write_in_process(&shim_executable_to_env(shim, target, env)?)
 }
 
 /// The shim [`install_shim_to_env`] lays, RENDERED but not written: an EXEC STUB, not a
@@ -758,10 +757,8 @@ pub fn install_shim_to_env(
 /// authenticate when its own `current_exe` is a symlink or a non-canonical path, so a
 /// symlinked shim made the product's headline tool fail on 100% of successful installs;
 /// `exec` hands the process image to the real binary at its real path, which also keeps
-/// its sysroot siblings resolvable). Written by [`crate::lay`] — temp+rename, `0755`,
-/// in-process or through the untracked launchd job when this process is
-/// provenance-tracked — so a shim on the user's PATH is never briefly absent, never
-/// half-written, and never a tagged script that tracks the tool it execs.
+/// its sysroot siblings resolvable). Written by [`crate::lay`] — temp+rename, `0755` — so a
+/// shim on the user's PATH is never briefly absent or half-written.
 ///
 /// ROUTED WHEN AN EXEC ROOT STANDS. The body carries the guard line of
 /// `platform::sh_shim_content_routed` exactly when [`crate::compat::route_for_shim`]
@@ -807,8 +804,7 @@ pub fn install_twin_to_env(
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> io::Result<()> {
-    let file = twin_executable_to_env(shim, target, env, prelude)?;
-    crate::lay::lay_executables(&[file])
+    crate::lay::write_in_process(&twin_executable_to_env(shim, target, env, prelude)?)
 }
 
 /// Wrap `s` in single quotes for safe embedding in a `/bin/sh` script, escaping any embedded
@@ -843,9 +839,8 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     // Atomic install through the one executable writer (`crate::lay`): a sibling temp,
     // `0755`, then `rename(2)` over `shim` — atomic on POSIX and replacing the
     // destination regardless of its prior type (symlink or regular file), so the live
-    // shim flips to the tombstone with no torn window; and through the untracked launchd
-    // job when this process is provenance-tracked, like every other shim.
-    crate::lay::lay_executable(shim, script.as_bytes())
+    // shim flips to the tombstone with no torn window.
+    crate::lay::write_in_process(&crate::lay::Executable::new(shim, script.as_bytes()))
 }
 
 /// Resolve the store/checkout target a `bin/<tool>` shim points at, or `None` if there is

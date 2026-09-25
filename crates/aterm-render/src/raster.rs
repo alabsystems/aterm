@@ -126,8 +126,9 @@ fn lerp(t: f32, p0: Point, p1: Point) -> Point {
 /// independent analytic reference over **2,108 glyph rasters** from the two
 /// embedded faces across 8..32 px — 2,320 reached, 212 dropped as
 /// self-overlapping, a class every signed-area rasterizer gets wrong
-/// identically (`tests/raster_accuracy_survey.rs`, which holds both the
-/// measurement and the guard):
+/// identically (measured by the `#[ignore]`d half of
+/// `tests/raster_accuracy_survey.rs`, retired 2026-09-24 and recoverable at
+/// `e8a8c80ab`; the file keeps the live guard):
 ///
 /// ```text
 ///                       corpus mean /255   worst cell /255
@@ -147,8 +148,9 @@ fn lerp(t: f32, p0: Point, p1: Point) -> Point {
 /// reference cell by up to 7.97/255, more than the 4.4 the shipped path scores.
 /// So 4.4 is an UPPER bound on the true worst-cell error and the ~4.8× lead
 /// over fontdue is a LOWER bound on the true one. The mean is the figure to
-/// quote; `raster_accuracy_survey::reference_phase_sensitivity` prints the
-/// spread.
+/// quote; the retired `raster_accuracy_survey::reference_phase_sensitivity`
+/// (source at `e8a8c80ab`, numbers in
+/// `docs/measured/fontdue-oracle-decision-2026-08-29.md` §1) printed the spread.
 ///
 /// # What it costs, and where
 ///
@@ -591,8 +593,9 @@ mod tests {
     /// bulges right — which is the same deficit the corpus-wide survey
     /// measures. What pins these numbers is therefore not an oracle but a
     /// bound: `tests/raster_accuracy_survey.rs` holds the shipped path to
-    /// mean ≤ 0.20/255 and per-glyph max ≤ 8/255 against an independent
-    /// analytic reference, and this grid is here to make a re-record LOUD.
+    /// mean ≤ 0.100/255, per-(face, size) row mean ≤ 0.130/255 and per-glyph
+    /// max ≤ 6/255 against an independent analytic reference, and this grid is
+    /// here to make a re-record LOUD.
     #[test]
     fn golden_quadratic() {
         let got = cov(6, 6, |r| {

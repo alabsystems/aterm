@@ -171,7 +171,7 @@ impl AppleTools for RecordingTools {
 }
 
 fn app() -> PathBuf {
-    PathBuf::from("/cut/dist/cut-app.noindex/aterm.app")
+    PathBuf::from("/cut/dist/cut-1790000000.noindex/aterm.app")
 }
 
 fn dmg_path() -> PathBuf {

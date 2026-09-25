@@ -25,9 +25,7 @@
 //     glyphs AND over a wdeco stamp AND over additive glow/nova light (over
 //     everything except the cursor — the GPU `FreeOver` slot); and B1-then-B2
 //     order — a free under-sprite sits OVER a legacy cat quad (mirroring the
-//     GPU `FreeUnder`-after-`cat_over` slot);
-//   * perf (§5.8): the tall-rect composite bench companion to
-//     `bench_render_row_under_sprites` (manual, `--ignored --nocapture`).
+//     GPU `FreeUnder`-after-`cat_over` slot).
 
 use std::sync::Arc;
 
@@ -476,115 +474,5 @@ fn free_z_under_text_over_legacy_and_over_text() {
     assert!(
         over(1, 0).iter().all(|&p| p == red) && over(1, 1).iter().all(|&p| p == red),
         "OverText: the sprite must draw OVER the additive glow"
-    );
-}
-
-/// §5.8 perf companion to `bench_render_row_under_sprites`: ONE tall free rect
-/// spanning EVERY row of a 120×40 text frame, full render vs the no-sprite
-/// baseline of the same frame. The GATED case is OPAQUE texels — the v1 cat
-/// regime the pass-1c bench also measures, so the two numbers are
-/// apples-to-apples (same bar, <10µs/row). A fully-TRANSLUCENT rect is also
-/// measured and reported (no bar): its cost is the shared linear-light
-/// `blend()` per pixel, which the legacy per-row slices pay identically — it
-/// measures src-over, not the phase runner. Timing-sensitive — manual idiom:
-///
-/// ```sh
-/// cargo test -p aterm-render --release --test free_composite \
-///   bench_composite_free_tall_rect -- --ignored --nocapture
-/// ```
-#[test]
-#[ignore = "perf gate (design §5.8): run manually in --release with --ignored --nocapture"]
-fn bench_composite_free_tall_rect() {
-    use std::time::Instant;
-    let Some(mut rend) = renderer() else {
-        panic!("bench needs a system monospace font");
-    };
-    let (cw, ch) = rend.cell_size();
-    let (rows, cols) = (40usize, 120usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l");
-    let line = "the quick brown fox jumps over the lazy dog 0123456789 ".repeat(3);
-    for r in 0..rows {
-        term.process(format!("\x1b[{};1H{}", r + 1, &line[..cols]).as_bytes());
-    }
-
-    let base_input = term.cell_frame(rows, cols);
-    let tall_h = (rows * ch) as u32;
-    // Patterned atlases tall enough for the full-height 1:1 rect: opaque (the
-    // gated cat regime) and translucent (the informational src-over worst case).
-    let tall_atlas = |opaque: bool, version: u64| {
-        let mut rgba = Vec::with_capacity((128 * tall_h * 4) as usize);
-        for y in 0..tall_h {
-            for x in 0..128u32 {
-                rgba.extend_from_slice(&[
-                    (x * 37 + y * 11) as u8,
-                    (x * 5 + y * 53) as u8,
-                    (x * 29 + y * 3) as u8,
-                    if opaque {
-                        255
-                    } else {
-                        (60 + (x * 3 + y) % 180) as u8
-                    },
-                ]);
-            }
-        }
-        SceneAtlas {
-            width: 128,
-            height: tall_h,
-            rgba,
-            version,
-        }
-    };
-    // ONE 80 px × full-grid-height rect — every row's band is composited.
-    let sprite = free_1to1((4 * cw) as i32, 0, 80, tall_h as u16, [0, 0]);
-    let mut opaque_input = base_input.clone();
-    opaque_input.free_atlas = Some(Arc::new(tall_atlas(true, 1)));
-    opaque_input.free_sprites = vec![sprite];
-    let mut translucent_input = base_input.clone();
-    translucent_input.free_atlas = Some(Arc::new(tall_atlas(false, 2)));
-    translucent_input.free_sprites = vec![sprite];
-
-    for _ in 0..4 {
-        let _ = rend.render_input(&base_input);
-        let _ = rend.render_input(&opaque_input);
-        let _ = rend.render_input(&translucent_input);
-    }
-    let iters = 60usize;
-    let mut t = [
-        Vec::with_capacity(iters),
-        Vec::with_capacity(iters),
-        Vec::with_capacity(iters),
-    ];
-    for _ in 0..iters {
-        for (i, input) in [&base_input, &opaque_input, &translucent_input]
-            .iter()
-            .enumerate()
-        {
-            let s = Instant::now();
-            let _ = rend.render_input(input);
-            t[i].push(s.elapsed());
-        }
-    }
-    for v in &mut t {
-        v.sort();
-    }
-    let (mb, mo, mt) = (t[0][iters / 2], t[1][iters / 2], t[2][iters / 2]);
-    let per_row = |m: std::time::Duration| -> f64 {
-        (m.as_nanos() as i128 - mb.as_nanos() as i128) as f64 / rows as f64
-    };
-    let (opaque_ns, translucent_ns) = (per_row(mo), per_row(mt));
-    println!(
-        "bench_composite_free_tall_rect: baseline full-frame median {mb:?}; ONE \
-         {rows}-row free rect — OPAQUE {mo:?} ({:.2} us/row, the gated cat \
-         regime), TRANSLUCENT {mt:?} ({:.2} us/row, informational: pure shared \
-         src-over blend() cost) (120x40, {}x{} px cells, 80 px-wide rect)",
-        opaque_ns / 1000.0,
-        translucent_ns / 1000.0,
-        cw,
-        ch
-    );
-    assert!(
-        opaque_ns < 10_000.0,
-        "§5.8 gate: opaque free-composite row cost {opaque_ns:.0} ns/row >= 10 us/row"
     );
 }

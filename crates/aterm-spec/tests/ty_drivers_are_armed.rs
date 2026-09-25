@@ -117,7 +117,9 @@ fn scan(path: &Path, rel: &str) -> Vec<Driver> {
             || region.contains("env!(\"CARGO\")")
             || region.contains("var_os(\"CARGO\")")
             || region.contains("var(\"CARGO\")")
-            || region.contains("cargo_bin(");
+            || region.contains("cargo_bin(")
+            // xtask's cross lanes: a rustup toolchain's own cargo, by path.
+            || region.contains(".cargo()");
         if runs_cargo && !mentions_ty(&region) {
             continue;
         }

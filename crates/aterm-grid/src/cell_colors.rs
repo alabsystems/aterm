@@ -311,325 +311,161 @@ impl PackedColor {
 mod tests {
     use super::*;
 
-    // ---- PackedColors: default state ----
+    /// One side's colour mode, for the exhaustive walks below.
+    #[derive(Clone, Copy, Debug)]
+    enum Side {
+        Default,
+        Indexed(u8),
+        Rgb,
+    }
 
-    #[test]
-    fn packed_colors_default_is_all_default() {
-        let c = PackedColors::DEFAULT;
-        assert!(c.fg_is_default());
-        assert!(c.bg_is_default());
-        assert!(c.is_default());
-        assert_eq!(c.0, 0);
+    /// Every state a side can be in: default, RGB and all 256 indexes.
+    fn every_side() -> impl Iterator<Item = Side> {
+        [Side::Default, Side::Rgb]
+            .into_iter()
+            .chain((0..=255u8).map(Side::Indexed))
+    }
+
+    /// Assert one side reads back as `want` and as nothing else.
+    fn assert_side(
+        label: &str,
+        (default, indexed, rgb, index): (bool, bool, bool, u8),
+        want: Side,
+    ) {
+        match want {
+            Side::Default => assert!(default && !indexed && !rgb, "{label}: want default"),
+            Side::Indexed(i) => {
+                assert!(!default && indexed && !rgb, "{label}: want indexed");
+                assert_eq!(index, i, "{label}: index");
+            }
+            Side::Rgb => assert!(!default && !indexed && rgb, "{label}: want rgb"),
+        }
+    }
+
+    fn fg(c: PackedColors) -> (bool, bool, bool, u8) {
+        (
+            c.fg_is_default(),
+            c.fg_is_indexed(),
+            c.fg_is_rgb(),
+            c.fg_index(),
+        )
+    }
+
+    fn bg(c: PackedColors) -> (bool, bool, bool, u8) {
+        (
+            c.bg_is_default(),
+            c.bg_is_indexed(),
+            c.bg_is_rgb(),
+            c.bg_index(),
+        )
+    }
+
+    fn set_fg(c: PackedColors, side: Side) -> PackedColors {
+        match side {
+            Side::Default => c.set_fg_default(),
+            Side::Indexed(i) => c.set_fg_indexed(i),
+            Side::Rgb => c.with_rgb_fg(),
+        }
+    }
+
+    fn set_bg(c: PackedColors, side: Side) -> PackedColors {
+        match side {
+            Side::Default => c.set_bg_default(),
+            Side::Indexed(i) => c.set_bg_indexed(i),
+            Side::Rgb => c.with_rgb_bg(),
+        }
     }
 
     #[test]
-    fn packed_colors_new_equals_default() {
+    fn packed_colors_every_fg_bg_and_extras_state() {
+        // One walk in place of 30 one-state tests here and 6 twins in
+        // cell_tests.rs: the default value, indexed fg/bg/both at 0, mid and 255,
+        // the RGB markers, a mode switch clearing the previous mode, index round
+        // trips, fg/bg independence, and the HAS_EXTRAS bit leaving the colours
+        // alone.
+        assert_eq!(PackedColors::DEFAULT.0, 0);
         assert_eq!(PackedColors::new(), PackedColors::DEFAULT);
-    }
-
-    #[test]
-    fn packed_colors_default_trait_equals_const_default() {
         assert_eq!(PackedColors::default(), PackedColors::DEFAULT);
-    }
-
-    // ---- PackedColors: indexed FG ----
-
-    #[test]
-    fn packed_colors_with_indexed_fg_mode() {
-        let c = PackedColors::with_indexed_fg(42);
-        assert!(c.fg_is_indexed());
-        assert!(c.bg_is_default());
-        assert_eq!(c.fg_index(), 42);
-    }
-
-    #[test]
-    fn packed_colors_with_indexed_fg_zero() {
-        let c = PackedColors::with_indexed_fg(0);
-        assert!(c.fg_is_indexed());
-        assert_eq!(c.fg_index(), 0);
-    }
-
-    #[test]
-    fn packed_colors_with_indexed_fg_max() {
-        let c = PackedColors::with_indexed_fg(255);
-        assert!(c.fg_is_indexed());
-        assert_eq!(c.fg_index(), 255);
-    }
-
-    // ---- PackedColors: indexed BG ----
-
-    #[test]
-    fn packed_colors_with_indexed_bg_mode() {
-        let c = PackedColors::with_indexed_bg(99);
-        assert!(c.bg_is_indexed());
-        assert!(c.fg_is_default());
-        assert_eq!(c.bg_index(), 99);
-    }
-
-    #[test]
-    fn packed_colors_with_indexed_bg_zero() {
-        let c = PackedColors::with_indexed_bg(0);
-        assert!(c.bg_is_indexed());
-        assert_eq!(c.bg_index(), 0);
-    }
-
-    #[test]
-    fn packed_colors_with_indexed_bg_max() {
-        let c = PackedColors::with_indexed_bg(255);
-        assert!(c.bg_is_indexed());
-        assert_eq!(c.bg_index(), 255);
-    }
-
-    // ---- PackedColors: both indexed ----
-
-    #[test]
-    fn packed_colors_with_indexed_both() {
-        let c = PackedColors::with_indexed(196, 21);
-        assert!(c.fg_is_indexed());
-        assert!(c.bg_is_indexed());
-        assert_eq!(c.fg_index(), 196);
-        assert_eq!(c.bg_index(), 21);
-        assert!(!c.is_default());
-    }
-
-    #[test]
-    fn packed_colors_with_indexed_both_boundary() {
-        let c = PackedColors::with_indexed(0, 255);
-        assert_eq!(c.fg_index(), 0);
-        assert_eq!(c.bg_index(), 255);
-
-        let c2 = PackedColors::with_indexed(255, 0);
-        assert_eq!(c2.fg_index(), 255);
-        assert_eq!(c2.bg_index(), 0);
-    }
-
-    // ---- PackedColors: RGB markers ----
-
-    #[test]
-    fn packed_colors_with_rgb_fg_marker() {
-        let c = PackedColors::new().with_rgb_fg();
-        assert!(c.fg_is_rgb());
-        assert!(c.bg_is_default());
-        assert!(!c.fg_is_default());
-        assert!(!c.fg_is_indexed());
-    }
-
-    #[test]
-    fn packed_colors_with_rgb_bg_marker() {
-        let c = PackedColors::new().with_rgb_bg();
-        assert!(c.bg_is_rgb());
-        assert!(c.fg_is_default());
-        assert!(!c.bg_is_default());
-        assert!(!c.bg_is_indexed());
-    }
-
-    #[test]
-    fn packed_colors_both_rgb() {
-        let c = PackedColors::new().with_rgb_fg().with_rgb_bg();
-        assert!(c.fg_is_rgb());
-        assert!(c.bg_is_rgb());
-        assert!(!c.is_default());
-    }
-
-    // ---- PackedColors: mutually exclusive states ----
-
-    #[test]
-    fn packed_colors_set_fg_indexed_clears_rgb() {
-        let c = PackedColors::new().with_rgb_fg().set_fg_indexed(77);
-        assert!(c.fg_is_indexed());
-        assert!(!c.fg_is_rgb());
-        assert_eq!(c.fg_index(), 77);
-    }
-
-    #[test]
-    fn packed_colors_set_bg_indexed_clears_rgb() {
-        let c = PackedColors::new().with_rgb_bg().set_bg_indexed(33);
-        assert!(c.bg_is_indexed());
-        assert!(!c.bg_is_rgb());
-        assert_eq!(c.bg_index(), 33);
-    }
-
-    #[test]
-    fn packed_colors_set_fg_default_clears_indexed() {
-        let c = PackedColors::with_indexed_fg(42).set_fg_default();
-        assert!(c.fg_is_default());
-        assert!(!c.fg_is_indexed());
-    }
-
-    #[test]
-    fn packed_colors_set_bg_default_clears_indexed() {
-        let c = PackedColors::with_indexed_bg(42).set_bg_default();
-        assert!(c.bg_is_default());
-        assert!(!c.bg_is_indexed());
-    }
-
-    #[test]
-    fn packed_colors_rgb_fg_overwrites_indexed_fg() {
-        let c = PackedColors::with_indexed_fg(100).with_rgb_fg();
-        assert!(c.fg_is_rgb());
-        assert!(!c.fg_is_indexed());
-    }
-
-    // ---- PackedColors: round-trip ----
-
-    #[test]
-    fn packed_colors_fg_index_roundtrip() {
-        for idx in [0u8, 1, 15, 128, 254, 255] {
-            let c = PackedColors::with_indexed_fg(idx);
-            assert_eq!(c.fg_index(), idx, "fg round-trip failed for index {idx}");
-        }
-    }
-
-    #[test]
-    fn packed_colors_bg_index_roundtrip() {
-        for idx in [0u8, 1, 15, 128, 254, 255] {
-            let c = PackedColors::with_indexed_bg(idx);
-            assert_eq!(c.bg_index(), idx, "bg round-trip failed for index {idx}");
-        }
-    }
-
-    #[test]
-    fn packed_colors_set_fg_indexed_roundtrip() {
-        let c = PackedColors::new().set_fg_indexed(200);
-        assert_eq!(c.fg_index(), 200);
-        let c2 = c.set_fg_indexed(50);
-        assert_eq!(c2.fg_index(), 50);
-    }
-
-    #[test]
-    fn packed_colors_set_bg_indexed_roundtrip() {
-        let c = PackedColors::new().set_bg_indexed(200);
-        assert_eq!(c.bg_index(), 200);
-        let c2 = c.set_bg_indexed(50);
-        assert_eq!(c2.bg_index(), 50);
-    }
-
-    // ---- PackedColors: independence of FG and BG ----
-
-    #[test]
-    fn packed_colors_set_fg_preserves_bg() {
-        let c = PackedColors::with_indexed_bg(88).set_fg_indexed(11);
-        assert_eq!(c.bg_index(), 88);
-        assert!(c.bg_is_indexed());
-        assert_eq!(c.fg_index(), 11);
-    }
-
-    #[test]
-    fn packed_colors_set_bg_preserves_fg() {
-        let c = PackedColors::with_indexed_fg(11).set_bg_indexed(88);
-        assert_eq!(c.fg_index(), 11);
-        assert!(c.fg_is_indexed());
-        assert_eq!(c.bg_index(), 88);
-    }
-
-    #[test]
-    fn packed_colors_set_fg_default_preserves_bg() {
-        let c = PackedColors::with_indexed(100, 200).set_fg_default();
-        assert!(c.fg_is_default());
-        assert!(c.bg_is_indexed());
-        assert_eq!(c.bg_index(), 200);
-    }
-
-    #[test]
-    fn packed_colors_set_bg_default_preserves_fg() {
-        let c = PackedColors::with_indexed(100, 200).set_bg_default();
-        assert!(c.bg_is_default());
-        assert!(c.fg_is_indexed());
-        assert_eq!(c.fg_index(), 100);
-    }
-
-    // ---- PackedColors: HAS_EXTRAS flag ----
-
-    #[test]
-    fn packed_colors_extras_flag_default_off() {
+        assert!(PackedColors::DEFAULT.is_default());
         assert!(!PackedColors::DEFAULT.has_extras());
-    }
 
-    #[test]
-    fn packed_colors_extras_flag_set_and_clear() {
-        let c = PackedColors::DEFAULT.with_extras_flag();
-        assert!(c.has_extras());
-        let c2 = c.without_extras_flag();
-        assert!(!c2.has_extras());
-    }
+        for i in 0..=255u8 {
+            let only_fg = PackedColors::with_indexed_fg(i);
+            assert_side("with_indexed_fg fg", fg(only_fg), Side::Indexed(i));
+            assert_side("with_indexed_fg bg", bg(only_fg), Side::Default);
+            let only_bg = PackedColors::with_indexed_bg(i);
+            assert_side("with_indexed_bg fg", fg(only_bg), Side::Default);
+            assert_side("with_indexed_bg bg", bg(only_bg), Side::Indexed(i));
+            for j in 0..=255u8 {
+                let both = PackedColors::with_indexed(i, j);
+                assert_side("with_indexed fg", fg(both), Side::Indexed(i));
+                assert_side("with_indexed bg", bg(both), Side::Indexed(j));
+                assert!(!both.is_default() && !both.has_extras());
+            }
+        }
 
-    #[test]
-    fn packed_colors_extras_flag_preserves_colors() {
-        let c = PackedColors::with_indexed(42, 99).with_extras_flag();
-        assert!(c.has_extras());
-        assert_eq!(c.fg_index(), 42);
-        assert_eq!(c.bg_index(), 99);
-        assert!(c.fg_is_indexed());
-        assert!(c.bg_is_indexed());
-    }
-
-    // ---- PackedColor (legacy): default ----
-
-    #[test]
-    fn packed_color_default_fg_is_default() {
-        assert!(PackedColor::DEFAULT_FG.is_default());
-        assert!(!PackedColor::DEFAULT_FG.is_indexed());
-        assert!(!PackedColor::DEFAULT_FG.is_rgb());
-    }
-
-    #[test]
-    fn packed_color_default_bg_is_default() {
-        assert!(PackedColor::DEFAULT_BG.is_default());
-        assert!(!PackedColor::DEFAULT_BG.is_indexed());
-        assert!(!PackedColor::DEFAULT_BG.is_rgb());
-    }
-
-    // ---- PackedColor (legacy): indexed ----
-
-    #[test]
-    fn packed_color_indexed_zero() {
-        let c = PackedColor::indexed(0);
-        assert!(c.is_indexed());
-        assert!(!c.is_default());
-        assert!(!c.is_rgb());
-        assert_eq!(c.index(), 0);
-    }
-
-    #[test]
-    fn packed_color_indexed_max() {
-        let c = PackedColor::indexed(255);
-        assert!(c.is_indexed());
-        assert_eq!(c.index(), 255);
-    }
-
-    #[test]
-    fn packed_color_indexed_roundtrip() {
-        for idx in [0u8, 1, 7, 15, 127, 128, 254, 255] {
-            let c = PackedColor::indexed(idx);
-            assert_eq!(c.index(), idx, "indexed round-trip failed for {idx}");
+        // Every (fg, bg) state reached by the setters from every kind of starting
+        // value, in both orders, so each setter must clear the mode it replaces
+        // and leave the other side untouched.
+        let starts = [
+            PackedColors::DEFAULT,
+            PackedColors::with_indexed(100, 200),
+            PackedColors::DEFAULT.with_rgb_fg().with_rgb_bg(),
+            PackedColors::with_indexed(7, 9).with_extras_flag(),
+        ];
+        for start in starts {
+            for want_fg in every_side() {
+                for want_bg in every_side() {
+                    let fg_first = set_bg(set_fg(start, want_fg), want_bg);
+                    let bg_first = set_fg(set_bg(start, want_bg), want_fg);
+                    for c in [fg_first, bg_first] {
+                        for extras in [false, true] {
+                            let c = if extras {
+                                c.with_extras_flag()
+                            } else {
+                                c.without_extras_flag()
+                            };
+                            assert_eq!(c.has_extras(), extras, "{start:?} -> {c:?}");
+                            assert_side("fg", fg(c), want_fg);
+                            assert_side("bg", bg(c), want_bg);
+                            assert_eq!(
+                                c.is_default(),
+                                matches!((want_fg, want_bg), (Side::Default, Side::Default)),
+                                "{c:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // ---- PackedColor (legacy): RGB ----
-
     #[test]
-    fn packed_color_rgb_mode() {
-        let c = PackedColor::rgb(255, 128, 0);
-        assert!(c.is_rgb());
-        assert!(!c.is_default());
-        assert!(!c.is_indexed());
-    }
-
-    #[test]
-    fn packed_color_rgb_roundtrip() {
-        let c = PackedColor::rgb(10, 20, 30);
-        assert_eq!(c.rgb_components(), (10, 20, 30));
-    }
-
-    #[test]
-    fn packed_color_rgb_boundary_values() {
-        let c = PackedColor::rgb(0, 0, 0);
-        assert_eq!(c.rgb_components(), (0, 0, 0));
-        assert!(c.is_rgb());
-
-        let c = PackedColor::rgb(255, 255, 255);
-        assert_eq!(c.rgb_components(), (255, 255, 255));
-        assert!(c.is_rgb());
+    fn packed_color_every_mode() {
+        // One walk in place of 8 one-value tests here and 3 twins in
+        // cell_tests.rs. #6704: DEFAULT_FG/BG must carry type byte 0xFF
+        // ("default"), never 0x00 ("indexed"); zero-initialised cells with an
+        // indexed-black background drew dark bands on light themes.
+        for d in [PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG] {
+            assert!(d.is_default(), "{d:?}");
+            assert!(!d.is_indexed(), "{d:?}");
+            assert!(!d.is_rgb(), "{d:?}");
+        }
+        for i in 0..=255u8 {
+            let c = PackedColor::indexed(i);
+            assert!(c.is_indexed() && !c.is_default() && !c.is_rgb(), "{c:?}");
+            assert_eq!(c.index(), i);
+        }
+        let components = [0u8, 1, 10, 20, 30, 64, 127, 128, 254, 255];
+        for r in components {
+            for g in components {
+                for b in components {
+                    let c = PackedColor::rgb(r, g, b);
+                    assert!(c.is_rgb() && !c.is_default() && !c.is_indexed(), "{c:?}");
+                    assert_eq!(c.rgb_components(), (r, g, b));
+                }
+            }
+        }
     }
 
     #[test]

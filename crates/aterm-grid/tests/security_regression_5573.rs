@@ -257,10 +257,7 @@ fn aterm_grid_rlib() -> Option<std::path::PathBuf> {
 /// assumption: the probe found the six-weeks-stale dev stage2, E0514'd on the
 /// fresh rlib, and the positive control failed on a healthy tree.
 ///
-/// So the DEFAULT candidates — PATH `trustc` (the atpkg lane; also the rustup
-/// shim on a dev box, which resolves to stage2 anyway), the conventional
-/// `$HOME/trust/build/host/stage2/bin` dev checkout (canonicalized — protected
-/// Trust drivers refuse symlinked toolchain paths), then PATH `rustc`
+/// So the DEFAULT candidates — PATH `trustc` (the atpkg lane), then PATH `rustc`
 /// (upstream boxes) — are each VETTED with a metadata-touch compile against
 /// the real rlib, and the first that passes wins. E0514 fires at metadata
 /// load, so the vet is precisely the skew check. If NONE vets, the first that
@@ -296,12 +293,6 @@ fn probe_compiler(
     }
     let mut candidates: Vec<(std::path::PathBuf, bool)> = Vec::new();
     candidates.push((std::path::PathBuf::from("trustc"), true));
-    if let Some(home) = std::env::var_os("HOME")
-        && let Ok(physical) =
-            std::fs::canonicalize(std::path::Path::new(&home).join("trust/build/host/stage2/bin"))
-    {
-        candidates.push((physical.join("trustc"), true));
-    }
     candidates.push((std::path::PathBuf::from("rustc"), false));
     candidates.retain(|(path, _)| runs(path));
     // The vet: `extern crate` alone forces the metadata load where an

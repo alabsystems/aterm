@@ -567,18 +567,16 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn move_cursor_to_absolute() {
-        let mut grid = Grid::new(24, 80);
-        grid.move_cursor_to(10, 20);
-        assert_eq!(grid.cursor(), Cursor::new(10, 20));
-    }
-
-    #[test]
-    fn move_cursor_to_clamps_out_of_bounds() {
-        let mut grid = Grid::new(5, 10);
-        grid.move_cursor_to(50, 50);
-        assert_eq!(grid.cursor_row(), 4);
-        assert_eq!(grid.cursor_col(), 9);
+    fn move_cursor_to_lands_or_clamps() {
+        // (grid rows, cols, target, expected cursor); each row was its own test.
+        for (rows, cols, (row, col), want) in [
+            (24, 80, (10, 20), Cursor::new(10, 20)),
+            (5, 10, (50, 50), Cursor::new(4, 9)),
+        ] {
+            let mut grid = Grid::new(rows, cols);
+            grid.move_cursor_to(row, col);
+            assert_eq!(grid.cursor(), want, "{rows}x{cols} -> ({row}, {col})");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -853,14 +851,6 @@ mod tests {
     }
 
     #[test]
-    fn carriage_return_at_col_zero_is_noop() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(3, 0);
-        grid.carriage_return();
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
     fn carriage_return_clears_pending_wrap() {
         let mut grid = Grid::new(10, 80);
         grid.set_cursor(0, 79);
@@ -941,15 +931,6 @@ mod tests {
         assert_eq!(grid.cursor_row(), 9);
     }
 
-    #[test]
-    fn line_feed_clears_pending_wrap() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(5, 79);
-        grid.set_pending_wrap(true);
-        grid.line_feed();
-        assert!(!grid.pending_wrap());
-    }
-
     // -------------------------------------------------------------------------
     // reverse_line_feed
     // -------------------------------------------------------------------------
@@ -1005,14 +986,6 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn backspace_moves_left_one() {
-        let mut grid = Grid::new(10, 80);
-        grid.set_cursor(0, 10);
-        grid.backspace();
-        assert_eq!(grid.cursor_col(), 9);
-    }
-
-    #[test]
     fn backspace_at_col_zero_stays() {
         let mut grid = Grid::new(10, 80);
         grid.set_cursor(3, 0);
@@ -1054,22 +1027,6 @@ mod tests {
         grid.set_cursor(5, 10);
         grid.restore_cursor(); // no prior save — should not change cursor
         assert_eq!(grid.cursor(), Cursor::new(5, 10));
-    }
-
-    #[test]
-    fn save_cursor_preserves_pending_wrap() {
-        let mut grid = Grid::new(24, 80);
-        grid.set_cursor(0, 79);
-        grid.set_pending_wrap(true);
-        grid.save_cursor();
-
-        // Move and clear wrap
-        grid.set_cursor(5, 5);
-        assert!(!grid.pending_wrap());
-
-        grid.restore_cursor();
-        assert!(grid.pending_wrap());
-        assert_eq!(grid.cursor(), Cursor::new(0, 79));
     }
 
     #[test]
@@ -1149,52 +1106,23 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn grid_1x1_set_cursor_clamped() {
-        let mut grid = Grid::new(1, 1);
-        grid.set_cursor(100, 100);
-        assert_eq!(grid.cursor(), Cursor::new(0, 0));
-    }
-
-    #[test]
-    fn grid_1x1_cursor_up_stays() {
-        let mut grid = Grid::new(1, 1);
-        grid.cursor_up(10);
-        assert_eq!(grid.cursor_row(), 0);
-    }
-
-    #[test]
-    fn grid_1x1_cursor_down_stays() {
-        let mut grid = Grid::new(1, 1);
-        grid.cursor_down(10);
-        assert_eq!(grid.cursor_row(), 0);
-    }
-
-    #[test]
-    fn grid_1x1_cursor_forward_stays() {
-        let mut grid = Grid::new(1, 1);
-        grid.cursor_forward(10);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn grid_1x1_cursor_backward_stays() {
-        let mut grid = Grid::new(1, 1);
-        grid.cursor_backward(10);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn grid_1x1_line_feed_stays() {
-        let mut grid = Grid::new(1, 1);
-        grid.line_feed();
-        assert_eq!(grid.cursor_row(), 0);
-    }
-
-    #[test]
-    fn grid_1x1_reverse_line_feed_stays() {
-        let mut grid = Grid::new(1, 1);
-        grid.reverse_line_feed();
-        assert_eq!(grid.cursor_row(), 0);
+    fn grid_1x1_every_motion_stays_at_origin() {
+        // One row per motion; each was its own test.
+        type Motion = fn(&mut Grid);
+        let motions: [(&str, Motion); 7] = [
+            ("set_cursor(100, 100) clamps", |g| g.set_cursor(100, 100)),
+            ("cursor_up(10)", |g| g.cursor_up(10)),
+            ("cursor_down(10)", |g| g.cursor_down(10)),
+            ("cursor_forward(10)", |g| g.cursor_forward(10)),
+            ("cursor_backward(10)", |g| g.cursor_backward(10)),
+            ("line_feed", Grid::line_feed),
+            ("reverse_line_feed", Grid::reverse_line_feed),
+        ];
+        for (label, motion) in motions {
+            let mut grid = Grid::new(1, 1);
+            motion(&mut grid);
+            assert_eq!(grid.cursor(), Cursor::new(0, 0), "{label}");
+        }
     }
 
     // -------------------------------------------------------------------------

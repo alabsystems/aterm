@@ -33,7 +33,7 @@ fn bypass_busy() -> Vec<String> {
 /// The owner's process inputs, fixed.
 fn owner_env() -> ApprovalEnv {
     ApprovalEnv {
-        home: Some(PathBuf::from("/Users//_owner")),
+        home: Some(PathBuf::from("/Users/_owner")),
         uid: 502,
         tmpdir: None,
     }
@@ -431,7 +431,7 @@ fn turn_of_rows(rows: &[String]) -> Turn {
 fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let (ldir, ledger) = ledger_file("rm");
     let mut m = Mock::new(true, vec![bypass_busy(), rm_box(SCRATCH_RM), busy_screen()]);
-    m.cwd = Some("/Users//_owner/proj".to_string());
+    m.cwd = Some("/Users/_owner/proj".to_string());
     m.vanish_after = Some(0);
     let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
         s.set_approval_env(owner_env());
@@ -456,7 +456,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
 
     let usr = "S=/usr; rm -rf \"$S/t5\"";
     let mut m = Mock::new(true, vec![bypass_busy(), rm_box(usr)]);
-    m.cwd = Some("/Users//_owner/proj".to_string());
+    m.cwd = Some("/Users/_owner/proj".to_string());
     m.vanish_after = Some(0);
     let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
         s.set_approval_env(owner_env());
@@ -477,7 +477,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
         ("cwd unknown", None, bypass_busy()),
         (
             "outside a bypass session",
-            Some("/Users//_owner/proj"),
+            Some("/Users/_owner/proj"),
             busy_screen(),
         ),
     ] {
@@ -612,21 +612,37 @@ fn run_hosted_runs_until_it_is_stopped_and_clears_its_badge() {
     assert_eq!(hosted.policy.approvals, ApprovalToggles::default());
     assert!(hosted.resume.is_some() && hosted.mail.is_none());
 
+    // THE STOP IS RAISED ON EVIDENCE, never on a clock (2026-09-24): right
+    // after the loop has raised its badge for the question it read. A fixed
+    // 100 ms timer raced the whole first look — the sibling hand-over test lost
+    // exactly that race at load ~40 with 662 tests in the process — and this
+    // test's first assertion needs the escalation to land before the stop.
+    struct StopAfterBadge<'a> {
+        inner: &'a mut Mock,
+        stop: Arc<AtomicBool>,
+    }
+    impl Ctl for StopAfterBadge<'_> {
+        fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+            let r = self.inner.call(args);
+            if args.windows(3).any(|w| w == ["meta", "set", "attention"]) {
+                self.stop.store(true, Ordering::SeqCst);
+            }
+            r
+        }
+    }
     let mut m = Mock::new(true, vec![question_screen()]);
     m.stall_sleep = Some(Duration::from_millis(5));
     let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    let setter = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        flag.store(true, Ordering::SeqCst);
-    });
+    let mut ctl = StopAfterBadge {
+        inner: &mut m,
+        stop: Arc::clone(&stop),
+    };
     let mut out: Vec<u8> = Vec::new();
     let (ldir, ledger) = ledger_file("hosted");
-    let mut s = Session::new(&mut m, Some("@s-1".to_string()));
+    let mut s = Session::new(&mut ctl, Some("@s-1".to_string()));
     s.set_approval_ledger(Some(ledger));
     let started = Instant::now();
     let r = s.run_hosted(&hosted, stop, &mut out);
-    setter.join().expect("setter");
     assert_eq!(r, Ok(()));
     assert!(started.elapsed() < Duration::from_secs(5));
     let text = String::from_utf8(out).expect("utf-8");

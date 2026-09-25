@@ -234,15 +234,14 @@ fn sink_no_loss_proves_and_buggy_tail_drop_is_caught() {
 
 // ===========================================================================
 // Tier-0 IN TRUST — the SAME `ty_model!`-derived specs, now exhaustively
-// model-checked by the real Trust-bundled `ty` ($HOME/trust/first-party/ty). This is
+// model-checked by the real Trust-bundled `ty` (`aterm pkg install ty`). This is
 // the "TLA+ spec auto-generated from code and linked to it, model-checked by
 // Trust" guarantee: the model is Rust, `to_tla()` emits the spec, `ty check`
 // proves the invariant over the WHOLE bounded state space, and the Buggy=1 cfg
 // MUST yield a counterexample — so the invariant is non-trivial AND catches the
 // real defect. VERIFICATION GATE (honesty ratchet, batteries-on, see
 // `aterm_spec::verify`): verification is always required — an absent Trust `ty` FAILS
-// the test with a build hint (`cargo build --release -p tla-cli` in
-// $HOME/trust/first-party/ty).
+// the test with the install hint (`aterm pkg install ty`).
 // ===========================================================================
 
 use std::path::PathBuf;

@@ -99,20 +99,14 @@ fn s(p: &Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }
 
-/// A `pins.rs` in the exact two shapes the real anchor file uses. `setup` arms the empty
-/// one; `atpkg_master_pubkeys` in the producer library reads what it wrote back out.
+/// An unarmed `pins.rs` master anchor. `setup` arms it; `atpkg_master_pubkeys` in the
+/// producer library reads what it wrote back out.
 fn unarmed_pins() -> &'static str {
     "// Copyright 2026 Andrew Yates\n\
      // SPDX-License-Identifier: Apache-2.0\n\
      \n\
      /// The paper master. Empty here means INERT.\n\
-     pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n\
-     \n\
-     /// The channel keyset. ORDER IS A CONTRACT: index 0 is the head.\n\
-     pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\n\
-     \x20   // K1 — HEAD.\n\
-     \x20   \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n\
-     ];\n"
+     pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n"
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +274,6 @@ struct Prefix {
     roster: PathBuf,
     spec: PathBuf,
     out: PathBuf,
-    counter: PathBuf,
     /// The paper master's public key — the ONE key a client pins, and therefore the only
     /// argument `verify-index` will accept.
     master_pub: String,
@@ -317,7 +310,6 @@ impl Prefix {
 
         Self {
             out: home.join("out"),
-            counter: home.join("index_counter"),
             home,
             pins,
             roster,
@@ -344,7 +336,6 @@ impl Prefix {
             .env("OUT", &self.out)
             .env("ROSTER", &self.roster)
             .env("PINS_FILE", &self.pins)
-            .env("INDEX_COUNTER_FILE", &self.counter)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (k, v) in extra {
@@ -395,7 +386,6 @@ impl Prefix {
             .env("INDEX_BUILD", INDEX_BUILD)
             .env("ALLOW_NO_BASELINE", "1")
             .env("PINS_FILE", &self.pins)
-            .env("INDEX_COUNTER_FILE", &self.counter)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (k, v) in extra {
@@ -609,71 +599,6 @@ fn the_real_producer_emits_a_quad_the_real_client_accepts() {
         "{}",
         text(&verified)
     );
-}
-
-/// THE VENDOR-DIRECT CUTOVER (design 2026-09-22 §1.9), producer to client. A spec row
-/// marked `vendor-direct` makes the real producer emit the program's row and no pin, and
-/// the real client authorizes that quad, keeps the row (a newer client reads the version of
-/// the legacy build it runs through `Index::program`) and decides `NotPinned` for an
-/// installed legacy build — the decision that leaves it alone on a client older than the
-/// vendor lane. A version yank rides the channel as written and yanks no build.
-#[test]
-fn a_vendor_direct_row_is_kept_unpinned_and_the_real_client_leaves_it_alone() {
-    let prefix = Prefix::provision("vendor-direct");
-    std::fs::write(
-        &prefix.spec,
-        "ay ay prebuilt-only 6255\nclaude aterm prebuilt-only - - vendor-direct\n",
-    )
-    .expect("program spec");
-    let out = prefix.run_indexer(&tracked_indexer(), &[("YANKED", "claude@2.1.281")]);
-    assert!(
-        out.status.success(),
-        "a vendor-direct spec must publish:\n{}",
-        text(&out)
-    );
-    let verified = prefix.client_verify();
-    assert!(
-        verified.status.success(),
-        "the shipping client verifier must accept the cutover quad:\n{}",
-        text(&verified)
-    );
-
-    let read = |name: &str| std::fs::read(prefix.out.join(name)).expect(name);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_secs();
-    let roster = atpkg::admit_roster(
-        &atpkg::Anchor::of(vec![prefix.master_pub.clone()], 0),
-        read("aterm-machines.toml"),
-        &read("aterm-machines.toml.sig"),
-        i64::try_from(now).expect("seconds fit an i64"),
-    )
-    .expect("the client admits the roster");
-    let (index, _) = roster
-        .authorize_index(read("index.toml"), &read("index.toml.sig"))
-        .expect("the client authorizes the cutover index");
-    assert_eq!(
-        index.program("claude").map(|p| p.repo.as_str()),
-        Some("aterm"),
-        "claude's row is kept, on the index repo"
-    );
-    let channel = index
-        .channel_for("stable", "aarch64-apple-darwin")
-        .expect("the stable channel");
-    assert_eq!(channel.pin.get("ay"), Some(&6255));
-    assert_eq!(
-        channel.pin.get("claude"),
-        None,
-        "a vendor-direct row pins nothing"
-    );
-    assert_eq!(
-        atpkg::decide(&channel, "claude", Some(2_026_092_201)),
-        atpkg::ApplyDecision::NotPinned,
-        "an installed legacy claude is no longer part of the channel: left alone"
-    );
-    assert_eq!(channel.yanked, vec!["claude@2.1.281".to_string()]);
-    assert!(!atpkg::is_yanked(&channel, "claude", 2_026_092_201));
 }
 
 // ===========================================================================
@@ -908,46 +833,37 @@ fn an_unarmed_anchor_stops_the_publish_rather_than_signing_into_the_void() {
 // (c) THE MIRROR. A public release without the roster authorizes nothing.
 // ===========================================================================
 
-/// A stub `gh` that serves releases out of a fixture directory, so the mirror's real
-/// control flow runs with no network and no credentials. It implements exactly the two
-/// call shapes the mirror makes before it would need either.
-fn stub_gh(dir: &Path, fixtures: &Path) -> PathBuf {
+/// Stubs for the mirror's two transports, so its real control flow runs with no network
+/// and no credentials: `curl` is the download host and answers 404 for everything (no pack
+/// is public yet), and `gh` answers every staging download with "no release" — the first
+/// thing the mirror does AFTER the quad verified.
+fn stub_transports(dir: &Path) -> PathBuf {
     let bin = dir.join("stub-bin");
     std::fs::create_dir_all(&bin).expect("stub bin dir");
-    let gh = bin.join("gh");
-    std::fs::write(
-        &gh,
-        format!(
+    use std::os::unix::fs::PermissionsExt as _;
+    for (name, body) in [
+        (
+            "gh",
             "#!/usr/bin/env bash\n\
-             # Test double for `gh`: serves release assets from a fixture tree.\n\
-             set -uo pipefail\n\
-             FIX=\"{fixtures}\"\n\
-             if [[ \"${{1:-}}\" == release && \"${{2:-}}\" == download ]]; then\n\
-             \ttag=\"$3\"; shift 3; dir=\"\"; pats=()\n\
-             \twhile [[ $# -gt 0 ]]; do\n\
-             \t\tcase \"$1\" in\n\
-             \t\t\t-D) dir=\"$2\"; shift 2 ;;\n\
-             \t\t\t-R) shift 2 ;;\n\
-             \t\t\t-p) pats+=(\"$2\"); shift 2 ;;\n\
-             \t\t\t*) shift ;;\n\
-             \t\tesac\n\
-             \tdone\n\
-             \t[[ -d \"$FIX/$tag\" ]] || {{ echo \"stub gh: no release $tag\" >&2; exit 1; }}\n\
-             \tmkdir -p \"$dir\"\n\
-             \tif [[ ${{#pats[@]}} -eq 0 ]]; then\n\
-             \t\tcp \"$FIX/$tag\"/* \"$dir\"/ 2>/dev/null || true\n\
-             \telse\n\
-             \t\tfor p in \"${{pats[@]}}\"; do [[ -e \"$FIX/$tag/$p\" ]] && cp \"$FIX/$tag/$p\" \"$dir\"/; done\n\
-             \tfi\n\
-             \texit 0\n\
+             # Test double for `gh`: no staging release exists.\n\
+             if [[ \"${1:-} ${2:-}\" == \"release download\" ]]; then\n\
+             \techo \"stub gh: no release $3\" >&2; exit 1\n\
              fi\n\
              exit 1\n",
-            fixtures = fixtures.display()
         ),
-    )
-    .expect("write the stub");
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        (
+            "curl",
+            "#!/usr/bin/env bash\n\
+             # Test double for the download host: nothing is public.\n\
+             out=\"\"; while (( $# )); do [[ \"$1\" == -o ]] && out=\"$2\"; shift; done\n\
+             [[ -z \"$out\" || \"$out\" == /dev/null ]] || : > \"$out\"\n\
+             printf 404\n",
+        ),
+    ] {
+        std::fs::write(bin.join(name), body).expect("write the stub");
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+    }
     bin
 }
 
@@ -964,45 +880,32 @@ fn run_mirror(prefix: &Prefix, stub_bin: &Path) -> Output {
         .env("HOME", &prefix.home)
         .env("ATPKG", atpkg_bin())
         .env("PINS_FILE", &prefix.pins)
-        .env("INDEX_BUILD", INDEX_BUILD)
+        .env("INDEX_DIR", &prefix.out)
         .env("SRC_ACCOUNT", "synthetic-src")
         .env("DST_ACCOUNT", "synthetic-dst")
-        .env("INDEX_REPO", "aterm")
         .env("DRY_RUN", "1")
+        .env("GH_RETRY_SLEEP", "0")
         .env("DST_TOKEN_FILE", prefix.home.join("no-token"))
         .output()
         .expect("bash runs the mirror")
 }
 
-/// THE MIRROR MUST CARRY THE ROSTER, AND MUST SAY SO WHEN IT CANNOT.
+/// THE MIRROR MUST SEE THE WHOLE QUAD, AND MUST SAY SO WHEN IT CANNOT.
 ///
-/// A mirror that dropped the pair would publish a public release that yields the client no
-/// candidate at all — every install and every update resolving `NoIndex`, with the mirror
-/// reporting success. So: with the quad present the mirror verifies it through the real
-/// client chain and moves on to the packages; with the pair removed it stops dead, names
-/// the missing asset, and says what to re-run.
+/// The mirror runs over the quad the indexer just signed, before the index is published. A
+/// quad without its roster pair is one no client can authorize, so publishing its packs
+/// would be the first half of an outage that reports success. So: with the quad present the
+/// mirror verifies it through the real client chain and moves on to the packages; with the
+/// pair removed it stops dead, names the missing asset, and says what to re-run.
 #[test]
-fn the_mirror_refuses_a_source_release_that_lost_its_roster() {
+fn the_mirror_refuses_a_quad_that_lost_its_roster() {
     let prefix = Prefix::provision("mirror-roster");
     assert!(prefix.run_indexer(&tracked_indexer(), &[]).status.success());
-
-    // The staged publish set IS the source release.
-    let fixtures = prefix.home.join("releases");
-    let tag_dir = fixtures.join(format!("atpkg-index-{INDEX_BUILD}"));
-    std::fs::create_dir_all(&tag_dir).expect("fixture release dir");
-    for asset in [
-        "index.toml",
-        "index.toml.sig",
-        "aterm-machines.toml",
-        "aterm-machines.toml.sig",
-    ] {
-        std::fs::copy(prefix.out.join(asset), tag_dir.join(asset)).expect("stage the asset");
-    }
-    let stub = stub_gh(&prefix.home, &fixtures);
+    let stub = stub_transports(&prefix.home);
 
     // POSITIVE CONTROL FIRST, so the refusal below is about the roster and not about the
     // harness. With all four assets the mirror verifies the quad through the client chain
-    // and proceeds to the packages, where the stub has no fixture — a LATER, different
+    // and proceeds to the packages, where no staging release exists — a LATER, different
     // failure.
     let ok = run_mirror(&prefix, &stub);
     let log = text(&ok);
@@ -1017,8 +920,8 @@ fn the_mirror_refuses_a_source_release_that_lost_its_roster() {
     );
 
     // NOW DROP THE PAIR. Nothing else changes.
-    std::fs::remove_file(tag_dir.join("aterm-machines.toml")).unwrap();
-    std::fs::remove_file(tag_dir.join("aterm-machines.toml.sig")).unwrap();
+    std::fs::remove_file(prefix.out.join("aterm-machines.toml")).unwrap();
+    std::fs::remove_file(prefix.out.join("aterm-machines.toml.sig")).unwrap();
 
     let out = run_mirror(&prefix, &stub);
     assert!(!out.status.success(), "{}", text(&out));
@@ -1121,8 +1024,8 @@ fn the_documented_default_layout_publishes_and_self_verifies() {
 /// uploaded. An unreadable stamp is not the milder case — `sig.rs` treats what it cannot
 /// parse as LAPSED, not as absent, so `valid_until = "next tuesday"` is equally dead.
 ///
-/// The refusal must land before the signature, because the upload consumes a tag and bumps
-/// the monotonic counter: discovering this afterwards costs a build number.
+/// The refusal must land before the signature, because the upload consumes a tag:
+/// discovering this afterwards costs an index number.
 #[test]
 fn a_lapsed_or_malformed_horizon_never_reaches_a_signature() {
     let prefix = Prefix::provision("horizon");
@@ -1238,14 +1141,13 @@ fn a_roster_older_than_the_published_generation_is_refused() {
     assert!(text(&ok).contains("self-check — OK"), "{}", text(&ok));
 }
 
-/// A BASELINE FROM BEFORE THE ROSTER SCHEME CANNOT BE FLOORED, AND MUST SAY SO.
+/// A BASELINE FROM BEFORE THE ROSTER SCHEME IS REFUSED.
 ///
-/// The first index published under the roster scheme has a schema-1 baseline with no
-/// `roster_seq` — a real transition state, so it cannot be fatal. But it is also exactly
-/// what a wrong-file baseline looks like, and this is the gate that would otherwise have
-/// caught that, so the run must not pass in silence.
+/// Every index this channel has published since the single-root move carries `roster_seq`;
+/// a baseline without one is the retired schema or the wrong file, and either way the
+/// roster floor cannot be enforced from it. One sentence, before anything is signed.
 #[test]
-fn a_baseline_with_no_roster_generation_warns_rather_than_flooring_silently() {
+fn a_pre_roster_baseline_is_refused() {
     let prefix = Prefix::provision("roster-floor-absent");
     let baseline = prefix.home.join("baseline-schema1.toml");
     std::fs::write(
@@ -1260,12 +1162,15 @@ fn a_baseline_with_no_roster_generation_warns_rather_than_flooring_silently() {
 
     let out = prefix.run_indexer(&tracked_indexer(), &[("BASELINE", &s(&baseline))]);
     let log = text(&out);
-    assert!(out.status.success(), "{log}");
+    assert!(!out.status.success(), "{log}");
     assert!(
-        log.contains("BASELINE has no 'roster_seq' line"),
-        "the missing floor must be announced, not assumed benign:\n{log}"
+        log.contains("pre-roster schema is retired"),
+        "the refusal must say what the baseline is:\n{log}"
     );
-    assert!(log.contains("self-check — OK"), "{log}");
+    assert!(
+        !prefix.out.join("index.toml").exists(),
+        "refused before signing"
+    );
 }
 
 /// A REVOKED MACHINE IS TOLD IT IS REVOKED — not told to re-join.
@@ -1312,35 +1217,39 @@ fn a_revoked_machine_is_diagnosed_as_revoked_and_not_sent_to_rejoin() {
 /// These scripts publish to a PUBLIC repo, and their output is routinely pasted into
 /// release notes and issues. A machine id or a public key in a log line is already in the
 /// signed bytes and is fine; an absolute path under `$HOME` carries the operator's account
-/// name and is in no signed document. The counter line was the leak that mattered most —
-/// it is the LAST line of every successful upload.
+/// name and is in no signed document. The upload path is driven to its last line, where
+/// the paths it touched (the output dir, the channel token) have all been printed.
 #[test]
 fn a_successful_publish_prints_no_absolute_home_path() {
     let prefix = Prefix::provision("no-home-leak");
-    // Put the counter and the output under $HOME, so there is something to leak; and drive
-    // the upload path, since the counter line only prints after a successful release.
+    // Put the output and the channel token under $HOME, so there is something to leak; and
+    // drive the upload path to its last line. gh: `release view` answers "no such release"
+    // (a fresh tag — the indexer compares an existing one and never clobbers it), anything
+    // else succeeds. curl: the download host answers 302 for the published index. The pack
+    // mirror is a stub (its own suite, tools/test-atpkg-mirror-extras.sh, drives it).
     let bin = prefix.home.join("gh-stub");
     std::fs::create_dir_all(&bin).expect("stub dir");
-    // `release view` answers "no such release", as the real gh does for a fresh tag: the
-    // indexer probes the tag before creating it and never clobbers an existing one
-    // (2026-09-12), so a stub that says yes to everything reads as a half-created
-    // release and the upload is refused before the counter line this test needs.
-    std::fs::write(
-        bin.join("gh"),
-        "#!/usr/bin/env bash\ncase \"$1 $2\" in 'release view') exit 1 ;; esac\nexit 0\n",
-    )
-    .expect("stub gh");
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, body) in [
+        (
+            "gh",
+            "#!/usr/bin/env bash\ncase \"$1 $2\" in 'release view') exit 1 ;; esac\nexit 0\n",
+        ),
+        ("curl", "#!/usr/bin/env bash\nprintf 302\n"),
+        ("mirror", "#!/usr/bin/env bash\nexit 0\n"),
+    ] {
+        std::fs::write(bin.join(name), body).expect("stub");
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let token = prefix.home.join(".secrets/gh_access_token_alabsystems");
+    std::fs::create_dir_all(token.parent().unwrap()).expect("token dir");
+    std::fs::write(&token, "stub-token\n").expect("token");
 
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let counter = prefix.home.join(".config/atpkg/index_build");
-    std::fs::create_dir_all(counter.parent().unwrap()).expect("counter dir");
-    std::fs::write(&counter, "20\n").expect("counter");
 
     let mut cmd = Command::new("bash");
     cmd.arg(tracked_indexer())
@@ -1353,20 +1262,21 @@ fn a_successful_publish_prints_no_absolute_home_path() {
         .env("CHANNEL", "stable")
         .env("VALID_UNTIL", FAR_FUTURE)
         .env("ALLOW_NO_BASELINE", "1")
+        .env("INDEX_BUILD", "20")
         .env("OUT", prefix.home.join("leak-out"))
         .env("ROSTER", &prefix.roster)
         .env("PINS_FILE", &prefix.pins)
-        .env("INDEX_COUNTER_FILE", &counter)
+        .env("MIRROR", bin.join("mirror"))
         .env("UPLOAD", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = cmd.output().expect("bash runs the producer");
     let log = text(&out);
     assert!(out.status.success(), "{log}");
-    // The counter line is the one that prints only on success — prove it ran.
+    // The publish line is the last one a successful upload prints — prove it ran.
     assert!(
-        log.contains("bumped 20 -> 21 (post-success)"),
-        "the post-success counter line must have printed:\n{log}"
+        log.contains("published atpkg-index-20 to alabsystems/aterm"),
+        "the publish line must have printed:\n{log}"
     );
     let home = prefix.home.to_str().expect("utf-8 scratch path");
 

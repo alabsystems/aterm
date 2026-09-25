@@ -118,10 +118,34 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
     })
 }
 
+/// `sessions bridge`: the same local-id, stable-sid and launch-nonce triples
+/// as the public `sessions` roster, without its placement hop or per-session
+/// terminal, metadata and timeline reads. The Fabric bridge asks every two
+/// seconds and uses only these three fields to fence admission and status.
+pub(crate) fn cmd_sessions_bridge(store: &Store) -> String {
+    use std::fmt::Write as _;
+
+    let rows = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .bridge_roster();
+    let mut out = format!("OK {}\n", rows.len());
+    for (local, sid, nonce) in rows {
+        writeln!(
+            &mut out,
+            "{local} {} nonce={}",
+            sid.as_str(),
+            nonce.to_hex()
+        )
+        .expect("writing to String cannot fail");
+    }
+    out
+}
+
 /// `sessions status`: a Lines-framed roster of the status fields the Fabric
 /// bridge consumes, including the server's agent verdict. One wake replaces one
 /// wake per hosted session on each bridge roster round. The bridge validates
-/// every row's sid and launch nonce against its own preceding `sessions` read.
+/// every row's sid and launch nonce against its own preceding `sessions bridge` read.
 pub(crate) fn cmd_sessions_status(proxy: &EventLoopProxy<Wake>) -> String {
     match super::control_media::call_main(proxy, |reply| Wake::ReadSessionStatuses { reply }) {
         Ok(rows) => rows,
@@ -4020,6 +4044,53 @@ mod tests {
         let meta_at = fields.iter().position(|f| f.starts_with("meta=")).unwrap();
         let nonce_at = fields.iter().position(|f| f.starts_with("nonce=")).unwrap();
         assert_eq!(nonce_at, meta_at + 1, "{row}");
+    }
+
+    /// The bridge projection must agree with the public roster on all three
+    /// identity fields, while staying answerable behind locks the public
+    /// roster reads. No event-loop proxy enters `cmd_sessions_bridge`, so it
+    /// cannot ask the main thread for placement either.
+    #[test]
+    fn bridge_roster_matches_public_identities_without_per_session_locks() {
+        let store = crate::session_store::new_store();
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let t1 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let h0 = handle(9, &t0);
+        let h1 = handle(2, &t1);
+        {
+            let mut g = store.write().unwrap();
+            g.register(h0.clone());
+            g.register(h1.clone());
+        }
+        let full = cmd_sessions_store(&store, None);
+        let expected: Vec<String> = full
+            .lines()
+            .skip(1)
+            .map(|row| {
+                let mut cols = row.split_whitespace();
+                let local = cols.next().unwrap();
+                let sid = cols.next().unwrap();
+                let nonce = cols.find(|tok| tok.starts_with("nonce=")).unwrap();
+                format!("{local} {sid} {nonce}")
+            })
+            .collect();
+        assert_eq!(expected.len(), 2);
+
+        let _term = t0.lock().unwrap();
+        let _meta = h0.ctx.meta.lock().unwrap();
+        let _timeline = h0.ctx.timeline.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(cmd_sessions_bridge(&store));
+        });
+        let bridge = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("identity-only roster must not wait on terminal, meta or timeline");
+        let mut lines = bridge.lines();
+        assert_eq!(lines.next(), Some("OK 2"));
+        assert_eq!(lines.map(str::to_string).collect::<Vec<_>>(), expected);
+        assert!(!bridge.contains("window=") && !bridge.contains("detail="));
+        worker.join().unwrap();
     }
 
     /// `detail=` is the sanitized executing command (no arguments), `-` when

@@ -8,7 +8,8 @@
 // bar <= 2 — so the suite-wide <= 8 can never mask decay. Also covered:
 //   * an opaque SIXEL inline image hides the sprite on BOTH backends (the
 //     pass-1c / emit_base_pre under-image slot);
-//   * empty cat fields are byte-identical on the GPU, also after clear_overlays;
+//   * empty cat fields are byte-identical on the GPU, also after clear_overlays
+//     (the cat row of `tests/empty_channels_gpu.rs`);
 //   * the damaged/cached path repaints a moved cat with no ghosting (cached ==
 //     fresh, byte-for-byte per backend) and a SETTLED cat (equal quads + same
 //     atlas version) takes the dirty gate.
@@ -263,52 +264,6 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
         gpu.render_input(&mut win, &moved, None).pixels,
         gpu_base.pixels,
         "control: the uncovered cat must paint on the GPU"
-    );
-}
-
-/// Empty cat fields are byte-identical on the GPU — including an atlas with no
-/// quads (uploads but draws nothing) and a populated input after
-/// `clear_overlays` (the `image plain` contract).
-#[test]
-fn empty_cat_fields_byte_identical_on_gpu() {
-    let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    // Cell metrics for quad geometry (the GPU shares the CPU face's metrics).
-    let (_, ch) = cpu.cell_size();
-    let mut term = Terminal::new(3, 10);
-    term.process(b"\x1b[?25lkitty");
-
-    let base = gpu
-        .render_input(&mut win, &term.cell_frame(3, 10), None)
-        .pixels;
-
-    let mut atlas_only = term.cell_frame(3, 10);
-    atlas_only.cat_atlas = Some(Arc::new(cat_atlas(1)));
-    assert!(atlas_only.cat_quads.is_empty());
-    let atlas_only_px = gpu.render_input(&mut win, &atlas_only, None).pixels;
-    assert_eq!(
-        base, atlas_only_px,
-        "a cat atlas with no quads must be byte-identical on the GPU"
-    );
-
-    let mut cleared = term.cell_frame(3, 10);
-    cleared.cat_atlas = Some(Arc::new(cat_atlas(1)));
-    cleared.cat_quads = vec![quad_1to1(
-        1,
-        [0, ch as u16, 24, (ch as u16).min(32)],
-        [0, 0],
-        255,
-    )];
-    let painted = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_ne!(base, painted, "a non-empty cat must paint on the GPU");
-    cleared.clear_overlays();
-    let stripped = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_eq!(
-        base, stripped,
-        "clear_overlays must restore the bare GPU frame (quads cleared, atlas nulled)"
     );
 }
 

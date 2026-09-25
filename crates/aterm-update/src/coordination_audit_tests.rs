@@ -13,9 +13,8 @@ use crate::checker_skip;
 use crate::health::Health;
 use crate::paths::Staging;
 
-/// The web lane's base — the interval every process on the public channel is
-/// actually deduped against once its lane is known.
-const WEB_BASE: Duration = Duration::from_secs(crate::cadence::WEB_INTERVAL_SECS);
+/// The check's one base interval — what every process is deduped against.
+const BASE: Duration = Duration::from_secs(crate::cadence::INTERVAL_SECS);
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -67,11 +66,11 @@ fn an_apply_lane_ledger_write_is_not_a_completed_check() {
     // window — so this cycle owes the channel a check.
     write_check_ledger(
         &s,
-        WEB_BASE.as_secs() * 8 / 10,
+        BASE.as_secs() * 8 / 10,
         "up to date (channel head v0.85.0)",
     );
     assert!(
-        checker_skip(&s, WEB_BASE).is_none(),
+        checker_skip(&s, BASE).is_none(),
         "precondition: a check stamp past the window does not defer"
     );
 
@@ -84,7 +83,7 @@ fn an_apply_lane_ledger_write_is_not_a_completed_check() {
          terminal was left untouched",
     );
     assert!(
-        checker_skip(&s, WEB_BASE).is_none(),
+        checker_skip(&s, BASE).is_none(),
         "an apply FAILURE is not a completed check: the sibling checkers must not \
          hold off the channel for another window because of it"
     );
@@ -97,7 +96,7 @@ fn an_apply_lane_ledger_write_is_not_a_completed_check() {
         "installed 0.85.0 (build 1789363090); activating now",
     );
     assert!(
-        checker_skip(&s, WEB_BASE).is_none(),
+        checker_skip(&s, BASE).is_none(),
         "a successful apply is not a completed check either: the freshly execed \
          build's first check must not be deferred by its own activation record"
     );
@@ -107,10 +106,7 @@ fn an_apply_lane_ledger_write_is_not_a_completed_check() {
 /// FINDING: a check stamp AHEAD of the clock defers every checker on the machine
 /// until the wall clock catches up.
 ///
-/// The hold path bounds its epoch against `min(updated_at, now)` precisely because
-/// "a stamp written by a clock that was later corrected backwards" must not be
-/// honoured (`ledger_hold`). The base window has no such bound: `rfc3339_older_than`
-/// answers `false` for any future stamp, so a ledger written by a fast clock — a
+/// `rfc3339_older_than` answers `false` for any future stamp, so a ledger written by a fast clock — a
 /// VM restored from a snapshot, an RTC corrected by NTP after boot — is "fresh"
 /// until real time passes it, and because every loop skips, nothing overwrites it.
 #[test]
@@ -130,7 +126,7 @@ outcome = \"up to date\"
     )
     .expect("write ledger");
     assert!(
-        checker_skip(&s, WEB_BASE).is_none(),
+        checker_skip(&s, BASE).is_none(),
         "a stamp six hours in the future is a clock fault, not a fresh check — \
          honouring it parks every checker on this machine for six hours"
     );

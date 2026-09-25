@@ -32,24 +32,6 @@
 //! roster bytes, which fail admission — fail-closed, and the next successful fetch
 //! replaces it.
 //!
-//! # The IDENTITY beside each entry is what turns this from a fallback into a hit path
-//!
-//! Each entry additionally records the `identity` of the release assets its bytes were
-//! downloaded from — an opaque, fixed-width fingerprint the FETCHER computes
-//! ([`crate::flow::Fetcher::index_identities`]). It exists so a resolve can ask the cheap
-//! question ("are the four blobs I already hold still the four blobs the source is
-//! publishing?") instead of the expensive one ("give me all sixteen blobs again"), which
-//! is what [`IndexCache::load_if_identical`] answers.
-//!
-//! It is a CHANGE DETECTOR, not a trust input, and the distinction is the whole safety
-//! argument. A matching identity does not make cached bytes trusted — they are handed to
-//! [`crate::select::select_index`] exactly as freshly-downloaded bytes are, and face the
-//! same master-signed roster admission, the same machine-signature check, the same
-//! durable floor and the same `valid_until` window. A NON-matching identity is not a
-//! failure either: it simply falls through to the historical download. So the worst a
-//! wrong identity can do — a collision, a host that froze it, a locally-tampered cache —
-//! is serve bytes that were already published and already pass every gate, i.e. exactly
-//! the suppression an authority serving the index could always perform by withholding.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,11 +55,6 @@ const MAX_CACHED_ROSTER_BYTES: usize = 65_536;
 /// ceiling, not a fit. Enforced on BOTH sides — see `store` and `read_doc`.
 const MAX_CACHED_LABEL_BYTES: usize = 512;
 const MAX_INDEX_CACHE_BYTES: usize = 144 * 1024 * 1024;
-/// Bound on one entry's `identity` string. The production fingerprint is a 64-char
-/// hex digest ([`crate::net`]); the ceiling is generous so a future fetcher can use a
-/// longer form, and small enough that a hostile cache cannot spend the document budget
-/// on identities alone.
-const MAX_CACHED_IDENTITY_BYTES: usize = 256;
 
 /// One cached index candidate: its label + base64 index/sig bytes + the master-signed
 /// roster published beside it.
@@ -95,14 +72,6 @@ struct CachedCandidate {
     roster_b64: String,
     #[serde(default)]
     roster_sig_b64: String,
-    /// The fetcher-computed fingerprint of the release assets these bytes came from.
-    /// `#[serde(default)]` for the same reason the roster fields are: a cache written
-    /// by an older build still DECODES, and decodes to an EMPTY identity, which
-    /// [`IndexCache::load_if_identical`] refuses to match — so a legacy cache keeps
-    /// working as the failure-only fallback it always was, and is upgraded in place by
-    /// the next successful fetch. EMPTY IS NEVER A MATCH.
-    #[serde(default)]
-    identity: String,
 }
 
 /// The on-disk cache document.
@@ -160,23 +129,12 @@ impl IndexCache {
         }
     }
 
-    /// Persist `candidates` tagged with `source_id`, each stamped with the matching
-    /// entry of `identities` (the fetcher's fingerprint of the assets the bytes came
-    /// from; pass `&[]` when the fetcher cannot supply one). Never clobbers a good cache
-    /// with an empty "success" (an empty candidate set is not stored). Best-effort — any
-    /// error is swallowed so a cache-write failure never fails an install. Written `0600`
-    /// via temp + rename so a reader never sees a half-written cache; a failure of either
-    /// step unlinks the temp rather than stranding it at the prefix root.
-    ///
-    /// The identities are stored ONLY when they line up 1:1 with the bytes they describe
-    /// and every one is present and bounded. Anything else stores EMPTY identities, which
-    /// no [`IndexCache::load_if_identical`] can match — the optimization simply does not
-    /// engage, and the entry stays a perfectly good failure-time fallback. That guard is
-    /// the binding: an identity that described some OTHER candidate set is the one way
-    /// this could serve bytes the source is no longer publishing, so a mismatch in COUNT
-    /// (the only way the pairing can silently slip) refuses the whole vector rather than
-    /// zipping a prefix.
-    pub fn store(&self, source_id: &str, candidates: &[Candidate], identities: &[String]) {
+    /// Persist `candidates` tagged with `source_id`. Never clobbers a good cache with an
+    /// empty "success" (an empty candidate set is not stored). Best-effort — any error is
+    /// swallowed so a cache-write failure never fails an install. Written `0600` via temp +
+    /// rename so a reader never sees a half-written cache; a failure of either step unlinks
+    /// the temp rather than stranding it at the prefix root.
+    pub fn store(&self, source_id: &str, candidates: &[Candidate]) {
         if candidates.is_empty()
             || candidates.len() > MAX_CACHE_CANDIDATES
             || candidates.iter().any(|candidate| {
@@ -189,18 +147,6 @@ impl IndexCache {
         {
             return; // never overwrite a good cache with an empty success
         }
-        // Pair-or-nothing (see the doc above): an identity vector that does not line up
-        // exactly with `candidates` is dropped WHOLE, so `paired.get(i)` can only ever yield
-        // the fingerprint of the very bytes on the same row.
-        let paired: &[String] = if identities.len() == candidates.len()
-            && identities
-                .iter()
-                .all(|id| !id.is_empty() && id.len() <= MAX_CACHED_IDENTITY_BYTES)
-        {
-            identities
-        } else {
-            &[]
-        };
         let doc = CacheDoc {
             schema: CACHE_SCHEMA,
             source: source_id.to_string(),
@@ -213,7 +159,7 @@ impl IndexCache {
                 // drops the write exactly like the `to_string` failure below —
                 // never a panic, and never a half-encoded document.
                 let mut rows = Vec::with_capacity(candidates.len());
-                for (i, c) in candidates.iter().enumerate() {
+                for c in candidates {
                     let (Ok(index_b64), Ok(sig_b64), Ok(roster_b64), Ok(roster_sig_b64)) = (
                         aterm_codec::base64::encode(&c.index_bytes),
                         aterm_codec::base64::encode(&c.sig),
@@ -228,7 +174,6 @@ impl IndexCache {
                         sig_b64,
                         roster_b64,
                         roster_sig_b64,
-                        identity: paired.get(i).cloned().unwrap_or_default(),
                     });
                 }
                 rows
@@ -308,7 +253,7 @@ impl IndexCache {
     /// The release LABELS of the candidates cached for `source_id`, newest first, under the
     /// same guards as [`Self::load`] and without decoding a byte of them. A label is
     /// diagnostics, never trust: `doctor` reads it to say which index the last pass that
-    /// reached the listing downloaded, never to decide anything. Read-only — no lock, no
+    /// reached the channel downloaded, never to decide anything. Read-only — no lock, no
     /// write, no repair; `None` on anything [`Self::load`] would refuse.
     #[must_use]
     pub fn labels(&self, source_id: &str) -> Option<Vec<String>> {
@@ -321,51 +266,8 @@ impl IndexCache {
         )
     }
 
-    /// The HIT PATH: the cached candidates IFF the same-source guard passes AND every
-    /// entry's stored `identity` equals `live` — the identity of the candidate set the
-    /// source is publishing RIGHT NOW, in the same order.
-    ///
-    /// # Why this is exactly as safe as the failure-time fallback
-    ///
-    /// It returns the same kind of thing `load` returns: RAW BYTES. They go to
-    /// [`crate::select::select_index`] unchanged, so the master-signed roster admission,
-    /// the machine signature over the index, the durable `index_build` floor, the
-    /// `roster_seq` ratchet and the `valid_until` freshness window all run identically.
-    /// Nothing here decides that anything is trusted; it decides only that re-downloading
-    /// sixteen assets to obtain bytes we can prove are the same sixteen assets is work
-    /// with no product.
-    ///
-    /// Refuses — i.e. falls through to the download — on EVERY ambiguity: an empty `live`
-    /// (a fetcher that cannot answer cheaply), a different candidate COUNT, any entry
-    /// whose stored identity is empty (a legacy cache), and any positional mismatch. The
-    /// failure direction is "pay the historical cost", never "serve the wrong bytes".
-    #[must_use]
-    pub fn load_if_identical(&self, source_id: &str, live: &[String]) -> Option<Vec<Candidate>> {
-        if live.is_empty() {
-            return None;
-        }
-        let doc = self.read_doc(source_id)?;
-        if doc.candidate.len() != live.len() {
-            return None;
-        }
-        // ORDER MATTERS. `index_candidates` yields candidates newest-first and the
-        // identity vector is built from the same walk in the same order, so comparing
-        // positionally is comparing like with like; a set that merely PERMUTED would be a
-        // different publication state and is refused.
-        if doc
-            .candidate
-            .iter()
-            .zip(live)
-            .any(|(c, id)| c.identity.is_empty() || c.identity.as_str() != id.as_str())
-        {
-            return None;
-        }
-        decode(doc)
-    }
-
     /// Read + parse the cache document, applying the same-source guard, the candidate
-    /// count bound and the per-entry identity ceiling. Shared by both readers so they
-    /// cannot drift on what a readable, admissible cache document is.
+    /// count bound and the per-entry label ceiling.
     fn read_doc(&self, source_id: &str) -> Option<CacheDoc> {
         let text = crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_INDEX_CACHE_BYTES)
             .ok()?;
@@ -385,20 +287,18 @@ impl IndexCache {
         if doc.source != source_id || doc.candidate.len() > MAX_CACHE_CANDIDATES {
             return None; // SAME-SOURCE GUARD: a dir: cache never satisfies a github: fetch
         }
-        // These are READ-path bounds, not merely the write-path ones in `store`: the
-        // hostile document is by definition one we did NOT write, so a ceiling checked
-        // only on the way out is checked in the one place it cannot matter. Every other
-        // per-entry field is bounded in `decode`, which would leave `identity` and `label`
-        // as the only unbounded strings in the document — MAX_CACHE_CANDIDATES of them
-        // could then spend the whole MAX_INDEX_CACHE_BYTES budget on those two fields
-        // alone, which is exactly what that constant's doc comment promises is impossible.
-        // `label` matters most: it is the one that survives decoding into the returned
-        // candidate. Both are checked HERE rather than in `decode` so the refusal costs no
-        // base64 work, and so it covers `load` and `load_if_identical` alike.
-        // Fail-closed on the WHOLE document, as an oversize blob already does.
-        if doc.candidate.iter().any(|c| {
-            c.identity.len() > MAX_CACHED_IDENTITY_BYTES || c.label.len() > MAX_CACHED_LABEL_BYTES
-        }) {
+        // A READ-path bound, not merely the write-path one in `store`: the hostile
+        // document is by definition one we did NOT write, so a ceiling checked only on the
+        // way out is checked in the one place it cannot matter. Every other per-entry field
+        // is bounded in `decode`, which would leave `label` — the one string that survives
+        // decoding into the returned candidate — unbounded. Checked HERE rather than in
+        // `decode` so the refusal costs no base64 work. Fail-closed on the WHOLE document,
+        // as an oversize blob already does.
+        if doc
+            .candidate
+            .iter()
+            .any(|c| c.label.len() > MAX_CACHED_LABEL_BYTES)
+        {
             return None;
         }
         Some(doc)
@@ -460,7 +360,7 @@ mod tests {
     fn store_then_load_same_source_round_trips() {
         let p = tmp("rt");
         let c = IndexCache::new(p.clone());
-        c.store("github:o/r", &[cand("v1"), cand("v0")], &[]);
+        c.store("github:o/r", &[cand("v1"), cand("v0")]);
         let back = c.load("github:o/r").expect("same source loads");
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].label, "v1");
@@ -483,7 +383,7 @@ mod tests {
     fn load_rejects_other_source() {
         let p = tmp("other");
         let c = IndexCache::new(p.clone());
-        c.store("dir:/tmp/reg", &[cand("v1")], &[]);
+        c.store("dir:/tmp/reg", &[cand("v1")]);
         assert!(
             c.load("github:o/r").is_none(),
             "same-source guard blocks cross-source reuse"
@@ -531,8 +431,8 @@ mod tests {
     fn store_skips_empty_candidate_set() {
         let p = tmp("empty");
         let c = IndexCache::new(p.clone());
-        c.store("github:o/r", &[cand("v1")], &[]); // good cache
-        c.store("github:o/r", &[], &[]); // an empty "success" must NOT clobber it
+        c.store("github:o/r", &[cand("v1")]); // good cache
+        c.store("github:o/r", &[]); // an empty "success" must NOT clobber it
         assert_eq!(
             c.load("github:o/r").unwrap().len(),
             1,
@@ -551,7 +451,7 @@ mod tests {
         let candidates = vec![cand("x"); MAX_CACHE_CANDIDATES + 1];
         let cache = IndexCache::new(p.clone());
         fs::write(&p, "sentinel").unwrap();
-        cache.store("any", &candidates, &[]);
+        cache.store("any", &candidates);
         assert_eq!(fs::read_to_string(&p).unwrap(), "sentinel");
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
@@ -568,7 +468,7 @@ mod tests {
         assert!(IndexCache::new(p.clone()).load("any").is_none());
         fs::remove_file(&p).unwrap();
         let target = p.with_file_name("cache-target");
-        IndexCache::new(target.clone()).store("any", &[cand("one")], &[]);
+        IndexCache::new(target.clone()).store("any", &[cand("one")]);
         std::os::unix::fs::symlink(&target, &p).unwrap();
         assert!(IndexCache::new(p.clone()).load("any").is_none());
         let _ = fs::remove_dir_all(p.parent().unwrap());
@@ -588,7 +488,7 @@ mod tests {
         let parent = p.parent().unwrap().to_path_buf();
         fs::create_dir(&p).unwrap();
         let c = IndexCache::new(p.clone());
-        c.store("github:o/r", &[cand("v1")], &[]);
+        c.store("github:o/r", &[cand("v1")]);
         assert!(
             p.is_dir(),
             "the un-renamable cache path is left exactly as it was"
@@ -606,173 +506,11 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
     }
 
-    /// THE HIT PATH, both directions. A cache stamped with identities is served WITHOUT
-    /// any fetch when the live identities match, and refuses the moment ANY of them
-    /// moves — which is the whole safety argument: the reuse is conditional on the
-    /// source still publishing the very assets these bytes came from.
-    #[test]
-    fn identical_identities_serve_the_cache_and_any_drift_refuses_it() {
-        let p = tmp("identity");
-        let c = IndexCache::new(p.clone());
-        let ids = vec!["id-v1".to_string(), "id-v0".to_string()];
-        c.store("github:o/r", &[cand("v1"), cand("v0")], &ids);
-
-        let hit = c
-            .load_if_identical("github:o/r", &ids)
-            .expect("matching identities serve the cached bytes");
-        assert_eq!(hit.len(), 2);
-        assert_eq!(hit[0].label, "v1");
-        assert_eq!(hit[0].index_bytes, vec![1, 2, 3, 0xFF]);
-        assert_eq!(hit[0].roster_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-
-        // A re-uploaded asset moves ONE identity: refuse, and re-download.
-        let moved = vec!["id-v1-NEW".to_string(), "id-v0".to_string()];
-        assert!(c.load_if_identical("github:o/r", &moved).is_none());
-        // A newly published release changes the COUNT: refuse.
-        let grown = vec![
-            "id-v2".to_string(),
-            "id-v1".to_string(),
-            "id-v0".to_string(),
-        ];
-        assert!(c.load_if_identical("github:o/r", &grown).is_none());
-        // A permutation is a different publication state: refuse.
-        let swapped = vec!["id-v0".to_string(), "id-v1".to_string()];
-        assert!(c.load_if_identical("github:o/r", &swapped).is_none());
-        // A fetcher that cannot answer cheaply (empty live vector): refuse.
-        assert!(c.load_if_identical("github:o/r", &[]).is_none());
-        // And the SAME-SOURCE guard still outranks a perfect identity match.
-        assert!(c.load_if_identical("dir:/elsewhere", &ids).is_none());
-        // The failure-time fallback is unchanged by any of this.
-        assert_eq!(c.load("github:o/r").unwrap().len(), 2);
-        let _ = fs::remove_dir_all(p.parent().unwrap());
-    }
-
-    /// The pair-or-nothing guard. An identity vector that does not line up 1:1 with the
-    /// candidates is dropped WHOLE — never zipped as a prefix — so no entry can ever
-    /// carry a fingerprint belonging to some other candidate's bytes.
-    #[test]
-    fn a_misaligned_identity_vector_is_dropped_whole() {
-        let p = tmp("identity-misaligned");
-        let c = IndexCache::new(p.clone());
-        // Two candidates, ONE identity: the pairing is ambiguous, so nothing is stamped.
-        c.store(
-            "github:o/r",
-            &[cand("v1"), cand("v0")],
-            &["id-v1".to_string()],
-        );
-        assert!(
-            c.load_if_identical("github:o/r", &["id-v1".to_string()])
-                .is_none(),
-            "a prefix must not be zipped onto the first row"
-        );
-        assert!(
-            c.load("github:o/r").is_some(),
-            "the entry is still a good failure-time fallback"
-        );
-        // An EMPTY identity is never a match either (this is also the legacy-cache case).
-        let c2 = IndexCache::new(p.clone());
-        c2.store("github:o/r", &[cand("v1")], &[String::new()]);
-        assert!(
-            c2.load_if_identical("github:o/r", &[String::new()])
-                .is_none(),
-            "empty is never a match, in either position"
-        );
-        let _ = fs::remove_dir_all(p.parent().unwrap());
-    }
-
-    /// A cache written by a build that predates identities decodes, serves the historical
-    /// failure-time fallback, and NEVER satisfies the hit path — so an in-place upgrade
-    /// pays one ordinary resolve and is stamped from then on.
-    #[test]
-    fn a_pre_identity_cache_entry_never_matches_the_hit_path() {
-        let p = tmp("identity-legacy");
-        fs::write(
-            &p,
-            "schema = 1\nsource = \"github:o/r\"\nfetched_at = \"\"\n\
-             [[candidate]]\nlabel = \"v1\"\nindex_b64 = \"AQID\"\nsig_b64 = \"CQgH\"\n\
-             roster_b64 = \"3q2+7w==\"\nroster_sig_b64 = \"BAUG\"\n",
-        )
-        .unwrap();
-        let c = IndexCache::new(p.clone());
-        assert_eq!(
-            c.load("github:o/r")
-                .expect("legacy entry still decodes")
-                .len(),
-            1
-        );
-        assert!(
-            c.load_if_identical("github:o/r", &["anything".to_string()])
-                .is_none(),
-            "no stored identity ⇒ no hit path"
-        );
-        let _ = fs::remove_dir_all(p.parent().unwrap());
-    }
-
-    /// The identity ceiling binds on the way IN, not just on the way out.
-    ///
-    /// `store` refuses to stamp an oversize identity, but the document this bound exists
-    /// to survive is one an attacker wrote, which never went through `store` at all.
-    /// Every other per-entry field is bounded in `decode`, so an unchecked `identity`
-    /// would be the only unbounded string in the document and `MAX_CACHE_CANDIDATES` of
-    /// them could spend the entire `MAX_INDEX_CACHE_BYTES` budget — the precise thing the
-    /// constant's doc comment promises cannot happen.
-    ///
-    /// TWO-SIDED on purpose: an identity exactly AT the ceiling must still work (or the
-    /// bound is silently something other than what it says, and the production 64-char
-    /// digest is one refactor away from being refused), and one byte OVER must refuse
-    /// through BOTH readers.
-    #[test]
-    fn an_oversize_identity_is_refused_by_the_read_path() {
-        let write_doc = |p: &PathBuf, id: &str| {
-            fs::write(
-                p,
-                format!(
-                    "schema = 1\nsource = \"github:o/r\"\nfetched_at = \"\"\n\
-                     [[candidate]]\nlabel = \"v1\"\nindex_b64 = \"AQID\"\nsig_b64 = \"CQgH\"\n\
-                     roster_b64 = \"3q2+7w==\"\nroster_sig_b64 = \"BAUG\"\n\
-                     identity = \"{id}\"\n"
-                ),
-            )
-            .unwrap();
-        };
-
-        // AT the ceiling: admissible, and a real hit.
-        let p = tmp("identity-at-ceiling");
-        let at = "a".repeat(MAX_CACHED_IDENTITY_BYTES);
-        write_doc(&p, &at);
-        let c = IndexCache::new(p.clone());
-        assert!(
-            c.load("github:o/r").is_some(),
-            "an identity exactly at the ceiling is admissible"
-        );
-        assert!(
-            c.load_if_identical("github:o/r", std::slice::from_ref(&at))
-                .is_some(),
-            "and still serves the hit path"
-        );
-        let _ = fs::remove_dir_all(p.parent().unwrap());
-
-        // ONE BYTE OVER: refused by both readers, whole document.
-        let p2 = tmp("identity-over-ceiling");
-        let over = "a".repeat(MAX_CACHED_IDENTITY_BYTES + 1);
-        write_doc(&p2, &over);
-        let c2 = IndexCache::new(p2.clone());
-        assert!(
-            c2.load("github:o/r").is_none(),
-            "one byte over the ceiling refuses the whole document"
-        );
-        assert!(
-            c2.load_if_identical("github:o/r", &[over]).is_none(),
-            "and a perfect match on an oversize identity is still no hit"
-        );
-        let _ = fs::remove_dir_all(p2.parent().unwrap());
-    }
-
-    /// Two-sided, BOTH readers, BOTH paths: exactly at the ceiling is a working cache, one
-    /// byte over is refused by the writer and by `load`/`load_if_identical` alike.
+    /// Two-sided, BOTH paths: exactly at the ceiling is a working cache, one byte over is
+    /// refused by the writer and by `load` alike.
     ///
     /// The read side is the half that matters. `store` only ever sees labels this build
-    /// produced; the readers parse a document we did NOT write, and `label` is the one
+    /// produced; the reader parses a document we did NOT write, and `label` is the one
     /// field that survives decoding into the returned candidate.
     #[test]
     fn label_ceiling_is_enforced_on_both_paths() {
@@ -783,7 +521,7 @@ mod tests {
                     "schema = 1\nsource = \"github:o/r\"\nfetched_at = \"\"\n\
                      [[candidate]]\nlabel = \"{label}\"\nindex_b64 = \"AQID\"\n\
                      sig_b64 = \"CQgH\"\nroster_b64 = \"3q2+7w==\"\n\
-                     roster_sig_b64 = \"BAUG\"\nidentity = \"id1\"\n"
+                     roster_sig_b64 = \"BAUG\"\n"
                 ),
             )
             .unwrap();
@@ -798,11 +536,6 @@ mod tests {
             .load("github:o/r")
             .expect("a label at the ceiling is admissible");
         assert_eq!(got[0].label, at, "and reaches the caller unmodified");
-        assert!(
-            c.load_if_identical("github:o/r", &["id1".to_string()])
-                .is_some(),
-            "and still serves the hit path"
-        );
         let _ = fs::remove_dir_all(p.parent().unwrap());
 
         // ONE BYTE OVER: refused by both readers, whole document.
@@ -813,21 +546,12 @@ mod tests {
             c2.load("github:o/r").is_none(),
             "one byte over the ceiling refuses the whole document"
         );
-        assert!(
-            c2.load_if_identical("github:o/r", &["id1".to_string()])
-                .is_none(),
-            "and a perfect identity match on an oversize label is still no hit"
-        );
         let _ = fs::remove_dir_all(p2.parent().unwrap());
 
         // WRITE path: an oversize label is never written, and never clobbers a good cache.
         let p3 = tmp("label-write");
         fs::write(&p3, "sentinel").unwrap();
-        IndexCache::new(p3.clone()).store(
-            "src",
-            &[cand(&"L".repeat(MAX_CACHED_LABEL_BYTES + 1))],
-            &[],
-        );
+        IndexCache::new(p3.clone()).store("src", &[cand(&"L".repeat(MAX_CACHED_LABEL_BYTES + 1))]);
         assert_eq!(
             fs::read_to_string(&p3).unwrap(),
             "sentinel",
@@ -837,19 +561,15 @@ mod tests {
     }
 
     /// An unrecognized schema is refused rather than read leniently — and the version this
-    /// build writes is, of course, still read, by both readers.
+    /// build writes is, of course, still read.
     #[test]
     fn unknown_schema_fails_closed() {
         let p = tmp("schema");
-        IndexCache::new(p.clone()).store("src", &[cand("v1")], &["id1".to_string()]);
+        IndexCache::new(p.clone()).store("src", &[cand("v1")]);
         let c = IndexCache::new(p.clone());
         assert!(
             c.load("src").is_some(),
             "the schema this build writes must still load — no behaviour change for valid documents"
-        );
-        assert!(
-            c.load_if_identical("src", &["id1".to_string()]).is_some(),
-            "and the hit path is unaffected too"
         );
 
         let good = fs::read_to_string(&p).unwrap();
@@ -870,10 +590,6 @@ mod tests {
             assert!(
                 c.load("src").is_none(),
                 "schema {bad} is not a version this build knows; it must fail CLOSED"
-            );
-            assert!(
-                c.load_if_identical("src", &["id1".to_string()]).is_none(),
-                "and the hit path must not read it either"
             );
         }
         let _ = fs::remove_dir_all(p.parent().unwrap());
@@ -931,7 +647,7 @@ mod tests {
             path: p.clone(),
             layout: Some(layout),
         };
-        cache.store("github:o/r", &[cand("v1")], &[]);
+        cache.store("github:o/r", &[cand("v1")]);
         assert!(
             cache.load("github:o/r").is_some(),
             "the cache is still written — this changes the DIRECTORY mode, nothing else"
@@ -970,7 +686,7 @@ mod tests {
             cache.path, p,
             "for_layout addresses <prefix>/index-cache.toml"
         );
-        cache.store("github:o/r", &[cand("v1")], &[]);
+        cache.store("github:o/r", &[cand("v1")]);
         assert!(cache.load("github:o/r").is_some(), "the cache is written");
         assert_eq!(
             mode_of(&parent),

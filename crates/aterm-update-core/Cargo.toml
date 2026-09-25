@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — artifact-agnostic, portable POSIX update primitives (source resolution, advisory file lock, curl/token plumbing, private-dir hardening, sha256) shared by aterm-update and atpkg."
+description = "aterm — artifact-agnostic, portable POSIX update primitives (source resolution, advisory file lock, curl plumbing, private-dir hardening, sha256) shared by aterm-update and atpkg."
 
 [lib]
 # The pinned custom `trust` toolchain (rust-toolchain.toml) ships no rustdoc, and a

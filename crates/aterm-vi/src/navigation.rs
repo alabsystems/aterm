@@ -365,122 +365,41 @@ mod tests {
 
     // ---- Bracket matching ----
 
+    /// `(what, grid lines, cols, start, match)` — `%` from `start` finds the
+    /// partner bracket, across nesting, kinds and rows, or nothing at all.
     #[test]
-    fn bracket_match_forward() {
-        let grid = MockGrid::new(1, 20).with_line(0, "(hello)");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(0, 6))
-        );
-    }
-
-    #[test]
-    fn bracket_match_backward() {
-        let grid = MockGrid::new(1, 20).with_line(0, "(hello)");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 6)),
-            Some(ViPoint::new(0, 0))
-        );
-    }
-
-    #[test]
-    fn bracket_match_nested() {
-        let grid = MockGrid::new(1, 20).with_line(0, "((a)(b))");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(0, 7))
-        );
-    }
-
-    #[test]
-    fn bracket_match_none_for_non_bracket() {
-        let grid = MockGrid::new(1, 10).with_line(0, "hello");
-        assert_eq!(bracket_match(&grid, ViPoint::new(0, 0)), None);
-    }
-
-    #[test]
-    fn bracket_match_curly() {
-        let grid = MockGrid::new(1, 10).with_line(0, "{x}");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(0, 2))
-        );
-    }
-
-    #[test]
-    fn bracket_match_angle() {
-        let grid = MockGrid::new(1, 20).with_line(0, "<html>");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(0, 5))
-        );
-    }
-
-    #[test]
-    fn bracket_match_angle_backward() {
-        let grid = MockGrid::new(1, 20).with_line(0, "<x>");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 2)),
-            Some(ViPoint::new(0, 0))
-        );
-    }
-
-    #[test]
-    fn bracket_match_empty_pair() {
-        let grid = MockGrid::new(1, 10).with_line(0, "()");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(0, 1))
-        );
-    }
-
-    #[test]
-    fn bracket_match_deeply_nested() {
-        let grid = MockGrid::new(1, 20).with_line(0, "(((())))");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(0, 7))
-        );
-    }
-
-    #[test]
-    fn bracket_match_mixed_nesting() {
-        let grid = MockGrid::new(1, 20).with_line(0, "([{<>}])");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(0, 7))
-        );
-    }
-
-    #[test]
-    fn bracket_match_unmatched_open() {
-        let grid = MockGrid::new(1, 10).with_line(0, "(abc");
-        assert_eq!(bracket_match(&grid, ViPoint::new(0, 0)), None);
-    }
-
-    #[test]
-    fn bracket_match_unmatched_close() {
-        let grid = MockGrid::new(1, 10).with_line(0, "abc)");
-        assert_eq!(bracket_match(&grid, ViPoint::new(0, 3)), None);
-    }
-
-    #[test]
-    fn bracket_match_multirow() {
-        let grid = MockGrid::new(3, 10)
-            .with_line(0, "(         ")
-            .with_line(1, "  hello   ")
-            .with_line(2, "         )");
-        assert_eq!(
-            bracket_match(&grid, ViPoint::new(0, 0)),
-            Some(ViPoint::new(2, 9))
-        );
-    }
-
-    #[test]
-    fn bracket_match_all_spaces_grid() {
-        // Grid of all spaces — bracket at (0,0) won't match
-        let grid = MockGrid::new(1, 10);
-        assert_eq!(bracket_match(&grid, ViPoint::new(0, 0)), None);
+    fn bracket_match_cases() {
+        let p = ViPoint::new;
+        for (what, lines, cols, start, want) in [
+            ("forward", &["(hello)"][..], 20, p(0, 0), Some(p(0, 6))),
+            ("backward", &["(hello)"], 20, p(0, 6), Some(p(0, 0))),
+            ("nested", &["((a)(b))"], 20, p(0, 0), Some(p(0, 7))),
+            ("not a bracket", &["hello"], 10, p(0, 0), None),
+            ("curly", &["{x}"], 10, p(0, 0), Some(p(0, 2))),
+            ("angle", &["<html>"], 20, p(0, 0), Some(p(0, 5))),
+            ("angle backward", &["<x>"], 20, p(0, 2), Some(p(0, 0))),
+            ("empty pair", &["()"], 10, p(0, 0), Some(p(0, 1))),
+            ("deeply nested", &["(((())))"], 20, p(0, 0), Some(p(0, 7))),
+            ("mixed nesting", &["([{<>}])"], 20, p(0, 0), Some(p(0, 7))),
+            ("unmatched open", &["(abc"], 10, p(0, 0), None),
+            ("unmatched close", &["abc)"], 10, p(0, 3), None),
+            (
+                "across rows",
+                &["(         ", "  hello   ", "         )"],
+                10,
+                p(0, 0),
+                Some(p(2, 9)),
+            ),
+            // A grid of all spaces: the start is not a bracket at all.
+            ("all spaces", &[], 10, p(0, 0), None),
+        ] {
+            let rows = u16::try_from(lines.len().max(1)).expect("few rows");
+            let mut grid = MockGrid::new(rows, cols);
+            for (row, text) in lines.iter().enumerate() {
+                grid = grid.with_line(row, text);
+            }
+            assert_eq!(bracket_match(&grid, start), want, "{what}");
+        }
     }
 
     // ---- Paragraph motions ----

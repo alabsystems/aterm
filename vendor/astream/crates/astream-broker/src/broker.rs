@@ -209,6 +209,26 @@ pub const MAX_KEYRING: usize = 16;
 /// (adding one would break the zero-third-party rule this crate keeps). It is a
 /// distinct, hard-to-predict value per connection; it is not claimed to be
 /// cryptographically random.
+/// Unix milliseconds, for the capability-expiry gate.
+///
+/// The wall clock is read HERE, at the connection boundary, and never inside
+/// `astream-cap` — that crate is on the deterministic side of the effect seam,
+/// where a clock read would make a replay depend on when it ran. A clock that
+/// cannot be read at all yields 0, which expires nothing: a broken clock must
+/// not become a way to revoke a fleet's capabilities, and it must not become a
+/// way to resurrect them either (0 is before every real `exp`, so a capability
+/// stays valid exactly as it was before this feature existed).
+/// `cap`-gated: the only readers are the attach door and the per-request
+/// authorization, both of which exist only under that feature. A default broker
+/// enforces no capabilities and so has no deadline to check — and must keep its
+/// zero-third-party, dead-code-free shape.
+#[cfg(feature = "cap")]
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 fn fresh_nonce() -> [u8; 32] {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -1648,7 +1668,12 @@ fn serve_conn<S: Stream>(
                 continue;
             }
             if let Some(secret) = shared.cap_secret.as_deref() {
-                if !cap_authorized(secret, &keyring, &req) {
+                // THE INSTANT IS TAKEN PER REQUEST, not once per connection. A
+                // capability that expires while a connection is open must stop
+                // authorizing on the next request — an attach-time check alone
+                // would let a long-lived subscriber outlive its own expiry,
+                // which is the one thing an expiry is for.
+                if !cap_authorized(secret, &keyring, &req, now_unix_ms()) {
                     if !emit(
                         &mut stream,
                         &mut pipe,
@@ -2201,6 +2226,21 @@ fn attach_grant(
     if !astream_cap::verify_attach(secret, grant, nonce, proof) {
         return Err("unauthorized: capability proof does not verify".to_string());
     }
+    // EXPIRY IS ITS OWN REFUSAL, after possession is proved and before anything
+    // is bound. A separate message because the two failures need separate
+    // remedies: "does not verify" means the wrong secret or a tampered string,
+    // "expired" means a correct capability whose time is up and which a mint can
+    // reissue. Reporting both as one would send an operator to rotate a secret
+    // that is fine. The authorization path re-checks this per request; this
+    // check is here so an expired attach fails at the door rather than binding a
+    // producer id and then authorizing nothing.
+    let now_ms = now_unix_ms();
+    if astream_cap::is_expired(grant, now_ms) {
+        let exp = astream_cap::expires_at(grant).unwrap_or(0);
+        return Err(format!(
+            "unauthorized: capability expired at {exp} (now {now_ms}, unix ms)"
+        ));
+    }
     // Genuine under this broker's secret, so `parse` cannot fail (verify_attach parses
     // first) — but fail closed rather than unwrap on a library change.
     let parsed = astream_cap::Grant::parse(grant).map_err(|e| format!("unauthorized: {e}"))?;
@@ -2280,24 +2320,29 @@ fn attach_grant(
 /// publish then silently deduped away at the attacker's offset, acked as landed.
 /// An empty ring authorizes nothing.
 #[cfg(feature = "cap")]
-fn cap_authorized(secret: &[u8], keyring: &[astream_cap::Capability], req: &Request) -> bool {
+fn cap_authorized(
+    secret: &[u8],
+    keyring: &[astream_cap::Capability],
+    req: &Request,
+    now_ms: u64,
+) -> bool {
     // A write as a named producer: read-write, filter matches, producer id derived.
     let publish = |subject: &str, producer_id: u64| {
         keyring
             .iter()
-            .any(|c| astream_cap::grants_publish(secret, c, subject, producer_id))
+            .any(|c| astream_cap::grants_publish(secret, c, subject, producer_id, now_ms))
     };
     // A group advance: read-write on the group name as a subject.
     let commit = |group: &str| {
         keyring
             .iter()
-            .any(|c| astream_cap::grants_commit(secret, c, group))
+            .any(|c| astream_cap::grants_commit(secret, c, group, now_ms))
     };
     // A read: ANY grant (either mode) whose filter contains the requested one.
     let read = |filter: &str| {
         keyring
             .iter()
-            .any(|c| astream_cap::grants_filter(secret, c, filter))
+            .any(|c| astream_cap::grants_filter(secret, c, filter, now_ms))
     };
     // A REPLICATED write: read-write and filter-matching, like any write — and
     // UNBOUND, because the record carries a producer id this connection's principal
@@ -2306,7 +2351,7 @@ fn cap_authorized(secret: &[u8], keyring: &[astream_cap::Capability], req: &Requ
     // cannot fail here; treat a parse failure as "not a link grant" anyway.
     let replicate = |subject: &str| {
         keyring.iter().any(|c| {
-            astream_cap::grants(secret, c, subject)
+            astream_cap::grants(secret, c, subject, now_ms)
                 && astream_cap::Grant::parse(c.filter.as_str()).is_ok_and(|g| g.principal.is_none())
         })
     };

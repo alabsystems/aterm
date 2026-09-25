@@ -134,9 +134,8 @@ impl Sentinel {
     /// whose extents were never written back reads as zeros, `read_state` parses that
     /// as `None`, and the whole count/budget/revert path is skipped: the machine
     /// crash-loops forever on the bad build with the retained old bundle sitting right
-    /// there unused. `token::write_private_file` already ends in `sync_all` for far
-    /// less critical state; the one file whose loss disables rollback must not be the
-    /// one that skips it. Cost is irrelevant at this frequency (once per apply, plus
+    /// there unused. The one file whose loss disables rollback must not skip the
+    /// flush. Cost is irrelevant at this frequency (once per apply, plus
     /// once per launch of an unconfirmed trial) — it is an 11-byte file.
     // Skip: the audited atomic write-then-rename (the update-atpkg brick-fix):
     // OpenOptions+rename are DELIBERATELY path-based inside the 0700 private

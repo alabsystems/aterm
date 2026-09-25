@@ -245,7 +245,7 @@ static TYPING_HOT_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
 /// than a fast typist's inter-key gap (~125 ms at 100 wpm) so a burst never
 /// disarms mid-word, short enough that a pure output flood pays the 8x lock
 /// round-trip cost only while a human is actually at the keyboard.
-const TYPING_HOT_TAIL_NS: u64 = 250_000_000;
+pub(crate) const TYPING_HOT_TAIL_NS: u64 = 250_000_000;
 
 // Lost-wake heals (the self-expiring `gated_output_wake` latch re-armed after a
 // `Wake::Output` was consumed without a handler pass). ANY non-zero value means
@@ -386,7 +386,7 @@ static SLOW_EPISODE_RESET: AtomicBool = AtomicBool::new(false);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 40;
+const DEADLINE_OWNER_SLOTS: usize = 41;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -566,6 +566,18 @@ pub(crate) fn now_ns() -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// The `Instant` a [`now_us`] stamp was read at — this clock's exact inverse,
+/// floored to the microsecond the stamp kept. The clock is
+/// `PROCESS_START.elapsed()`, so every stamp is an offset from ONE fixed anchor
+/// and needs no second clock read to place: the answer is a pure function of
+/// the stamp, ordered exactly as the stamps are and identical on every call.
+/// `None` only past `Instant`'s range.
+pub(crate) fn instant_at_us(stamp_us: u64) -> Option<Instant> {
+    PROCESS_START
+        .get_or_init(Instant::now)
+        .checked_add(Duration::from_micros(stamp_us))
+}
+
 /// Stable labels for the event loop's single earliest `WaitUntil` owner.
 /// Values are stored in atomics, so keep discriminants append-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,6 +677,13 @@ pub(crate) enum DeadlineOwner {
     /// busy spinner steps on this grid every `aterm_messages::SPIN_FRAMES`
     /// frames — and nothing is armed while a handoff freezes the band.
     MessageBandMotion = 39,
+    /// STRAIN (design §10.14, ruling 211): the next reading of the machine
+    /// while the strain engine is Suspect or Open — every 2 s, a sweep on every
+    /// other — and only while the `explain_heavy_load` switch is on, a focused
+    /// window's band is on screen and no reading is in flight. A calm machine,
+    /// an unfocused, occluded, minimized or headless window and a folded row
+    /// arm nothing (`crate::strain_host`).
+    SystemStrain = 40,
 }
 
 impl DeadlineOwner {
@@ -709,6 +728,7 @@ impl DeadlineOwner {
             37 => Self::Presence,
             38 => Self::HandoffPark,
             39 => Self::MessageBandMotion,
+            40 => Self::SystemStrain,
             _ => Self::None,
         }
     }
@@ -756,6 +776,7 @@ impl DeadlineOwner {
             Self::Presence => "presence",
             Self::HandoffPark => "handoff_park",
             Self::MessageBandMotion => "message_band_motion",
+            Self::SystemStrain => "system_strain",
         }
     }
 }
@@ -2034,12 +2055,19 @@ pub const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333; // 1/30 s
 /// `window_input` is the PRESENTING window's pending input stamp (`None` when the
 /// window state is gone). Only it — plus the session-routed global stamp — can be
 /// closed by this present; another window's pending key is untouched.
+///
+/// Returns the slice it closed for that window when the key came through the
+/// HARDWARE path and the present is untainted — one strain sample (design
+/// §10.14, ruling 211): the host hands it to `StrainTracker::note_key` on a
+/// frame that is drawn anyway. A controller's key, a tainted present and a
+/// frame that closed nothing return `None`.
 pub(crate) fn record_present(
     latency_ns: u64,
     render_ns: u64,
     startup_timing: StartupPresentTiming,
     window_input: Option<&mut PendingInputStamp>,
-) {
+) -> Option<u64> {
+    let mut hardware_slice = None;
     // First startup-metrics publication point inside the successful-present
     // finalizer (see `mark_process_start`). Capture one end Instant and derive
     // both scopes from it, then publish the pair atomically through OnceLock
@@ -2132,8 +2160,15 @@ pub(crate) fn record_present(
         // Only the OUTPUT slice above measures an interval nobody asked for.
         let now = now_ns();
         let reset_at = INPUT_RESET_AT_NS.load(Ordering::Relaxed);
-        if let Some(d) = window_input.and_then(|pending| pending.take_slice(now, reset_at)) {
+        if let Some((d, hardware)) =
+            window_input.and_then(|pending| pending.take_attributed(now, reset_at))
+        {
             book_input_present(d);
+            // The strain sample IS taint-gated, unlike the metric: an occluded
+            // or captured window's echo describes the episode, not the machine.
+            if hardware && !present_latency_tainted() {
+                hardware_slice = Some(d);
+            }
         }
         // The session-routed stamp (no window known at arm time): any content
         // present closes it, as before.
@@ -2163,6 +2198,7 @@ pub(crate) fn record_present(
         MAX_FRAME_GAP_NS.fetch_max(now.saturating_sub(prev_stamp), Ordering::Relaxed);
     }
     note_slow_episode_quiet(now);
+    hardware_slice
 }
 
 /// An `output→application-present-return` reading big enough to be what a user
@@ -2607,33 +2643,60 @@ pub(crate) struct PendingInputStamp {
     /// When the stamp was armed — compared against the last [`reset`], because a
     /// backdated arrival can precede a reset the key itself followed.
     armed_ns: u64,
+    /// The key that armed it came through the HARDWARE path (the winit
+    /// `KeyboardInput` arm — a physical key, or `ctl hwkey`'s real `NSEvent`),
+    /// never a control `send`/`feed`/`key`. Only such a slice is a sample for the
+    /// strain engine's FELT (design §10.14, ruling 206): a controller's key is
+    /// not a person waiting.
+    hardware: bool,
 }
 
 impl PendingInputStamp {
     /// Keep-oldest arm: a burst does not shrink the measured slice.
+    #[cfg(test)]
     fn arm(&mut self, arrival_ns: u64, armed_ns: u64) {
+        self.arm_from(arrival_ns, armed_ns, false);
+    }
+
+    /// [`Self::arm`], saying whether the key came through the hardware path.
+    /// Keep-oldest, and so is the flag: the slice measures the OLDEST key, and
+    /// that key's path is the one that says whether a person waited on it.
+    fn arm_from(&mut self, arrival_ns: u64, armed_ns: u64, hardware: bool) {
         if self.arrival_ns == 0 {
             self.arrival_ns = arrival_ns.max(1);
             self.armed_ns = armed_ns;
+            self.hardware = hardware;
         }
     }
 
     /// Whether a keystroke in this window is still waiting on a content present.
     #[cfg(test)]
-    const fn is_pending(self) -> bool {
+    pub(crate) const fn is_pending(self) -> bool {
         self.arrival_ns != 0
+    }
+
+    /// Whether the pending stamp was armed by a HARDWARE key.
+    #[cfg(test)]
+    pub(crate) const fn armed_by_hardware(self) -> bool {
+        self.hardware
     }
 
     /// Consume the stamp at a content present of THIS window. `None` when nothing
     /// was pending, when it was armed before the last reset (`reset_at_ns`), or
     /// when it aged past `INPUT_SLICE_CAP_NS` (a keystroke that never echoed).
+    #[cfg(test)]
     fn take_slice(&mut self, now_ns: u64, reset_at_ns: u64) -> Option<u64> {
+        self.take_attributed(now_ns, reset_at_ns).map(|(d, _)| d)
+    }
+
+    /// [`Self::take_slice`] with the arming key's path: `(slice, hardware)`.
+    fn take_attributed(&mut self, now_ns: u64, reset_at_ns: u64) -> Option<(u64, bool)> {
         let taken = std::mem::take(self);
         if taken.arrival_ns == 0 || taken.armed_ns < reset_at_ns {
             return None;
         }
         let d = now_ns.saturating_sub(taken.arrival_ns);
-        (d <= INPUT_SLICE_CAP_NS).then_some(d)
+        (d <= INPUT_SLICE_CAP_NS).then_some((d, taken.hardware))
     }
 }
 
@@ -2652,9 +2715,13 @@ fn input_arrival_ns(now: u64) -> u64 {
 /// `App::input_to_session` seam, hardware keys and controller `key` alike) into
 /// that window's [`PendingInputStamp`], so only that window's content present
 /// closes the slice. Same arrival and keep-oldest rules as [`note_input`].
-pub(crate) fn note_window_input(pending: &mut PendingInputStamp) {
+///
+/// `hardware` is whether the key came through the winit `KeyboardInput` arm
+/// (see [`PendingInputStamp`]'s field): only such a slice comes back out of
+/// [`record_present`] for the strain engine.
+pub(crate) fn note_window_input(pending: &mut PendingInputStamp, hardware: bool) {
     let now = now_ns();
-    pending.arm(input_arrival_ns(now), now);
+    pending.arm_from(input_arrival_ns(now), now, hardware);
     note_typing_hot();
 }
 
@@ -3408,16 +3475,6 @@ pub fn set_backend_gpu(on: bool) {
     BACKEND_GPU.store(on, Ordering::Relaxed);
 }
 
-/// Just the live-renderer flag — the single field of [`snapshot`] that the
-/// Settings view needs, without building the ~400-byte `Snapshot` (≈50 atomic
-/// loads, three enum decodes and a `now_ns()` monotonic-clock read) and throwing
-/// all of it away. `setting_row` asks per ROW, so a Settings page rebuild used to
-/// pay that a few dozen times per keystroke/hover for one bool.
-#[must_use]
-pub fn backend_gpu() -> bool {
-    BACKEND_GPU.load(Ordering::Relaxed)
-}
-
 /// Zero the measurement-window stats (frame count, maxima, slow count) so a driver
 /// can time a SPECIFIC operation: `metrics reset`, run the workload, then `metrics`.
 /// Keeps `backend` and legacy momentary `last_*` readings. The redraw-audit
@@ -3572,6 +3629,7 @@ pub fn reset() {
     // line: a driver that resets, drives a workload and reads must see THAT
     // workload's worst main-thread turn, not the launch storm's.
     crate::watchdog::reset_turn_census();
+    crate::strain_host::reset_metrics();
     // Gauges (`SYNC_HOLDING`, `PERF_REDUCED`), legacy momentary `last_*`
     // readings, and `first_present` (a startup FACT, not a window stat) survive
     // a reset, like `backend`. Redraw-audit last/drop fields intentionally reset
@@ -4911,6 +4969,11 @@ mod histogram_tests {
             DeadlineOwner::MessageBandMotion.as_str(),
             "message_band_motion"
         );
+        // Slot 40 is the strain engine's reading cadence (design §10.14): its
+        // own label, so an idle machine's `system_strain` arms read 0 and a
+        // spin in the probe is never charged to the band.
+        assert_eq!(DeadlineOwner::from_raw(40), DeadlineOwner::SystemStrain);
+        assert_eq!(DeadlineOwner::SystemStrain.as_str(), "system_strain");
         // Slot 22 is a tombstone (2026-09-22): the config banner's owner
         // retired with `config_notice.rs`, and the number stays taken under a
         // label no live owner wears, so an older wire reader never attributes
@@ -5222,6 +5285,24 @@ mod window_input_attribution_tests {
         // arrival precedes it (the key sat in the OS queue across the reset).
         pending.arm(50, 61);
         assert_eq!(pending.take_slice(10_050, 61), Some(10_000));
+    }
+
+    /// Only a HARDWARE key's slice is a strain sample, and the flag is the
+    /// oldest key's: a controller key that armed first keeps the slice its own
+    /// even when a hardware key follows inside the same unpresented burst.
+    #[test]
+    fn the_hardware_flag_is_the_arming_keys() {
+        let mut pending = PendingInputStamp::default();
+        pending.arm_from(10, 10, true);
+        pending.arm_from(20, 20, false);
+        assert_eq!(pending.take_attributed(110, 0), Some((100, true)));
+        pending.arm_from(10, 10, false);
+        pending.arm_from(20, 20, true);
+        assert_eq!(
+            pending.take_attributed(110, 0),
+            Some((100, false)),
+            "a ctl send/feed/key never counts, even ahead of a real key"
+        );
     }
 
     #[test]

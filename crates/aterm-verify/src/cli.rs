@@ -223,9 +223,10 @@ way for a reviewer (human or AI) to be wrong about it: run this.
   tools/verify.sh --fast --in-place # run in this checkout, not the snapshot
 
 --fast    : targo build + targo test --workspace + the zero-tolerance grep
-            guards + bootstrap update-channel arbitration/identity checks + a
-            headless control-socket smoke (the AI-first spine must never
-            regress, so every gate run proves the socket still answers).
+            guards + the release-tooling suites (installer update channel,
+            export policy, release preflight) + a headless control-socket
+            smoke (the AI-first spine must never regress, so every gate run
+            proves the socket still answers).
 --full    : everything in --fast, PLUS the aterm-vs-alacritty differential
             oracle and the trust-mc / Kani BMC harnesses *when those tools are
             installed* (skipped-not-failed when absent — see docs/PROCESS.md),
@@ -233,22 +234,16 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             own triple; ~19 s warm, ~106 s cold).
 --scope   : restrict the targo build/test to `-p <crate>`; the guards and the
             socket smoke always run whole-tree (they are cheap and global).
---changed : THE MISSING MIDDLE — a change-scoped tier between a bare `targo
-            check` and a whole-tree run. (Until 2026-08-31 this line named the
-            ~2 s pre-push L0 hook as the lower end. There is no such hook:
-            `.githooks/pre-push` runs no gate — since 2026-09-17 it BLOCKS a
-            push whose commit has no passing receipt from this gate, which is a
-            file read, not a tier — so the tier below this one is whatever you
-            run by hand.) Restricts build/test/doctest/lint to
+--changed : a change-scoped PRE-FLIGHT. Restricts build/test/doctest/lint to
             the crates this branch touches PLUS every workspace crate that
             depends on one of them (the reverse-dependency cone, read from the
             SAME dependency graph the build uses). `--base <ref>` (default
             `main`, or $ATERM_VERIFY_BASE) picks the merge-base the diff is
-            taken against. Every whole-tree stage still runs. A narrowed run can
-            NEVER claim the merge contract — the verdict names exactly what it
-            left out — and if the scope cannot be computed honestly the run
-            WIDENS to the whole workspace, because a broken narrower must do
-            MORE work, never less.
+            taken against. Every whole-tree stage still runs. The run never
+            claims the merge contract and its receipt admits no push: other
+            crates' tests read files no dependency edge names. If the scope
+            cannot be computed honestly the run WIDENS to the whole workspace,
+            because a broken narrower must do MORE work, never less.
 
 --in-place: in a git checkout every run except --selftest verifies a
             SNAPSHOT — a git worktree at <root>-verify.noindex (or

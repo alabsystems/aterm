@@ -1480,14 +1480,10 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
             pct_encode(reason)
         );
     }
-    // HOW UPDATES REACH THIS MACHINE, in the same one-glance line: `lane=` (`web` — the
-    // unmetered download host, no credential, no API request — or `token:<rung id>`,
-    // the rung's fixed whitespace-free id: env/keychain/file/github-env/gh-env/gh-cli),
-    // `delivery=` (`ok`, `held:<rfc3339>` while a token's API budget renews, `deferred`,
-    // `blocked` on the web lane, `api-failed` on the token lane) and, on the token lane
-    // only, `budget=<remaining>/<limit>@<reset>` from the last release LIST's own
-    // headers. Emitted ONLY when the ledger recorded them, so a healthy line from an
-    // older ledger is byte-identical to before.
+    // HOW THE LAST CHECK'S ASSETS ARRIVED, in the same one-glance line: `delivery=`
+    // (`deferred` — the download host asked us to wait — or `blocked` — it did not serve
+    // an asset the release names). Emitted ONLY when the ledger recorded one, so a
+    // healthy line carries nothing.
     if let Some(delivery) = aterm_update::delivery() {
         let suffix = delivery.status_line_suffix();
         if !suffix.is_empty() {
@@ -4040,6 +4036,10 @@ fn dispatch_app_verb(
         // session state, so it answers the same with no terminal at all — which
         // is exactly when an operator asks it.
         "appstatus" => control_query::cmd_appstatus(proxy),
+        // `messages` -> the message log, one engine-built row per record: the
+        // band and Settings ▸ Messages as text (design rulings 163-179).
+        // Instance state, so it answers with no terminal at all.
+        "messages" => control_query::cmd_messages(proxy, rest),
         "panes" => control_media::cmd_panes(proxy, None),
         "controls" => control_media::cmd_controls(proxy, rest),
         "inspect" => control_media::cmd_inspect(proxy, rest),
@@ -4645,11 +4645,11 @@ fn dispatch_before_session(
             return Some("ERR denied\n".into());
         }
         return match verb {
-            "sessions" => Some(if rest.trim() == "status" {
-                control_session::cmd_sessions_status(proxy)
-            } else {
-                refuse_stray_args(verb, rest)
-                    .unwrap_or_else(|| control_session::cmd_sessions_store(store, Some(proxy)))
+            "sessions" => Some(match rest.trim() {
+                "bridge" => control_session::cmd_sessions_bridge(store),
+                "status" => control_session::cmd_sessions_status(proxy),
+                _ => refuse_stray_args(verb, rest)
+                    .unwrap_or_else(|| control_session::cmd_sessions_store(store, Some(proxy))),
             }),
             "who" => Some(
                 refuse_stray_args(verb, rest)
@@ -4668,6 +4668,10 @@ fn dispatch_before_session(
             // process. App state, so it answers with no terminal at all — which is
             // exactly the shape of the terminal-run install that posts it.
             "appnotice" => Some(control_query::cmd_appnotice(proxy, rest)),
+            // `notice <post|progress|done|dismiss|act> …`: the message band's
+            // write face (design rulings 163-179). App state, so it answers with
+            // no terminal at all — a script's progress needs no session.
+            "notice" => Some(control_query::cmd_notice(proxy, rest)),
             // `fabric status|attach`: the bridge supervisor of THIS process. Process
             // state, not session state, so it answers with no terminal at all — a
             // windowless instance is exactly the one that needs attaching.
@@ -8937,15 +8941,12 @@ fn handle(
             // Production intercepts these before generic dispatch because it owns
             // the durable handle and (for propose) the following binary frame.
             "operator" | "operator-propose-bin" => "ERR operator unavailable\n".to_string(),
-            "sessions" => {
-                if rest.trim() == "status" {
-                    control_session::cmd_sessions_status(proxy)
-                } else {
-                    refuse_stray_args(verb, rest).unwrap_or_else(|| {
-                        control_session::cmd_sessions(self_ctx, store, Some(proxy))
-                    })
-                }
-            }
+            "sessions" => match rest.trim() {
+                "bridge" => control_session::cmd_sessions_bridge(store),
+                "status" => control_session::cmd_sessions_status(proxy),
+                _ => refuse_stray_args(verb, rest)
+                    .unwrap_or_else(|| control_session::cmd_sessions(self_ctx, store, Some(proxy))),
+            },
             "who" => refuse_stray_args(verb, rest)
                 .unwrap_or_else(|| control_session::cmd_who(store, subscribers)),
             // `exits`: the roster journal's `Exited` rows — `sessions`' past.
@@ -8984,6 +8985,7 @@ fn handle(
             "dial-list" => cmd_dial_list(),
             "dial-token" => cmd_dial_token(rest),
             "appnotice" => control_query::cmd_appnotice(proxy, rest),
+            "notice" => control_query::cmd_notice(proxy, rest),
             "fabric" => dispatch_fabric_verb(rest, selector.as_ref(), scope, store),
             // A BARE `dial` reaches here: the serve-loop interception fires only on the
             // `"dial "` prefix (a name follows), but `read_request_line` strips the
@@ -9925,6 +9927,8 @@ fn handle(
         // plus the finished ones the ring still holds. Session-independent App
         // state, so it takes no `term` and is correct from any session.
         "appstatus" => control_query::cmd_appstatus(proxy),
+        // `messages` -> the message log (see `dispatch_app_verb`); App state.
+        "messages" => control_query::cmd_messages(proxy, rest),
         "title" => control_query::cmd_title(term),
         "cwd" => control_query::cmd_cwd(term),
         "blocks" => control_selection::cmd_blocks(&host, session, rest),
@@ -16061,6 +16065,9 @@ mod tests {
                 // reports what aterm has been doing on its own initiative and
                 // starts nothing.
                 "appstatus",
+                // Instance state, read-op like every observer: the message log
+                // as text; it presses, raises and ends nothing.
+                "messages",
                 "panes",
                 "controls",
                 "inspect",
@@ -16187,6 +16194,10 @@ mod tests {
                 // write op-class; the orthogonal `OwnerOnly` scope gate is what keeps
                 // a child edge from posting one.
                 "appnotice",
+                // `notice` MUTATES the band (a row rises, moves, ends or is
+                // pressed), so it takes the write op-class; `OwnerOnly` is the
+                // orthogonal gate.
+                "notice",
                 // `story` MUTATES the presence band (the phase slot reads the
                 // watcher's verb), so it takes the write op-class too; the same
                 // `OwnerOnly` gate keeps a child edge from writing `✓ approved`.

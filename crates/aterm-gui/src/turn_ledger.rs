@@ -232,12 +232,39 @@ pub(crate) fn clamp_text(s: &str) -> String {
 /// FNV-1a/64 — deterministic across processes (unlike `DefaultHasher`), so the
 /// screen hash is stable enough to diff a replayed turn against a recorded one.
 pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    let mut h = Fnv1a64::new();
+    h.update(bytes);
+    h.finish()
+}
+
+/// The same FNV-1a/64 over successive byte slices. The agent-status sweep
+/// hashes visible rows while retaining only its last forty, so it must use
+/// exactly the algorithm that `status hash=` and `turn` use for one buffer.
+pub(crate) struct Fnv1a64(u64);
+
+impl Default for Fnv1a64 {
+    fn default() -> Self {
+        Self::new()
     }
-    h
+}
+
+impl Fnv1a64 {
+    pub(crate) const fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+
+    pub(crate) const fn finish(self) -> u64 {
+        self.0
+    }
 }
 
 /// Milliseconds since the process epoch (a lazily-pinned monotonic `Instant`).

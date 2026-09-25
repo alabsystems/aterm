@@ -1708,7 +1708,7 @@ mod tests {
         pad: f32,
     }
 
-    /// The 96-byte `Blit` uniform (`shaders/blit.metal`'s `struct Blit`), restated
+    /// The 112-byte `Blit` uniform (`shaders/blit.metal`'s `struct Blit`), restated
     /// `repr(C)` — every member naturally aligned, so the MSL `constant`
     /// layout and this struct agree offset for offset; the size is asserted
     /// against [`crate::metal::blit::MetalBlit::UNIFORM_BYTES`] at the fill
@@ -1733,6 +1733,8 @@ mod tests {
         visible_y: f32,
         visible_h: f32,
         premult: f32,
+        chrome_y0: f32,
+        chrome_pad: [f32; 3],
     }
 
     /// # Safety
@@ -1883,7 +1885,7 @@ mod tests {
         assert_eq!(
             size_of::<BlitUniformBytes>(),
             crate::metal::blit::MetalBlit::UNIFORM_BYTES,
-            "the repr(C) restatement must be the 96 bytes blit.metal declares"
+            "the repr(C) restatement must be the 112 bytes blit.metal declares"
         );
         #[expect(clippy::cast_precision_loss, reason = "as above")]
         let blit_uniform = BlitUniformBytes {
@@ -1904,6 +1906,8 @@ mod tests {
             visible_y: 0.0,
             visible_h: H as f32,
             premult: 0.0,
+            chrome_y0: 0.0,
+            chrome_pad: [0.0; 3],
         };
         let blit_ubuf = dev
             .new_buffer(crate::metal::blit::MetalBlit::UNIFORM_BYTES)
@@ -2563,7 +2567,7 @@ mod tests {
         assert_eq!(
             size_of::<BlitUniformBytes>(),
             crate::metal::blit::MetalBlit::UNIFORM_BYTES,
-            "the repr(C) restatement must be the 96 bytes blit.metal declares"
+            "the repr(C) restatement must be the 112 bytes blit.metal declares"
         );
         #[expect(clippy::cast_precision_loss, reason = "as above")]
         let blit_uniform = BlitUniformBytes {
@@ -2584,6 +2588,8 @@ mod tests {
             visible_y: 0.0,
             visible_h: H as f32,
             premult: 0.0,
+            chrome_y0: 0.0,
+            chrome_pad: [0.0; 3],
         };
         let blit_ubuf = dev
             .new_buffer(crate::metal::blit::MetalBlit::UNIFORM_BYTES)
@@ -3036,6 +3042,8 @@ mod tests {
             visible_y: 0.0,
             visible_h: H as f32,
             premult: 0.0,
+            chrome_y0: 0.0,
+            chrome_pad: [0.0; 3],
         };
         // SAFETY: `repr(C)`, size-asserted layout into a fresh shared buffer.
         unsafe { ffi::buffer_write(&blit_ubuf, as_bytes(&blit_uniform)) };
@@ -3359,6 +3367,8 @@ mod tests {
             visible_y: 0.0,
             visible_h: H as f32,
             premult: 0.0,
+            chrome_y0: 0.0,
+            chrome_pad: [0.0; 3],
         };
         // SAFETY: `repr(C)`, size-asserted at T3's fill site already.
         unsafe { ffi::buffer_write(&blit_ubuf, as_bytes(&blit_uniform)) };

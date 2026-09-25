@@ -18,7 +18,7 @@ fn rows(lines: &[&str]) -> Vec<String> {
 const ID: &str = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
 
 /// The session file Claude Code 2.1.280 wrote for pid 9162, measured 2026-09-23.
-const SESSION_9162: &str = r#"{"pid":9162,"sessionId":"03396a15-856e-4f1b-8174-ae9a3e4b369f","cwd":"/Users//_owner/aterm","startedAt":1790194436213,"procStart":"Wed Sep 23 20:13:55 2026","version":"2.1.280","peerProtocol":1,"peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin","messagingSocketPath":"/tmp/cc-socks/9162.sock","name":"aterm-83","nameSource":"derived","nameSince":1790194436213,"updatedAt":1790212772957,"status":"busy","statusUpdatedAt":1790212772957}"#;
+const SESSION_9162: &str = r#"{"pid":9162,"sessionId":"03396a15-856e-4f1b-8174-ae9a3e4b369f","cwd":"/Users/_owner/aterm","startedAt":1790194436213,"procStart":"Wed Sep 23 20:13:55 2026","version":"2.1.280","peerProtocol":1,"peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin","messagingSocketPath":"/tmp/cc-socks/9162.sock","name":"aterm-83","nameSource":"derived","nameSince":1790194436213,"updatedAt":1790212772957,"status":"busy","statusUpdatedAt":1790212772957}"#;
 
 #[test]
 fn versions_order_numerically_and_refuse_suffixes() {
@@ -36,7 +36,7 @@ fn the_measured_session_file_parses_and_a_changed_shape_refuses() {
     let s = parse_session_file(SESSION_9162).expect("the measured file");
     assert_eq!(s.pid, 9162);
     assert_eq!(s.session_id, ID);
-    assert_eq!(s.cwd, "/Users//_owner/aterm");
+    assert_eq!(s.cwd, "/Users/_owner/aterm");
     assert_eq!(s.version, "2.1.280");
     assert_eq!(s.status, "busy");
     assert_eq!(s.status_updated_at_ms, 1_790_212_772_957);
@@ -431,14 +431,14 @@ fn every_short_argv_resumes_with_exactly_the_values_claude_parsed() {
 
 #[test]
 fn the_relaunch_line_heals_a_frozen_shell_and_quotes_every_word() {
-    let exe = Path::new("/Users//_me/Library/Application Support/aterm/pkg/agents/claude");
-    let hook = Path::new("/Users//_me/.aterm/shell.d/00-atpkg.zsh");
+    let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
+    let hook = Path::new("/Users/_me/.aterm/shell.d/00-atpkg.zsh");
     let args = argv(&["--dangerously-skip-permissions", "--resume", ID]);
     assert_eq!(
         relaunch_line(Dialect::Zsh, Some(hook), None, exe, &args).unwrap(),
         format!(
-            " . '/Users//_me/.aterm/shell.d/00-atpkg.zsh'; rehash; \
-             '/Users//_me/Library/Application Support/aterm/pkg/agents/claude' \
+            " . '/Users/_me/.aterm/shell.d/00-atpkg.zsh'; rehash; \
+             '/Users/_me/Library/Application Support/aterm/pkg/agents/claude' \
              '--dangerously-skip-permissions' '--resume' '{ID}'"
         )
     );
@@ -483,8 +483,8 @@ fn a_line_the_tty_could_cut_is_refused() {
     // macOS keeps at most 1024 bytes of a line typed before the shell's line
     // editor is back (measured: with the Enter in that window 1023 ran and 1024
     // did not); `--resume <id>` is the END of the line, so any cut loses it.
-    let exe = Path::new("/Users//_me/Library/Application Support/aterm/pkg/agents/claude");
-    let hook = Path::new("/Users//_me/.aterm/shell.d/00-atpkg.zsh");
+    let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
+    let hook = Path::new("/Users/_me/.aterm/shell.d/00-atpkg.zsh");
     let line = |tty: LineDiscipline, pad: &str| {
         relaunch_line_on(
             tty,
@@ -531,7 +531,7 @@ fn a_line_the_tty_could_cut_is_refused() {
     let everyday = relaunch_line(
         Dialect::Zsh,
         Some(hook),
-        Some("/Users//_me/some/project dir"),
+        Some("/Users/_me/some/project dir"),
         exe,
         &argv(&[
             "--dangerously-skip-permissions",
@@ -729,4 +729,272 @@ fn the_reducer_announces_waits_for_ready_reasks_and_gives_up_without_forcing() {
         Step::Wait("in-flight")
     );
     assert_eq!(Phase::Failed("x".into()).word(), "failed:x");
+}
+
+// ---------------------------------------------------------------- the model
+
+/// An assistant row as Claude Code 2.1.282 writes one (measured 2026-09-24 in
+/// the owner's transcript: `isSidechain`, `type`, `message.model`, the content
+/// blocks), naming `model`.
+fn said_by(model: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","message":{{"model":"{model}","id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"ok"}}]}},"version":"2.1.282"}}"#
+    )
+}
+
+/// The rows a turn interleaves with its assistant rows: the person's prompt,
+/// a tool's result (a USER row), an attachment and a system row.
+fn between() -> [String; 4] {
+    [
+        r#"{"type":"user","message":{"role":"user","content":"run the tests"}}"#.to_string(),
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#.to_string(),
+        r#"{"type":"attachment","attachment":{"type":"edited_text_file"}}"#.to_string(),
+        r#"{"type":"system","subtype":"turn_duration","version":"2.1.282"}"#.to_string(),
+    ]
+}
+
+/// Claude Code's own assistant rows name no model: `<synthetic>`, measured
+/// 2026-09-24 (22 in the owner's transcripts — a limit notice, and `No
+/// response requested.` written just after a restart).
+const SYNTHETIC: &str = r#"{"type":"assistant","isApiErrorMessage":false,"message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"No response requested."}]}}"#;
+
+fn jsonl(rows: &[&str]) -> String {
+    rows.join("\n") + "\n"
+}
+
+#[test]
+fn the_model_is_the_last_assistant_turns_and_the_first_is_the_resumed_ones() {
+    let [prompt, tool, attached, system] = between();
+    let (a, b, c) = (
+        said_by("claude-opus-5"),
+        said_by("claude-fable-5-1"),
+        said_by("claude-opus-5-5"),
+    );
+    // Several turns on different models, the other rows interleaved.
+    let tail = jsonl(&[&prompt, &a, &tool, &b, &attached, &prompt, &c, &system]);
+    assert_eq!(transcript_model(&tail).as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(
+        transcript_first_model(&tail, "2.1.282").as_deref(),
+        Some("claude-opus-5")
+    );
+    // No assistant turn at all.
+    let quiet = jsonl(&[&prompt, &tool, &attached, &system]);
+    assert_eq!(transcript_model(&quiet), None);
+    assert_eq!(transcript_first_model(&quiet, "2.1.282"), None);
+    assert_eq!(transcript_model(""), None);
+    // The tail's cut first line is skipped, not read: alone it is no turn, and
+    // before a whole one the whole one answers from both ends.
+    let cut = &b[b.len() / 3..];
+    assert!(cut.contains("claude-fable-5-1"), "the cut keeps the model");
+    assert_eq!(transcript_model(&jsonl(&[cut, &prompt])), None);
+    assert_eq!(
+        transcript_first_model(&jsonl(&[cut, &prompt, &c]), "2.1.282").as_deref(),
+        Some("claude-opus-5-5")
+    );
+    // A row half-written at the end (Claude appending) is not a turn yet.
+    let half = &c[..c.len() / 2];
+    assert_eq!(
+        transcript_model(&format!("{a}\n{half}")).as_deref(),
+        Some("claude-opus-5")
+    );
+    // Claude's own rows name no model, and a row that names something no model
+    // id looks like is not taken either: a model is typed into the tab.
+    let odd = said_by("claude opus\\u001b[2J");
+    for filler in [SYNTHETIC, odd.as_str()] {
+        assert_eq!(
+            transcript_model(&jsonl(&[&a, filler])).as_deref(),
+            Some("claude-opus-5"),
+            "{filler}"
+        );
+        assert_eq!(
+            transcript_first_model(&jsonl(&[filler, &c]), "2.1.282").as_deref(),
+            Some("claude-opus-5-5"),
+            "{filler}"
+        );
+        assert_eq!(transcript_model(&jsonl(&[&prompt, filler])), None);
+    }
+    // A subagent's turn is not the session's model.
+    let sidechain =
+        said_by("claude-haiku-5").replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+    assert_eq!(
+        transcript_model(&jsonl(&[&c, &sidechain])).as_deref(),
+        Some("claude-opus-5-5")
+    );
+    // The ids other providers and the long-context variant carry are ids.
+    for id in [
+        "claude-opus-5-5[1m]",
+        "us.anthropic.claude-opus-5-5-v1:0",
+        "claude-opus-5-5@20260901",
+    ] {
+        assert_eq!(transcript_model(&said_by(id)).as_deref(), Some(id), "{id}");
+    }
+}
+
+#[test]
+fn the_continuation_says_what_the_session_ran_before_the_restart() {
+    let (from, to) = (v("2.1.281"), v("2.1.282"));
+    let said = continue_prompt(&from, &to, Some("claude-opus-5"));
+    assert_eq!(
+        said,
+        "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.282 (from \
+         2.1.281); it ran claude-opus-5 before the restart and was resumed. Continue where you \
+         left off; if you were waiting on the user, say so in one line."
+    );
+    assert!(!said.starts_with(ANNOUNCE_HEAD), "never the announcement");
+    // No model known: the clause is left out, not guessed.
+    let bare = continue_prompt(&from, &to, None);
+    assert_eq!(
+        bare,
+        "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.282 (from \
+         2.1.281) and resumed. Continue where you left off; if you were waiting on the user, say \
+         so in one line."
+    );
+}
+
+#[test]
+fn the_outcome_names_the_model_after_and_a_change_from_before() {
+    assert_eq!(
+        restart_outcome(
+            "2.1.282",
+            Some("claude-opus-5-5"),
+            Some("claude-opus-5-5"),
+            None
+        ),
+        "claude restarted on 2.1.282 · model claude-opus-5-5"
+    );
+    assert_eq!(
+        restart_outcome("2.1.282", None, Some("claude-opus-5-5"), None),
+        "claude restarted on 2.1.282 · model claude-opus-5-5",
+        "nothing before to compare with"
+    );
+    assert_eq!(
+        restart_outcome(
+            "2.1.282",
+            Some("claude-opus-5"),
+            Some("claude-opus-5-5"),
+            None
+        ),
+        "claude restarted on 2.1.282 · model claude-opus-5 -> claude-opus-5-5 (a session \
+         launched without --model takes the current default; /model changes it)"
+    );
+    assert_eq!(
+        restart_outcome("2.1.282", Some("claude-opus-5"), None, None),
+        "claude restarted on 2.1.282 · model unconfirmed (it ran claude-opus-5 before the \
+         restart)"
+    );
+    assert_eq!(
+        restart_outcome("2.1.282", None, None, None),
+        "claude restarted on 2.1.282 · model unconfirmed"
+    );
+}
+
+/// A cloud provider's model can be named by an ARN, longer than any first-party
+/// id: it is an id all the same, read and said, never "unconfirmed".
+#[test]
+fn a_provider_arn_is_a_model_id() {
+    let arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/\
+               us.anthropic.claude-opus-5-5-20260901-v1:0";
+    assert!(arn.len() > 64, "{}", arn.len());
+    assert_eq!(transcript_model(&said_by(arn)).as_deref(), Some(arn));
+    // The bound still holds: an id is never an unbounded run of bytes.
+    let endless = "a".repeat(4096);
+    assert_eq!(transcript_model(&said_by(&endless)), None);
+}
+
+/// THE REASON FOR A CHANGE is what decided the model after: a launch that
+/// named `--model` keeps it on the relaunch — which undoes a `/model` choice
+/// made since, and resolves an alias against the new build — so the default
+/// had nothing to do with it and is not blamed.
+#[test]
+fn the_outcome_blames_a_kept_model_flag_not_the_default() {
+    assert_eq!(
+        restart_outcome(
+            "2.1.282",
+            Some("claude-opus-5-5"),
+            Some("claude-sonnet-5"),
+            Some("claude-sonnet-5")
+        ),
+        "claude restarted on 2.1.282 · model claude-opus-5-5 -> claude-sonnet-5 (the relaunch \
+         kept the launch's --model claude-sonnet-5; /model changes it)"
+    );
+    assert_eq!(
+        restart_outcome(
+            "2.1.282",
+            Some("claude-opus-5"),
+            Some("claude-opus-5-5"),
+            Some("opus")
+        ),
+        "claude restarted on 2.1.282 · model claude-opus-5 -> claude-opus-5-5 (the relaunch \
+         kept the launch's --model opus; /model changes it)",
+        "an alias the new build resolves elsewhere"
+    );
+    // No change: the flag is not mentioned.
+    assert_eq!(
+        restart_outcome(
+            "2.1.282",
+            Some("claude-sonnet-5"),
+            Some("claude-sonnet-5"),
+            Some("claude-sonnet-5")
+        ),
+        "claude restarted on 2.1.282 · model claude-sonnet-5"
+    );
+}
+
+/// THE KEPT `--model` is read by the rewrite's own parse: the last one wins,
+/// as in Claude's parser; `--model=<v>` is one; a `--model` that is another
+/// flag's value, or comes after `--`, is not one.
+#[test]
+fn the_launch_model_is_the_model_flag_the_rewrite_keeps() {
+    let got = |w: &[&str]| launch_model(&argv(w));
+    assert_eq!(
+        got(&["claude", "--model", "claude-sonnet-5"]).as_deref(),
+        Some("claude-sonnet-5")
+    );
+    assert_eq!(got(&["claude", "--model=opus"]).as_deref(), Some("opus"));
+    assert_eq!(
+        got(&[
+            "claude",
+            "--model",
+            "opus",
+            "--verbose",
+            "--model",
+            "sonnet"
+        ])
+        .as_deref(),
+        Some("sonnet"),
+        "the last one wins"
+    );
+    assert_eq!(got(&["claude", "--verbose"]), None);
+    assert_eq!(got(&["claude", "--fallback-model", "sonnet"]), None);
+    assert_eq!(
+        got(&["claude", "--append-system-prompt", "--model", "x"]),
+        None,
+        "a value, not the flag (and `x` is a positional)"
+    );
+    assert_eq!(got(&["claude", "--", "--model", "x"]), None);
+    assert_eq!(got(&["claude", "--model"]), None, "no value");
+    // A launch the rewrite refuses relaunches nothing.
+    assert_eq!(got(&["claude", "--print", "--model", "x"]), None);
+}
+
+/// THE RESUMED MODEL is the new process's: every transcript row carries the
+/// `version` that wrote it (measured 2026-09-24: all 25,018 assistant rows in
+/// the owner's transcripts), so a row the old process wrote past the mark —
+/// alive past its SIGTERM for one more turn — is never taken as the answer.
+#[test]
+fn the_resumed_model_is_read_only_from_the_new_builds_rows() {
+    let old = said_by("claude-opus-5").replace("2.1.282", "2.1.281");
+    let new = said_by("claude-opus-5-5");
+    let past = jsonl(&[&old, &new]);
+    assert_eq!(
+        transcript_first_model(&past, "2.1.282").as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(transcript_first_model(&jsonl(&[&old]), "2.1.282"), None);
+    // A row that names no version is no build's.
+    let unversioned = new.replace(r#","version":"2.1.282""#, "");
+    assert_eq!(
+        transcript_first_model(&jsonl(&[&unversioned]), "2.1.282"),
+        None
+    );
 }

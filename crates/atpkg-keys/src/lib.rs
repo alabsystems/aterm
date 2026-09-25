@@ -84,9 +84,144 @@ pub fn sign(pkcs8: &[u8], msg: &[u8]) -> Result<Vec<u8>, String> {
     Ok(kp.sign(msg).as_ref().to_vec())
 }
 
+/// Who signed a file, as [`verify_signed`] proved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    /// The roster id of the machine whose key verified.
+    pub machine_id: String,
+    /// The roster generation that authorized it.
+    pub roster_seq: u64,
+}
+
+/// Verify a detached Ed25519 signature over `file`'s exact bytes by a machine the
+/// master-signed roster authorizes — the client's own rule for an appcast
+/// (`aterm_update_core::roster`): the roster verifies under one of `master_pubkeys`, parses,
+/// is fresh at `now_unix`, and one of its LIVE machines (listed, not revoked, not expired)
+/// signed the file.
+///
+/// The ALab lane (`tools/atpkg-auto-alab.sh`) runs this over an ALab source release's
+/// `SHA256SUMS` before it builds that source, against the roster the channel's verified
+/// index ships — so a release signed by no rostered machine, or by one revoked since, is
+/// never built beside the machine key. The refusal is the verifier's own reason, never an
+/// oracle about which key was close.
+///
+/// # Errors
+///
+/// The [`aterm_update_core::roster::RosterReject`] of the first step that refused.
+pub fn verify_signed(
+    master_pubkeys: &[&str],
+    roster: Vec<u8>,
+    roster_sig: &[u8],
+    file: &[u8],
+    sig: &[u8],
+    now_unix: i64,
+) -> Result<Signed, aterm_update_core::roster::RosterReject> {
+    use aterm_update_core::roster::{Roster, verify_roster};
+    let verified = verify_roster(master_pubkeys, roster, roster_sig)?;
+    let parsed = Roster::parse(&verified)?;
+    parsed.admit(0, now_unix)?;
+    let who = parsed.authorize_appcast(file, sig, now_unix)?;
+    Ok(Signed {
+        machine_id: who.machine_id,
+        roster_seq: who.roster_seq,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A master-signed one-machine roster (plus an optional revoked id and a validity
+    /// deadline), minted in memory with keys this tool generates.
+    fn signed_roster(
+        master: &[u8],
+        machine_pub: &str,
+        revoked: &[&str],
+        valid_until: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        use aterm_update_core::roster::{Machine, Roster};
+        let roster = Roster {
+            schema: 1,
+            roster_seq: 4,
+            valid_until: valid_until.into(),
+            machines: vec![Machine {
+                id: "m2".into(),
+                pubkey: machine_pub.into(),
+                added_at: "2026-08-04T00:00:00Z".into(),
+                not_after: None,
+            }],
+            revoked: revoked.iter().map(|r| (*r).to_string()).collect(),
+        };
+        let bytes = roster
+            .to_toml()
+            .expect("a valid roster serializes")
+            .into_bytes();
+        let sig = sign(master, &bytes).expect("the master signs");
+        (bytes, sig)
+    }
+
+    // `verify-signed`: the release-side twin of the client's appcast rule. The positive
+    // case names the machine; every negative control is one link of the chain broken.
+    #[test]
+    fn verify_signed_accepts_a_rostered_signature_and_nothing_else() {
+        use aterm_update_core::roster::RosterReject;
+        let now = 1_785_801_600i64; // 2026-08-04
+        let (master, master_pub) = generate().unwrap();
+        let (machine, machine_pub) = generate().unwrap();
+        let file = b"# alab-release SHA256SUMS \xe2\x80\x94 schema 1\n# tag: v0.25.0\n";
+        let sig = sign(&machine, file).unwrap();
+        let (roster, roster_sig) =
+            signed_roster(&master, &machine_pub, &[], "2099-01-01T00:00:00Z");
+
+        let who = verify_signed(&[&master_pub], roster.clone(), &roster_sig, file, &sig, now)
+            .expect("a rostered machine's signature verifies");
+        assert_eq!(
+            who,
+            Signed {
+                machine_id: "m2".into(),
+                roster_seq: 4
+            }
+        );
+
+        // A tampered file (one byte) is refused.
+        let mut bad = file.to_vec();
+        bad[2] ^= 0x01;
+        assert_eq!(
+            verify_signed(&[&master_pub], roster.clone(), &roster_sig, &bad, &sig, now),
+            Err(RosterReject::Verify)
+        );
+        // A signature by a key the roster does not list is refused.
+        let (stranger, _) = generate().unwrap();
+        let stranger_sig = sign(&stranger, file).unwrap();
+        assert_eq!(
+            verify_signed(
+                &[&master_pub],
+                roster.clone(),
+                &roster_sig,
+                file,
+                &stranger_sig,
+                now
+            ),
+            Err(RosterReject::Verify)
+        );
+        // A roster the pinned master did not sign is refused before any file crypto.
+        let (other_master, _) = generate().unwrap();
+        let forged_sig = sign(&other_master, &roster).unwrap();
+        assert_eq!(
+            verify_signed(&[&master_pub], roster.clone(), &forged_sig, file, &sig, now),
+            Err(RosterReject::Verify)
+        );
+        // A machine revoked on the roster authorizes nothing.
+        let (revoked, revoked_sig) =
+            signed_roster(&master, &machine_pub, &["m2"], "2099-01-01T00:00:00Z");
+        assert!(verify_signed(&[&master_pub], revoked, &revoked_sig, file, &sig, now).is_err());
+        // A lapsed roster authorizes nothing.
+        let (stale, stale_sig) = signed_roster(&master, &machine_pub, &[], "2026-01-01T00:00:00Z");
+        assert_eq!(
+            verify_signed(&[&master_pub], stale, &stale_sig, file, &sig, now),
+            Err(RosterReject::Stale)
+        );
+    }
 
     // THE contract: a signature produced here is accepted by the actual client verifier
     // over the exact bytes, and a 1-byte tamper is rejected.

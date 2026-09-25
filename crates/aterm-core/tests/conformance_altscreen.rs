@@ -48,8 +48,8 @@ const CELLS: usize = 3;
 const MAXVAL: i64 = 2;
 
 // VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`:
-// verification is always required — an absent Trust `ty` FAILS the test with a build
-// hint (`cargo build --release -p tla-cli` in $HOME/trust/first-party/ty).
+// verification is always required — an absent Trust `ty` FAILS the test with the
+// install hint (`aterm pkg install ty`).
 
 /// The abstract spec state — the projection target.
 #[derive(Clone, PartialEq, Debug)]

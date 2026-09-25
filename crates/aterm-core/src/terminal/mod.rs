@@ -121,10 +121,7 @@ pub use aterm_types::{ColorPalette, Rgb};
 pub use aterm_types::{KittyKeyboardFlags, KittyKeyboardState};
 pub use blocks_api::BlockText;
 pub use builder::{TIERED_RING_CAP_DEFAULT, TerminalBuilder};
-pub use callbacks::{
-    CALLBACK_REGISTRY, CallbackCategory, CallbackInfo, SshConductorCallbackEvent,
-    TmuxCallbackEvent, callback_by_name, callback_count, callback_info,
-};
+pub use callbacks::{SshConductorCallbackEvent, TmuxCallbackEvent};
 #[cfg(feature = "serde")]
 pub use checkpoint::CheckpointMeta;
 pub use checkpoint::{

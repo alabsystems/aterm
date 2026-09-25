@@ -23,6 +23,21 @@ pub fn current_time_ms() -> Option<u64> {
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Milliseconds from `start` to `end`: `None` when either timestamp is missing
+/// or `end` precedes `start` (an inconsistent pair is not a zero duration).
+///
+/// The one rule behind every OSC 133 phase duration on [`CommandMark`] and
+/// `OutputBlock`, which used to carry six identical copies of this `match`.
+#[must_use]
+pub(crate) fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+    match (start, end) {
+        // saturating_sub: exact under the `end >= start` guard (which the
+        // verifier cannot chain into the arm's arithmetic).
+        (Some(start), Some(end)) if end >= start => Some(end.saturating_sub(start)),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Shell Integration (OSC 133)
 // ============================================================================
@@ -123,12 +138,7 @@ impl CommandMark {
     /// Returns `None` if timestamps are incomplete or inconsistent.
     #[must_use]
     pub fn prompt_duration_ms(&self) -> Option<u64> {
-        match (self.prompt_time_ms, self.command_input_start_time_ms) {
-            // saturating_sub: exact under the `end >= start` guard (which the
-            // verifier cannot chain into the arm's arithmetic).
-            (Some(start), Some(end)) if end >= start => Some(end.saturating_sub(start)),
-            _ => None,
-        }
+        elapsed_ms(self.prompt_time_ms, self.command_input_start_time_ms)
     }
 
     /// Calculate the command typing duration in milliseconds.
@@ -137,15 +147,10 @@ impl CommandMark {
     /// Returns `None` if timestamps are incomplete or inconsistent.
     #[must_use]
     pub fn input_duration_ms(&self) -> Option<u64> {
-        match (
+        elapsed_ms(
             self.command_input_start_time_ms,
             self.command_exec_start_time_ms,
-        ) {
-            // saturating_sub: exact under the `end >= start` guard (which the
-            // verifier cannot chain into the arm's arithmetic).
-            (Some(start), Some(end)) if end >= start => Some(end.saturating_sub(start)),
-            _ => None,
-        }
+        )
     }
 
     /// Calculate the command execution duration in milliseconds.
@@ -154,12 +159,7 @@ impl CommandMark {
     /// Returns `None` if timestamps are incomplete or inconsistent.
     #[must_use]
     pub fn exec_duration_ms(&self) -> Option<u64> {
-        match (self.command_exec_start_time_ms, self.command_end_time_ms) {
-            // saturating_sub: exact under the `end >= start` guard (which the
-            // verifier cannot chain into the arm's arithmetic).
-            (Some(start), Some(end)) if end >= start => Some(end.saturating_sub(start)),
-            _ => None,
-        }
+        elapsed_ms(self.command_exec_start_time_ms, self.command_end_time_ms)
     }
 
     /// Calculate the total command duration in milliseconds.
@@ -169,12 +169,7 @@ impl CommandMark {
     /// Returns `None` if either timestamp is missing or inconsistent.
     #[must_use]
     pub fn command_duration_ms(&self) -> Option<u64> {
-        match (self.prompt_time_ms, self.command_end_time_ms) {
-            // saturating_sub: exact under the `end >= start` guard (which the
-            // verifier cannot chain into the arm's arithmetic).
-            (Some(start), Some(end)) if end >= start => Some(end.saturating_sub(start)),
-            _ => None,
-        }
+        elapsed_ms(self.prompt_time_ms, self.command_end_time_ms)
     }
 }
 

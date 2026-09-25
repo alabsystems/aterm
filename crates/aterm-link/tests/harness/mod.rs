@@ -162,25 +162,30 @@ impl Drop for BootPermit {
 /// deliberately running two suites at once and willing to read the results with that in
 /// mind.
 fn refuse_a_dirty_machine() {
-    // ONCE PER PROCESS, at the FIRST world's boot. This suite runs its tests in
-    // parallel and every world spawns its own pair, so from the second boot onward
-    // the daemons this run started are indistinguishable from a previous run's by
-    // `pgrep` alone — checking every time turns a correct guard into one that fails
-    // its own suite. At the first boot nothing of this run exists yet, so anything
-    // alive then is genuinely someone else's.
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    let mut found: Option<String> = None;
-    ONCE.call_once(|| found = strays_now());
-    let Some(strays) = found else {
+    // DECIDED ONCE PER PROCESS, at the FIRST world's boot, and then REFUSED AT
+    // EVERY BOOT. This suite runs its tests in parallel and every world spawns its
+    // own pair, so from the second boot onward the daemons this run started are
+    // indistinguishable from a previous run's by `pgrep` alone — asking every time
+    // turns a correct guard into one that fails its own suite. At the first boot
+    // nothing of this run exists yet, so anything alive then is genuinely someone
+    // else's. The ANSWER is kept (2026-09-23): until then only the first boot
+    // refused and every later world booted beside the strays, so the rest of the
+    // binary measured them after all and its reds read as findings.
+    static STRAYS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(strays) = STRAYS.get_or_init(strays_now) else {
         return;
     };
+    // The first words are the merge gate's COULD NOT RUN sentinel
+    // (`aterm_verify::libtest::COULD_NOT_RUN_SENTINEL`): a machine still running a
+    // previous run's daemons is not a finding about this tree, and the gate
+    // records a binary whose every red carries it as could-not-run.
     panic!(
-        "a PREVIOUS run's daemons were already alive when this suite started ({strays}). \
-         This suite would measure them rather than itself, which reads as a flake and \
-         then as a regression. Reap them (`pkill -f 'aterm-gui --headless'; \
-         pkill -f 'aterm-link serve'`) and clear the scratch worlds \
-         (`rm -rf /private/tmp/a5-* /private/tmp/atl-*`), or set \
-         $ATERM_LINK_ALLOW_STRAYS=1 if the overlap is deliberate."
+        "aterm-gate: COULD NOT RUN — a PREVIOUS run's daemons were already alive when this \
+         suite started ({strays}). This suite would measure them rather than itself, which \
+         reads as a flake and then as a regression. Reap them (`pkill -f 'aterm-gui \
+         --headless'; pkill -f 'aterm-link serve'`) and clear the scratch worlds (`rm -rf \
+         /private/tmp/a5-* /private/tmp/atl-*`), or set $ATERM_LINK_ALLOW_STRAYS=1 if the \
+         overlap is deliberate."
     );
 }
 
@@ -216,6 +221,18 @@ fn process_age_secs(pid: &str) -> Option<i64> {
     Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
 }
 
+/// A process's command line (`ps -o command=`), so a refusal names the binary the
+/// stray runs from — which checkout's `target/` left it behind — not just a pid.
+fn process_command(pid: &str) -> String {
+    std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", pid])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "<command unreadable>".to_string())
+}
+
 /// The stray daemons alive RIGHT NOW, or `None` when the machine is clean (or when the
 /// question cannot be asked, in which case the harness says nothing rather than guessing).
 fn strays_now() -> Option<String> {
@@ -235,15 +252,20 @@ fn strays_now() -> Option<String> {
         else {
             return None;
         };
-        let older = String::from_utf8_lossy(&out.stdout)
+        let older: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter_map(|pid| process_age_secs(pid.trim()))
+            .map(str::trim)
             // A couple of seconds of slack: our own children are born a moment after we
             // are, and ps reports whole seconds.
-            .filter(|age| *age > my_age + 2)
-            .count();
-        if older > 0 {
-            strays.push(format!("{older} x `{pattern}`"));
+            .filter(|pid| process_age_secs(pid).is_some_and(|age| age > my_age + 2))
+            .map(|pid| format!("pid {pid}: {}", process_command(pid)))
+            .collect();
+        if !older.is_empty() {
+            strays.push(format!(
+                "{} x `{pattern}` — {}",
+                older.len(),
+                older.join("; ")
+            ));
         }
     }
     (!strays.is_empty()).then(|| strays.join(", "))

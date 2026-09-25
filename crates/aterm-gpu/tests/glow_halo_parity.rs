@@ -15,7 +15,8 @@
 //     centre), and quads clipped at the grid edges — is BYTE-EXACT;
 //   * the damaged/cached path: a halo MOVING between frames must miss the GPU
 //     dirty gate and re-render byte-exactly (the prev∪cur row discipline);
-//   * an emptied stream (`clear_overlays`) restores the bare GPU frame;
+//   * an emptied stream (`clear_overlays`) restores the bare GPU frame (the
+//     glow_halo row of `tests/empty_channels_gpu.rs`);
 //   * `HaloMode::Over` (EMBERFORGE P7, the light-theme veil — CPU `over_rgb`
 //     == GPU `fs_rain_glow_over` through the deco source-over blend state on
 //     the Unorm view): a mixed Add+Over field — veils overlapping embers,
@@ -513,51 +514,4 @@ fn damaged_path_over_veil_parity_cpu_matches_gpu() {
     } else {
         eprintln!("SKIP damaged-path byte-exact Over gate: downlevel sRGB offscreen");
     }
-}
-
-/// An emptied stream is byte-identical on the GPU: a populated `glow_halo`
-/// must paint, and `clear_overlays` must restore the bare frame — the
-/// introspection-capture (`image plain`) contract, GPU side.
-#[test]
-fn glow_halo_disabled_bytes_identical_on_gpu() {
-    let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (6usize, 20usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l$ embers off");
-    let (cw, ch) = cpu.cell_size();
-
-    let base_input = term.cell_frame(rows, cols);
-    assert!(base_input.glow_halo.is_empty());
-    let base = gpu.render_input(&mut win, &base_input, None).pixels;
-
-    let mut cleared = term.cell_frame(rows, cols);
-    cleared.glow_halo.push(RainHalo {
-        row: 2,
-        x: (3 * cw) as u16,
-        y: (2 * ch) as u16,
-        w: (2 * cw) as u16,
-        h: ch as u16,
-        color: 0x0080_FF80,
-        cx: (4 * cw) as u16,
-        cy: (2 * ch + ch / 2) as u16,
-        rx: cw as u16,
-        ry: (ch / 2).max(1) as u16,
-        mode: HaloMode::Add,
-    });
-    let painted = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_ne!(
-        base, painted,
-        "a live glow_halo frame must paint on the GPU"
-    );
-    cleared.clear_overlays();
-    assert!(cleared.glow_halo.is_empty(), "clear_overlays must strip it");
-    let stripped = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_eq!(
-        base, stripped,
-        "clear_overlays must restore the bare GPU frame (glow_halo IS bling)"
-    );
 }

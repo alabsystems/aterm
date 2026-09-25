@@ -6,15 +6,10 @@
 // makes formal model-checking a first-class `cargo test` + CI artifact rather
 // than a manual side ritual.
 //
-// `ty` is located by a fixed canonical path search (in order): the Trust
-// first-party submodule ($HOME/trust/first-party/ty/target/release/ty), the Trust
-// stage2 build ($HOME/trust/build/host/stage2/bin/ty), ~/ty/target/release/ty, then
-// `ty` on PATH. VERIFICATION GATE (honesty ratchet, batteries-on, see
-// `aterm_spec::verify`): verification is always required — an absent Trust `ty` FAILS
-// the test with a build hint; build the toolchain once (`cargo build --release -p
-// tla-cli` in $HOME/trust/first-party/ty). The canonical search includes the Trust
-// submodule path so a standard `cargo test` model-checks the specs with no
-// configuration.
+// `ty` is located by `aterm_spec::verify`'s discovery (the atpkg store's shim, then
+// PATH), so a standard `cargo test` model-checks the specs with no configuration.
+// VERIFICATION GATE (honesty ratchet, batteries-on): an absent Trust `ty` is
+// reported loudly (`aterm pkg install ty`), never read as a pass.
 
 use aterm_spec::verify::ty_escalation;
 use std::path::{Path, PathBuf};

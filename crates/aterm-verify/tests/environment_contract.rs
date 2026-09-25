@@ -35,7 +35,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use aterm_verify::exec::Timings;
-use aterm_verify::identity::{self, ToolchainIdentity, TreeState, Tripwire};
+use aterm_verify::identity::{self, PathState, ToolchainIdentity, TreeState, Tripwire};
 use aterm_verify::snapshot::{self, SourceMode};
 use aterm_verify::verdict::MERGE_CONTRACT_SENTENCE;
 use aterm_verify::{Ctx, EnvSnapshot, Mode, Scope, exit, mktemp_dir, plan};
@@ -98,13 +98,16 @@ fn mtime(p: &Path) -> std::time::SystemTime {
 
 /// The stage2 driver body that also produces the two binaries the smokes drive
 /// — the same stand-in `gate_contract.rs` uses, so a whole ladder runs green.
+/// Its `aterm-gui` points the control socket at `@LISTENER@`, the fixture's
+/// real listening socket ([`Fixture::answering_smoke`] fills it in): the smoke
+/// waits for a socket that accepts a connect, not for a file.
 const ANSWERING_SMOKE: &str = r#"case "$*" in
   *aterm-gui*aterm-ctl*)
     mkdir -p target-drivers/debug
     cat >target-drivers/debug/aterm-gui <<'GUI'
 #!/bin/sh
 mkdir -p "$XDG_RUNTIME_DIR/aterm"
-ln -s /dev/null "$XDG_RUNTIME_DIR/aterm/aterm.sock"
+ln -s '@LISTENER@' "$XDG_RUNTIME_DIR/aterm/aterm.sock"
 exec sleep 300
 GUI
     cat >target-drivers/debug/aterm-ctl <<'CTL'
@@ -128,6 +131,9 @@ struct Fixture {
     root: PathBuf,
     stage2: PathBuf,
     scratch: PathBuf,
+    /// The control socket the answering smoke's `aterm-gui` links to, held
+    /// listening for the fixture's life.
+    _listener: std::os::unix::net::UnixListener,
 }
 
 impl Fixture {
@@ -141,7 +147,6 @@ impl Fixture {
         write(&root.join("Cargo.toml"), "[workspace]\n");
         for rel in [
             "tools/verify.sh",
-            "tools/test-install-channel.sh",
             "tools/test-trust-gate-verdict.sh",
             "tools/test-trust-contract-probe.sh",
             "tools/perf-arena/test-start-compare.sh",
@@ -149,8 +154,11 @@ impl Fixture {
         ] {
             script(&root.join(rel), "exit 0");
         }
-        // The atpkg publish suites come from the ROSTER, never from a hand-written copy of
-        // it: the copy drifted the moment the roster grew (2026-09-17).
+        // The release and atpkg publish suites come from their ROSTERS, never from a
+        // hand-written copy: the copy drifted the moment a roster grew (2026-09-17).
+        for name in aterm_verify::stages::RELEASE_SUITES {
+            script(&root.join("tools").join(name), "exit 0");
+        }
         for name in aterm_verify::stages::ATPKG_SUITES {
             script(&root.join("tools").join(name), "exit 0");
         }
@@ -183,11 +191,14 @@ impl Fixture {
             );
         }
         script(&stage2.join("trustdoc"), "exit 0");
+        let _listener = std::os::unix::net::UnixListener::bind(base.join("ctl.sock"))
+            .expect("bind the fixture's control socket");
         Self {
             base,
             root,
             stage2,
             scratch,
+            _listener,
         }
     }
 
@@ -208,8 +219,9 @@ impl Fixture {
             &self.stage2.join("targo"),
             &format!(
                 "case \"$*\" in\n  \"--unverified build --workspace\")\n    \
-                 if [ -e '{}' ]; then {on_build}; fi ;;\nesac\n{ANSWERING_SMOKE}",
-                self.base.join("trigger").display()
+                 if [ -e '{}' ]; then {on_build}; fi ;;\nesac\n{}",
+                self.base.join("trigger").display(),
+                self.answering_smoke()
             ),
         );
         self
@@ -244,6 +256,16 @@ impl Fixture {
         let mut out: Vec<u8> = Vec::new();
         let code = aterm_verify::run(ctx, &mut out).expect("the ladder is writable");
         (String::from_utf8(out).expect("utf-8 ladder"), code)
+    }
+}
+
+impl Fixture {
+    /// [`ANSWERING_SMOKE`] pointed at this fixture's listening socket.
+    fn answering_smoke(&self) -> String {
+        ANSWERING_SMOKE.replace(
+            "@LISTENER@",
+            &self.base.join("ctl.sock").display().to_string(),
+        )
     }
 }
 
@@ -332,8 +354,18 @@ fn a_git_tree_that_cannot_be_read_in_place_is_could_not_run_before_any_stage() {
     assert!(calm.contains("verify: source "), "{calm}");
 }
 
+/// The machine lock a fixture gate takes: one beside the fixture, never the
+/// per-user one. On the real lock a fixture gate queues behind every other gate
+/// on the machine (silently: `.output()` swallows its stderr) and, when a real
+/// gate's test stage runs this file, behind that very gate — its ancestor,
+/// which cannot release the lock until this test returns.
+fn fixture_lock(root: &Path) -> PathBuf {
+    root.with_file_name("machine-lock")
+}
+
 /// The gate binary on `root`: `--fast` plus `extra`, the fixture's driver,
-/// `path` as PATH, and none of the caller's gate channels.
+/// `path` as PATH, none of the caller's gate channels, and a machine lock of
+/// the fixture's own (see [`fixture_lock`]).
 fn gate(
     root: &Path,
     stage2: &Path,
@@ -349,6 +381,7 @@ fn gate(
         .env("PATH", path)
         .env("TRUST_STAGE2_BIN", stage2)
         .env("ATERM_SKIP_GUI_SMOKE", "1")
+        .env(snapshot::MACHINE_LOCK_DIR_ENV, fixture_lock(root))
         .env_remove(snapshot::SNAPSHOT_ENV)
         .env_remove("ATERM_VERIFY_TIMINGS")
         .env_remove("CARGO_TARGET_DIR")
@@ -554,7 +587,8 @@ fn a_changed_run_selects_the_crate_an_index_flag_hides_an_edit_in() {
              echo 'crate-a v0.1.0 ({r}/crates/a)'; echo 'crate-b v0.1.0 ({r}/crates/b)'; exit 0 ;;\n  \
              \"tree --invert crate-a\"*) echo 'crate-a v0.1.0 ({r}/crates/a)'; exit 0 ;;\n  \
              \"tree --invert crate-b\"*) echo 'crate-b v0.1.0 ({r}/crates/b)'; exit 0 ;;\n\
-             esac\n{ANSWERING_SMOKE}"
+             esac\n{}",
+            repo.answering_smoke()
         ),
     );
     let lib = root.join("crates/b/src/lib.rs");
@@ -573,6 +607,7 @@ fn a_changed_run_selects_the_crate_an_index_flag_hides_an_edit_in() {
             ])
             .env("TRUST_STAGE2_BIN", &repo.stage2)
             .env("ATERM_SKIP_GUI_SMOKE", "1")
+            .env(snapshot::MACHINE_LOCK_DIR_ENV, fixture_lock(&root))
             .env_remove(snapshot::SNAPSHOT_ENV)
             .env_remove("ATERM_VERIFY_TIMINGS")
             .env_remove("CARGO_TARGET_DIR")
@@ -1064,6 +1099,7 @@ fn a_second_gate_on_a_held_snapshot_is_could_not_run() {
         .arg(&c.root)
         .env(snapshot::SNAPSHOT_ENV, c.snap())
         .env("TRUST_STAGE2_BIN", &stage2)
+        .env(snapshot::MACHINE_LOCK_DIR_ENV, fixture_lock(&c.root))
         .env_remove("ATERM_VERIFY_TIMINGS")
         .output()
         .expect("the gate binary runs");
@@ -1092,6 +1128,311 @@ fn a_second_gate_on_a_held_snapshot_is_could_not_run() {
     c.prepare(&[], None)
         .expect("a stale lock is broken")
         .finish();
+}
+
+// --- submodules (2026-09-24: `vendor/astream` became one) -------------------------
+//
+// A linked worktree shares no submodule checkout with its main one, and `git
+// submodule update --init` in the snapshot would clone from `.gitmodules`' URL —
+// the network, credentials for a private repository, and possibly a commit the
+// caller does not have. Every fixture below records a URL that resolves nowhere
+// and then DELETES the upstream it was added from, so the one place the
+// submodule's objects exist is the caller's own `.git/modules/`: a sync that
+// reached for the network, or for any other copy, fails these tests.
+
+const SUB: &str = "vendor/sub";
+
+/// Give `c` a committed submodule at [`SUB`] whose only surviving copy is the
+/// caller's own. Returns the gitlink commit.
+fn add_submodule(c: &Caller) -> String {
+    let upstream = c.base.join("upstream");
+    write(&upstream.join("lib.txt"), "l1\n");
+    git(&upstream, &["init", "-q"]);
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "upstream"]);
+    let url = upstream.to_str().expect("utf-8 temp path");
+    git(
+        &c.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            url,
+            SUB,
+        ],
+    );
+    git(
+        &c.root,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            &format!("submodule.{SUB}.url"),
+            "https://astream.invalid/unreachable.git",
+        ],
+    );
+    git(&c.root, &["submodule", "sync", "-q"]);
+    git(&c.root, &["add", ".gitmodules"]);
+    git(&c.root, &["commit", "-q", "-m", "add the submodule"]);
+    fs::remove_dir_all(&upstream).expect("rm upstream");
+    sub_head(&c.root)
+}
+
+fn caller_with_submodule(tag: &str) -> Caller {
+    let c = Caller::new(tag);
+    add_submodule(&c);
+    c
+}
+
+fn sub_head(root: &Path) -> String {
+    git(&root.join(SUB), &["rev-parse", "HEAD"])
+}
+
+fn read(p: &Path) -> String {
+    fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+fn no_toolchain() -> ToolchainIdentity {
+    ToolchainIdentity {
+        files: vec![],
+        commit: None,
+    }
+}
+
+#[test]
+fn a_clean_submodule_is_synced_offline_from_the_callers_own_checkout() {
+    let c = caller_with_submodule("atv-env-sub-clean");
+    let config = fs::read(c.root.join(".git/config")).expect("config");
+    let status = |root: &Path| {
+        git(
+            root,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored",
+                "--ignore-submodules=none",
+            ],
+        )
+    };
+    let before = status(&c.root);
+
+    let s = c.prepare(&[], None).expect("snapshot");
+    let snap = s.root.clone();
+    assert_eq!(read(&snap.join(SUB).join("lib.txt")), "l1\n");
+    assert_eq!(sub_head(&snap), sub_head(&c.root));
+    assert_eq!(
+        git(
+            &snap,
+            &["status", "--porcelain", "--ignore-submodules=none"]
+        ),
+        "",
+        "the snapshot is a clean checkout, submodule and all"
+    );
+    assert_eq!(
+        read(&snap.join(SUB).join(".git")),
+        format!("gitdir: ../../{}/modules/{SUB}\n", identity::GATE_STATE_DIR),
+        "the submodule's git dir is the gate's, named by a relative .git file"
+    );
+
+    // Clean is clean: a populated submodule at its gitlink adds nothing.
+    let caller_tree = TreeState::capture(&c.root, &path_env()).expect("caller");
+    assert!(caller_tree.dirty.is_empty(), "{:?}", caller_tree.dirty);
+    assert_eq!(s.tree, caller_tree);
+
+    // Nothing was written to the caller: not its config, not its tree.
+    assert_eq!(
+        fs::read(c.root.join(".git/config")).expect("config"),
+        config
+    );
+    assert_eq!(status(&c.root), before);
+    s.finish();
+
+    // A resync reuses the submodule's git dir and still proves equality.
+    let s = c.prepare(&[], None).expect("resync");
+    assert_eq!(s.tree, caller_tree);
+    s.finish();
+
+    // THE CHECK IS NOT VACUOUS: the same snapshot with its submodule
+    // unpopulated — what a sync that skipped the submodule would leave — does
+    // not compare equal to the caller, so it could never be verified as it.
+    fs::remove_file(snap.join(SUB).join(".git")).expect("unlink the .git file");
+    let hollow = TreeState::capture(&snap, &path_env()).expect("snapshot");
+    assert_eq!(hollow.dirty.get(SUB), Some(&PathState::Unpopulated));
+    assert_ne!(hollow, caller_tree);
+    // …and the next sync repairs it.
+    let s = c.prepare(&[], None).expect("repair");
+    assert_eq!(s.tree, caller_tree);
+    s.finish();
+}
+
+/// Trying an astream change before its bump: the caller's submodule sits on a
+/// commit the gitlink does not name — and that exists ONLY in the caller's
+/// submodule repository. MIRRORED, not refused: that is the tree cargo reads.
+#[test]
+fn a_submodule_checked_out_off_its_gitlink_is_mirrored_and_reads_dirty() {
+    let c = caller_with_submodule("atv-env-sub-moved");
+    let gitlink = sub_head(&c.root);
+    let sub = c.root.join(SUB);
+    write(&sub.join("lib.txt"), "l2\n");
+    git(&sub, &["commit", "-q", "-a", "-m", "tried before its bump"]);
+    let moved = sub_head(&c.root);
+    assert_ne!(moved, gitlink);
+
+    let s = c.prepare(&[], None).expect("snapshot");
+    assert_eq!(sub_head(&s.root), moved);
+    assert_eq!(read(&s.root.join(SUB).join("lib.txt")), "l2\n");
+    let caller_tree = TreeState::capture(&c.root, &path_env()).expect("caller");
+    assert_eq!(
+        caller_tree.dirty.get(SUB),
+        Some(&PathState::Gitlink {
+            head: moved.clone()
+        })
+    );
+    assert_eq!(s.tree, caller_tree);
+    assert!(
+        caller_tree.dirty_digest(&path_env()).is_some(),
+        "a submodule off its gitlink is not the tree HEAD names"
+    );
+    s.finish();
+
+    // And back: the next sync follows the caller to the gitlink.
+    git(
+        &sub,
+        &[
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "-q",
+            &gitlink,
+        ],
+    );
+    let s = c.prepare(&[], None).expect("resync");
+    assert_eq!(sub_head(&s.root), gitlink);
+    assert_eq!(read(&s.root.join(SUB).join("lib.txt")), "l1\n");
+    assert!(s.tree.dirty.is_empty(), "{:?}", s.tree.dirty);
+    s.finish();
+}
+
+/// A dirty submodule is mirrored path by path, and its paths are identity: an
+/// edit inside the snapshot's submodule after the sync trips the run. (Before
+/// 2026-09-24 the whole submodule was ONE path in state "other", so two
+/// different edits inside it compared equal.)
+#[test]
+fn a_dirty_submodule_is_mirrored_path_by_path_and_an_edit_inside_it_trips_the_run() {
+    let c = caller_with_submodule("atv-env-sub-dirty");
+    let sub = c.root.join(SUB);
+    write(&sub.join("lib.txt"), "edited\n");
+    write(&sub.join("new.txt"), "untracked\n");
+
+    let s = c.prepare(&[], None).expect("snapshot");
+    assert_eq!(read(&s.root.join(SUB).join("lib.txt")), "edited\n");
+    assert_eq!(read(&s.root.join(SUB).join("new.txt")), "untracked\n");
+    let caller_tree = TreeState::capture(&c.root, &path_env()).expect("caller");
+    for p in [SUB, "vendor/sub/lib.txt", "vendor/sub/new.txt"] {
+        assert!(
+            caller_tree.dirty.contains_key(p),
+            "{p}: {:?}",
+            caller_tree.dirty
+        );
+    }
+    assert_eq!(s.tree, caller_tree);
+
+    let wire = Tripwire::arm_against(&s.root, &path_env(), Some(s.tree.clone()), no_toolchain());
+    assert_eq!(wire.check(Duration::ZERO), None, "nothing moved yet");
+    write(&s.root.join(SUB).join("lib.txt"), "changed under the run\n");
+    let why = wire.check(Duration::ZERO).expect("tripped");
+    assert!(why.contains("vendor/sub/lib.txt"), "{why}");
+    s.finish();
+
+    // An unchanged dirty file inside the submodule keeps its mtime across a
+    // resync, like one in the superproject: cargo must not rebuild for nothing.
+    let unchanged = s_root_of(&c).join(SUB).join("new.txt");
+    let status = Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(&unchanged)
+        .status()
+        .expect("touch");
+    assert!(status.success());
+    let old = mtime(&unchanged);
+    let s = c.prepare(&[], None).expect("resync");
+    assert_eq!(read(&s.root.join(SUB).join("lib.txt")), "edited\n");
+    assert_eq!(
+        mtime(&unchanged),
+        old,
+        "an unchanged dirty file was rewritten"
+    );
+    assert_eq!(s.tree, caller_tree);
+    s.finish();
+}
+
+fn s_root_of(c: &Caller) -> PathBuf {
+    fs::canonicalize(c.snap()).expect("snapshot exists")
+}
+
+#[test]
+fn an_uninitialised_submodule_is_refused_with_the_command_that_fixes_it() {
+    let c = caller_with_submodule("atv-env-sub-uninit");
+    git(&c.root, &["submodule", "deinit", "-q", "-f", SUB]);
+    let tree = TreeState::capture(&c.root, &path_env()).expect("caller");
+    assert_eq!(
+        tree.dirty.get(SUB),
+        Some(&PathState::Unpopulated),
+        "a tree missing its submodule's source is not the tree HEAD names"
+    );
+    let err = c
+        .prepare(&[], None)
+        .expect_err("there is no source to copy");
+    assert!(err.contains("not initialised"), "{err}");
+    assert!(
+        err.contains(&format!("`git submodule update --init {SUB}`")),
+        "{err}"
+    );
+}
+
+/// The caller goes back to a commit from before the submodule, when the same
+/// path held ordinary files: the snapshot's submodule checkout is removed, not
+/// left as a stray `.git` inside a directory of tracked files.
+#[test]
+fn a_submodule_the_callers_commit_does_not_have_is_removed_from_the_snapshot() {
+    let c = Caller::new("atv-env-sub-stale");
+    write(&c.root.join(SUB).join("lib.txt"), "vendored\n");
+    git(&c.root, &["add", "-A"]);
+    git(&c.root, &["commit", "-q", "-m", "vendored as plain files"]);
+    let vendored = git(&c.root, &["rev-parse", "HEAD"]);
+    git(&c.root, &["rm", "-r", "-q", SUB]);
+    git(&c.root, &["commit", "-q", "-m", "drop the copy"]);
+    add_submodule(&c);
+    c.prepare(&[], None).expect("snapshot").finish();
+    assert!(s_root_of(&c).join(SUB).join(".git").is_file());
+
+    git(
+        &c.root,
+        &[
+            "-c",
+            "advice.detachedHead=false",
+            "-c",
+            "submodule.recurse=false",
+            "checkout",
+            "-q",
+            "--force",
+            &vendored,
+        ],
+    );
+    let s = c.prepare(&[], None).expect("resync");
+    assert_eq!(git(&s.root, &["rev-parse", "HEAD"]), vendored);
+    assert_eq!(read(&s.root.join(SUB).join("lib.txt")), "vendored\n");
+    assert!(
+        fs::symlink_metadata(s.root.join(SUB).join(".git")).is_err(),
+        "the old submodule checkout's .git was left behind"
+    );
+    assert_eq!(
+        s.tree,
+        TreeState::capture(&c.root, &path_env()).expect("caller")
+    );
+    s.finish();
 }
 
 /// A checkout's precious state: porcelain plus the bytes of the named files.
@@ -1340,6 +1681,7 @@ fn the_gates_own_channels_never_reach_a_child() {
         .arg(&repo.root)
         .env("TRUST_STAGE2_BIN", &repo.stage2)
         .env("ATERM_SKIP_GUI_SMOKE", "1")
+        .env(snapshot::MACHINE_LOCK_DIR_ENV, fixture_lock(&repo.root))
         .env("ATERM_VERIFY_TIMINGS", repo.base.join("timings.tsv"))
         .env(snapshot::SNAPSHOT_ENV, repo.base.join("unused-snapshot"))
         .output()
@@ -1376,6 +1718,7 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
         .env("TRUST_STAGE2_BIN", &repo.stage2)
         .env("CARGO_TARGET_DIR", repo.base.join("caller-target"))
         .env("ATERM_SKIP_GUI_SMOKE", "1")
+        .env(snapshot::MACHINE_LOCK_DIR_ENV, fixture_lock(&repo.root))
         .env_remove(snapshot::SNAPSHOT_ENV)
         .env_remove("ATERM_VERIFY_TIMINGS")
         .output()
@@ -1497,6 +1840,7 @@ fn a_run_whose_ladder_is_redirected_into_the_checkout_still_decides() {
         .env("PATH", path_env())
         .env("TRUST_STAGE2_BIN", &repo.stage2)
         .env("ATERM_SKIP_GUI_SMOKE", "1")
+        .env(snapshot::MACHINE_LOCK_DIR_ENV, fixture_lock(&repo.root))
         // The gate's OWN copy off: this test is about the caller's redirect.
         .env("ATERM_VERIFY_LOG", "")
         .env_remove(snapshot::SNAPSHOT_ENV)
@@ -1595,7 +1939,9 @@ fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
         "{ladder}"
     );
 
-    let path = aterm_verify::receipt::dir(&repo.root).join(&head);
+    let path = aterm_verify::receipt::dir(&repo.root)
+        .expect("the receipt store")
+        .join(&head);
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("no receipt at {}: {e}\n{ladder}", path.display()));
     let r = aterm_verify::receipt::Receipt::parse(&text)
@@ -1605,7 +1951,6 @@ fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
         r.head, head,
         "the receipt is about the commit the ladder named"
     );
-    assert_eq!(r.dirty, None, "the fixture is committed clean");
     assert_eq!(r.mode, "fast");
     assert_eq!(r.scope, "workspace");
     assert_eq!(
@@ -1617,12 +1962,16 @@ fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
         !r.merge_contract && r.skipped.contains("gui smoke"),
         "a skipping run says WHICH skip cost it the contract: {r:?}"
     );
-    // …and it lives where no TreeState can see it, which is the whole reason it
-    // may be written into the checkout at all.
+    // …and it lives in the git common dir, which every worktree of the
+    // repository shares and no TreeState reads.
     assert!(
-        path.starts_with(repo.root.join(identity::GATE_STATE_DIR)),
-        "the receipt must live under {}: {}",
-        identity::GATE_STATE_DIR,
+        path.starts_with(
+            repo.root
+                .canonicalize()
+                .expect("the fixture root")
+                .join(".git/aterm-verify/receipts")
+        ),
+        "the receipt must live in the shared store: {}",
         path.display()
     );
     let tree = TreeState::capture(&repo.root, &path_env()).expect("readable");
@@ -1631,6 +1980,78 @@ fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
         "the receipt entered the source identity: {:?}",
         tree.dirty.keys().collect::<Vec<_>>()
     );
+}
+
+/// A RUN THAT CANNOT ADMIT NEVER TAKES A WHOLE-TREE RECEIPT'S PLACE. The
+/// store is shared by every worktree and keyed by commit, so a `--changed` run
+/// over uncommitted work, or a clean `--scope` run, at a commit that already
+/// carries a whole-tree receipt — any worktree sitting at main's tip — used to
+/// replace the receipt every push over that commit needs. Now the dirty run
+/// writes nothing and the narrowed run leaves the stronger receipt standing.
+/// The negative control: with only a narrowed receipt standing, the same
+/// `--scope` run replaces it — among receipts that admit nothing, the newest
+/// wins — so the run under test really does reach the write.
+#[test]
+fn a_dirty_or_narrowed_run_leaves_the_commits_whole_tree_receipt_standing() {
+    let repo = Fixture::new("atv-env-receipt-keep");
+    repo.git_init().with_targo("true");
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let path = aterm_verify::receipt::dir(&repo.root)
+        .expect("the receipt store")
+        .join(&head);
+    let standing = || {
+        aterm_verify::receipt::Receipt::parse(&fs::read_to_string(&path).expect("a receipt"))
+            .expect("it parses")
+    };
+    let whole = aterm_verify::receipt::Receipt {
+        head: head.clone(),
+        mode: "fast".into(),
+        scope: "workspace".into(),
+        verdict: "PASS".into(),
+        merge_contract: true,
+        skipped: "none".into(),
+        when: 1,
+    };
+
+    // A --changed run over uncommitted work verified bytes no commit holds:
+    // it writes nothing at all, whatever stands…
+    write(&repo.root.join("notes.txt"), "not committed\n");
+    let mut dirty = repo.ctx();
+    dirty.scope = Scope::changed("HEAD", Vec::new(), true);
+    let (ladder, _) = repo.run(&dirty);
+    assert!(
+        ladder.contains(&format!("verify: source {head}+dirty ")),
+        "the run was over a dirty tree: {ladder}"
+    );
+    assert!(!path.exists(), "a dirty run wrote a receipt for {head}");
+    // …so it cannot replace the whole-tree receipt either.
+    aterm_verify::receipt::write(&repo.root, &whole).expect("the whole-tree receipt");
+    repo.run(&dirty);
+    assert_eq!(standing(), whole, "a dirty run replaced the receipt");
+    fs::remove_file(repo.root.join("notes.txt")).expect("clean again");
+
+    // A clean --scope run at the same commit.
+    let mut scoped = repo.ctx();
+    scoped.scope = Scope::from_option(Some("crate-x".into()));
+    let (ladder, _) = repo.run(&scoped);
+    assert!(
+        ladder.contains(&format!("verify: source {head} in place ")),
+        "the run was over the clean commit: {ladder}"
+    );
+    assert_eq!(standing(), whole, "a narrowed run replaced the receipt");
+
+    // The control: a narrowed receipt standing is replaced by the same run.
+    let narrowed = aterm_verify::receipt::Receipt {
+        scope: "changed".into(),
+        merge_contract: false,
+        ..whole.clone()
+    };
+    fs::remove_file(&path).expect("drop the whole-tree receipt");
+    aterm_verify::receipt::write(&repo.root, &narrowed).expect("a narrowed receipt");
+    repo.run(&scoped);
+    let now = standing();
+    assert_eq!(now.scope, "crate:crate-x", "{now:?}");
+    assert!(!now.merge_contract, "{now:?}");
 }
 
 /// THE DISK PREFLIGHT, WIRED (2026-09-21). Two contract runs died mid-ladder on
@@ -1648,7 +2069,6 @@ fn a_volume_under_the_floor_is_could_not_run_before_any_stage_and_leaves_no_rece
     // A receipt from an earlier, real judgement of this commit.
     let prior = aterm_verify::receipt::Receipt {
         head: head.clone(),
-        dirty: None,
         mode: "fast".into(),
         scope: "workspace".into(),
         verdict: "PASS".into(),
@@ -1689,8 +2109,12 @@ fn a_volume_under_the_floor_is_could_not_run_before_any_stage_and_leaves_no_rece
     );
     assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
     // No receipt was written: the earlier judgement stands, byte for byte.
-    let text = fs::read_to_string(aterm_verify::receipt::dir(&repo.root).join(&head))
-        .expect("the prior receipt is still there");
+    let text = fs::read_to_string(
+        aterm_verify::receipt::dir(&repo.root)
+            .expect("the receipt store")
+            .join(&head),
+    )
+    .expect("the prior receipt is still there");
     assert_eq!(aterm_verify::receipt::Receipt::parse(&text), Some(prior));
 }
 

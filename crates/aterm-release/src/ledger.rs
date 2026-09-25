@@ -4,11 +4,12 @@
 //! Build-number ledger (release spec §2): parse/append `RELEASES.ledger`
 //! (`#` comments ignored; records are `<build_number> <version>`; malformed
 //! non-comment lines abort with their line number), compute
-//! `n = max(last + 1, unix_now)`, and run the claim protocol — a fast-forward
-//! `git push` is a compare-and-swap on the ledger tail, with the
-//! reset-hard-and-regenerate retry (max 5) on rejection and the mandatory
-//! post-push verification that the remote tail is byte-exactly ours. Only a
-//! verified claim is ever stamped into an artifact.
+//! `n = max(last + 1, unix_now)`, and run the claim protocol — the RELEASE
+//! commit is built on the published commit, main takes it (a fast-forward, or a
+//! merge onto a tip peers moved), and that `git push` is a compare-and-swap on
+//! the ledger tail, with the reset-and-rebuild retry (max 5) on rejection and the
+//! mandatory post-push verification that the remote tail is byte-exactly ours.
+//! Only a verified claim is ever stamped into an artifact.
 //!
 //! This module also hosts the crate-wide plumbing every pipeline stage shares
 //! (`Error`, the injectable [`GitRunner`] seam, [`git_ok`]): the spec's file
@@ -232,19 +233,22 @@ pub fn next_build(last: u64, now: u64) -> Result<u64> {
 /// are deterministic and so every retry reuses ONE clock reading — retries
 /// derive monotonicity from the ledger tail, never from time moving.
 pub struct ClaimPlan<'a> {
-    /// Release version being cut, e.g. "0.2.0" (canonical MAJOR.MINOR.PATCH —
-    /// the workspace version with DEV reset to 0).
+    /// Release version being cut, e.g. "0.2.0" (`[workspace.package] version`,
+    /// always `MAJOR.MINOR.0`).
     pub version: &'a str,
     /// Unix seconds, read once by the caller.
     pub now: u64,
-    /// The recut path (spec §5) legitimately re-claims a version whose
-    /// `## [X.Y.Z]` changelog section already sits on origin (rolled by the
-    /// earlier wedged cut) — it sets this to skip the section half of the
-    /// "cut elsewhere" abort. The remote-TAG abort always applies: a tag
-    /// means the version was fully published somewhere.
+    /// Main ALREADY carries this version's `## [X.Y.Z]` changelog section —
+    /// rolled there by an earlier claim whose cut wedged — so a lost race onto
+    /// such a tip is this cut's own history, not a cut elsewhere. The remote-TAG
+    /// abort always applies: a tag means the version was fully published.
     pub allow_existing_section: bool,
     /// Normally [`MAX_CLAIM_ATTEMPTS`]; a knob so tests can prove the cap.
     pub max_attempts: u32,
+    /// The published commit (full sha) the release is cut from. The worktree the
+    /// claim runs in — the cut tree — must sit exactly there; it must be on
+    /// `origin/main`.
+    pub source: &'a str,
 }
 
 /// A verified claim: the number is on origin/main, tail-checked byte-exactly,
@@ -252,125 +256,171 @@ pub struct ClaimPlan<'a> {
 #[derive(Debug)]
 pub struct Claim {
     pub build: u64,
-    /// The release commit's full sha (== origin/main at verification time).
+    /// The RELEASE commit (full sha): the published commit plus the ledger line
+    /// and the rolled changelog, and nothing else. The artifacts are built from
+    /// here; the worktree the claim ran in (the cut tree) is left on it, detached.
     pub commit: String,
+    /// The commit that landed on origin/main: the release commit itself when main
+    /// had not moved past the published commit, else a merge of it onto main's
+    /// tip ([`landing_commit`]).
+    pub landed: String,
     /// The exact ledger line we appended, e.g. "1783918101 0.2.0".
     pub ledger_line: String,
 }
+
+/// The changelog texts a claim writes, from `(published commit's, main tip's)`
+/// CHANGELOG.md: `(release commit's, main's)`. See `changelog::claim_changelogs`.
+pub type ClaimChangelogs<'a> = &'a dyn Fn(&str, &str) -> Result<(String, String)>;
 
 /// The claim protocol (spec §2, steps 1-5). Runs BEFORE the expensive build —
 /// n is baked into the binary, so the number must be settled first; a lost
 /// race here costs seconds.
 ///
-/// `regenerate` produces the rest of the release commit's content for a given
-/// n (the changelog roll; the workspace version is the operator's bump and is
-/// never rewritten by a cut)
-/// and returns the repo-relative paths it wrote, which are staged alongside
-/// the ledger. It is re-run from scratch on every retry because the retry
-/// resets hard to origin/main and rebuilds the WHOLE commit from origin's
-/// blobs — the reset-soft alternative was rejected for verifiably clobbering
-/// the winner's ledger line (spec decision 3).
+/// ONE RELEASE COMMIT, ON THE PUBLISHED COMMIT (2026-09-23, owner ruling R2). The
+/// release commit is `plan.source` plus the ledger line and the rolled changelog —
+/// the tree `pub publish` exported, and the tree the binary is built from. Main
+/// takes it whatever its tip is: as a fast-forward when main has not moved past the
+/// published commit, else as a merge onto the tip whose tree is the tip's plus the
+/// same ledger line and the shipped notes moved out of `[Unreleased]`
+/// ([`landing_commit`]). Peers' pushes since the publish stay on main and out of
+/// the release. The push of that commit is the compare-and-swap: a lost race
+/// resets the checkout to the published commit and rebuilds BOTH commits from
+/// the winner's ledger — reset-and-rebuild rather than reset-soft, which
+/// verifiably clobbered the winner's ledger line (spec decision 3).
+///
+/// The worktree never leaves the release commit's line: the landing commit is
+/// built from blobs and a scratch index, so nothing checks main's tip out.
 pub fn claim(
     git: &dyn GitRunner,
     worktree: &Path,
     plan: &ClaimPlan<'_>,
-    regenerate: &mut dyn FnMut(u64) -> Result<Vec<String>>,
+    changelogs: ClaimChangelogs<'_>,
 ) -> Result<Claim> {
     check_version_shape(plan.version)?;
 
-    // Step 1: fetch, and require HEAD == origin/main. Fail closed if offline —
-    // an offline "claim" would be a local fiction another machine could race.
+    // Step 1: fetch, and require HEAD == the published commit, on origin/main.
+    // Fail closed if offline — an offline "claim" would be a local fiction
+    // another machine could race.
     git_ok(git, &["fetch", "origin", "main"]).map_err(|e| {
         Error::new(format!(
             "cannot reach origin (no offline cuts — the ledger claim IS the push): {e}"
         ))
     })?;
     let head = rev_parse(git, "HEAD")?;
-    let origin_tip = rev_parse(git, "origin/main")?;
-    if head != origin_tip {
+    if head != plan.source {
         return Err(Error::new(format!(
-            "HEAD ({head}) != origin/main ({origin_tip}) — pull first; a claim must be \
-             a fast-forward append on the current remote tip"
+            "HEAD ({head}) is not the published commit ({}) — the release commit is built \
+             on it, so the checkout must sit exactly there",
+            plan.source
         )));
     }
+    if !git
+        .git(&["merge-base", "--is-ancestor", plan.source, "origin/main"])?
+        .success()
+    {
+        return Err(Error::new(format!(
+            "the published commit {} is not on origin/main — a claim lands on main",
+            plan.source
+        )));
+    }
+    let source_ledger = show_utf8(git, plan.source, LEDGER_FILE)?;
+    let source_changelog = show_utf8(git, plan.source, changelog::CHANGELOG_FILE)?;
 
     // Step 2: read the tail from ORIGIN's blob (not the worktree file) — the
-    // blob is what the fast-forward push CASes against, and re-reading it on
-    // every retry is what preserves a race winner's line byte-exactly.
+    // blob is what the push CASes against, and re-reading it on every retry is
+    // what preserves a race winner's line byte-exactly.
     let mut base = show_origin_ledger(git)?;
     let mut n = next_build(tail(&base)?.build, plan.now)?;
 
     let mut attempt = 0u32;
-    loop {
+    let (release, landed, line) = loop {
         attempt += 1;
-
-        // Step 3: ONE commit — regenerated content for THIS n, plus our
-        // ledger line appended to origin's exact blob bytes.
-        let mut paths = regenerate(n)?;
         let line = format!("{n} {}", plan.version);
-        let mut ledger_out = base.clone();
-        if !ledger_out.is_empty() && !ledger_out.ends_with('\n') {
-            ledger_out.push('\n');
-        }
-        ledger_out.push_str(&line);
-        ledger_out.push('\n');
-        let ledger_path = worktree.join(LEDGER_FILE);
-        fs::write(&ledger_path, &ledger_out)
-            .map_err(|e| Error::new(format!("cannot write {}: {e}", ledger_path.display())))?;
-        if !paths.iter().any(|p| p == LEDGER_FILE) {
-            paths.push(LEDGER_FILE.to_string());
-        }
-        let mut add: Vec<&str> = vec!["add", "--"];
-        add.extend(paths.iter().map(String::as_str));
-        git_ok(git, &add)?;
-        let msg = format!("release: v{} (build {n})", plan.version);
-        git_ok(git, &["commit", "-q", "-m", &msg])?;
+        let tip = rev_parse(git, "origin/main")?;
+        let main_changelog = show_utf8(git, "origin/main", changelog::CHANGELOG_FILE)?;
+        let (release_changelog, landing_changelog) =
+            changelogs(&source_changelog, &main_changelog)?;
 
-        // Step 4: the push IS the compare-and-swap — a fast-forward succeeds
-        // for exactly one appender per remote tip.
-        let push = git.git(&["push", "origin", "main"])?;
+        // Step 3: the RELEASE commit — the published commit plus our ledger line
+        // (appended to ITS ledger) and its rolled changelog — then the commit main
+        // takes. Any failure between the first write and the push puts the checkout
+        // back on the published commit, so no half-built claim survives an abort.
+        let msg = format!("release: v{} (build {n})", plan.version);
+        let built = (|| -> Result<(String, String)> {
+            write_file(worktree, changelog::CHANGELOG_FILE, &release_changelog)?;
+            write_file(worktree, LEDGER_FILE, &appended(&source_ledger, &line))?;
+            git_ok(git, &["add", "--", changelog::CHANGELOG_FILE, LEDGER_FILE])?;
+            git_ok(git, &["commit", "-q", "-m", &msg])?;
+            let release = rev_parse(git, "HEAD")?;
+            let landed = if tip == plan.source {
+                release.clone()
+            } else {
+                landing_commit(
+                    git,
+                    worktree,
+                    &Landing {
+                        tip: &tip,
+                        release: &release,
+                        ledger: &appended(&base, &line),
+                        changelog: &landing_changelog,
+                        message: &format!(
+                            "release: v{} (build {n}) lands on main — cut from the published {}",
+                            plan.version,
+                            plan.source.get(..12).unwrap_or(plan.source)
+                        ),
+                    },
+                )?
+            };
+            Ok((release, landed))
+        })();
+        let (release, landed) = match built {
+            Ok(commits) => commits,
+            Err(error) => {
+                let _ = git.git(&["reset", "-q", "--hard", plan.source]);
+                return Err(error);
+            }
+        };
+
+        // Step 4: the push IS the compare-and-swap — a fast-forward of the tip
+        // succeeds for exactly one appender per remote tip.
+        let push = git.git(&["push", "origin", &format!("{landed}:refs/heads/main")])?;
         if push.success() {
-            break;
+            break (release, landed, line);
         }
         let push_err = push.stderr_utf8().trim().to_string();
 
-        // Drop OUR commit and realign on the last-KNOWN origin tip FIRST — a
-        // pure local operation that no network state can fail. Doing it
-        // before anything that CAN fail (the recovery fetch below) keeps the
-        // abort invariant ("tree clean, nothing burned") unconditional: the
-        // unpushed release commit must never be stranded on local main, where
-        // the next cut's "pull first" gate cannot fix an ahead-of-origin
-        // branch and no message would tell the operator to reset by hand.
-        git_ok(git, &["reset", "--hard", "origin/main"])?;
+        // Back onto the published commit FIRST — a pure local operation that no
+        // network state can fail — so the abort invariant ("tree clean, nothing
+        // burned") holds unconditionally, and the unpushed release commit is never
+        // left checked out where a resume would take it for a claim.
+        git_ok(git, &["reset", "-q", "--hard", plan.source])?;
 
         // Only a non-fast-forward rejection is a lost CAS race — the one
-        // failure regenerating the commit can fix. Anything else (expired
+        // failure rebuilding the commits can fix. Anything else (expired
         // credentials, branch protection, network death mid-push) would fail
         // identically on every round; abort NOW with git's own diagnostic
-        // instead of burning five regenerate rounds against an unmoved origin
-        // and then misreporting a "push race" on a single-operator repo.
+        // instead of burning five rounds against an unmoved origin and then
+        // misreporting a "push race" on a single-operator repo.
         let lost_race = push_err.contains("non-fast-forward")
             || push_err.contains("fetch first")
             || push_err.contains("[rejected]");
         if !lost_race {
             return Err(Error::new(format!(
                 "git push origin main failed (NOT a fast-forward rejection — retrying \
-                 cannot help); aborting with the tree reset clean to origin/main, \
-                 nothing burned: {push_err}"
+                 cannot help); aborting with the checkout reset clean to the published \
+                 commit, nothing burned: {push_err}"
             )));
         }
 
-        // Someone else won this tip: fetch the winner's truth and realign on
-        // it (reset --hard, spec decision 3) before deciding whether to retry.
+        // Someone else won this tip: fetch the winner's truth before deciding
+        // whether to retry.
         git_ok(git, &["fetch", "origin", "main"])?;
-        git_ok(git, &["reset", "--hard", "origin/main"])?;
 
         if attempt >= plan.max_attempts {
             return Err(Error::new(format!(
                 "ledger claim lost the push race {attempt} times — aborting with the \
-                 tree reset clean to origin/main; nothing was burned (losing this many \
-                 CAS rounds on a single-operator repo needs a human look). last \
-                 rejection: {push_err}"
+                 checkout reset clean to the published commit; nothing was burned (losing \
+                 this many CAS rounds needs a human look). last rejection: {push_err}"
             )));
         }
 
@@ -387,9 +437,8 @@ pub fn claim(
             )));
         }
         if !plan.allow_existing_section {
-            let spec = format!("origin/main:{}", changelog::CHANGELOG_FILE);
-            let cl = git_ok(git, &["show", &spec])?;
-            if changelog::has_section(&cl.stdout_utf8(), plan.version) {
+            let cl = show_utf8(git, "origin/main", changelog::CHANGELOG_FILE)?;
+            if changelog::has_section(&cl, plan.version) {
                 return Err(Error::new(format!(
                     "v{} cut elsewhere: origin/main already has a \"## [{}]\" changelog \
                      section",
@@ -402,20 +451,18 @@ pub fn claim(
         // is now on origin, same single `now` reading.
         base = show_origin_ledger(git)?;
         n = next_build(tail(&base)?.build, plan.now)?;
-    }
+    };
 
     // Step 5: verify the append LANDED as ours — a successful push exit code
     // is git's claim; the artifact stamp requires the remote bytes. Fresh
     // fetch, tip identity, and byte-exact tail equality.
     git_ok(git, &["fetch", "origin", "main"])?;
-    let head = rev_parse(git, "HEAD")?;
     let origin_tip = rev_parse(git, "origin/main")?;
-    let line = format!("{n} {}", plan.version);
-    if head != origin_tip {
+    if origin_tip != landed {
         return Err(Error::new(format!(
-            "post-push verify failed: origin/main ({origin_tip}) != HEAD ({head}) — the \
-             claim may have landed but cannot be verified; re-run `cargo ship cut` (a \
-             fresh claim will mint a fresh number; gaps are normal)"
+            "post-push verify failed: origin/main ({origin_tip}) != the pushed claim \
+             ({landed}) — the claim may have landed but cannot be verified; re-run the cut \
+             (a fresh claim will mint a fresh number; gaps are normal)"
         )));
     }
     let remote = show_origin_ledger(git)?;
@@ -426,34 +473,149 @@ pub fn claim(
              byte-exactly our line {line:?} — refusing to stamp an unverified claim"
         )));
     }
+    let head = rev_parse(git, "HEAD")?;
+    if head != release {
+        return Err(Error::new(format!(
+            "post-push verify failed: HEAD ({head}) is not the release commit ({release})"
+        )));
+    }
     Ok(Claim {
         build: n,
-        commit: head,
+        commit: release,
+        landed,
         ledger_line: line,
     })
 }
 
-/// `git show origin/main:RELEASES.ledger`, strict UTF-8: the same bytes are
-/// re-used as the append base, so a lossy decode could silently rewrite the
-/// winner's line — refuse instead.
-fn show_origin_ledger(git: &dyn GitRunner) -> Result<String> {
-    let spec = format!("origin/main:{LEDGER_FILE}");
+/// What main takes when it has moved past the published commit.
+struct Landing<'a> {
+    tip: &'a str,
+    release: &'a str,
+    ledger: &'a str,
+    changelog: &'a str,
+    message: &'a str,
+}
+
+/// Main's commit for a release cut from a commit main has moved past: the tip's
+/// tree with the same ledger line and the shipped notes moved out of
+/// `[Unreleased]`, and two parents — the tip, so the push fast-forwards it, and
+/// the release commit, so main's history records exactly which commit shipped.
+/// Against the tip it moves only `CHANGELOG.md` and `RELEASES.ledger`: the shape
+/// `.githooks/pre-push` admits as a release claim.
+///
+/// Built from blobs and a scratch index: the two files are hashed out of the
+/// worktree and restored, the index is loaded with the tip's tree, the two blobs
+/// swapped in and written as a tree, and the index reset to the release commit
+/// on every path — so the worktree never leaves the release commit.
+fn landing_commit(git: &dyn GitRunner, worktree: &Path, landing: &Landing<'_>) -> Result<String> {
+    write_file(worktree, changelog::CHANGELOG_FILE, landing.changelog)?;
+    write_file(worktree, LEDGER_FILE, landing.ledger)?;
+    let hashed = git_ok(
+        git,
+        &[
+            "hash-object",
+            "-w",
+            "--",
+            changelog::CHANGELOG_FILE,
+            LEDGER_FILE,
+        ],
+    );
+    git_ok(
+        git,
+        &[
+            "checkout",
+            "-q",
+            "HEAD",
+            "--",
+            changelog::CHANGELOG_FILE,
+            LEDGER_FILE,
+        ],
+    )?;
+    let hashed = hashed?.stdout_utf8();
+    let blobs: Vec<&str> = hashed.lines().map(str::trim).collect();
+    let [changelog_blob, ledger_blob] = blobs.as_slice() else {
+        return Err(Error::new(format!(
+            "git hash-object answered {} object id(s) for two files",
+            blobs.len()
+        )));
+    };
+    let built = (|| {
+        git_ok(git, &["read-tree", landing.tip])?;
+        git_ok(
+            git,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("100644,{changelog_blob},{}", changelog::CHANGELOG_FILE),
+                "--cacheinfo",
+                &format!("100644,{ledger_blob},{LEDGER_FILE}"),
+            ],
+        )?;
+        let tree = rev_trimmed(git, &["write-tree"])?;
+        rev_trimmed(
+            git,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                landing.tip,
+                "-p",
+                landing.release,
+                "-m",
+                landing.message,
+            ],
+        )
+    })();
+    // The index is the release commit's again, whatever happened above.
+    git_ok(git, &["reset", "-q"])?;
+    built
+}
+
+fn rev_trimmed(git: &dyn GitRunner, args: &[&str]) -> Result<String> {
+    Ok(git_ok(git, args)?.stdout_utf8().trim().to_string())
+}
+
+fn write_file(worktree: &Path, name: &str, text: &str) -> Result<()> {
+    let path = worktree.join(name);
+    fs::write(&path, text).map_err(|e| Error::new(format!("cannot write {}: {e}", path.display())))
+}
+
+/// `base` with `line` appended as its last record.
+fn appended(base: &str, line: &str) -> String {
+    let mut out = base.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(line);
+    out.push('\n');
+    out
+}
+
+/// `git show <rev>:<path>`, strict UTF-8: the same bytes are re-used as a base
+/// to append to or roll, so a lossy decode could silently rewrite them — refuse
+/// instead.
+fn show_utf8(git: &dyn GitRunner, rev: &str, path: &str) -> Result<String> {
+    let spec = format!("{rev}:{path}");
     let out = git_ok(git, &["show", &spec])?;
-    String::from_utf8(out.stdout)
-        .map_err(|_| Error::new(format!("origin/main:{LEDGER_FILE} is not valid UTF-8")))
+    String::from_utf8(out.stdout).map_err(|_| Error::new(format!("{spec} is not valid UTF-8")))
+}
+
+/// `git show origin/main:RELEASES.ledger` — the blob the claim's push CASes
+/// against.
+pub fn show_origin_ledger(git: &dyn GitRunner) -> Result<String> {
+    show_utf8(git, "origin/main", LEDGER_FILE)
 }
 
 /// The release version is spliced into a tag name, a changelog heading, the
 /// DMG asset name and the ledger grammar — reject anything that is not
 /// exactly three canonical numeric components before it can poison those
-/// greps. There is ONE version scheme: `MAJOR.MINOR.PATCH` (the workspace
-/// `MAJOR.MINOR.0` with DEV reset to 0 — see `VERSIONING.md`).
+/// greps. There is ONE version scheme: `MAJOR.MINOR.PATCH` (a release is the
+/// workspace `MAJOR.MINOR.0` as written — see `VERSIONING.md`).
 ///
 /// Canonical means non-empty, ASCII digits only, and no leading zero unless
 /// the component IS `"0"`: one version must have exactly ONE spelling, or two
 /// tags could share a numeric order. Public: cli.rs applies the same shape
-/// check to `--set-version` / `--abandon` / `verify vX.Y.Z` arguments up
-/// front.
+/// check to `--abandon` / `verify vX.Y.Z` arguments up front.
 pub fn check_version_shape(version: &str) -> Result<()> {
     let parts: Vec<&str> = version.split('.').collect();
     let ok = parts.len() == 3

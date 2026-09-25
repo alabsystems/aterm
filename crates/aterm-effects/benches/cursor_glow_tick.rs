@@ -30,6 +30,8 @@
 // half of that very same frame, is 51 ns. Timed as one unit, as it was, that
 // workload reported 61.6 ns and five sixths of the number was the host, not the
 // early return it was named for.
+// The same host-seams group also prices a real 190-column terminal row's
+// content-witness handoff with and without the extra full-row copy.
 //
 // THE PRICE OF THAT SEPARATION is one `Instant::now()` pair per iteration, which
 // lands INSIDE every reported number in this group as a constant additive
@@ -180,6 +182,7 @@
 use std::time::Duration;
 use std::time::Instant as WallInstant;
 
+use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, TrailParams};
 use aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET;
 use aterm_effects::trail_pack::{HaloChannel, ParticlePop, RampParams};
@@ -1675,6 +1678,37 @@ fn cursor_glow_tick(c: &mut Criterion) {
         let mut armed = f_rainbow_retina();
         group.bench_function("typing_arm_190col", |b| {
             b.iter(|| arm_typing(black_box(&mut armed)));
+        });
+        // A far ribbon row is projected under the host's terminal lock. The
+        // old handoff copied that projection into a second resident Vec while
+        // still holding the lock; the direct handoff lets the terminal fill
+        // the engine's own slot. Price the exact inner seam on a genuinely
+        // filled 190-column row. The copy arm remains as an in-binary control
+        // so compiler, fixture and terminal projection cancel in the A/B.
+        let mut term = Terminal::new(RETINA.rows as u16, RETINA.cols as u16);
+        term.process(format!("\x1b[5;1H{}", "x".repeat(RETINA.cols)).as_bytes());
+        let mut row = Vec::new();
+        term.row_cols_into(4, &mut row);
+        assert_eq!(row.len(), RETINA.cols, "capture bench row is fully inked");
+        assert_eq!(row.first(), Some(&'x'));
+        assert_eq!(row.last(), Some(&'x'));
+        let mut copied = f_rainbow_retina();
+        let mut direct = f_rainbow_retina();
+        copied.tick();
+        direct.tick();
+        assert!(copied.glow.v2_owns_frame() && direct.glow.v2_owns_frame());
+        group.bench_function("ribbon_far_row_capture_copy_190col", |b| {
+            b.iter(|| {
+                black_box(&term).row_cols_into(4, &mut row);
+                black_box(&mut copied.glow).observe_ribbon_row(4, &row);
+            });
+        });
+        group.bench_function("ribbon_far_row_capture_direct_190col", |b| {
+            b.iter(|| {
+                black_box(&mut direct.glow).capture_ribbon_row(4, |cols| {
+                    black_box(&term).row_cols_into(4, cols);
+                });
+            });
         });
         group.finish();
     }

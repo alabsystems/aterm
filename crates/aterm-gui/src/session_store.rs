@@ -209,8 +209,19 @@ pub fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
 /// codec scrollback offload already trusts across process restarts) ride
 /// nonce-stamped sidecar files next to the manifest. The modern two-phase reader
 /// requires the declared schema and every semantics-bearing meta key; the explicit
-/// one-release legacy protocol alone tolerates schema 0. Any parse/read failure
-/// rejects the entire adoption before ownership transfers—never a blank partial adopt.
+/// one-release legacy protocol alone tolerates schema 0.
+///
+/// WHAT A BAD CARRY COSTS (the 2026-09-22/23 update audit, plan P0-2). A carry
+/// that is missing, names a sidecar other than its own, or breaks a RESOURCE
+/// bound (a sidecar over its byte cap, the aggregate byte cap) still rejects the
+/// entire adoption before ownership transfers: those are identity and
+/// allocation facts. A carry whose CONTENT this build refuses — a meta that does
+/// not parse or breaks a bound, dimensions it will not admit, a grid that is not
+/// canonical, alt presence that disagrees with the meta — costs only that
+/// session's screen: its shell is adopted onto a blank engine and repainted,
+/// and the adoption proof is still taken over the bytes as read. This used to
+/// say "never a blank partial adopt", and one unreadable screen then kept every
+/// shell on the old build, update after update.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScreenCarry {
     /// Required by the modern two-phase protocol. `0` is accepted only by the
@@ -228,6 +239,21 @@ pub struct ScreenCarry {
     /// Sidecar file holding the alt grid's bytes, when an alt grid existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alt_grid_file: Option<String>,
+    /// THE PRODUCER CARRIED A BLANK SCREEN ON PURPOSE (plan P0-1e, the
+    /// 2026-09-22/23 update audit): its own capture could not carry this
+    /// session's real screen and sent a canonical blank one instead, so the
+    /// successor must make the program redraw — the same PTY size pulse an
+    /// alt-screen adoption gets (`spawn_session`). The consumer sets the same
+    /// flag on the adopted session when IT is the side that blanked the screen.
+    ///
+    /// WIRE-NEUTRAL BY CONSTRUCTION. `skip_serializing_if` keeps every healthy
+    /// carry byte-identical to what an older build writes; `ScreenCarry` has no
+    /// `deny_unknown_fields`, so an older reader ignores the key; and no digest
+    /// covers it — `screen_wire_digest` hashes the local id, the meta string and
+    /// the grid bytes, never this record — so neither the proof nor the schema
+    /// moves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repaint: bool,
 }
 
 impl ScreenCarry {
@@ -261,12 +287,6 @@ pub struct WindowCarry {
     /// reads as no rows.
     #[serde(default)]
     pub status_bar_rows: u16,
-    /// The status bars' rows as an OLDER outgoing build writes them — read
-    /// only ([`WindowCarry::message_carry`] maps each to a message); this
-    /// build writes `messages` and leaves this empty. Dies in Phase 6 of the
-    /// unified message system, one release after the band shipped.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub bars: Vec<CarriedBar>,
     /// The center's live rows at handoff time, glass rows first
     /// (`aterm_messages::MessageCenter::carried`, design §3.8).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -306,68 +326,18 @@ impl From<&aterm_messages::Carry> for MessagesCarry {
 
 impl WindowCarry {
     /// The carried messages in the center's own shape, for
-    /// `MessageCenter::seed_carried`. A manifest from THIS build carries
-    /// `messages`; one from an older parent carries `bars`, and each of
-    /// those becomes a message with its lane as the tag, its tone as the
-    /// severity, the lane's own supersede key (so the successor's first
-    /// report replaces it), the severity's default hold, and an id minted
-    /// from `next_id_floor` (the successor's next id) stamped `now_unix_ms`
-    /// — nothing invented beyond what the bar said.
-    pub fn message_carry(&self, next_id_floor: u64, now_unix_ms: u64) -> aterm_messages::Carry {
-        if !self.messages.is_empty() || self.next_message_id > 0 {
-            return aterm_messages::Carry {
-                next_id: self.next_message_id,
-                live: self
-                    .messages
-                    .iter()
-                    .map(aterm_messages::CarriedMessage::from)
-                    .collect(),
-            };
-        }
-        let live: Vec<aterm_messages::CarriedMessage> = self
-            .bars
-            .iter()
-            .enumerate()
-            .filter_map(|(i, bar)| {
-                let severity = match bar.tone.as_str() {
-                    "info" => "info",
-                    "success" => "success",
-                    "warn" => "warn",
-                    _ => return None,
-                };
-                let key = match bar.lane.as_str() {
-                    "toolchain" => "toolchain.pass",
-                    "update" => "update.progress",
-                    _ => return None,
-                };
-                Some(aterm_messages::CarriedMessage {
-                    id: next_id_floor.saturating_add(i as u64),
-                    unix_ms: now_unix_ms,
-                    tag: bar.lane.clone(),
-                    severity: severity.to_string(),
-                    glyph: bar.glyph,
-                    title: bar.title.clone(),
-                    detail: if bar.detail.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![bar.detail.clone()]
-                    },
-                    actions: Vec::new(),
-                    hold: "default".to_string(),
-                    key: Some(key.to_string()),
-                    fill_permille: bar.fill_permille,
-                    stats: bar.stats.clone(),
-                    // An older parent's bar carries no busy flag: a still row.
-                    busy: false,
-                    on_glass: true,
-                    excerpt: true,
-                    finished: None,
-                })
-            })
-            .collect();
+    /// `MessageCenter::seed_carried`. An older parent's status-bar `bars`
+    /// key is no longer read (Phase 6, one release after the band shipped
+    /// in 0.92.0): serde skips it, so that parent's rows are simply not
+    /// carried and the successor's own reporters say them at Commit.
+    pub fn message_carry(&self) -> aterm_messages::Carry {
         aterm_messages::Carry {
-            next_id: next_id_floor.saturating_add(live.len() as u64),
-            live,
+            next_id: self.next_message_id,
+            live: self
+                .messages
+                .iter()
+                .map(aterm_messages::CarriedMessage::from)
+                .collect(),
         }
     }
 }
@@ -485,27 +455,6 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
             finished: m.finished.clone(),
         }
     }
-}
-
-/// One status-bar row's words at handoff time, as an OLDER outgoing build
-/// writes them (the plain-data projection of the retired `status_bars::Bar`).
-/// Decoded, never written: [`WindowCarry::message_carry`] maps each to a
-/// message. Dies in Phase 6 of the unified message system.
-#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub struct CarriedBar {
-    /// `toolchain` | `update` (the retired `status_bars::Lane::as_str`).
-    pub lane: String,
-    pub glyph: char,
-    pub title: String,
-    pub detail: String,
-    #[serde(default)]
-    pub stats: String,
-    /// `info` | `success` | `warn`.
-    pub tone: String,
-    /// Determinate meter fill in permille (`0..=1000`), if the bar had one —
-    /// an integer so the manifest stays `Eq`-comparable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fill_permille: Option<u16>,
 }
 
 /// One carried connection edge — the TOKENLESS projection of a live
@@ -1309,6 +1258,21 @@ impl SessionStore {
         let mut v: Vec<SessionHandle> = self.by_id.values().cloned().collect();
         v.sort_by_key(|h| h.local_id);
         v
+    }
+
+    /// The Fabric bridge's identity-only roster. Read under one registry guard
+    /// so each local id, stable sid, and launch nonce comes from the same handle.
+    /// Unlike `snapshot`, this does not clone a terminal or session context;
+    /// callers never need a placement hop or a per-session lock.
+    #[must_use]
+    pub fn bridge_roster(&self) -> Vec<(u64, SessionId, aterm_session::LaunchNonce)> {
+        let mut rows: Vec<_> = self
+            .by_id
+            .values()
+            .map(|h| (h.local_id, h.sid.clone(), h.nonce))
+            .collect();
+        rows.sort_by_key(|row| row.0);
+        rows
     }
 
     /// The set of live session sids — a LIGHT read for the subscribe `sessions`

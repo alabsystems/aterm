@@ -72,11 +72,12 @@
 //! touch the fleet.)
 
 // EVERY LINE atpkg PRINTS STEPS AROUND THE TERMINAL METER ([`meter`]). These shadow the
-// standard `println!`, `eprintln!` and `print!` for the whole crate — declared before
-// every module, so every module sees them. With no meter running (a pipe, the window's
-// children, a host, a test) each is the std macro with the same bytes and the same panic
-// on a closed pipe; under a person's typed verb the meter's line is cleared first and
-// redrawn below.
+// standard `println!` and `eprintln!` for the whole crate — declared before every module,
+// so every module sees them. With no meter running (a pipe, the window's children, a
+// host, a test) each is the std macro with the same bytes and the same panic on a closed
+// pipe; under a person's typed verb the meter's line is cleared first and redrawn below.
+// atpkg prints no partial line: its one `print!`, the extras' consent prompt, went with
+// the extras (2026-09-24).
 macro_rules! println {
     () => {
         $crate::meter::println(::std::format_args!(""))
@@ -91,11 +92,6 @@ macro_rules! eprintln {
     };
     ($($arg:tt)*) => {
         $crate::meter::eprintln(::std::format_args!($($arg)*))
-    };
-}
-macro_rules! print {
-    ($($arg:tt)*) => {
-        $crate::meter::print(::std::format_args!($($arg)*))
     };
 }
 
@@ -121,10 +117,6 @@ pub mod cost;
 pub mod discovery;
 pub mod dispatch;
 pub mod doctor;
-/// The elevation seam the OS-installer lanes share: the injectable [`elevate::Runner`],
-/// the calling verb's [`elevate::Elevation`] policy (Deferred by default — a background
-/// pass never elevates), the `sudo`/`osascript` wrappers and the `provides` probe.
-pub mod elevate;
 pub mod extract;
 pub mod flow;
 pub mod freespace;
@@ -135,15 +127,10 @@ pub mod hooks;
 /// wakes the ordinary signed update pass; it never authorizes an index by itself.
 pub mod index_probe;
 pub mod install;
-/// The `pkg` protocol's lane: a Developer-ID-signed macOS installer package, its
-/// signer team checked with `pkgutil`, applied by `installer` with elevation.
-pub mod installer_pkg;
 /// The retired landing wait (2026-09-16 to 2026-09-22): the `__landing` verb older twins
 /// still call, now an immediate silent `exec`, and the sweep of the markers they test for.
 pub mod landing;
-/// Laying executables (shims, stubs, tombstones) through the untracked launchd lane when
-/// this process is provenance-tracked — law m21: a tagged `#!/bin/sh` shim tracks the
-/// tool it execs — and the one refuse-by-default policy both untracked lanes share.
+/// Laying executables (shims, stubs, tombstones): one temp + `rename(2)` writer.
 pub mod lay;
 pub mod linkmode;
 pub mod lock;
@@ -187,9 +174,6 @@ pub mod protected;
 /// measurement, and the two sentences every refusal that names the tag shares.
 pub mod provenance;
 pub mod relocate;
-/// The `requires` relation's one gate (`unmet_requirement`, §17.10), shared by the
-/// set-completion pass, the OS-installed reconcile and the update pass.
-pub mod requires;
 pub mod reroute;
 /// The rustup toolchain seam owner (Lockstep S1): `<rustup_home>/toolchains/trust` ->
 /// `<prefix>/store/trust/current`, laid, adopted, re-asserted and recorded by atpkg.
@@ -201,12 +185,6 @@ pub mod select;
 pub mod selfupdate;
 pub mod shim_env;
 pub mod sig;
-/// The `softwareupdate` protocol's lane: Apple's Command Line Tools, installed
-/// headlessly by `softwareupdate` with elevation (never `xcode-select --install`).
-pub mod softwareupdate;
-/// The untracked staging lane: extraction handed to a launchd job when the installer
-/// measures itself as provenance-tracked, so the bundle it lays down is clean.
-pub mod stage_helper;
 /// The CANONICAL per-program state spellings (`managed <build> — pinned by index <N>`,
 /// `system: <path> — not managed by aterm`, …) shared by status.toml, the pass log,
 /// `doctor` and `which`.
@@ -215,17 +193,12 @@ pub mod status;
 pub mod store;
 pub mod stub;
 pub mod sysroot;
-/// The `system-pm` protocol's lane: a package the platform's own manager (one row of
-/// [`vendor::MANAGER_TABLE`]) installs — `sudo` for the system-wide ones, as the user
-/// for the rest, never installing a manager, proven by the row's `provides`.
-pub mod system_pm;
 /// The read-only USTAR/PAX/GNU bundle parser the extractor drives (retired the
 /// `tar` crate, and with it `xattr` and `filetime` — aterm never WRITES tar).
 pub mod tarread;
 pub mod tree;
-/// Per-protocol row admission (`https`: host allow-list + payload shape; `pkg`,
-/// `system-pm` and `softwareupdate`: their own field rules), the extensible manager
-/// table, the `system = "<bin>"` satisfaction probe and the PATH-shadow probe — both
+/// Per-protocol row admission (`https`: host allow-list + payload shape), the
+/// `system = "<bin>"` satisfaction probe and the PATH-shadow probe — both
 /// cross-platform (`PATHEXT` on Windows).
 pub mod vendor;
 /// Vendor-direct agents (design 2026-09-22, Phase 1): the compiled vendor table, the
@@ -240,15 +213,14 @@ pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use cost::{disk_ok, human_bytes, needs_consent};
 pub use discovery::{IndexRepo, resolve_account};
 pub use dispatch::{ApplyStrategy, strategy_for};
-pub use elevate::{Elevation, Runner};
 pub use extract::{
     EntryKind, ExtractError, ExtractReject, TooLargeReason, extract_tar_zst, vet_entry,
     vet_hardlink,
 };
 pub use flow::{
     AppliedMember, ChannelApplyReport, DepOutcome, DepResult, Fetcher, FlowError, InstallReport,
-    InstallRequest, ProtocolOutcome, VendorFetchError, VendorGet, apply_channel,
-    apply_channel_with, install, resolve_verified_index,
+    InstallRequest, VendorFetchError, VendorGet, apply_channel, apply_channel_with, install,
+    resolve_verified_index,
 };
 pub use gate::{ApplyDecision, decide, is_yanked};
 pub use gc::{GcReport, reclaimable, run as run_gc};
@@ -277,9 +249,7 @@ pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
 pub use sysroot::{relocate_sysroot, write_toolchain_version};
 pub use tree::{sha256_file, tree_root};
-pub use vendor::{
-    MANAGER_TABLE, MANAGERS, Manager, VENDOR_HOSTS, shadowing_binary_on_path, system_satisfied,
-};
+pub use vendor::{VENDOR_HOSTS, shadowing_binary_on_path, system_satisfied};
 pub use verify::{VerifyOutcome, verify_all, verify_program};
 
 /// The base64 Ed25519 public key(s) of the **paper master** this binary trusts — atpkg's
@@ -287,8 +257,8 @@ pub use verify::{VerifyOutcome, verify_all, verify_program};
 ///
 /// A committed constant ([`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`]), not a build
 /// env var: what a binary trusts is a property of the source, identical on every machine.
-/// A LIST for the same reason the channel keyset is one — a client that accepts exactly
-/// one master cannot be told about a replacement by a document it would refuse to verify.
+/// A LIST because a client that accepts exactly one master cannot be told about a
+/// replacement by a document it would refuse to verify.
 ///
 /// EMPTY means unpinned means INERT, and inert grants nothing: no roster verifies, so no
 /// machine is authorized, so no index verifies, so nothing installs. It never means

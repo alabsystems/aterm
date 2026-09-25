@@ -1681,15 +1681,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The live-root smoke test: the shipping registry over the real checkout.
+    /// No standing finding is registered. The supernova aggregator finding
+    /// closed on 2026-08-08, and a standing block prints only for a registered
+    /// entry, so an empty registry is the whole claim. The live tree's GREEN is
+    /// not re-walked here: `tools/freeze-safety-gate`'s build runs this census
+    /// over the checkout on every `verify --fast` and fails the compile on RED.
     #[test]
-    fn real_tree_scope_census_is_green_with_no_standing_findings() {
-        let out = run_scope_census(&repo_root());
-        assert!(out.ok, "the live tree must be GREEN:\n{}", out.log);
+    fn no_scope_standing_finding_is_registered() {
         assert!(
-            !out.log.contains("STANDING FINDING"),
-            "the supernova aggregator finding closed on 2026-08-08; nothing may reprint:\n{}",
-            out.log
+            SCOPE_STANDING_FINDINGS.is_empty(),
+            "a scope standing finding was registered; re-audit before accepting it"
         );
     }
 }

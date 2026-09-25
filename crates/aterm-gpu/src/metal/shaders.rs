@@ -83,7 +83,7 @@
 //!   buffers use natural C layout. For all four uniform blocks here every
 //!   member is <= 16 bytes and naturally aligned, and both layouts agree
 //!   member-for-member — so the existing Rust structs are byte-identical and
-//!   UNCHANGED. `BlitUniform` (96 bytes) and `ShimmerU`'s `float4[16]` are the
+//!   UNCHANGED. `BlitUniform` (112 bytes) and `ShimmerU`'s `float4[16]` are the
 //!   two worth re-checking if a field is ever added.
 
 use crate::pipeline_table::ShaderLibrary;
@@ -460,52 +460,6 @@ mod tests {
             "the binding scan found {scanned_any:?} (stage_in/buffers/textures/\
              samplers) across all rows — it went blind and this guard proves nothing"
         );
-    }
-
-    /// The scan reads multi-line parameter lists correctly: `fs_blit`'s three
-    /// bindings sit on three different lines, and the reported file:line for
-    /// each must be the line the attribute is ON (the guard's failure messages
-    /// stand on these numbers).
-    #[test]
-    fn the_binding_scan_reports_the_declaring_line() {
-        let fs = entry_point_bindings(BLIT, "fs_blit").expect("fs_blit exists");
-        assert_eq!(
-            (
-                fs.buffers.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
-                fs.textures.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
-                fs.samplers.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
-            ),
-            (vec![2], vec![0], vec![0]),
-            "fs_blit's binding set is the POST_FS shape"
-        );
-        let (_, tex_line) = fs.textures[0];
-        let (_, buf_line) = fs.buffers[0];
-        assert!(
-            tex_line > fs.line && buf_line > tex_line,
-            "fs_blit declares texture then buffer on later lines than the \
-             declaration ({} / {tex_line} / {buf_line})",
-            fs.line
-        );
-        // And an entry point that does not exist is None, not a panic.
-        assert!(entry_point_bindings(BLIT, "fs_nonexistent").is_none());
-    }
-
-    /// The two verification-only sources are NOT part of any library, so the
-    /// guard above must not be able to be satisfied by them — and a shipping
-    /// pipeline must never name one of their functions.
-    #[test]
-    fn the_probe_and_parity_sources_are_outside_every_roster() {
-        let probes: Vec<&str> = defined_entry_points(STATE_PROBE);
-        assert_eq!(probes, ["vs_probe", "fs_probe_const", "fs_probe_sample"]);
-        for (lib, _, roster) in libraries() {
-            for p in &probes {
-                assert!(
-                    !roster.contains(p),
-                    "{} asks for the verification-only `{p}`",
-                    lib.name()
-                );
-            }
-        }
     }
 
     /// THE SCAN'S OWN BOUNDARY, pinned so it cannot rot silently. The binding

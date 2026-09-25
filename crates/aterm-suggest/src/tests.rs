@@ -374,7 +374,15 @@ fn an_unknown_exit_code_counts_as_neither_success_nor_failure() {
 #[test]
 fn secret_bearing_commands_are_never_recorded() {
     let mut e = Engine::new(on());
-    e.record(concat!("export GITHUB_TOKEN=ghp", "_abcdefghijklmnop"), None, Some(0), 0);
+    // The two credential-shaped commands are split with `concat!` so a secret
+    // scanner reads no token literal (gitleaks `curl-auth-header`); the recorded
+    // strings are identical.
+    e.record(
+        concat!("export GITHUB_TOKEN=ghp", "_abcdefghijklmnop"),
+        None,
+        Some(0),
+        0,
+    );
     e.record(
         concat!("curl -H 'Authorization: Bearer sk", "-abc123'"),
         None,

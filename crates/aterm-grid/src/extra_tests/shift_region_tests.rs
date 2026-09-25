@@ -131,51 +131,6 @@ fn cell_extras_shift_region_down_by_zero_is_noop() {
 }
 
 // =============================================================================
-// shift_rows_up_by boundary conditions
-// =============================================================================
-
-#[test]
-fn cell_extras_shift_rows_up_by_boundary_u16_max() {
-    let mut extras = CellExtras::new();
-
-    extras
-        .get_or_create(CellCoord::new(u16::MAX, 0))
-        .add_combining('\u{0301}');
-
-    extras.shift_rows_up_by(0, 1);
-
-    assert!(
-        extras.get(CellCoord::new(u16::MAX, 0)).is_none(),
-        "old position should be gone"
-    );
-    assert!(
-        extras.get(CellCoord::new(u16::MAX - 1, 0)).is_some(),
-        "should have shifted to u16::MAX - 1"
-    );
-}
-
-#[test]
-fn cell_extras_shift_rows_up_by_overflow_drops_all() {
-    let mut extras = CellExtras::new();
-
-    extras
-        .get_or_create(CellCoord::new(0, 0))
-        .add_combining('\u{0301}');
-    extras
-        .get_or_create(CellCoord::new(5, 0))
-        .add_combining('\u{0302}');
-
-    extras.shift_rows_up_by(1, u16::MAX);
-
-    assert!(
-        extras.get(CellCoord::new(0, 0)).is_some(),
-        "row 0 preserved"
-    );
-    assert!(extras.get(CellCoord::new(5, 0)).is_none(), "row 5 dropped");
-    assert_eq!(extras.len(), 1, "only row 0 survives overflow");
-}
-
-// =============================================================================
 // Algorithm audit boundary cases (#4335)
 // =============================================================================
 

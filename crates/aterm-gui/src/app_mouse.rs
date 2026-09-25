@@ -5215,7 +5215,7 @@ impl App {
     /// rows still arrive through the seam and snap), and is checked BEFORE the
     /// probe so it never pays the lock.
     fn track_precise_scroll(&mut self, wid: WindowId, dy_px: f64) {
-        use aterm_types::mouse::SHIFT_MASK;
+        use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
         // The SAME gate the whole-row glide resolves (`effect_policy`: OS Reduce
         // Motion, `motion = "reduced"`, an unfocused window — never the
         // load-shed latch, which sheds decoration, not the reader's own hand).
@@ -5238,7 +5238,13 @@ impl App {
         // reserves the wheel for the terminal on every screen; Alt's bypass is
         // alt-screen-conditional (`wheel_route_for`) and the mirror carries no
         // alt-screen bit, so Alt cannot be honoured here and falls to tier 3.
-        if modes.mouse_tracking_enabled() && mods & SHIFT_MASK == 0 {
+        // Alt is excluded HERE for exactly that reason (audit, 2026-09-24): with
+        // only Shift excluded, Alt over a main-screen tracking app — the SELECTION
+        // CUSTODY override, which the seam routes to the local viewport — took
+        // this release-and-return, so every sub-row delta was dropped while the
+        // row-banking events still moved the band by their own pixels: about
+        // 1/N of the finger, settling back between events.
+        if modes.mouse_tracking_enabled() && mods & (SHIFT_MASK | ALT_MASK) == 0 {
             self.release_scroll_track(wid);
             return;
         }
@@ -5268,13 +5274,29 @@ impl App {
     /// ended, or the seam just reported a precise delta to an app. A no-op for
     /// a notch ease or a settle already in flight, and for no glide at all.
     pub(crate) fn release_scroll_track(&mut self, wid: WindowId) {
-        let now = Instant::now();
-        if let Some(st) = self
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.scroll_glide.as_mut())
-        {
+        self.release_scroll_track_at(wid, Instant::now());
+    }
+
+    /// [`Self::release_scroll_track`] at an explicit `now` (one timeline for
+    /// the tests). THE ANCHOR MOVES WITH THE EASE (audit, 2026-09-24): a parked
+    /// band's anchored tick is its OLD rest boundary (the parked arm of
+    /// `apply_scroll_glide_sample`), and the loop wakes only on that anchor —
+    /// so a release that moved the ease's start without it held the settle
+    /// until the old boundary (~90 ms) and then presented 98 % of it in one
+    /// frame. The anchor is pulled in to one panel period out, the chained
+    /// notch's rule.
+    pub(crate) fn release_scroll_track_at(&mut self, wid: WindowId, now: Instant) {
+        let app_interval = self.frame_interval;
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let tick_interval = ws.frame_interval.unwrap_or(app_interval);
+        if let Some(st) = ws.scroll_glide.as_mut() {
+            let parked = now < st.glide.settle_start();
             st.glide.release(now);
+            if parked {
+                st.next_tick = st.next_tick.min(now + tick_interval);
+            }
         }
     }
 

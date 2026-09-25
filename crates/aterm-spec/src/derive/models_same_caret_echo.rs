@@ -157,11 +157,14 @@ pub fn same_caret_typed_echo_model() -> Model {
 
 /// An unknown-width insert can absorb a queued key into its own hop, so its
 /// dispatch-to-delivery credits leave the generic ring at orphan cleanup.
-/// When exactly one known one-cell key remains, the seam escrows its glyph
-/// and the insert's row/next column/print generation. Only that exact later
-/// row transition can spend it; a different print, another pending key,
-/// expiry, scroll, rewrite, or reset closes the one-shot escrow. Tier-1 drives
-/// the genuine CursorGlow seam in `cursor_glow::tests`.
+/// When one or two known one-cell keys remain, the seam escrows their glyphs
+/// and the insert's row/next column/print generation. Exact later row
+/// transitions spend one key or both when a single frame has two new exact
+/// cells; a different print, a third pending key, expiry, scroll, rewrite, or
+/// reset closes the remainder. The PTY cannot distinguish a delayed key from
+/// program output that exactly mimics its glyphs and transition; the model
+/// rejects every distinguishable program move. Tier-1 drives the genuine
+/// CursorGlow seam in `cursor_glow::tests`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn unknown_insert_orphan_key_model() -> Model {
@@ -180,24 +183,49 @@ pub fn unknown_insert_orphan_key_model() -> Model {
                 queued = 1; generic = 1; phase = 1;
             }
             action QueueBlank when (phase == 0) {
-                queued = 3; generic = 1; phase = 1;
+                queued = 4; generic = 1; phase = 1;
             }
             action QueueTwo when (phase == 0) {
                 queued = 2; generic = 2; phase = 1;
+            }
+            action QueueThree when (phase == 0) {
+                queued = 3; generic = 3; phase = 1;
             }
             action QueueNone when (phase == 0) { phase = 1; }
             action LayWithSite when (phase == 1) { site = 1; phase = 2; }
             action LayWithoutSite when (phase == 1) { phase = 2; }
             action Cleanup when (phase == 2) {
                 generic = if Buggy == 1 { generic } else { 0 };
-                escrow = if queued == 1 && site == 1 { 1 } else { 0 };
+                escrow = if (queued == 1 || queued == 2) && site == 1
+                    { queued } else { 0 };
                 phase = 3;
             }
             action ExactNewPrint when (phase == 3) {
                 exact = 1;
-                lit = if Buggy == 1 || (escrow == 1 && site == 1) { 1 } else { 0 };
-                escrow = if Buggy == 1 { escrow } else { 0 };
+                lit = if Buggy == 1 || (escrow > 0 && site == 1) { 1 } else { 0 };
+                escrow = if Buggy == 1 { escrow }
+                    else if escrow > 0 { escrow - 1 } else { 0 };
                 phase = 4;
+            }
+            action CoalescedTwoExactNewPrint when (phase == 3 && queued == 2) {
+                exact = 2;
+                lit = if Buggy == 1 || (escrow == 2 && site == 1) { 2 } else { 0 };
+                escrow = 0; phase = 5;
+            }
+            action CoalescedTwoWrongOrPartial when (phase == 3 && queued == 2) {
+                escrow = 0; phase = 5;
+            }
+            action CoalescedTwoOldPrint when (phase == 3 && queued == 2) {
+                escrow = 0; phase = 5;
+            }
+            action CoalescedTwoMissingProbe when (phase == 3 && queued == 2) {
+                escrow = 0; phase = 5;
+            }
+            action CoalescedTwoAltWithoutBlink when (phase == 3 && queued == 2) {
+                escrow = 0; phase = 5;
+            }
+            action CoalescedTooMany when (phase == 3 && queued == 3) {
+                escrow = 0; phase = 5;
             }
             action AmbientOtherGlyph when (phase == 3) {
                 lit = if Buggy == 1 { 1 } else { 0 };
@@ -218,16 +246,29 @@ pub fn unknown_insert_orphan_key_model() -> Model {
             action Reset when (phase == 3) {
                 site = 0; escrow = 0; phase = 4;
             }
-            action LaterProgramPrint when (phase == 4) { phase = 5; }
+            action SecondExactNewPrint when (phase == 4 && queued == 2 && escrow == 1) {
+                exact = 2; lit = 2; escrow = 0; phase = 5;
+            }
+            action SecondAmbientOtherGlyph when (phase == 4 && queued == 2 && escrow == 1) {
+                escrow = 0; phase = 5;
+            }
+            action SecondExactOldPrint when (phase == 4 && queued == 2 && escrow == 1) {
+                escrow = 0; phase = 5;
+            }
+            action SecondPrefixRewrite when (phase == 4 && queued == 2 && escrow == 1) {
+                escrow = 0; phase = 5;
+            }
+            action LaterProgramPrint when (phase == 4) { escrow = 0; phase = 5; }
 
             invariant NoGenericAfterCleanup:
-                if phase > 2 { generic == 0 } else { generic <= 2 };
+                if phase > 2 { generic == 0 } else { generic <= 3 };
             invariant ExactOnly: lit <= exact;
-            invariant SiteRequired: lit <= site;
-            invariant OneShot: lit + escrow <= 1;
+            invariant SiteRequired:
+                if site == 0 { lit == 0 } else { lit <= 2 };
+            invariant OneShot: lit + escrow <= queued;
             invariant Bounded:
-                phase <= 5 && queued <= 3 && generic <= 2 && site <= 1
-                    && escrow <= 1 && exact <= 1 && lit <= 1;
+                phase <= 5 && queued <= 4 && generic <= 3 && site <= 1
+                    && escrow <= 2 && exact <= 2 && lit <= 2;
         }
     }
 }

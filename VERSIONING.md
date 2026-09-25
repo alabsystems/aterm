@@ -64,9 +64,9 @@ that scheme. Those are fixtures, not version claims.
 
 ## The public source snapshot
 
-The publication transform normalizes the public workspace and every first-party
-`Cargo.lock` record to the public `MAJOR.MINOR.0` and tags the snapshot to match
-the application. First-party crates are detected structurally (a `[[package]]`
-with no `source` line in `Cargo.lock`), so the normalization is exact regardless
-of which versions third-party crates happen to use. See
-[PUBLICATION.md](PUBLICATION.md) for the rest of that boundary.
+The public source snapshot carries the workspace version exactly as committed —
+`Cargo.toml` and every `Cargo.lock` record — and is tagged `vMAJOR.MINOR.0` to
+match the application. Nothing rewrites it on the way out, so a tree whose
+version has a patch slot other than `0` is not publishable: the publication
+engine refuses to promote it. See [PUBLICATION.md](PUBLICATION.md) for the rest
+of that boundary.

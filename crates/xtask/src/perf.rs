@@ -2136,41 +2136,15 @@ mod tests {
     }
 
     #[test]
-    fn compare_passes_above_floor() {
-        let (v, floor) = compare(1000.0, 500.0, 0.45);
-        assert_eq!(v, Verdict::Pass);
-        assert!((floor - 450.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn compare_fails_below_floor() {
-        let (v, floor) = compare(1000.0, 449.0, 0.45);
-        assert_eq!(v, Verdict::Fail);
-        assert!((floor - 450.0).abs() < 1e-9);
-    }
-
-    #[test]
     fn compare_boundary_is_inclusive_pass() {
-        // EXACTLY at the floor must PASS (>= floor), never flake at the edge.
-        let (v, _) = compare(1000.0, 450.0, 0.45);
+        // EXACTLY at the floor must PASS (>= floor), never flake at the edge —
+        // and the floor is baseline × ratio.
+        let (v, floor) = compare(1000.0, 450.0, 0.45);
         assert_eq!(v, Verdict::Pass);
+        assert!((floor - 450.0).abs() < 1e-9, "floor {floor}");
         // A hair below fails.
         let (v2, _) = compare(1000.0, 449.999, 0.45);
         assert_eq!(v2, Verdict::Fail);
-    }
-
-    #[test]
-    fn compare_catastrophic_regression_fails() {
-        // A 10x collapse (debug build / O(n^2)) is far below any generous floor.
-        let (v, _) = compare(3000.0, 300.0, 0.45);
-        assert_eq!(v, Verdict::Fail);
-    }
-
-    #[test]
-    fn compare_faster_machine_passes() {
-        // A faster box (2x baseline) trivially passes.
-        let (v, _) = compare(1000.0, 2000.0, 0.45);
-        assert_eq!(v, Verdict::Pass);
     }
 
     #[test]

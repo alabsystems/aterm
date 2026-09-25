@@ -587,85 +587,83 @@ mod tests {
     }
 
     // ====================================================================
-    // Literal string matching
+    // Literal, case and Unicode matching: one row per former test
     // ====================================================================
 
     #[test]
-    fn test_literal_match_at_start() {
-        let matches = find_in_row("hello", "hello world", true);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0], (0, 5));
+    fn literal_rows_report_display_column_spans() {
+        // (label, pattern, row text, case sensitive, expected (start, end) spans)
+        #[allow(clippy::type_complexity, reason = "one labelled row per case")]
+        let rows: &[(&str, &str, &str, bool, &[(usize, usize)])] = &[
+            ("match at start", "hello", "hello world", true, &[(0, 5)]),
+            ("match in middle", "llo", "hello world", true, &[(2, 5)]),
+            ("match at end", "world", "hello world", true, &[(6, 11)]),
+            (
+                "several per line",
+                "ab",
+                "ab cd ab ef ab",
+                true,
+                &[(0, 2), (6, 8), (12, 14)],
+            ),
+            ("no match", "xyz", "hello world", true, &[]),
+            ("pattern equals text", "exact", "exact", true, &[(0, 5)]),
+            (
+                "insensitive finds uppercase",
+                "hello",
+                "HELLO WORLD",
+                false,
+                &[(0, 5)],
+            ),
+            (
+                "insensitive finds mixed case",
+                "hello",
+                "HeLLo World",
+                false,
+                &[(0, 5)],
+            ),
+            (
+                "sensitive rejects other case",
+                "hello",
+                "HELLO WORLD",
+                true,
+                &[],
+            ),
+            (
+                "insensitive, several per line",
+                "ab",
+                "Ab aB AB ab",
+                false,
+                &[(0, 2), (3, 5), (6, 8), (9, 11)],
+            ),
+            ("empty line", "test", "", true, &[]),
+            (
+                "pattern longer than text",
+                "longpattern",
+                "short",
+                true,
+                &[],
+            ),
+            // CJK is two columns wide: 日 = 0-1, 本 = 2-3.
+            ("CJK", "日本", "日本語テスト", true, &[(0, 4)]),
+            ("emoji", "🎉", "hello 🎉 world", true, &[(6, 8)]),
+            // a = 1 column, あ = 2 columns, b = 1 column.
+            ("mixed width", "あ", "aあb", true, &[(1, 3)]),
+            (
+                "repeated CJK, every one found",
+                "日",
+                "日日日",
+                true,
+                &[(0, 2), (2, 4), (4, 6)],
+            ),
+        ];
+        for &(label, pattern, text, case_sensitive, expected) in rows {
+            assert_eq!(
+                find_in_row(pattern, text, case_sensitive),
+                expected,
+                "{label}"
+            );
+        }
     }
-
-    #[test]
-    fn test_literal_match_at_middle() {
-        let matches = find_in_row("llo", "hello world", true);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0], (2, 5));
-    }
-
-    #[test]
-    fn test_literal_match_at_end() {
-        let matches = find_in_row("world", "hello world", true);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0], (6, 11));
-    }
-
-    #[test]
-    fn test_literal_multiple_matches_per_line() {
-        let matches = find_in_row("ab", "ab cd ab ef ab", true);
-        assert_eq!(matches.len(), 3);
-        assert_eq!(matches[0], (0, 2));
-        assert_eq!(matches[1], (6, 8));
-        assert_eq!(matches[2], (12, 14));
-    }
-
-    #[test]
-    fn test_literal_no_match() {
-        let matches = find_in_row("xyz", "hello world", true);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn test_literal_pattern_equals_text() {
-        let matches = find_in_row("exact", "exact", true);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0], (0, 5));
-    }
-
-    // ====================================================================
-    // Case-insensitive matching
-    // ====================================================================
-
-    #[test]
-    fn test_case_insensitive_finds_uppercase() {
-        let matches = find_in_row("hello", "HELLO WORLD", false);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0], (0, 5));
-    }
-
-    #[test]
-    fn test_case_insensitive_finds_mixed_case() {
-        let matches = find_in_row("hello", "HeLLo World", false);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0], (0, 5));
-    }
-
-    #[test]
-    fn test_case_sensitive_does_not_match_different_case() {
-        let matches = find_in_row("hello", "HELLO WORLD", true);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn test_case_insensitive_multiple_matches() {
-        let matches = find_in_row("ab", "Ab aB AB ab", false);
-        assert_eq!(matches.len(), 4);
-    }
-
-    // ====================================================================
-    // Empty pattern / empty line
-    // ====================================================================
 
     #[test]
     fn test_empty_pattern_returns_no_matches() {
@@ -673,53 +671,6 @@ mod tests {
         // start_search rejects empty patterns
         let result = engine.start_search("", FilterMode::Literal);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_empty_line_returns_no_matches() {
-        let matches = find_in_row("test", "", true);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn test_pattern_longer_than_text_no_match() {
-        let matches = find_in_row("longpattern", "short", true);
-        assert!(matches.is_empty());
-    }
-
-    // ====================================================================
-    // Unicode matching
-    // ====================================================================
-
-    #[test]
-    fn test_unicode_cjk_match() {
-        let matches = find_in_row("日本", "日本語テスト", true);
-        assert_eq!(matches.len(), 1);
-        // CJK chars are 2 columns wide: "日" = cols 0-1, "本" = cols 2-3
-        assert_eq!(matches[0], (0, 4));
-    }
-
-    #[test]
-    fn test_unicode_emoji_match() {
-        let matches = find_in_row("🎉", "hello 🎉 world", true);
-        assert_eq!(matches.len(), 1);
-    }
-
-    #[test]
-    fn test_unicode_mixed_width() {
-        // "aあb" — 'a' is 1 col, 'あ' is 2 cols, 'b' is 1 col
-        let matches = find_in_row("あ", "aあb", true);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0], (1, 3)); // columns 1-2 (2 wide)
-    }
-
-    #[test]
-    fn test_unicode_repeated_cjk_all_found() {
-        let matches = find_in_row("日", "日日日", true);
-        assert_eq!(matches.len(), 3);
-        assert_eq!(matches[0], (0, 2));
-        assert_eq!(matches[1], (2, 4));
-        assert_eq!(matches[2], (4, 6));
     }
 
     // ====================================================================
@@ -746,33 +697,23 @@ mod tests {
     }
 
     #[test]
-    fn test_fuzzy_match_exact_string() {
-        assert!(StreamingSearch::fuzzy_match("abc", "abc"));
-    }
-
-    #[test]
-    fn test_fuzzy_match_empty_pattern() {
-        assert!(StreamingSearch::fuzzy_match("anything", ""));
-    }
-
-    #[test]
-    fn test_fuzzy_match_empty_both() {
-        assert!(StreamingSearch::fuzzy_match("", ""));
-    }
-
-    #[test]
-    fn test_fuzzy_no_match_reversed() {
-        assert!(!StreamingSearch::fuzzy_match("hello", "olleh"));
-    }
-
-    #[test]
-    fn test_fuzzy_no_match_absent_chars() {
-        assert!(!StreamingSearch::fuzzy_match("hello", "xyz"));
-    }
-
-    #[test]
-    fn test_fuzzy_no_match_nonempty_on_empty() {
-        assert!(!StreamingSearch::fuzzy_match("", "a"));
+    fn fuzzy_match_rows() {
+        // (label, text, pattern, is a subsequence match)
+        let rows: &[(&str, &str, &str, bool)] = &[
+            ("exact string", "abc", "abc", true),
+            ("empty pattern", "anything", "", true),
+            ("empty text and pattern", "", "", true),
+            ("reversed order", "hello", "olleh", false),
+            ("absent chars", "hello", "xyz", false),
+            ("non-empty pattern on empty text", "", "a", false),
+        ];
+        for &(label, text, pattern, expected) in rows {
+            assert_eq!(
+                StreamingSearch::fuzzy_match(text, pattern),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     // ====================================================================

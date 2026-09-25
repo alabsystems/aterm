@@ -160,14 +160,14 @@ fn boot(tag: &str, harness: &str) -> Option<Instance> {
             );
             return None;
         }
-        if is_socket_or_symlink(&sock_path) {
+        if is_socket_or_symlink(&sock_path) && launch_isolation::control_listening(&sock_path) {
             inst.sid = boot_session(&inst);
             return Some(inst);
         }
         std::thread::sleep(POLL_GAP);
     }
     eprintln!(
-        "SKIP: control socket never appeared; log tail:\n{}",
+        "SKIP: control socket never started listening; log tail:\n{}",
         log_tail(&inst.log)
     );
     None

@@ -29,14 +29,13 @@
 //! * `exclude` — per-program opt-out, narrowing-only over the SIGNED index
 //!   ([`crate::manifest::Index::installable`]).
 //!
-//! THE REST: `tracked_install` (machine policy for release-cutting machines, until
-//! Phase 5 deletes its lane), and three DEVELOPMENT settings a shipped binary drops at
-//! load with a notice ([`DEV_SEAMS`]): `prefix`, `account` and the `owner/repo` form of
+//! THE REST: three DEVELOPMENT settings a shipped binary drops at load with a notice
+//! ([`DEV_SEAMS`]): `prefix`, `account` and the `owner/repo` form of
 //! `[packages.links]` (a checkout-path link is a dev link and stays). A dropped `prefix`
 //! naming another store also stops unattended installs until the line is removed
 //! ([`PackagesConfig::installs_unattended`]). Every load-time note is said ONCE per
-//! process ([`crate::notice::say_spelling`]). `channel` and
-//! `include` are retired: named once and ignored. Nothing here is a trust input: the
+//! process ([`crate::notice::say_spelling`]). `channel`, `include` and
+//! `tracked_install` are retired: named once and ignored. Nothing here is a trust input: the
 //! account is slug-validated downstream, and a `[packages.links]` entry can only
 //! redirect WHERE bytes are fetched from or suppress registry management — never what
 //! verifies (§5/§8: the host is not an authenticity input).
@@ -162,25 +161,11 @@ pub struct PackagesConfig {
     pub include: Option<aterm_toml::Value>,
     /// Narrowing-only exclude filter: the per-program opt-out.
     pub exclude: Option<Vec<String>>,
-    /// `[packages].tracked_install`: what a provenance-tracked pass does with files whose
-    /// macOS tag could not be cleared ([`crate::lay`], "When the lane cannot run") —
-    /// `"record"` keeps them and, for a staged bundle, records it beside the build (the
-    /// default since 2026-09-14); `"refuse"` fails the install instead. The tag is cleared
-    /// in place first either way ([`crate::provenance::heal`]), so on a working Mac
-    /// neither word changes anything. Default `record`.
-    ///
-    /// WHY A CONFIG KEY (2026-09-15): the knob was env-only
-    /// (`ATPKG_REFUSE_TRACKED_INSTALL`), and the window's own update/seed passes are
-    /// spawned from launchd's environment, which no shell export reaches — so a
-    /// release-cutting machine that wanted the refusal could have it for a pass typed
-    /// by hand and never for the unattended passes that lay most of its toolchain. This
-    /// key is the ONE spelling now: the env var is gone (2026-09-23), so no shell can
-    /// give one run a policy the machine's passes do not have.
-    /// Admitted at load ([`parse_packages`]): any word but the two is named once (as an
-    /// unasked notice, [`crate::notice`]) and treated as unset, so a typo falls to
-    /// `record` — the reading that does not intervene — and never takes the rest of the
-    /// table down with it.
-    pub tracked_install: Option<String>,
+    /// RETIRED 2026-09-24: the refuse/record policy of the untracked install lanes, which
+    /// were deleted — the store heal is the one cure for the macOS tag
+    /// ([`crate::provenance::heal_store`]). Parsed as any value, named once at load, never
+    /// read.
+    pub tracked_install: Option<aterm_toml::Value>,
     /// `[packages.links]`: `name = "/path/to/checkout"` (or `~/…`) declares a
     /// managed dev-link ([`crate::linkmode`] — registry management skipped; a
     /// maintainer's key, never in Settings); `name = "owner/repo"` declares a
@@ -206,9 +191,9 @@ pub struct PackagesConfig {
     #[serde(skip)]
     pub ignored_prefix: Option<PathBuf>,
     /// NOT a config key — `#[serde(skip)]`. What [`admit_packages`] took out of the table,
-    /// in its own words: a development setting a shipped binary does not read, or a
-    /// `tracked_install` word that is neither spelling. Said once at load and repeated by
-    /// doctor ([`Self::config_notes`]), which is where a person looks.
+    /// in its own words: a development setting a shipped binary does not read. Said once
+    /// at load and repeated by doctor ([`Self::config_notes`]), which is where a person
+    /// looks.
     #[serde(skip)]
     pub admission_notes: Vec<String>,
 }
@@ -293,8 +278,9 @@ impl PackagesConfig {
 
     /// What doctor says about this table's spelling — one line per key a person should
     /// rename or remove: the retired `auto_update`/`seed_install` (still honoured), and
-    /// the retired `channel`/`include` (ignored). The development settings a shipped
-    /// binary dropped are named at load ([`admit_packages`]), where they are dropped.
+    /// the retired `channel`/`include`/`tracked_install` (ignored). The development
+    /// settings a shipped binary dropped are named at load ([`admit_packages`]), where they
+    /// are dropped.
     #[must_use]
     pub fn config_notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
@@ -327,6 +313,7 @@ impl PackagesConfig {
         for (key, present) in [
             ("channel", self.channel.is_some()),
             ("include", self.include.is_some()),
+            ("tracked_install", self.tracked_install.is_some()),
         ] {
             if present {
                 notes.push(retired_key_note(key));
@@ -340,17 +327,6 @@ impl PackagesConfig {
     #[must_use]
     pub fn exclude(&self) -> &[String] {
         self.exclude.as_deref().unwrap_or(&[])
-    }
-
-    /// What `[packages].tracked_install` selects — `Some(Refuse)` for `"refuse"`,
-    /// `Some(Allow)` for `"record"` — or `None` when the key is absent, blank, or not one
-    /// of the two spellings (which [`parse_packages`] already named, [`crate::notice`], and
-    /// dropped; a table built by hand and never parsed gets the same `None`, silently).
-    /// The default is [`crate::lay::tracked_policy_of`]'s, not this method's — one place
-    /// decides.
-    #[must_use]
-    pub fn tracked_install(&self) -> Option<crate::lay::TrackedPolicy> {
-        tracked_install_of(self.tracked_install.as_deref()?)
     }
 }
 
@@ -384,20 +360,14 @@ fn retired_key_note(key: &str) -> String {
         "channel" => "[packages] channel is retired — atpkg reads the one `stable` channel; \
                       remove the key"
             .to_string(),
+        "tracked_install" => "[packages] tracked_install is retired — atpkg clears the macOS \
+                              tag from installed files itself (`aterm pkg repair`); remove \
+                              the key"
+            .to_string(),
         _ => format!(
             "[packages] {key} is retired — a machine keeps the whole signed set minus \
              `exclude`; remove the key"
         ),
-    }
-}
-
-/// The two spellings of `[packages].tracked_install`, trimmed and case-sensitive (like
-/// `[machine] universal_control`: `"REFUSE"` is a word the owner did not write).
-fn tracked_install_of(value: &str) -> Option<crate::lay::TrackedPolicy> {
-    match value.trim() {
-        "record" => Some(crate::lay::TrackedPolicy::Allow),
-        "refuse" => Some(crate::lay::TrackedPolicy::Refuse),
-        _ => None,
     }
 }
 
@@ -728,7 +698,8 @@ pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> Pa
 
 /// The per-key admission a WELL-FORMED `[packages]` table still gets, once, at load.
 ///
-/// RETIRED AND DEVELOPMENT KEYS (2026-09-23). A retired `channel`/`include` is named
+/// RETIRED AND DEVELOPMENT KEYS (2026-09-23). A retired `channel`/`include` (and, since
+/// 2026-09-24, `tracked_install`) is named
 /// ([`crate::notice::say_spelling`]) and never read. In a shipped binary (`dev_seams`
 /// false) the development settings — `prefix`, `account`, and every `owner/repo` value of
 /// `[packages.links]` — are named and DROPPED from the table, so no resolver downstream
@@ -742,30 +713,11 @@ pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> Pa
 /// read by every layout resolution, and a note said per read was said three times by one
 /// `doctor` and before every `cargo` a session ran. What was dropped is also kept in
 /// [`PackagesConfig::admission_notes`], which doctor prints.
-///
-/// And the tracked-install word: a
-/// `tracked_install` that is neither `"record"` nor `"refuse"` (a blank is merely unset)
-/// is named and dropped from the table, so no resolver ever sees a word the owner did not
-/// write. It is the loud-defaults posture of a malformed file narrowed to the one key — a
-/// typo here must not zero `exclude` — and, like `[machine] universal_control`'s unknown
-/// word, it falls to the reading that does NOT intervene: `record`, the default, never
-/// `refuse`. The owner's 2026-09-14 ruling is that a lane that cannot run must not leave a
-/// machine with no toolchain unless the refusal was spelled exactly; the doctor and the
-/// release cutter's pre-claim gate still name a tagged toolchain either way.
 fn admit_packages(mut cfg: PackagesConfig, dev_seams: bool, home: Option<&Path>) -> PackagesConfig {
-    if let Some(raw) = cfg.tracked_install.as_deref()
-        && !raw.trim().is_empty()
-        && tracked_install_of(raw).is_none()
-    {
-        cfg.admission_notes.push(format!(
-            "[packages] tracked_install must be \"record\" or \"refuse\", not {raw:?} — \
-             using \"record\""
-        ));
-        cfg.tracked_install = None;
-    }
     for (key, present) in [
         ("channel", cfg.channel.is_some()),
         ("include", cfg.include.is_some()),
+        ("tracked_install", cfg.tracked_install.is_some()),
     ] {
         if present {
             crate::notice::say_spelling(&retired_key_note(key));
@@ -1008,11 +960,6 @@ mod tests {
         assert!(cfg.exclude().is_empty());
         assert!(cfg.links.is_empty());
         assert!(cfg.config_notes().is_empty(), "nothing to rename");
-        assert_eq!(
-            cfg.tracked_install(),
-            None,
-            "tracked_install absent is unset — the default (record) is lay's to apply"
-        );
         assert_eq!(cfg.enabled, None);
         assert_eq!(cfg.auto_update, None);
     }
@@ -1022,7 +969,6 @@ mod tests {
         let cfg = parse_packages_with(
             "[packages]\nenabled = true\nauto_install = false\n\
              account = \"alabsystems\"\nexclude = [\"trust\"]\n\
-             tracked_install = \"refuse\"\n\
              [packages.links]\nay = \"~/ay\"\norc = \"alabsystems/orc\"\n",
             true,
         );
@@ -1031,10 +977,6 @@ mod tests {
         assert!(!cfg.auto_install());
         assert_eq!(cfg.account(), Some("alabsystems"));
         assert_eq!(cfg.exclude(), ["trust".to_string()]);
-        assert_eq!(
-            cfg.tracked_install(),
-            Some(crate::lay::TrackedPolicy::Refuse)
-        );
         assert_eq!(cfg.links.get("ay").map(String::as_str), Some("~/ay"));
         assert_eq!(
             cfg.links.get("orc").map(String::as_str),
@@ -1303,9 +1245,8 @@ mod tests {
     /// most of `aterm.toml`, and a syntax error anywhere in it fails this parse too.
     #[test]
     fn an_unreadable_packages_table_never_widens_the_download_gates() {
-        // A wrong TYPE inside [packages] — the whole table fails, as
-        // `tracked_install = true` already showed — with auto_install = false written
-        // right above it.
+        // A wrong TYPE inside [packages] — the whole table fails — with auto_install =
+        // false written right above it.
         let typed = parse_packages("[packages]\nauto_install = false\nenabled = \"yes\"\n");
         assert!(typed.unreadable);
         assert!(
@@ -1339,66 +1280,35 @@ mod tests {
         assert!(!PackagesConfig::unreadable_table().auto_install());
     }
 
-    /// `[packages].tracked_install` (2026-09-15): the two spellings resolve; absent and
-    /// blank are unset (the `record` default is `lay::tracked_policy_of`'s); a word the owner did not write is dropped AT LOAD —
-    /// to unset, never to `refuse` — and the rest of the table survives it; a value of
-    /// the wrong TYPE is the whole table's malformed-file posture (loud defaults). Never
-    /// a panic in any of these.
+    /// `[packages].tracked_install` is retired (2026-09-24, its lanes deleted): any value,
+    /// of any type, reads, is never acted on, and doctor names it once; the rest of the
+    /// table survives it.
     #[test]
-    fn tracked_install_admits_two_spellings_and_drops_the_rest_at_load() {
-        use crate::lay::TrackedPolicy;
-        let of = |toml: &str| parse_packages(toml).tracked_install();
-        assert_eq!(of(""), None);
-        assert_eq!(of("[packages]\nexclude = []\n"), None);
-        assert_eq!(
-            of("[packages]\ntracked_install = \"record\"\n"),
-            Some(TrackedPolicy::Allow)
+    fn retired_tracked_install_is_ignored_and_named() {
+        for value in ["\"refuse\"", "\"record\"", "\"refuze\"", "true"] {
+            let cfg = parse_packages(&format!(
+                "[packages]\nexclude = [\"ay\"]\ntracked_install = {value}\n"
+            ));
+            assert!(
+                !cfg.unreadable,
+                "{value}: a retired key never fails the table"
+            );
+            assert_eq!(cfg.exclude(), ["ay".to_string()], "{value}");
+            let notes = cfg.config_notes();
+            assert_eq!(
+                notes
+                    .iter()
+                    .filter(|n| n.contains("tracked_install is retired"))
+                    .count(),
+                1,
+                "{value}: {notes:?}"
+            );
+        }
+        assert!(
+            parse_packages("[packages]\nexclude = []\n")
+                .config_notes()
+                .is_empty()
         );
-        assert_eq!(
-            of("[packages]\ntracked_install = \"refuse\"\n"),
-            Some(TrackedPolicy::Refuse)
-        );
-        assert_eq!(
-            of("[packages]\ntracked_install = \" refuse \"\n"),
-            Some(TrackedPolicy::Refuse),
-            "surrounding whitespace is not a different word"
-        );
-        assert_eq!(
-            of("[packages]\ntracked_install = \"\"\n"),
-            None,
-            "blank is unset, like account"
-        );
-        assert_eq!(
-            of("[packages]\ntracked_install = \"REFUSE\"\n"),
-            None,
-            "case-sensitive, like [machine] universal_control"
-        );
-        let typo = parse_packages("[packages]\nexclude = [\"ay\"]\ntracked_install = \"refuze\"\n");
-        assert_eq!(
-            typo.tracked_install(),
-            None,
-            "an unknown word is dropped at load — to unset, never read as refuse"
-        );
-        assert_eq!(
-            typo.tracked_install, None,
-            "dropped from the table itself, so no later consumer sees or re-reports it"
-        );
-        assert_eq!(
-            typo.exclude(),
-            ["ay".to_string()],
-            "the rest of the table survives the one bad key"
-        );
-        assert_eq!(
-            parse_packages("[packages]\ntracked_install = true\n").tracked_install(),
-            None,
-            "the wrong type is the malformed-file posture: loud defaults, no panic"
-        );
-        // A table built by hand and never parsed resolves the same way, silently.
-        let hand = PackagesConfig {
-            tracked_install: Some("nonsense".into()),
-            ..PackagesConfig::default()
-        };
-        assert_eq!(hand.tracked_install(), None);
     }
 
     #[cfg(unix)]

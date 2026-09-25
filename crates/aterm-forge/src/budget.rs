@@ -746,7 +746,7 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
              unpublished crate has no registry copy to shadow it. These are the complete \
              retained package sources, including tests and \
              examples, not only local edits or reachable code. `cargo forge attest` checks \
-             fork obligations and the separately reviewed direct-bundle inventory.",
+             fork obligations and the astream submodule's gitlink pin.",
             d.vendored_measured.join(", ")
         );
     }

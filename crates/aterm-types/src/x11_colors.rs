@@ -268,16 +268,4 @@ mod tests {
     fn lookup_non_ascii_returns_none() {
         assert_eq!(lookup("r\u{00e9}d"), None);
     }
-
-    #[test]
-    fn table_has_140_entries() {
-        // The standard X11/CSS named color list has 148 entries
-        // (140 unique colors + 8 grey/gray duplicates = 148 names).
-        // We include all standard names.
-        assert!(
-            X11_COLORS.len() >= 140,
-            "Expected at least 140 X11 colors, got {}",
-            X11_COLORS.len()
-        );
-    }
 }

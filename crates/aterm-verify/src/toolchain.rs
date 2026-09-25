@@ -1,20 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Finding THE toolchain — a SEALED, PROMOTED toolchain directory, which is what
-//! `rust-toolchain.toml`'s `trust` pin actually resolves to. A LIVE BUILD TREE IS
-//! NOT A TOOLCHAIN: `x.py build --stage 2` empties the stage bins and refills
-//! them only at the end, so a discovery order that reaches into `$HOME/trust/build`
-//! first is broken for the entire length of every rebuild. Measured 2026-08-30
-//! mid-rebuild on the dev box: `$HOME/trust/build/host/stage2/bin` held `targo` and
-//! `targo-trust` — no `trustc`, and no sibling `lib/` at all. The build tree stays
-//! reachable, explicitly, and LAST.
+//! Finding THE toolchain — the directory `rust-toolchain.toml`'s `trust` pin
+//! actually resolves to. ONE resolution order, and `aterm-release`'s
+//! `gates::trust_stage2_bin` walks the same one (it cannot reach this crate
+//! without a new edge, so it mirrors it and says so):
 //!
-//! Three rules carried over from the script, all load-bearing:
+//! 1. `$TRUST_STAGE2_BIN` — an explicit development override, never fallen back from;
+//! 2. the rustup toolchain the pin names, `~/.rustup/toolchains/<channel>` — atpkg lays
+//!    it as a view of its store, and Trust's `scripts/promote-toolchain.sh` points it at
+//!    a SEALED from-source build, the sanctioned way to drive one (never the live tree);
+//! 3. the atpkg store's `store/trust/current/bin`;
+//! 4. `PATH`.
 //!
-//! 1. RESOLVE THE PHYSICAL PATH. `build/host` is commonly a target-triple
-//!    symlink and Trust's drivers reject a symlinked toolchain path, so the
-//!    stage2 directory is canonicalised before anything selects a tool out of it
+//! A LIVE BUILD TREE IS NOT A CANDIDATE. `$HOME/trust/build/host/stage2/bin` (and the
+//! `~/toolchains/<channel>-current` promote target) were probed here until
+//! 2026-09-24, ahead of the store, a month after both were retired from the
+//! delivery (2026-08-29). On m7 that made `aterm help rust` report a JULY stage2 —
+//! one whose `targo` no longer knows `--unverified` — as "the gates' toolchain"
+//! while PATH ran the store's. A build tree is also empty for the whole length of
+//! every `x.py build --stage 2`.
+//!
+//! The rules, all load-bearing:
+//!
+//! 1. RESOLVE THE PHYSICAL PATH. The rustup entry and the store's `current` are
+//!    symlinks and Trust's drivers reject a symlinked toolchain path, so the
+//!    chosen directory is canonicalised before anything selects a tool out of it
 //!    or puts it on PATH.
 //! 2. PATH FIRST. Whatever cargo wins the caller's PATH otherwise (Homebrew's,
 //!    typically) drives a stable rustc that rejects the workspace's `-Z` flags,
@@ -30,16 +41,10 @@
 //!    lane; the workspace rides `--unverified` until the Trust-Std campaign
 //!    greens, the same statement `.cargo/config.toml`'s off-switch already makes.
 //!
-//! 4. THE STORE IS A CANDIDATE, AND IT COMES BEFORE THE SOURCE TREE. The
-//!    ordinary way to get the pinned toolchain is `aterm pkg install trust`,
-//!    which lays it down under the atpkg prefix as `store/trust/current/bin`
-//!    (the per-program live-build link atpkg flips on every update). That
-//!    directory is probed right after an explicit `$TRUST_STAGE2_BIN` and
-//!    BEFORE `$HOME/trust/build/host/stage2/bin`, the from-source developer
-//!    alternative — the same order `aterm-release`'s gates use. The prefix is
-//!    resolved the way atpkg resolves it ([`atpkg_prefix`]: `[packages].prefix`
-//!    from aterm.toml, else the platform default) as a dependency-free MIRROR,
-//!    because this crate has no dependencies by charter (see its Cargo.toml).
+//! 4. THE STORE PREFIX IS A MIRROR. It is resolved the way atpkg resolves it
+//!    ([`atpkg_prefix`]: `[packages].prefix` from aterm.toml, else the platform
+//!    default) without a dependency edge, because this crate has none by charter
+//!    (see its Cargo.toml).
 //!
 //! 5. THE DIRECTORY MUST BE THE PIN. `rust-toolchain.toml` names `trust`; a
 //!    directory carrying a file called `targo` is not evidence that it is that
@@ -237,40 +242,6 @@ pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
     prefix.join("store/trust/current/bin")
 }
 
-/// The `bin` of the sysroot `rustc` resolves to under `path_env`.
-///
-/// THIS IS HOW A rustup-LINKED PIN IS REACHED. `rust-toolchain.toml` is honoured
-/// only by the rustup shim, so on a machine with no `$HOME/trust` checkout — where
-/// the pinned toolchain is a `rustup toolchain link` into some build tree — the
-/// stage2 default and the PATH scan both come up empty while the pinned drivers
-/// are one `rustc --print sysroot` away. Canonicalised for the same reason
-/// everything else here is: the link makes every path through rustup
-/// non-canonical, and Trust's drivers refuse a symlinked toolchain path.
-///
-/// PATH is set explicitly rather than inherited so the probe answers about the
-/// same environment the children will run in — and so a caller with an empty
-/// `path_env` gets `None` instead of this process's own PATH.
-fn sysroot_bin(path_env: &OsStr) -> Option<PathBuf> {
-    let out = std::process::Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
-        .env("PATH", path_env)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sysroot = String::from_utf8(out.stdout).ok()?;
-    let sysroot = PathBuf::from(sysroot.trim());
-    if sysroot.as_os_str().is_empty() {
-        return None;
-    }
-    let dir = std::fs::canonicalize(&sysroot)
-        .unwrap_or(sysroot)
-        .join("bin");
-    dir.is_dir().then_some(dir)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toolchain {
     /// The resolved (physical) stage2 `bin` directory.
@@ -284,51 +255,18 @@ pub struct Toolchain {
     /// "there was one and it was the wrong one" — the diagnosis and the remedy
     /// for that are nothing like the ones for "there was none".
     pub refused: Option<PathBuf>,
-    /// The atpkg store candidate that was probed (`store/trust/current/bin` under
-    /// the resolved prefix), whether or not it held anything — so the diagnostic
-    /// can name the place `aterm pkg install trust` would have filled.
+    /// The atpkg store candidate (`store/trust/current/bin` under the resolved
+    /// prefix), whether or not it held anything, so the diagnostic can name the place
+    /// `aterm pkg install trust` would have filled. `None` for an explicit override.
     pub store_bin: Option<PathBuf>,
 }
 
 impl Toolchain {
-    /// `$TRUST_STAGE2_BIN`, else the first PROMOTED toolchain under `home` that
-    /// satisfies the pin, else the atpkg store's `store/trust/current/bin`, else
-    /// `$HOME/trust/build/host/stage2/bin`, canonicalised when it exists.
-    ///
-    /// SEALED FIRST, BUILD TREE LAST. The default used to be
-    /// `$HOME/trust/build/host/stage2/bin` outright — a live build tree, checked
-    /// before anything finished. See the module header for why that is broken for
-    /// the whole length of every rebuild. The order is now
-    /// `~/toolchains/<channel>-current/bin` (the sealed promote target, moved
-    /// atomically by `trust/scripts/promote-toolchain.sh` and nothing else), then
-    /// `~/.rustup/toolchains/<channel>/bin` (the rustup link — the seam atpkg
-    /// lays and re-asserts into its store, and an independent spelling that
-    /// survives a layout change on either side), then the atpkg store itself,
-    /// then the stage2 tree. A candidate must carry a `targo` AND be the pin to
-    /// win; when none does, the stage2 path stays as the reported location so
-    /// the "no targo" diagnosis keeps naming a place the reader recognises.
-    ///
-    /// THE STORE COMES AHEAD OF THE BUILD TREE among the defaults (only the
-    /// promoted spellings above outrank it): `aterm pkg install trust` is the
-    /// ordinary way to have the pinned toolchain at all, and the store's
-    /// live-build link is the one path that keeps pointing at it across
-    /// updates. The prefix is [`atpkg_prefix`] — `$XDG_CONFIG_HOME` is the one
-    /// environment read here, for the config file atpkg itself reads; callers
-    /// that hold a snapshot use [`Self::discover_with_store`].
-    ///
-    /// GOLDEN-PATH FALLBACK: when neither default tree carries a targo and no
-    /// explicit `$TRUST_STAGE2_BIN` named one, the drivers are looked up on
-    /// `path_env` — a machine whose store lives at a prefix this mirror cannot
-    /// see still reaches its toolchain through PATH (shell.d, or the
-    /// `tools/verify.sh` wrapper, which prepends the store's shim dir itself).
-    /// Positional stage2-only discovery left every stage on such a machine
-    /// skipping with "no targo" — the same skew class the aterm-grid compile
-    /// probe had. An EXPLICIT override never falls back: naming a toolchain
-    /// that is not there is an error to surface, not a preference to route
-    /// around. `pinned` is the channel `rust-toolchain.toml` names
-    /// ([`pinned_channel`]); `None` disables the check and restores the
-    /// pre-guard behaviour, which is what the pure unit tests below want and
-    /// what a repo with no pin means.
+    /// [`Self::discover_with_store`] under the atpkg prefix atpkg itself would resolve
+    /// ([`atpkg_prefix`]; `$XDG_CONFIG_HOME` is the one environment read here, for the
+    /// config file atpkg reads). `pinned` is the channel `rust-toolchain.toml` names
+    /// ([`pinned_channel`]); `None` disables the pin check, which is what the pure unit
+    /// tests below want and what a repo with no pin means.
     #[must_use]
     pub fn discover(
         stage2_bin: Option<&Path>,
@@ -341,22 +279,19 @@ impl Toolchain {
         Self::discover_with_store(stage2_bin, home, Some(&prefix), path_env, pinned)
     }
 
-    /// [`Self::discover`] with the atpkg prefix supplied by the caller (`None`
-    /// skips the store probe entirely). The resolution order, first hit wins:
+    /// THE resolution order (the module header), first hit wins:
     ///
-    /// 1. `stage2_bin` — an explicit override; checked, never fallen back from.
-    /// 2. `<home>/toolchains/<channel>-current/bin` — the sealed promote target.
-    /// 3. `<home>/.rustup/toolchains/<channel>/bin` — the rustup link (the seam
-    ///    atpkg lays into its store).
-    /// 4. `<store_prefix>/store/trust/current/bin` — the atpkg store.
-    /// 5. `<home>/trust/build/host/stage2/bin` — a from-source stage2.
-    /// 6. every `path_env` directory, then the sysroot `rustc --print sysroot`
-    ///    names (how a rustup-LINKED pin is reached).
+    /// 1. `stage2_bin` — `$TRUST_STAGE2_BIN`; checked, never fallen back from: naming a
+    ///    toolchain that is not there is an error to surface, not a preference.
+    /// 2. `<home>/.rustup/toolchains/<channel>/bin` — the rustup toolchain the pin names.
+    /// 3. `<store_prefix>/store/trust/current/bin` — the atpkg store (`None` skips it).
+    /// 4. every `path_env` directory.
     ///
-    /// Every candidate must BE the pin (`is_pinned_toolchain`, private to this
-    /// module); the first one
-    /// that carries a targo and is not gets remembered in `refused` for the
-    /// diagnostic, and the search goes on past it.
+    /// A candidate must carry a `targo` AND be the pin (`is_pinned_toolchain`); the
+    /// first one that carries a targo and is not is remembered in `refused` for the
+    /// diagnostic, and the search goes on past it. When nothing qualifies, the store
+    /// (else the rustup entry) is the reported location, because that is where the
+    /// remedy puts one.
     #[must_use]
     pub fn discover_with_store(
         stage2_bin: Option<&Path>,
@@ -365,88 +300,43 @@ impl Toolchain {
         path_env: &OsStr,
         pinned: Option<&str>,
     ) -> Self {
-        let explicit = stage2_bin.is_some();
-        let stage2_tree = home.join("trust/build/host/stage2/bin");
-        let store_bin = (!explicit)
-            .then(|| store_prefix.map(store_stage2_bin))
-            .flatten();
-        // The promoted spellings, ahead of everything but an explicit override:
-        // the sealed promote target, then the rustup link (the seam atpkg lays
-        // into its store). A hit here is final — the store probe below stands
-        // down for it.
-        let channel_hit = (!explicit)
-            .then(|| {
-                let channel = pinned.unwrap_or("trust");
-                [
-                    home.join(format!("toolchains/{channel}-current/bin")),
-                    home.join(format!(".rustup/toolchains/{channel}/bin")),
-                ]
-                .into_iter()
-                .find(|d| is_executable_file(&d.join("targo")) && is_pinned_toolchain(d, pinned))
-            })
-            .flatten();
-        let settled_by_channel = channel_hit.is_some();
-        let declared = stage2_bin
-            .map(Path::to_path_buf)
-            .or(channel_hit)
-            .unwrap_or_else(|| stage2_tree.clone());
-        let mut tool_dir = if declared.is_dir() {
-            std::fs::canonicalize(&declared).unwrap_or(declared)
-        } else {
-            declared
-        };
-        // The declared directory is checked too, not just the fallbacks:
-        // `$TRUST_STAGE2_BIN` is an ordinary environment variable and can name a
-        // tree that is not the pin as easily as PATH can. A refused directory
-        // stays in `stage2_dir` (it is what the operator asked for, and the
-        // diagnostic has to name it) but `refused` makes `have_targo` answer no,
-        // so every stage takes the same fail-closed branch as an absent one.
-        let mut refused = (is_executable_file(&tool_dir.join("targo"))
-            && !is_pinned_toolchain(&tool_dir, pinned))
-        .then(|| tool_dir.clone());
-        // The store, AHEAD of the source-tree default: a pinned targo there wins
-        // outright; a targo there that is not the pin is refused and remembered,
-        // exactly like a PATH impostor.
-        let mut settled = settled_by_channel;
-        if let Some(store) = &store_bin
-            && !settled
-            && is_executable_file(&store.join("targo"))
-        {
-            let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.clone());
-            if is_pinned_toolchain(&store, pinned) {
-                tool_dir = store;
-                refused = None;
-                settled = true;
-            } else {
-                refused.get_or_insert(store);
+        let physical = |dir: PathBuf| std::fs::canonicalize(&dir).unwrap_or(dir);
+        let mut refused = None;
+        let (tool_dir, store_bin) = if let Some(explicit) = stage2_bin {
+            // `$TRUST_STAGE2_BIN` is an ordinary environment variable and can name a tree
+            // that is not the pin as easily as PATH can: a refused directory stays the
+            // reported one (it is what the operator asked for) and `refused` makes
+            // `have_targo` answer no, the same fail-closed branch as an absent one.
+            let dir = physical(explicit.to_path_buf());
+            if is_executable_file(&dir.join("targo")) && !is_pinned_toolchain(&dir, pinned) {
+                refused = Some(dir.clone());
             }
-        }
-        if !explicit
-            && !settled
-            && (refused.is_some() || !is_executable_file(&tool_dir.join("targo")))
-        {
-            // PATH next (the golden path for a store this mirror cannot see: a
-            // store-provisioned machine reaches its toolchain that way), then
-            // the rustup-linked sysroot. Every candidate must BE the pin; the
-            // first one that carries a targo and is not gets remembered for the
-            // diagnostic.
-            // `once_with` keeps the sysroot probe LAZY: it spawns a process, and a
-            // PATH hit must not pay for a candidate it never needed.
-            let from_path = std::env::split_paths(path_env);
-            let sysroot = std::iter::once_with(|| sysroot_bin(path_env)).flatten();
-            for dir in from_path.chain(sysroot) {
+            (dir, None)
+        } else {
+            let rustup = home
+                .join(".rustup/toolchains")
+                .join(pinned.unwrap_or("trust"))
+                .join("bin");
+            let store_bin = store_prefix.map(store_stage2_bin);
+            let candidates = std::iter::once(rustup.clone())
+                .chain(store_bin.clone())
+                .chain(std::env::split_paths(path_env));
+            let mut chosen = None;
+            for dir in candidates {
                 if !is_executable_file(&dir.join("targo")) {
                     continue;
                 }
-                let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+                let dir = physical(dir);
                 if is_pinned_toolchain(&dir, pinned) {
-                    tool_dir = dir;
+                    chosen = Some(dir);
                     refused = None;
                     break;
                 }
                 refused.get_or_insert(dir);
             }
-        }
+            let reported = chosen.unwrap_or_else(|| store_bin.clone().unwrap_or(rustup));
+            (reported, store_bin)
+        };
         let tippy = ["targo-tippy", "targo-clippy"]
             .into_iter()
             .map(|n| tool_dir.join(n))
@@ -556,37 +446,43 @@ impl Toolchain {
     }
 
     /// The remedy every "no toolchain" diagnostic leads with. The signed
-    /// package index is the ordinary source of the pinned toolchain; building
-    /// one from source is the developer alternative, named second.
+    /// package index is the ordinary source of the pinned toolchain; a from-source
+    /// build is the developer alternative, SEALED first — `promote-toolchain.sh` points
+    /// the rustup `trust` toolchain at the seal, never at the live build tree, which
+    /// `x.py` empties for the length of every rebuild (discovery probes no build tree).
     pub const INSTALL_REMEDY: &'static str = "`aterm pkg install trust` (then `aterm pkg doctor` \
-         to confirm the store); from source instead: python3 x.py build --stage 2 in $HOME/trust";
+         to confirm the store); from source instead: python3 x.py build --stage 2 in $HOME/trust, \
+         then seal it with $HOME/trust/scripts/promote-toolchain.sh";
 
-    /// The diagnostic for a stage2 that is absent — or mid-rebuild, which empties
-    /// the directory and refills it at the end.
+    /// The diagnostic for no usable toolchain: none found, or one found and refused.
     #[must_use]
     pub fn missing_targo_label(&self) -> String {
         if let Some(dir) = &self.refused {
             return format!(
-                "targo at {} is NOT the toolchain rust-toolchain.toml pins (no branded rustc \
-                 beside it), so running the gate there would use a different frontend and a \
-                 different lint set under the pinned one's name. Refusing. Fix: {} — the gate \
-                 finds the store on its own; or link the pinned toolchain and put the rustup \
-                 shim first on PATH — `rustup toolchain link trust <stage-sysroot>` then \
-                 `export PATH=\"$HOME/.cargo/bin:$PATH\"` — or point TRUST_STAGE2_BIN at the \
-                 real stage2 bin",
+                "targo at {} is NOT the toolchain rust-toolchain.toml pins (no `trustc` beside \
+                 it that answers with a real sysroot — a mid-rebuild stage tree fails this way), \
+                 so running the gate there would use a different frontend and a different lint \
+                 set under the pinned one's name. Refusing. Fix: {} — or point TRUST_STAGE2_BIN \
+                 at a finished stage2 bin",
                 dir.display(),
                 Self::INSTALL_REMEDY,
             );
         }
-        let store = self.store_bin.as_ref().map_or_else(String::new, |s| {
-            format!(" nor in the atpkg store at {}", s.display())
-        });
-        format!(
-            "targo not found at {}{store}. Fix: {}; or set TRUST_STAGE2_BIN (a rustup-linked pin \
-             is found through `rustc --print sysroot` when ~/.cargo/bin is on PATH)",
-            self.targo.display(),
-            Self::INSTALL_REMEDY,
-        )
+        match &self.store_bin {
+            Some(store) => format!(
+                "targo not found — looked in the rustup `trust` toolchain, the atpkg store at \
+                 {}, and PATH. Fix: {}; or point TRUST_STAGE2_BIN at a stage2 bin",
+                store.display(),
+                Self::INSTALL_REMEDY,
+            ),
+            // An explicit override (discovery always probes a store).
+            None => format!(
+                "targo not found at {} — TRUST_STAGE2_BIN names no toolchain, and an explicit \
+                 override is never fallen back from: unset it to let discovery run. Fix: {}",
+                self.targo.display(),
+                Self::INSTALL_REMEDY,
+            ),
+        }
     }
 
     /// The diagnostic for a doc-running stage that cannot start: no `trustdoc`
@@ -665,27 +561,30 @@ mod tests {
     }
 
     #[test]
-    fn the_reported_location_when_nothing_resolves_is_the_stage2_tree_under_home() {
-        // Not a statement about PREFERENCE — the sealed toolchain is preferred,
-        // see `the_sealed_toolchain_is_preferred_over_the_live_build_tree`. This
-        // pins what the gate REPORTS when no candidate exists at all: the stage2
-        // path, because that is the place the "no targo" remedy talks about.
-        let t = Toolchain::discover(None, Path::new("/nonexistent-home"), OsStr::new(""), None);
-        assert_eq!(
-            t.targo,
-            Path::new("/nonexistent-home/trust/build/host/stage2/bin/targo")
-        );
-        assert_eq!(
-            t.trustdoc,
-            Path::new("/nonexistent-home/trust/build/host/stage2/bin/trustdoc")
-        );
+    fn the_reported_location_when_nothing_resolves_is_the_store() {
+        // Not a statement about PREFERENCE (see `one_resolution_order_and_no_build_tree`).
+        // This pins what the gate REPORTS when no candidate exists at all: the store,
+        // the place `aterm pkg install trust` fills — and, with no store probed, the
+        // rustup entry.
+        let home = Path::new("/nonexistent-home");
+        let prefix = default_atpkg_prefix(home);
+        let t = Toolchain::discover_with_store(None, home, Some(&prefix), OsStr::new(""), None);
+        assert_eq!(t.targo, store_stage2_bin(&prefix).join("targo"));
+        assert_eq!(t.trustdoc, store_stage2_bin(&prefix).join("trustdoc"));
         assert!(!t.have_targo());
         assert!(t.tippy.is_none());
+        let t = Toolchain::discover_with_store(None, home, None, OsStr::new(""), None);
+        assert_eq!(
+            t.targo,
+            Path::new("/nonexistent-home/.rustup/toolchains/trust/bin/targo")
+        );
     }
 
     #[test]
     fn the_missing_trustdoc_diagnosis_names_the_config_key_and_both_remedies() {
-        let t = Toolchain::discover(None, Path::new("/nonexistent-home"), OsStr::new(""), None);
+        let home = Path::new("/nonexistent-home");
+        let prefix = default_atpkg_prefix(home);
+        let t = Toolchain::discover_with_store(None, home, Some(&prefix), OsStr::new(""), None);
         let label = t.missing_trustdoc_label();
         assert!(label.contains("x.py build --stage 2"), "{label}");
         assert!(label.contains("~/.local/bin/trustdoc"), "{label}");
@@ -696,7 +595,9 @@ mod tests {
     fn every_remedy_leads_with_the_package_manager_and_names_source_second() {
         // The signed index is the ordinary way to have the toolchain; x.py is the
         // developer alternative. Every diagnostic says them in that order.
-        let t = Toolchain::discover(None, Path::new("/nonexistent-home"), OsStr::new(""), None);
+        let home = Path::new("/nonexistent-home");
+        let prefix = default_atpkg_prefix(home);
+        let t = Toolchain::discover_with_store(None, home, Some(&prefix), OsStr::new(""), None);
         for label in [
             t.missing_targo_label(),
             t.missing_trustdoc_label(),
@@ -716,71 +617,66 @@ mod tests {
         assert!(label.contains("store/trust/current/bin"), "{label}");
     }
 
-    /// Unix-pinned on the `current` SYMLINK, which is the shape `aterm pkg
-    /// install trust` really lays down on the platforms that carry a store.
+    /// A pinned toolchain bin under `root` — `targo` plus a `trustc` that answers with a
+    /// real sysroot — returned as its physical path.
+    fn pinned_bin(root: &Path) -> PathBuf {
+        fs::create_dir_all(root).expect("mkdir");
+        exec_stub(&root.join("targo"));
+        driver_stub(&root.join("trustc"));
+        fs::canonicalize(root).expect("canonicalize")
+    }
+
+    /// THE ORDER, and what is no longer in it. Unix-pinned on the SYMLINKS — the rustup
+    /// entry and the store's `current` — which are the shapes really laid down.
     #[cfg(unix)]
     #[test]
-    fn the_atpkg_store_is_probed_ahead_of_the_from_source_default() {
-        // `aterm pkg install trust` lays the toolchain down at
-        // <prefix>/store/trust/current/bin, with `current` a symlink at the
-        // numbered build — exactly the shape built here, under a fake HOME.
-        let home = crate::mktemp_dir("atv-store").expect("mktemp");
+    fn one_resolution_order_and_no_build_tree() {
+        let home = crate::mktemp_dir("atv-order").expect("mktemp");
         let prefix = default_atpkg_prefix(&home);
-        let build = prefix.join("store/trust/6808/bin");
-        fs::create_dir_all(&build).expect("mkdir");
-        exec_stub(&build.join("targo"));
-        driver_stub(&build.join("trustc"));
+        // Every candidate present and pinned, plus both retired spellings.
+        let store = pinned_bin(&prefix.join("store/trust/6808/bin"));
         std::os::unix::fs::symlink(
             prefix.join("store/trust/6808"),
             prefix.join("store/trust/current"),
         )
         .expect("ln current");
-        // A from-source stage2 beside it, ALSO pinned — the store must still win.
-        let source = home.join("trust/build/host/stage2/bin");
-        fs::create_dir_all(&source).expect("mkdir");
-        exec_stub(&source.join("targo"));
-        driver_stub(&source.join("trustc"));
+        let linked = pinned_bin(&home.join("sealed/bin"));
+        fs::create_dir_all(home.join(".rustup/toolchains")).expect("mkdir");
+        std::os::unix::fs::symlink(home.join("sealed"), home.join(".rustup/toolchains/trust"))
+            .expect("ln rustup");
+        let on_path = pinned_bin(&home.join("elsewhere/bin"));
+        let tree = pinned_bin(&home.join("trust/build/host/stage2/bin"));
+        let promoted = pinned_bin(&home.join("toolchains/trust-current/bin"));
+        let path = std::env::join_paths([&tree, &promoted, &on_path]).expect("join");
+        let found = |explicit: Option<&Path>, path: &OsStr| {
+            Toolchain::discover_with_store(explicit, &home, Some(&prefix), path, Some("trust"))
+        };
 
-        let t = Toolchain::discover_with_store(
-            None,
-            &home,
-            Some(&prefix),
-            OsStr::new(""),
-            Some("trust"),
+        // 1. An explicit override wins, and never consults the store.
+        let t = found(Some(&on_path), &path);
+        assert_eq!(
+            (t.stage2_dir.as_path(), t.store_bin.is_none()),
+            (on_path.as_path(), true)
         );
+        // 2. The rustup toolchain the pin names, resolved to its physical directory.
+        let t = found(None, &path);
         assert!(t.have_targo());
-        assert_eq!(
-            t.stage2_dir,
-            fs::canonicalize(&build).expect("canonicalize"),
-            "the store's live build, resolved to its physical numbered dir"
+        assert_eq!(t.stage2_dir, linked);
+        assert_eq!(t.store_bin, Some(store_stage2_bin(&prefix)));
+        // 3. The store.
+        fs::remove_file(home.join(".rustup/toolchains/trust")).expect("rm rustup");
+        assert_eq!(found(None, &path).stage2_dir, store);
+        // 4. PATH — the build tree and the promote target are reached ONLY as PATH
+        //    entries, never probed under home.
+        fs::remove_file(prefix.join("store/trust/current")).expect("rm current");
+        assert_eq!(found(None, &path).stage2_dir, tree);
+        let t = found(None, OsStr::new(""));
+        assert!(
+            !t.have_targo(),
+            "a build tree under home is not a candidate: {}",
+            t.stage2_dir.display()
         );
-        assert_eq!(
-            t.store_bin.as_deref(),
-            Some(store_stage2_bin(&prefix).as_path())
-        );
-
-        // Without the store the from-source default is what it always was.
-        let t = Toolchain::discover_with_store(None, &home, None, OsStr::new(""), Some("trust"));
-        assert!(t.have_targo());
-        assert_eq!(
-            t.stage2_dir,
-            fs::canonicalize(&source).expect("canonicalize")
-        );
-        assert!(t.store_bin.is_none());
-
-        // An EXPLICIT override never consults the store.
-        let t = Toolchain::discover_with_store(
-            Some(&source),
-            &home,
-            Some(&prefix),
-            OsStr::new(""),
-            Some("trust"),
-        );
-        assert_eq!(
-            t.stage2_dir,
-            fs::canonicalize(&source).expect("canonicalize")
-        );
-        assert!(t.store_bin.is_none());
+        assert_eq!(t.stage2_dir, store_stage2_bin(&prefix));
         fs::remove_dir_all(&home).ok();
     }
 
@@ -987,8 +883,8 @@ mod tests {
         assert!(t.refused.is_some());
         let label = t.missing_targo_label();
         assert!(label.contains("rust-toolchain.toml pins"), "{label}");
-        assert!(label.contains("rustup toolchain link"), "{label}");
-        assert!(label.contains("$HOME/.cargo/bin:$PATH"), "{label}");
+        assert!(label.contains("promote-toolchain.sh"), "{label}");
+        assert!(label.contains("TRUST_STAGE2_BIN"), "{label}");
 
         // A `trustc` that is PRESENT but cannot answer for itself is the
         // mid-rebuild stage tree, and it must still be refused: `x.py build
@@ -1029,43 +925,6 @@ mod tests {
         );
         assert!(t.have_targo(), "upstream channels are a passthrough");
         fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn the_sealed_toolchain_is_preferred_over_the_live_build_tree() {
-        // THE ITEM 2 REGRESSION NET. Both directories are the pin; the sealed one
-        // must win, because the build tree is empty for the whole length of every
-        // `x.py build --stage 2` and a gate that prefers it is dead while a
-        // rebuild runs.
-        let home = crate::mktemp_dir("atv-order").expect("mktemp");
-        let sealed = home.join("toolchains/trust-current/bin");
-        let tree = home.join("trust/build/host/stage2/bin");
-        for d in [&sealed, &tree] {
-            fs::create_dir_all(d).expect("mkdir");
-            exec_stub(&d.join("targo"));
-            driver_stub(&d.join("trustc"));
-        }
-
-        let t = Toolchain::discover(None, &home, OsStr::new(""), Some("trust"));
-        assert!(t.have_targo());
-        assert_eq!(
-            t.stage2_dir,
-            fs::canonicalize(&sealed).expect("canonicalize")
-        );
-
-        // With the sealed one gone, the build tree is still reachable — the
-        // fallback is explicit, not deleted.
-        fs::remove_dir_all(home.join("toolchains")).expect("rm");
-        let t = Toolchain::discover(None, &home, OsStr::new(""), Some("trust"));
-        assert!(t.have_targo());
-        assert_eq!(t.stage2_dir, fs::canonicalize(&tree).expect("canonicalize"));
-
-        // And a build tree that is MID-REBUILD (targo relinked, no answering
-        // driver) fails closed rather than becoming the gate's compiler.
-        fs::remove_file(tree.join("trustc")).expect("rm");
-        let t = Toolchain::discover(None, &home, OsStr::new(""), Some("trust"));
-        assert!(!t.have_targo(), "fail-closed on a half-built stage2");
-        fs::remove_dir_all(&home).ok();
     }
 
     #[test]

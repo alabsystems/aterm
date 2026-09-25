@@ -16,9 +16,9 @@
 //! * a MALFORMED `[packages]` table — the launch read `aterm.toml` once per consumer and
 //!   printed a five-line "ignoring malformed aterm.toml" block per read, 25 lines before the
 //!   prompt (review, 2026-09-22);
-//! * the reroute ENGAGED over a store whose `reroute/` cannot be made, with a
-//!   `tracked_install` word atpkg does not know and a configured prefix this user cannot
-//!   write — every one of which printed on stderr, the lay failure from a thread beside the
+//! * the reroute ENGAGED over a store whose `reroute/` cannot be made, with a retired
+//!   `tracked_install` key and a configured prefix this user cannot write — every one of
+//!   which printed on stderr, the lay failure from a thread beside the
 //!   live shell.
 //!
 //! Nothing here reaches the machine: every root is private ([`launch_isolation`]), no
@@ -241,8 +241,8 @@ fn a_malformed_packages_table_is_not_reported_into_the_new_shell() {
 
 /// The reroute ENGAGED over a `reroute/` that cannot be made (a regular file stands
 /// there), so both the directory and the background lay fail — the lay on a thread beside
-/// the live shell — plus a `tracked_install` word atpkg does not know and, where the test
-/// is not root, a configured prefix this user cannot write. Each is a log record now.
+/// the live shell — plus a retired `tracked_install` key and, where the test is not root, a
+/// configured prefix this user cannot write. Each is a log record now.
 #[test]
 fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing() {
     // `/usr/…`: a root-owned chain the vet admits and this user cannot write, so the

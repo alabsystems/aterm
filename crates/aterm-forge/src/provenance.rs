@@ -22,13 +22,14 @@
 //!     the directory listing to agreeing in both directions.
 //!
 //! v0.81.0 added a third: **a first-party path dependency, vendored in-tree.**
-//! `vendor/astream` is a copy of `github.com/alabsystems/astream`, whose
-//! owner is the owner of `github.com/alabsystems/aterm` — the same account,
-//! not a similar name — and `crates/aterm-link` path-depends on three of its
-//! crates directly. It is in `vendor/` for a build reason, not a provenance
-//! one: `crates/aterm-link` used to path-depend on a SIBLING CHECKOUT most
-//! clones do not have, so `cargo build` never built the fabric bridge and no
-//! release ever carried it.
+//! `vendor/astream` holds `github.com/alabsystems/astream`, whose owner is
+//! the owner of `github.com/alabsystems/aterm` — the same account, not a
+//! similar name — and `crates/aterm-link` path-depends on its crates directly.
+//! It began as a hand-synced copy and has been a GIT SUBMODULE since
+//! 2026-09-24 (`vendor/README-astream.md`). It is in `vendor/` for a build
+//! reason, not a provenance one: `crates/aterm-link` used to path-depend on a
+//! SIBLING CHECKOUT most clones do not have, so `cargo build` never built the
+//! fabric bridge and no release ever carried it.
 //!
 //! The prefix rule called that third-party, and everything downstream believed
 //! it: 11,122 lines of aterm's own code entered `third_party_loc`, three
@@ -49,19 +50,19 @@
 //! THE ROSTER IS NOT THE ONLY PLACE THE CLAIM COULD LIVE, and the two
 //! alternatives were rejected for the same reason:
 //!
-//!   * `vendor/astream/README.md`'s `Upstream:` line states the fact in prose,
-//!     but it lives INSIDE the synced tree. The README's own re-sync recipe is
-//!     `rsync -a --exclude target ../astream/crates/$c/ vendor/astream/crates/$c/`,
-//!     and a rule that reads a file the next sync can overwrite is a rule the
-//!     next sync can silently rewrite. A fork's README could also simply claim
-//!     it, which is the wrong direction for a fail-closed check to be wrong in.
+//!   * A file inside `vendor/astream` could state the fact in prose, but it
+//!     would live INSIDE the tree the claim is about — once a hand-synced copy
+//!     that the next sync could overwrite, now another repository's checkout
+//!     that the next submodule bump replaces wholesale. A rule that reads a
+//!     file the next update can rewrite is a rule the next update can silently
+//!     rewrite, and a fork's README could simply claim it, which is the wrong
+//!     direction for a fail-closed check to be wrong in.
 //!   * A manifest key (`[package.metadata.aterm] provenance = …`) is in the
-//!     same blast radius, four times over: `vendor/astream/README.md` already
-//!     lists THREE manifest edits this tree carries that must be re-applied by
-//!     hand after every sync, and this would be a fourth, per crate.
+//!     same blast radius, four times over: the astream manifests are astream's
+//!     own, and a key in them is a key astream's repository decides.
 //!
-//! The roster is in aterm's OWN source, outside the synced tree, is one row
-//! rather than four, and puts the provenance claim where a human reviews it —
+//! The roster is in aterm's OWN source, outside that tree, is one row rather
+//! than four, and puts the provenance claim where a human reviews it —
 //! which is exactly the discipline `aterm_census::scan_set::
 //! REVIEWED_VENDORED_CRATES` already establishes for the third-party
 //! direction. This is that constant's mirror image, and the two must never
@@ -85,7 +86,9 @@ use std::path::{Component, Path, PathBuf};
 pub struct FirstPartyVendored {
     /// Repo-relative directory, always `vendor/<dir>`, no trailing slash.
     pub dir: &'static str,
-    /// The upstream this tree is a copy of, so the claim can be checked.
+    /// The upstream repository this tree comes from, so the claim can be
+    /// checked. Names the repository, never a commit: where there is a pin,
+    /// it is read from the tree (`[OB-1]` prints a submodule's gitlink).
     pub upstream: &'static str,
     /// Why it is aterm's own code rather than a redistribution, and why it is
     /// under `vendor/` at all. Printed by `[OB-1]` on every run.
@@ -95,16 +98,17 @@ pub struct FirstPartyVendored {
 /// THE ROSTER. Reviewed by a human, one row per directory.
 pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
     dir: "vendor/astream",
-    upstream: "github.com/alabsystems/astream (branch main, commit bb98d61)",
+    upstream: "github.com/alabsystems/astream, a git submodule pinned by this tree's gitlink",
     why: "Same owner as github.com/alabsystems/aterm — the same account, not a similar \
           name — so this is aterm's own code, not a redistribution. It is under vendor/ for a \
           BUILD reason: crates/aterm-link path-depended on a sibling checkout most clones do \
           not have, so cargo build never built the fabric bridge and no release ever shipped \
-          it. Four crates are here (wire, cap, broker, aead); the sealed transport's aead is \
-          vendored but off by default. Not on crates.io, so no [patch.crates-io] entry could \
-          ever name it: a patch entry replaces a registry package and there is none to \
-          replace. The third-party packages it DRAGS IN (the sha2 chain under astream-cap) \
-          are unaffected by this row and stay on the ratchet.",
+          it. It is a git submodule (vendor/README-astream.md), and aterm resolves four of its \
+          crates (wire, cap, broker, aead) by path, outside this workspace; aead only under \
+          aterm-link's off-by-default sealed feature. Not on crates.io, so no \
+          [patch.crates-io] entry could ever name it: a patch entry replaces a registry \
+          package and there is none to replace. The third-party packages it DRAGS IN (the \
+          sha2 chain under astream-cap) are unaffected by this row and stay on the ratchet.",
 }];
 
 /// The roster row whose directory contains `rel`, if any. `rel` is

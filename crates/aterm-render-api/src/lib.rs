@@ -189,6 +189,11 @@ pub trait Rasterizer {
     fn set_cursor_style_override(&mut self, style: Option<CursorStyle>);
 }
 
+// The trait stays dyn-compatible: a frontend holds `Box<dyn Rasterizer>` and
+// picks the renderer by injection (the DI the design wants). Checked at compile
+// time; each renderer's `impl Rasterizer` is checked by its own crate's build.
+const _: Option<&dyn Rasterizer> = None;
+
 #[cfg(test)]
 mod tests {
     use super::Frame;

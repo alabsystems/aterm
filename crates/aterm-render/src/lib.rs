@@ -1397,6 +1397,13 @@ pub struct ChromeBleed {
     /// top pad), because that strip has no row of its own and would otherwise be a
     /// dark lip above the band.
     pub rows: usize,
+    /// Chrome rows `[0, first)` the bleed leaves on the frame's padding: a strip
+    /// with no surface of its own (macOS's in-grid strip, `tab_strip_rows = 1`)
+    /// above band rows that have one. Row 0 owns the `[0, grid_top)` lip only
+    /// when `first == 0`. `0` for every other host. Before 2026-09-24 the host
+    /// could not express this and dropped the WHOLE bleed there, so the band —
+    /// and its full-width meter — stopped `pad` px short of both window edges.
+    pub first: usize,
     /// The chrome surface tone, `0x00RRGGBB`. Painted OPAQUE, exactly like the chrome
     /// cells themselves: their background is not the frame default, so the
     /// background-opacity transmittance never applied to them, and a translucent
@@ -2276,6 +2283,18 @@ pub struct WindowCpu {
     /// [`apron`]). Rastered only on a sub-row frame that owes a strip; empty
     /// otherwise.
     pub(crate) apron: ApronScratch,
+    /// Whether the most recent [`render_input_cached`](Renderer::render_input_cached)
+    /// handed back the TRANSLATED [`present_scratch`](Self::present_scratch) (a
+    /// sub-row frame: band shift plus incoming-row strip) rather than the
+    /// pristine cache. A presenter reads the frame through
+    /// [`Self::presented_pixels`], never [`Self::frame_pixels`], and must copy
+    /// the whole frame on such a frame and on the one after it.
+    pub(crate) last_translated: bool,
+    /// PRESENTER scratch (the renderer never reads it): whether the surface's
+    /// last accepted present was a translated frame — its rows are then shifted
+    /// against the cache, so the next present must be a full copy even when the
+    /// cache gate-hits.
+    pub(crate) presented_translated: bool,
     /// How the most recent [`render_input_cached`](Renderer::render_input_cached)
     /// frame changed the cached pixels (see [`DamageOutcome`]). `Full` until the
     /// first frame and after every invalidation, so a presenter that consults it
@@ -2293,8 +2312,8 @@ pub struct WindowCpu {
     /// pixels into those bands, and a damage-bounded copy never touches them,
     /// so a presenter must take the full copy when the extent moves (a band
     /// row retiring leaves its edge pixels beside what is terminal content
-    /// now). `0` until the first present — no bands continued.
-    pub(crate) presented_edge_rows: usize,
+    /// now). `0..0` until the first present — no bands continued.
+    pub(crate) presented_edge_rows: std::ops::Range<usize>,
     /// PRESENTER scratch (the renderer never reads it): whether a background
     /// fallback-face parse was pending at this window's previous redraw — the
     /// frontend's edge detector for the in-flight → landed transition, which
@@ -2343,6 +2362,10 @@ impl WindowCpu {
     pub fn invalidate(&mut self) {
         self.cache = None;
         self.last_damage = DamageOutcome::Full;
+        // The incoming-row raster reads renderer state its key cannot see
+        // (blending, contrast, font knobs): the appearance change that drops
+        // this cache drops that raster too.
+        self.apron.invalidate();
     }
 
     /// How the most recent [`render_input_cached`](Renderer::render_input_cached)
@@ -2353,13 +2376,45 @@ impl WindowCpu {
     }
 
     /// The cached frame's pixels as a SHARED borrow (empty before the first
-    /// frame). Lets a presenter end the exclusive
-    /// [`render_input_cached`](Renderer::render_input_cached) borrow first and
-    /// then read the pixels alongside [`Self::last_damage`] /
-    /// [`Self::dirty_rows`] — every return path of that call leaves the full
-    /// frame in this cache, so the re-borrow is always the just-rendered frame.
+    /// frame): the UNTRANSLATED damage cache. On a sub-row frame that is NOT
+    /// what [`render_input_cached`](Renderer::render_input_cached) handed back
+    /// (its band is shifted and its strip painted in the present scratch), so a
+    /// presenter reads [`Self::presented_pixels`] instead.
     pub fn frame_pixels(&self) -> &[u32] {
         self.cache.as_ref().map_or(&[], |c| &c.pixels[..])
+    }
+
+    /// The pixels the most recent [`render_input_cached`](Renderer::render_input_cached)
+    /// handed back, as a SHARED borrow a presenter can take after ending that
+    /// call's exclusive one: the translated present scratch on a sub-row frame,
+    /// else the cache ([`Self::frame_pixels`]). Reading the cache on a sub-row
+    /// frame threw the band shift and the incoming strip away — the CPU window
+    /// scrolled in whole-row jumps while every sub-row frame rastered its strip
+    /// for nothing (audit, 2026-09-24).
+    pub fn presented_pixels(&self) -> &[u32] {
+        if self.last_translated {
+            &self.present_scratch
+        } else {
+            self.frame_pixels()
+        }
+    }
+
+    /// Whether the most recent frame was translated (see the field doc).
+    pub fn last_translated(&self) -> bool {
+        self.last_translated
+    }
+
+    /// PRESENTER scratch: whether the surface's last accepted present was a
+    /// translated frame.
+    pub fn presented_translated(&self) -> bool {
+        self.presented_translated
+    }
+
+    /// PRESENTER scratch: record whether the present the surface just accepted
+    /// was translated. Call only after the surface accepted it, like
+    /// [`Self::set_presented_chrome`].
+    pub fn set_presented_translated(&mut self, translated: bool) {
+        self.presented_translated = translated;
     }
 
     /// The per-row repaint flags of the most recent frame (`dirty[r]` ⇔ row `r`
@@ -2389,14 +2444,14 @@ impl WindowCpu {
 
     /// PRESENTER scratch: the chrome extent the surface's remainder bands were
     /// last placed with (see the field doc).
-    pub fn presented_edge_rows(&self) -> usize {
-        self.presented_edge_rows
+    pub fn presented_edge_rows(&self) -> std::ops::Range<usize> {
+        self.presented_edge_rows.clone()
     }
 
     /// PRESENTER scratch: record the chrome extent the present just placed the
     /// surface's remainder bands with. Call only after the surface accepted the
     /// present, like [`Self::set_presented_chrome`].
-    pub fn set_presented_edge_rows(&mut self, rows: usize) {
+    pub fn set_presented_edge_rows(&mut self, rows: std::ops::Range<usize>) {
         self.presented_edge_rows = rows;
     }
 
@@ -6865,13 +6920,14 @@ pub fn band_offset_y(dst_px: usize, src_px: usize) -> i64 {
 /// band-aware `fs_blit`. `invert` XORs the CONTENT pixels (the visual-bell flash); the
 /// bands are chrome and never flash, matching the GPU shader's early-out.
 ///
-/// CHROME REACHES THE WINDOW EDGE. The source rows `[0, edge_rows)` are host
+/// CHROME REACHES THE WINDOW EDGE. The source rows in `edge_rows` are host
 /// chrome ([`Renderer::chrome_extent_px`]): beside them the left and right
 /// remainder bands CONTINUE the row's own first and last frame pixel instead of
 /// `band_rgb`, so a chrome band — its gutters, and a full-width meter's fill —
 /// runs to the true window edge on a window that is not a whole number of cells
-/// wide (maximized, tiled, full screen). `0` is the historical layout. The
-/// continued pixels are band pixels: never inverted, exactly like the GPU twin.
+/// wide (maximized, tiled, full screen). An empty range (`0..0`) is the
+/// historical layout. The continued pixels are band pixels: never inverted,
+/// exactly like the GPU twin.
 ///
 /// Byte-exactness: every in-bounds content pixel is copied 1:1 (never scaled);
 /// with `dst == src` dims this is exactly the historical whole-buffer copy
@@ -6890,7 +6946,7 @@ pub fn place_frame_bands(
     src_h: usize,
     invert: bool,
     band_rgb: u32,
-    edge_rows: usize,
+    edge_rows: std::ops::Range<usize>,
 ) {
     let band = band_rgb & 0x00ff_ffff;
     let xor = if invert { 0x00ff_ffff } else { 0 };
@@ -6913,7 +6969,7 @@ pub fn place_frame_bands(
         }
         // Beside a chrome row the bands continue its own edge pixels (the
         // source row exists: `0 <= sy < src_h`, and `src_w > 0` is checked).
-        let (lo, hi) = if (sy as usize) < edge_rows && src_w > 0 {
+        let (lo, hi) = if edge_rows.contains(&(sy as usize)) && src_w > 0 {
             let base = sy as usize * src_w;
             (src[base] & 0x00ff_ffff, src[base + src_w - 1] & 0x00ff_ffff)
         } else {
@@ -11422,17 +11478,28 @@ impl Renderer {
         self.chrome_bleed
     }
 
-    /// How many frame pixel rows from the top belong to host chrome: the strip
-    /// above the grid (`grid_top`) plus [`ChromeBleed::rows`] cell rows, clamped
-    /// to `frame_h`; `0` with no chrome declared. The presenters continue these
-    /// rows' edge pixels through the window's remainder bands
-    /// ([`place_frame_bands`]' `edge_rows`, the GPU blit's `chrome_y1`), so a
-    /// chrome band — and a full-width meter on it — reaches the true window
-    /// edge when the window is not a whole number of cells wide.
+    /// The frame pixel rows `[y0, y1)` that belong to host chrome, clamped to
+    /// `frame_h`; `0..0` with no chrome declared. They end below
+    /// [`ChromeBleed::rows`] cell rows and start at [`ChromeBleed::first`]: the
+    /// strip above the grid (`grid_top`) joins only when row 0 is chrome
+    /// (`first == 0`), because rows `[0, first)` stay on the frame's padding,
+    /// so beside them the bands stay `band_rgb` like beside any terminal row.
+    /// The presenters continue these rows' edge pixels through the window's
+    /// remainder bands ([`place_frame_bands`]' `edge_rows`, the GPU blit's
+    /// `chrome_y0..chrome_y1`), so a chrome band — and a full-width meter on it
+    /// — reaches the true window edge when the window is not a whole number of
+    /// cells wide.
     #[must_use]
-    pub fn chrome_extent_px(&self, frame_h: usize) -> usize {
-        self.chrome_bleed
-            .map_or(0, |b| (self.grid_top() + b.rows * self.cell_h).min(frame_h))
+    pub fn chrome_extent_px(&self, frame_h: usize) -> std::ops::Range<usize> {
+        self.chrome_bleed.map_or(0..0, |b| {
+            let y1 = (self.grid_top() + b.rows * self.cell_h).min(frame_h);
+            let y0 = if b.first == 0 {
+                0
+            } else {
+                (self.grid_top() + b.first * self.cell_h).min(y1)
+            };
+            y0..y1
+        })
     }
 
     /// Declare (or clear, with `None`) the top rows that are host chrome and the tone
@@ -11451,7 +11518,7 @@ impl Renderer {
     /// keeps it that way by contract: each per-row gutter tone IS its row's edge
     /// cell's background.
     pub fn set_chrome_bleed(&mut self, bleed: Option<ChromeBleed>) {
-        self.chrome_bleed = bleed.filter(|b| b.rows > 0);
+        self.chrome_bleed = bleed.filter(|b| b.rows > b.first);
     }
 
     /// The grid content's Y-origin in window px: `pad_top + head` (X stays
@@ -14020,8 +14087,10 @@ impl Renderer {
         apron_ready: bool,
     ) -> RenderView<'_> {
         if frac == 0 || y0 >= y1 {
+            wc.last_translated = false;
             return Self::cached_view(wc, w, h);
         }
+        wc.last_translated = true;
         // Split-borrow `wc`: read the pristine cache (and the apron raster), write
         // the present scratch.
         let WindowCpu {
@@ -14062,22 +14131,6 @@ impl Renderer {
             height: h,
             pixels,
         }
-    }
-
-    /// TEST/BENCH SCAFFOLDING ONLY — drop the damage-tracking cache so the very
-    /// next [`render_input`](Self::render_input) takes the full-repaint path (as
-    /// if it were the first frame). This does NOT change normal rendering: the
-    /// cache is rebuilt on that next frame exactly as construction leaves it
-    /// (`cache: None`), and the pixels produced are byte-identical either way —
-    /// only the WORK differs. It exists so a benchmark can measure the OLD
-    /// pre-optimization behavior (full repaint every frame) on one warm renderer:
-    /// call it between frames to defeat row-reuse. It is `#[doc(hidden)]` and
-    /// carries no semantic meaning for production callers, which never reset the
-    /// cache mid-session.
-    #[doc(hidden)]
-    pub fn reset_damage_cache(wc: &mut WindowCpu) {
-        wc.cache = None;
-        wc.last_damage = DamageOutcome::Full;
     }
 
     /// Pixel-row band of grid row `r` (of a `rows`-row grid) in a frame of
@@ -14292,7 +14345,7 @@ impl Renderer {
     /// (and is called per pane on composed rows), while this is one window-space
     /// border fill per chrome row.
     fn fill_chrome_bleed(&self, pixels: &mut [u32], w: usize, h: usize, r: usize) {
-        let Some(bleed) = self.chrome_bleed.filter(|b| r < b.rows) else {
+        let Some(bleed) = self.chrome_bleed.filter(|b| (b.first..b.rows).contains(&r)) else {
             return;
         };
         let (y0, y1) = self.row_band_px(r, h);
@@ -24056,7 +24109,7 @@ fn layered_beam_quads(
 /// composites the same operands through an sRGB-typed render target (hardware
 /// linear blend), so CPU and GPU agree within the parity tolerance. The
 /// fully-empty (`t == 0`) and fully-covered (`t == 255`) cases are returned EXACT
-/// (no sRGB round-trip), so solid fills and the `blend_endpoints` contract are
+/// (no sRGB round-trip), so solid fills and the endpoint contract are
 /// bit-precise — only the antialiased fringe goes through the LUTs.
 fn blend(bg: u32, fg: u32, t: u8) -> u32 {
     if t == 0 {
@@ -26959,21 +27012,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blend_endpoints() {
-        assert_eq!(blend(0x000000, 0xffffff, 0), 0x000000);
-        assert_eq!(blend(0x000000, 0xffffff, 255), 0xffffff);
-        // Halfway coverage is LINEAR-LIGHT grey: a 50%-covered white stem on black
-        // emits ~50% of the photons → sRGB ~188 (0xBC), NOT the old gamma-space
-        // lerp's 128. This higher mid value is the whole point — light-on-dark AA
-        // edges read correctly weighted instead of thin/muddy.
-        let m = blend(0x000000, 0xffffff, 128) & 0xff;
-        assert!(
-            (182..=194).contains(&m),
-            "linear-light mid = {m:#x}, want ~188"
-        );
-    }
-
     /// Linear-light `blend` is correct (matches a direct f32 sRGB↔linear blend to
     /// within ~1 LSB across coverage + colour pairs) and keeps the endpoints exact.
     #[test]
@@ -28897,8 +28935,11 @@ mod tests {
         );
     }
 
-    /// LAZY-FONT-PARSE, the whole point: building the broad-fallback chain must
-    /// NOT fontdue-parse the faces, and neither must probing their coverage.
+    /// LAZY-FONT-PARSE, the whole point, through the real startup path:
+    /// `seal_admitted_font_sources` is what the GUI's backend-build thread runs
+    /// and what window attach blocks on. It builds the broad-fallback chain and
+    /// probes its coverage, and must settle the whole font generation without
+    /// materialising a single fallback or symbol fontdue parse.
     ///
     /// The two macOS chain faces are 23.5 MB / 23.3 MB and fontdue eagerly
     /// converts all 29,352 + 50,377 of their glyph outlines — measured 1799 ms +
@@ -28906,28 +28947,6 @@ mod tests {
     /// backend-build thread that window attach waits on. Nothing on the default
     /// macOS path reads those parses: `fallback_has` probes the ttf-parser cmap,
     /// and the rasterizer is CoreText.
-    #[test]
-    fn building_the_fallback_chain_does_not_fontdue_parse_the_faces() {
-        let paths = present_fallback_paths();
-        if paths.is_empty() {
-            eprintln!("SKIP: no built-in fallback candidate exists on this machine");
-            return;
-        }
-        let chain = build_fallback_chain(&paths, 0); // all discovery: no user entries
-        assert!(!chain.is_empty(), "a present candidate must load");
-        for face in &chain {
-            assert!(
-                !face.font.is_materialised(),
-                "chain entry {:?} fontdue-parsed at BUILD time",
-                face.path
-            );
-        }
-    }
-
-    /// The same, through the real startup path: `seal_admitted_font_sources` is
-    /// what the GUI's backend-build thread runs and what window attach blocks on.
-    /// It must settle the whole font generation without materialising a single
-    /// fallback or symbol fontdue parse.
     #[cfg(feature = "embedded-font")]
     #[test]
     fn sealing_a_generation_does_not_fontdue_parse_the_fallback_or_symbol_faces() {
@@ -29025,39 +29044,17 @@ mod tests {
         Some(r)
     }
 
-    /// LAZY-FONT-PARSE, the styled tier: DISCOVERING the real `[bold, italic,
-    /// bold-italic]` siblings must fill the slots without fontdue-parsing them.
+    /// LAZY-FONT-PARSE, the styled tier, through the real startup path —
+    /// `seal_admitted_font_sources` is what the GUI's backend-build thread runs:
+    /// DISCOVERING the real `[bold, italic, bold-italic]` siblings must fill the
+    /// slots without fontdue-parsing them, and the slots must still be ADMITTED
+    /// there (the sources a device-loss rebuild replays come from it).
     ///
     /// The three DejaVu Sans Mono siblings cost a MEASURED 8.7 + 6.7 + 6.5 =
     /// 21.9 MB of live heap once fontdue converts their outlines, and an idle
     /// terminal that never draws a styled cell used to pay all of it at seal.
     /// The disk READ has to stay where it is (the render thread must never do
     /// font I/O); only the parse moves.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn discovering_styled_siblings_does_not_fontdue_parse_them() {
-        let Some(mut r) = dejavu_path_backed_renderer() else {
-            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
-            return;
-        };
-        r.ensure_styled_faces();
-        assert!(
-            r.styled_faces.iter().any(Option::is_some),
-            "DejaVu ships -Bold/-Oblique/-BoldOblique: discovery must fill slots"
-        );
-        for (slot, face) in r.styled_faces.iter().enumerate() {
-            if let Some(sf) = face {
-                assert!(
-                    !sf.font.is_materialised(),
-                    "styled slot {slot} fontdue-parsed at DISCOVERY time"
-                );
-            }
-        }
-    }
-
-    /// The same, through the real startup path — `seal_admitted_font_sources` is
-    /// what the GUI's backend-build thread runs — and the slots must still be
-    /// ADMITTED there (the sources a device-loss rebuild replays come from it).
     #[cfg(target_os = "linux")]
     #[test]
     fn sealing_a_generation_does_not_fontdue_parse_the_styled_siblings() {
@@ -32563,6 +32560,77 @@ mod tests {
         );
     }
 
+    /// `ChromeBleed::first` (audit, 2026-09-24): chrome rows above it keep the
+    /// frame's padding — a strip with no surface of its own, macOS's in-grid
+    /// strip — and do NOT own the `[0, grid_top)` lip; the rows from `first`
+    /// on bleed as ever. A bleed whose rows are all skipped is no bleed.
+    #[test]
+    fn a_bleed_below_a_surfaceless_strip_leaves_the_strip_on_the_padding() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const BAND: u32 = 0x0030_3135;
+        let (_, ch) = r.cell_size();
+        let (rows, cols) = (4usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"strip row");
+        let input = term.cell_frame(rows, cols);
+        r.set_pad(P);
+        let base = r.render_input(&input);
+        let bg = Theme::default().bg;
+        let top = r.grid_top();
+        let w = base.width;
+        let bleed = ChromeBleed {
+            rows: 2,
+            first: 1,
+            color: BAND,
+            seam: None,
+            top_extends_cells: false,
+            row_edges: [None; CHROME_ROW_EDGES],
+        };
+        r.set_chrome_bleed(Some(bleed));
+        let bled = r.render_input(&input);
+        assert_eq!(
+            r.chrome_extent_px(bled.height),
+            top + ch..top + 2 * ch,
+            "the presenters continue the band row alone: the lip and the strip \
+             row keep the flat remainder bands"
+        );
+        let at = |px: &[u32], x: usize, y: usize| px[y * w + x];
+        for x in 0..w {
+            for y in 0..top {
+                assert_eq!(
+                    at(&bled.pixels, x, y),
+                    bg,
+                    "row 0 owns no lip below `first` ({x},{y})"
+                );
+            }
+        }
+        for y in top..top + ch {
+            for x in (0..P).chain(w - P..w) {
+                assert_eq!(
+                    at(&bled.pixels, x, y),
+                    bg,
+                    "the strip row keeps the padding ({x},{y})"
+                );
+            }
+        }
+        for y in top + ch..top + 2 * ch {
+            for x in (0..P).chain(w - P..w) {
+                assert_eq!(
+                    at(&bled.pixels, x, y),
+                    BAND,
+                    "the band row bleeds ({x},{y})"
+                );
+            }
+        }
+        r.set_chrome_bleed(Some(ChromeBleed { rows: 1, ..bleed }));
+        assert_eq!(r.chrome_bleed(), None, "every row skipped: no bleed");
+        assert_eq!(r.render_input(&input).pixels, base.pixels);
+    }
+
     /// A METERED chrome row continues its own edge cells into the gutters
     /// ([`ChromeBleed::row_edges`], the message band's full-width meter —
     /// ruling 55): its left gutter wears `left`, its right gutter `right`,
@@ -32590,9 +32658,10 @@ mod tests {
         r.set_pad(P);
         let base = r.render_input(&input);
         let (w, hgt) = (base.width, base.height);
-        assert_eq!(r.chrome_extent_px(hgt), 0, "no chrome, no extent");
+        assert_eq!(r.chrome_extent_px(hgt), 0..0, "no chrome, no extent");
         let bleed = ChromeBleed {
             rows: 2,
+            first: 0,
             color: BAND,
             seam: Some(SEAM),
             top_extends_cells: false,
@@ -32615,8 +32684,12 @@ mod tests {
         );
         r.set_chrome_bleed(Some(bleed));
         let top = r.grid_top();
-        assert_eq!(r.chrome_extent_px(hgt), top + 2 * ch);
-        assert_eq!(r.chrome_extent_px(top + 1), top + 1, "clamped to the frame");
+        assert_eq!(r.chrome_extent_px(hgt), 0..top + 2 * ch);
+        assert_eq!(
+            r.chrome_extent_px(top + 1),
+            0..top + 1,
+            "clamped to the frame"
+        );
         let bled = r.render_input(&input);
         let at = |px: &[u32], x: usize, y: usize| px[y * w + x];
         let deco = r.deco_metrics();
@@ -32729,6 +32802,7 @@ mod tests {
         assert_eq!(r.chrome_bleed(), None, "no bleed by default");
         r.set_chrome_bleed(Some(ChromeBleed {
             rows: 1,
+            first: 0,
             color: BAND,
             seam: Some(SEAM),
             top_extends_cells: false,
@@ -32802,6 +32876,7 @@ mod tests {
         //    normalized to no bleed at all rather than an inert one.
         r.set_chrome_bleed(Some(ChromeBleed {
             rows: 0,
+            first: 0,
             color: BAND,
             seam: None,
             top_extends_cells: false,
@@ -32855,6 +32930,7 @@ mod tests {
         let flat = {
             r.set_chrome_bleed(Some(ChromeBleed {
                 rows: 1,
+                first: 0,
                 color: BAND,
                 seam: None,
                 top_extends_cells: false,
@@ -32865,6 +32941,7 @@ mod tests {
         let extended = {
             r.set_chrome_bleed(Some(ChromeBleed {
                 rows: 1,
+                first: 0,
                 color: BAND,
                 seam: None,
                 top_extends_cells: true,

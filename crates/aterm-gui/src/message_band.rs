@@ -3801,6 +3801,107 @@ mod tests {
         }
     }
 
+    /// EVERY GLYPH ON A METERED ROW CLEARS AA ON ITS OWN CELL, IN EVERY
+    /// FRAME (design ruling 199): on every builtin scheme, a row with a
+    /// Primary, a Secondary and `Details ›` — its fill's edge swept under
+    /// every chip cell, then through the glint, the Complete wipe and bloom
+    /// and the Fault flash — never paints a glyph under 4.5:1 on the cell
+    /// it sits on. The static chip test held the fill at 2 % and 100 %, so
+    /// the edge cell under a chip and the moving frames were never read,
+    /// and the title test allowed 0.01 under the floor: 4.49:1 passed.
+    #[test]
+    fn every_glyph_on_a_metered_row_clears_aa_in_every_frame() {
+        use aterm_messages::{
+            ANIM_FRAME, Duration, ECHO_FAULT_FLASH, ECHO_FILL, ECHO_GLOW, GLINT_DELAY,
+            GLINT_TRAVEL, Outcome,
+        };
+        let cols = 120;
+        let check = |name: &str, what: &str, row: &[RenderCell]| {
+            for (x, cell) in row.iter().enumerate() {
+                if cell.ch == ' ' {
+                    continue;
+                }
+                let ratio = chrome_band::contrast(cell.fg, cell.bg);
+                assert!(
+                    ratio >= WORD_AA,
+                    "{name} {what} col {x} {:?}: {:?} on {:?} is {ratio:.3}:1",
+                    cell.ch,
+                    cell.fg,
+                    cell.bg
+                );
+            }
+        };
+        let post = |center: &mut MessageCenter, permille: u16, now: Instant| {
+            center
+                .post(
+                    Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.91.0")
+                        .line("detail")
+                        .action(Intent::NewWindow)
+                        .action(Intent::OpenSettings {
+                            route: "/packages".into(),
+                        })
+                        .meter(Meter {
+                            fill_permille: Some(permille),
+                            ..Meter::default()
+                        })
+                        .hold(Hold::Live {
+                            stale_after: aterm_messages::STALE_UPDATE,
+                        }),
+                    stamp(),
+                    now,
+                )
+                .id
+        };
+        for (name, theme) in builtin_themes() {
+            // The fill's edge under every column, the chips' included.
+            for permille in (0..=1000u16).step_by(4) {
+                let now = t0();
+                let mut center = MessageCenter::new(MessageLog::empty(), now);
+                post(&mut center, permille, now);
+                center.commit_rows(now, 3);
+                let p = present(&center, cols);
+                assert_eq!(p.rows[0].capsules.len(), 3, "{name}: the chips are drawn");
+                check(
+                    name,
+                    &format!("still {permille}"),
+                    &paint_still(&p, theme, None, &center)[0],
+                );
+            }
+            // The glint's travel, the Complete echo, the Fault flash.
+            for (permille, outcome) in [
+                (570, None),
+                (960, None),
+                (800, Some(Outcome::Ok)),
+                (400, Some(Outcome::Warn)),
+            ] {
+                let now = t0();
+                let mut center = MessageCenter::new(MessageLog::empty(), now);
+                let id = post(&mut center, permille, now);
+                center.commit_rows(now, 3);
+                let (from, span) = match outcome {
+                    None => (now + GLINT_DELAY, GLINT_TRAVEL),
+                    Some(o) => {
+                        let at = now + Duration::from_millis(1000);
+                        assert!(center.resolve(id, o, at));
+                        let span = if o == Outcome::Ok {
+                            ECHO_FILL + ECHO_GLOW
+                        } else {
+                            ECHO_FAULT_FLASH
+                        };
+                        (at, span)
+                    }
+                };
+                let p = present(&center, cols);
+                let mut t = Duration::ZERO;
+                while t <= span {
+                    let row = &frame_at(&center, &p, from + t, Look::MOVING, theme).0[0];
+                    check(name, &format!("{permille} {outcome:?} t={t:?}"), row);
+                    t += ANIM_FRAME;
+                }
+            }
+        }
+    }
+
     /// THE FAULT ECHO WARMS STRAIGHT TO THE FAULT HUE (design ruling 156):
     /// on every builtin scheme and every stock High Contrast palette, for a
     /// determinate bar and a busy row, in the moving, still and flat looks,
@@ -3933,7 +4034,7 @@ mod tests {
                 for &x in &letters {
                     let (fg, bg) = (row[x].fg, row[x].bg);
                     assert!(
-                        chrome_band::contrast(fg, bg) >= WORD_AA - 0.01,
+                        chrome_band::contrast(fg, bg) >= WORD_AA - 1e-9,
                         "{name} {outcome:?} t={t:?} col {x}: {fg:?} on {bg:?} under AA"
                     );
                     let Some(prev) = &last else { continue };

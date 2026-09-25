@@ -14,7 +14,7 @@ fn walk(model: &aterm_spec::derive::Model, actions: &[&str]) -> interp::State {
 /// Tier-0: every invariant holds over the whole bounded space at `Buggy=0`, each has its
 /// own counterexample at `Buggy=1`, and the two defects are replayed step by step: the
 /// session lane's misread (a write after the last success read as a failed pass) and the
-/// queued child that ran back to back behind a failed, rate-limited pass.
+/// queued child that ran back to back behind a failed pass.
 #[test]
 fn the_full_pass_rule_proves_and_catches_the_session_lanes_misread() {
     let model = atpkg_full_pass_rule_model();
@@ -52,13 +52,12 @@ fn the_full_pass_rule_proves_and_catches_the_session_lanes_misread() {
     assert!(!buggy.check_invariant("NoSuccessReadAsFailure", &old));
 
     // Two lanes decide in the gap before either child holds the lock; the first child's
-    // pass is rate-limited. The fixed second child stands down behind it; the old one ran
-    // at once, inside the hold.
+    // pass fails. The fixed second child stands down behind it; the old one ran at once.
     let queue = [
         "SessionLook",
         "WindowWalk",
         "TakeLockFresh",
-        "PassRateLimited",
+        "PassFails",
         "TakeLockBehind",
     ];
     let stood_down = walk(&model, &queue);
@@ -66,15 +65,6 @@ fn the_full_pass_rule_proves_and_catches_the_session_lanes_misread() {
     let ran = walk(&buggy, &queue);
     assert_eq!(ran["running"], 1, "the old child ran behind the failure");
     assert!(!buggy.check_invariant("NoPassBackToBack", &ran));
-    assert!(!buggy.check_invariant("NoMeteredPassInsideHold", &ran));
-
-    // The record a rate limit leaves when the cache stood in — a success WITH a hold — is
-    // reachable, and the window's lanes wait it out.
-    let on_cache = walk(
-        &model,
-        &["WindowWalk", "TakeLockFresh", "PassRateLimitedOnCache"],
-    );
-    assert_eq!((on_cache["rec"], on_cache["hold"]), (1, 2));
 
     // THE PROGRESS OBLIGATION IS ON THE TRUTH: with the interval past the record's
     // saturating age, the lanes can never read "an interval old" and park a failed (or
@@ -83,12 +73,5 @@ fn the_full_pass_rule_proves_and_catches_the_session_lanes_misread() {
     assert!(
         matches!(interp::bmc(&parked), Err((_, "NoOwedPassHeldBack"))),
         "a rule that parks an owed pass is caught"
-    );
-    // The session lane reads no hold: it never runs inside one only because a hold is
-    // shorter than the interval every pass end starts. A hold as long breaks that.
-    let long_hold = interp::with_consts(&model, &[("HoldMax", 4)]);
-    assert!(
-        matches!(interp::bmc(&long_hold), Err((_, "NoMeteredPassInsideHold"))),
-        "the session lane's hold-free rule rests on the hold being the shorter"
     );
 }

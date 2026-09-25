@@ -254,49 +254,30 @@ fn an_unpinned_master_accepts_nothing_at_all() {
 /// client verifier accepts, and a machine key that signs a release attributed to the
 /// machine that holds it.
 ///
-/// **AND IT PROVES THE POINT OF THE WHOLE TIER: `m11` is ROSTER-ONLY.** Its key is in no
-/// keyset, in this anchor file or any shipped one, and it never will be — neither verb
-/// touches `UPDATE_CHANNEL_PUBKEYS`. Under an armed master that is enough, because the
-/// roster alone authorizes (`aterm_update::github::fetch_authoritative_release`), which is
-/// what makes adding a machine a LOCAL act: run `join`, copy the roster out, publish.
-///
-/// Two mutations die here:
-///
-/// * "put the machine key back in the keyset as a bridge" — the keyset assertion fails.
-///   The entry would be an irrevocable grant to every client that shipped with it, and it
-///   authorizes nothing the roster does not already.
-/// * "make the client require keyset membership too" — the roster-only machine below stops
-///   being able to publish, and the owner is back to needing a release from a machine that
-///   can already sign, which is the ceremony this replaced.
+/// **AND IT PROVES THE POINT OF THE WHOLE TIER: a machine is ROSTER-ONLY.** No minted key
+/// appears in the anchor file; the roster alone authorizes
+/// (`aterm_update::github::fetch_authoritative_release`), which is what makes adding a
+/// machine a LOCAL act: run `join`, copy the roster out, publish.
 #[test]
 fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
-    use atpkg_keys::pins_edit::{CHANNEL_ANCHOR, MASTER_ANCHOR, read_anchor};
+    use atpkg_keys::pins_edit::{MASTER_ANCHOR, read_anchor};
     use atpkg_keys::provision::{
         Paths, Verb, plan, preflight, verify_master, write_pins, write_rest,
     };
-
-    // The incumbent head — the key whose private half is on another machine and which
-    // signed the live release. Its survival is the property that keeps the fleet alive.
-    const HEAD_KEY: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
 
     let dir = std::env::temp_dir().join("atpkg-keys-e2e/provisioned");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch tree");
     let at = |n: &str| dir.join(n).to_str().expect("utf-8 path").to_string();
 
-    // An unarmed anchor file in the two shapes the real one uses.
+    // An unarmed anchor file.
     std::fs::write(
         at("pins.rs"),
         "// Copyright 2026 Andrew Yates\n\
          // SPDX-License-Identifier: Apache-2.0\n\
          \n\
          /// The paper master. Empty means INERT.\n\
-         pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n\
-         \n\
-         /// ORDER IS A CONTRACT: index 0 is the head.\n\
-         pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\n\
-         \x20   \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n\
-         ];\n",
+         pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n",
     )
     .expect("unarmed fixture");
 
@@ -313,49 +294,36 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     // downstream of it is exactly what the verb does.
     let seed = parse_master(PAPER).expect("synthetic phrase").seed();
     let m3_paths = paths("m3.key", "m3.toml");
-    let pre = preflight(Verb::Setup, "m3", "incumbent-head", &m3_paths)
-        .expect("a fresh tree accepts setup");
+    let pre = preflight(Verb::Setup, "m3", &m3_paths).expect("a fresh tree accepts setup");
     let planned = plan(pre, &seed, NOW).expect("setup plans");
     write_pins(&planned).expect("the anchor is written and verified");
     let m3 = write_rest(planned).expect("setup completes");
 
     // --- join, on a second machine, against the anchor setup committed ---------------
     let m11_paths = paths("m11.key", "m11.toml");
-    let pre = preflight(Verb::Join, "m11", "incumbent-head", &m11_paths)
-        .expect("an armed tree accepts join");
+    let pre = preflight(Verb::Join, "m11", &m11_paths).expect("an armed tree accepts join");
     verify_master(&pre, &seed).expect("the phrase proves against the committed anchor");
     let planned = plan(pre, &seed, NOW).expect("join plans");
-    write_pins(&planned).expect("the keyset entry is written and verified");
+    write_pins(&planned).expect("join leaves the anchor exactly as committed");
     let m11 = write_rest(planned).expect("join completes");
 
     // --- what the anchor file now says ----------------------------------------------
     let src = std::fs::read_to_string(at("pins.rs")).expect("the anchor file");
     let master_anchor = read_anchor(&src, MASTER_ANCHOR).unwrap().members;
-    let keyset = read_anchor(&src, CHANNEL_ANCHOR).unwrap().members;
     assert_eq!(
         master_anchor,
         vec![seed.pubkey_b64().unwrap()],
         "the master anchor names the paper master, written by the tool"
-    );
-    assert_eq!(
-        keyset,
-        vec![HEAD_KEY.to_string()],
-        "UNTOUCHED: neither verb grants a machine the pre-roster allowance — a keyset \
-         member cannot be un-shipped, so `machine-revoke` could never take it back"
     );
     assert!(
         !src.contains(&m3.machine_pubkey) && !src.contains(&m11.machine_pubkey),
         "no minted key appears anywhere in the anchor file"
     );
 
-    // --- the machine that the compiled-in keyset has never heard of -------------------
+    // --- a machine known only to the roster ---------------------------------------
     let bytes = appcast("m11", m11.roster_seq);
     let m11_key = std::fs::read(at("m11.key")).expect("the 0600 machine key");
     let sig = atpkg_keys::sign(&m11_key, &bytes).expect("the machine signs its own release");
-    assert!(
-        !keyset.contains(&m11.machine_pubkey),
-        "precondition: m11 is ROSTER-ONLY, or the acceptance below proves nothing"
-    );
 
     // --- the client's ONLY gate under an armed master: the master-signed roster -------
     let roster_bytes = std::fs::read(at("aterm-machines.toml")).expect("the roster");
@@ -394,27 +362,6 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     assert_eq!(
         parsed.authorize_appcast(&bytes, &forged, NOW as i64),
         Err(RosterReject::Verify)
-    );
-
-    // --- AND THE HALF THAT IS NOT FREE ------------------------------------------------
-    // A client that predates the roster does not run any of the above. Its whole rule is
-    // membership of the keyset it was COMPILED with, it has no fallback to an older
-    // release, and no document can teach it a key. So the same m11 release that every
-    // roster-aware client accepts is one such a client can never install — which is why
-    // `cargo ship cut` refuses to sign under this key unless the operator asserts that
-    // none are left (`--strand-pre-roster-clients`; proved in aterm-release's
-    // tests/machine_roster.rs). Asserted here, at the seam, so the cost of the acceptance
-    // above is recorded beside it rather than only in prose.
-    for shipped in aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS {
-        assert_ne!(
-            *shipped, m11.machine_pubkey,
-            "a roster-only machine is by definition outside every shipped keyset"
-        );
-    }
-    assert!(
-        keyset.contains(&HEAD_KEY.to_string()),
-        "and the incumbent — the one machine those clients CAN verify — is still there, \
-         which is why the first roster names it"
     );
 }
 

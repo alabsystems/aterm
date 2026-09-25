@@ -250,15 +250,6 @@ pub(crate) fn admit(row: &SyntheticArtifact) -> Result<(), FlowError> {
     if a.asset != asset_name(row.program, row.version, &a.target, &a.payload) {
         return refuse("asset is not the per-version local name");
     }
-    if !a.signer_team.is_empty()
-        || !a.manager.is_empty()
-        || !a.package.is_empty()
-        || !a.label_prefix.is_empty()
-        || !a.provides.is_empty()
-        || a.elevated
-    {
-        return refuse("a vendor-direct row carries no installer-protocol keys");
-    }
     Ok(())
 }
 
@@ -567,12 +558,6 @@ fn synthetic(
             strip_components: 0,
             links: BTreeMap::new(),
             vendor: spec.vendor.to_string(),
-            signer_team: String::new(),
-            elevated: false,
-            provides: Vec::new(),
-            manager: String::new(),
-            package: String::new(),
-            label_prefix: String::new(),
         },
     }
 }
@@ -586,8 +571,8 @@ fn codex_tag_version(doc: &aterm_json::Value) -> Result<Version, ()> {
         .ok_or(())
 }
 
-/// The publisher's asset rule for `triple` (`tools/atpkg-author-vendor.sh`,
-/// `resolve_codex`), in preference order: the tarball everywhere; on windows the zip
+/// The publisher's asset rule for `triple` (the deleted authoring ceremony's
+/// `resolve_codex`, kept here as the one statement of it), in preference order: the tarball everywhere; on windows the zip
 /// first; on linux the static musl package as the glibc triple's fallback.
 fn codex_candidates(triple: &str) -> Vec<String> {
     let package = |t: &str, ext: &str| format!("codex-package-{t}{ext}");
@@ -1067,7 +1052,6 @@ mod tests {
             Box::new(|a| a.sha256 = "A".repeat(64)),
             Box::new(|a| a.asset = "claude-2.1.279-aarch64-apple-darwin".into()),
             Box::new(|a| a.protocol = "github-release".into()),
-            Box::new(|a| a.signer_team = "Q6L2SF6YDW".into()),
         ];
         for (i, tweak) in tweaks.iter().enumerate() {
             let mut row = good.clone();

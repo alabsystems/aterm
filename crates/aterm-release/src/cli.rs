@@ -4,18 +4,25 @@
 //! CLI surface (release spec §5): hand-rolled `std::env::args` parsing (no
 //! third-party arg crate — same rule as `aterm-ctl`) for the whole command
 //! surface: `cut [--dry-run] [--resume] [--abandon vX.Y.Z]
-//! [--set-version X.Y.Z]
 //! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]
-//! [--release-credentials <profile.toml>] [--strand-pre-roster-clients]`,
+//! [--release-credentials <profile.toml>]`,
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
 //! `verify [vX.Y.Z]`,
-//! `yank <build> [--release-credentials <profile.toml>]
-//! [--strand-pre-roster-clients]`.
+//! `yank <build> [--release-credentials <profile.toml>]`.
 
 use std::process::Command;
 
 use crate::ledger::{self, Error};
 use crate::{publish, verify};
+
+/// The retired pre-roster acknowledgement. A leftover spelling in a script or a
+/// runbook is refused by name, in one sentence, rather than as an unknown flag.
+pub const RETIRED_STRAND_FLAG: &str = "--strand-pre-roster-clients";
+
+/// The one sentence [`RETIRED_STRAND_FLAG`] is refused with.
+pub const RETIRED_STRAND_REFUSAL: &str = "--strand-pre-roster-clients is retired: installs older \
+     than v0.21.0 are abandoned and every current client authorizes a release by the machine \
+     roster alone, so a rostered key needs no acknowledgement — drop the flag";
 
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
@@ -26,11 +33,10 @@ USAGE
       No signing or publication. Run on both x86_64 and aarch64 Linux,
       then give the complete handoff directory to the canonical cutter.
 
-  targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z] [--set-version X.Y.Z]
+  targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z]
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
                  [--arm64-only] [--no-paint-smoke] [--release-credentials <profile.toml>]
-                 [--strand-pre-roster-clients] [--linux-artifacts DIRECTORY]
-                 [--linux-target aarch64|x86_64]...
+                 [--linux-artifacts DIRECTORY] [--linux-target aarch64|x86_64]...
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
       → draft-first publish → late tag → flip → verify.
         --dry-run          gates + provisional number + full local build into
@@ -45,12 +51,9 @@ USAGE
                            for a cut that flipped on the origin but whose mirror
                            step the fleet's roster floor now refuses (a roster
                            join landed between the origin flip and the public
-                           flip): the public channel never saw it, and the next
-                           cut, attributed under the current generation,
-                           supersedes it
-        --set-version X.Y.Z
-                           override the version derived from
-                           [workspace.package] version (DEV → 0)
+                           flip): the public channel never made it the head,
+                           and the next cut, attributed under the current
+                           generation, supersedes it
         --min-build N      emit an operator apply floor into the manifest
         --gate             additionally run tools/verify.sh --full inline
         --rehearse O/R     full real cut published to the scratch repo O/R
@@ -73,16 +76,9 @@ USAGE
                            the ONE signing input: the credentials profile this
                            cut signs with. Omitted, the machine key provisioned
                            at ~/.aterm/machine.key is used; a signature-required
-                           cut with neither refuses before it claims
-        --strand-pre-roster-clients
-                           OPERATOR ASSERTION, only meaningful once the paper
-                           master is armed: no client running a build older than
-                           the machine roster is left in the field, so this cut
-                           may be signed by a rostered key that is in no shipped
-                           UPDATE_CHANNEL_PUBKEYS. Such clients verify under
-                           their own compiled-in keyset and have no fallback to
-                           an older release: they do not miss this update, they
-                           never update again.
+                           cut with neither refuses before it claims. The key
+                           must belong to a machine the master-signed roster
+                           names and has not revoked
 
   targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]
                            ON A BARE MACHINE, RUN tools/bootstrap-publisher.sh
@@ -128,14 +124,13 @@ USAGE
   targo --unverified ship verify [vX.Y.Z]
                            re-run the post-publish check anytime
   targo --unverified ship yank <build> [--release-credentials <profile.toml>]
-        [--strand-pre-roster-clients]
                            publish + fully verify a min_build-ratcheted
                            successor FIRST; only then remove the inert bad
                            tag and release (crash-convergent cleanup). That
-                           successor is a REAL cut, so it takes the cut's two
-                           signing inputs and means exactly what they mean
-                           there — with the paper master armed it refuses
-                           pre-claim without them, having deleted nothing
+                           successor is a REAL cut, so it takes the cut's
+                           signing input and means exactly what it means there
+                           — with the paper master armed it refuses pre-claim
+                           without it, having deleted nothing
 ";
 
 /// A parsed invocation. `Cut.abandon` rides outside [`publish::CutOptions`]
@@ -384,20 +379,16 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             let build: u64 = build
                 .parse()
                 .map_err(|_| format!("yank: {build:?} is not a build number (u64)"))?;
-            // Yank used to refuse every extra argument, which was right while a
-            // cut signed from an ambient key and asked nobody anything. With the
-            // paper master armed, the successor cut a yank publishes refuses
-            // pre-claim unless it is told which credentials profile signs and
-            // whether stranding pre-roster clients is acceptable — so a yank
-            // that cannot forward those answers cannot retire a bad build at
-            // all. Same two flags, same spellings, same meanings as `cut`.
+            // With the paper master armed, the successor cut a yank publishes
+            // refuses pre-claim unless it is told which credentials profile signs —
+            // so a yank that cannot forward that answer cannot retire a bad build
+            // at all. Same flag, same spelling, same meaning as `cut`.
             //
-            // And ONLY those two: every other cut flag either contradicts what
+            // And ONLY that one: every other cut flag either contradicts what
             // a yank's successor is (--dry-run/--rehearse publish nothing to
             // prove, --resume belongs to the journal) or is the yank's own
-            // decision (--min-build is fixed at bad build + 1, --set-version at
-            // the workspace version), so accepting one could only mean ignoring
-            // it.
+            // decision (--min-build is fixed at bad build + 1), so accepting one
+            // could only mean ignoring it.
             let mut opts = verify::YankOptions::default();
             while let Some(flag) = it.next() {
                 match flag {
@@ -409,14 +400,11 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                             it.next().ok_or("--release-credentials needs a path")?,
                         ));
                     }
-                    // An ACKNOWLEDGEMENT, not a parameter — publish::PreRosterClients
-                    // says why it is on the command line and in no file.
-                    publish::PRE_ROSTER_STRANDING_FLAG => opts.strand_pre_roster_clients = true,
+                    RETIRED_STRAND_FLAG => return Err(RETIRED_STRAND_REFUSAL.to_string()),
                     extra => {
                         return Err(format!(
                             "yank takes one build number and optionally --release-credentials \
-                             <profile.toml> / {PRE_ROSTER_STRANDING_FLAG} (got {extra:?})",
-                            PRE_ROSTER_STRANDING_FLAG = publish::PRE_ROSTER_STRANDING_FLAG,
+                             <profile.toml> (got {extra:?})"
                         ));
                     }
                 }
@@ -467,9 +455,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             // An EMERGENCY ESCAPE, not a setting — publish::paint_smoke_policy
             // owns the refusal on notarized real cuts and the ack it demands.
             publish::NO_PAINT_SMOKE_FLAG => opts.no_paint_smoke = true,
-            // An ACKNOWLEDGEMENT, not a parameter — see publish::PreRosterClients
-            // for why it is on the command line and not in the credentials profile.
-            publish::PRE_ROSTER_STRANDING_FLAG => opts.strand_pre_roster_clients = true,
+            RETIRED_STRAND_FLAG => return Err(RETIRED_STRAND_REFUSAL.to_string()),
             // The ONE signing input. A path in the command, never an ambient file:
             // "what signed this?" is answered by reading the command that ran.
             "--release-credentials" => {
@@ -483,10 +469,6 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             "--abandon" => {
                 let v = it.next().ok_or("--abandon needs a version (vX.Y.Z)")?;
                 abandon = Some(normalize_version(v)?);
-            }
-            "--set-version" => {
-                let v = it.next().ok_or("--set-version needs a version (X.Y.Z)")?;
-                opts.set_version = Some(normalize_version(v)?);
             }
             "--min-build" => {
                 let n = it.next().ok_or("--min-build needs a number")?;
@@ -520,26 +502,17 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.arm64_only
             || opts.linux_artifacts.is_some()
             || opts.no_paint_smoke
-            || opts.strand_pre_roster_clients
-            || opts.set_version.is_some()
             || opts.min_build.is_some()
             || opts.rehearse.is_some())
     {
         return Err("--abandon combines with no other cut flag".to_string());
     }
-    // `--strand-pre-roster-clients` is in this list for a reason worth stating: a
-    // resume does not re-ask the question. It continues a cut that answered it at
-    // pre-claim, under a key `revalidate_ctx_signature_policy` refuses to let change,
-    // so the flag would be silently ignored here — and silently ignoring an
-    // acknowledgement is the one thing an acknowledgement may never do.
     if opts.resume
         && (opts.dry_run
             || opts.gate
             || opts.arm64_only
             || opts.linux_artifacts.is_some()
             || opts.no_paint_smoke
-            || opts.strand_pre_roster_clients
-            || opts.set_version.is_some()
             || opts.min_build.is_some()
             || opts.rehearse.is_some())
     {
@@ -615,6 +588,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
                 true,
                 no_draft_posted,
                 creds.as_ref(),
+                release_credentials.as_deref(),
             )
         }
         Cmd::Verify { version } => verify::run_verify(&repo_root()?, version),

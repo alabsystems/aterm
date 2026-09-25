@@ -1507,7 +1507,7 @@ mod tests {
     /// The vendor's statusLine shape (field names as its help text documents
     /// them, 2.1.274), with integers and floats mixed on purpose.
     const STATUSLINE: &str = r#"{
-      "session_id":"s-7f3","session_name":"wrapper","transcript_path":"/Users//_x/.claude/projects/p/s-7f3.jsonl",
+      "session_id":"s-7f3","session_name":"wrapper","transcript_path":"/Users/_x/.claude/projects/p/s-7f3.jsonl",
       "cwd":"/work/proj","model":{"id":"claude-fable-5-1","display_name":"Fable 5.1"},
       "workspace":{"current_dir":"/work/proj","project_dir":"/work","added_dirs":[]},
       "version":"2.1.274",
@@ -2367,7 +2367,7 @@ mod tests {
     #[test]
     fn usage_json_is_schema_1_and_round_trips_through_the_parser() {
         let mut work = live_account();
-        work.dir = Some("/Users//_x/.claude".to_owned());
+        work.dir = Some("/Users/_x/.claude".to_owned());
         work.add_cache_window("seven_day_opus", None, None, Some(3600));
         let mut t = TranscriptUsage::new();
         fold_all(
@@ -2401,7 +2401,7 @@ mod tests {
         assert_eq!(accounts.len(), 2);
         let w = &accounts[0];
         assert_eq!(w["label"].as_str(), Some("work"));
-        assert_eq!(w["dir"].as_str(), Some("/Users//_x/.claude"));
+        assert_eq!(w["dir"].as_str(), Some("/Users/_x/.claude"));
         assert_eq!(w["active"].as_bool(), Some(true));
         assert_eq!(w["model"].as_str(), Some("claude-fable-5-1"));
         assert_eq!(w["windows"]["five_hour"]["used_pct"].as_f64(), Some(62.0));

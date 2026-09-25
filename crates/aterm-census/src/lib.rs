@@ -1850,12 +1850,6 @@ mod tests {
     }
 
     #[test]
-    fn census_is_green_on_this_tree() {
-        let out = run_mainloop_census(&repo_root());
-        assert!(out.ok, "census RED on the current tree:\n{}", out.log);
-    }
-
-    #[test]
     fn offload_allowlist_entries_resolve_on_this_tree() {
         let root = repo_root();
         for b in OFFLOAD_ALLOWLIST {

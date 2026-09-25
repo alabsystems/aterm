@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 //
 // Sparkle-word decoration compositing for the CPU renderer: an empty
-// `word_decorations` list is byte-identical to the pre-feature render, and a
+// `word_decorations` list is byte-identical to the pre-feature render (the
+// `word_decorations` row of `tests/empty_channels.rs`), and a
 // non-empty list stamps sprites over exactly the targeted cell (and leaves the
 // rest of the frame untouched).
 
@@ -40,28 +41,6 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
         }
     }
     out
-}
-
-#[test]
-fn empty_decorations_are_byte_identical() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let mut term = Terminal::new(3, 12);
-    term.process(b"i love cats");
-
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    let mut input = term.cell_frame(3, 12);
-    assert!(input.word_decorations.is_empty());
-    let again = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, again, "empty decorations must not change any pixel");
-
-    // Explicitly empty list (host feature on, no match) is also identical.
-    input.word_decorations.clear();
-    let still = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, still);
 }
 
 #[test]

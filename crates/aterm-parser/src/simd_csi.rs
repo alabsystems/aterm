@@ -611,36 +611,24 @@ mod tests {
     }
 
     #[test]
-    fn test_simd_csi_params_single_digit() {
-        let result = simd_parse_csi_params(b"5m").expect("should parse");
-        assert_eq!(result.count, 1);
-        assert_eq!(result.params[0], 5);
-        assert_eq!(result.bytes_consumed, 1);
-        assert!(!result.has_subparams);
-    }
-
-    #[test]
-    fn test_simd_csi_params_two_digits() {
-        let result = simd_parse_csi_params(b"31m").expect("should parse");
-        assert_eq!(result.count, 1);
-        assert_eq!(result.params[0], 31);
-        assert_eq!(result.bytes_consumed, 2);
-    }
-
-    #[test]
-    fn test_simd_csi_params_three_digits() {
-        let result = simd_parse_csi_params(b"196m").expect("should parse");
-        assert_eq!(result.count, 1);
-        assert_eq!(result.params[0], 196);
-        assert_eq!(result.bytes_consumed, 3);
-    }
-
-    #[test]
-    fn test_simd_csi_params_five_digits() {
-        let result = simd_parse_csi_params(b"65535m").expect("should parse");
-        assert_eq!(result.count, 1);
-        assert_eq!(result.params[0], 65535);
-        assert_eq!(result.bytes_consumed, 5);
+    fn test_simd_csi_params_single_param_widths() {
+        // One parameter of 1-5 digits: (input, value, bytes consumed). Each row
+        // was its own test; the 99999 and 17-digit clamps stay separate below.
+        let rows: &[(&[u8], u16, usize)] = &[
+            (b"5m", 5, 1),
+            (b"31m", 31, 2),
+            (b"196m", 196, 3),
+            (b"65535m", 65535, 5),
+            (b"0m", 0, 1),
+        ];
+        for &(input, value, consumed) in rows {
+            let label = String::from_utf8_lossy(input);
+            let result = simd_parse_csi_params(input).expect("should parse");
+            assert_eq!(result.count, 1, "{label}");
+            assert_eq!(result.params[0], value, "{label}");
+            assert_eq!(result.bytes_consumed, consumed, "{label}");
+            assert!(!result.has_subparams, "{label}");
+        }
     }
 
     #[test]
@@ -682,14 +670,6 @@ mod tests {
         assert_eq!(result.params[0], 10);
         assert_eq!(result.params[1], 20);
         assert_eq!(result.bytes_consumed, 5);
-    }
-
-    #[test]
-    fn test_simd_csi_params_zero_param() {
-        let result = simd_parse_csi_params(b"0m").expect("should parse");
-        assert_eq!(result.count, 1);
-        assert_eq!(result.params[0], 0);
-        assert_eq!(result.bytes_consumed, 1);
     }
 
     #[test]

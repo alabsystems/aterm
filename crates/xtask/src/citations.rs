@@ -25,11 +25,9 @@
 //!   named — and a retired-key table named a consumer crate that no longer
 //!   existed.
 //!
-//! That is a class, not four accidents, and the repository already has the two
-//! gates that bracket it: `gate help-surfaces` hashes help prose and refuses
-//! until a human re-reads it against its handler, and `gate drift` proves an
-//! advertised capability has an implementation witness. What neither can see is
-//! prose that CITES SOMETHING BY NAME as its proof. Three of the four cases
+//! That is a class, not four accidents. `gate drift` proves an advertised
+//! capability has an implementation witness; what it cannot see is prose that
+//! CITES SOMETHING BY NAME as its proof. Three of the four cases
 //! above cited a file, a test or a crate that no longer exists, and a gate that
 //! merely RESOLVES such citations would have caught all three on the day they
 //! rotted — for the cost of a directory walk.
@@ -440,10 +438,25 @@ fn backticked(line: &str) -> Vec<String> {
     out
 }
 
+/// Sentence punctuation a citation may carry, and the ESCAPE a document may
+/// carry, trimmed off the end before the token is judged.
+///
+/// The backslash is the one that is not punctuation. A citation inside an
+/// unquoted shell heredoc writes its backticks escaped — `` \`crates/aterm-link\` ``
+/// — and the closing `\` lands inside the token, so a path that exists is
+/// reported as resolving to nothing. Measured 2026-09-24: `publish/transforms.sh`
+/// generates the public `vendor/astream/README.md` that way, and the gate failed
+/// the whole merge contract over `crates/aterm-link\`, a directory that is right
+/// there. No repository path ends in a backslash, so trimming it can only ever
+/// turn a false alarm into a real decision.
+fn trim_citation_punctuation(tok: &str) -> &str {
+    tok.trim_end_matches(&['.', ',', ';', ':', '\\'][..])
+}
+
 /// Which rule, if any, a token is subject to. `None` means "not a citation this
 /// gate can decide" — the majority of backticked tokens, and deliberately so.
 fn classify(tok: &str) -> Option<Rule> {
-    let t = tok.trim_end_matches(&['.', ',', ';', ':'][..]);
+    let t = trim_citation_punctuation(tok);
     if t.is_empty() {
         return None;
     }
@@ -499,7 +512,7 @@ fn is_crate_relative(t: &str) -> bool {
 /// `crates/aterm-pty/src/unix.rs:739-744`, a file that exists, was reported as
 /// resolving to nothing.
 fn resolves_path(root: &Path, citing: &str, cited: &str) -> bool {
-    let t = cited.trim_end_matches(&['.', ',', ';', ':'][..]);
+    let t = trim_citation_punctuation(cited);
     // `crates/a/src/b.rs::item` — a path plus the item in it. The path half is
     // what this rule decides; the item half is a Rust path, which [`Rule::Name`]
     // deliberately does not claim to resolve.
@@ -765,6 +778,50 @@ mod tests {
         .expect("write doc");
         let (ok, log) = citations_report(&dir, &[], &["docs/RELEASING.md"]);
         assert!(ok, "an admitted absence must be GREEN:\n{log}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CITATION INSIDE AN UNQUOTED SHELL HEREDOC escapes its backticks, so
+    /// the closing `\` lands inside the token. The gate decides the PATH and
+    /// must not read that escape as part of the name.
+    ///
+    /// Measured 2026-09-24: `publish/transforms.sh` writes the public
+    /// `vendor/astream/README.md` with `` \`crates/aterm-link\` `` and the gate
+    /// failed the whole merge contract over `crates/aterm-link\`, a directory
+    /// that is right there. No repository path ends in a backslash.
+    #[test]
+    fn a_path_citation_escaped_in_a_heredoc_resolves_to_its_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "xtask-citations-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("docs")).expect("mk docs");
+        std::fs::create_dir_all(dir.join("tools")).expect("mk tools");
+        std::fs::write(dir.join("tools/real.sh"), "#!/bin/sh\n:\n").expect("write tool");
+        // The shape a heredoc leaves behind: the token carries the escape.
+        std::fs::write(
+            dir.join("docs/RELEASING.md"),
+            "The generator writes \\`tools/real.sh\\` into the export.\n",
+        )
+        .expect("write doc");
+        let (ok, log) = citations_report(&dir, &[], &["docs/RELEASING.md"]);
+        assert!(
+            ok,
+            "an escaped backtick must not make a file that exists unresolvable:\n{log}"
+        );
+
+        // The bound: a trailing backslash is trimmed, it does not excuse a path
+        // that is genuinely gone.
+        std::fs::write(
+            dir.join("docs/RELEASING.md"),
+            "The generator writes \\`tools/ghost.sh\\` into the export.\n",
+        )
+        .expect("write doc");
+        let (ok, log) = citations_report(&dir, &[], &["docs/RELEASING.md"]);
+        assert!(!ok, "a missing file is still a finding:\n{log}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

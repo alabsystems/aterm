@@ -64,6 +64,8 @@ fn test_diff_single_field_changes() {
     let config1 = TerminalConfig::default();
     let mut auto_wrap_disabled = TerminalConfig::default();
     auto_wrap_disabled.auto_wrap = false;
+    let mut ambiguous_width_double = TerminalConfig::default();
+    ambiguous_width_double.ambiguous_width_double = true;
     let cases = [
         (
             TerminalConfig::builder()
@@ -80,40 +82,36 @@ fn test_diff_single_field_changes() {
             ConfigChange::ScrollbackLimit,
         ),
         (auto_wrap_disabled, ConfigChange::AutoWrap),
+        (
+            TerminalConfig::builder()
+                .default_foreground(Rgb::new(200, 200, 200))
+                .build(),
+            ConfigChange::Colors,
+        ),
+        (
+            TerminalConfig::builder()
+                .selection_background(Some(Rgb::new(0x11, 0x22, 0x33)))
+                .selection_foreground(Some(Rgb::new(0x44, 0x55, 0x66)))
+                .build(),
+            ConfigChange::Colors,
+        ),
+        (
+            TerminalConfig::builder().font_family("Menlo").build(),
+            ConfigChange::Font,
+        ),
+        (
+            TerminalConfig::builder()
+                .bidi_mode(BiDiMode::Disabled)
+                .build(),
+            ConfigChange::BiDi,
+        ),
+        (ambiguous_width_double, ConfigChange::AmbiguousWidth),
     ];
 
     for (config2, expected_change) in cases {
         let changes = config1.diff(&config2);
         assert_eq!(changes, vec![expected_change]);
     }
-}
-
-#[test]
-fn test_diff_colors() {
-    let config1 = TerminalConfig::default();
-    let config2 = TerminalConfig::builder()
-        .default_foreground(Rgb::new(200, 200, 200))
-        .build();
-
-    let changes = config1.diff(&config2);
-    assert!(changes.contains(&ConfigChange::Colors));
-    assert_eq!(changes.len(), 1);
-
-    let selections = TerminalConfig::builder()
-        .selection_background(Some(Rgb::new(0x11, 0x22, 0x33)))
-        .selection_foreground(Some(Rgb::new(0x44, 0x55, 0x66)))
-        .build();
-    assert_eq!(config1.diff(&selections), vec![ConfigChange::Colors]);
-}
-
-#[test]
-fn test_diff_font() {
-    let config1 = TerminalConfig::default();
-    let config2 = TerminalConfig::builder().font_family("Menlo").build();
-
-    let changes = config1.diff(&config2);
-    assert!(changes.contains(&ConfigChange::Font));
-    assert_eq!(changes.len(), 1);
 }
 
 #[test]
@@ -160,27 +158,6 @@ fn test_bidi_builder_methods() {
     assert_eq!(config.bidi.mode, BiDiMode::Explicit);
     assert_eq!(config.bidi.direction, ParagraphDirection::Rtl);
     assert!(!config.bidi.reorder_nsm);
-}
-
-#[test]
-fn test_diff_bidi_change() {
-    let config1 = TerminalConfig::default();
-    let config2 = TerminalConfig::builder()
-        .bidi_mode(BiDiMode::Disabled)
-        .build();
-
-    let changes = config1.diff(&config2);
-    assert!(changes.contains(&ConfigChange::BiDi));
-    assert_eq!(changes.len(), 1);
-}
-
-#[test]
-fn test_diff_ambiguous_width_change() {
-    let config1 = TerminalConfig::default();
-    let mut config2 = TerminalConfig::default();
-    config2.ambiguous_width_double = true;
-
-    assert_eq!(config1.diff(&config2), vec![ConfigChange::AmbiguousWidth]);
 }
 
 #[test]

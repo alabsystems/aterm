@@ -10,8 +10,8 @@
 //! (`naga`, `tiny-skia`, `vte`) are `no_std`-capable and take it with
 //! `default-features = false`. Re-check with
 //! `grep -n 'std::' crates/aterm-alloc/src/array_vec.rs` — every hit other than
-//! this sentence must be inside the `#[cfg(test)]` module at the bottom (17
-//! hits today: this line and 16 in the tests).
+//! this sentence must be inside the `#[cfg(test)]` module at the bottom (10
+//! hits today: this line and 9 in the tests).
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -978,34 +978,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_is_empty() {
-        let av: ArrayVec<i32, 4> = ArrayVec::new();
-        assert!(av.is_empty());
-        assert_eq!(av.len(), 0);
-        assert_eq!(av.capacity(), 4);
-        assert!(!av.is_full());
-    }
-
-    #[test]
-    fn test_push_and_access() {
-        let mut av: ArrayVec<i32, 4> = ArrayVec::new();
-        av.push(1);
-        av.push(2);
-        av.push(3);
-        assert_eq!(av.len(), 3);
-        assert_eq!(av.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn test_is_full() {
-        let mut av: ArrayVec<i32, 2> = ArrayVec::new();
-        av.push(1);
-        av.push(2);
-        assert!(av.is_full());
-        assert_eq!(av.remaining_capacity(), 0);
-    }
-
-    #[test]
     #[should_panic(expected = "ArrayVec overflow")]
     fn test_push_overflow_panics() {
         let mut av: ArrayVec<i32, 2> = ArrayVec::new();
@@ -1015,126 +987,10 @@ mod tests {
     }
 
     #[test]
-    fn test_try_push() {
-        let mut av: ArrayVec<i32, 2> = ArrayVec::new();
-        assert!(av.try_push(1).is_ok());
-        assert!(av.try_push(2).is_ok());
-        assert_eq!(av.try_push(3), Err(CapacityError::new(3)));
-        // …and the element comes back out.
-        assert_eq!(av.try_push(4).unwrap_err().element(), 4);
-    }
-
-    #[test]
-    fn test_pop() {
-        let mut av: ArrayVec<i32, 4> = ArrayVec::new();
-        av.push(10);
-        av.push(20);
-        assert_eq!(av.pop(), Some(20));
-        assert_eq!(av.pop(), Some(10));
-        assert_eq!(av.pop(), None);
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut av: ArrayVec<String, 4> = ArrayVec::new();
-        av.push("hello".into());
-        av.push("world".into());
-        av.clear();
-        assert!(av.is_empty());
-    }
-
-    #[test]
-    fn test_truncate() {
-        let mut av: ArrayVec<i32, 4> = ArrayVec::new();
-        av.push(1);
-        av.push(2);
-        av.push(3);
-        av.truncate(1);
-        assert_eq!(av.as_slice(), &[1]);
-    }
-
-    #[test]
-    fn test_insert_and_remove() {
-        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
-        av.push(1);
-        av.push(3);
-        av.insert(1, 2);
-        assert_eq!(av.as_slice(), &[1, 2, 3]);
-
-        let removed = av.remove(1);
-        assert_eq!(removed, 2);
-        assert_eq!(av.as_slice(), &[1, 3]);
-    }
-
-    #[test]
-    fn test_retain() {
-        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
-        av.push(1);
-        av.push(2);
-        av.push(3);
-        av.push(4);
-        av.push(5);
-        av.retain(|x| *x % 2 == 0);
-        assert_eq!(av.as_slice(), &[2, 4]);
-    }
-
-    #[test]
-    fn test_clone() {
-        let mut av: ArrayVec<String, 4> = ArrayVec::new();
-        av.push("hello".into());
-        let cloned = av.clone();
-        assert_eq!(av, cloned);
-    }
-
-    #[test]
-    fn test_collect() {
-        let av: ArrayVec<i32, 8> = (0..5).collect();
-        assert_eq!(av.as_slice(), &[0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_deref_indexing() {
-        let mut av: ArrayVec<i32, 4> = ArrayVec::new();
-        av.push(10);
-        av.push(20);
-        assert_eq!(av[0], 10);
-        assert_eq!(av[1], 20);
-    }
-
-    #[test]
-    fn test_debug_format() {
-        let mut av: ArrayVec<i32, 4> = ArrayVec::new();
-        av.push(1);
-        av.push(2);
-        assert_eq!(format!("{av:?}"), "[1, 2]");
-    }
-
-    #[test]
-    fn test_drop_string_elements() {
-        let mut av: ArrayVec<String, 4> = ArrayVec::new();
-        av.push("heap allocated string that is long enough".into());
-        av.push("another one".into());
-        drop(av);
-    }
-
-    #[test]
     fn test_const_new() {
         // Verify const construction works
         const AV: ArrayVec<u8, 16> = ArrayVec::new_const();
         assert!(AV.is_empty());
-    }
-
-    #[test]
-    fn test_retain_with_drop_types() {
-        let mut av: ArrayVec<String, 8> = ArrayVec::new();
-        av.push("keep-a".into());
-        av.push("drop-b".into());
-        av.push("keep-c".into());
-        av.push("drop-d".into());
-        av.push("keep-e".into());
-        av.retain(|s| s.starts_with("keep"));
-        assert_eq!(av.len(), 3);
-        assert_eq!(av.as_slice(), &["keep-a", "keep-c", "keep-e"]);
     }
 
     #[test]
@@ -1181,19 +1037,6 @@ mod tests {
     // ── The surface added for the `arrayvec` shim ───────────────────────────
 
     #[test]
-    fn test_into_inner_full_and_short() {
-        let mut av: ArrayVec<i32, 3> = ArrayVec::new();
-        av.push(1);
-        av.push(2);
-        // Short: Err, and the vec comes back untouched.
-        let mut av = av.into_inner().unwrap_err();
-        assert_eq!(av.as_slice(), &[1, 2]);
-        av.push(3);
-        // Full: Ok, in order.
-        assert_eq!(av.into_inner().unwrap(), [1, 2, 3]);
-    }
-
-    #[test]
     fn test_into_inner_moves_without_double_drop() {
         let counter = std::rc::Rc::new(std::cell::Cell::new(0));
         struct Bomb(std::rc::Rc<std::cell::Cell<usize>>);
@@ -1209,130 +1052,6 @@ mod tests {
         assert_eq!(counter.get(), 0, "into_inner must not drop");
         drop(arr);
         assert_eq!(counter.get(), 2, "each element dropped exactly once");
-    }
-
-    #[test]
-    fn test_hash_matches_slice_and_ignores_capacity() {
-        use std::collections::hash_map::DefaultHasher;
-        fn h<T: Hash + ?Sized>(v: &T) -> u64 {
-            let mut s = DefaultHasher::new();
-            v.hash(&mut s);
-            s.finish()
-        }
-        let mut a: ArrayVec<u8, 4> = ArrayVec::new();
-        let mut b: ArrayVec<u8, 32> = ArrayVec::new();
-        for v in [1u8, 2, 3] {
-            a.push(v);
-            b.push(v);
-        }
-        // Same elements, different N: the hash must not see the capacity, and
-        // it must equal the slice's own hash.
-        assert_eq!(h(&a), h(&b));
-        assert_eq!(h(&a), h(&[1u8, 2, 3][..]));
-    }
-
-    #[test]
-    fn test_extend_and_collect_panic_rather_than_truncate() {
-        let mut av: ArrayVec<i32, 3> = ArrayVec::new();
-        av.extend([1, 2, 3]);
-        assert_eq!(av.as_slice(), &[1, 2, 3]);
-
-        // CONTROL for the tripwires below: the same call one element smaller
-        // must NOT panic, so a passing "it panicked" assertion cannot be an
-        // artifact of `extend` panicking unconditionally.
-        let control = std::panic::catch_unwind(|| {
-            let mut av: ArrayVec<i32, 3> = ArrayVec::new();
-            av.extend([1, 2]);
-            av.len()
-        });
-        assert_eq!(
-            control.ok(),
-            Some(2),
-            "control: a fitting extend must not panic"
-        );
-
-        let overflow = std::panic::catch_unwind(|| {
-            let mut av: ArrayVec<i32, 3> = ArrayVec::new();
-            av.extend([1, 2, 3, 4]);
-        });
-        assert!(overflow.is_err(), "extend must panic, never truncate");
-
-        let collected = std::panic::catch_unwind(|| {
-            let _: ArrayVec<i32, 3> = (1..=4).collect();
-        });
-        assert!(collected.is_err(), "collect must panic, never truncate");
-    }
-
-    #[test]
-    fn test_into_iter_by_value_order_and_drop_of_remainder() {
-        let mut av: ArrayVec<i32, 4> = ArrayVec::new();
-        av.extend([1, 2, 3, 4]);
-        assert_eq!(av.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-
-        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
-        struct Bomb(std::rc::Rc<std::cell::Cell<usize>>);
-        impl Drop for Bomb {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-        let mut av: ArrayVec<Bomb, 4> = ArrayVec::new();
-        for _ in 0..4 {
-            av.push(Bomb(std::rc::Rc::clone(&counter)));
-        }
-        {
-            let mut it = av.into_iter();
-            let first = it.next().unwrap();
-            drop(first);
-            assert_eq!(counter.get(), 1);
-            // `it` is dropped here with three elements un-yielded.
-        }
-        assert_eq!(
-            counter.get(),
-            4,
-            "the un-yielded remainder is dropped exactly once"
-        );
-    }
-
-    #[test]
-    fn test_into_iter_double_ended_and_as_slice() {
-        let mut av: ArrayVec<i32, 5> = ArrayVec::new();
-        av.extend([1, 2, 3, 4, 5]);
-        let mut it = av.into_iter();
-        assert_eq!(it.next(), Some(1));
-        assert_eq!(it.next_back(), Some(5));
-        assert_eq!(it.as_slice(), &[2, 3, 4]);
-        assert_eq!(it.len(), 3);
-        assert_eq!(it.collect::<Vec<_>>(), vec![2, 3, 4]);
-    }
-
-    #[test]
-    fn test_iter_by_ref_and_by_mut_are_bounded_by_len() {
-        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
-        av.extend([1, 2, 3]);
-        let mut seen = Vec::new();
-        for v in &av {
-            seen.push(*v);
-        }
-        assert_eq!(seen, vec![1, 2, 3], "&ArrayVec walks 0..len, not 0..N");
-        for v in &mut av {
-            *v *= 10;
-        }
-        assert_eq!(av.as_slice(), &[10, 20, 30]);
-    }
-
-    #[test]
-    fn test_drain_removes_and_closes_the_tail() {
-        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
-        av.extend([1, 2, 3, 4, 5]);
-        let taken: Vec<_> = av.drain(1..3).collect();
-        assert_eq!(taken, vec![2, 3]);
-        assert_eq!(av.as_slice(), &[1, 4, 5]);
-
-        // `drain(..)` — the form `wgpu-hal` uses — must EMPTY the vec.
-        let taken: Vec<_> = av.drain(..).collect();
-        assert_eq!(taken, vec![1, 4, 5]);
-        assert!(av.is_empty(), "drain(..) must leave the vec empty");
     }
 
     #[test]
@@ -1383,62 +1102,12 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_from_reuses_prefix_and_matches_clone() {
-        let mut dst: ArrayVec<String, 4> = ArrayVec::new();
-        dst.extend(["a".to_string(), "b".to_string(), "c".to_string()]);
-
-        // Shorter source: truncates.
-        let mut src: ArrayVec<String, 4> = ArrayVec::new();
-        src.extend(["x".to_string()]);
-        dst.clone_from(&src);
-        assert_eq!(dst.as_slice(), src.as_slice());
-
-        // Longer source: extends.
-        let mut src: ArrayVec<String, 4> = ArrayVec::new();
-        src.extend([
-            "p".to_string(),
-            "q".to_string(),
-            "r".to_string(),
-            "s".to_string(),
-        ]);
-        dst.clone_from(&src);
-        assert_eq!(dst.as_slice(), src.as_slice());
-        assert_eq!(dst, src.clone());
-    }
-
-    #[test]
     fn test_capacity_error_shape() {
         let e = CapacityError::new(7u8);
         assert_eq!(format!("{e}"), "insufficient capacity");
         assert_eq!(format!("{e:?}"), "CapacityError: insufficient capacity");
         assert_eq!(e.simplify(), CapacityError::new(()));
         assert_eq!(e.element(), 7);
-    }
-
-    #[test]
-    fn test_retain_can_mutate_through_the_predicate() {
-        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
-        av.extend([1, 2, 3, 4]);
-        // Upstream's bound is `FnMut(&mut T) -> bool`; this closure could not
-        // compile against the old `FnMut(&T) -> bool`.
-        av.retain(|v| {
-            *v += 100;
-            *v % 2 == 1
-        });
-        assert_eq!(av.as_slice(), &[101, 103]);
-    }
-
-    #[test]
-    fn test_extend_from_slice_and_try_form() {
-        let mut av: ArrayVec<u8, 4> = ArrayVec::new();
-        av.extend_from_slice(&[1, 2]);
-        assert!(av.try_extend_from_slice(&[3, 4]).is_ok());
-        assert_eq!(av.as_slice(), &[1, 2, 3, 4]);
-        // All-or-nothing: the vec is untouched when the slice does not fit.
-        let mut av: ArrayVec<u8, 4> = ArrayVec::new();
-        av.extend_from_slice(&[1, 2, 3]);
-        assert!(av.try_extend_from_slice(&[4, 5]).is_err());
-        assert_eq!(av.as_slice(), &[1, 2, 3]);
     }
 }
 

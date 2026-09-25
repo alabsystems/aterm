@@ -57,22 +57,22 @@ use aterm_spec::derive::{
     native_settings_draft_close_model, native_settings_singleton_model, native_tab_identity_model,
     native_update_admission_model, native_update_apply_ladder_model,
     native_update_attempt_identity_model, native_update_auto_intent_model,
-    native_update_channel_scan_model, native_update_disk_transaction_model,
-    native_update_failed_mark_suppression_model, native_update_hidden_output_quiet_model,
-    native_update_menu_activation_model, native_update_overlap_handoff_model,
-    native_update_seamless_handoff_ownership_model, native_update_status_reconciliation_model,
-    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
-    net_dial_after_grant_model, nova_phase_model, one_shot_peek_model,
-    operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
-    operator_resync_cursor_model, operator_wal_actuator_model, output_streak_attribution_model,
-    output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
-    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
-    present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
-    proxy_forward_model, rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
+    native_update_disk_transaction_model, native_update_failed_mark_suppression_model,
+    native_update_hidden_output_quiet_model, native_update_menu_activation_model,
+    native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
+    native_update_status_reconciliation_model, native_update_worker_queue_model,
+    native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
+    one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
+    operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
+    output_streak_attribution_model, output_streak_episode_delivery_model, pad_absorption_model,
+    pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
+    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
+    presented_frame_tap_model, press_custody_model, proxy_forward_model,
+    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
     rainbow_terminus_admission_model, rainbow_typed_continuity_model, read_image_seq_model,
     recording_model, recovery_redraw_model, reduced_motion_companion_handoff_model,
-    release_channel_floor_model, release_channel_single_head_model,
+    release_channel_floor_model, release_channel_single_head_model, release_claim_landing_model,
     release_durable_post_intent_model, release_historical_recovery_model,
     release_journal_prefix_model, release_key_epoch_transition_model,
     release_published_identity_model, release_publisher_fence_model,
@@ -4237,6 +4237,119 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
     assert!(!buggy.check_invariant("UnlockCannotBeBypassed", &early_unlock));
 }
 
+/// The release claim's writer/reader contract (owner ruling R2, 2026-09-23): the
+/// release commit carries only the published code, main keeps every peer commit
+/// and every ledger line, build numbers strictly increase, and a claimed-unpublished
+/// version is read as a recut — never fresh, never "cut elsewhere", never claimed
+/// again once published. Each mutant is replayed and caught by its own law.
+#[test]
+fn derived_release_claim_landing_proves_the_writer_reader_contract() {
+    let model = release_claim_landing_model();
+    assert_operator_model_shape(&model, |state| state[&"phase"] == 5 || state[&"seq"] == 6);
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &["ClaimStateBounds"]);
+
+    // Peers push, the claim loses a race to another version's claim, re-reads,
+    // and lands as a merge; the cut dies; the recut claims again and publishes; a
+    // third cut is refused.
+    let mut state = model.init_state();
+    for action in [
+        "PeerPush",
+        "ClassifyFresh",
+        "ClaimRead",
+        "RivalClaim",
+        "ClaimRetry",
+        "ClaimLand",
+        "Die",
+        "ClassifyRecut",
+        "ClaimRead",
+        "PeerPush",
+        "ClaimRetry",
+        "ClaimLand",
+        "Publish",
+        "ClassifyRefuse",
+    ] {
+        assert!(model.fire(action, &mut state), "{action}: {state:?}");
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, &state),
+                "{action} broke {}: {state:?}",
+                invariant.name
+            );
+        }
+    }
+    assert_eq!(state["landings"], 2);
+    assert_eq!(state["main_code"], 2);
+    assert_eq!(state["main_lines"], 4);
+    assert_eq!(state["tail"], 4);
+    assert_eq!(state["phase"], 5);
+
+    // Another machine claiming this version while ours is in flight IS a cut
+    // elsewhere — the abort is legitimate there, and only there.
+    let mut raced = model.init_state();
+    for action in ["ClassifyFresh", "ClaimRead", "ElsewhereClaim"] {
+        assert!(model.fire(action, &mut raced), "{action}");
+    }
+    assert!(!model.action_enabled("ClaimRetry", &raced));
+    assert!(model.fire("ClaimElsewhere", &mut raced));
+    assert!(model.check_invariant("OwnSectionIsNeverCutElsewhere", &raced));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+    // The pre-R2 cut: the release built from main's tip carries a peer's code.
+    let mut tip_build = buggy.init_state();
+    for action in ["PeerPush", "ClassifyFresh", "ClaimRead"] {
+        assert!(buggy.fire(action, &mut tip_build), "{action}");
+    }
+    assert!(!buggy.check_invariant("ReleaseCarriesOnlyThePublishedCode", &tip_build));
+
+    // A landing built from the release commit's tree drops the rival's ledger line.
+    let mut r_tree = buggy.init_state();
+    for action in ["RivalClaim", "ClassifyFresh", "ClaimRead", "ClaimLand"] {
+        assert!(buggy.fire(action, &mut r_tree), "{action}");
+    }
+    assert!(!buggy.check_invariant("MainKeepsEveryLedgerLine", &r_tree));
+
+    // A retry that keeps its stale number lands at or below the winner's tail.
+    let mut stale = buggy.init_state();
+    for action in [
+        "ClassifyFresh",
+        "ClaimRead",
+        "RivalClaim",
+        "ClaimRetry",
+        "ClaimLand",
+    ] {
+        assert!(buggy.fire(action, &mut stale), "{action}");
+    }
+    assert!(!buggy.check_invariant("BuildsStrictlyIncrease", &stale));
+
+    // The reader that takes the recut signal from the published commit's changelog:
+    // a claimed-unpublished version is fresh to it, and its own claim's section then
+    // aborts a lost race as "cut elsewhere".
+    let mut wedged = model.init_state();
+    for action in ["ClassifyFresh", "ClaimRead", "ClaimLand", "Die"] {
+        assert!(model.fire(action, &mut wedged), "{action}");
+    }
+    assert!(!model.action_enabled("ClassifyFresh", &wedged));
+    assert!(buggy.fire("ClassifyFresh", &mut wedged));
+    assert!(!buggy.check_invariant("ClaimedUnpublishedIsNeverFresh", &wedged));
+    for action in ["ClaimRead", "PeerPush", "ClaimElsewhere"] {
+        assert!(buggy.fire(action, &mut wedged), "{action}");
+    }
+    assert!(!buggy.check_invariant("OwnSectionIsNeverCutElsewhere", &wedged));
+
+    // ...and a published version is claimed again.
+    let mut republished = model.init_state();
+    for action in ["ClassifyFresh", "ClaimRead", "ClaimLand", "Publish"] {
+        assert!(model.fire(action, &mut republished), "{action}");
+    }
+    assert!(!model.action_enabled("ClassifyFresh", &republished));
+    for action in ["ClassifyFresh", "ClaimRead", "ClaimLand"] {
+        assert!(buggy.fire(action, &mut republished), "{action}");
+    }
+    assert!(!buggy.check_invariant("NoClaimAfterPublish", &republished));
+}
+
 /// A current release journal is an exact canonical prefix. Resume starts at the
 /// first gap and can never use later membership to skip an ordered mutation.
 #[test]
@@ -5140,7 +5253,6 @@ fn release_channel_models_are_registered_for_xref_resolution() {
         "ReleasePublishedIdentity",
         "ReleaseYankSuccessorFirst",
         "ReleaseChannelSingleHead",
-        "NativeUpdateChannelScan",
         "NativeUpdateHiddenOutputQuiet",
     ] {
         assert!(
@@ -5148,250 +5260,6 @@ fn release_channel_models_are_registered_for_xref_resolution() {
             "{expected} must resolve through the spec↔source registry"
         );
     }
-}
-
-/// GitHub release rows are unordered. The complete metadata catalog is arbitrated by
-/// canonical numeric tag, so every permutation of v0.8/v0.9/v0.10 selects v0.10.
-/// Strictly-lower numeric multi-part legacy tags remain migration-compatible, while a
-/// same/newer noncanonical maximum refuses. Only the canonical authority's manifest
-/// (and, when configured, signature) is fetched. An older 503, malformed/duplicate
-/// metadata, authoritative rejection, signature failure, or a missing/duplicate/
-/// noncanonical authoritative DMG identity can never cause fallback.
-///
-/// Production's `select_authoritative_release` and `fetch_authoritative_release`
-/// seams use the same two-phase split. Their local fixtures enumerate all six
-/// permutations and count transport calls; this derived test exhaustively checks the
-/// bounded transition system and explicit row-order/over-fetch/fallback mutants.
-#[test]
-fn derived_native_update_channel_scan_proves_permutation_invariance_and_one_fetch() {
-    let model = native_update_channel_scan_model();
-    assert_proves_and_catches(&model);
-
-    let orders = [
-        ["ObserveMinor8", "ObserveMinor9", "ObserveMinor10"],
-        ["ObserveMinor8", "ObserveMinor10", "ObserveMinor9"],
-        ["ObserveMinor9", "ObserveMinor8", "ObserveMinor10"],
-        ["ObserveMinor9", "ObserveMinor10", "ObserveMinor8"],
-        ["ObserveMinor10", "ObserveMinor8", "ObserveMinor9"],
-        ["ObserveMinor10", "ObserveMinor9", "ObserveMinor8"],
-    ];
-    for order in orders {
-        let mut state = model.init_state();
-        for action in order {
-            assert!(model.fire(action, &mut state));
-            assert!(model.check_invariant("CatalogMaximumIsNumericAndOrderIndependent", &state));
-        }
-        assert_eq!(state["max_minor"], 10, "numeric 9 must sort below 10");
-        assert!(model.fire("CompleteMetadataArbitration", &mut state));
-        assert_eq!(state["selected_minor"], 10);
-        assert!(model.fire("ExposeOlderUnreadable", &mut state));
-        assert!(model.fire("FetchAuthoritativeVerified", &mut state));
-        assert_eq!(state["manifest_fetch_count"], 1);
-        assert_eq!(state["fetched_minor"], 10);
-        assert_eq!(state["older_manifest_fetch_count"], 0);
-        assert!(model.check_invariant("ManifestFetchBudgetIsOne", &state));
-        assert!(model.check_invariant("OlderUnreadableIsNeverFetched", &state));
-        assert!(model.fire("FinalizeAccepted", &mut state));
-        assert!(model.check_invariant("AcceptedUsesAuthoritativeRelease", &state));
-    }
-
-    // A lower numeric multi-part migration tag can appear before or after the
-    // canonical rows without changing authority or adding a transport call.
-    for legacy_first in [false, true] {
-        let mut state = model.init_state();
-        if legacy_first {
-            assert!(model.fire("ObserveLowerLegacy", &mut state));
-        }
-        for action in orders[4] {
-            assert!(model.fire(action, &mut state));
-        }
-        if !legacy_first {
-            assert!(model.fire("ObserveLowerLegacy", &mut state));
-        }
-        assert_eq!(state["max_minor"], 10);
-        assert!(model.fire("CompleteMetadataArbitration", &mut state));
-        assert_eq!(state["selected_minor"], 10);
-    }
-
-    // A same-prefix newer numeric vector (v0.10.1) wins ordering but is not a
-    // canonical two-component authority, so refusal happens before fetch.
-    let mut noncanonical = model.init_state();
-    for action in orders[0] {
-        assert!(model.fire(action, &mut noncanonical));
-    }
-    assert!(model.fire("ObserveNewerNoncanonical", &mut noncanonical));
-    assert!(!model.action_enabled("CompleteMetadataArbitration", &noncanonical));
-    assert!(model.fire("RefuseNoncanonicalAuthority", &mut noncanonical));
-    assert_eq!(noncanonical["phase"], 3);
-    assert_eq!(noncanonical["manifest_fetch_count"], 0);
-    assert!(model.check_invariant("NoncanonicalMaximumCannotSelect", &noncanonical));
-
-    // A pinned channel fetches exactly the selected authority's manifest and one
-    // detached signature. The signature remains subordinate to the manifest budget.
-    let mut signed = model.init_state();
-    assert!(model.fire("ConfigureSignatures", &mut signed));
-    for action in orders[5] {
-        assert!(model.fire(action, &mut signed));
-    }
-    assert!(model.fire("CompleteMetadataArbitration", &mut signed));
-    assert!(model.fire("FetchAuthoritativeVerified", &mut signed));
-    assert_eq!(signed["manifest_fetch_count"], 1);
-    assert_eq!(signed["signature_fetch_count"], 1);
-    assert!(model.check_invariant("VerifiedFetchHonorsSignaturePolicy", &signed));
-
-    let mut signature_unreadable = model.init_state();
-    assert!(model.fire("ConfigureSignatures", &mut signature_unreadable));
-    for action in orders[1] {
-        assert!(model.fire(action, &mut signature_unreadable));
-    }
-    assert!(model.fire("CompleteMetadataArbitration", &mut signature_unreadable));
-    assert!(model.fire(
-        "FetchAuthoritativeSignatureUnreadable",
-        &mut signature_unreadable
-    ));
-    assert_eq!(signature_unreadable["manifest_fetch_count"], 1);
-    assert_eq!(signature_unreadable["signature_fetch_count"], 1);
-    assert_eq!(signature_unreadable["phase"], 3);
-    assert!(model.check_invariant("RefusalIsTerminalForThisCheck", &signature_unreadable));
-
-    // Malformed or duplicate candidate metadata is terminal before any download.
-    for bad_action in [
-        "ObserveMalformedCandidate",
-        "ObserveDuplicateCanonicalCandidate",
-    ] {
-        let mut bad_metadata = model.init_state();
-        assert!(model.fire(bad_action, &mut bad_metadata));
-        assert!(model.fire("RefuseMetadata", &mut bad_metadata));
-        assert_eq!(bad_metadata["phase"], 3);
-        assert_eq!(bad_metadata["manifest_fetch_count"], 0);
-        assert!(model.check_invariant("MetadataFailureFetchesNothing", &bad_metadata));
-    }
-
-    // Missing or ambiguous signature on the numeric maximum does not fall back to
-    // the older signed release and never starts manifest transport.
-    for signature_failure in [
-        "ObserveMissingAuthoritativeSignature",
-        "ObserveAmbiguousAuthoritativeSignature",
-    ] {
-        let mut missing_signature = model.init_state();
-        assert!(model.fire("ConfigureSignatures", &mut missing_signature));
-        for action in orders[0] {
-            assert!(model.fire(action, &mut missing_signature));
-        }
-        assert!(model.fire("CompleteMetadataArbitration", &mut missing_signature));
-        assert!(model.fire(signature_failure, &mut missing_signature));
-        assert!(!model.action_enabled("FetchAuthoritativeVerified", &missing_signature));
-        assert!(model.fire("RefuseSignaturePolicy", &mut missing_signature));
-        assert_eq!(missing_signature["manifest_fetch_count"], 0);
-        assert_eq!(missing_signature["accepted"], 0);
-    }
-
-    // Authoritative 503 or tag/manifest mismatch is one attempted authoritative
-    // fetch followed by refusal. No lower release is probed.
-    for failure in [
-        "FetchAuthoritativeUnreadable",
-        "RejectAuthoritativeManifest",
-    ] {
-        let mut refused = model.init_state();
-        for action in orders[3] {
-            assert!(model.fire(action, &mut refused));
-        }
-        assert!(model.fire("CompleteMetadataArbitration", &mut refused));
-        assert!(model.fire(failure, &mut refused));
-        assert_eq!(refused["phase"], 3);
-        assert_eq!(refused["manifest_fetch_count"], 1);
-        assert_eq!(refused["fetched_minor"], 10);
-        assert_eq!(refused["older_manifest_fetch_count"], 0);
-        assert!(model.check_invariant("RefusalIsTerminalForThisCheck", &refused));
-        assert!(model.check_invariant("AuthorityFailureNeverFallsBack", &refused));
-    }
-
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-
-    // NEGATIVE CONTROL 1: trusting row order can overwrite v0.10 with any later,
-    // numerically older migration row.
-    for (mutant, regressed_to) in [
-        ("ObserveLowerLegacyByRowOrder", 5),
-        ("ObserveMinor8ByRowOrder", 8),
-        ("ObserveMinor9ByRowOrder", 9),
-    ] {
-        let mut row_order = buggy.init_state();
-        assert!(buggy.fire("ObserveMinor10", &mut row_order));
-        assert!(buggy.fire(mutant, &mut row_order));
-        assert_eq!(row_order["max_minor"], regressed_to);
-        assert!(!buggy.check_invariant("CatalogMaximumIsNumericAndOrderIndependent", &row_order));
-    }
-
-    // NEGATIVE CONTROL 2: a partial first page cannot become authoritative.
-    let mut early = buggy.init_state();
-    assert!(buggy.fire("ObserveMinor8", &mut early));
-    assert!(buggy.fire("SelectBeforeCatalogComplete", &mut early));
-    assert!(!buggy.check_invariant("SelectionWaitsForCompleteCatalog", &early));
-    assert!(!buggy.check_invariant("EnumerationCannotBeBypassed", &early));
-
-    // NEGATIVE CONTROL 3: a noncanonical maximum cannot be accepted merely because
-    // its numeric vector is newest.
-    let mut noncanonical_bug = buggy.init_state();
-    for action in orders[0] {
-        assert!(buggy.fire(action, &mut noncanonical_bug));
-    }
-    assert!(buggy.fire("ObserveNewerNoncanonical", &mut noncanonical_bug));
-    assert!(buggy.fire("AcceptNoncanonicalAuthority", &mut noncanonical_bug));
-    assert!(!buggy.check_invariant("NoncanonicalMaximumCannotSelect", &noncanonical_bug));
-    assert!(!buggy.check_invariant("NoncanonicalAuthorityCannotBeBypassed", &noncanonical_bug));
-
-    // NEGATIVE CONTROL 4: fetching an older 503 after the verified authority breaks
-    // both the one-manifest budget and the no-historical-fetch obligation.
-    let mut old_503 = buggy.init_state();
-    for action in orders[0] {
-        assert!(buggy.fire(action, &mut old_503));
-    }
-    assert!(buggy.fire("CompleteMetadataArbitration", &mut old_503));
-    assert!(buggy.fire("ExposeOlderUnreadable", &mut old_503));
-    assert!(buggy.fire("FetchAuthoritativeVerified", &mut old_503));
-    assert!(buggy.fire("FetchOlderUnreadable", &mut old_503));
-    assert_eq!(old_503["manifest_fetch_count"], 2);
-    assert!(!buggy.check_invariant("ManifestFetchBudgetIsOne", &old_503));
-    assert!(!buggy.check_invariant("OlderUnreadableIsNeverFetched", &old_503));
-
-    // NEGATIVE CONTROL 5: failure of the authority never authorizes v0.9 fallback.
-    let mut fallback = buggy.init_state();
-    for action in orders[0] {
-        assert!(buggy.fire(action, &mut fallback));
-    }
-    assert!(buggy.fire("CompleteMetadataArbitration", &mut fallback));
-    assert!(buggy.fire("FetchAuthoritativeUnreadable", &mut fallback));
-    assert!(buggy.fire("FallbackAfterFetchFailure", &mut fallback));
-    assert_eq!(fallback["fetched_minor"], 9);
-    assert!(!buggy.check_invariant("AuthorityFailureNeverFallsBack", &fallback));
-    assert!(!buggy.check_invariant("AcceptedUsesAuthoritativeRelease", &fallback));
-
-    // NEGATIVE CONTROL 6: a fetched-but-rejected manifest/signature is equally
-    // authoritative and cannot authorize an older candidate.
-    let mut reject_fallback = buggy.init_state();
-    for action in orders[2] {
-        assert!(buggy.fire(action, &mut reject_fallback));
-    }
-    assert!(buggy.fire("CompleteMetadataArbitration", &mut reject_fallback));
-    assert!(buggy.fire("RejectAuthoritativeManifest", &mut reject_fallback));
-    assert!(buggy.fire("FallbackAfterManifestReject", &mut reject_fallback));
-    assert!(!buggy.check_invariant("AuthorityFailureNeverFallsBack", &reject_fallback));
-
-    // NEGATIVE CONTROL 7: missing/ambiguous signature policy refuses before
-    // transport and may never be repaired by probing an older signed row.
-    let mut signature_fallback = buggy.init_state();
-    assert!(buggy.fire("ConfigureSignatures", &mut signature_fallback));
-    for action in orders[4] {
-        assert!(buggy.fire(action, &mut signature_fallback));
-    }
-    assert!(buggy.fire("CompleteMetadataArbitration", &mut signature_fallback));
-    assert!(buggy.fire(
-        "ObserveMissingAuthoritativeSignature",
-        &mut signature_fallback
-    ));
-    assert!(buggy.fire("RefuseSignaturePolicy", &mut signature_fallback));
-    assert!(buggy.fire("FallbackAfterSignatureRefusal", &mut signature_fallback));
-    assert!(!buggy.check_invariant("AuthorityFailureNeverFallsBack", &signature_fallback));
 }
 
 /// Foreground terminal work is carried across a seamless updater handoff. It
@@ -5490,23 +5358,29 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     );
     let aged = model.successors("Advance", &latched)[0].clone();
     assert_eq!(aged["phase"], 3, "the clock advances under the latch");
-    let lapsed = model.successors("Lapse", &aged)[0].clone();
+    assert!(
+        model.successors("Lapse", &aged).is_empty(),
+        "no lapse before the latch's deadline (plan P0-6)"
+    );
+    let due = model.successors("Due", &aged)[0].clone();
+    let lapsed = model.successors("Lapse", &due)[0].clone();
     assert_eq!(lapsed["latched"], 0);
     assert_eq!(
         lapsed["phase"], 3,
         "the lapse keeps the phase the clock reached"
     );
     assert!(model.check_invariant("TheLadderNeverRestarts", &lapsed));
+    assert!(model.check_invariant("NoEarlyRelease", &lapsed));
     assert_eq!(
         model.successors("Park", &lapsed)[0]["landed"],
         1,
         "and a lapse at Land lands at the next poll"
     );
     assert!(
-        model.successors("LapseRestartsTheLadder", &aged).is_empty(),
+        model.successors("LapseRestartsTheLadder", &due).is_empty(),
         "the healthy ladder has no lapse that restarts it"
     );
-    let restarted = buggy.successors("LapseRestartsTheLadder", &aged)[0].clone();
+    let restarted = buggy.successors("LapseRestartsTheLadder", &due)[0].clone();
     assert_eq!(
         restarted["phase"], 0,
         "the mutant: a 600 s latch bought a fresh ladder"
@@ -5548,6 +5422,131 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     assert_eq!(model.successors("Park", &ended)[0]["landed"], 1);
     let over_dialog = buggy.successors("ParkWithoutTheRule", &warming)[0].clone();
     assert!(!buggy.check_invariant("ParkedOnlyWhenTheLadderAdmits", &over_dialog));
+
+    // The capture-refusal half is walked by its own function, and pinned by
+    // the `assert_proves_and_catches` above (one run per machine: two tests
+    // checking the same machine concurrently race over its emitted module in
+    // the external `ty` tier).
+    ladder_never_retries_a_capture_refusal_as_activity(&model);
+    ladder_keeps_a_latch_across_its_own_bundle_swap(&model, &latched);
+}
+
+/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-6): a physical latch survives the
+/// failed candidate's own bundle swap. On the launched lane the candidate
+/// boot-applies the bundle before it dials, so the reconcile after its failure
+/// retires the download for the installed-bundle activation of the same update.
+/// The healthy lane re-keys the latch and keeps its deadline; the mutant — what
+/// v0.87–v0.91 shipped — clears it, the activation arms half a second later,
+/// and a structural failure's ten-minute confirming retry runs at once.
+/// `NoEarlyRelease` catches it.
+fn ladder_keeps_a_latch_across_its_own_bundle_swap(
+    model: &Model,
+    latched: &aterm_spec::interp::State,
+) {
+    assert_eq!((latched["latched"], latched["due"]), (1, 0));
+    let swapped = model.successors("BundleSwap", latched)[0].clone();
+    assert_eq!(swapped["swapped"], 1);
+    assert_eq!(
+        swapped["latched"], 1,
+        "the swap re-keys the latch, never clears it"
+    );
+    assert!(model.check_invariant("NoEarlyRelease", &swapped));
+    assert!(
+        model.successors("Park", &swapped).is_empty()
+            && model.successors("Lapse", &swapped).is_empty(),
+        "nothing parks and nothing lapses before the deadline"
+    );
+    let due = model.successors("Due", &swapped)[0].clone();
+    let lapsed = model.successors("Lapse", &due)[0].clone();
+    assert_eq!(
+        lapsed["latched"], 0,
+        "the deadline releases it, and only the deadline"
+    );
+    assert!(model.check_invariant("NoEarlyRelease", &lapsed));
+
+    // THE MUTANT: the retirement clears the latch before its deadline.
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
+    assert!(
+        model
+            .successors("BundleSwapClearsLatch", latched)
+            .is_empty(),
+        "the healthy ladder has no swap that clears the latch"
+    );
+    let cleared = buggy.successors("BundleSwapClearsLatch", latched)[0].clone();
+    assert_eq!((cleared["latched"], cleared["due"]), (0, 0));
+    assert!(!buggy.check_invariant("NoEarlyRelease", &cleared));
+    assert!(
+        !buggy.successors("Park", &cleared).is_empty(),
+        "the early release re-opens the park at once — the half-second retry"
+    );
+}
+
+/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-3): a park the capture REFUSES is a
+/// fact about the desk, never about the moment. The healthy ladder answers for
+/// it — the refusing session is carried at a degraded rung and the park lands —
+/// and a refusal is never filed as the machine being busy. The mutant is the
+/// v0.91 shape: the refusal re-filed as a park miss, stood down as activity and
+/// retried every fifteen minutes into the same refusal, with nothing on any
+/// surface. `RefusalNeverRetriesAsActivity` catches it.
+fn ladder_never_retries_a_capture_refusal_as_activity(model: &Model) {
+    // Walk the clock to Land (the phase where nothing else holds a park back)
+    // and let the desk refuse.
+    let mut land = model.init_state();
+    for _ in 0..3 {
+        land = model.successors("Advance", &land)[0].clone();
+    }
+    assert_eq!(land["phase"], 3);
+    let refusing = model.successors("DeskRefuses", &land)[0].clone();
+    assert_eq!(refusing["refusing"], 1);
+    assert!(
+        model.successors("Park", &refusing).is_empty(),
+        "a refusing desk does not park before the capture has answered for it"
+    );
+
+    // The healthy capture answers with a degraded carry, and the park lands.
+    let answered = model.successors("CaptureRefused", &refusing)[0].clone();
+    assert_eq!(answered["degraded"], 1);
+    assert_eq!(answered["refusals"], 0);
+    assert_eq!(
+        answered["quiet"], refusing["quiet"],
+        "never filed as activity"
+    );
+    assert!(model.check_invariant("RefusalNeverRetriesAsActivity", &answered));
+    let landed = model.successors("Park", &answered)[0].clone();
+    assert_eq!(landed["landed"], 1);
+    assert!(model.check_invariant("ParkedOnlyWhenTheLadderAdmits", &landed));
+
+    // A desk that changed invalidates the degraded carry: the next refusal is
+    // answered afresh rather than parked on the old answer.
+    let moved = model.successors("DeskChanges", &answered)[0].clone();
+    assert_eq!((moved["refusing"], moved["degraded"]), (0, 0));
+
+    // The healthy ladder still never wedges before landing.
+    let is_landed = |state: &aterm_spec::interp::State| state["landed"] == 1;
+    assert!(aterm_spec::interp::find_deadlock(model, is_landed).is_none());
+
+    // THE MUTANT: the same refusal re-filed as the machine being busy.
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
+    let mut quiet_refusing = refusing.clone();
+    quiet_refusing.insert("quiet", 1);
+    assert!(
+        model
+            .successors("CaptureRefusedAsActivity", &quiet_refusing)
+            .is_empty(),
+        "the healthy ladder has no refusal it files as activity"
+    );
+    let refiled = buggy.successors("CaptureRefusedAsActivity", &quiet_refusing)[0].clone();
+    assert_eq!(
+        refiled["quiet"], 0,
+        "the mutant reads the refusal as activity"
+    );
+    assert_eq!(refiled["refusals"], 1);
+    assert_eq!(refiled["degraded"], 0, "and never answers for the session");
+    assert!(!buggy.check_invariant("RefusalNeverRetriesAsActivity", &refiled));
+    assert!(
+        buggy.successors("Park", &refiled).is_empty(),
+        "the mutant's refusing desk never parks until the desk itself moves"
+    );
 }
 
 /// A hidden tab may never present after its output wake. Its old latency sample
@@ -8564,7 +8563,7 @@ fn derived_same_caret_typed_echo_requires_exact_oldest_key_and_fresh_probe() {
 }
 
 #[test]
-fn derived_unknown_insert_orphan_key_is_exact_one_shot_and_invalidated() {
+fn derived_unknown_insert_orphan_keys_are_exact_ordered_and_invalidated() {
     let model = unknown_insert_orphan_key_model();
     assert!(
         aterm_spec::xref::model_registry()
@@ -8587,6 +8586,78 @@ fn derived_unknown_insert_orphan_key_is_exact_one_shot_and_invalidated() {
     assert_eq!(exact["generic"], 0, "escrow leaked into generic credits");
     assert_eq!(exact["escrow"], 0, "the key spent more than once");
 
+    let mut two = model.init_state();
+    for action in ["QueueTwo", "LayWithSite", "Cleanup", "ExactNewPrint"] {
+        assert!(model.fire(action, &mut two));
+    }
+    assert_eq!(two["lit"], 1, "the first exact key stayed dark");
+    assert_eq!(two["escrow"], 1, "the second key became generic credit");
+    assert!(model.fire("SecondExactNewPrint", &mut two));
+    assert_eq!(two["lit"], 2, "the second exact key stayed dark");
+    assert_eq!(two["escrow"], 0, "the two-key escrow was spent twice");
+
+    let mut combined = model.init_state();
+    for action in [
+        "QueueTwo",
+        "LayWithSite",
+        "Cleanup",
+        "CoalescedTwoExactNewPrint",
+    ] {
+        assert!(model.fire(action, &mut combined));
+    }
+    assert_eq!(combined["lit"], 2, "the exact two-cell frame stayed dark");
+    assert_eq!(combined["escrow"], 0, "the coalesced keys were reusable");
+    assert_eq!(combined["generic"], 0, "the batch leaked generic credits");
+
+    for refusal in [
+        "CoalescedTwoWrongOrPartial",
+        "CoalescedTwoOldPrint",
+        "CoalescedTwoMissingProbe",
+        "CoalescedTwoAltWithoutBlink",
+    ] {
+        let mut state = model.init_state();
+        for action in ["QueueTwo", "LayWithSite", "Cleanup", refusal] {
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!(state["lit"], 0, "{refusal} claimed the batch");
+        assert_eq!(state["escrow"], 0, "{refusal} retained ambiguity");
+    }
+    let mut no_site = model.init_state();
+    for action in [
+        "QueueTwo",
+        "LayWithoutSite",
+        "Cleanup",
+        "CoalescedTwoExactNewPrint",
+    ] {
+        assert!(model.fire(action, &mut no_site));
+    }
+    assert_eq!(no_site["lit"], 0, "a missing insert site claimed two keys");
+    let mut too_many = model.init_state();
+    for action in ["QueueThree", "LayWithSite", "Cleanup", "CoalescedTooMany"] {
+        assert!(model.fire(action, &mut too_many));
+    }
+    assert_eq!(too_many["lit"], 0, "three queued keys claimed two cells");
+    assert_eq!(too_many["generic"], 0, "third key leaked generic credit");
+
+    for refusal in [
+        "SecondAmbientOtherGlyph",
+        "SecondExactOldPrint",
+        "SecondPrefixRewrite",
+    ] {
+        let mut state = model.init_state();
+        for action in [
+            "QueueTwo",
+            "LayWithSite",
+            "Cleanup",
+            "ExactNewPrint",
+            refusal,
+        ] {
+            assert!(model.fire(action, &mut state));
+        }
+        assert_eq!(state["lit"], 1, "{refusal} claimed the second key");
+        assert_eq!(state["escrow"], 0, "{refusal} kept ambiguous credit");
+    }
+
     for refusal in [
         "AmbientOtherGlyph",
         "ExactOldPrint",
@@ -8602,7 +8673,7 @@ fn derived_unknown_insert_orphan_key_is_exact_one_shot_and_invalidated() {
         assert_eq!(state["lit"], 0, "{refusal} claimed the key");
         assert_eq!(state["escrow"], 0, "{refusal} retained the escrow");
     }
-    for queue in ["QueueNone", "QueueTwo", "QueueBlank"] {
+    for queue in ["QueueNone", "QueueBlank", "QueueThree"] {
         let mut state = model.init_state();
         for action in [queue, "LayWithSite", "Cleanup", "ExactNewPrint"] {
             assert!(model.fire(action, &mut state));

@@ -30,11 +30,10 @@
 //! # Example
 //!
 //! ```text
-//! use aterm_core::platform::{FontProvider, FontDescriptor, StubFontProvider};
+//! use aterm_core::platform::{StubTextShaper, TextShaper};
 //!
-//! let provider = StubFontProvider::new();
-//! let desc = provider.system_monospace();
-//! println!("System font: {} {}pt", desc.family, desc.size);
+//! // 1:1 glyph mapping for a host without a real shaper.
+//! let glyphs = StubTextShaper.shape(&run, &font);
 //! ```
 #![allow(
     clippy::wildcard_imports,
@@ -229,20 +228,6 @@ pub struct PlatformServices {
     pub opener: Arc<dyn Opener>,
 }
 
-impl PlatformServices {
-    /// Create platform services with stub implementations for unit tests.
-    #[cfg(test)]
-    pub(crate) fn stub() -> Self {
-        Self {
-            fonts: Arc::new(StubFontProvider::new()),
-            shaper: Arc::new(StubTextShaper),
-            clipboard: Arc::new(StubClipboard::new()),
-            notifier: Arc::new(StubNotifier),
-            opener: Arc::new(StubOpener),
-        }
-    }
-}
-
 impl std::fmt::Debug for PlatformServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlatformServices").finish_non_exhaustive()
@@ -295,31 +280,6 @@ mod tests {
 
         assert_eq!(italic.weight, 400);
         assert!(italic.italic);
-    }
-
-    #[test]
-    fn test_stub_font_provider() {
-        let provider = StubFontProvider::new();
-        let desc = provider.system_monospace();
-        assert_eq!(desc.family, "SF Mono");
-
-        let font = provider.load_font(&desc).unwrap();
-        // 14.0 * 0.6 = 8.4
-        assert!((font.metrics.cell_width - 8.4).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_stub_clipboard() {
-        let clipboard = StubClipboard::new();
-        clipboard.write("test").unwrap();
-        assert_eq!(clipboard.read(), Some("test".to_string()));
-    }
-
-    #[test]
-    fn test_platform_services_stub() {
-        let services = PlatformServices::stub();
-        let desc = services.fonts.system_monospace();
-        assert_eq!(desc.family, "SF Mono");
     }
 
     #[test]

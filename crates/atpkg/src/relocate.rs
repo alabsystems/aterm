@@ -37,11 +37,11 @@ pub const VENDOR_REL: &str = "lib/atpkg-vendored";
 
 /// A path that hard-codes THIS build machine's layout — the thing relocation
 /// must eliminate from a self-contained bundle. `/home/` covers a Linux
-/// builder's `~/.rustup`; `/Users//` + `/opt/homebrew` cover macOS.
+/// builder's `~/.rustup`; `/Users/` + `/opt/homebrew` cover macOS.
 #[must_use]
 pub fn is_machine_local(path: &str) -> bool {
     path.starts_with("/opt/homebrew")
-        || path.starts_with(concat!("/", "Users", "/"))
+        || path.starts_with("/Users/")
         || path.starts_with("/home/")
         || path.contains("/.rustup/")
         || path.contains("/.cargo/")

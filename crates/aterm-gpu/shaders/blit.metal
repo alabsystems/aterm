@@ -16,10 +16,11 @@ vertex VsOut vs_blit(uint vi [[vertex_id]]) {
     return o;
 }
 
-// std140 twin of the Rust `BlitUniform` — 96 bytes, member for member:
+// std140 twin of the Rust `BlitUniform` — 112 bytes, member for member:
 //   flag 0, overlay 4, border_px 8, encode_srgb 12, accent 16, chrome_y1 28,
 //   dims 32, wash_a 40, border_a 44, band 48, content_off 64, hdr 72,
-//   translucent 76, sdr_white_scale 80, visible_y 84, visible_h 88, premult 92.
+//   translucent 76, sdr_white_scale 80, visible_y 84, visible_h 88, premult 92,
+//   chrome_y0 96, three pads 100..112.
 // Every float4 lands on a 16-byte boundary in BOTH layouts, so MSL's natural
 // constant layout is byte-identical to std140 here and the Rust struct is
 // UNCHANGED from the WGSL era. The accent is a `packed_float3` (12 bytes,
@@ -31,7 +32,7 @@ struct Blit {
     float border_px;    // inset border thickness, device px
     float encode_srgb;  // !=0: re-encode linear->sRGB (downlevel WebGL2 blit)
     packed_float3 accent; // overlay accent rgb, normalized 0..1
-    float chrome_y1;    // source rows [0, chrome_y1) are host chrome: their bands continue the frame's edge pixels
+    float chrome_y1;    // source rows [chrome_y0, chrome_y1) are host chrome: their bands continue the frame's edge pixels
     float2 dims;        // OFFSCREEN frame width,height in px
     float wash_a;       // interior wash alpha 0..1
     float border_a;     // border alpha 0..1
@@ -43,6 +44,10 @@ struct Blit {
     float visible_y;    // first source row exposed by the frontend crop
     float visible_h;    // exposed source height; rows outside are remainder bands
     float premult;      // H1: !=0: multiply output rgb by the emitted alpha
+    float chrome_y0;    // first host-chrome source row (rows above it keep flat bands)
+    float chrome_pad0;  // pad to 112 bytes, matching the Rust/WGSL twins
+    float chrome_pad1;
+    float chrome_pad2;
 };
 
 // Linear-light channel -> sRGB (the standard piecewise encode).
@@ -73,8 +78,9 @@ fragment float4 fs_blit(VsOut in [[stage_in]],
     // CHROME REACHES THE WINDOW EDGE (the WGSL twin's words): beside a
     // host-chrome source row the horizontal remainder bands continue the
     // frame's own edge pixel; still a band pixel — never inverted or washed.
+    // Rows above `chrome_y0` (a surfaceless strip on the padding) keep the band.
     bool chrome_edge = false;
-    if ((p.x < 0.0 || p.x >= b.dims.x) && p.y >= b.visible_y && p.y < min(visible_y1, b.chrome_y1)) {
+    if ((p.x < 0.0 || p.x >= b.dims.x) && p.y >= max(b.visible_y, b.chrome_y0) && p.y < min(visible_y1, b.chrome_y1)) {
         p.x = clamp(p.x, 0.0, b.dims.x - 1.0);
         chrome_edge = true;
     }

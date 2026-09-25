@@ -1590,6 +1590,16 @@ pub(crate) mod test_fixtures {
         "crates/aterm-shell-integration/src",
         "crates/aterm-sixel/src",
         "crates/aterm-suggest/src",
+        // Entered the closure 2026-09-24 with the strain row
+        // (docs/DESIGN-unified-messages-2026-09-21.md §10.14, ruling 210):
+        // aterm-gui's strain host reads the machine through it on its probe
+        // thread. A normal [dependencies] edge, so it is GUI process code.
+        // Reviewed: its only synchronisation is a `OnceLock` over the Mach
+        // host port, whose initialiser is one `mach_host_self()` call and
+        // acquires no other lock, so it can participate in no lock order.
+        // (Its sampler method is `reading()`, not `read()`: a zero-argument
+        // `.read()` is this census's RwLock token.)
+        "crates/aterm-sysprobe/src",
         "crates/aterm-tempfile/src",
         // Entered the closure when the first-party clock replaced
         // `web-time`: aterm-core, -types, -effects, -gpu, -predict,

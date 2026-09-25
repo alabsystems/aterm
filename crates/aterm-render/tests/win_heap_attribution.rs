@@ -145,34 +145,6 @@ fn the_font_seal_reads_each_file_once_and_keeps_one_copy() {
     );
 }
 
-/// The terminal font engine alone: what a `Renderer` holds in an ASCII-only
-/// session, step by step.
-#[test]
-#[ignore = "measurement, not a gate: run alone with --nocapture"]
-fn renderer_startup_heap() {
-    windows_font_bill();
-    heapprof::mark("process start");
-    heapprof::start();
-
-    let Some(mut r) = heapprof::bill("Renderer::from_system", || {
-        Renderer::from_system(14.0, Theme::default())
-    }) else {
-        eprintln!("SKIP: no system font");
-        return;
-    };
-    heapprof::mark("from_system (primary parsed)");
-
-    heapprof::bill("seal_admitted_font_sources", || {
-        r.seal_admitted_font_sources()
-    });
-    heapprof::mark("seal_admitted_font_sources");
-
-    heapprof::bill("one ASCII frame", || ascii_frame(&mut r));
-    heapprof::mark("one ASCII frame");
-
-    heapprof::report("renderer, ASCII-only, settled", 30);
-}
-
 /// The WHOLE font stack a windowed aterm builds, in the order it builds it:
 /// the terminal engine, then the GUI chrome's faces (`tray_raster`), then the
 /// two background warms (`warm_font_coverage_index`, the font catalogue).

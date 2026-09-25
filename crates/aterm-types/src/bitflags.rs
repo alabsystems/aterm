@@ -248,19 +248,50 @@ mod tests {
         }
     }
 
+    /// Every constructor and operator, as the bits it must produce. A generated
+    /// flag type is only as sound as these: `!` and `from_bits_truncate` must
+    /// drop undefined bits, and only `from_bits_retain` may keep them.
     #[test]
-    fn test_empty() {
-        let f = TestFlags::empty();
-        assert!(f.is_empty());
-        assert_eq!(f.bits(), 0);
-    }
-
-    #[test]
-    fn test_constants() {
-        assert_eq!(TestFlags::A.bits(), 1);
-        assert_eq!(TestFlags::B.bits(), 2);
-        assert_eq!(TestFlags::C.bits(), 4);
-        assert_eq!(TestFlags::AB.bits(), 3);
+    fn operations_produce_expected_bits() {
+        use TestFlags as F;
+        let assigned = |mut f: F, op: fn(&mut F)| {
+            op(&mut f);
+            f
+        };
+        for (what, flags, bits) in [
+            ("empty", F::empty(), 0),
+            ("A", F::A, 1),
+            ("B", F::B, 2),
+            ("C", F::C, 4),
+            ("AB", F::AB, 3),
+            ("union", F::A.union(F::C), 5),
+            ("intersection", (F::A | F::B).intersection(F::AB), 3),
+            ("difference", F::AB.difference(F::A), 2),
+            // Must not set undefined bits (bits 3-7 of u8).
+            ("not A", !F::A, 0b0000_0110),
+            ("not empty", !F::empty(), 0b0000_0111),
+            ("from_bits_truncate", F::from_bits_truncate(0xFF), 0x07),
+            ("from_bits_retain", F::from_bits_retain(0xFF), 0xFF),
+            ("|=", assigned(F::A, |f| *f |= F::B), 3),
+            ("&=", assigned(F::AB, |f| *f &= F::A), 1),
+            ("^", F::AB ^ F::A, 2),
+            ("-", F::AB - F::A, 2),
+            ("-=", assigned(F::AB, |f| *f -= F::A), 2),
+        ] {
+            assert_eq!(flags.bits(), bits, "{what}");
+        }
+        for (what, holds) in [
+            ("empty is empty", F::empty().is_empty()),
+            ("not empty is all", (!F::empty()).is_all()),
+            ("A|B|C is all", (F::A | F::B | F::C).is_all()),
+            ("from_bits keeps defined bits", F::from_bits(0x07).is_some()),
+            (
+                "from_bits rejects unknown bits",
+                F::from_bits(0xFF).is_none(),
+            ),
+        ] {
+            assert!(holds, "{what}");
+        }
     }
 
     #[test]
@@ -278,24 +309,6 @@ mod tests {
         assert!(f.intersects(TestFlags::A));
         assert!(!f.intersects(TestFlags::B));
         assert!(f.intersects(TestFlags::AB));
-    }
-
-    #[test]
-    fn test_union() {
-        let f = TestFlags::A.union(TestFlags::C);
-        assert_eq!(f.bits(), 5);
-    }
-
-    #[test]
-    fn test_intersection() {
-        let f = (TestFlags::A | TestFlags::B).intersection(TestFlags::AB);
-        assert_eq!(f, TestFlags::AB);
-    }
-
-    #[test]
-    fn test_difference() {
-        let f = TestFlags::AB.difference(TestFlags::A);
-        assert_eq!(f, TestFlags::B);
     }
 
     #[test]
@@ -318,82 +331,5 @@ mod tests {
         assert!(f.contains(TestFlags::C));
         f.set(TestFlags::C, false);
         assert!(!f.contains(TestFlags::C));
-    }
-
-    #[test]
-    fn test_not_truncates_to_defined_bits() {
-        let f = !TestFlags::A;
-        assert!(!f.contains(TestFlags::A));
-        assert!(f.contains(TestFlags::B));
-        assert!(f.contains(TestFlags::C));
-        // Must not set undefined bits (bits 3-7 of u8).
-        assert_eq!(f.bits(), 0b0000_0110);
-    }
-
-    #[test]
-    fn test_not_empty_is_all() {
-        let f = !TestFlags::empty();
-        assert!(f.is_all());
-        assert_eq!(
-            f.bits(),
-            TestFlags::A.bits() | TestFlags::B.bits() | TestFlags::C.bits() | TestFlags::AB.bits()
-        );
-    }
-
-    #[test]
-    fn test_from_bits_truncate() {
-        let f = TestFlags::from_bits_truncate(0xFF);
-        assert_eq!(f.bits(), 0x07);
-    }
-
-    #[test]
-    fn test_from_bits_retain() {
-        let f = TestFlags::from_bits_retain(0xFF);
-        assert_eq!(f.bits(), 0xFF);
-    }
-
-    #[test]
-    fn test_from_bits_rejects_unknown() {
-        assert!(TestFlags::from_bits(0x07).is_some());
-        assert!(TestFlags::from_bits(0xFF).is_none());
-    }
-
-    #[test]
-    fn test_is_all() {
-        let f = TestFlags::A | TestFlags::B | TestFlags::C;
-        assert!(f.is_all());
-    }
-
-    #[test]
-    fn test_bitor_assign() {
-        let mut f = TestFlags::A;
-        f |= TestFlags::B;
-        assert_eq!(f, TestFlags::AB);
-    }
-
-    #[test]
-    fn test_bitand_assign() {
-        let mut f = TestFlags::AB;
-        f &= TestFlags::A;
-        assert_eq!(f, TestFlags::A);
-    }
-
-    #[test]
-    fn test_bitxor() {
-        let f = TestFlags::AB ^ TestFlags::A;
-        assert_eq!(f, TestFlags::B);
-    }
-
-    #[test]
-    fn test_sub_operator() {
-        let f = TestFlags::AB - TestFlags::A;
-        assert_eq!(f, TestFlags::B);
-    }
-
-    #[test]
-    fn test_sub_assign() {
-        let mut f = TestFlags::AB;
-        f -= TestFlags::A;
-        assert_eq!(f, TestFlags::B);
     }
 }

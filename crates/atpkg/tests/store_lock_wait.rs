@@ -816,9 +816,9 @@ fn a_declined_seed_without_contention_is_unchanged() {
 const NOTHING_TO_UPDATE: &str = "nothing installed to update";
 
 /// A FULL PASS THAT QUEUED BEHIND ANOTHER STANDS DOWN BEHIND ITS END, WHATEVER IT WAS
-/// (2026-09-24). The holder records a FAILED full pass — rate-limited, with a reset — while
-/// the child waits; once it lets go, the child does not run the pass again back to back (a
-/// metered listing inside the reset just recorded): it says the holder's failure on stderr,
+/// (2026-09-24). The holder records a FAILED full pass while the child waits; once it lets
+/// go, the child does not run the pass again back to back: it says the holder's failure on
+/// stderr,
 /// in the holder's own sentence, exits 1 so its window's ladder retries it, and records
 /// nothing of its own. Until then only a success stood it down.
 #[test]
@@ -828,23 +828,19 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
     let guard = fx.hold();
     let mut child = stream(fx.spawn(&["update", "--wait-lock", "60"]));
     child.wait_for_line(&waiting_line(), ANNOUNCE_WITHIN);
-    // A second past now: strictly after the child's first contended poll.
+    // Stamped in the very second the child found the lock held: a clock cannot tell that
+    // end from one before the wait (the child ran back to back until 2026-09-24); the
+    // store's full-pass count, which the child read before its first attempt, can.
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let ended = aterm_types::rfc3339::format_rfc3339(unix + 1);
+    let ended = aterm_types::rfc3339::format_rfc3339(unix);
     let layout = fx.layout();
     let mut record = atpkg::status::read(&layout).unwrap_or_default();
-    record.outcome = "update failed: the index listing was refused (rate limited)".into();
+    record.outcome = "update failed: the release host answered HTTP 503 (unavailable)".into();
     atpkg::status::write(&layout, &record).unwrap();
-    atpkg::status::stamp_pass_end(
-        &layout,
-        &ended,
-        PassOutcome::Failed,
-        atpkg::status::MeteredHold::Until(i64::try_from(unix + 1800).unwrap()),
-    )
-    .unwrap();
+    atpkg::status::stamp_pass_end(&layout, &ended, PassOutcome::Failed).unwrap();
     drop(guard);
     let (status, _, stdout, stderr) = child.finish(Duration::from_secs(20));
     assert_eq!(
@@ -855,7 +851,7 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
     assert!(
         stderr.contains("failed")
             && stderr.contains("while this one waited")
-            && stderr.contains("(rate limited)"),
+            && stderr.contains("(unavailable)"),
         "the holder's failure, in its own sentence: {stderr}"
     );
     assert!(

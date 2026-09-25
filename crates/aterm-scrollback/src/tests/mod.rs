@@ -13,6 +13,7 @@ mod decompression;
 mod image_horizon;
 mod line_limit;
 mod memory_budget;
+mod proptests;
 mod repaired_trimmed;
 mod threading;
 mod truncation;

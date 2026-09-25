@@ -8,12 +8,9 @@
 //! trust/trust-mc/ay/clean tuple) move **atomically**; a program with no group applies
 //! **independently** so one tiny tool can never wedge the trust update.
 //!
-//! [`plan_groups`] partitions a channel's pinned programs into groups (pure) and orders
-//! them DEPENDENCY-FIRST over the index's `requires` relation (§17.10): a group carrying
-//! a requirement follows the group that provides it, with the partition's own order —
-//! named groups by name, then singletons by name — as the stable tiebreak; a group's
-//! requirements are the union of its members' ([`group_requires`]), since the tuple
-//! installs as one unit. [`transact`]
+//! [`plan_groups`] partitions a channel's pinned programs into groups (pure): named groups
+//! by name, then singletons by name. (The index-level `requires` ordering went with the
+//! OS-installer protocols it served, design 2026-09-22 §5.3(b), 2026-09-24.) [`transact`]
 //! runs one group as an all-or-nothing transaction over **injected** stage/flip/rollback
 //! actions, so the sequencing is unit-tested without any network or filesystem:
 //!
@@ -44,13 +41,12 @@ pub struct Group {
     pub members: Vec<String>,
 }
 
-/// Partition a channel's pinned programs into coherence groups (§7) and order them
-/// dependency-first (§17.10). A pinned program the index does not name is excluded
-/// (reachability, §5), and so is a vendor-direct program: its vendor lane owns it, and a
-/// legacy pin must never downgrade or tombstone the build that lane installed. Grouped members are gathered by their `coherence_group`; ungrouped
+/// Partition a channel's pinned programs into coherence groups (§7). A pinned program the
+/// index does not name is excluded (reachability, §5), and so is a vendor-direct program:
+/// its vendor lane owns it, and a legacy pin must never downgrade or tombstone the build
+/// that lane installed. Grouped members are gathered by their `coherence_group`; ungrouped
 /// programs become singleton groups. Deterministic order: named groups first (by name),
-/// then ungrouped singletons, members sorted — and then [`order_by_requires`] moves every
-/// group behind the groups it requires, that partition order as the stable tiebreak.
+/// then ungrouped singletons, members sorted.
 #[must_use]
 pub fn plan_groups(index: &Index, channel: &Channel) -> Vec<Group> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -83,68 +79,7 @@ pub fn plan_groups(index: &Index, channel: &Channel) -> Vec<Group> {
         group: None,
         members: vec![m],
     }));
-    order_by_requires(index, out)
-}
-
-/// A group's requirements as ONE unit: the union of its members' `requires`
-/// ([`crate::manifest::Program::requires`]) in member order, deduplicated, MINUS the
-/// members themselves — a dependency inside an atomic tuple is satisfied by the tuple's
-/// own transaction. What the plan orders on, what the priority queue pulls ahead of a
-/// bumped group, and what the pass checks before starting the group.
-#[must_use]
-pub fn group_requires(index: &Index, group: &Group) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for m in &group.members {
-        let Some(p) = index.program(m) else {
-            continue;
-        };
-        for dep in &p.requires {
-            if !group.members.contains(dep) && !out.contains(dep) {
-                out.push(dep.clone());
-            }
-        }
-    }
     out
-}
-
-/// Dependency-first over `plan`: a group is emitted only once every group carrying one of
-/// its requirements has been (Kahn's algorithm, first-ready-in-plan-order wins), so plan
-/// order is the stable tiebreak and a plan with no `requires` comes back untouched. A
-/// requirement OUTSIDE the plan (not pinned, or not named) constrains nothing here — the
-/// pass's requirement gate decides what to do about it. A cycle cannot reach this
-/// function (index parse refuses one, [`crate::manifest::validate_requires`]); were one
-/// to, the first remaining group in plan order is emitted and the walk goes on, so the
-/// output is always a PERMUTATION of the input — never lost work.
-fn order_by_requires(index: &Index, plan: Vec<Group>) -> Vec<Group> {
-    let position: BTreeMap<&str, usize> = plan
-        .iter()
-        .enumerate()
-        .flat_map(|(i, g)| g.members.iter().map(move |m| (m.as_str(), i)))
-        .collect();
-    let deps: Vec<Vec<usize>> = plan
-        .iter()
-        .enumerate()
-        .map(|(i, g)| {
-            group_requires(index, g)
-                .iter()
-                .filter_map(|d| position.get(d.as_str()).copied())
-                .filter(|&j| j != i)
-                .collect()
-        })
-        .collect();
-    let n = plan.len();
-    let mut emitted = vec![false; n];
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    while order.len() < n {
-        let ready = (0..n).find(|&i| !emitted[i] && deps[i].iter().all(|&j| emitted[j]));
-        let Some(i) = ready.or_else(|| (0..n).find(|&i| !emitted[i])) else {
-            break;
-        };
-        emitted[i] = true;
-        order.push(i);
-    }
-    let mut slots: Vec<Option<Group>> = plan.into_iter().map(Some).collect();
-    order.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
 /// The result of applying one group transactionally.
@@ -163,15 +98,6 @@ pub enum TxnOutcome {
     /// staged or flipped. Constructed by [`crate::flow`]'s group apply directly —
     /// [`transact`] never returns it.
     Pinned(Vec<String>),
-    /// The group is held on its current builds because one of its `requires` is NOT met
-    /// (§17.10): `dep` is not installed, dev-linked, system-satisfied or installed through
-    /// its protocol, and `dep_state` is the dependency's own canonical row — the two
-    /// halves of the `blocked by <dep>: <dep state>` state the caller records. A DEFERRAL,
-    /// never a failure: nothing was resolved, downloaded, staged or flipped, and the next
-    /// pass retries. Constructed by [`crate::flow`]'s group transaction directly (the
-    /// requirement gate, [`crate::requires::unmet_requirement`]) — [`transact`] never
-    /// returns it.
-    Blocked { dep: String, dep_state: String },
     /// The group is held on its current builds because `member`'s pinned `build` publishes
     /// no artifact for `triple` — a tuple that cannot fully exist on this host is a correct
     /// state, not a failure, so nothing is staged or flipped and the next pass retries.
@@ -264,13 +190,7 @@ mod tests {
     use crate::sig::testkit;
 
     fn index_with_groups() -> Index {
-        index_with_requires("", "", "")
-    }
-
-    /// [`index_with_groups`] with a `requires = […]` line under trust / ay / ny, plus a
-    /// `clt` and a `brew` that requires it (unpinned unless a channel pins them).
-    fn index_with_requires(trust: &str, ay: &str, ny: &str) -> Index {
-        let body = format!(
+        let body = String::from(
             r#"
 schema = 2
 index_build = 41
@@ -280,24 +200,16 @@ roster_seq = 3
 [programs.trust]
 repo = "trust"
 coherence_group = "rustc"
-{trust}
 [programs.ay]
 repo = "ay"
 coherence_group = "rustc"
-{ay}
 [programs.ny]
 repo = "ny"
-{ny}
-[programs.clt]
-repo = "clt"
-[programs.brew]
-repo = "brew"
-requires = ["clt"]
 [programs.claude]
 repo = "aterm"
 [programs.codex]
 repo = "aterm"
-"#
+"#,
         );
         // Machine-signed through the real roster chain: `VerifiedBytes` still has no
         // public constructor, so a fixture index must be signed like a published one.
@@ -357,60 +269,6 @@ repo = "aterm"
             .flat_map(|g| g.members)
             .collect();
         assert_eq!(planned, ["ny"]);
-    }
-
-    /// The plan is DEPENDENCY-FIRST (§17.10): a group follows every group it requires —
-    /// the union of its members' `requires` counts for a tuple — with the partition's own
-    /// order (named groups, then singletons, by name) as the stable tiebreak; a
-    /// requirement outside the plan constrains nothing; and a plan with no `requires` is
-    /// exactly the partition.
-    #[test]
-    fn plan_groups_orders_requirements_first_with_plan_order_as_the_tiebreak() {
-        let names = |groups: &[Group]| -> Vec<String> {
-            groups
-                .iter()
-                .map(|g| g.group.clone().unwrap_or_else(|| g.members[0].clone()))
-                .collect()
-        };
-        // Only brew's `clt` edge among the pinned: the partition order stands except
-        // that brew follows clt.
-        let idx = index_with_groups();
-        let ch = channel(&[("trust", 1), ("ay", 1), ("ny", 1), ("brew", 1), ("clt", 1)]);
-        assert_eq!(
-            names(&plan_groups(&idx, &ch)),
-            ["rustc", "clt", "brew", "ny"]
-        );
-        // ny requires trust: rustc already precedes ny — untouched.
-        let idx = index_with_requires("", "", "requires = [\"trust\"]");
-        let ch = channel(&[("trust", 1), ("ay", 1), ("ny", 1)]);
-        assert_eq!(names(&plan_groups(&idx, &ch)), ["rustc", "ny"]);
-        // trust requires ny: the WHOLE rustc tuple now follows ny.
-        let idx = index_with_requires("requires = [\"ny\"]", "", "");
-        let plan = plan_groups(&idx, &ch);
-        assert_eq!(names(&plan), ["ny", "rustc"]);
-        assert_eq!(
-            group_requires(&idx, &plan[1]),
-            vec!["ny".to_string()],
-            "the tuple's requirement is the union of its members'"
-        );
-        // A requirement INSIDE the tuple (ay requires trust) is not a group requirement
-        // and moves nothing; one outside the plan (trust requires clt, clt unpinned)
-        // moves nothing either.
-        let idx = index_with_requires("requires = [\"clt\"]", "requires = [\"trust\"]", "");
-        let plan = plan_groups(&idx, &ch);
-        assert_eq!(names(&plan), ["rustc", "ny"]);
-        assert_eq!(group_requires(&idx, &plan[0]), vec!["clt".to_string()]);
-        // Stable tiebreak with a chain: brew → clt, ny → brew; singletons are brew, clt,
-        // ny by name, and the order becomes clt, brew, ny — every step the first READY
-        // group in plan order.
-        let idx = index_with_requires("", "", "requires = [\"brew\"]");
-        let ch = channel(&[("brew", 1), ("clt", 1), ("ny", 1)]);
-        assert_eq!(names(&plan_groups(&idx, &ch)), ["clt", "brew", "ny"]);
-        // The output is always a permutation of the partition.
-        let ch = channel(&[("trust", 1), ("ay", 1), ("ny", 1), ("brew", 1), ("clt", 1)]);
-        let mut a = names(&plan_groups(&idx, &ch));
-        a.sort();
-        assert_eq!(a, ["brew", "clt", "ny", "rustc"]);
     }
 
     fn d(name: &str, dec: ApplyDecision) -> (String, ApplyDecision) {

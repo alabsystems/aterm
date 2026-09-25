@@ -61,7 +61,7 @@ font8x8 = { workspace = true }
 # The ty models the sparkle tests run (identity episodes, flash limiter).
 aterm-spec = { workspace = true }
 # Atlas PNG dumps for visual iteration (`ATERM_CAT_ART_DUMP_DIR` in
-# tests/cat_art_quality.rs, `PET_LOD_DUMP_DIR` in src/pet_baker.rs); dev-only.
+# tests/cat_art_quality.rs); dev-only.
 # (The `ATERM_CAT_DUMP` this comment used to name was never implemented.)
 aterm-png = { workspace = true }
 # The per-frame effect benchmarks. Until these landed the crate had NO bench

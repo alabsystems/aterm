@@ -615,22 +615,9 @@ pub(crate) fn report_done(r: &atpkg_keys::provision::Report) -> Vec<(String, Str
         );
     }
     out.push(("roster".to_string(), roster));
-    if let Some((head_id, head_key)) = &r.seeded_head {
-        out.push((
-            String::new(),
-            format!(
-                "'{head_id}' = the incumbent keyset head ({head_key}); rename only now, via \
-                 --head-id — roster ids are revoke-only later"
-            ),
-        ));
-    }
     out.push((
-        "keyset".to_string(),
-        format!(
-            "pins::UPDATE_CHANNEL_PUBKEYS unchanged ({}) — the roster authorizes '{}'",
-            r.channel_after.len(),
-            r.id
-        ),
+        "authority".to_string(),
+        format!("the master-signed roster authorizes '{}'", r.id),
     ));
     out
 }
@@ -666,46 +653,14 @@ pub(crate) fn report_next_before_cut(r: &atpkg_keys::provision::Report) -> Vec<S
     out
 }
 
-/// The mint's NEXT steps that follow the dry run: distribute the roster, and who may sign
-/// a REAL cut.
-///
-/// The head-key requirement sits directly under the copy step so the two read as one
-/// escalation. It used to be `render_report`'s step 1 while the last line on the screen —
-/// `READY TO CUT — next: targo --unverified ship cut --dry-run …` — named neither the head key nor the
-/// flag. Both were true and they looked like a disagreement, and the last one is the one a
-/// stressed operator copies.
+/// The mint's NEXT step that follows the dry run: distribute the roster.
 #[cfg(unix)]
 pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<String> {
-    let mut out = vec![format!(
+    vec![format!(
         "copy {} + .sig to every other publishing machine — a cut from an older roster is \
          refused",
         r.paths.roster
-    )];
-    if r.machine_is_committed_head {
-        out.push(format!(
-            "a REAL cut may be signed here — '{}' holds the committed keyset head, the one \
-             key pre-roster clients verify",
-            r.id
-        ));
-    } else if let Some(head) = r.channel_after.first() {
-        // V5: the caveat rides the step it guards, indented under it, rather than
-        // floating in a paragraph five lines from the command it qualifies.
-        let mut line = format!(
-            "a REAL cut must be signed by the head key {head}:\n  \
-             run it on that machine, or from '{}' with --strand-pre-roster-clients (asserts \
-             no pre-roster client is left to strand)",
-            r.id
-        );
-        if let Some((head_id, _)) = &r.seeded_head {
-            line.push_str(&format!(
-                "\n  that machine's roster id is '{head_id}', and its profile must set \
-                 machine_id = \"{head_id}\" — a declared id that contradicts the roster \
-                 refuses the cut"
-            ));
-        }
-        out.push(line);
-    }
-    out
+    )]
 }
 
 /// The product's spelling of the release verbs in every remedy this audit prints.
@@ -714,7 +669,7 @@ pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<St
 /// (`command -v cargo` → nothing), so a copyable `cargo ship …` line was a command that
 /// did not exist on the machine the audit had just called READY TO CUT. `.cargo/config.toml`
 /// sets `-Ztrust-verify=off` workspace-wide, so targo needs its explicit lane flag.
-pub(crate) const SHIP: &str = "targo --unverified ship";
+pub(crate) const SHIP: &str = crate::publish::SHIP_COMMAND;
 
 /// The one line an operator copies off a READY TO CUT transcript. It RUNS as printed:
 /// the profile path is the real one the audit resolved, never a `<profile>` placeholder.
@@ -790,14 +745,8 @@ fn close(c: Closing<'_>) -> Result<()> {
     }
 
     // ---- NEXT -------------------------------------------------------------------
-    // One list, because there used to be two answers to "how do I cut?" five lines apart:
-    // the mint's own step 1 named the head key and `--strand-pre-roster-clients`, and the
-    // last line on the screen said `READY TO CUT — next: … ship cut --dry-run …` with
-    // neither. Both were true and they looked like a disagreement — and the LAST one is
-    // the one a stressed operator copies, which makes dropping `--dry-run` from it the
-    // obvious next move. So: the dry run is step 1, printed once; the head-key
-    // requirement is step 3, adjacent, so the two read as one escalation; and the verdict
-    // banner is the bare word.
+    // One list, so there is one answer to "how do I cut?": the dry run is step 1, printed
+    // once, and the verdict banner is the bare word.
     let mut next: Vec<String> = Vec::new();
     if let Some(r) = c.report {
         next.extend(report_next_before_cut(r));
@@ -908,8 +857,7 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provisi
         // This is the checkout's own discovered anchor, not another tree's.
         pins_explicit: false,
     };
-    let pre =
-        prov::preflight(prov::Verb::Join, id, prov::DEFAULT_HEAD_ID, &paths).map_err(Error::new)?;
+    let pre = prov::preflight(prov::Verb::Join, id, &paths).map_err(Error::new)?;
     let phrase = prompt_master_with_retries()?;
     let seed = phrase.seed();
     // The fingerprint is printed HERE and nowhere else. It used to be printed on the way
@@ -1466,7 +1414,7 @@ fn print_check(label: &str, c: &Check) {
 }
 
 /// The Trust stage2 toolchain, proven by the same probe a cut runs: resolve it
-/// (atpkg store → `$HOME/trust` → `TRUST_STAGE2_BIN`), run `trustc --version`, then
+/// (`gates::trust_stage2_bin`'s one order), run `trustc --version`, then
 /// smoke-COMPILE a probe under the exact native-lane rustflags.
 ///
 /// Returns the stage2 `bin` dir beside the verdict, because the two checks that follow

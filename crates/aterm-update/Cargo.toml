@@ -42,12 +42,7 @@ aterm-update-core = { workspace = true }
 # Route updater diagnostics through the global logger aterm-gui installs, so they
 # land in the app log file (visible for a Finder-launched .app, unlike stderr).
 aterm-log = { workspace = true }
-# Ed25519 verification of the OPTIONAL signed update manifest (the Apple-free "signed
-# channel" tier — a repo-write attacker can't forge a manifest without the offline
-# private key). Verify-only, so no `alloc`; the SAME primitive atpkg pins (§8). The
-# default (no pinned pubkey) tier needs no crypto — it stays sha256 + repo-trust.
-ring = { version = "0.17.14", default-features = false }
-# Decode the base64-pinned Ed25519 public key (32 raw bytes), same as atpkg.
+# Decode the base64-pinned paper master (32 raw bytes) for its fingerprint.
 # Standard padded Base64 — first-party, zero-dependency, and held byte-identical
 # to the retired `base64` package's `general_purpose::STANDARD` engine by
 # `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
@@ -67,8 +62,8 @@ aterm-uds = { workspace = true }
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Signing side (Ed25519KeyPair::from_seed_unchecked + .sign) for the sig unit tests;
-# default features pull in ring's `alloc` (test build only). Mirrors atpkg's sig tests.
+# Signing side (Ed25519KeyPair::from_seed_unchecked + .sign) for the roster-chain
+# fixtures; the verifying side is `aterm_update_core::roster`'s.
 ring = { version = "0.17.14" }
 # Tier-1 binds the real updater reducers to their single-source derived models;
 # production builds retain no spec dependency.

@@ -54,6 +54,8 @@
 //! but the bytes behind it are now the lean app — nothing ever required them
 //! to be seeded.
 
+use std::path::{Path, PathBuf};
+
 use crate::ledger::{Error, Result};
 use crate::manifest_out;
 use crate::publish::{DurablePostDecision, durable_post_decision};
@@ -364,7 +366,8 @@ pub fn validate_mirror_asset_set_with_linux(
     for src in SOURCE_ATTESTATION_ASSETS {
         if names.iter().filter(|n| n.as_str() == src).count() > 1 {
             return Err(Error::new(format!(
-                "mirrored release carries a duplicated source-attestation asset                  {src:?} — the client's unique_asset_index refuses duplicates"
+                "mirrored release carries a duplicated source-attestation asset {src:?} — the \
+                 client's unique_asset_index refuses duplicates"
             )));
         }
     }
@@ -429,6 +432,215 @@ pub fn mirror_plan(create_issued: bool, observed_draft: Option<bool>) -> MirrorP
             _ => MirrorPlan::ConvergePublished,
         },
     }
+}
+
+/// Where an asset goes in the upload order onto the channel release: every other
+/// asset first (rank 0), then the appcast's detached signature (1), then the appcast
+/// itself (2).
+///
+/// The appcast is what makes a release a channel head a client can elect, so it
+/// lands after every byte it names; its signature lands before it, so no client can
+/// ever read an appcast whose signature is not there yet (a client with the channel
+/// key pinned refuses exactly that head). On a draft nobody can see either, and the
+/// order costs nothing; on an adopted release it is the only thing standing between
+/// a client and a half-published head.
+#[must_use]
+pub fn channel_upload_rank(name: &str) -> u8 {
+    if name == manifest_out::MANIFEST_SIG_ASSET {
+        1
+    } else if name == manifest_out::MANIFEST_ASSET {
+        2
+    } else {
+        0
+    }
+}
+
+/// What the release under this cut's tag on the public channel is, when the journal
+/// holds no intent for it (`step_mirror`'s `ConvergePublished` arm with no durable
+/// create intent) — decided by [`classify_unclaimed_channel_release`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnclaimedChannelRelease {
+    /// The engine's SOURCE release: nothing on it but the source attestation pair and
+    /// the roster pair (which the source publish uploads too, so it cannot
+    /// discriminate). `pub publish` creates it before every cut.
+    Source,
+    /// THIS cut's own release: every app asset on it is one this cut publishes and is
+    /// byte-identical to this cut's artifact in `dist/` — whose appcast names this
+    /// cut's build and commit, so the bytes are the proof of ownership, whoever
+    /// uploaded them. A lost-machine recovery meets exactly this: its reconstructed
+    /// journal holds no channel intent.
+    Own,
+    /// Anything else, and why. Adopting it would publish someone else's bytes as this
+    /// cut.
+    Foreign(String),
+}
+
+/// Classify a visible release under this cut's tag that the journal holds no intent
+/// for. `names` is its asset listing; `elected` the set this cut publishes
+/// ([`required_asset_names`]); `ours(name)` the byte verdict for one app asset —
+/// `Ok(())` when the release's object is byte-identical to this cut's artifact,
+/// `Err(why)` otherwise.
+///
+/// The source shapes (the attestation pair and the roster pair) never decide
+/// anything. Every other asset must be a name this cut publishes — checked for ALL of
+/// them before `ours` is asked once, so a foreign name costs no download — and then
+/// byte-identical to this cut's artifact. `ours` is never asked for a source release.
+pub fn classify_unclaimed_channel_release(
+    names: &[String],
+    elected: &[String],
+    mut ours: impl FnMut(&str) -> std::result::Result<(), String>,
+) -> UnclaimedChannelRelease {
+    let source_shape = |name: &str| {
+        SOURCE_ATTESTATION_ASSETS.contains(&name)
+            || name == aterm_update_core::roster::ROSTER_ASSET
+            || name == aterm_update_core::roster::ROSTER_SIG_ASSET
+    };
+    let app: Vec<&String> = names.iter().filter(|name| !source_shape(name)).collect();
+    if app.is_empty() {
+        return UnclaimedChannelRelease::Source;
+    }
+    if let Some(stray) = app.iter().find(|name| !elected.contains(name)) {
+        return UnclaimedChannelRelease::Foreign(format!(
+            "it carries {stray}, which this cut does not publish"
+        ));
+    }
+    for name in app {
+        if let Err(why) = ours(name) {
+            return UnclaimedChannelRelease::Foreign(format!(
+                "{name} is not this cut's artifact ({why})"
+            ));
+        }
+    }
+    UnclaimedChannelRelease::Own
+}
+
+/// One field of the head PATCH, typed the way `gh api` sends it: `-F` for a JSON
+/// boolean, `-f` for a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadPatchValue {
+    Bool(bool),
+    Str(&'static str),
+}
+
+/// THE HEAD PATCH BODY — `PATCH /repos/{channel}/releases/{id}`, the one request that
+/// makes this cut's release the channel head ([`ChannelRelease::make_head`]). Every
+/// field is load-bearing:
+///
+/// * `draft=false` publishes a draft this cut created;
+/// * `prerelease=false` turns the engine's source PRERELEASE into a full release —
+///   GitHub never lets a prerelease hold `latest`, so without it `make_latest` moves
+///   nothing on the adopt path and the pointer gate refuses the cut;
+/// * `make_latest="true"` moves `latest` to this release (a STRING enum on GitHub's
+///   API, `"true" | "false" | "legacy"`, hence `-f`).
+///
+/// The live PATCH ([`head_patch_argv`]) and the fake GitHub in
+/// `tests/channel_latest.rs` both read this table, so a field dropped here is dropped
+/// from the tests too — and the adopt-path proof fails at the pointer gate.
+pub const HEAD_PATCH: [(&str, HeadPatchValue); 3] = [
+    ("draft", HeadPatchValue::Bool(false)),
+    ("prerelease", HeadPatchValue::Bool(false)),
+    ("make_latest", HeadPatchValue::Str("true")),
+];
+
+/// The `gh` argv that sends [`HEAD_PATCH`] to `endpoint` (`repos/{slug}/releases/{id}`).
+#[must_use]
+pub fn head_patch_argv(endpoint: &str) -> Vec<String> {
+    let mut argv: Vec<String> = ["api", "--method", "PATCH", endpoint]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+    for (name, value) in HEAD_PATCH {
+        let (flag, value) = match value {
+            HeadPatchValue::Bool(value) => ("-F", value.to_string()),
+            HeadPatchValue::Str(value) => ("-f", value.to_string()),
+        };
+        argv.push(flag.to_string());
+        argv.push(format!("{name}={value}"));
+    }
+    argv
+}
+
+/// The remote half of putting one cut onto its release on the public channel — every
+/// call that talks to GitHub — so that [`publish_on_channel`] can fix their ORDER in
+/// one place and a fake GitHub can prove it (`tests/channel_latest.rs`).
+pub trait ChannelRelease {
+    /// Converge one asset onto the release under a durable one-shot upload intent,
+    /// re-downloaded and proved byte-identical to the local file.
+    fn upload(&mut self, file: &Path) -> Result<()>;
+    /// From a fresh listing: the release carries exactly the asset set the deployed
+    /// updater elects, each byte-identical to this cut's artifact.
+    fn prove_assets(&mut self) -> Result<()>;
+    /// The fleet's floors, read from what the channel serves NOW: the channel head
+    /// (the release the evergreen pointer names) is this cut or OLDER than it, and
+    /// its machine-roster generation is one this cut's roster covers. A cut owns
+    /// `latest`; it never takes it from a newer release, and never makes a head of a
+    /// roster the fleet has moved past.
+    fn ratchet(&mut self) -> Result<()>;
+    /// Bind the release object this cut publishes onto — the engine's source release,
+    /// adopted, or a draft created under a durable one-shot intent — and record it in
+    /// the journal. Called only after the floors passed (see [`publish_on_channel`]).
+    fn bind(&mut self) -> Result<()>;
+    /// THE one PATCH that makes the release the channel head: [`HEAD_PATCH`], guarded
+    /// by the release capability and the release lease. Idempotent, and sent on every
+    /// path — a draft this cut created, and a release it adopted.
+    fn make_head(&mut self) -> Result<()>;
+    /// What a credential-less client now sees: the release elected by the client's
+    /// replay, the evergreen pointer naming it and serving its appcast, and every
+    /// required asset downloading.
+    fn prove_head(&mut self) -> Result<()>;
+}
+
+/// THE CHANNEL PUBLISH SEQUENCE, one order for every path: check the fleet's floors,
+/// bind the release, upload everything with the appcast pair last
+/// ([`channel_upload_rank`]), prove the asset set, check the floors again, make the
+/// release the head, prove what a stranger sees.
+///
+/// The floors are read BEFORE THE BIND. A cut they refuse there has touched nothing
+/// and recorded nothing: no draft created, no adoption intent persisted, no channel
+/// release ID in the journal — so `--retire-unmirrored`, the documented exit for a
+/// cut the fleet's roster floor has passed, finds nothing on the channel to trip on.
+/// (Bound first, the adopted source release's ID sat in the journal of a cut refused
+/// before it uploaded a byte, and retire refused it as a LIVE release.)
+///
+/// The floors are read before the first upload as well as before the head PATCH. An
+/// upload may replace the release's roster pair (the source release carries the one
+/// `pub publish` had; the cut ships its own), and on a release that is ALREADY the
+/// head — a resume after the PATCH landed, with a roster join since — that
+/// replacement would roll the fleet's roster back; checked first, that release is
+/// refused before anything is written. Checked again last, because a newer cut or a
+/// roster join can land while this one uploads.
+///
+/// WHY THE HEAD PATCH IS ON EVERY PATH (2026-09-23). The cut OWNS GitHub's `latest`
+/// pointer — the one request every credential-less updater makes, and the target of
+/// the evergreen `releases/latest/download/aterm.dmg` / `aterm-mac.zip` links.
+/// `pub publish` creates the same vX.Y.0 release first, as a source release, and the
+/// cut ADOPTS it. The adopt path used to flip nothing ("already visible"), and passed
+/// its pointer gate only because that source release had already STOLEN `latest`
+/// from the previous app release — about twenty minutes before any app asset
+/// existed, during which every updater 302'd to a release with no appcast. The
+/// engine now creates that source release as a prerelease, which can never hold
+/// `latest`; without this PATCH on the adopt path the pointer would stay on the
+/// previous release and the gate would refuse every cut.
+///
+/// # Errors
+/// The first failing call; nothing after it runs.
+pub fn publish_on_channel(release: &mut dyn ChannelRelease, mut files: Vec<PathBuf>) -> Result<()> {
+    files.sort_by_key(|file| {
+        channel_upload_rank(
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        )
+    });
+    release.ratchet()?;
+    release.bind()?;
+    for file in &files {
+        release.upload(file)?;
+    }
+    release.prove_assets()?;
+    release.ratchet()?;
+    release.make_head()?;
+    release.prove_head()
 }
 
 #[cfg(test)]
@@ -695,8 +907,8 @@ update_channel = \"someone/else\"
              never also in Cargo.toml"
         );
         assert!(
-            !aterm_update_core::pins::update_channel_signing_pubkey().is_empty(),
-            "the public channel is pinned in pins.rs"
+            aterm_update_core::pins::roster_tier_armed(),
+            "the public channel's anchor — the paper master — is pinned in pins.rs"
         );
     }
 

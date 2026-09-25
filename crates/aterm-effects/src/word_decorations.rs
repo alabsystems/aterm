@@ -15350,7 +15350,7 @@ mod tests {
     /// §14 P2 perf gate: a 128-match full-viewport rescan with ALL-MISS SimHash
     /// (`persist` cleared each iteration, so every match walks its ±4-token
     /// context) must stay under 100 µs. Timing-sensitive, so it follows the
-    /// repo's manual-timing idiom (aterm-render/tests/session_cpu_bench.rs):
+    /// repo's manual-timing idiom:
     ///
     /// ```sh
     /// cargo test -p aterm-effects --release bench_rescan_ctx_128_matches -- --ignored --nocapture
@@ -15399,77 +15399,6 @@ mod tests {
         assert!(
             median < Duration::from_micros(100),
             "§14 P2 gate: median {median:?} >= 100 µs"
-        );
-    }
-
-    /// Worst resident-alignment companion to the all-miss SimHash gate above:
-    /// 128 visible equal-form candidates against the full 512-episode grace cap
-    /// exercises every cell of the bounded monotone DP. Persist-map setup is
-    /// deliberately outside the timed interval; the measured work is the real
-    /// scan, removal, 65,536 compatibility decisions, transfer, and reinsertion.
-    #[test]
-    #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
-    fn bench_rescan_alignment_512_by_128_worstcase() {
-        let _perf_guard = PERF_BENCH_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let lex = lex();
-        let c = cfg();
-        let (rows, cols) = (32usize, 80usize);
-        let mut term = Terminal::new(32, 80);
-        let line: &[u8] =
-            b"the soft kitty saw a warm kitty near the tiny kitty by one cozy kitty end";
-        for r in 0..rows {
-            if r > 0 {
-                term.process(b"\r\n");
-            }
-            term.process(line);
-        }
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
-        assert_eq!(wd.occ.len(), 128);
-        let exemplar = wd.persist[&wd.occ[0].ident];
-        let mut episodes = Vec::with_capacity(PERSIST_CAP);
-        for i in 0..PERSIST_CAP {
-            let mut ep = exemplar;
-            ep.seed = 0xA500_0000_0000_0000u64 ^ i as u64;
-            ep.ctx_fp = 0x5A00_0000_0000_0000u64 ^ (i as u64).rotate_left(17);
-            ep.last_row = (i % rows) as u16;
-            ep.last_col = ((i / rows) % cols) as u16;
-            episodes.push((0xD000_0000_0000_0000u64 ^ i as u64, ep));
-        }
-
-        // Warm every resident scratch at the exact cap.
-        wd.persist.clear();
-        for &(key, mut ep) in &episodes {
-            ep.seen_seq = wd.rescan_seq;
-            wd.persist.insert(key, ep);
-        }
-        wd.rescan(&term, rows, cols, &lex, &c, 2, t0);
-
-        let iters = 200usize;
-        let mut samples = Vec::with_capacity(iters);
-        for epoch in 0..iters {
-            wd.persist.clear();
-            for &(key, mut ep) in &episodes {
-                ep.seen_seq = wd.rescan_seq;
-                wd.persist.insert(key, ep);
-            }
-            let start = Instant::now();
-            wd.rescan(&term, rows, cols, &lex, &c, 100 + epoch as u64, t0);
-            samples.push(start.elapsed());
-        }
-        samples.sort();
-        let median = samples[iters / 2];
-        println!(
-            "bench_rescan_alignment_512_by_128_worstcase: median {median:?} (min {:?}, max {:?})",
-            samples[0],
-            samples[iters - 1]
-        );
-        assert!(
-            median < Duration::from_millis(1),
-            "resident alignment median {median:?} exceeds the 1 ms input-path budget"
         );
     }
 
@@ -21299,118 +21228,6 @@ mod tests {
         );
     }
 
-    /// v3 §3.2 perf gate — the worst-case DETONATION frame: full-viewport
-    /// wash + crown over a text-full 240×64 grid, ≤ 3 ms median in release.
-    /// Sibling of `bench_nova_emit_worstcase`.
-    ///
-    /// SCOPE (deliberate): the design gates the full damaged present path, but
-    /// a full-viewport wash marks EVERY row lit and `render_input_cached`
-    /// re-renders every lit band (glyph blit + blend: ~31 ms at 240×64/18 px on
-    /// the dev machine — the same per-row cost the 3-nova bench pays over ~15
-    /// rows). That compositor cost is not this engine's, so the bench GATES the
-    /// engine share (tick: prepass + emitters + selection split + channel fill)
-    /// at ≤ 3 ms and reports the composite median informationally. The
-    /// `perf_reduced` degrade path (§1.1 fix #3 freeze/thaw — non-destructive)
-    /// covers machines where the composite overruns.
-    ///
-    /// ```sh
-    /// cargo test -p aterm-effects --release bench_supernova_detonation_worstcase -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "perf gate (v3 §3.2): run manually in --release with --ignored --nocapture"]
-    fn bench_supernova_detonation_worstcase() {
-        let _perf_guard = PERF_BENCH_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        use aterm_render::{Renderer, Theme, WindowCpu};
-        let Some(mut rend) = Renderer::from_system(18.0, Theme::default()) else {
-            panic!("bench needs a system monospace font");
-        };
-        let (cw, ch) = rend.cell_size();
-        let (rows, cols) = (64usize, 240usize);
-        let lex = lex();
-        let c = cfg_rainbow(100);
-        let g = EffectGeom {
-            cell_w: cw as u16,
-            cell_h: ch as u16,
-            rows: rows as u16,
-            cols: cols as u16,
-        };
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process(b"\x1b[?25l");
-        // Text-full grid (no matches in the filler), one word mid-screen.
-        let filler =
-            "lorem ipsum dolor sit amet consetetur sadipscing elitr sed diam nonumy ".repeat(4);
-        for r in 0..rows {
-            if r > 0 {
-                term.process(b"\r\n");
-            }
-            term.process(&filler.as_bytes()[..cols.min(filler.len())]);
-        }
-        // Space-isolated so the whole-word scanner matches it mid-filler.
-        term.process(b"\x1b[32;99H fuck ");
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
-        let ident = wd
-            .occ
-            .iter()
-            .find(|o| o.class == Class::Profanity)
-            .expect("the word scanned")
-            .ident;
-        {
-            let ep = wd.persist.get_mut(&ident).expect("episode");
-            ep.burst_roll = true;
-            ep.nova_start = Some(t0);
-            ep.burst_started = true;
-            ep.burst_done = true;
-        }
-        let base_input = term.cell_frame(rows, cols);
-        let mut input = base_input.clone();
-        let mut win = WindowCpu::new();
-        rend.render_input_cached(&mut win, &base_input);
-        let (mut deco, mut ink, mut fr, mut nova) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut engine = Vec::new();
-        let mut composite = Vec::new();
-        for _ in 0..8u64 {
-            for t_ms in (360..640u64).step_by(16) {
-                let now = t0 + Duration::from_millis(t_ms);
-                let start = Instant::now();
-                wd.tick(
-                    now, &c, g, None, None, true, &mut deco, &mut ink, &mut fr, &mut nova,
-                );
-                input.word_decorations.clone_from(&deco);
-                input.ink.clone_from(&ink);
-                input.nova_add.clone_from(&nova);
-                let engine_dt = start.elapsed();
-                rend.render_input_cached(&mut win, &input);
-                engine.push(engine_dt);
-                composite.push(start.elapsed());
-            }
-        }
-        assert!(
-            !nova.is_empty() || !deco.is_empty(),
-            "the detonation actually emitted"
-        );
-        engine.sort();
-        composite.sort();
-        let median = engine[engine.len() / 2];
-        println!(
-            "bench_supernova_detonation_worstcase: ENGINE median {median:?} over {} frames \
-             (min {:?}, max {:?}); tick+composite median {:?} (informational — the \
-             full-viewport wash re-renders every band until the overlay compositor lands)",
-            engine.len(),
-            engine[0],
-            engine[engine.len() - 1],
-            composite[composite.len() / 2],
-        );
-        assert!(
-            median < Duration::from_millis(3),
-            "v3 §3.2 gate: engine median {median:?} >= 3 ms/frame"
-        );
-    }
-
     // ──────────── one-shot × reduced-motion regression battery ────────────
 
     /// ONE-SHOT × REDUCED MOTION: native hosts demote UNFOCUSED
@@ -24512,111 +24329,61 @@ mod tests {
         assert_eq!(cues[0].kind, CurseCueKind::Typed);
     }
 
-    /// DETONATION EDGE: a rolled supernova cues `Detonated` exactly once, AT
-    /// the ignition grant (inheriting the flash limiter + `burst_done`), and
-    /// an OUTPUT curse detonating cues Detonated WITHOUT a Typed cue — the
-    /// two kinds keep their provenance separate for the host's two knobs.
+    /// DETONATION EDGE, one row per profile: a rolled supernova (the rainbow
+    /// profile) and a highlighted profanity in the `style = "nova"`
+    /// classic-nova profile each cue `Detonated` exactly once, AT the ignition
+    /// grant (inheriting the flash limiter + `burst_done`), none on the
+    /// running blast — and an OUTPUT curse detonating cues Detonated WITHOUT a
+    /// Typed cue: the two kinds keep their provenance separate for the host's
+    /// two knobs.
     #[test]
     fn supernova_detonation_cues_at_the_grant_edge_once() {
         let lex = lex();
-        let c = cfg_rainbow(100);
         let t0 = Instant::now();
         let g = geom20();
-        // Typed curse: the same tick carries the typed cue AND the grant cue.
-        let mut term = Terminal::new(6, 20);
-        term.process(b"oh fuck");
-        let mut wd = WordDecorations::default();
-        // TYPED, and the fixture says so: the bonk's witness is the caret's
-        // completion position AND a committed key. `wd2` below deliberately
-        // omits it — that arm IS the output case.
-        wd.note_typed_edit(t0, None);
-        wd.rescan(&term, 6, 20, &lex, &c, 1, t0);
-        tick_nova(&mut wd, t0, &c, g, None, None);
-        let cues: Vec<CurseCue> = wd.drain_curse_cues().collect();
-        assert!(
-            cues.iter().any(|q| q.kind == CurseCueKind::Typed),
-            "typed witness cue missing: {cues:?}"
-        );
-        assert_eq!(
-            cues.iter()
-                .filter(|q| q.kind == CurseCueKind::Detonated)
-                .count(),
-            1,
-            "exactly one detonation cue at the grant: {cues:?}"
-        );
-        // Once per episode: the running blast re-cues nothing.
-        tick_nova(&mut wd, t0 + Duration::from_millis(100), &c, g, None, None);
-        assert_eq!(wd.drain_curse_cues().count(), 0);
-        // Output curse (no typed witness): Detonated only.
-        let mut term2 = Terminal::new(6, 20);
-        term2.process(b"fuck\r\n$ ");
-        let mut wd2 = WordDecorations::default();
-        wd2.rescan(&term2, 6, 20, &lex, &c, 1, t0);
-        tick_nova(&mut wd2, t0, &c, g, None, None);
-        let cues2: Vec<CurseCue> = wd2.drain_curse_cues().collect();
-        assert!(
-            cues2.iter().all(|q| q.kind == CurseCueKind::Detonated),
-            "output content must never carry the typed kind: {cues2:?}"
-        );
-        assert_eq!(
-            cues2.len(),
-            1,
-            "the output detonation still cues: {cues2:?}"
-        );
-    }
-
-    /// DETONATION EDGE (classic nova twin of
-    /// `supernova_detonation_cues_at_the_grant_edge_once`): a highlighted
-    /// profanity in the `style = "nova"` classic-nova profile also bonks at
-    /// detonation — one `Detonated` cue AT the ignition grant, none on the
-    /// running blast, and an OUTPUT curse detonates WITHOUT a Typed cue.
-    #[test]
-    fn nova_detonation_cues_at_the_grant_edge_once() {
-        let lex = lex();
-        let c = cfg_nova();
-        let t0 = Instant::now();
-        let g = geom20();
-        // Typed curse: the same tick carries the typed cue AND the grant cue.
-        let mut term = Terminal::new(6, 20);
-        term.process(b"oh fuck");
-        let mut wd = WordDecorations::default();
-        // TYPED, and the fixture says so: the bonk's witness is the caret's
-        // completion position AND a committed key. `wd2` below deliberately
-        // omits it — that arm IS the output case.
-        wd.note_typed_edit(t0, None);
-        wd.rescan(&term, 6, 20, &lex, &c, 1, t0);
-        tick_nova(&mut wd, t0, &c, g, None, None);
-        let cues: Vec<CurseCue> = wd.drain_curse_cues().collect();
-        assert!(
-            cues.iter().any(|q| q.kind == CurseCueKind::Typed),
-            "typed witness cue missing: {cues:?}"
-        );
-        assert_eq!(
-            cues.iter()
-                .filter(|q| q.kind == CurseCueKind::Detonated)
-                .count(),
-            1,
-            "exactly one detonation cue at the nova grant: {cues:?}"
-        );
-        // Once per episode: the running blast re-cues nothing.
-        tick_nova(&mut wd, t0 + Duration::from_millis(100), &c, g, None, None);
-        assert_eq!(wd.drain_curse_cues().count(), 0);
-        // Output curse (no typed witness): Detonated only.
-        let mut term2 = Terminal::new(6, 20);
-        term2.process(b"fuck\r\n$ ");
-        let mut wd2 = WordDecorations::default();
-        wd2.rescan(&term2, 6, 20, &lex, &c, 1, t0);
-        tick_nova(&mut wd2, t0, &c, g, None, None);
-        let cues2: Vec<CurseCue> = wd2.drain_curse_cues().collect();
-        assert!(
-            cues2.iter().all(|q| q.kind == CurseCueKind::Detonated),
-            "output content must never carry the typed kind: {cues2:?}"
-        );
-        assert_eq!(
-            cues2.len(),
-            1,
-            "the output nova detonation still cues: {cues2:?}"
-        );
+        for (profile, c) in [("supernova", cfg_rainbow(100)), ("nova", cfg_nova())] {
+            // Typed curse: the same tick carries the typed cue AND the grant cue.
+            let mut term = Terminal::new(6, 20);
+            term.process(b"oh fuck");
+            let mut wd = WordDecorations::default();
+            // TYPED, and the fixture says so: the bonk's witness is the caret's
+            // completion position AND a committed key. `wd2` below deliberately
+            // omits it — that arm IS the output case.
+            wd.note_typed_edit(t0, None);
+            wd.rescan(&term, 6, 20, &lex, &c, 1, t0);
+            tick_nova(&mut wd, t0, &c, g, None, None);
+            let cues: Vec<CurseCue> = wd.drain_curse_cues().collect();
+            assert!(
+                cues.iter().any(|q| q.kind == CurseCueKind::Typed),
+                "{profile}: typed witness cue missing: {cues:?}"
+            );
+            assert_eq!(
+                cues.iter()
+                    .filter(|q| q.kind == CurseCueKind::Detonated)
+                    .count(),
+                1,
+                "{profile}: exactly one detonation cue at the grant: {cues:?}"
+            );
+            // Once per episode: the running blast re-cues nothing.
+            tick_nova(&mut wd, t0 + Duration::from_millis(100), &c, g, None, None);
+            assert_eq!(wd.drain_curse_cues().count(), 0, "{profile}");
+            // Output curse (no typed witness): Detonated only.
+            let mut term2 = Terminal::new(6, 20);
+            term2.process(b"fuck\r\n$ ");
+            let mut wd2 = WordDecorations::default();
+            wd2.rescan(&term2, 6, 20, &lex, &c, 1, t0);
+            tick_nova(&mut wd2, t0, &c, g, None, None);
+            let cues2: Vec<CurseCue> = wd2.drain_curse_cues().collect();
+            assert!(
+                cues2.iter().all(|q| q.kind == CurseCueKind::Detonated),
+                "{profile}: output content must never carry the typed kind: {cues2:?}"
+            );
+            assert_eq!(
+                cues2.len(),
+                1,
+                "{profile}: the output detonation still cues: {cues2:?}"
+            );
+        }
     }
 
     /// BOUNDEDNESS + STATE DROP (the hostless/wasm rule the sightings
@@ -24969,213 +24736,6 @@ mod tests {
             assert!(
                 !wd.needs_rescan(1),
                 "and its scan — a survivor is not re-scanned because a sibling closed"
-            );
-        }
-    }
-}
-
-/// The measurement behind the [`ScanMemo`]: how much of a rescan the per-row
-/// tokenise+lexicon pass actually is, on the two shapes that matter — a full
-/// screen the user is typing into, and a screen scrolling under output.
-///
-/// Not a correctness test (it prints, it does not assert timings — a shared CI
-/// box has no stable clock), so it is `#[ignore]`d. Reproduce with:
-/// `cargo test -p aterm-effects --release --lib -- --ignored --nocapture scan_memo_cost`
-#[cfg(test)]
-mod scan_memo_bench {
-    use super::*;
-    use aterm_core::terminal::Terminal;
-    use aterm_lexicon::Lexicon;
-
-    /// A dense line of ordinary prose carrying one match of each live class —
-    /// the realistic worst case for the scanner (every token is a spaced-script
-    /// token that must be folded and probed, none are suppressed as code/paths).
-    const PROSE: &str = "the quick brown fox jumps over the lazy dog while a cat naps and someone says fuck about the build system output that keeps scrolling past here forever\r\n";
-
-    fn bench_cfg() -> DecoConfig {
-        DecoConfig {
-            profanity: true,
-            feline: true,
-            orca: true,
-            emphasis: true,
-            ink_enabled: true,
-            ..DecoConfig::default()
-        }
-    }
-
-    #[test]
-    #[ignore = "timing probe, not an assertion; see the module doc"]
-    fn scan_memo_cost() {
-        let (rows, cols) = (60usize, 200usize);
-        let lex = Lexicon::with_languages(&["en"]);
-        let cfg = bench_cfg();
-        let geom = EffectGeom {
-            cell_w: 8,
-            cell_h: 16,
-            rows: rows as u16,
-            cols: cols as u16,
-        };
-        let now = Instant::now();
-        let frames = 200u64;
-
-        // (1) STATIC full screen, rescanned every frame — the shape a user
-        // typing at a prompt on a full screen presents: one row's text changes,
-        // the damage epoch advances, and the rescan re-tokenises everything.
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        for _ in 0..rows {
-            term.process(PROSE.as_bytes());
-        }
-        let mut snap = aterm_core::render::RenderInput::default();
-        term.cell_frame_into(&mut snap, rows, cols);
-        for bypass in [true, false] {
-            let mut wd = WordDecorations::default();
-            wd.scan_memo.bypass = bypass;
-            for e in 0..5u64 {
-                wd.rescan_from_cells_with_geom(
-                    &snap.cells,
-                    &snap.line_sizes,
-                    rows,
-                    cols,
-                    &lex,
-                    &cfg,
-                    e,
-                    now,
-                    geom,
-                    0,
-                );
-            }
-            let started = Instant::now();
-            for e in 10..10 + frames {
-                wd.rescan_from_cells_with_geom(
-                    &snap.cells,
-                    &snap.line_sizes,
-                    rows,
-                    cols,
-                    &lex,
-                    &cfg,
-                    e,
-                    now,
-                    geom,
-                    0,
-                );
-            }
-            println!(
-                "STATIC screen  memo={:5}: {:?}/frame  occ={}",
-                !bypass,
-                started.elapsed() / u32::try_from(frames).expect("small"),
-                wd.occ.len()
-            );
-        }
-
-        // (2) SCROLLING output: one new line per frame, so every surviving row
-        // keeps its TEXT and changes its INDEX. This is what makes the memo
-        // text-keyed rather than row-keyed.
-        for bypass in [true, false] {
-            let mut term = Terminal::new(rows as u16, cols as u16);
-            for _ in 0..rows {
-                term.process(PROSE.as_bytes());
-            }
-            let mut wd = WordDecorations::default();
-            wd.scan_memo.bypass = bypass;
-            let mut snap = aterm_core::render::RenderInput::default();
-            let started = Instant::now();
-            for e in 0..frames {
-                term.process(PROSE.as_bytes());
-                term.cell_frame_into(&mut snap, rows, cols);
-                wd.rescan_from_cells_with_geom(
-                    &snap.cells,
-                    &snap.line_sizes,
-                    rows,
-                    cols,
-                    &lex,
-                    &cfg,
-                    e,
-                    now,
-                    geom,
-                    0,
-                );
-            }
-            println!(
-                "SCROLL 1 line  memo={:5}: {:?}/frame (includes cell_frame_into)",
-                !bypass,
-                started.elapsed() / u32::try_from(frames).expect("small")
-            );
-        }
-
-        // (3) FULL-SCREEN REPAINT — the memo's WORST case: a TUI whose every
-        // row's text is new every frame, so every probe misses and the memo's
-        // bookkeeping (key + match-list buffers, insert, generation rotation)
-        // is pure overhead on top of the full lexicon pass it cannot avoid.
-        // `memo=false` here is the pre-memo baseline (`bypass` switches the
-        // cache off, it does not merely force misses), so the two lines below
-        // ARE the regression this shape is suspected of.
-        //
-        // Both engines are driven over the SAME frames and each is timed around
-        // its own rescan only: a full-screen repaint costs more to push through
-        // the parser than to scan, and this box's clock drifts under load, so
-        // separate runs of the two legs measure the machine rather than the
-        // memo. Interleaved, the drift lands on both.
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        let mut snap = aterm_core::render::RenderInput::default();
-        let mut line = String::new();
-        // Three engines, same frames: no memo at all, an unpooled memo (a fresh
-        // key + match-list allocation per miss), and the shipping memo with the
-        // retired generation's buffers recycled.
-        let mut engines: Vec<(&str, WordDecorations, Duration)> =
-            ["no memo   ", "memo alloc", "memo pool "]
-                .into_iter()
-                .map(|label| {
-                    let mut wd = WordDecorations::default();
-                    wd.scan_memo.bypass = label.starts_with("no memo");
-                    wd.scan_memo.no_recycle = label.starts_with("memo alloc");
-                    (label, wd, Duration::MAX)
-                })
-                .collect();
-        for e in 0..frames {
-            term.process(b"\x1b[H");
-            for r in 0..rows {
-                // A per-(frame, row) prefix in front of the same prose: the
-                // scanner's work per row is unchanged, only the memo key is
-                // new — so the delta between the two legs is the memo's
-                // miss-path cost and nothing else.
-                line.clear();
-                line.push_str(&e.to_string());
-                line.push(' ');
-                line.push_str(&r.to_string());
-                line.push(' ');
-                line.push_str(PROSE);
-                term.process(line.as_bytes());
-            }
-            term.cell_frame_into(&mut snap, rows, cols);
-            for (_, wd, best) in &mut engines {
-                let started = Instant::now();
-                wd.rescan_from_cells_with_geom(
-                    &snap.cells,
-                    &snap.line_sizes,
-                    rows,
-                    cols,
-                    &lex,
-                    &cfg,
-                    e,
-                    now,
-                    geom,
-                    0,
-                );
-                // MIN, not mean: this box builds other crates while the probe
-                // runs, and a preempted frame measures the scheduler. The
-                // fastest frame of each engine is the one that ran undisturbed.
-                *best = (*best).min(started.elapsed());
-            }
-        }
-        for (label, wd, spent) in &engines {
-            println!(
-                "REPAINT all-miss {label}: {:?} fastest frame (rescan only) \
-                 misses={} resident={} spare={} fresh={}",
-                *spent,
-                wd.scan_memo.misses,
-                wd.scan_memo.hot.len() + wd.scan_memo.cold.len(),
-                wd.scan_memo.spare.len(),
-                wd.scan_memo.fresh_buffers,
             );
         }
     }

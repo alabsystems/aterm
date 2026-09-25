@@ -26,9 +26,7 @@
 //! of the store written. `lib/`, `libexec/`, `share/` and `etc/` are cloned the same way,
 //! every symlink recreated, so the view is a complete sysroot and every frontend read from
 //! it answers the view as its sysroot. Clones, not hard links, for the reasons in
-//! [`crate::clone`]'s doc. The untracked lane still builds it ([`refresh_view`]): a file a
-//! provenance-tracked process creates is tagged, and a toolchain run from tagged files tags
-//! what it writes. Mirrored and not symlinked because
+//! [`crate::clone`]'s doc. Mirrored and not symlinked because
 //! rustc finds its sysroot through the real path of the driver dylib it loaded, so a
 //! symlinked `lib/` made `rustc --print sysroot` answer the STORE, and every script
 //! that finds the frontends beside that answer (`$(rustc --print sysroot)/bin/targo`,
@@ -72,7 +70,9 @@
 //!   RE-POINTED at the view when it names the store (`current`, or a numbered build —
 //!   the layouts from before the view existed). Anything else — a real directory, a
 //!   regular file, a symlink elsewhere — is REFUSED with the one fix, [`DETACH_FIX`].
-//!   Nothing here ever follows an existing link.
+//!   Nothing here ever follows an existing link. The one exception is [`repair`], the pass
+//!   a person asks for: it re-points a symlink elsewhere that names nothing, or a toolchain
+//!   OLDER than the store's ([`stale_against_store`]), leaving that toolchain where it is.
 //! * A view that already matches its build is left untouched. One that does not has
 //!   each part that differs — a mirrored directory, or `bin/` — built beside the live one
 //!   and swapped in by `rename(2)`, and the parts that still match are not re-laid. A
@@ -292,7 +292,7 @@ pub struct Refreshed {
     pub deferred: Option<Deferred>,
 }
 
-/// Why [`refresh_view_in_process`] left an out-of-date view as it stands.
+/// Why [`refresh_view`] left an out-of-date view as it stands.
 ///
 /// A build that runs from the view keeps finding its compiler by the view's NAME: `targo`
 /// spawns the `trustc` beside its own executable for every crate, and a `cargo` rustup
@@ -690,511 +690,6 @@ fn tree_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The hidden verb the launchd job execs when this process is provenance-tracked —
-/// machinery, not vocabulary: unlisted in help and `VERBS`, dispatched on the raw argv
-/// before the store lock (its parent HOLDS that lock), served by name through the
-/// `aterm` front door like its two siblings.
-pub const HIDDEN_VERB: &str = "__refresh-view";
-
-/// First line of a spec file — a version stamp, so a stale copy of this binary never
-/// misreads a newer spec. `v2`: the job lays clones; an older helper binary would lay hard
-/// links the clone identity rejects on every pass, so it must refuse the spec instead.
-const SPEC_HEADER: &str = "atpkg-view-spec v2";
-
-/// What the view helper is asked to lay: the rustup view for a seam name, or a trust
-/// build's exec root ([`crate::compat`]) — the same clone construction, so the same lane:
-/// the files it creates must not carry a tracked process's provenance tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ViewJob {
-    /// `<prefix>/rustup/<name>` from `store/trust/current`.
-    Seam { name: String },
-    /// `<prefix>/compat/trust/<build>` from the build at this directory.
-    Root { build_dir: PathBuf },
-}
-
-/// Render the spec the helper reads: the store prefix and the job, hex-encoded (the
-/// prefix is under `Library/Application Support`, which has a space).
-#[must_use]
-pub fn encode_spec(prefix: &Path, job: &ViewJob) -> String {
-    let mut out = String::from(SPEC_HEADER);
-    out.push('\n');
-    out.push_str("prefix=");
-    out.push_str(&crate::tree::hex(crate::call1(
-        crate::platform::os_str_bytes,
-        prefix.as_os_str(),
-    )));
-    match job {
-        ViewJob::Seam { name } => {
-            out.push_str("\nname=");
-            out.push_str(&crate::tree::hex(name.as_bytes()));
-        }
-        ViewJob::Root { build_dir } => {
-            out.push_str("\nroot=");
-            out.push_str(&crate::tree::hex(crate::call1(
-                crate::platform::os_str_bytes,
-                build_dir.as_os_str(),
-            )));
-        }
-    }
-    out.push('\n');
-    out
-}
-
-/// Parse a spec rendered by [`encode_spec`]. A foreign header, an unknown key, a bad
-/// hex digit, a relative prefix or a name off the allowlist refuses the whole spec —
-/// the helper must never build a view for a prefix it half-understood.
-pub fn decode_spec(text: &str) -> Result<(PathBuf, ViewJob), String> {
-    let mut lines = text.lines();
-    if lines.next() != Some(SPEC_HEADER) {
-        return Err(String::from("spec header missing or of another version"));
-    }
-    let (mut prefix, mut name, mut root) = (None, None, None);
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("malformed spec line: {line:?}"));
-        };
-        match key {
-            "prefix" => {
-                prefix = Some(crate::stage_helper::path_of(crate::stage_helper::unhex(
-                    value,
-                )?));
-            }
-            "name" => {
-                name = Some(
-                    String::from_utf8(crate::stage_helper::unhex(value)?)
-                        .map_err(|_| String::from("seam name is not UTF-8"))?,
-                );
-            }
-            "root" => {
-                root = Some(crate::stage_helper::path_of(crate::stage_helper::unhex(
-                    value,
-                )?));
-            }
-            other => return Err(format!("unknown spec key: {other:?}")),
-        }
-    }
-    let prefix = prefix.ok_or_else(|| String::from("spec names no prefix"))?;
-    if !prefix.is_absolute() {
-        return Err(String::from("spec prefix must be absolute"));
-    }
-    match (name, root) {
-        (Some(name), None) => {
-            if !name_allowed(&name) {
-                return Err(format!("seam name {name:?} is not on the allowlist"));
-            }
-            Ok((prefix, ViewJob::Seam { name }))
-        }
-        (None, Some(build_dir)) => {
-            if !build_dir.is_absolute() {
-                return Err(String::from("spec root must be absolute"));
-            }
-            Ok((prefix, ViewJob::Root { build_dir }))
-        }
-        (Some(_), Some(_)) => Err(String::from("spec names both a seam and a root")),
-        (None, None) => Err(String::from("spec names neither a seam nor a root")),
-    }
-}
-
-/// The one line the helper answers with: `<changed> <tools> <hex build> <stock pairs>
-/// <deferred>`, the last `-` (re-laid or already current), `?` ([`Deferred::Unknown`]) or
-/// the hex of the executable running from the view ([`Deferred::InUse`]) — the helper
-/// reads the process table in its own process, and a deferral it could not hand back
-/// would read as a view that is current.
-fn encode_refreshed(r: &Refreshed) -> String {
-    let stock: Vec<String> = r.stock.iter().map(|(p, t)| format!("{p}:{t}")).collect();
-    let hex_path =
-        |p: &Path| crate::tree::hex(crate::call1(crate::platform::os_str_bytes, p.as_os_str()));
-    let deferred = match &r.deferred {
-        None => String::from("-"),
-        Some(Deferred::Unknown) => String::from("?"),
-        Some(Deferred::InUse(exe)) => hex_path(exe),
-    };
-    format!(
-        "{} {} {} {} {deferred}",
-        u8::from(r.changed),
-        r.tools,
-        hex_path(&r.build),
-        stock.join(",")
-    )
-}
-
-/// [`encode_refreshed`], read back. A stock pair the allowlist does not name is a
-/// refusal: the parent hands out `&'static` names, never ones a result file spelled.
-#[cfg(any(target_os = "macos", test))]
-fn decode_refreshed(body: &str) -> Result<Refreshed, String> {
-    let mut fields = body.split(' ');
-    let changed = match fields.next() {
-        Some("0") => false,
-        Some("1") => true,
-        other => return Err(format!("malformed view result: changed={other:?}")),
-    };
-    let tools = fields
-        .next()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| String::from("malformed view result: tools"))?;
-    let build = crate::stage_helper::path_of(crate::stage_helper::unhex(
-        fields
-            .next()
-            .ok_or_else(|| String::from("malformed view result: build"))?,
-    )?);
-    let mut stock = Vec::new();
-    for pair in fields
-        .next()
-        .unwrap_or("")
-        .split(',')
-        .filter(|s| !s.is_empty())
-    {
-        let Some((public, trust)) = pair.split_once(':') else {
-            return Err(format!("malformed view result: stock pair {pair:?}"));
-        };
-        let Some(&(public, trust)) = STOCK_NAMES
-            .iter()
-            .find(|(p, t)| *p == public && *t == trust)
-        else {
-            return Err(format!("view result names an unknown stock pair {pair:?}"));
-        };
-        stock.push((public, trust));
-    }
-    // Required, not defaulted: the helper is this binary, and a line without the field is
-    // one that cannot say whether the view was left behind.
-    let deferred = match fields.next() {
-        Some("-") => None,
-        Some("?") => Some(Deferred::Unknown),
-        Some(hex) if !hex.is_empty() => Some(Deferred::InUse(crate::stage_helper::path_of(
-            crate::stage_helper::unhex(hex)?,
-        ))),
-        other => return Err(format!("malformed view result: deferred={other:?}")),
-    };
-    if fields.next().is_some() {
-        return Err(String::from("malformed view result: trailing fields"));
-    }
-    Ok(Refreshed {
-        build,
-        tools,
-        stock,
-        changed,
-        deferred,
-    })
-}
-
-/// The hidden verb's body: `__refresh-view <spec-file>`. Reads the spec, builds the
-/// view IN THIS (untracked) PROCESS — which is the whole point — and answers in
-/// `<spec-dir>/result`: `ok\n<line>\n` ([`encode_refreshed`]) or `err\n<message>\n`,
-/// temp + rename so the parent never reads a half-written answer. Touches nothing
-/// else: no config, no store lock, no status.
-pub fn run_helper(args: &[std::ffi::OsString]) -> std::process::ExitCode {
-    use std::process::ExitCode;
-    crate::stage_helper::arm_parent_watchdog();
-    let Some(spec_path) = args.first().map(PathBuf::from) else {
-        eprintln!("atpkg {HIDDEN_VERB}: usage: {HIDDEN_VERB} <spec-file>");
-        return ExitCode::from(2);
-    };
-    let result_path = spec_path.with_file_name("result");
-    let outcome = (|| -> Result<String, String> {
-        let text = std::fs::read_to_string(&spec_path)
-            .map_err(|e| format!("read spec {}: {e}", spec_path.display()))?;
-        let (prefix, job) = decode_spec(&text)?;
-        let layout = Layout { prefix };
-        match job {
-            ViewJob::Seam { name } => {
-                let refreshed =
-                    refresh_view_in_process(&layout, &name).map_err(|e| e.to_string())?;
-                Ok(encode_refreshed(&refreshed))
-            }
-            ViewJob::Root { build_dir } => {
-                let ensured =
-                    crate::compat::ensure_root_in_process(&layout, &build_dir, Depth::Deep)
-                        .map_err(|e| e.to_string())?;
-                Ok(format!("root {}", crate::compat::ensured_word(ensured)))
-            }
-        }
-    })();
-    let body = match &outcome {
-        Ok(line) => format!("ok\n{line}\n"),
-        Err(why) => format!("err\n{why}\n"),
-    };
-    let tmp = result_path.with_file_name("result.tmp");
-    if std::fs::write(&tmp, body).is_err() || std::fs::rename(&tmp, &result_path).is_err() {
-        eprintln!(
-            "atpkg {HIDDEN_VERB}: cannot write {}",
-            result_path.display()
-        );
-        return ExitCode::from(1);
-    }
-    if outcome.is_ok() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    }
-}
-
-/// Build, or rebuild, the view for `name` from `store/trust/current` — through the
-/// UNTRACKED launchd lane when this process is provenance-tracked.
-///
-/// A file a tracked process creates is tagged. macOS tags what a provenance-tracked
-/// process writes (`crate::provenance`), and a toolchain run from tagged files tags what it
-/// writes in turn. A clone never writes the store, but the clone's own new files would
-/// carry the tag just the same. So the view is
-/// built the way the bundle is staged and the shims are laid: by a launchd job
-/// running this binary (in place, from a clean copy, or from a copy of its whole
-/// bundle — [`crate::stage_helper::plan_helper`]), with the outcome MEASURED on a
-/// file that was clean before the job. A tracked process with no lane builds in place.
-/// One whose lane fails does what [`crate::lay::tracked_policy`] says: by default it keeps
-/// the view that stands, or — with none — builds it in-process and clears the tag
-/// ([`crate::provenance::heal_laid`]); under `[packages] tracked_install = "refuse"` it
-/// refuses.
-/// An untracked process — every pass from an untagged app, every test harness —
-/// builds in place exactly as before.
-///
-/// # Errors
-/// [`refresh_view_in_process`]'s, and a refused lane under the refuse policy.
-pub fn refresh_view(layout: &Layout, name: &str) -> io::Result<Refreshed> {
-    let scratch = views_root(layout);
-    layout.ensure_dir(&scratch)?;
-    // MEASURED, once here: a probe file written into the views root and read back.
-    let tracked = cfg!(target_os = "macos") && crate::provenance::process_is_tracked(&scratch);
-    refresh_view_with(
-        layout,
-        name,
-        tracked,
-        &crate::lay::lane_for_this_binary(),
-        crate::lay::tracked_policy(),
-    )
-}
-
-/// [`refresh_view`] with the lane's three inputs explicit — whether this process is
-/// tracked, which binary would serve the lane, and the policy when it cannot — so
-/// every arm is provable from a test that is not itself in a position to be tracked.
-pub fn refresh_view_with(
-    layout: &Layout,
-    name: &str,
-    tracked: bool,
-    lane: &crate::lay::Lane,
-    policy: crate::lay::TrackedPolicy,
-) -> io::Result<Refreshed> {
-    let helper = match (tracked, lane) {
-        (true, crate::lay::Lane::Helper(exe)) => exe,
-        // Untracked, or a binary with no lane (a test harness — a fact about the
-        // binary, not a failure): in place, as always.
-        _ => return refresh_view_in_process(layout, name),
-    };
-    // A dev-linked view is stubs and links into the checkout, so laying it writes nothing
-    // in the store. This lane still serves it while a store build stands (the lane's witness
-    // is a file of that build) and cannot when none does; the stubs then go through the shim
-    // lane inside `lay_executables`, one untracked job for all of them.
-    let linked = matches!(view_source(layout), ViewSource::Linked(_));
-    if linked && std::fs::symlink_metadata(store_current(layout)).is_err() {
-        return refresh_view_in_process(layout, name);
-    }
-    match refresh_view_untracked(helper, layout, name) {
-        Ok(refreshed) => Ok(refreshed),
-        Err(why) => match policy {
-            crate::lay::TrackedPolicy::Refuse => Err(io::Error::other(
-                crate::lay::tracked_refusal("refreshing the rustup view", &why),
-            )),
-            crate::lay::TrackedPolicy::Allow if linked => {
-                // Links into the checkout and stubs through the shim lane: no file of the
-                // store written or linked, and the stubs' own lay clears their tag.
-                crate::provenance::log_line(&format!(
-                    "could not refresh the rustup view the clean way ({why}); laid the \
-                     dev-linked view directly"
-                ));
-                refresh_view_in_process(layout, name)
-            }
-            crate::lay::TrackedPolicy::Allow => {
-                // KEEP THE VIEW THAT IS THERE (audit 2026-09-14): an in-process rebuild
-                // lays every file of the view from this tracked process — tagged — to gain
-                // a view one build fresher, and the lane that failed usually means the heal
-                // that would clear it cannot run either. A stale view runs the previous
-                // compiler until the next pass. Only when there is NO view at all — rustup's
-                // `trust` would dangle — is it built in-process, and then cleared
-                // ([`crate::provenance::heal_laid`]).
-                if let Some(existing) = existing_view(layout, name) {
-                    crate::provenance::log_line(&format!(
-                        "could not refresh the rustup view ({why}); it keeps {} until the \
-                         next pass",
-                        existing.build.display()
-                    ));
-                    return Ok(existing);
-                }
-                let refreshed = refresh_view_in_process(layout, name)?;
-                crate::provenance::heal_laid(layout, "the rustup view", &[view_dir(layout, name)]);
-                Ok(refreshed)
-            }
-        },
-    }
-}
-
-/// The view as it stands — what a lane that could not refresh it leaves in place: the
-/// build its `bin/` was cloned from (read off the view's `trustc` against the builds in
-/// the store), its tool count and the stock names present. `None` when there is
-/// no `bin/` with a Trust tool in it.
-fn existing_view(layout: &Layout, name: &str) -> Option<Refreshed> {
-    let bin = view_dir(layout, name).join("bin");
-    let entries: Vec<std::ffi::OsString> = std::fs::read_dir(&bin)
-        .ok()?
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .map(|e| e.file_name())
-        .collect();
-    if !entries.iter().any(|n| n == "trustc") {
-        return None;
-    }
-    let stock: Vec<(&'static str, &'static str)> = STOCK_NAMES
-        .iter()
-        .copied()
-        .filter(|(public, trust)| {
-            entries.iter().any(|n| n == public) && entries.iter().any(|n| n == trust)
-        })
-        .collect();
-    let tools = entries.len().saturating_sub(stock.len());
-    let build = build_of_view(layout, &bin.join("trustc"))?;
-    Some(Refreshed {
-        build,
-        tools,
-        stock,
-        changed: false,
-        deferred: None,
-    })
-}
-
-/// Which `store/trust/<build>` a view's `trustc` was laid from — the build whose own
-/// `bin/trustc` it has the length, mode and modification time of. `None` when no build
-/// matches (a view from a build gc reclaimed).
-#[cfg(unix)]
-fn build_of_view(layout: &Layout, view_trustc: &Path) -> Option<PathBuf> {
-    let store = layout.prefix.join("store").join("trust");
-    std::fs::read_dir(&store)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .find(|p| crate::clone::same_attributes(&p.join("bin").join("trustc"), view_trustc))
-}
-
-#[cfg(not(unix))]
-fn build_of_view(_layout: &Layout, _view_trustc: &Path) -> Option<PathBuf> {
-    None
-}
-
-/// Build the view through an untracked launchd job running `helper` on
-/// [`HIDDEN_VERB`], then measure: the view's clone of a file of the live build's `bin/`
-/// that is clean must be clean too (a tag on it would be the tag the lane exists to
-/// prevent). `Err(reason)` is "the lane could not do it"; the caller's policy decides
-/// what happens next.
-#[cfg(target_os = "macos")]
-fn refresh_view_untracked(helper: &Path, layout: &Layout, name: &str) -> Result<Refreshed, String> {
-    let current = store_current(layout);
-    let build = std::fs::read_link(&current)
-        .map(|raw| absolute_target(&raw, &current))
-        .map_err(|e| format!("read {}: {e}", current.display()))?;
-    let line = run_view_job(
-        helper,
-        layout,
-        &ViewJob::Seam {
-            name: name.to_string(),
-        },
-        &build,
-    )?;
-    decode_refreshed(&line)
-}
-
-/// Run one [`ViewJob`] through the untracked launchd lane and measure: the laid clone of a
-/// clean file of `build`'s `bin/` must not have gained com.apple.provenance (a tag on it
-/// would be the tag the lane exists to prevent). Returns the helper's one result line;
-/// `Err(reason)` is "the lane could not do it", and the caller's policy decides what next.
-#[cfg(target_os = "macos")]
-pub(crate) fn run_view_job(
-    helper: &Path,
-    layout: &Layout,
-    job: &ViewJob,
-    build: &Path,
-) -> Result<String, String> {
-    if !crate::stage_helper::exe_serves_hidden_verb(helper) {
-        return Err(format!(
-            "{} is not an atpkg/aterm binary, so it would not serve {HIDDEN_VERB}",
-            helper.display()
-        ));
-    }
-    // The witness is chosen before the job: a store file that is clean, whose clone in the
-    // laid tree must be clean after it. A clone copies its source's extended attributes, so
-    // an already-tagged store file proves nothing either way and the measurement is skipped
-    // when none is clean. The witness asks only for a tag this job added.
-    let dest_bin = match job {
-        ViewJob::Seam { name } => view_dir(layout, name),
-        ViewJob::Root { .. } => crate::compat::trust_build_of(layout, build).map_or_else(
-            || build.to_path_buf(),
-            |n| crate::compat::root_dir(layout, n),
-        ),
-    }
-    .join("bin");
-    let witness = std::fs::read_dir(build.join("bin"))
-        .map_err(|e| format!("list {}: {e}", build.join("bin").display()))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
-        .find(|p| !crate::provenance::carries_provenance(p))
-        .and_then(|p| p.file_name().map(|n| dest_bin.join(n)))
-        .map(|clone| {
-            let tagged_before = crate::provenance::carries_provenance(&clone);
-            (clone, tagged_before)
-        });
-    let scratch = crate::stage_helper::lanes_scratch().unwrap_or_else(|| views_root(layout));
-    layout
-        .ensure_dir(&scratch)
-        .map_err(|e| format!("create {}: {e}", scratch.display()))?;
-    let mut handle = crate::stage_helper::Job::prepare(&scratch, "view-helper")?;
-    std::fs::write(&handle.spec, encode_spec(&layout.prefix, job))
-        .map_err(|e| format!("write spec: {e}"))?;
-    handle.submit(helper, HIDDEN_VERB)?;
-    let outcome = (|| -> Result<Result<String, String>, String> {
-        handle.wait_for_result()?;
-        handle.read_result()
-    })();
-    // The label removed and a still-running helper stopped BEFORE the view is
-    // inspected or the in-process fallback touches it.
-    drop(handle);
-    let line = match outcome {
-        Ok(Ok(line)) => line,
-        Ok(Err(refusal)) => return Err(format!("the untracked helper refused: {refusal}")),
-        Err(why) => return Err(why),
-    };
-    if let Some((witness, tagged_before)) = witness
-        && !tagged_before
-        && crate::provenance::carries_provenance(&witness)
-    {
-        return Err(format!(
-            "the untracked lane laid the clones, but {} now carries com.apple.provenance",
-            witness.display()
-        ));
-    }
-    Ok(line)
-}
-
-/// See the macOS body — there is no launchd and no tag anywhere else.
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn run_view_job(
-    _helper: &Path,
-    _layout: &Layout,
-    _job: &ViewJob,
-    _build: &Path,
-) -> Result<String, String> {
-    Err(String::from("the untracked lane exists on macOS only"))
-}
-
-/// See the macOS body — there is no launchd and no tag anywhere else.
-#[cfg(not(target_os = "macos"))]
-fn refresh_view_untracked(
-    _helper: &Path,
-    _layout: &Layout,
-    _name: &str,
-) -> Result<Refreshed, String> {
-    Err(String::from("the untracked lane exists on macOS only"))
-}
-
 /// Build, or rebuild, the view for `name` from `store/trust/current` — or, when the view
 /// already IS that build ([`view_matches`] at [`Depth::Deep`]), do nothing at all.
 ///
@@ -1247,13 +742,13 @@ fn refresh_view_untracked(
 /// not a directory atpkg may write, the build's `bin/` cannot be listed, or a clone
 /// cannot be made — the last is the store on another volume, and it refuses rather than
 /// byte-copying the toolchain.
-pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refreshed> {
-    refresh_view_in_process_with(layout, name, &crate::gc::process_table)
+pub fn refresh_view(layout: &Layout, name: &str) -> io::Result<Refreshed> {
+    refresh_view_with(layout, name, &crate::gc::process_table)
 }
 
-/// [`refresh_view_in_process`] with the process enumeration injected (`running`, answering
-/// as [`crate::gc::running_from`] takes it), so the in-use arm is provable from a test.
-pub(crate) fn refresh_view_in_process_with(
+/// [`refresh_view`] with the process enumeration injected (`running`, answering as
+/// [`crate::gc::running_from`] takes it), so the in-use arm is provable from a test.
+pub(crate) fn refresh_view_with(
     layout: &Layout,
     name: &str,
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
@@ -1415,16 +910,8 @@ fn is_view_debris(name: &str) -> bool {
 /// sysroot under a name no later pass looks at — [`first_mismatch`] ignores top-level
 /// entries beside `bin/`, since counting debris would rebuild the view forever — so the
 /// view reads as current while those clones keep a superseded build's blocks allocated.
-///
-/// The store lock is not by itself why this is safe: the view lane hands its work to a
-/// launchd job whose helper holds no lock of its own, so a `kill -9` of the pass drops the
-/// lock while the helper keeps writing into the very names swept here. Orphaned lane jobs
-/// are stopped and waited out first ([`crate::stage_helper::stop_orphaned_lane_jobs`]).
-/// Best-effort: what will not go is left for the next pass.
+/// The caller holds the store lock. Best-effort: what will not go is left for the next pass.
 fn sweep_view_debris(view: &Path) {
-    // Stop first, delete second: a launchd-parented lane helper outlives the pass that
-    // submitted it, and the store lock that pass dropped says nothing about the helper.
-    crate::stage_helper::stop_orphaned_lane_jobs();
     let Ok(entries) = std::fs::read_dir(view) else {
         return;
     };
@@ -1560,11 +1047,10 @@ fn take_down(view: &Path, at: &Path, stem: &str, pid: &str) -> io::Result<()> {
 
 /// Lay the view for a dev-linked `checkout` (see the module doc): the mirrored directories
 /// as links to the checkout's, `bin/` staged beside the live one as one exec stub per plan
-/// entry — laid in one [`crate::lay::lay_executables`] call, so a provenance-tracked process
-/// uses one untracked job for all of them — and swapped in by `rename(2)` when it differs.
+/// entry — and swapped in by `rename(2)` when it differs.
 /// Writes no file of the store: a store view standing there is taken down ([`take_down`]),
 /// never followed — and not while a build runs from it ([`Deferred`]; `running` as
-/// [`refresh_view_in_process_with`] takes it): a `link` switches rustup's compiler for the
+/// [`refresh_view_with`] takes it): a `link` switches rustup's compiler for the
 /// next build, never for the rest of one in flight.
 #[cfg(unix)]
 fn refresh_linked_view(
@@ -1629,7 +1115,9 @@ fn refresh_linked_view(
     let _ = std::fs::remove_dir_all(&staged);
     crate::platform::remove_link(&staged);
     layout.ensure_dir(&staged)?;
-    crate::lay::lay_executables(&linked_stubs(&staged, &plan)?)?;
+    linked_stubs(&staged, &plan)?
+        .iter()
+        .try_for_each(crate::lay::write_in_process)?;
     {
         take_down(&view, &live, "bin", &pid)?;
         std::fs::rename(&staged, &live)?;
@@ -1703,18 +1191,6 @@ impl Entry {
             Entry::File => "a regular file".to_string(),
             Entry::Other => "neither a symlink nor a directory".to_string(),
         }
-    }
-}
-
-/// The bare noun for what sits at a seam path, with no layout to compare against — the
-/// half of [`Entry::describe`] a caller that already names the path needs.
-fn entry_noun(entry: &Entry) -> &'static str {
-    match entry {
-        Entry::Absent => "absent",
-        Entry::Link(_) => "a symlink",
-        Entry::Dir => "a real directory",
-        Entry::File => "a regular file",
-        Entry::Other => "neither a symlink nor a directory",
     }
 }
 
@@ -1858,6 +1334,15 @@ pub enum Attached {
         from: PathBuf,
         to: PathBuf,
     },
+    /// [`repair`] only: the entry linked outside the store to nothing, or to a toolchain
+    /// older than the store's; now the view. The toolchain it named is untouched.
+    ReplacedStale {
+        key: String,
+        path: PathBuf,
+        from: PathBuf,
+        to: PathBuf,
+        stale: Stale,
+    },
 }
 
 impl Attached {
@@ -1874,6 +1359,7 @@ impl Attached {
             self,
             Attached::Created { .. }
                 | Attached::Repointed { .. }
+                | Attached::ReplacedStale { .. }
                 | Attached::Adopted {
                     view_build: Some(_),
                     ..
@@ -1931,8 +1417,89 @@ impl fmt::Display for Attached {
                 to.display(),
                 from.display()
             ),
+            Attached::ReplacedStale {
+                key,
+                path,
+                from,
+                to,
+                stale,
+            } => write!(
+                f,
+                "{key}: re-pointed {} -> {} (was {}, {stale})",
+                path.display(),
+                to.display(),
+                from.display()
+            ),
         }
     }
+}
+
+/// Why a foreign link's toolchain is stale beside the store's trust build — the one kind
+/// of foreign entry [`repair`] re-points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stale {
+    /// The link names nothing: every `cargo +trust` fails.
+    Dangling,
+    /// Older than the store's build, by the `commit-date` each compiler's `-vV` reports
+    /// (`YYYY-MM-DD`): the toolchain's own, and the store's.
+    Older { its: String, store: String },
+}
+
+impl fmt::Display for Stale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stale::Dangling => f.write_str("which no longer exists"),
+            Stale::Older { its, store } => write!(
+                f,
+                "a toolchain from {its}, older than the store's {store}; it is left where it is"
+            ),
+        }
+    }
+}
+
+/// Whether the toolchain at `sysroot` is stale beside the store's current trust build: gone,
+/// or older. `None` without a store build, while the view presents a dev-linked checkout
+/// rather than the store ([`view_source`]), and when either compiler does not answer with a
+/// date inside the probe bound — an unknown age is never read as stale. The one rule for
+/// `doctor`'s (5e) line and for [`repair`], so doctor never names a fix repair refuses.
+#[must_use]
+pub fn stale_against_store(layout: &Layout, sysroot: &Path) -> Option<Stale> {
+    if view_source(layout) != ViewSource::Store {
+        return None;
+    }
+    let store = store_current(layout);
+    std::fs::metadata(&store).ok()?;
+    match std::fs::metadata(sysroot) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(Stale::Dangling),
+        Err(_) => return None,
+        Ok(_) => {}
+    }
+    let its = commit_date(sysroot)?;
+    let store = commit_date(&store)?;
+    (its < store).then_some(Stale::Older { its, store })
+}
+
+/// The `commit-date:` a sysroot's compiler reports — `bin/trustc -vV`, else `bin/rustc
+/// -vV` (a stage2 from before the Trust names) — when it is a `YYYY-MM-DD` date.
+fn commit_date(sysroot: &Path) -> Option<String> {
+    let bin = sysroot.join("bin");
+    ["trustc", "rustc"].iter().find_map(|name| {
+        let out =
+            crate::doctor::output_bounded(std::process::Command::new(bin.join(name)).arg("-vV"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let date = text
+            .lines()
+            .find_map(|l| l.strip_prefix("commit-date: "))?
+            .trim();
+        let digits = date.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+        (out.status.success() && date.len() == 10 && digits).then(|| date.to_string())
+    })
 }
 
 /// Why an [`attach`] or [`detach`] did not happen. Every variant is fail-closed:
@@ -1998,7 +1565,7 @@ impl std::error::Error for Refusal {}
 /// atpkg's, the view could not be built, or the filesystem failed. The rustup entry is
 /// unchanged on any `Err`.
 pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attached, Refusal> {
-    attach_reporting(layout, rustup_home, name, &refresh_view).map(|(attached, _)| attached)
+    attach_reporting(layout, rustup_home, name, &refresh_view, false).map(|(attached, _)| attached)
 }
 
 /// A view [`attach`] found out of date and left as it stands ([`Refreshed::deferred`]):
@@ -2012,11 +1579,13 @@ type Refresh<'a> = &'a dyn Fn(&Layout, &str) -> io::Result<Refreshed>;
 /// [`attach`], also answering whether the view was left behind ([`LeftView`]) — what
 /// [`reassert`] says in a line of its own. The entry is laid, adopted or re-pointed either
 /// way: what it names is the view, and a view one pass stale still presents a compiler.
+/// With `repair`, a foreign link to nothing or to an older toolchain is re-pointed too.
 fn attach_reporting(
     layout: &Layout,
     rustup_home: &Path,
     name: &str,
     refresh: Refresh<'_>,
+    repair: bool,
 ) -> Result<(Attached, Option<LeftView>), Refusal> {
     if !name_allowed(name) {
         return Err(Refusal::BadName(name.to_string()));
@@ -2029,14 +1598,24 @@ fn attach_reporting(
     let target = seam_target(layout, name);
     let p = probe(layout, rustup_home, name)?;
     // Foreign entries are refused BEFORE the view is touched, so a refusal changes
-    // nothing on disk, as the contract says.
+    // nothing on disk, as the contract says — but for `repair`, a link to nothing or to a
+    // toolchain older than the store's installed build.
+    let mut stale = None;
     if let Entry::Link(raw) = &p.entry
         && !p.in_prefix
     {
-        return Err(Refusal::Foreign {
-            what: Entry::Link(raw.clone()).describe(layout),
-            path: p.path,
-        });
+        if repair {
+            stale = p
+                .target
+                .as_deref()
+                .and_then(|t| stale_against_store(layout, t));
+        }
+        if stale.is_none() {
+            return Err(Refusal::Foreign {
+                what: Entry::Link(raw.clone()).describe(layout),
+                path: p.path,
+            });
+        }
     }
     if !matches!(p.entry, Entry::Absent | Entry::Link(_)) {
         return Err(Refusal::Foreign {
@@ -2085,15 +1664,24 @@ fn attach_reporting(
         }
         Entry::Link(raw) => {
             // A link into the store — `current`, or a numbered build — from before the
-            // view existed: `rename(2)` a fresh link over it. The existing link is
-            // replaced, never followed.
+            // view existed, or (`repair`) to nothing or an older toolchain: `rename(2)` a
+            // fresh link over it. The existing link is replaced, never followed.
             crate::activate::atomic_symlink(&target, &p.path)?;
             record(layout, name)?;
-            Attached::Repointed {
-                key,
-                path: p.path,
-                from: raw,
-                to: target,
+            match stale {
+                Some(stale) => Attached::ReplacedStale {
+                    key,
+                    path: p.path,
+                    from: raw,
+                    to: target,
+                    stale,
+                },
+                None => Attached::Repointed {
+                    key,
+                    path: p.path,
+                    from: raw,
+                    to: target,
+                },
             }
         }
         // Every other shape was refused above.
@@ -2534,12 +2122,25 @@ fn clear_refusal(layout: &Layout, name: &str) -> io::Result<()> {
 /// no-op.
 #[must_use]
 pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
-    reassert_with(layout, rustup_home, &refresh_view)
+    reassert_with(layout, rustup_home, &refresh_view, false)
+}
+
+/// [`reassert`] for `aterm pkg repair`, the pass a person asks for: a foreign link to
+/// nothing, or to a toolchain older than the store's ([`stale_against_store`]), is
+/// re-pointed at the view too, and the line names what it was, so it can be linked back.
+#[must_use]
+pub fn repair(layout: &Layout, rustup_home: &Path) -> Vec<String> {
+    reassert_with(layout, rustup_home, &refresh_view, true)
 }
 
 /// [`reassert`] with the view's refresh injected ([`Refresh`]), so what a pass records
 /// around a view it left behind — or one it failed to lay — is provable from a test.
-fn reassert_with(layout: &Layout, rustup_home: &Path, refresh: Refresh<'_>) -> Vec<String> {
+fn reassert_with(
+    layout: &Layout,
+    rustup_home: &Path,
+    refresh: Refresh<'_>,
+    repair: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     if !toolchains_dir(rustup_home).is_dir() {
         return lines;
@@ -2563,7 +2164,7 @@ fn reassert_with(layout: &Layout, rustup_home: &Path, refresh: Refresh<'_>) -> V
         names.insert(DEFAULT_SEAM.to_string());
     }
     for name in names {
-        match attach_reporting(layout, rustup_home, &name, refresh) {
+        match attach_reporting(layout, rustup_home, &name, refresh, repair) {
             Ok((a, left)) => {
                 // A seam that attaches (or was already right) clears the refusal the
                 // last pass may have recorded — the record follows the disk. A view left
@@ -2602,108 +2203,6 @@ fn reassert_with(layout: &Layout, rustup_home: &Path, refresh: Refresh<'_>) -> V
     lines
 }
 
-/// WHAT THIS MACHINE ACTUALLY COMPILES WITH, when that is not the build atpkg manages —
-/// one clause naming the dissent, or `None` when rustup's entry IS the managed seam, is
-/// absent, or there is no rustup at all.
-///
-/// **THE FAILURE THIS ANSWERS.** `aterm pkg update trust` printed `atpkg: rustc up to date`
-/// for two weeks while every `targo`, every `cargo +trust` and every repo pinning
-/// `channel = "trust"` ran a hand-placed toolchain in the home directory that was 859
-/// commits behind — measured on m3, 2026-09-17: pin 8595, `$HOME/trust` HEAD 9454. Both halves
-/// of that sentence were true of what atpkg MANAGES and neither was true of what the
-/// machine USES, and nothing in the update lane had ever been given the second question to
-/// ask. `doctor` knew — [`crate::doctor`]'s seam check had reported the same entry, twice —
-/// but a verdict a person only sees when they run a different verb is not a verdict the
-/// verb they ran gave them.
-///
-/// **THE FACT ONLY, NEVER THE REMEDY.** The one-line `ln -sfn` re-point (and the
-/// [`DETACH_FIX`] for the shapes a link cannot be laid over) is spelled in exactly one
-/// place, `doctor`'s `seam_line`, and this clause points there rather than growing a second
-/// copy that can drift from it. What belongs here is the thing the update lane alone is in
-/// a position to say: the verdict it just printed is about a build this machine does not
-/// run.
-///
-/// Pure over the probe, so the words are testable without a rustup — the same rule
-/// `seam_line` follows.
-#[must_use]
-pub fn dissent_line(st: &SeamStatus) -> Option<String> {
-    if !st.rustup_present {
-        return None;
-    }
-    let names_what = |what: String| {
-        // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
-        let mut s = String::from("rustup's `");
-        s.push_str(DEFAULT_SEAM);
-        s.push_str("` resolves to ");
-        s.push_str(&what);
-        s.push_str(", which atpkg does not manage — `cargo +");
-        s.push_str(DEFAULT_SEAM);
-        s.push_str("`, `rustup run ");
-        s.push_str(DEFAULT_SEAM);
-        s.push_str("` and every repo pinning `channel = \"");
-        s.push_str(DEFAULT_SEAM);
-        s.push_str(
-            "\"` compile with THAT copy; `aterm pkg doctor` names the one-line \
-                    re-point",
-        );
-        s
-    };
-    match &st.entry {
-        // A link somewhere else entirely: the hand-placed toolchain, the case this exists for.
-        Ok(Entry::Link(raw)) if !st.in_prefix => Some(names_what(raw.display().to_string())),
-        // A real directory, a regular file, something that is not a symlink at all: whatever
-        // it holds is what `+trust` runs, and no re-point can be laid over it.
-        Ok(entry @ (Entry::Dir | Entry::File | Entry::Other)) => {
-            let mut what = st.path.display().to_string();
-            what.push_str(" (");
-            what.push_str(entry_noun(entry));
-            what.push(')');
-            Some(names_what(what))
-        }
-        // A link INTO the prefix but not at the view is atpkg's own older layout: `repair`
-        // re-points it and the tools it reaches are this build's either way. Not a dissent.
-        Ok(Entry::Link(_) | Entry::Absent) => None,
-        // Nobody looked. A bound on what this process may know is never reported as a fact
-        // about the machine — but it is not silence either: say that the question could not
-        // be answered, so a reader is not left with a bare "up to date" that was never
-        // checked.
-        Err(e) => {
-            let mut s = String::from("rustup's `");
-            s.push_str(DEFAULT_SEAM);
-            s.push_str("` at ");
-            s.push_str(&st.path.display().to_string());
-            s.push_str(" could not be inspected (");
-            s.push_str(e);
-            s.push_str("), so whether this machine compiles with the build above is UNKNOWN");
-            Some(s)
-        }
-    }
-}
-
-/// [`dissent_line`] for `program`, against the rustup home [`arm_from_env`] armed —
-/// `None` for any program but [`SEAM_PROGRAM`], and `None` in every unit test by
-/// construction, so no test can be made to depend on the developer's own `~/.rustup`.
-///
-/// This is the accessor the update and install lanes call. Their tests reach
-/// [`dissent_line`] directly, which is where the words are.
-///
-/// NOT LIVE (measured 2026-09-23, Phase 5 of
-/// `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): nothing calls
-/// [`arm_from_env`] — no caller since the seam landed (`ecb1d6691`) — so [`armed`] is
-/// `None` in every shipped process and this answers `None` everywhere. The three lanes'
-/// "but not what this machine runs" sentence has never printed. Wiring the edge is a
-/// behaviour change (on m7 it would qualify every trust "up to date" line: rustup's
-/// `trust` there is a hand link into `$HOME/trust/build/host/stage2`), so it is the owner's
-/// call, not a deletion's.
-#[must_use]
-pub fn dissent_if_armed(layout: &Layout, program: &str) -> Option<String> {
-    if program != SEAM_PROGRAM {
-        return None;
-    }
-    let home = armed()?;
-    dissent_line(&status(layout, home, DEFAULT_SEAM))
-}
-
 /// Detach every recorded seam (never `--force`): the whole-set removal's companion.
 /// Returns one line per seam acted on or refused.
 #[must_use]
@@ -2715,28 +2214,6 @@ pub fn detach_recorded(layout: &Layout, rustup_home: &Path) -> Vec<String> {
             Err(e) => e.to_string(),
         })
         .collect()
-}
-
-/// The rustup home [`arm_from_env`] armed, if any. `None` inside the crate's own test
-/// harness by construction, and — while nothing calls [`arm_from_env`] — `None` in every
-/// shipped process too (see [`dissent_if_armed`]).
-static ARMED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-
-/// Arm [`dissent_if_armed`] with this process's [`rustup_home`]: meant to be called ONCE
-/// at the CLI dispatch edge, and today called by NOTHING (see [`dissent_if_armed`]). A
-/// deliberate no-op under `cfg(test)`, so no unit test reads the developer's live
-/// `~/.rustup`.
-pub fn arm_from_env() {
-    if cfg!(test) {
-        return;
-    }
-    let _ = ARMED.set(rustup_home());
-}
-
-/// Whether [`arm_from_env`] armed a rustup home.
-#[must_use]
-pub fn armed() -> Option<&'static Path> {
-    ARMED.get().and_then(|h| h.as_deref())
 }
 
 #[cfg(test)]
@@ -2828,127 +2305,6 @@ mod tests {
     fn cloned(store: &Path, at: &Path) -> bool {
         crate::clone::is_clone_of(store, at)
             && matches!(crate::clone::same_bytes(store, at), Ok(true))
-    }
-
-    /// The view spec round-trips byte for byte and refuses what it half-understands —
-    /// a foreign header, an unknown key, a name off the allowlist, a relative prefix.
-    #[test]
-    fn the_view_spec_round_trips_and_refuses_what_it_half_understands() {
-        let prefix = Path::new("/Users//x/Library/Application Support/aterm/pkg");
-        let seam = ViewJob::Seam {
-            name: String::from("trust"),
-        };
-        let text = encode_spec(prefix, &seam);
-        assert!(text.starts_with(SPEC_HEADER), "{text}");
-        assert_eq!(
-            decode_spec(&text).unwrap(),
-            (prefix.to_path_buf(), seam.clone())
-        );
-        let root = ViewJob::Root {
-            build_dir: prefix.join("store/trust/8595"),
-        };
-        assert_eq!(
-            decode_spec(&encode_spec(prefix, &root)).unwrap(),
-            (prefix.to_path_buf(), root)
-        );
-        assert!(decode_spec("atpkg-view-spec v0\n").is_err());
-        assert!(decode_spec(&text.replace("name=", "nom=")).is_err());
-        assert!(
-            decode_spec(&encode_spec(
-                prefix,
-                &ViewJob::Seam {
-                    name: String::from("nightly")
-                }
-            ))
-            .is_err(),
-            "a name off the allowlist"
-        );
-        assert!(decode_spec(&encode_spec(Path::new("relative/prefix"), &seam)).is_err());
-        assert!(
-            decode_spec(&encode_spec(
-                prefix,
-                &ViewJob::Root {
-                    build_dir: PathBuf::from("store/trust/8595")
-                }
-            ))
-            .is_err(),
-            "a relative root"
-        );
-    }
-
-    /// The helper's one result line round-trips, its stock pairs resolved back to the
-    /// allowlist's own statics; a pair the allowlist does not name is refused. A view the
-    /// helper left behind comes back as left behind — both reasons, the executable's path
-    /// with its spaces — and a line that does not say either way is refused, never read as
-    /// a current view.
-    #[test]
-    fn the_view_result_round_trips_through_the_allowlist() {
-        let r = Refreshed {
-            build: PathBuf::from("/p/store/trust/8595"),
-            tools: 21,
-            stock: STOCK_NAMES.to_vec(),
-            changed: true,
-            deferred: None,
-        };
-        assert_eq!(decode_refreshed(&encode_refreshed(&r)).unwrap(), r);
-        let none = Refreshed {
-            build: PathBuf::from("/p/store/trust/8595"),
-            tools: 0,
-            stock: Vec::new(),
-            changed: false,
-            deferred: None,
-        };
-        assert_eq!(decode_refreshed(&encode_refreshed(&none)).unwrap(), none);
-        for deferred in [
-            Deferred::Unknown,
-            Deferred::InUse(PathBuf::from("/p/App Support/rustup/trust/bin/targo")),
-        ] {
-            let left = Refreshed {
-                deferred: Some(deferred),
-                ..none.clone()
-            };
-            assert_eq!(decode_refreshed(&encode_refreshed(&left)).unwrap(), left);
-        }
-        assert!(decode_refreshed("1 21 2f70 rustc:nope -").is_err());
-        assert!(decode_refreshed("2 21 2f70  -").is_err());
-        assert!(decode_refreshed("0 21 2f70 ").is_err(), "no deferred field");
-        assert!(decode_refreshed("0 21 2f70  - extra").is_err());
-    }
-
-    /// The policy table for the view, with the lane's outcome forced: an untracked
-    /// process builds in place whatever the lane; a tracked one with no lane for its
-    /// binary builds in place; a tracked one whose lane FAILS refuses under `Refuse`
-    /// and builds in-process under `Allow`, the default.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_tracked_process_whose_view_lane_fails_refuses_under_refuse_and_builds_under_allow() {
-        use crate::lay::{Lane, TrackedPolicy};
-        let f = Fixture::new("view-policy");
-        f.install_trust(8595);
-        // A helper spelled right that answers nothing: `/usr/bin/true` named `atpkg`.
-        let fake_dir = f.layout.prefix.join("fake");
-        std::fs::create_dir_all(&fake_dir).unwrap();
-        let fake = fake_dir.join("atpkg");
-        std::fs::copy("/usr/bin/true", &fake).unwrap();
-        let broken = Lane::Helper(fake);
-        let none = Lane::Unavailable(String::from("a test harness"));
-        let view_trustc = view_dir(&f.layout, "trust").join("bin").join("trustc");
-
-        refresh_view_with(&f.layout, "trust", false, &broken, TrackedPolicy::Refuse).unwrap();
-        assert!(
-            view_trustc.is_file(),
-            "untracked: in place, whatever the lane"
-        );
-        refresh_view_with(&f.layout, "trust", true, &none, TrackedPolicy::Refuse).unwrap();
-        assert!(view_trustc.is_file(), "tracked, no lane: in place");
-        let err = refresh_view_with(&f.layout, "trust", true, &broken, TrackedPolicy::Refuse)
-            .expect_err("a tracked process with a broken lane must refuse under Refuse");
-        let msg = err.to_string();
-        assert!(msg.contains("com.apple.provenance"), "{msg}");
-        assert!(msg.contains("refreshing the rustup view"), "{msg}");
-        refresh_view_with(&f.layout, "trust", true, &broken, TrackedPolicy::Allow)
-            .expect("the default builds in-process");
-        assert!(view_trustc.is_file());
     }
 
     #[test]
@@ -3209,95 +2565,6 @@ mod tests {
         assert_eq!(refused_key("trust"), "refused:rustup:trust");
     }
 
-    /// WHAT `update` NOW ASKS THAT IT NEVER USED TO. `aterm pkg update trust` printed
-    /// `atpkg: rustc up to date` for two weeks on m3 while `~/.rustup/toolchains/trust`
-    /// pointed at a hand-placed toolchain 859 commits behind the pin. Every shape the entry
-    /// can take, judged.
-    #[cfg(unix)]
-    #[test]
-    fn dissent_names_a_foreign_entry_and_stays_silent_about_the_managed_one() {
-        let fx = Fixture::new("dissent");
-        fx.install_trust(8595);
-
-        // ABSENT: nothing to dissent about — the store IS the only answer rustup has.
-        assert_eq!(dissent_line(&status(&fx.layout, &fx.rustup, "trust")), None);
-
-        // THE m3 SHAPE: a link to a hand-placed toolchain in the home directory.
-        let elsewhere = fx.root.join("toolchains").join("trust-957012d3");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        link(&elsewhere, &fx.seam("trust"));
-        let why = dissent_line(&status(&fx.layout, &fx.rustup, "trust"))
-            .expect("a foreign link is a dissent");
-        assert!(
-            why.contains(&elsewhere.display().to_string()),
-            "it NAMES what runs instead: {why}"
-        );
-        assert!(why.contains("cargo +trust"), "{why}");
-        assert!(
-            why.contains("aterm pkg doctor"),
-            "the remedy has ONE spelling and it is doctor's: {why}"
-        );
-
-        // A REAL DIRECTORY: no re-point can be laid over it, and it is still a dissent.
-        std::fs::remove_file(fx.seam("trust")).unwrap();
-        std::fs::create_dir_all(fx.seam("trust")).unwrap();
-        let why = dissent_line(&status(&fx.layout, &fx.rustup, "trust"))
-            .expect("a real directory is a dissent");
-        assert!(why.contains("a real directory"), "{why}");
-
-        // THE MANAGED SEAM ITSELF: silent. A verb that narrates a healthy machine trains
-        // its reader to skip the line that matters.
-        std::fs::remove_dir_all(fx.seam("trust")).unwrap();
-        refresh_view(&fx.layout, "trust").unwrap();
-        link(&seam_target(&fx.layout, "trust"), &fx.seam("trust"));
-        assert_eq!(dissent_line(&status(&fx.layout, &fx.rustup, "trust")), None);
-
-        // A link INTO the store but not at the view — atpkg's own older layout. `repair`
-        // re-points it; the compiler it reaches is this build either way, so not a dissent.
-        std::fs::remove_file(fx.seam("trust")).unwrap();
-        link(&store_current(&fx.layout), &fx.seam("trust"));
-        assert_eq!(dissent_line(&status(&fx.layout, &fx.rustup, "trust")), None);
-    }
-
-    /// NO RUSTUP IS NOT A DISSENT, and an entry nobody could inspect is not silence.
-    #[cfg(unix)]
-    #[test]
-    fn dissent_is_silent_without_rustup_and_says_so_when_it_cannot_look() {
-        let fx = Fixture::new("dissent-norustup");
-        fx.install_trust(8595);
-        std::fs::remove_dir_all(fx.rustup.join("toolchains")).unwrap();
-        assert_eq!(
-            dissent_line(&status(&fx.layout, &fx.rustup, "trust")),
-            None,
-            "a machine with no rustup compiles with what is on PATH; this check has no \
-             opinion about it"
-        );
-        // An inspection that FAILED is reported as unknown, never as "fine": a bound on
-        // what this process may know must not be written down as a fact about the machine.
-        let st = SeamStatus {
-            key: String::from("rustup:trust"),
-            recorded: false,
-            path: fx.seam("trust"),
-            rustup_present: true,
-            entry: Err(String::from("Permission denied (os error 13)")),
-            target: None,
-            in_prefix: false,
-            targets_view: false,
-        };
-        let why = dissent_line(&st).expect("an unreadable entry is said, not skipped");
-        assert!(why.contains("UNKNOWN"), "{why}");
-        assert!(why.contains("Permission denied"), "{why}");
-    }
-
-    /// The armed accessor is inert under test — no unit test can be made to read the
-    /// developer's own `~/.rustup` — and it answers only for the seam program.
-    #[test]
-    fn dissent_if_armed_is_inert_in_tests_and_only_ever_about_trust() {
-        let fx = Fixture::new("dissent-armed");
-        assert_eq!(dissent_if_armed(&fx.layout, "ay"), None);
-        assert_eq!(dissent_if_armed(&fx.layout, SEAM_PROGRAM), None);
-    }
-
     #[cfg(unix)]
     #[test]
     fn foreign_symlink_is_refused_and_left_alone() {
@@ -3318,6 +2585,137 @@ mod tests {
             s.to_string().contains("in-prefix=no targets-view=no"),
             "{s}"
         );
+    }
+
+    /// A compiler at `<sysroot>/bin/<name>` that answers `-vV` with `commit-date: <date>` —
+    /// the date read from `<sysroot>/commit-date`, through a hard link to ONE script per
+    /// fixture that is run once here, unbounded. macOS assesses every new executable file
+    /// on its first exec (measured ~20 s on a loaded m7, 2026-09-24 — past the 5 s probe
+    /// bound), and a link to an assessed file is not new: the probes under test time the
+    /// date comparison, not Gatekeeper.
+    #[cfg(unix)]
+    fn dated_compiler(fx: &Fixture, sysroot: &Path, name: &str, date: &str) {
+        let script = fx.root.join("dated-compiler");
+        if !script.is_file() {
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nd=$(cat \"$(dirname \"$0\")/../commit-date\")\n\
+                 echo \"rustc 1.99.0-dev (0000000 $d)\"\necho \"commit-date: $d\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::process::Command::new(&script).output();
+        }
+        let bin = sysroot.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join(name);
+        let _ = std::fs::remove_file(&exe);
+        std::fs::hard_link(&script, &exe).unwrap();
+        std::fs::write(sysroot.join("commit-date"), date).unwrap();
+    }
+
+    /// A STALE LOCAL TOOLCHAIN (m7, 2026-09-24: rustup's `trust` -> a 2026-07-17 stage2 while
+    /// the store held 2026-09-17). The unattended pass refuses the foreign link as ever;
+    /// `repair` re-points it at the view, names what it was, and leaves that tree alone — and
+    /// a link to a tree that is gone. A newer toolchain, one that names no date, or any link
+    /// while trust is dev-linked, stays refused under `repair` too.
+    #[cfg(unix)]
+    #[test]
+    fn repair_repoints_a_link_to_an_older_or_missing_toolchain_and_nothing_else() {
+        let fx = Fixture::new("stale-local");
+        let build = fx.install_trust(9192);
+        dated_compiler(&fx, &build, "trustc", "2026-09-17");
+        let stage2 = fx
+            .root
+            .join("trust")
+            .join("build")
+            .join("host")
+            .join("stage2");
+        dated_compiler(&fx, &stage2, "rustc", "2026-07-17");
+        link(&stage2, &fx.seam("trust"));
+        assert_eq!(
+            stale_against_store(&fx.layout, &stage2),
+            Some(Stale::Older {
+                its: "2026-07-17".into(),
+                store: "2026-09-17".into()
+            })
+        );
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert!(lines[0].contains("refusing to touch it"), "{lines:?}");
+        assert_eq!(std::fs::read_link(fx.seam("trust")).unwrap(), stage2);
+
+        let lines = repair(&fx.layout, &fx.rustup);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(&stage2.display().to_string())
+                && lines[0]
+                    .contains("a toolchain from 2026-07-17, older than the store's 2026-09-17"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.seam("trust")).unwrap(),
+            seam_target(&fx.layout, "trust")
+        );
+        assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
+        assert!(
+            stage2.join("bin").join("rustc").is_file(),
+            "the old tree is left"
+        );
+        assert!(
+            repair(&fx.layout, &fx.rustup).is_empty(),
+            "then it is ours: adopted"
+        );
+
+        for (date, why) in [("2026-09-18", "newer"), ("unknown", "undated")] {
+            std::fs::remove_file(fx.seam("trust")).unwrap();
+            dated_compiler(&fx, &stage2, "rustc", date);
+            link(&stage2, &fx.seam("trust"));
+            assert_eq!(stale_against_store(&fx.layout, &stage2), None, "{why}");
+            let lines = repair(&fx.layout, &fx.rustup);
+            assert!(
+                lines[0].contains("refusing to touch it"),
+                "{why}: {lines:?}"
+            );
+            assert_eq!(
+                std::fs::read_link(fx.seam("trust")).unwrap(),
+                stage2,
+                "{why}"
+            );
+        }
+
+        // A link to a tree that is gone: `cargo +trust` fails outright, and repair relinks.
+        let gone = fx.root.join("toolchains").join("trust-deleted");
+        std::fs::remove_file(fx.seam("trust")).unwrap();
+        link(&gone, &fx.seam("trust"));
+        assert!(reassert(&fx.layout, &fx.rustup)[0].contains("refusing to touch it"));
+        let lines = repair(&fx.layout, &fx.rustup);
+        assert!(
+            lines[0].contains(&format!("(was {}, which no longer exists)", gone.display())),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.seam("trust")).unwrap(),
+            seam_target(&fx.layout, "trust")
+        );
+
+        // A dev-linked trust: the view presents the checkout, not the store, so no link is
+        // stale against the store — doctor names no `repair` fix, and repair re-points
+        // nothing.
+        let checkout = sysroot_checkout(&fx, "checkout");
+        crate::linkmode::link(
+            &fx.layout,
+            "trust",
+            &checkout,
+            &[PathBuf::from("bin/trustc")],
+        )
+        .unwrap();
+        dated_compiler(&fx, &stage2, "rustc", "2026-07-17");
+        std::fs::remove_file(fx.seam("trust")).unwrap();
+        link(&stage2, &fx.seam("trust"));
+        assert_eq!(stale_against_store(&fx.layout, &stage2), None);
+        assert_eq!(stale_against_store(&fx.layout, &gone), None);
+        assert!(repair(&fx.layout, &fx.rustup)[0].contains("refusing to touch it"));
+        assert_eq!(std::fs::read_link(fx.seam("trust")).unwrap(), stage2);
     }
 
     #[cfg(unix)]
@@ -3429,14 +2827,13 @@ mod tests {
                 outcome: "up to date".into(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
-                last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
                 last_pass: String::new(),
                 last_pass_at: String::new(),
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
-                metered_hold_until: String::new(),
+                pass_seq: 0,
                 programs,
                 extra: Default::default(),
             },
@@ -3582,21 +2979,6 @@ mod tests {
         assert_eq!(recorded_names(&fx.layout), vec!["trust".to_string()]);
     }
 
-    #[test]
-    fn arming_is_inert_inside_the_test_harness() {
-        // A test that armed the edge would read the developer's ~/.rustup.
-        arm_from_env();
-        assert!(
-            armed().is_none(),
-            "arm_from_env must be a no-op under cfg(test)"
-        );
-        let fx = Fixture::new("unarmed");
-        fx.install_trust(6808);
-        assert_eq!(dissent_if_armed(&fx.layout, SEAM_PROGRAM), None);
-        assert!(std::fs::symlink_metadata(fx.seam("trust")).is_err());
-        assert!(fx.seams_recorded().is_empty());
-    }
-
     /// The view: one clone per tool under its own name, each stock name a clone of its
     /// Trust tool — its bytes on a new inode, never the store's own — `lib/` a real
     /// directory of clones, and not one store file gaining a link.
@@ -3723,11 +3105,10 @@ mod tests {
     fn a_view_a_live_process_runs_from_is_left_as_it_stands() {
         let fx = Fixture::new("view-in-use");
         fx.install_trust(9178);
-        let first =
-            refresh_view_in_process_with(&fx.layout, "trust", &|| -> Option<Vec<PathBuf>> {
-                panic!("a first lay has nothing a process could run from, and reads no table")
-            })
-            .unwrap();
+        let first = refresh_view_with(&fx.layout, "trust", &|| -> Option<Vec<PathBuf>> {
+            panic!("a first lay has nothing a process could run from, and reads no table")
+        })
+        .unwrap();
         assert!(first.changed && first.deferred.is_none(), "{first:?}");
         let view = view_dir(&fx.layout, "trust");
         let reads = &std::cell::Cell::new(0_u32);
@@ -3737,8 +3118,7 @@ mod tests {
                 exes.clone()
             }
         };
-        let current =
-            refresh_view_in_process_with(&fx.layout, "trust", &table(Some(Vec::new()))).unwrap();
+        let current = refresh_view_with(&fx.layout, "trust", &table(Some(Vec::new()))).unwrap();
         assert!(!current.changed && current.deferred.is_none());
         assert_eq!(reads.get(), 0, "a current view reads no table");
 
@@ -3754,7 +3134,7 @@ mod tests {
             (None, Deferred::Unknown),
         ] {
             reads.set(0);
-            let r = refresh_view_in_process_with(&fx.layout, "trust", &table(running)).unwrap();
+            let r = refresh_view_with(&fx.layout, "trust", &table(running)).unwrap();
             assert_eq!(reads.get(), 1, "the table is read once per refresh");
             assert!(!r.changed, "{r:?}");
             assert_eq!(r.deferred, Some(why), "{r:?}");
@@ -3775,7 +3155,7 @@ mod tests {
             view_dir(&fx.layout, "trust-dev").join("bin").join("targo"),
             new.join("bin").join("targo"),
         ];
-        let r = refresh_view_in_process_with(&fx.layout, "trust", &table(Some(elsewhere))).unwrap();
+        let r = refresh_view_with(&fx.layout, "trust", &table(Some(elsewhere))).unwrap();
         assert!(r.changed && r.deferred.is_none(), "{r:?}");
         assert_eq!(
             std::fs::read_to_string(view.join("bin").join("trustc")).unwrap(),
@@ -3802,8 +3182,7 @@ mod tests {
             &[PathBuf::from("bin/trustc"), PathBuf::from("bin/targo")],
         )
         .unwrap();
-        let r =
-            refresh_view_in_process_with(&fx.layout, "trust", &|| Some(vec![exe.clone()])).unwrap();
+        let r = refresh_view_with(&fx.layout, "trust", &|| Some(vec![exe.clone()])).unwrap();
         assert_eq!(r.deferred, Some(Deferred::InUse(exe.clone())), "{r:?}");
         assert_eq!(r.build, checkout);
         assert!(cloned(
@@ -3814,7 +3193,7 @@ mod tests {
             is_real_dir(&view.join("lib")),
             "the clone view's lib/ stays"
         );
-        let r = refresh_view_in_process_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
+        let r = refresh_view_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
         assert!(r.changed && r.deferred.is_none(), "{r:?}");
         assert_eq!(
             std::fs::read_link(view.join("lib")).unwrap(),
@@ -3845,9 +3224,12 @@ mod tests {
             (Some(vec![exe.clone()]), "once that process has exited"),
             (None, "once the process table can be read"),
         ] {
-            let lines = reassert_with(&fx.layout, &fx.rustup, &|l: &Layout, n: &str| {
-                refresh_view_in_process_with(l, n, &|| running.clone())
-            });
+            let lines = reassert_with(
+                &fx.layout,
+                &fx.rustup,
+                &|l: &Layout, n: &str| refresh_view_with(l, n, &|| running.clone()),
+                false,
+            );
             assert_eq!(lines.len(), 1, "{lines:?}");
             let line = &lines[0];
             assert!(
@@ -3906,9 +3288,8 @@ mod tests {
 
         // The rebuild finishes while a build still runs from the store's view.
         std::fs::rename(&aside, checkout.join("lib")).unwrap();
-        let in_use =
-            |l: &Layout, n: &str| refresh_view_in_process_with(l, n, &|| Some(vec![exe.clone()]));
-        let lines = reassert_with(&fx.layout, &fx.rustup, &in_use);
+        let in_use = |l: &Layout, n: &str| refresh_view_with(l, n, &|| Some(vec![exe.clone()]));
+        let lines = reassert_with(&fx.layout, &fx.rustup, &in_use, false);
         assert!(
             lines.len() == 1
                 && lines[0].contains("left as it stands")
@@ -3925,7 +3306,7 @@ mod tests {
         let failed = |_: &Layout, _: &str| -> io::Result<Refreshed> {
             Err(io::Error::other("clonefile: operation not supported"))
         };
-        let lines = reassert_with(&fx.layout, &fx.rustup, &failed);
+        let lines = reassert_with(&fx.layout, &fx.rustup, &failed, false);
         assert!(
             lines.len() == 1 && lines[0].contains("clonefile"),
             "{lines:?}"

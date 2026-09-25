@@ -1,0 +1,24 @@
+schema = 1
+roster_seq = 4
+valid_until = "9999-12-31T00:00:00Z"
+revoked = []
+
+[[machine]]
+id = "incumbent-head"
+pubkey = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8="
+added_at = "2026-08-15T21:55:04Z"
+
+[[machine]]
+id = "m3"
+pubkey = "YOHw0OoefQ79NdE8qsQFobIMR7QXChpreYBi2Of74Uo="
+added_at = "2026-08-15T21:55:04Z"
+
+[[machine]]
+id = "m2"
+pubkey = "vwy2UpnNw2R8nTAsb+eTlC9p2RZmvBITgUnXWGIk5J8="
+added_at = "2026-08-16T23:29:37Z"
+
+[[machine]]
+id = "m22"
+pubkey = "woDdkghTGzQBIJWwja4jCWYo+k8NJV8Eg92KPxMHkys="
+added_at = "2026-08-21T19:45:42Z"

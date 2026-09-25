@@ -415,201 +415,94 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Permissive
+    // Built-in profile decisions
     // -----------------------------------------------------------------
 
-    #[test]
-    fn permissive_default_unmatched_is_execute() {
-        let eng = PolicyEngine::new(profiles::permissive());
-        let d = eng.evaluate(&osc(52, &["c", "SGk="]), OriginTag::Pty);
-        assert_eq!(d.response, Response::Execute);
-    }
+    /// One sequence from one origin under one built-in profile:
+    /// `(what, profile, sequence, origin, response, rate-limit id)`. The
+    /// rate-limit id is asserted only where a row names one.
+    type ProfileRow = (
+        &'static str,
+        fn() -> crate::Policy,
+        DispatchedSequence,
+        OriginTag,
+        Response,
+        Option<&'static str>,
+    );
 
     #[test]
-    fn permissive_clipboard_set_from_pty_executes() {
-        let eng = PolicyEngine::new(profiles::permissive());
-        // `response any` rule is the only rule in Permissive; everything else
-        // falls through to `unmatched = Execute`.
-        let d = eng.evaluate(&osc(52, &["c", "SGk="]), OriginTag::Pty);
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    #[test]
-    fn permissive_window_op_from_pty_executes() {
-        let eng = PolicyEngine::new(profiles::permissive());
-        let d = eng.evaluate(&csi(Some(20), 't', &[]), OriginTag::Pty);
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    // -----------------------------------------------------------------
-    // Standard
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn standard_clipboard_set_from_user_is_ask() {
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(52, &["c", "SGVsbG8="]), OriginTag::User);
-        assert_eq!(d.response, Response::Ask);
-        assert_eq!(d.rate_limit.as_deref(), Some("clipboard"));
-    }
-
-    #[test]
-    fn standard_clipboard_set_from_pty_falls_through_to_unmatched() {
-        // PTY origin fails the `User`-or-higher gate on the OSC 52 set rule;
-        // evaluation continues. Next same-bucket rules are OSC 52 query — no
-        // match. Eventually we hit the `response any` rule with origin_min =
-        // NetworkUntrusted (the loosest tag), which dominates Pty. That rule
-        // responds Execute.
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(52, &["c", "SGVsbG8="]), OriginTag::Pty);
-        // The `response any` wildcard catches this with Execute because its
-        // origin_min = NetworkUntrusted (everyone dominates that).
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    #[test]
-    fn standard_clipboard_query_drops() {
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(52, &["c", "?"]), OriginTag::Host);
-        assert_eq!(d.response, Response::Drop);
-    }
-
-    #[test]
-    fn standard_palette_query_executes_for_pty_safe() {
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(4, &["3", "?"]), OriginTag::PtySafe);
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    #[test]
-    fn standard_palette_query_from_pty_falls_through() {
-        // Pty does not dominate PtySafe, so the OSC 4 query rule continues.
-        // Next matching bucket rule is OSC 4 set — that's a different param
-        // pattern. Falls through to wildcard `response any` with
-        // origin_min=NetworkUntrusted → Execute.
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(4, &["3", "?"]), OriginTag::Pty);
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    #[test]
-    fn standard_window_op_from_pty_drops() {
-        // CSI t rule requires Host origin; Pty does not dominate Host.
-        // No other CSI rule matches. Falls through to `response any`
-        // wildcard (NetworkUntrusted origin_min) → Execute.
-        // This is Standard-profile behavior by design: CSI responses go
-        // through the response rate limiter, not the window-op gate.
-        // Host-only blocking is enforced by the capability module for
-        // non-query window ops; the policy rule here is the gate for
-        // dispatch, not the actual ops.
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&csi(Some(20), 't', &[]), OriginTag::Pty);
-        // Fallthrough `response any` wildcard responds Execute.
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    #[test]
-    fn standard_notification_from_user_warns() {
-        let eng = PolicyEngine::new(profiles::standard());
-        let d = eng.evaluate(&osc(9, &["build done"]), OriginTag::User);
-        assert_eq!(d.response, Response::Warn);
-        assert_eq!(d.rate_limit.as_deref(), Some("notifications"));
-    }
-
-    #[test]
-    fn standard_default_unmatched_is_warn() {
-        let eng = PolicyEngine::new(profiles::standard());
-        // OSC 999 — no rule matches, not covered by wildcard at wildcard-origin.
-        // `response any` has origin_min=NetworkUntrusted; ConfigFile dominates
-        // NetworkUntrusted so it matches. Use an origin that does not dominate
-        // anything (but NetworkUntrusted dominates itself).
-        // Easier path: use a sequence and origin where no rule matches at all.
-        // The wildcard `response any` matches any origin that dominates
-        // NetworkUntrusted — which is all of them. So we can never hit the
-        // unmatched default in Standard as long as the wildcard is present.
-        // Assert instead: the default is configured correctly.
-        assert_eq!(eng.policy().defaults.unmatched, Response::Warn);
-        // And an obscure DCS sequence with no matching rule triggers
-        // the wildcard response rather than unmatched.
-        let d = eng.evaluate(&DispatchedSequence::dcs("3000p"), OriginTag::Host);
-        // DCS 3000p has no matching rule; wildcard catches it → Execute.
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    // -----------------------------------------------------------------
-    // Hardened
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn hardened_clipboard_set_from_user_drops() {
-        // Hardened requires Host origin for OSC 52 set. User does not
-        // dominate Host → fall through → unmatched = Drop.
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&osc(52, &["c", "SGVsbG8="]), OriginTag::User);
-        assert_eq!(d.response, Response::Drop);
-    }
-
-    #[test]
-    fn hardened_clipboard_set_from_host_drops() {
-        // Hardened's OSC 52 set rule is response = Drop with origin_min =
-        // Host. Host dominates Host → rule fires → Drop.
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&osc(52, &["c", "SGVsbG8="]), OriginTag::Host);
-        assert_eq!(d.response, Response::Drop);
-    }
-
-    #[test]
-    fn hardened_clipboard_query_from_host_drops() {
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&osc(52, &["c", "?"]), OriginTag::Host);
-        assert_eq!(d.response, Response::Drop);
-    }
-
-    #[test]
-    fn hardened_palette_query_from_pty_drops() {
-        // Hardened OSC 4 query rule requires ConfigFile origin. Pty does not
-        // dominate ConfigFile → fall through → unmatched = Drop.
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&osc(4, &["3", "?"]), OriginTag::Pty);
-        assert_eq!(d.response, Response::Drop);
-    }
-
-    #[test]
-    fn hardened_palette_query_from_configfile_executes() {
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&osc(4, &["3", "?"]), OriginTag::ConfigFile);
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    #[test]
-    fn hardened_modal_activation_from_host_executes() {
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&DispatchedSequence::dcs("2000p"), OriginTag::Host);
-        assert_eq!(d.response, Response::Execute);
-    }
-
-    #[test]
-    fn hardened_modal_activation_from_pty_drops() {
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&DispatchedSequence::dcs("2000p"), OriginTag::Pty);
-        assert_eq!(d.response, Response::Drop);
-    }
-
-    #[test]
-    fn hardened_unknown_sequence_from_network_drops() {
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&osc(1337, &["leet"]), OriginTag::NetworkUntrusted);
-        assert_eq!(d.response, Response::Drop);
-    }
-
-    #[test]
-    fn hardened_unknown_sequence_from_host_drops() {
-        // No rule matches OSC 1337; `response any` rule has origin_min = Host
-        // and response = Execute — Host dominates Host, so it fires for
-        // response sequences from Host.
-        let eng = PolicyEngine::new(profiles::hardened());
-        let d = eng.evaluate(&osc(1337, &["leet"]), OriginTag::Host);
-        assert_eq!(d.response, Response::Execute);
+    #[rustfmt::skip]
+    fn builtin_profile_decisions() {
+        use {OriginTag as O, Response as R};
+        let permissive: fn() -> crate::Policy = profiles::permissive;
+        let standard: fn() -> crate::Policy = profiles::standard;
+        let hardened: fn() -> crate::Policy = profiles::hardened;
+        let clip_set = || osc(52, &["c", "SGVsbG8="]);
+        let clip_query = || osc(52, &["c", "?"]);
+        let palette_query = || osc(4, &["3", "?"]);
+        let modal = || DispatchedSequence::dcs("2000p");
+        let rows: Vec<ProfileRow> = vec![
+            // Permissive: `response any` is its only rule; everything else
+            // falls through to `unmatched = Execute`.
+            ("permissive unmatched", permissive, osc(52, &["c", "SGk="]), O::Pty, R::Execute, None),
+            ("permissive window op", permissive, csi(Some(20), 't', &[]), O::Pty, R::Execute, None),
+            ("standard clip set, user", standard, clip_set(), O::User, R::Ask,
+             Some("clipboard")),
+            // PTY origin fails the `User`-or-higher gate on the OSC 52 set
+            // rule; evaluation continues past the OSC 52 query rule to the
+            // `response any` rule, whose origin_min = NetworkUntrusted (the
+            // loosest tag) every origin dominates. That rule responds Execute.
+            ("standard clip set, pty", standard, clip_set(), O::Pty, R::Execute, None),
+            ("standard clip query, host", standard, clip_query(), O::Host, R::Drop, None),
+            ("standard palette query, pty-safe", standard, palette_query(), O::PtySafe, R::Execute,
+             None),
+            // Pty does not dominate PtySafe, so the OSC 4 query rule continues;
+            // OSC 4 set has a different param pattern; the wildcard catches it.
+            ("standard palette query, pty", standard, palette_query(), O::Pty, R::Execute,
+             None),
+            // CSI t requires Host; Pty falls through to the wildcard. By
+            // design: CSI responses go through the response rate limiter, and
+            // Host-only blocking of non-query window ops is the capability
+            // module's job — this rule gates dispatch, not the ops.
+            ("standard window op, pty", standard, csi(Some(20), 't', &[]), O::Pty, R::Execute,
+             None),
+            ("standard notification, user", standard, osc(9, &["build done"]), O::User, R::Warn,
+             Some("notifications")),
+            // Standard's wildcard matches every origin, so its unmatched
+            // default (asserted below) is unreachable: an obscure DCS with no
+            // rule of its own is caught by the wildcard instead.
+            ("standard dcs 3000p, host", standard, DispatchedSequence::dcs("3000p"), O::Host,
+             R::Execute, None),
+            // Hardened requires Host for OSC 52 set: User falls through to
+            // `unmatched = Drop`; Host fires the rule, whose response is Drop.
+            ("hardened clip set, user", hardened, clip_set(), O::User, R::Drop, None),
+            ("hardened clip set, host", hardened, clip_set(), O::Host, R::Drop, None),
+            ("hardened clip query, host", hardened, clip_query(), O::Host, R::Drop, None),
+            // The OSC 4 query rule requires ConfigFile; Pty falls through.
+            ("hardened palette query, pty", hardened, palette_query(), O::Pty, R::Drop, None),
+            ("hardened palette query, config", hardened, palette_query(), O::ConfigFile, R::Execute,
+             None),
+            ("hardened modal activation, host", hardened, modal(), O::Host, R::Execute, None),
+            ("hardened modal activation, pty", hardened, modal(), O::Pty, R::Drop, None),
+            ("hardened unknown, network", hardened, osc(1337, &["leet"]), O::NetworkUntrusted,
+             R::Drop, None),
+            // No rule matches OSC 1337; the `response any` rule (origin_min =
+            // Host, response = Execute) fires for response sequences from Host.
+            ("hardened unknown, host", hardened, osc(1337, &["leet"]), O::Host, R::Execute,
+             None),
+        ];
+        for (what, profile, sequence, origin, response, rate_limit) in rows {
+            let d = PolicyEngine::new(profile()).evaluate(&sequence, origin);
+            assert_eq!(d.response, response, "{what}");
+            if rate_limit.is_some() {
+                assert_eq!(d.rate_limit.as_deref(), rate_limit, "{what}: rate limit");
+            }
+        }
+        assert_eq!(
+            PolicyEngine::new(standard()).policy().defaults.unmatched,
+            R::Warn,
+            "standard's configured unmatched default"
+        );
     }
 
     // -----------------------------------------------------------------

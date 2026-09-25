@@ -566,8 +566,8 @@ pub fn changed_since_applied(
 
 /// Forget the applied table, so the next pass's edge applies it again — what an apply that
 /// did not FINISH leaves (a live build skipped, a rename or a `defaults` write that failed):
-/// the passes carry only a changed table, so without this nothing but the next window (or
-/// the day's first terminal session) would retry what it missed. Best-effort.
+/// the passes carry only a changed table, so without this nothing but the next day's launch
+/// apply ([`launch_apply_due`]) would retry what it missed. Best-effort.
 pub fn forget_applied(layout: &crate::store::Layout) {
     let _ = std::fs::remove_file(applied_stamp_path(layout));
 }
@@ -589,10 +589,51 @@ pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::Machin
     }
 }
 
+/// How often a launch runs `aterm pkg machine apply` on its own: once a day.
+pub const LAUNCH_APPLY_EVERY_SECS: u64 = 24 * 60 * 60;
+
+/// Whether this launch runs the day's `aterm pkg machine apply`: it claims the one daily
+/// slot in `machine-apply.stamp` ([`aterm_update_core::pkg_check::claim`]). A terminal
+/// session and a window opening both claim it here, so their walk of `$HOME` runs once a
+/// day between them, not at every tab and every window; an edit to `[machine]` rides the
+/// next pass ([`changed_since_applied`]) and Settings' Apply now runs at once, unclaimed.
+#[must_use]
+pub fn launch_apply_due(layout: &crate::store::Layout, now_unix: i64) -> bool {
+    aterm_update_core::pkg_check::claim(
+        &layout.machine_apply_stamp(),
+        now_unix,
+        LAUNCH_APPLY_EVERY_SECS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// ONE DAILY SLOT: the first launch of the day claims it, every later one — a tab or a
+    /// window, whichever lane — spawns nothing until a day has passed.
+    #[test]
+    fn the_launch_apply_is_claimed_once_a_day() {
+        let prefix = std::env::temp_dir().join(format!(
+            "atpkg-machine-daily-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = crate::store::Layout {
+            prefix: prefix.clone(),
+        };
+        let now = 1_790_000_000_i64;
+        let day = i64::try_from(LAUNCH_APPLY_EVERY_SECS).unwrap();
+        assert!(launch_apply_due(&layout, now));
+        assert!(!launch_apply_due(&layout, now + 60));
+        assert!(!launch_apply_due(&layout, now + day - 1));
+        assert!(launch_apply_due(&layout, now + day));
+        assert!(layout.machine_apply_stamp().is_file());
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
 
     /// THE PASSES CARRY ONLY AN EDIT (Phase 3): a machine that never applied the `[machine]`
     /// table reads "changed"; recording it makes the same table unchanged (and a second

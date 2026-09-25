@@ -2079,68 +2079,56 @@ mod tests {
         }
     }
 
-    /// Disabled ⇒ no fill, no halo, no fingerprint (byte-identical to the plain cursor).
+    /// Disabled, or reduced motion / load-shed (`intensity == 0`) even at full
+    /// strength ⇒ fully inert: no fill, no halo, fp 0, settled —
+    /// byte-identical to the plain cursor.
     #[test]
-    fn disabled_is_inert() {
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        let f = cr.tick(
-            Some((1, 1)),
-            Instant::now(),
-            1.0,
-            true,
-            true,
-            geom(),
-            &RainbowConfig {
-                enabled: false,
-                intensity: 1.0,
-                blinking: false,
-                base: None,
-                head_rgb: None,
-                paint: None,
-                ground: None,
-                flare_at: None,
-            },
-            &mut out,
-        );
-        assert!(f.fill.is_none());
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty());
-        assert!(!cr.is_active());
-    }
-
-    /// Reduced motion / load-shed (`intensity == 0`) ⇒ fully inert: no fill, no halo,
-    /// fp 0, settled — byte-identical to the plain cursor, even with full energy.
-    #[test]
-    fn zero_intensity_is_inert() {
-        let mut cr = CursorRainbow::default();
-        let mut out = Vec::new();
-        let f = cr.tick(
-            Some((1, 1)),
-            Instant::now(),
-            1.0,
-            true,
-            true,
-            geom(),
-            &RainbowConfig {
-                enabled: true,
-                intensity: 0.0,
-                blinking: false,
-                base: None,
-                head_rgb: None,
-                paint: None,
-                ground: None,
-                flare_at: None,
-            },
-            &mut out,
-        );
-        assert!(
-            f.fill.is_none(),
-            "reduced motion keeps the plain themed cursor"
-        );
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty(), "no halo under reduced motion");
-        assert!(!cr.is_active());
+    fn disabled_or_zero_intensity_is_inert() {
+        for (why, config) in [
+            (
+                "disabled",
+                RainbowConfig {
+                    enabled: false,
+                    intensity: 1.0,
+                    blinking: false,
+                    base: None,
+                    head_rgb: None,
+                    paint: None,
+                    ground: None,
+                    flare_at: None,
+                },
+            ),
+            (
+                "zero intensity",
+                RainbowConfig {
+                    enabled: true,
+                    intensity: 0.0,
+                    blinking: false,
+                    base: None,
+                    head_rgb: None,
+                    paint: None,
+                    ground: None,
+                    flare_at: None,
+                },
+            ),
+        ] {
+            let mut cr = CursorRainbow::default();
+            let mut out = Vec::new();
+            let f = cr.tick(
+                Some((1, 1)),
+                Instant::now(),
+                1.0,
+                true,
+                true,
+                geom(),
+                &config,
+                &mut out,
+            );
+            assert!(f.fill.is_none(), "{why}: keeps the plain cursor");
+            assert_eq!(f.fp, 0, "{why}");
+            assert!(out.is_empty(), "{why}: no additive light");
+            assert!(!cr.is_active(), "{why}: settled");
+        }
     }
 
     /// A hot rainbow caret rasterizes its rim's light peak every frame. Its

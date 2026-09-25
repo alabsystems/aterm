@@ -53,22 +53,6 @@ impl Grid {
         total
     }
 
-    /// Test-only: ring-buffer row Vec capacity (entries), for startup-footprint
-    /// measurement in `mem_measure_tests`.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn ring_rows_capacity_for_test(&self) -> usize {
-        self.storage.rows.capacity()
-    }
-
-    /// Test-only: page-store total memory (bytes), for startup-footprint
-    /// measurement in `mem_measure_tests`.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn pages_total_memory_for_test(&self) -> usize {
-        self.storage.pages.total_memory()
-    }
-
     /// Get the text content of a visible row, resolving complex characters.
     ///
     /// Handles non-BMP characters stored in the overflow table. Thin wrapper
@@ -841,17 +825,6 @@ mod tests {
             small.memory_used(),
             large.memory_used()
         );
-    }
-
-    #[test]
-    fn test_memory_used_after_writing() {
-        let empty = Grid::new(4, 20);
-        let mut filled = Grid::new(4, 20);
-        write_text(&mut filled, "Hello World");
-        // Writing simple ASCII shouldn't significantly change memory
-        // (rows are pre-allocated), but should not crash
-        let _ = filled.memory_used();
-        let _ = empty.memory_used();
     }
 
     // =========================================================================

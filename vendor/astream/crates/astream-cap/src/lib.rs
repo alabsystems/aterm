@@ -45,11 +45,17 @@
 //! `HMAC-SHA256(tag, nonce ‖ grant)`, so the tag is never readable out of a stream
 //! and a captured attach cannot be replayed onto another connection.
 //!
+//! [`capfile`] is the one format a capability is STORED in — the `<grant> <tag-hex>`
+//! line `asb mint` prints and every `--cap-file` reads — and the one reader for it,
+//! so a face that presents a ring reads it by these rules instead of its own.
+//!
 //! Crypto honesty: the MAC is **HMAC-SHA256 per RFC 2104** over the workspace's
 //! already-vetted `sha2` primitive — a standard construction, NOT a hand-rolled
 //! cipher or MAC. Encrypting the wire is intentionally NOT done here: that is
 //! `astream-aead`'s job (over the vetted RustCrypto AEAD), wired into the broker
 //! as `serve_tcp_sealed`; a guarded broker (`open_guarded`) composes the two.
+
+pub mod capfile;
 
 use astream_wire::{Filter, Subject};
 use sha2::{Digest, Sha256};
@@ -106,6 +112,18 @@ pub struct Grant {
     pub principal: Option<String>,
     /// The `astream_wire` filter half — the subject subtree itself.
     pub filter: String,
+    /// The instant this grant STOPS authorizing, as unix milliseconds, or `None`
+    /// for a capability that never expires.
+    ///
+    /// It rides inside the grant STRING, which is the whole of what the tag is
+    /// computed over, so it needs no new crypto and cannot be stripped, shortened
+    /// or extended: any edit changes the string and the tag no longer verifies.
+    /// That is the same property the mode and the principal already had.
+    ///
+    /// `None` is not "valid forever by accident" — it is every capability minted
+    /// before this field existed, and the deliberate shape for a fleet root an
+    /// operator rotates by changing the secret.
+    pub expires_at: Option<u64>,
 }
 
 impl Grant {
@@ -114,9 +132,17 @@ impl Grant {
     /// A bare filter (leading `/`) is the read-write, unbound grant: every
     /// capability minted before the prefix existed parses to exactly that, which
     /// is what keeps those capabilities valid. Otherwise the string is
-    /// `<mode>[,p=<principal>]:<filter>`, split on the FIRST `:` — unambiguous
-    /// because a principal may not contain one, and a filter that does is only
-    /// ever reached after the prefix has been consumed.
+    /// `<mode>[,<field>]*:<filter>`, split on the FIRST `:` — unambiguous because
+    /// no field value may contain one, and a filter that does is only ever
+    /// reached after the prefix has been consumed.
+    ///
+    /// The fields are `p=<principal>` and `exp=<unix-ms>`, each at most once and
+    /// in either order. A REPEATED field is refused rather than last-wins: two
+    /// `exp=` values in one string is not a grant whose meaning anyone should
+    /// have to guess, and last-wins would let a longer expiry be appended to a
+    /// string a reader skims. An UNKNOWN field is refused too, because a future
+    /// field silently ignored by an older broker is a capability that means less
+    /// than it says.
     pub fn parse(grant: &str) -> Result<Self, String> {
         if grant.starts_with('/') {
             Filter::new(grant).map_err(|e| format!("invalid filter: {e}"))?;
@@ -124,6 +150,7 @@ impl Grant {
                 mode: Mode::ReadWrite,
                 principal: None,
                 filter: grant.to_string(),
+                expires_at: None,
             });
         }
         let Some((prefix, filter)) = grant.split_once(':') else {
@@ -132,21 +159,47 @@ impl Grant {
                  \"<rw|ro>[,p=<principal>]:<filter>\" prefix"
             ));
         };
-        let (mode_tok, principal) = match prefix.split_once(',') {
-            None => (prefix, None),
-            Some((mode_tok, rest)) => {
-                let p = rest.strip_prefix("p=").ok_or_else(|| {
-                    format!("invalid grant prefix {prefix:?}: expected \",p=<principal>\"")
-                })?;
+        let mut fields = prefix.split(',');
+        let mode_tok = fields.next().unwrap_or("");
+        let mut principal: Option<String> = None;
+        let mut expires_at: Option<u64> = None;
+        for field in fields {
+            if let Some(p) = field.strip_prefix("p=") {
+                if principal.is_some() {
+                    return Err(format!("invalid grant prefix {prefix:?}: repeated \"p=\""));
+                }
                 if !valid_principal(p) {
                     return Err(format!(
                         "invalid principal {p:?}: expected one of {PRINCIPAL_CLASSES:?} \
                          then 1..={PRINCIPAL_NAME_MAX} of [a-z0-9-]"
                     ));
                 }
-                (mode_tok, Some(p.to_string()))
+                principal = Some(p.to_string());
+            } else if let Some(v) = field.strip_prefix("exp=") {
+                if expires_at.is_some() {
+                    return Err(format!(
+                        "invalid grant prefix {prefix:?}: repeated \"exp=\""
+                    ));
+                }
+                // ASCII DIGITS ONLY, then parse. `u64::from_str` accepts a leading
+                // `+`, and a capability whose expiry can be spelled two ways is a
+                // capability with two tags for one authority.
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(format!(
+                        "invalid grant expiry {v:?}: expected unix milliseconds as ASCII digits"
+                    ));
+                }
+                let ms = v.parse::<u64>().map_err(|_| {
+                    format!("invalid grant expiry {v:?}: does not fit in u64 milliseconds")
+                })?;
+                expires_at = Some(ms);
+            } else {
+                return Err(format!(
+                    "invalid grant prefix {prefix:?}: expected \",p=<principal>\" or \
+                     \",exp=<unix-ms>\""
+                ));
             }
-        };
+        }
         let mode = match mode_tok {
             "rw" => Mode::ReadWrite,
             "ro" => Mode::ReadOnly,
@@ -161,6 +214,7 @@ impl Grant {
             mode,
             principal,
             filter: filter.to_string(),
+            expires_at,
         })
     }
 }
@@ -181,6 +235,40 @@ fn valid_principal(p: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// When `grant` stops authorizing, as unix milliseconds — `None` for a grant
+/// that never expires, and `None` for a string that is not a grant at all.
+///
+/// The two `None`s are deliberately the same answer because this is a *reader*,
+/// not a gate: nothing decides authority from it. [`is_expired`] is the gate, and
+/// it separates them the other way (an unparseable string is expired).
+#[must_use]
+pub fn expires_at(grant: &str) -> Option<u64> {
+    Grant::parse(grant).ok().and_then(|g| g.expires_at)
+}
+
+/// Whether `grant` has stopped authorizing at `now_ms` (unix milliseconds).
+///
+/// `exp` is the FIRST instant at which the capability is invalid, so a grant is
+/// expired when `now_ms >= exp`. Half-open, like every other range in this crate,
+/// and it makes "valid until midnight" spellable exactly once.
+///
+/// FAIL CLOSED: a string that does not parse as a grant is reported EXPIRED. It
+/// cannot authorize anything anyway ([`Grant::parse`] is on every authorization
+/// path), and a gate that answered "not expired" for a malformed grant would be
+/// a gate that says yes to garbage.
+///
+/// THE CLOCK IS THE CALLER'S. Nothing here reads one: this crate is on the
+/// deterministic side of astream's effect seam, where a `SystemTime::now()` would
+/// make a replay depend on when it ran. The broker passes the instant it already
+/// took at the connection boundary.
+#[must_use]
+pub fn is_expired(grant: &str, now_ms: u64) -> bool {
+    match Grant::parse(grant) {
+        Err(_) => true,
+        Ok(g) => g.expires_at.is_some_and(|exp| now_ms >= exp),
+    }
 }
 
 /// The mode `grant` authorizes, or `None` if it is not a grant at all.
@@ -336,18 +424,29 @@ pub fn verify_attach(secret: &[u8], grant: &str, nonce: &[u8], proof: &[u8]) -> 
     verify_attach_diff(secret, grant, nonce, proof) == Some(0)
 }
 
-/// The parsed grant of a capability that is genuine under `secret`, or `None`.
-fn authentic_grant(secret: &[u8], cap: &Capability) -> Option<Grant> {
+/// The parsed grant of a capability that is genuine under `secret` AND has not
+/// expired at `now_ms`, or `None`.
+///
+/// THE ONE PLACE EXPIRY IS DECIDED. Every public predicate in this crate reaches
+/// authority through here or through [`rw_matches`], which itself starts here, so
+/// an expired capability cannot authorize a read, a write, a publish, a commit or
+/// a subscribe — and a future predicate cannot forget the check, because there is
+/// no other way in.
+fn authentic_grant(secret: &[u8], cap: &Capability, now_ms: u64) -> Option<Grant> {
     if !verify(secret, cap) {
         return None;
     }
-    Grant::parse(cap.filter.as_str()).ok()
+    let grant = Grant::parse(cap.filter.as_str()).ok()?;
+    match grant.expires_at {
+        Some(exp) if now_ms >= exp => None,
+        _ => Some(grant),
+    }
 }
 
 /// The genuine, read-write grant of `cap` whose filter matches `subject`, if any.
 /// The one place the write half of the §8.2 matrix is decided.
-fn rw_matches(secret: &[u8], cap: &Capability, subject: &str) -> Option<Grant> {
-    let grant = authentic_grant(secret, cap)?;
+fn rw_matches(secret: &[u8], cap: &Capability, subject: &str, now_ms: u64) -> Option<Grant> {
+    let grant = authentic_grant(secret, cap, now_ms)?;
     if grant.mode != Mode::ReadWrite {
         return None;
     }
@@ -364,8 +463,12 @@ fn rw_matches(secret: &[u8], cap: &Capability, subject: &str) -> Option<Grant> {
 /// HONEST BOUNDARY: it does **not** check the producer binding, because it is not
 /// given a producer id — [`grants_publish`] is the check that closes dedup-key
 /// poisoning, and [`grants_commit`] is the same rule named for a group.
-pub fn grants(secret: &[u8], cap: &Capability, subject: &str) -> bool {
-    rw_matches(secret, cap, subject).is_some()
+///
+/// `now_ms` is unix milliseconds, and every predicate here takes one: an expired
+/// capability authorizes nothing (see the private `authentic_grant`). Pass the instant the
+/// caller already holds — this crate never reads a clock.
+pub fn grants(secret: &[u8], cap: &Capability, subject: &str, now_ms: u64) -> bool {
+    rw_matches(secret, cap, subject, now_ms).is_some()
 }
 
 /// Whether `cap` authorizes publishing to `subject` **as** `producer_id`: genuine,
@@ -374,8 +477,14 @@ pub fn grants(secret: &[u8], cap: &Capability, subject: &str) -> bool {
 ///
 /// An unbound grant (no principal) may publish under any id: that is the god cap
 /// the fleet root keeps, and the reason a mint face should require an explicit mode.
-pub fn grants_publish(secret: &[u8], cap: &Capability, subject: &str, producer_id: u64) -> bool {
-    match rw_matches(secret, cap, subject) {
+pub fn grants_publish(
+    secret: &[u8],
+    cap: &Capability,
+    subject: &str,
+    producer_id: u64,
+    now_ms: u64,
+) -> bool {
+    match rw_matches(secret, cap, subject, now_ms) {
         None => false,
         Some(grant) => match grant.principal {
             None => true,
@@ -389,8 +498,8 @@ pub fn grants_publish(secret: &[u8], cap: &Capability, subject: &str, producer_i
 /// subjects the capability must grant; they are never delivered).
 ///
 /// The producer binding does not apply — a commit carries no producer id.
-pub fn grants_commit(secret: &[u8], cap: &Capability, group: &str) -> bool {
-    rw_matches(secret, cap, group).is_some()
+pub fn grants_commit(secret: &[u8], cap: &Capability, group: &str, now_ms: u64) -> bool {
+    rw_matches(secret, cap, group, now_ms).is_some()
 }
 
 /// Whether `cap` (verified under `secret`) authorizes SUBSCRIBING with `filter`
@@ -399,8 +508,8 @@ pub fn grants_commit(secret: &[u8], cap: &Capability, group: &str) -> bool {
 /// [`grants`]: the ACL check a broker runs before a capability-scoped subscribe.
 ///
 /// Mode-agnostic on purpose: a read-only grant is a full *read* grant.
-pub fn grants_filter(secret: &[u8], cap: &Capability, filter: &str) -> bool {
-    let Some(grant) = authentic_grant(secret, cap) else {
+pub fn grants_filter(secret: &[u8], cap: &Capability, filter: &str, now_ms: u64) -> bool {
+    let Some(grant) = authentic_grant(secret, cap, now_ms) else {
         return false;
     };
     match (Filter::new(grant.filter.as_str()), Filter::new(filter)) {
@@ -413,21 +522,25 @@ pub fn grants_filter(secret: &[u8], cap: &Capability, filter: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A FIXED instant for every authorization call below: this crate reads no
+    /// clock, so a test that passed one would be testing the machine.
+    const T0: u64 = 1_700_000_000_000;
+
     #[test]
     fn grants_filter_scopes_subscribe_to_the_granted_subtree() {
         let secret = b"broker-secret";
         let cap = mint(secret, "/a/stream/s1/>").unwrap();
-        assert!(grants_filter(secret, &cap, "/a/stream/s1/out"));
-        assert!(grants_filter(secret, &cap, "/a/stream/s1/>"));
-        assert!(grants_filter(secret, &cap, "/a/stream/s1/*"));
-        assert!(!grants_filter(secret, &cap, "/a/stream/s2/out"));
-        assert!(!grants_filter(secret, &cap, "/a/>"));
+        assert!(grants_filter(secret, &cap, "/a/stream/s1/out", T0));
+        assert!(grants_filter(secret, &cap, "/a/stream/s1/>", T0));
+        assert!(grants_filter(secret, &cap, "/a/stream/s1/*", T0));
+        assert!(!grants_filter(secret, &cap, "/a/stream/s2/out", T0));
+        assert!(!grants_filter(secret, &cap, "/a/>", T0));
         // a forged/widened cap (real tag, swapped filter) is rejected.
         let forged = Capability {
             filter: "/a/>".to_string(),
             tag: cap.tag,
         };
-        assert!(!grants_filter(secret, &forged, "/a/x"));
+        assert!(!grants_filter(secret, &forged, "/a/x", T0));
     }
 
     #[test]
@@ -446,10 +559,10 @@ mod tests {
         let secret = b"broker-secret-key";
         let cap = mint(secret, "/a/stream/>").unwrap();
         assert!(verify(secret, &cap));
-        assert!(grants(secret, &cap, "/a/stream/x"));
-        assert!(grants(secret, &cap, "/a/stream/x/y"));
+        assert!(grants(secret, &cap, "/a/stream/x", T0));
+        assert!(grants(secret, &cap, "/a/stream/x/y", T0));
         // Outside the granted subtree: denied even though the cap is genuine.
-        assert!(!grants(secret, &cap, "/a/inbox/x"));
+        assert!(!grants(secret, &cap, "/a/inbox/x", T0));
     }
 
     #[test]
@@ -462,7 +575,7 @@ mod tests {
             tag: cap.tag,
         };
         assert!(!verify(secret, &tampered));
-        assert!(!grants(secret, &tampered, "/a/inbox/x"));
+        assert!(!grants(secret, &tampered, "/a/inbox/x", T0));
         // A guessed tag is rejected.
         let forged = Capability {
             filter: "/a/>".to_string(),
@@ -490,10 +603,10 @@ mod tests {
         assert!(verify(secret, &cap));
 
         // Unbound: any producer id publishes, which is what makes it the god cap.
-        assert!(grants_publish(secret, &cap, "/a/stream/x", 1));
-        assert!(grants_publish(secret, &cap, "/a/stream/x", u64::MAX));
-        assert!(!grants_publish(secret, &cap, "/a/inbox/x", 1));
-        assert!(grants_commit(secret, &cap, "/a/stream/g1"));
+        assert!(grants_publish(secret, &cap, "/a/stream/x", 1, T0));
+        assert!(grants_publish(secret, &cap, "/a/stream/x", u64::MAX, T0));
+        assert!(!grants_publish(secret, &cap, "/a/inbox/x", 1, T0));
+        assert!(grants_commit(secret, &cap, "/a/stream/g1", T0));
     }
 
     #[test]
@@ -509,14 +622,20 @@ mod tests {
         assert_eq!(Grant::parse(grant).unwrap().filter, "/f/F/fleet/>");
 
         // Reads: the whole granted subtree.
-        assert!(grants_filter(secret, &cap, "/f/F/fleet/h-andrew/halt"));
-        assert!(grants_filter(secret, &cap, "/f/F/fleet/>"));
-        assert!(!grants_filter(secret, &cap, "/f/F/pub/>"));
+        assert!(grants_filter(secret, &cap, "/f/F/fleet/h-andrew/halt", T0));
+        assert!(grants_filter(secret, &cap, "/f/F/fleet/>", T0));
+        assert!(!grants_filter(secret, &cap, "/f/F/pub/>", T0));
 
         // Writes: none, anywhere, including through the legacy entry point.
-        assert!(!grants_publish(secret, &cap, "/f/F/fleet/h-andrew/halt", 7));
-        assert!(!grants_commit(secret, &cap, "/f/F/fleet/g1"));
-        assert!(!grants(secret, &cap, "/f/F/fleet/h-andrew/halt"));
+        assert!(!grants_publish(
+            secret,
+            &cap,
+            "/f/F/fleet/h-andrew/halt",
+            7,
+            T0
+        ));
+        assert!(!grants_commit(secret, &cap, "/f/F/fleet/g1", T0));
+        assert!(!grants(secret, &cap, "/f/F/fleet/h-andrew/halt", T0));
     }
 
     #[test]
@@ -531,30 +650,39 @@ mod tests {
         let cap = mint(secret, grant).unwrap();
         let pid = producer_id_of(node);
         let subject = "/f/F/in/n-b/s-c/n-a1b2c3d4e5f60718/ask";
-        assert!(grants_publish(secret, &cap, subject, pid));
+        assert!(grants_publish(secret, &cap, subject, pid, T0));
         // A bearer that names any other producer id is refused: this is the
         // dedup-key poisoning hole, closed.
-        assert!(!grants_publish(secret, &cap, subject, pid.wrapping_add(1)));
         assert!(!grants_publish(
             secret,
             &cap,
             subject,
-            producer_id_of("h-andrew")
+            pid.wrapping_add(1),
+            T0
         ));
-        assert!(!grants_publish(secret, &cap, subject, 0));
+        assert!(!grants_publish(
+            secret,
+            &cap,
+            subject,
+            producer_id_of("h-andrew"),
+            T0
+        ));
+        assert!(!grants_publish(secret, &cap, subject, 0, T0));
         // Still scoped by the filter, under the right id.
         assert!(!grants_publish(
             secret,
             &cap,
             "/f/F/in/n-b/s-c/h-andrew/ask",
-            pid
+            pid,
+            T0
         ));
         // The `*` kind segment: an 8-segment subject is outside the grant.
         assert!(!grants_publish(
             secret,
             &cap,
             "/f/F/in/n-b/s-c/n-a1b2c3d4e5f60718/h-andrew/answer",
-            pid
+            pid,
+            T0
         ));
     }
 
@@ -600,8 +728,14 @@ mod tests {
             tag: ro.tag,
         };
         assert!(!verify(secret, &widened));
-        assert!(!grants_publish(secret, &widened, "/f/F/fleet/h-a/halt", 1));
-        assert!(!grants_filter(secret, &widened, "/f/F/fleet/>"));
+        assert!(!grants_publish(
+            secret,
+            &widened,
+            "/f/F/fleet/h-a/halt",
+            1,
+            T0
+        ));
+        assert!(!grants_filter(secret, &widened, "/f/F/fleet/>", T0));
 
         let bound = mint(secret, "rw,p=h-andrew:/f/F/fleet/h-andrew/>").unwrap();
         // Swap the principal for one whose id the attacker controls.
@@ -614,7 +748,8 @@ mod tests {
             secret,
             &swapped,
             "/f/F/fleet/h-andrew/halt",
-            producer_id_of("h-mallory")
+            producer_id_of("h-mallory"),
+            T0
         ));
         // Drop the binding entirely to reach the unbound god-cap branch.
         let unbound = Capability {
@@ -626,7 +761,8 @@ mod tests {
             secret,
             &unbound,
             "/f/F/fleet/h-andrew/halt",
-            9
+            9,
+            T0
         ));
         // Widen the filter half under a genuine prefix.
         let wide = Capability {
@@ -640,7 +776,8 @@ mod tests {
             b"attacker-key",
             &bound,
             "/f/F/fleet/h-andrew/halt",
-            producer_id_of("h-andrew")
+            producer_id_of("h-andrew"),
+            T0
         ));
     }
 
@@ -689,10 +826,10 @@ mod tests {
             tag: hmac_sha256(secret, junk.as_bytes()),
         };
         assert!(verify(secret, &genuine_tag), "the tag itself is genuine");
-        assert!(!grants(secret, &genuine_tag, "/f/F/pub/x"));
-        assert!(!grants_publish(secret, &genuine_tag, "/f/F/pub/x", 1));
-        assert!(!grants_commit(secret, &genuine_tag, "/f/F/pub/x"));
-        assert!(!grants_filter(secret, &genuine_tag, "/f/F/pub/x"));
+        assert!(!grants(secret, &genuine_tag, "/f/F/pub/x", T0));
+        assert!(!grants_publish(secret, &genuine_tag, "/f/F/pub/x", 1, T0));
+        assert!(!grants_commit(secret, &genuine_tag, "/f/F/pub/x", T0));
+        assert!(!grants_filter(secret, &genuine_tag, "/f/F/pub/x", T0));
     }
 
     #[test]
@@ -886,5 +1023,176 @@ mod tests {
             verify_attach_diff(secret, "rwx:/f/F/pub/>", &nonce, &proof),
             None
         );
+    }
+
+    /// The grammar: `exp=` is a prefix field beside `p=`, in either order, and
+    /// every string that was a grant before this field existed still is one with
+    /// no expiry. That last half is what keeps already-minted capabilities valid.
+    #[test]
+    fn an_expiry_is_a_prefix_field_and_every_older_grant_still_parses() {
+        let g = Grant::parse("rw,exp=1700000000000:/f/lab/>").expect("exp alone");
+        assert_eq!(g.expires_at, Some(1_700_000_000_000));
+        assert_eq!(g.mode, Mode::ReadWrite);
+        assert_eq!(g.principal, None);
+
+        // Either order, and both fields together.
+        for text in [
+            "rw,p=n-lab,exp=1700000000000:/f/lab/>",
+            "rw,exp=1700000000000,p=n-lab:/f/lab/>",
+        ] {
+            let g = Grant::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(g.expires_at, Some(1_700_000_000_000), "{text}");
+            assert_eq!(g.principal.as_deref(), Some("n-lab"), "{text}");
+        }
+
+        // EVERY shape that predates the field: no expiry, and never expiring.
+        for older in [
+            "/f/lab/>",
+            "rw:/f/lab/>",
+            "ro:/f/lab/>",
+            "rw,p=n-lab:/f/lab/>",
+        ] {
+            let g = Grant::parse(older).unwrap_or_else(|e| panic!("{older}: {e}"));
+            assert_eq!(g.expires_at, None, "{older}");
+            assert!(!is_expired(older, u64::MAX), "{older} must never expire");
+        }
+        assert_eq!(expires_at("rw,exp=7:/f/lab/>"), Some(7));
+        assert_eq!(expires_at("rw:/f/lab/>"), None);
+    }
+
+    /// A malformed expiry is a REFUSAL, never a default. A grant that quietly
+    /// dropped an unreadable `exp=` would be a capability that outlives the
+    /// authority its author wrote down.
+    #[test]
+    fn a_malformed_expiry_is_refused_rather_than_defaulted() {
+        for bad in [
+            "rw,exp=:/f/lab/>",                        // empty
+            "rw,exp=abc:/f/lab/>",                     // not digits
+            "rw,exp=+7:/f/lab/>",                      // u64::from_str would accept this
+            "rw,exp=-7:/f/lab/>",                      // ditto for the sign
+            "rw,exp=7 :/f/lab/>",                      // trailing space
+            "rw,exp=99999999999999999999999:/f/lab/>", // overflows u64
+            "rw,exp=1,exp=2:/f/lab/>",                 // repeated: not a last-wins grammar
+            "rw,p=n-a,p=n-b:/f/lab/>",                 // the same rule for the older field
+            "rw,ttl=60:/f/lab/>",                      // an unknown field is never ignored
+        ] {
+            assert!(Grant::parse(bad).is_err(), "{bad} must not parse");
+            // And the gate agrees: an unparseable grant is EXPIRED, not eternal.
+            assert!(is_expired(bad, 0), "{bad} must fail closed");
+        }
+    }
+
+    /// Half-open, like every other range here: valid at `exp - 1`, expired AT
+    /// `exp`. Spelling "valid until midnight" has exactly one right answer.
+    #[test]
+    fn expiry_is_half_open_at_the_instant_itself() {
+        let grant = "rw,exp=1000:/f/lab/>";
+        assert!(!is_expired(grant, 0));
+        assert!(!is_expired(grant, 999));
+        assert!(is_expired(grant, 1000), "exp is the first INVALID instant");
+        assert!(is_expired(grant, 1001));
+    }
+
+    /// An expired capability authorizes NOTHING — not a write, not a publish,
+    /// not a commit, not a subscribe. All four predicates reach authority through
+    /// one place, and this pins that none of them has its own way in.
+    #[test]
+    fn an_expired_capability_authorizes_nothing_on_any_path() {
+        let secret = b"broker-secret";
+        let cap = mint(secret, "rw,p=n-lab,exp=1000:/f/lab/>").expect("mint");
+        let pid = producer_id_of("n-lab");
+
+        // One millisecond before: every path authorizes.
+        assert!(grants(secret, &cap, "/f/lab/pub", 999));
+        assert!(grants_publish(secret, &cap, "/f/lab/pub", pid, 999));
+        assert!(grants_commit(secret, &cap, "/f/lab/g1", 999));
+        assert!(grants_filter(secret, &cap, "/f/lab/>", 999));
+
+        // At the instant itself, and after: none of them does.
+        for now in [1000u64, 1001, u64::MAX] {
+            assert!(!grants(secret, &cap, "/f/lab/pub", now), "grants @{now}");
+            assert!(
+                !grants_publish(secret, &cap, "/f/lab/pub", pid, now),
+                "grants_publish @{now}"
+            );
+            assert!(
+                !grants_commit(secret, &cap, "/f/lab/g1", now),
+                "grants_commit @{now}"
+            );
+            assert!(
+                !grants_filter(secret, &cap, "/f/lab/>", now),
+                "grants_filter @{now}"
+            );
+        }
+        // The capability is still GENUINE — expiry is not forgery, and `verify`
+        // is not the gate. A caller that only checked `verify` would be wrong,
+        // which is why nothing in this crate authorizes through it alone.
+        assert!(verify(secret, &cap));
+    }
+
+    /// THE SECURITY PROPERTY, and the reason this needed no new crypto: the tag
+    /// is HMAC over the WHOLE grant string, so the expiry is inside the signed
+    /// material. A bearer who edits the number to buy themselves more time holds
+    /// a capability that no longer verifies — and cannot mint the right tag
+    /// without the secret.
+    #[test]
+    fn the_expiry_cannot_be_extended_stripped_or_shortened_without_the_secret() {
+        let secret = b"broker-secret";
+        let honest = mint(secret, "rw,exp=1000:/f/lab/>").expect("mint");
+
+        // Extend it: same tag, later deadline.
+        let extended = Capability {
+            filter: "rw,exp=99999999:/f/lab/>".to_string(),
+            tag: honest.tag,
+        };
+        assert!(
+            !verify(secret, &extended),
+            "an extended expiry must not verify"
+        );
+        assert!(!grants(secret, &extended, "/f/lab/pub", 2000));
+
+        // Strip it entirely: the eternal capability nobody granted.
+        let stripped = Capability {
+            filter: "rw:/f/lab/>".to_string(),
+            tag: honest.tag,
+        };
+        assert!(
+            !verify(secret, &stripped),
+            "a stripped expiry must not verify"
+        );
+        assert!(!grants(secret, &stripped, "/f/lab/pub", 2000));
+
+        // And the other direction, because a capability is not only the bearer's
+        // to weaken: a third party must not be able to shorten someone's grant.
+        let shortened = Capability {
+            filter: "rw,exp=1:/f/lab/>".to_string(),
+            tag: honest.tag,
+        };
+        assert!(!verify(secret, &shortened));
+
+        // Only the secret-holder can reissue, and the reissue is a DIFFERENT tag.
+        let reissued = mint(secret, "rw,exp=99999999:/f/lab/>").expect("reissue");
+        assert!(verify(secret, &reissued));
+        assert_ne!(reissued.tag, honest.tag);
+        assert!(grants(secret, &reissued, "/f/lab/pub", 2000));
+    }
+
+    /// The attach proof covers the expiry too, because it is computed over the
+    /// grant string: a bearer cannot present a genuine tag under an edited
+    /// deadline, which is the shape `verify_attach` already refused for filters.
+    #[test]
+    fn an_attach_proof_does_not_carry_across_an_edited_expiry() {
+        let secret = b"broker-secret";
+        let grant = "rw,exp=1000:/f/lab/>";
+        let cap = mint(secret, grant).expect("mint");
+        let nonce = [7u8; 32];
+        let proof = attach_proof(&cap.tag, &nonce, grant);
+        assert!(verify_attach(secret, grant, &nonce, &proof));
+        assert!(!verify_attach(
+            secret,
+            "rw,exp=99999999:/f/lab/>",
+            &nonce,
+            &proof
+        ));
     }
 }

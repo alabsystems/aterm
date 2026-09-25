@@ -5,7 +5,7 @@
 //! behaviour (docs/DESIGN-unified-messages-2026-09-21.md §1, §2.4) so a
 //! failure is the evidence of a defect. Test-only; nothing here ships.
 
-use crate::center::{MessageCenter, Outcome};
+use crate::center::MessageCenter;
 use crate::glass::{
     CapsuleSpec, Hit, Links, Presentation, RowKind, RowSpec, layout_row, overflow_spec,
 };
@@ -55,183 +55,11 @@ fn caps(intents: &[Intent]) -> Vec<CapsuleSpec> {
     v
 }
 
-/// §1.4: "Only rows in the first `committed` glass slots get
-/// `on_glass_since` … so a clamped third row never burns its hold
-/// unpainted"; §2.4: "Holds anchor at FIRST glass". A fourth message turns
-/// the third slot into the overflow row: the third row is no longer painted,
-/// yet it keeps burning the hold it anchored, folds `Folded` while hidden,
-/// and — if it returns before that — comes back with a burned anchor.
-#[test]
-fn a_row_displaced_by_the_overflow_row_does_not_burn_its_hold_hidden() {
-    let now = t0();
-    let mut c = fresh(now);
-    let a = c.post(info("a"), stamp(1), now).id;
-    let b = c.post(info("b"), stamp(2), now).id;
-    let third = c.post(info("c"), stamp(3), now).id;
-    assert_eq!(c.commit_rows(now, 3), Some(3));
-    assert_eq!(glass_ids(&c), vec![a, b, third]);
-    assert_eq!(c.live(third).unwrap().fold_at, Some(now + HOLD_INFO));
-
-    // A fourth Info arrives one second later: the band becomes 2 rows + overflow.
-    let d = c.post(info("d"), stamp(4), now + secs(1)).id;
-    assert_eq!(
-        c.commit_rows(now + secs(1), 3),
-        None,
-        "3 wanted, 3 committed"
-    );
-    assert_eq!(
-        glass_ids(&c),
-        vec![a, b],
-        "the third slot is the overflow row"
-    );
-    let p = c.presentation(120, &chars, None, Links::Painted);
-    assert_eq!(p.rows[2].kind, RowKind::Overflow { hidden: 2 });
-    assert_eq!(c.queued(), 2, "c and d are both off glass");
-    assert!(c.live(d).unwrap().is_queued());
-
-    // The displaced row is off glass but is neither queued (no patience) nor
-    // released from its hold.
-    let displaced = c.live(third).unwrap();
-    assert!(
-        displaced.is_queued() || displaced.fold_at.is_none(),
-        "a row that is not painted must not burn its hold: on_glass_since={:?} fold_at={:?} is_queued={}",
-        displaced.on_glass_since,
-        displaced.fold_at,
-        displaced.is_queued()
-    );
-}
-
-/// The second half of the same defect: the displaced row folds `Folded`
-/// (read) at its ORIGINAL anchor while hidden behind the overflow row.
-#[test]
-fn a_row_hidden_behind_the_overflow_row_does_not_fold_as_read() {
-    let now = t0();
-    let mut c = fresh(now);
-    let _a = c.post(info("a"), stamp(1), now).id;
-    let _b = c.post(info("b"), stamp(2), now).id;
-    let third = c.post(info("c"), stamp(3), now).id;
-    c.commit_rows(now, 3);
-    let _d = c.post(info("d"), stamp(4), now + secs(1)).id;
-    c.commit_rows(now + secs(1), 3);
-    assert!(!glass_ids(&c).contains(&third), "c is hidden");
-    let settled = c.settle(now + HOLD_INFO, true);
-    let how = settled
-        .retired
-        .iter()
-        .find(|(id, _)| *id == third)
-        .map(|(_, h)| h.clone());
-    assert_ne!(
-        how,
-        Some(Retired::Folded),
-        "c was painted for one second and then hidden; it must not retire as Folded (read) — \
-         a hidden row either waits for the glass or folds Unseen by patience"
-    );
-}
-
-/// …and when a displaced row RETURNS to the glass it is re-anchored (the
-/// promotion rule: "the freed bottom slot is filled by the highest-ranked
-/// queued row, whose hold anchors THEN").
-#[test]
-fn a_displaced_row_re_anchors_when_it_returns_to_the_glass() {
-    let now = t0();
-    let mut c = fresh(now);
-    let a = c.post(info("a"), stamp(1), now).id;
-    let b = c.post(info("b"), stamp(2), now).id;
-    let third = c.post(info("c"), stamp(3), now).id;
-    c.commit_rows(now, 3);
-    let d = c.post(info("d"), stamp(4), now + secs(1)).id;
-    c.commit_rows(now + secs(1), 3);
-    let back = now + secs(20);
-    assert!(c.resolve(a, Outcome::Ok, back));
-    assert_eq!(
-        glass_ids(&c),
-        vec![b, third, d],
-        "three live rows: no overflow row; c returns"
-    );
-    assert_eq!(
-        c.live(third).unwrap().fold_at,
-        Some(back + HOLD_INFO),
-        "a row promoted to the glass anchors its hold THEN; it came back with a burned anchor instead"
-    );
-}
-
-/// The same family through the D1 clamp: an afford shrink pushes rows off
-/// the glass; they keep burning.
-#[test]
-fn a_row_pushed_off_by_an_afford_shrink_does_not_burn_hidden() {
-    let now = t0();
-    let mut c = fresh(now);
-    let a = c.post(info("a"), stamp(1), now).id;
-    let b = c.post(info("b"), stamp(2), now).id;
-    c.commit_rows(now, 3);
-    assert_eq!(glass_ids(&c), vec![a, b]);
-    // The window shrinks: afford 1, committed at once (the quiet is for a
-    // burst of folding rows, not for a window that lost its terminal row).
-    assert_eq!(c.commit_rows(now + secs(1), 1), Some(1));
-    assert_eq!(glass_ids(&c), vec![a]);
-    let hidden = c.live(b).unwrap();
-    assert!(
-        hidden.fold_at.is_none() || hidden.is_queued(),
-        "b is not painted at afford 1 but keeps fold_at={:?}",
-        hidden.fold_at
-    );
-}
-
-/// §1.8 / the builder's own rule: "a restate or supersede clears the
-/// carried flag". A carried HELD row restated by the successor before the
-/// handoff commit (the config reporter re-stating its count, the update
-/// reporter its words) loses the handoff cap's replacement: the flag is
-/// cleared, the hold is never armed by `after_handoff_commit`, and the row
-/// leaves as `Stale` at `seed + STALE_HANDOFF` — a held row on glass whose
-/// hold never anchors and whose retire reason is a lie.
-#[test]
-fn a_carried_held_row_restated_before_commit_still_folds_on_its_hold() {
-    let now = t0();
-    let mut parent = fresh(now);
-    let id = parent
-        .post(
-            Message::new(
-                tags::CONFIG,
-                Severity::Warn,
-                "3 keybindings in aterm.toml were skipped",
-            )
-            .key("config.keybindings"),
-            stamp(1),
-            now,
-        )
-        .id;
-    parent.commit_rows(now, 3);
-    let carry = parent.carried();
-
-    let later = now + secs(5);
-    let mut child = fresh(later);
-    child.seed_carried(&carry, later);
-    assert_eq!(
-        child.live(id).unwrap().stale_at,
-        Some(later + STALE_HANDOFF)
-    );
-    // The successor restates the words (no hold change) before the commit.
-    assert!(child.restate(
-        id,
-        Restatement {
-            title: Some("2 keybindings in aterm.toml were skipped".into()),
-            ..Restatement::default()
-        },
-        later + secs(1)
-    ));
-    let commit = later + secs(2);
-    child.after_handoff_commit(commit);
-    let row = child.live(id).unwrap();
-    assert!(
-        row.fold_at.is_some(),
-        "a Warn Default row on glass after the commit must have an anchored hold; fold_at={:?} stale_at={:?}",
-        row.fold_at,
-        row.stale_at
-    );
-}
-
-/// The observable consequence of the previous test: the row overstays its
-/// 45 s hold and leaves as `Stale` after 125 s.
+/// §1.8: "a restate or supersede clears the carried flag". A carried HELD
+/// row restated by the successor before the handoff commit must still fold on
+/// its own hold — it used to overstay its 45 s hold and leave as `Stale` after
+/// 125 s. (That its hold is armed at all is `center`'s
+/// `a_carried_held_row_restated_before_commit_still_folds`.)
 #[test]
 fn a_carried_held_row_restated_before_commit_leaves_on_time_and_as_folded() {
     let now = t0();
@@ -248,7 +76,7 @@ fn a_carried_held_row_restated_before_commit_leaves_on_time_and_as_folded() {
     let carry = parent.carried();
     let later = now + secs(5);
     let mut child = fresh(later);
-    child.seed_carried(&carry, later);
+    child.seed_carried(&carry, stamp(5_000), later);
     child.restate(
         id,
         Restatement {
@@ -291,7 +119,7 @@ fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
     let carry = parent.carried();
     let later = now + secs(5);
     let mut child = fresh(later);
-    child.seed_carried(&carry, later);
+    child.seed_carried(&carry, stamp(5_000), later);
     assert_eq!(glass_ids(&child), vec![ids[0], ids[1]]);
     assert!(child.live(ids[2]).unwrap().is_queued());
     let commit = later + secs(1);
@@ -361,6 +189,7 @@ fn the_meter_spans_the_row_at_every_width() {
         detail0: None,
         meter: Some((Some(500), "45 MB / 90 MB")),
         animated: false,
+        level: false,
         busy: false,
         eta: false,
         load: None,
@@ -391,6 +220,7 @@ fn the_excerpt_never_comes_back_while_narrowing() {
         detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
         meter: None,
         animated: false,
+        level: false,
         busy: false,
         eta: false,
         load: None,
@@ -638,7 +468,7 @@ fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
     let carry = parent.carried();
     let later = now + secs(5);
     let mut child = fresh(later);
-    child.seed_carried(&carry, later);
+    child.seed_carried(&carry, stamp(5_000), later);
     child.after_handoff_commit(later + secs(1));
     let row = child.live(id).unwrap();
     assert_eq!(

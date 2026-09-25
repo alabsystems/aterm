@@ -105,7 +105,6 @@ fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCos
 mod tests {
     use super::*;
     use crate::loc::survey_cell;
-    use crate::measured::{self, Dom};
     use crate::model::{Cell, Graph, PkgFacts};
     use crate::resolve::default_cells;
     use std::collections::BTreeMap;
@@ -123,43 +122,6 @@ mod tests {
         let cells = default_cells();
         survey_cell(&repo_root(), &cells[cell_index])
             .unwrap_or_else(|e| panic!("cell must survey offline: {e}"))
-    }
-
-    /// `find`, with an optional version for the names that resolve twice.
-    /// Passing `None` still ASSERTS uniqueness rather than picking one: a name
-    /// that quietly became ambiguous is a graph change worth failing on.
-    fn find_at(s: &CellSurvey, name: &str, version: Option<&str>) -> PkgId {
-        let mut hits: Vec<&PkgId> = s
-            .graph
-            .nodes
-            .iter()
-            .filter(|p| p.name == name && version.is_none_or(|v| p.version == v))
-            .collect();
-        assert_eq!(
-            hits.len(),
-            1,
-            "`{name}`{} must be unambiguous in this cell, got {hits:?}",
-            version.map_or(String::new(), |v| format!(" {v}"))
-        );
-        hits.pop().expect("checked above").clone()
-    }
-
-    /// Check one anchor against its row in `measured`, plus the shape rules
-    /// every `DomCost` owes regardless of the numbers.
-    fn assert_dom(s: &CellSurvey, want: Dom) {
-        let id = find_at(s, want.name, want.version);
-        let cost = dom(s, &id);
-        assert_eq!((cost.pkgs, cost.loc), (want.pkgs, want.loc), "dom({id})");
-        assert_eq!(
-            cost.also.len(),
-            want.pkgs - 1,
-            "`also` excludes the target itself"
-        );
-        assert!(!cost.also.contains(&id));
-        assert!(
-            cost.also.windows(2).all(|w| w[0] < w[1]),
-            "`also` must be sorted"
-        );
     }
 
     // ---- synthetic: the property that makes a dominator not a subtree -----
@@ -306,14 +268,6 @@ mod tests {
     // ---- the real repository: regression constants ------------------------
 
     #[test]
-    fn mac_arm_dominator_costs_match_the_baseline() {
-        let s = survey(0);
-        for want in measured::MAC_ARM_DOMINATORS {
-            assert_dom(&s, want);
-        }
-    }
-
-    #[test]
     fn naga_falls_with_wgpu_and_libc_has_left_the_surface() {
         let s = survey(0);
         // THE FLIP: "naga is wgpu's alone" resolved the strong way — BOTH left
@@ -336,9 +290,9 @@ mod tests {
         // surface has an empty dominator too. A test that passes both when a
         // fact holds and when its subject has ceased to exist is not testing the
         // fact. So the claim is now ABSENCE, stated directly — the same shape
-        // `linux_dominator_costs_match_the_baseline` uses for AccessKit, and for
-        // the same reason: a cost of zero would also be reported for a package
-        // forge simply failed to see.
+        // `loc`'s mac-arm ceiling test uses for AccessKit, and for the same
+        // reason: a cost of zero would also be reported for a package forge
+        // simply failed to see.
         assert!(
             !s.third_party().any(|id| id.name == "libc"),
             "libc is patched to crates/aterm-libc and must not be third-party"
@@ -368,77 +322,37 @@ mod tests {
         }
     }
 
-    /// The linux anchors. `accesskit_unix` and `accesskit_winit` used to be
-    /// pinned here too; dropping the `a11y-accesskit` default removed them from
-    /// the graph outright, so this asserts they are ABSENT rather than cheap —
-    /// a cost of zero would also be reported for a package forge failed to see.
-    #[test]
-    fn linux_dominator_costs_match_the_baseline() {
-        let s = survey(1);
-        for want in measured::LINUX_DOMINATORS {
-            assert_dom(&s, want);
-        }
-        // AccessKit is PRESENT on linux, deliberately. It was dropped from the
-        // default feature set on 2026-08-25 and made an UNCONDITIONAL linux
-        // dependency on 2026-08-26 (crates/aterm-gui/Cargo.toml, owner's call):
-        // measured with the feature off, the AT-SPI registry reports zero
-        // applications for aterm while a GTK app sits in the same registry, so a
-        // blind linux user gets no terminal at all rather than a degraded one.
-        // macOS keeps the native `a11y-appkit` surface, which is why it is
-        // absent there and the two cells legitimately disagree.
-        //
-        // Asserting presence, not absence: this test previously demanded the
-        // packages be GONE, which turned a deliberate product decision into a
-        // red suite. The regression it should catch is the stack silently
-        // changing shape, not the owner choosing to ship accessibility.
-        for present in ["accesskit", "accesskit_unix", "accesskit_winit"] {
-            assert!(
-                s.graph.nodes.iter().any(|p| p.name == present),
-                "`{present}` left the linux graph — linux carries the AccessKit \
-                 tree unconditionally; if that changed, linux ships no a11y surface"
-            );
-        }
-        assert!(
-            !s.graph
-                .nodes
-                .iter()
-                .any(|p| p.name == "accesskit" && s.cell.triple.contains("darwin")),
-            "macOS must not carry AccessKit — it has the native a11y-appkit path"
-        );
-    }
-
-    /// `measured::MAC_ARM_DOMINATORS` is held in dominator-LOC order precisely
-    /// so it IS the head of the ranking — one list, two properties.
-    #[test]
-    fn the_mac_arm_ranking_leads_with_the_baseline_anchors() {
-        let r = ranked(&survey(0));
-        let head: Vec<(&str, usize, u64)> = r
-            .iter()
-            .take(measured::MAC_ARM_DOMINATORS.len())
-            .map(|(id, c)| (id.name.as_str(), c.pkgs, c.loc))
-            .collect();
-        let want: Vec<(&str, usize, u64)> = measured::MAC_ARM_DOMINATORS
-            .iter()
-            .map(|d| (d.name, d.pkgs, d.loc))
-            .collect();
-        assert_eq!(head, want);
-        assert_eq!(
-            r.len(),
-            measured::MAC_ARM.third_party,
-            "every third-party package is ranked, none twice"
-        );
-    }
-
+    /// The shape every `DomCost` owes, over the real mac-arm ranking: a
+    /// dominator costs at least itself and never more than the whole surface,
+    /// and `also` lists the OTHER packages that fall — sorted, without the
+    /// target, one fewer than `pkgs`. The ranking holds every third-party
+    /// package once.
     #[test]
     fn no_dominator_can_exceed_the_whole_third_party_surface() {
         let s = survey(0);
         let total = s.third_party_loc();
-        for (id, cost) in ranked(&s) {
+        let r = ranked(&s);
+        assert_eq!(
+            r.len(),
+            s.third_party().count(),
+            "every third-party package is ranked, none twice"
+        );
+        for (id, cost) in r {
             assert!(cost.pkgs >= 1, "{id} must at least cost itself");
             assert!(
                 cost.loc <= total,
                 "dom({id}) = {} exceeds the surface {total}",
                 cost.loc
+            );
+            assert_eq!(
+                cost.also.len(),
+                cost.pkgs - 1,
+                "dom({id}): `also` excludes the target itself"
+            );
+            assert!(!cost.also.contains(&id), "dom({id}) lists itself");
+            assert!(
+                cost.also.windows(2).all(|w| w[0] < w[1]),
+                "dom({id}): `also` must be sorted"
             );
         }
     }

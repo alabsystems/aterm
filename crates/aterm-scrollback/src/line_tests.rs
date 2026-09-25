@@ -859,7 +859,126 @@ fn strict_checkpoint_decoder_rejects_attr_run_beyond_columns() {
             80 * 512 + 16 * 1024,
         )
         .is_none(),
-        "a compact RLE run cannot claim more cells than meta.cols"
+        "a compact RLE run cannot claim more attributes than the line has \
+         characters AND more than meta.cols cells — the one-char line bounds it"
+    );
+}
+
+/// The per-line cap the seamless-update consumer passes for a `cols`-wide grid
+/// (`checkpoint_grid_is_canonical` in aterm-gui): `cols` cells, one 256-byte
+/// grapheme unit per cell, and the record framing budget.
+fn strict_decode_one_row(line: &Line, cols: usize) -> Option<Vec<Line>> {
+    let data = serialize_lines(std::slice::from_ref(line));
+    crate::line::line_codec_block::deserialize_lines_strict(
+        &data,
+        1,
+        cols,
+        cols * 256,
+        16 * 1024 + cols * 512,
+    )
+}
+
+/// A styled row whose attrs RLE has one entry per CHARACTER, as the grid's
+/// row→line conversion emits it (`push_cell_text` charges `chars().count()`,
+/// one attr per combining mark, nothing for a wide spacer).
+fn styled_row(text: &str) -> Line {
+    let bold = CellAttrs::new(DEFAULT_FG, DEFAULT_BG, 1);
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    for _ in text.chars() {
+        rle.push(bold);
+    }
+    Line::with_attrs(text, rle)
+}
+
+/// The 2026-09-22 update wedge: a bold 149-column row of 148 `a` and an NFD
+/// `e` + U+0301 is 149 CELLS but 150 CHARACTERS, and the strict decoder
+/// compared the attrs RLE's character count to the cell cap, so the whole
+/// visible screen was "not canonical" and every in-session update refused.
+/// Fails on the old comparison (`cells > max_cells_per_line`).
+#[test]
+fn strict_checkpoint_decoder_admits_a_full_styled_row_with_a_combining_mark() {
+    let text = format!("{}e\u{301}", "a".repeat(148));
+    assert_eq!(text.chars().count(), 150, "150 characters in 149 cells");
+    let line = styled_row(&text);
+    let decoded = strict_decode_one_row(&line, 149)
+        .expect("a combining mark on a full styled row is canonical content");
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(
+        serialize_lines(&decoded),
+        serialize_lines(std::slice::from_ref(&line)),
+        "the strict decode is lossless"
+    );
+}
+
+/// The ZWJ variant of the same wedge: `👨‍💻` is three codepoints in two cells,
+/// so 147 `a` plus the cluster fill 149 columns with 150 characters.
+/// Fails on the old comparison.
+#[test]
+fn strict_checkpoint_decoder_admits_a_full_styled_row_with_a_zwj_emoji() {
+    let text = format!("{}\u{1F468}\u{200D}\u{1F4BB}", "a".repeat(147));
+    assert_eq!(text.chars().count(), 150, "150 characters in 149 cells");
+    let line = styled_row(&text);
+    let decoded = strict_decode_one_row(&line, 149)
+        .expect("a ZWJ cluster on a full styled row is canonical content");
+    assert_eq!(
+        serialize_lines(&decoded),
+        serialize_lines(std::slice::from_ref(&line))
+    );
+}
+
+/// The leniency is bounded by the line's OWN character count: an attrs RLE
+/// that claims more entries than the line has characters and more than the
+/// grid has columns is still refused, so the cap never became unbounded.
+#[test]
+fn strict_checkpoint_decoder_still_refuses_attrs_beyond_both_bounds() {
+    let bold = CellAttrs::new(DEFAULT_FG, DEFAULT_BG, 1);
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    for _ in 0..81 {
+        rle.push(bold);
+    }
+    // 10 characters, 81 attrs, an 80-column grid: over both bounds.
+    let line = Line::with_attrs("0123456789", rle);
+    assert!(
+        strict_decode_one_row(&line, 80).is_none(),
+        "attrs beyond both the column cap and the character count are hostile"
+    );
+    // Exactly `cols` attrs is still admitted, as before.
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    for _ in 0..80 {
+        rle.push(bold);
+    }
+    let line = Line::with_attrs("0123456789", rle);
+    assert!(strict_decode_one_row(&line, 80).is_some());
+}
+
+/// Hyperlink and underline-colour spans are PHYSICAL columns, not characters,
+/// so the character-count leniency must not reach them: a span ending past
+/// `cols` is refused even on a line with more characters than columns.
+#[test]
+fn strict_checkpoint_decoder_keeps_span_columns_bounded_by_cols() {
+    let text = format!("{}e\u{301}", "a".repeat(148));
+    let bold = CellAttrs::new(DEFAULT_FG, DEFAULT_BG, 1);
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    for _ in text.chars() {
+        rle.push(bold);
+    }
+    let inside = Line::with_hyperlinks(
+        &text,
+        rle.clone(),
+        vec![HyperlinkSpan::new(0, 149, Arc::from("https://example.com"))],
+    );
+    assert!(
+        strict_decode_one_row(&inside, 149).is_some(),
+        "a span whose exclusive end is `cols` covers the last column and is in bounds"
+    );
+    let beyond = Line::with_hyperlinks(
+        &text,
+        rle,
+        vec![HyperlinkSpan::new(0, 150, Arc::from("https://example.com"))],
+    );
+    assert!(
+        strict_decode_one_row(&beyond, 149).is_none(),
+        "a span cannot end past the grid's last column, whatever the character count"
     );
 }
 

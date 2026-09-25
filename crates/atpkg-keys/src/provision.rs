@@ -18,27 +18,12 @@
 //!   anchor and the existing roster, then does the same remaining work. It edits NO trust
 //!   anchor at all.
 //!
-//! # NEITHER VERB PUTS A MACHINE KEY IN `pins::UPDATE_CHANNEL_PUBKEYS`
+//! # THE ROSTER IS THE ONLY GRANT
 //!
-//! They used to, as a bridge. It was removed, and the reasoning is worth keeping because
-//! the append looks helpful:
-//!
-//! * It buys a ROSTER-AWARE client nothing. With the master armed, the roster alone
-//!   authorizes (`aterm_update::github::fetch_authoritative_release`); the keyset is not
-//!   consulted and cannot grant.
-//! * It buys a PRE-ROSTER client nothing either — not from here. Such a client can only
-//!   learn a key from a release it already accepts, so an entry in this working tree
-//!   reaches it only if a release is cut and adopted, and that release must itself be
-//!   signed by a key it already holds. Minting a key on a laptop cannot change what a
-//!   shipped binary trusts.
-//! * And it COSTS something real, permanently. A keyset member is irrevocable for every
-//!   client that ships with it: `machine-revoke` withdraws a machine from the roster, and
-//!   a pre-roster client would go on accepting that same key forever. It also spends one
-//!   of four slots in what is a rotation window, not a machine registry.
-//!
-//! Extending the pre-roster allowance is therefore a reviewed edit to `pins.rs` made as
-//! part of a release, not a side effect of minting a key. The producer names the same fact
-//! from the other end: `aterm_release::publish::PreRosterClients`.
+//! A minted machine is authorized by the master-signed roster and by nothing else — there
+//! is no compiled-in channel keyset (the pre-roster K1 keyset was retired 2026-09-23, with
+//! the installs older than v0.21.0 that verified under it). So neither verb edits any
+//! anchor but the master's, and every grant it makes is one `machine-revoke` can take back.
 //!
 //! # The split, and why the secret is not in this module's signatures
 //!
@@ -85,8 +70,7 @@ use crate::fsio::{
 };
 use crate::master::MasterSeed;
 use crate::pins_edit::{
-    CHANNEL_ANCHOR, Edit, MASTER_ANCHOR, MAX_MASTER_MEMBERS, append_member, read_anchor,
-    verify_members,
+    Edit, MASTER_ANCHOR, MAX_MASTER_MEMBERS, append_member, read_anchor, verify_members,
 };
 use aterm_update_core::roster::{Roster, RosterReject};
 
@@ -103,13 +87,6 @@ pub const MACHINE_PUB_REL: &str = ".aterm/machine.toml";
 
 /// The anchor file, relative to the workspace root.
 pub const PINS_REL: &str = "crates/aterm-update-core/src/pins.rs";
-
-/// The roster id `setup` gives the INCUMBENT keyset head when no better name is supplied.
-///
-/// See [`plan`] for why the first roster must name that key at all. The default is a
-/// description rather than a guess at a hostname, because this tool genuinely does not know
-/// which machine holds that key — `--head-id` exists for the operator who does.
-pub const DEFAULT_HEAD_ID: &str = "incumbent-head";
 
 /// Which verb is running. The two share almost all of their work; what differs is who
 /// supplies the master and what the anchor is allowed to look like beforehand.
@@ -761,23 +738,16 @@ fn complete_roster_transaction(path: &str) -> Result<(), String> {
     retire_roster_transaction(&transaction)
 }
 
-/// How a [`RosterLock`] holds its `flock`: a writer's managed rendezvous (created if
-/// absent, transaction replayed on acquisition) or a read-only claim on one that must
-/// already exist.
-enum RosterGuard {
-    Managed { _guard: aterm_update_core::FileLock },
-    Existing { _file: std::fs::File },
-}
-
 /// The advisory lock a roster writer holds across its whole read → edit → sign →
 /// publish sequence.
 ///
 /// Without it, two runs could each read sequence N, each sign N+1, and each pass a
 /// compare-then-publish premise check in the gap before the other's rename — a
 /// same-sequence fork the monotonic ratchet cannot see, in which the second publish
-/// silently de-authorizes the machine the first one added. `flock` is released by the
-/// kernel when the file closes, INCLUDING on a crash, so serializing here does not buy a
-/// stale-lock recovery ceremony.
+/// silently de-authorizes the machine the first one added. The lock is an
+/// [`aterm_update_core::FileLock`]: released by `LOCK_UN` when the guard drops (a copy
+/// of the descriptor in a child mid-spawn cannot keep it), and by the kernel on a crash,
+/// so serializing here does not buy a stale-lock recovery ceremony.
 ///
 /// # Which writers take it
 ///
@@ -804,7 +774,7 @@ enum RosterGuard {
 /// [`refuse_pending_roster_transaction`] alone when no rendezvous need exist.
 pub struct RosterLock {
     path: String,
-    _guard: RosterGuard,
+    _guard: aterm_update_core::FileLock,
 }
 
 impl RosterLock {
@@ -894,7 +864,7 @@ pub fn lock_roster(path: &str) -> Result<RosterLock, String> {
     complete_roster_transaction(path)?;
     Ok(RosterLock {
         path: path.to_string(),
-        _guard: RosterGuard::Managed { _guard: guard },
+        _guard: guard,
     })
 }
 
@@ -921,12 +891,6 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
                 &e.to_string(),
             ])
         })?;
-    file.lock()
-        .map_err(|e| concat(&["lock roster ", path, ": ", &e.to_string()]))?;
-
-    // Refuse a raced unlink/replacement after open. Normal roster tooling never deletes
-    // this rendezvous, but a read-only claim must not sit locking an orphaned inode while
-    // a writer creates and locks a new path under the same name.
     let opened = file.metadata().map_err(|e| {
         concat(&[
             "inspect opened roster lock ",
@@ -935,6 +899,12 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
             &e.to_string(),
         ])
     })?;
+    let guard = aterm_update_core::FileLock::lock_open(file)
+        .map_err(|e| concat(&["lock roster ", path, ": ", &e.to_string()]))?;
+
+    // Refuse a raced unlink/replacement after open. Normal roster tooling never deletes
+    // this rendezvous, but a read-only claim must not sit locking an orphaned inode while
+    // a writer creates and locks a new path under the same name.
     let current = std::fs::symlink_metadata(&lock_path).map_err(|e| {
         concat(&[
             "re-check existing roster lock ",
@@ -954,7 +924,7 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
     refuse_pending_roster_transaction(path)?;
     Ok(RosterLock {
         path: path.to_string(),
-        _guard: RosterGuard::Existing { _file: file },
+        _guard: guard,
     })
 }
 
@@ -1068,16 +1038,11 @@ pub fn publish_roster_locked(
 pub struct Preflight {
     verb: Verb,
     id: String,
-    /// The roster id `setup` will give the incumbent keyset head. Unused by `join`, whose
-    /// roster already names it.
-    head_id: String,
     paths: Paths,
     /// The anchor file's exact current bytes, as text.
     pins_src: String,
     /// What `PAPER_MASTER_PUBKEYS` holds in the working tree right now.
     master_members: Vec<String>,
-    /// What `UPDATE_CHANNEL_PUBKEYS` holds in the working tree right now.
-    channel_members: Vec<String>,
 }
 
 impl std::fmt::Debug for Preflight {
@@ -1093,14 +1058,6 @@ impl std::fmt::Debug for Preflight {
     }
 }
 
-impl Preflight {
-    /// The channel keyset's head — the key this build signs with today.
-    #[must_use]
-    pub fn channel_head(&self) -> Option<&str> {
-        self.channel_members.first().map(String::as_str)
-    }
-}
-
 /// EVERY REFUSAL THAT CAN BE MADE BEFORE A SECRET EXISTS.
 ///
 /// Nothing here writes a FILE, and nothing here needs the master. That ordering is the
@@ -1113,22 +1070,11 @@ impl Preflight {
 /// rather than later for exactly the reason above. `$HOME/.aterm` does not exist on a fresh
 /// machine — the first machine, which is what `setup` is for — and creating the machine key
 /// inside it used to fail ENOENT at the last step of a run that had already armed the
-/// anchor, published a master-signed roster naming a machine whose key was never written,
-/// and burned one of four keyset slots on a public key whose private half existed only in
-/// the memory of a process that was exiting. An `mkdir -p` before any of that is the whole
-/// fix, and a failure here costs an error message.
-pub fn preflight(verb: Verb, id: &str, head_id: &str, paths: &Paths) -> Result<Preflight, String> {
+/// anchor and published a master-signed roster naming a machine whose key was never
+/// written. An `mkdir -p` before any of that is the whole fix, and a failure here costs an
+/// error message.
+pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, String> {
     vet_machine_id(id)?;
-    vet_machine_id(head_id).map_err(|e| concat(&["--head-id: ", &e]))?;
-    if verb == Verb::Setup && head_id == id {
-        return Err(concat(&[
-            "--head-id and --id are both '",
-            id,
-            "', but they name two DIFFERENT machines: --id is this machine, and --head-id \
-             is the machine that already holds the incumbent channel key (whose private \
-             half is not on this one). Give the incumbent its own id.",
-        ]));
-    }
 
     let raw = read_bytes(&paths.pins)
         .map_err(|e| concat(&["read ", &paths.pins, ": ", &e.to_string()]))?;
@@ -1140,11 +1086,10 @@ pub fn preflight(verb: Verb, id: &str, head_id: &str, paths: &Paths) -> Result<P
         ])
     })?;
 
-    // Reading BOTH anchors here is a shape check as much as a data read: if either is
-    // spelled in a way the writer does not recognise, the run stops now rather than
-    // halfway through.
+    // Reading the anchor here is a shape check as much as a data read: if it is spelled
+    // in a way the writer does not recognise, the run stops now rather than halfway
+    // through.
     let master = read_anchor(&pins_src, MASTER_ANCHOR)?;
-    let channel = read_anchor(&pins_src, CHANNEL_ANCHOR)?;
 
     match verb {
         Verb::Setup => {
@@ -1265,18 +1210,12 @@ pub fn preflight(verb: Verb, id: &str, head_id: &str, paths: &Paths) -> Result<P
         ]));
     }
 
-    // There is deliberately NO "is there room in the keyset" check here any more: this
-    // machine does not need a slot. See the module doc for why the append was removed
-    // rather than made conditional.
-
     Ok(Preflight {
         verb,
         id: id.to_string(),
-        head_id: head_id.to_string(),
         paths: paths.clone(),
         pins_src,
         master_members: master.members,
-        channel_members: channel.members,
     })
 }
 
@@ -1319,16 +1258,11 @@ pub struct Planned {
     /// can prove it is replacing the file it planned against, and not one somebody else
     /// changed in the meantime.
     pins_src: String,
-    /// The incumbent keyset head, seeded onto a FRESH roster as `(id, pubkey)`. `None` when
-    /// there was no incumbent (a fork with no channel pin) or when the roster already
-    /// existed.
-    seeded_head: Option<(String, String)>,
     /// The exact roster-pair bytes this plan was computed against (`None` = planned
     /// fresh), so [`write_rest`] can prove it is extending the pair it read — the same
     /// premise check [`write_pins`] runs over the anchor file.
     roster_snapshot: Option<RosterSnapshot>,
     master_after: Vec<String>,
-    channel_after: Vec<String>,
     master_pubkey: String,
     master_fingerprint: String,
     machine_pkcs8: Vec<u8>,
@@ -1385,20 +1319,10 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
     // The machine keypair. Generated here, on this machine, and never copied off it.
     let (machine_pkcs8, machine_pubkey) = crate::generate()?;
 
-    // The hierarchy must not collapse: `pins::tests::the_master_is_never_also_a_channel_
-    // signing_key` refuses a master that is also a channel key, and the reason is the
-    // whole premise of the tier — a master that signs releases lives on the release
-    // machine, which is exactly the arrangement the previous one-key design was retired
-    // for. A fresh Ed25519 collision is not a realistic accident, but a re-run against a
-    // hand-edited file is, so it is checked rather than assumed.
-    if pre.channel_members.contains(&master_pubkey) {
-        return Err(concat(&[
-            "the paper master ",
-            &master_pubkey,
-            " is already listed as a CHANNEL SIGNING key. That collapses the hierarchy \
-             back into one key while looking like a hierarchy; refusing.",
-        ]));
-    }
+    // The hierarchy must not collapse: a master that also signs releases lives on the
+    // release machine, which is exactly the arrangement the one-key design was retired
+    // for. A fresh Ed25519 collision is not a realistic accident, but it is checked
+    // rather than assumed.
     if machine_pubkey == master_pubkey {
         return Err("the freshly minted machine key is the paper master; refusing".to_string());
     }
@@ -1437,14 +1361,6 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
         }
     }
 
-    // THE CHANNEL KEYSET IS NOT TOUCHED, by either verb. This machine's key goes on the
-    // ROSTER and nowhere else — the roster is what authorizes it, and a keyset entry
-    // would be an irrevocable grant to clients this tool cannot reach anyway. See the
-    // module doc. Carrying the members forward unchanged is not a formality: `write_pins`
-    // verifies the anchor file against this list afterwards, so what used to prove "the
-    // append landed" now proves the stronger property that the keyset is UNTOUCHED.
-    let channel_after = pre.channel_members.clone();
-
     // --- the roster ---------------------------------------------------------------
     // Loading it VERIFIES it under the master just derived. For `join` that is the second
     // half of the transcription proof; for `setup` there is nothing on disk to verify, so
@@ -1457,38 +1373,10 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
         Verb::Join => RosterExpectation::MustExist,
         Verb::Setup => RosterExpectation::MayCreateFresh,
     };
-    let (mut roster, roster_snapshot) =
+    let (roster, roster_snapshot) =
         load_roster(&pre.paths.roster, &master_pubkey, now, expectation)?;
     let roster_was_fresh = roster_snapshot.is_none();
 
-    // THE FIRST ROSTER MUST NAME THE INCUMBENT CHANNEL HEAD, and this is where that
-    // happens.
-    //
-    // Arming the master changes what the CUTTER checks. With the anchor empty a cut is
-    // authorized by head equality — the signing key must BE `UPDATE_CHANNEL_PUBKEYS[0]`.
-    // Arm it and that widens to keyset membership AND a roster lookup by public key
-    // (`aterm_release::machines::authorize_cut`). So a first roster that named only the
-    // machine running `setup` would, the moment the anchor was committed, make the machine
-    // holding the head key unable to cut at all — and that machine is the only one whose
-    // key every shipped client already accepts. The channel would be bricked in both
-    // directions: the one machine that can be verified may not sign, and the one machine
-    // that may sign cannot be verified. `pins.rs` states this as step 5 of its activation
-    // sequence; the tool now satisfies it instead of printing it.
-    //
-    // ONLY the head is seeded, deliberately. The other keyset members are accept-only keys
-    // inside a rotation window: today head equality is what stops them cutting, and putting
-    // them on the roster would hand them a cutting authority the shipped fleet cannot
-    // verify — the exact permanent wedge the keyset ordering exists to prevent. They join
-    // the roster when their machine runs `join`, which is also when the operator finds out
-    // (from the closing report) that it cannot cut yet.
-    let mut seeded_head = None;
-    if roster_was_fresh
-        && let Some(head) = pre.channel_members.first()
-        && *head != machine_pubkey
-    {
-        roster = crate::roster_ops::add(roster, &pre.head_id, head, now)?;
-        seeded_head = Some((pre.head_id.clone(), head.clone()));
-    }
     let roster = crate::roster_ops::add(roster, &pre.id, &machine_pubkey, now)?;
     let roster_bytes = roster
         .to_toml()
@@ -1508,10 +1396,8 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
         paths: pre.paths,
         pins_text: if changed { Some(text) } else { None },
         pins_src: pre.pins_src,
-        seeded_head,
         roster_snapshot,
         master_after,
-        channel_after,
         master_pubkey,
         master_fingerprint,
         machine_pkcs8,
@@ -1596,8 +1482,7 @@ pub fn write_pins(planned: &Planned) -> Result<(), String> {
             " before doing anything else",
         ])
     };
-    verify_members(&back, MASTER_ANCHOR, &planned.master_after).map_err(damaged)?;
-    verify_members(&back, CHANNEL_ANCHOR, &planned.channel_after).map_err(damaged)
+    verify_members(&back, MASTER_ANCHOR, &planned.master_after).map_err(damaged)
 }
 
 /// What a completed run produced, for [`render_report`] to speak.
@@ -1609,22 +1494,6 @@ pub struct Report {
     pub master_fingerprint: String,
     pub master_after: Vec<String>,
     pub machine_pubkey: String,
-    /// Whether this machine's public key IS the committed keyset's HEAD.
-    ///
-    /// Normally FALSE, and that is not a defect: this tool does not touch the keyset.
-    /// It is true only when a reviewed commit already put this key at index 0 — i.e.
-    /// when this machine IS the incumbent whose releases pre-roster clients can verify —
-    /// and that single fact decides everything the closing report has to say about the
-    /// installed base.
-    ///
-    /// HEAD, not membership, and the distinction is the difference between a correct
-    /// report and one that talks an operator into bricking the fleet. A non-head keyset
-    /// member is in this tree and in no shipped build (step 1 of the rotation appends it
-    /// so a FUTURE build can carry it), so "your key is in the keyset, therefore old
-    /// clients can verify you" is false for exactly the member most likely to be there.
-    /// `publish::channel_signature_policy` tests the same thing the same way.
-    pub machine_is_committed_head: bool,
-    pub channel_after: Vec<String>,
     pub roster_seq: u64,
     pub roster_valid_until: String,
     pub roster_machines: Vec<String>,
@@ -1633,8 +1502,6 @@ pub struct Report {
     /// `setup` can be in that position) or a fork of one that exists elsewhere (fatal), and
     /// the operator is the only one who can tell which.
     pub roster_was_fresh: bool,
-    /// The incumbent keyset head this run put on the fresh roster, `(id, pubkey)`.
-    pub seeded_head: Option<(String, String)>,
     pub pins_changed: bool,
 }
 
@@ -1813,8 +1680,6 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
         }
     })?;
 
-    let machine_is_committed_head = planned.channel_after.first() == Some(&planned.machine_pubkey);
-
     Ok(Report {
         verb: planned.verb,
         id: planned.id,
@@ -1823,13 +1688,10 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
         master_fingerprint: planned.master_fingerprint,
         master_after: planned.master_after,
         machine_pubkey: planned.machine_pubkey,
-        machine_is_committed_head,
-        channel_after: planned.channel_after,
         roster_seq: planned.roster_seq,
         roster_valid_until: planned.roster_valid_until,
         roster_machines: planned.roster_machines,
         roster_was_fresh: planned.roster_was_fresh,
-        seeded_head: planned.seeded_head,
         pins_changed: planned.pins_text.is_some(),
     })
 }
@@ -1893,23 +1755,6 @@ pub fn render_report(r: &Report) -> Vec<String> {
         );
     }
     out.push(roster);
-    if let Some((head_id, head_key)) = &r.seeded_head {
-        out.push(concat(&[
-            "          '",
-            head_id,
-            "' = the incumbent keyset head (",
-            head_key,
-            "); rename only now, via --head-id — roster ids are revoke-only later",
-        ]));
-    }
-    out.push(concat(&[
-        "  keyset  pins::UPDATE_CHANNEL_PUBKEYS unchanged (",
-        &r.channel_after.len().to_string(),
-        ") — the roster authorizes '",
-        &r.id,
-        "'",
-    ]));
-
     out.push(String::new());
     out.push("=== NEXT ===".to_string());
     let mut step = 0usize;
@@ -1949,31 +1794,11 @@ pub fn render_report(r: &Report) -> Vec<String> {
     if r.pins_changed {
         out.push(numbered("commit — durable from here".to_string()));
     }
-    if r.machine_is_committed_head {
-        out.push(numbered(concat(&[
-            "cut from this machine — '",
-            &r.id,
-            "' holds the committed keyset head, the one key pre-roster clients verify",
-        ])));
-    } else if let Some(head) = r.channel_after.first() {
-        let mut line = concat(&["cut — from the machine holding the head key ", head]);
-        if let Some((head_id, _)) = &r.seeded_head {
-            line.push_str(&concat(&[
-                " (roster id '",
-                head_id,
-                "'; its profile sets machine_id = \"",
-                head_id,
-                "\" — a declared id that contradicts the roster refuses the cut)",
-            ]));
-        }
-        line.push_str(&concat(&[
-            ", or from '",
-            &r.id,
-            "' with --strand-pre-roster-clients (asserts no pre-roster client is left \
-             to strand)",
-        ]));
-        out.push(numbered(line));
-    }
+    out.push(numbered(concat(&[
+        "cut from this machine — the master-signed roster authorizes '",
+        &r.id,
+        "'",
+    ])));
     out.push(numbered(concat(&[
         "copy ",
         &r.paths.roster,
@@ -2002,22 +1827,14 @@ mod tests {
         dir
     }
 
-    /// A `pins.rs` fixture with the real two shapes. Deliberately a COPY: the tests write
+    /// A `pins.rs` fixture with the master anchor's empty shape. Deliberately a COPY: the tests write
     /// to it, and writing to the tree's own anchor file from a test would be exactly the
     /// accident this whole module is trying to make impossible.
     const PINS_FIXTURE: &str = "// Copyright 2026 Andrew Yates\n\
         // SPDX-License-Identifier: Apache-2.0\n\
         \n\
         /// The paper master. Empty here, and therefore INERT.\n\
-        pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n\
-        \n\
-        /// The channel keyset. ORDER IS A CONTRACT: index 0 is the head.\n\
-        pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\n\
-        \x20   // K1 — HEAD, the key this build signs with.\n\
-        \x20   \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n\
-        ];\n";
-
-    const HEAD_KEY: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
+        pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n";
 
     fn paths_in(dir: &std::path::Path) -> Paths {
         let s = |n: &str| {
@@ -2045,7 +1862,7 @@ mod tests {
 
     /// Run `setup` end to end against a scratch tree, returning its report.
     fn run_setup(paths: &Paths, id: &str) -> Result<Report, String> {
-        let pre = preflight(Verb::Setup, id, HEAD_ID, paths)?;
+        let pre = preflight(Verb::Setup, id, paths)?;
         let seed = seed_of(PAPER);
         let planned = plan(pre, &seed, NOW)?;
         write_pins(&planned)?;
@@ -2054,7 +1871,7 @@ mod tests {
 
     /// Run `join` end to end, with the phrase already in hand.
     fn run_join(paths: &Paths, id: &str, paper: &str) -> Result<Report, String> {
-        let pre = preflight(Verb::Join, id, HEAD_ID, paths)?;
+        let pre = preflight(Verb::Join, id, paths)?;
         let seed = seed_of(paper);
         verify_master(&pre, &seed)?;
         let planned = plan(pre, &seed, NOW)?;
@@ -2062,16 +1879,10 @@ mod tests {
         write_rest(planned)
     }
 
-    /// The id the tests give the incumbent head.
-    const HEAD_ID: &str = "incumbent-head";
-
-    /// THE WHOLE OF `setup`, on a fresh tree: the anchor is armed, the CHANNEL KEYSET IS
-    /// NOT TOUCHED, the roster names the machine and verifies under the master, and the
-    /// secret key lands 0600.
-    ///
-    /// Kills the mutation "append the machine key to the keyset as a bridge": the keyset
-    /// assertion below then fails. A keyset entry is an irrevocable grant to every client
-    /// that ships with it, and it authorizes nothing that the roster does not already.
+    /// THE WHOLE OF `setup`, on a fresh tree: the anchor is armed, the roster names the
+    /// machine — and ONLY the machine: no incumbent is seeded, because no client verifies
+    /// under anything but the roster — it verifies under the master, and the secret key
+    /// lands 0600.
     #[test]
     fn setup_arms_the_anchor_mints_the_machine_and_signs_the_roster() {
         let dir = scratch("setup-happy");
@@ -2089,17 +1900,6 @@ mod tests {
             seed_of(PAPER).pubkey_b64().unwrap(),
             "the armed anchor is the master the phrase derives"
         );
-        let channel = read_anchor(&src, CHANNEL_ANCHOR).unwrap();
-        assert_eq!(
-            channel.members,
-            vec![HEAD_KEY.to_string()],
-            "UNTOUCHED: the machine key belongs on the roster, never in the keyset"
-        );
-        assert_eq!(channel.head(), Some(HEAD_KEY), "the head is not reordered");
-        assert!(
-            !report.machine_is_committed_head,
-            "this tool never grants a machine the pre-roster allowance"
-        );
         assert!(
             !src.contains(report.machine_pubkey.as_str()),
             "the minted key must appear nowhere in the anchor file"
@@ -2112,23 +1912,14 @@ mod tests {
             aterm_update_core::roster::verify_roster(&[report.master_pubkey.as_str()], bytes, &sig)
                 .expect("the roster verifies under the armed master");
         let roster = Roster::parse(&verified).unwrap();
-        // THE FIRST ROSTER NAMES THE INCUMBENT HEAD FIRST. Without this entry, committing
-        // the anchor would leave the one machine every shipped client can verify unable to
-        // cut — `authorize_cut` looks the signing key up in the roster by public key.
-        assert_eq!(roster.machines.len(), 2);
-        assert_eq!(roster.machines[0].id, HEAD_ID);
         assert_eq!(
-            roster.machines[0].pubkey, HEAD_KEY,
-            "the incumbent channel head is the roster's first machine"
+            roster.machines.len(),
+            1,
+            "the first roster names this machine alone"
         );
-        assert_eq!(roster.machines[1].id, "m3");
-        assert_eq!(roster.machines[1].pubkey, report.machine_pubkey);
-        assert_eq!(roster.roster_seq, 2, "one bump per machine added");
-        assert_eq!(
-            report.seeded_head,
-            Some((HEAD_ID.to_string(), HEAD_KEY.to_string())),
-            "the report carries the seeding so it can be spoken out loud"
-        );
+        assert_eq!(roster.machines[0].id, "m3");
+        assert_eq!(roster.machines[0].pubkey, report.machine_pubkey);
+        assert_eq!(roster.roster_seq, 1, "one bump per machine added");
 
         // The secret key is 0600 and holds a usable pkcs8 key.
         use std::os::unix::fs::PermissionsExt as _;
@@ -2150,7 +1941,7 @@ mod tests {
 
         // Second run: the anchor is armed now.
         let before = std::fs::read_to_string(&paths.pins).unwrap();
-        let err = preflight(Verb::Setup, "m11", "incumbent-head", &paths).unwrap_err();
+        let err = preflight(Verb::Setup, "m11", &paths).unwrap_err();
         assert!(err.contains("ALREADY committed"), "{err}");
         assert!(err.contains("join"), "{err}");
         assert!(err.contains("strand"), "{err}");
@@ -2165,7 +1956,7 @@ mod tests {
         let fresh = scratch("setup-refuses-control");
         let fresh_paths = paths_in(&fresh);
         write_fixture(&fresh_paths);
-        assert!(preflight(Verb::Setup, "m11", "incumbent-head", &fresh_paths).is_ok());
+        assert!(preflight(Verb::Setup, "m11", &fresh_paths).is_ok());
     }
 
     /// `join` on a later machine: the master is proved, the machine is added to the
@@ -2182,7 +1973,7 @@ mod tests {
         second.key = dir.join("m11.key").to_str().unwrap().to_string();
         second.machine_pub = dir.join("m11.toml").to_str().unwrap().to_string();
 
-        let pre = preflight(Verb::Join, "m11", "incumbent-head", &second).expect("join preflight");
+        let pre = preflight(Verb::Join, "m11", &second).expect("join preflight");
         let seed = seed_of(PAPER);
         verify_master(&pre, &seed).expect("the phrase matches the committed anchor");
         let planned = plan(pre, &seed, NOW).expect("join plans");
@@ -2195,24 +1986,14 @@ mod tests {
             vec![first.master_pubkey.clone()],
             "join never touches the master anchor"
         );
-        assert_eq!(
-            read_anchor(&src, CHANNEL_ANCHOR).unwrap().members,
-            vec![HEAD_KEY.to_string()],
-            "join grants no pre-roster allowance: the keyset is exactly as committed"
-        );
         assert!(
             !src.contains(first.machine_pubkey.as_str())
                 && !src.contains(report.machine_pubkey.as_str()),
             "neither minted key appears in the anchor file"
         );
-        assert!(!report.machine_is_committed_head);
-        assert_eq!(report.roster_seq, 3, "the roster advanced");
-        assert_eq!(report.roster_machines, vec![HEAD_ID, "m3", "m11"]);
+        assert_eq!(report.roster_seq, 2, "the roster advanced");
+        assert_eq!(report.roster_machines, vec!["m3", "m11"]);
         assert!(!report.roster_was_fresh, "join edited the existing roster");
-        assert_eq!(
-            report.seeded_head, None,
-            "only a FRESH roster is seeded; join extends the one it was given"
-        );
     }
 
     /// `join` WITH NO ROSTER ON DISK REFUSES RATHER THAN STARTING A SECOND ONE.
@@ -2241,7 +2022,7 @@ mod tests {
             "the roster does NOT travel with the repo; that is the premise"
         );
 
-        let err = preflight(Verb::Join, "m11", HEAD_ID, &second).unwrap_err();
+        let err = preflight(Verb::Join, "m11", &second).unwrap_err();
         assert!(err.contains("no roster at"), "{err}");
         assert!(err.contains("COPY"), "{err}");
         assert!(err.contains("will not start a second roster"), "{err}");
@@ -2262,7 +2043,7 @@ mod tests {
         let report = run_join(&second, "m11", PAPER).expect("join, with the roster in hand");
         assert_eq!(
             report.roster_machines,
-            vec![HEAD_ID, "m3", "m11"],
+            vec!["m3", "m11"],
             "the roster was EXTENDED: every machine already on it survives"
         );
         assert!(!report.roster_was_fresh);
@@ -2289,7 +2070,7 @@ mod tests {
         second.machine_pub = dir.join("m11.toml").to_str().unwrap().to_string();
 
         // Preflight sees the roster and passes — the courteous check.
-        let pre = preflight(Verb::Join, "m11", HEAD_ID, &second).expect("roster is present");
+        let pre = preflight(Verb::Join, "m11", &second).expect("roster is present");
         // THE WINDOW: both halves of the pair disappear while the phrase is typed.
         // (Held in memory first, so the negative control below can put them back.)
         let saved_body = std::fs::read(&second.roster).unwrap();
@@ -2313,7 +2094,7 @@ mod tests {
         std::fs::write(&second.roster, &saved_body).unwrap();
         std::fs::write(concat(&[&second.roster, ".sig"]), &saved_sig).unwrap();
         let report = run_join(&second, "m11", PAPER).expect("join with the pair in place");
-        assert_eq!(report.roster_machines, vec![HEAD_ID, "m3", "m11"]);
+        assert_eq!(report.roster_machines, vec!["m3", "m11"]);
     }
 
     /// THE ROSTER'S OWN PREMISE CHECK: `write_rest` refuses to publish a roster signed
@@ -2335,7 +2116,7 @@ mod tests {
         second.key = dir.join("m11.key").to_str().unwrap().to_string();
         second.machine_pub = dir.join("m11.toml").to_str().unwrap().to_string();
 
-        let pre = preflight(Verb::Join, "m11", HEAD_ID, &second).expect("preflight");
+        let pre = preflight(Verb::Join, "m11", &second).expect("preflight");
         let seed = seed_of(PAPER);
         let planned = plan(pre, &seed, NOW).expect("plan against the current pair");
 
@@ -2364,7 +2145,7 @@ mod tests {
         let fresh_dir = scratch("roster-premise-fresh");
         let fresh_paths = paths_in(&fresh_dir);
         write_fixture(&fresh_paths);
-        let pre = preflight(Verb::Setup, "m3", HEAD_ID, &fresh_paths).unwrap();
+        let pre = preflight(Verb::Setup, "m3", &fresh_paths).unwrap();
         let planned = plan(pre, &seed_of(PAPER), NOW).unwrap();
         write_pins(&planned).unwrap();
         std::fs::write(&fresh_paths.roster, b"someone else's first roster").unwrap();
@@ -2673,7 +2454,7 @@ mod tests {
         let attacker_dir = scratch("plan-anchor-reproof-attacker");
         let attacker_paths = paths_in(&attacker_dir);
         write_fixture(&attacker_paths);
-        let pre = preflight(Verb::Setup, "mx", HEAD_ID, &attacker_paths).unwrap();
+        let pre = preflight(Verb::Setup, "mx", &attacker_paths).unwrap();
         let wrong = seed_of(OTHER_PAPER);
         let planned = plan(pre, &wrong, NOW).unwrap();
         write_pins(&planned).unwrap();
@@ -2684,7 +2465,7 @@ mod tests {
         second.roster = attacker_paths.roster.clone();
         second.key = dir.join("m11.key").to_str().unwrap().to_string();
         second.machine_pub = dir.join("m11.toml").to_str().unwrap().to_string();
-        let pre = preflight(Verb::Join, "m11", HEAD_ID, &second).expect("roster file exists");
+        let pre = preflight(Verb::Join, "m11", &second).expect("roster file exists");
         let err = plan(pre, &wrong, NOW).unwrap_err();
         assert!(
             err.contains("is NOT the master committed"),
@@ -2697,7 +2478,7 @@ mod tests {
         let mut honest = paths.clone();
         honest.key = dir.join("m11b.key").to_str().unwrap().to_string();
         honest.machine_pub = dir.join("m11b.toml").to_str().unwrap().to_string();
-        let pre = preflight(Verb::Join, "m11", HEAD_ID, &honest).unwrap();
+        let pre = preflight(Verb::Join, "m11", &honest).unwrap();
         assert!(plan(pre, &seed_of(PAPER), NOW).is_ok());
     }
 
@@ -2767,7 +2548,7 @@ mod tests {
         paths.roster = roster_dir.join("r.toml").to_str().unwrap().to_string();
         write_fixture(&paths);
 
-        let pre = preflight(Verb::Setup, "m3", HEAD_ID, &paths).expect("preflight");
+        let pre = preflight(Verb::Setup, "m3", &paths).expect("preflight");
         let planned = plan(pre, &seed_of(PAPER), NOW).expect("plan");
         write_pins(&planned).expect("the anchor is written");
         // Preflight created this directory; pre-create the persistent advisory-lock inode
@@ -2833,7 +2614,7 @@ mod tests {
             .to_string();
         write_fixture(&paths);
 
-        let pre = preflight(Verb::Setup, "m3", HEAD_ID, &paths).expect("preflight");
+        let pre = preflight(Verb::Setup, "m3", &paths).expect("preflight");
         let planned = plan(pre, &seed_of(PAPER), NOW).expect("plan");
         write_pins(&planned).expect("the anchor is written");
         assert!(
@@ -2872,19 +2653,18 @@ mod tests {
     /// The plan is computed from bytes read in `preflight`, and for `join` that read happens
     /// before the human types 64 characters. A `git checkout`, a rebase, an editor or
     /// another agent landing in that window used to be silently reverted by the write —
-    /// including, in the worst case, a reviewed commit retiring a compromised key, which
-    /// would be resurrected into the keyset by a run that reported success.
+    /// including, in the worst case, a reviewed commit retiring a compromised master, which
+    /// would be resurrected into the anchor by a run that reported success.
     #[test]
     fn write_pins_refuses_a_file_that_changed_under_it() {
         let dir = scratch("stale-snapshot");
         let paths = paths_in(&dir);
         write_fixture(&paths);
-        let pre = preflight(Verb::Setup, "m3", HEAD_ID, &paths).unwrap();
+        let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
 
-        // A reviewed commit lands while the run is in flight: the head key is retired and
-        // replaced.
-        const REPLACEMENT: &str = "bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=";
-        let concurrent = PINS_FIXTURE.replace(HEAD_KEY, REPLACEMENT);
+        // A reviewed commit lands while the run is in flight.
+        const REPLACEMENT: &str = "Edited by a reviewed commit that landed in flight.";
+        let concurrent = PINS_FIXTURE.replace("Empty here, and therefore INERT.", REPLACEMENT);
         assert_ne!(concurrent, PINS_FIXTURE, "the fixture must actually differ");
         std::fs::write(&paths.pins, &concurrent).unwrap();
 
@@ -2895,18 +2675,17 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&paths.pins).unwrap(),
             concurrent,
-            "the concurrent edit survives, and the retired key stays retired"
+            "the concurrent edit survives"
         );
 
         // NEGATIVE CONTROL: plan against what the file says NOW, and the write is accepted.
-        let pre = preflight(Verb::Setup, "m3", HEAD_ID, &paths).unwrap();
+        let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
         let planned = plan(pre, &seed_of(PAPER), NOW).unwrap();
         write_pins(&planned).expect("a plan built from the current bytes writes");
         let after = std::fs::read_to_string(&paths.pins).unwrap();
-        assert!(after.contains(REPLACEMENT), "{after}");
         assert!(
-            !after.contains(HEAD_KEY),
-            "the retired key was not resurrected"
+            after.contains(REPLACEMENT),
+            "the concurrent edit was not reverted: {after}"
         );
     }
 
@@ -2926,8 +2705,7 @@ mod tests {
         let before = std::fs::read_to_string(&paths.pins).unwrap();
         let roster_before = std::fs::read(&paths.roster).unwrap();
 
-        let pre =
-            preflight(Verb::Join, "m11", "incumbent-head", &second).expect("preflight is fine");
+        let pre = preflight(Verb::Join, "m11", &second).expect("preflight is fine");
         let wrong = seed_of(OTHER_PAPER);
         let err = verify_master(&pre, &wrong).unwrap_err();
         assert!(err.contains("is NOT the master committed"), "{err}");
@@ -2961,7 +2739,7 @@ mod tests {
         );
 
         // NEGATIVE CONTROL: the RIGHT paper is accepted on the same inputs.
-        let pre = preflight(Verb::Join, "m11", "incumbent-head", &second).unwrap();
+        let pre = preflight(Verb::Join, "m11", &second).unwrap();
         assert!(verify_master(&pre, &seed_of(PAPER)).is_ok());
     }
 
@@ -2973,11 +2751,11 @@ mod tests {
         let dir = scratch("join-unarmed");
         let paths = paths_in(&dir);
         write_fixture(&paths);
-        let err = preflight(Verb::Join, "m3", "incumbent-head", &paths).unwrap_err();
+        let err = preflight(Verb::Join, "m3", &paths).unwrap_err();
         assert!(err.contains("no paper master is committed"), "{err}");
         assert!(err.contains("setup"), "{err}");
         // Negative control: setup IS allowed here.
-        assert!(preflight(Verb::Setup, "m3", "incumbent-head", &paths).is_ok());
+        assert!(preflight(Verb::Setup, "m3", &paths).is_ok());
     }
 
     /// IDEMPOTENCE AT THE VERB LEVEL: re-arming the SAME master is a no-op rather than a
@@ -3020,7 +2798,7 @@ mod tests {
         let paths = paths_in(&dir);
         write_fixture(&paths);
         run_setup(&paths, "m3").expect("setup");
-        let err = preflight(Verb::Join, "m3", "incumbent-head", &paths).unwrap_err();
+        let err = preflight(Verb::Join, "m3", &paths).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
         assert!(
             err.contains("never overwrite a key the roster still names"),
@@ -3035,39 +2813,8 @@ mod tests {
         let paths = paths_in(&dir);
         write_fixture(&paths);
         std::fs::write(&paths.roster, b"schema = 1\n").unwrap();
-        let err = preflight(Verb::Setup, "m3", "incumbent-head", &paths).unwrap_err();
+        let err = preflight(Verb::Setup, "m3", &paths).unwrap_err();
         assert!(err.contains("roster already exists"), "{err}");
-    }
-
-    /// A FULL KEYSET IS NO LONGER AN OBSTACLE, because provisioning does not need a slot
-    /// in it. This used to refuse at preflight; refusing now would block a machine from
-    /// being minted over a resource it never consumes.
-    ///
-    /// Kills the mutation "put the keyset room check back": a fleet whose rotation window
-    /// happens to be full could not add a publishing machine at all, which is exactly the
-    /// coupling this change removes.
-    #[test]
-    fn a_full_keyset_is_no_longer_an_obstacle_to_provisioning() {
-        let dir = scratch("full-keyset");
-        let paths = paths_in(&dir);
-        let full = PINS_FIXTURE.replace(
-            "    \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n",
-            "    \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n\
-             \x20   \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",\n\
-             \x20   \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\n\
-             \x20   \"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\",\n",
-        );
-        std::fs::write(&paths.pins, &full).unwrap();
-        preflight(Verb::Setup, "m3", "incumbent-head", &paths)
-            .expect("a full rotation window says nothing about minting a machine key");
-        let report = run_setup(&paths, "m3").expect("setup completes over a full keyset");
-        let src = std::fs::read_to_string(&paths.pins).unwrap();
-        assert_eq!(
-            read_anchor(&src, CHANNEL_ANCHOR).unwrap().members.len(),
-            4,
-            "and the keyset is still exactly what was committed"
-        );
-        assert!(!src.contains(report.machine_pubkey.as_str()));
     }
 
     /// A pins file this writer does not recognise stops the run at preflight rather than
@@ -3077,7 +2824,7 @@ mod tests {
         let dir = scratch("bad-pins");
         let paths = paths_in(&dir);
         std::fs::write(&paths.pins, "// nothing resembling an anchor\n").unwrap();
-        let err = preflight(Verb::Setup, "m3", "incumbent-head", &paths).unwrap_err();
+        let err = preflight(Verb::Setup, "m3", &paths).unwrap_err();
         assert!(err.contains("will not guess"), "{err}");
     }
 
@@ -3089,7 +2836,7 @@ mod tests {
         let dir = scratch("verify-write");
         let paths = paths_in(&dir);
         write_fixture(&paths);
-        let pre = preflight(Verb::Setup, "m3", "incumbent-head", &paths).unwrap();
+        let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
         let seed = seed_of(PAPER);
         let planned = plan(pre, &seed, NOW).unwrap();
 
@@ -3103,7 +2850,6 @@ mod tests {
             let pre = preflight(
                 Verb::Setup,
                 "m3-b",
-                "incumbent-head",
                 &Paths {
                     key: dir.join("m3b.key").to_str().unwrap().to_string(),
                     ..paths.clone()
@@ -3126,10 +2872,10 @@ mod tests {
         );
     }
 
-    /// THE CLOSING OUTPUT SAYS THE THREE THINGS IT MUST SAY: what is true, what is not,
-    /// and the next action — including the bridge order and the no-commit rule.
+    /// THE CLOSING OUTPUT SAYS WHAT IS TRUE AND THE NEXT ACTION — including the
+    /// no-commit rule — and nothing about a retired keyset or a strand flag.
     #[test]
-    fn the_report_states_the_bridge_order_and_that_nothing_is_committed() {
+    fn the_report_states_the_next_steps_and_that_nothing_is_committed() {
         let dir = scratch("report");
         let paths = paths_in(&dir);
         write_fixture(&paths);
@@ -3143,35 +2889,23 @@ mod tests {
 
         assert!(text.contains("=== NEXT ==="), "{text}");
         assert!(text.contains("commit — durable from here"), "{text}");
-        // The two halves of the truth, both required: who this machine reaches, and who
-        // it can never reach. A report that printed only one of them would send an
-        // operator either to an unnecessary release or into a wedged fleet.
         assert!(text.contains("the ONLY roster this master signs"), "{text}");
-        assert!(text.contains("no pre-roster client is left"), "{text}");
-        assert!(text.contains("--strand-pre-roster-clients"), "{text}");
         assert!(
-            text.contains("UPDATE_CHANNEL_PUBKEYS unchanged"),
-            "the report must say the keyset was not touched: {text}"
+            text.contains("the master-signed roster authorizes 'm3'"),
+            "the one grant is named: {text}"
         );
-        assert!(text.contains(HEAD_KEY), "the head key is named: {text}");
+        // Negative controls: nothing a retired lane would have printed.
+        assert!(
+            !text.contains("--strand-pre-roster-clients")
+                && !text.contains("UPDATE_CHANNEL_PUBKEYS")
+                && !text.contains("keyset"),
+            "{text}"
+        );
         assert!(text.contains(&report.machine_pubkey), "{text}");
         assert!(text.contains("git diff -- "), "{text}");
         assert!(
             text.contains("the_paper_master_is_unset_so_the_roster_tier_is_inert"),
             "setup must name the tripwires it just broke: {text}"
-        );
-
-        // THE SAFE PATH IS SPELLED OUT IN FULL, not left one refusal short: the cut from
-        // the incumbent must name the profile line it needs, because a declared id that
-        // contradicts the roster refuses the cut — and an operator who finds that out
-        // from the refusal is one step from reaching for --strand-pre-roster-clients.
-        assert!(
-            text.contains("machine_id = \"incumbent-head\""),
-            "the safe path must name the profile line it needs: {text}"
-        );
-        assert!(
-            text.contains("contradicts the roster refuses the cut"),
-            "and say why it is needed, or it reads as boilerplate: {text}"
         );
 
         // THE SECRET IS NOT IN THE OUTPUT. The report is built from public identities
@@ -3188,7 +2922,7 @@ mod tests {
         let dir = scratch("debug-redaction");
         let paths = paths_in(&dir);
         write_fixture(&paths);
-        let pre = preflight(Verb::Setup, "m3", "incumbent-head", &paths).unwrap();
+        let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
         assert_eq!(format!("{pre:?}"), "Preflight(setup, m3)");
         let seed = seed_of(PAPER);
         let planned = plan(pre, &seed, NOW).unwrap();

@@ -37,7 +37,8 @@
 //! # Feature flags
 //!
 //! - `safe-encode` — safe-only encoder path (enabled by default).
-//! - `safe-decode` — safe-only decoder path (enabled by default).
+//! - `safe-decode` — the bounds-checked decoder (enabled by default, and
+//!   required: the upstream raw-pointer decoder is not carried).
 //! - `checked-decode` — extra bounds checks during decompression (enabled by
 //!   default).
 //! - `std` — depend on the standard library (enabled by default); disable
@@ -50,8 +51,8 @@
     all(feature = "safe-encode", feature = "safe-decode"),
     forbid(unsafe_code)
 )]
-// The files under `src/block/`, `src/sink.rs`, `src/fastcpy.rs`, and
-// `src/fastcpy_unsafe.rs` derive from upstream `lz4_flex` 0.11.5. Upstream
+// The files under `src/block/`, `src/sink.rs`, and `src/fastcpy.rs`
+// derive from upstream `lz4_flex` 0.11.5. Upstream
 // does not currently enforce the stricter clippy lints the rest of the aterm
 // workspace enables, so we relax them here at the crate boundary. Any
 // locally-authored code in this crate (see `lib.rs` and `tests/`) is
@@ -133,10 +134,6 @@ pub mod block;
 
 #[allow(dead_code)]
 mod fastcpy;
-
-#[cfg(not(all(feature = "safe-encode", feature = "safe-decode")))]
-#[allow(dead_code)]
-mod fastcpy_unsafe;
 
 #[cfg_attr(
     all(feature = "safe-encode", feature = "safe-decode"),

@@ -9,8 +9,10 @@
 //! blend half of the M2 PROVE bullets on the shipping blend itself:
 //!
 //! * **CONVERGENCE-TO-EXACT** — coverage 255 returns the fg bytes EXACTLY and
-//!   coverage 0 the destination bytes EXACTLY, over the ENTIRE per-channel
-//!   byte domain (256×256 pairs, every channel position). With the envelope's
+//!   coverage 0 the destination bytes EXACTLY. Both are structural early
+//!   returns in `blend_text`, taken before any per-value arithmetic, and
+//!   `tests/text_blending.rs::endpoint_exactness_both_modes` pins them in BOTH
+//!   modes over a colour lattice with dirty high bytes. With the envelope's
 //!   `age >= fade_ms ⇒ alpha == 255` theorem this closes "no permanent tint":
 //!   the steady frame is byte-identical to the no-feature frame.
 //! * **MONOTONICITY** — the blended channel is monotone in coverage
@@ -26,41 +28,6 @@
 //! perceptual coverage remap stays where it lives — the glyph raster seam.
 
 use aterm_render::blend_text;
-
-/// CONVERGENCE endpoints, full byte domain: `t == 255` is exactly the fg and
-/// `t == 0` exactly the destination, for every (bg, fg) byte pair in every
-/// channel position. (Both are structural early returns in `blend_text`; this
-/// pins them against regressions that would route endpoints through the LUTs.)
-#[test]
-fn endpoints_exact_over_full_byte_domain() {
-    for shift in [16u32, 8, 0] {
-        for b in 0u32..=255 {
-            for f in 0u32..=255 {
-                let bg = b << shift;
-                let fg = f << shift;
-                assert_eq!(
-                    blend_text(bg, fg, bg, 255, false),
-                    fg,
-                    "t=255 must be the exact fg (shift {shift}, b={b}, f={f})"
-                );
-                assert_eq!(
-                    blend_text(bg, fg, bg, 0, false),
-                    bg,
-                    "t=0 must be the exact bg (shift {shift}, b={b}, f={f})"
-                );
-            }
-        }
-    }
-    // Full-pixel spot anchors (all three channels at once, distinct values).
-    assert_eq!(
-        blend_text(0x0010_2030, 0x00AA_BBCC, 0x0010_2030, 255, false),
-        0x00AA_BBCC
-    );
-    assert_eq!(
-        blend_text(0x0010_2030, 0x00AA_BBCC, 0x0010_2030, 0, false),
-        0x0010_2030
-    );
-}
 
 /// MONOTONICITY, full per-channel domain: for EVERY (bg, fg) byte pair the
 /// blended red channel is monotone in coverage over all 256 steps — the

@@ -1081,39 +1081,6 @@ fn corpus_skips(root: &std::path::Path, dir: &std::path::Path) -> bool {
         || (dir.parent() == Some(root) && (name.starts_with("target-") || name == ".aterm-verify"))
 }
 
-/// The walk stays out of the gate's sibling build dirs (`target-regex/`,
-/// `target-xtask/`, `target-drivers/`, `target-gate/`) and its `.aterm-verify/`
-/// state dir at the repository root — gigabytes of build output, some of it
-/// JSON — while a `target-*` name deeper in the tree is still walked.
-#[test]
-fn the_corpus_walk_skips_root_lane_dirs_and_verify_state() {
-    let root = std::env::temp_dir().join(format!("aterm-json-corpus-skip-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    for (rel, body) in [
-        ("target-regex/debug/.fingerprint/x.json", "{}"),
-        ("target-gate/lane.json", "{}"),
-        (".aterm-verify/state.json", "{}"),
-        ("target/debug/y.json", "{}"),
-        ("crates/a/b.json", "[]"),
-        ("crates/a/target-input/c.json", "[]"),
-    ] {
-        let path = root.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, body).unwrap();
-    }
-    let found: Vec<String> = json_corpus(&root)
-        .iter()
-        .map(|p| {
-            p.strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
-    std::fs::remove_dir_all(&root).unwrap();
-    assert_eq!(found, ["crates/a/b.json", "crates/a/target-input/c.json"]);
-}
-
 /// THE ONE DOCUMENTED DIVERGENCE, and it is the oracle that gives ground.
 ///
 /// `serde_json` parses floats through a fast path that multiplies a significand

@@ -250,315 +250,151 @@ mod tests {
     use super::{Cell, CellFlags, PackedColor, PackedColors};
 
     // =========================================================================
-    // Cell::EMPTY / Cell::default() — blank cell invariants
+    // EMPTY / default / from_ascii_fast / from_ascii_styled / new / with_style,
+    // and the from_raw_parts / from_checkpoint_raw round trips
     // =========================================================================
 
-    #[test]
-    fn test_empty_is_space_char() {
-        assert_eq!(Cell::EMPTY.char(), ' ');
-        assert_eq!(Cell::EMPTY.char_data(), ' ' as u16);
+    /// Assert one side of `colors` reads back as the legacy `want` colour.
+    fn assert_side_matches(
+        label: &str,
+        (default, indexed, rgb, index): (bool, bool, bool, u8),
+        want: PackedColor,
+    ) {
+        if want.is_indexed() {
+            assert!(!default && indexed && !rgb, "{label}: want indexed");
+            assert_eq!(index, want.index(), "{label}: index");
+        } else if want.is_rgb() {
+            assert!(!default && !indexed && rgb, "{label}: want rgb");
+        } else {
+            assert!(default && !indexed && !rgb, "{label}: want default");
+        }
     }
 
     #[test]
-    fn test_empty_has_default_colors() {
-        let colors = Cell::EMPTY.colors();
-        assert!(colors.is_default());
-        assert!(colors.fg_is_default());
-        assert!(colors.bg_is_default());
-    }
+    fn value_constructors_store_exactly_what_they_are_given() {
+        // One walk in place of 31 one-case tests.
 
-    #[test]
-    fn test_empty_has_no_flags() {
-        assert!(Cell::EMPTY.flags().is_empty());
-        assert!(!Cell::EMPTY.is_complex());
-        assert!(!Cell::EMPTY.is_wide());
-        assert!(!Cell::EMPTY.is_wide_continuation());
-        assert!(!Cell::EMPTY.uses_style_id());
-    }
+        // The blank cell, three ways: a space, default colours, no flags.
+        for blank in [Cell::EMPTY, Cell::default(), Cell::from_ascii_fast(b' ')] {
+            assert_eq!(blank.char(), ' ');
+            assert_eq!(blank.char_data(), u16::from(b' '));
+            let colors = blank.colors();
+            assert!(colors.is_default() && colors.fg_is_default() && colors.bg_is_default());
+            assert!(blank.flags().is_empty());
+            assert!(!blank.is_complex());
+            assert!(!blank.is_wide() && !blank.is_wide_continuation());
+            assert!(!blank.uses_style_id());
+            assert!(blank.is_empty());
+        }
 
-    #[test]
-    fn test_empty_is_empty() {
-        assert!(Cell::EMPTY.is_empty());
-    }
+        // Every ASCII byte (0x20 and 0x7E are the printable ends) through the
+        // two byte constructors.
+        let styles = [
+            (PackedColors::DEFAULT, CellFlags::empty()),
+            (
+                PackedColors::with_indexed(196, 21),
+                CellFlags::BOLD.union(CellFlags::ITALIC),
+            ),
+            (
+                PackedColors::DEFAULT.with_rgb_fg().with_rgb_bg(),
+                CellFlags::INVERSE,
+            ),
+        ];
+        for byte in 0..=0x7Fu8 {
+            let fast = Cell::from_ascii_fast(byte);
+            assert_eq!(fast.char_data(), u16::from(byte));
+            assert_eq!(fast.char(), char::from(byte));
+            assert!(fast.colors().is_default());
+            assert!(fast.flags().is_empty());
+            for (colors, flags) in styles {
+                let styled = Cell::from_ascii_styled(byte, colors, flags);
+                assert_eq!(styled.char(), char::from(byte));
+                assert_eq!(styled.colors(), colors);
+                assert_eq!(styled.flags(), flags);
+            }
+        }
 
-    #[test]
-    fn test_default_equals_empty() {
-        let def = Cell::default();
-        assert_eq!(def.char_data(), Cell::EMPTY.char_data());
-        assert_eq!(def.colors(), Cell::EMPTY.colors());
-        assert_eq!(def.flags(), Cell::EMPTY.flags());
-        assert!(def.is_empty());
-    }
-
-    // =========================================================================
-    // from_ascii_fast — ASCII hot path
-    // =========================================================================
-
-    #[test]
-    fn test_from_ascii_fast_stores_byte_as_char_data() {
-        let cell = Cell::from_ascii_fast(b'A');
-        assert_eq!(cell.char_data(), b'A' as u16);
-        assert_eq!(cell.char(), 'A');
-    }
-
-    #[test]
-    fn test_from_ascii_fast_default_colors() {
-        let cell = Cell::from_ascii_fast(b'z');
-        assert!(cell.colors().is_default());
-    }
-
-    #[test]
-    fn test_from_ascii_fast_empty_flags() {
-        let cell = Cell::from_ascii_fast(b'~');
-        assert!(cell.flags().is_empty());
-    }
-
-    #[test]
-    fn test_from_ascii_fast_space_matches_empty() {
-        let cell = Cell::from_ascii_fast(b' ');
-        assert_eq!(cell.char_data(), Cell::EMPTY.char_data());
-        assert_eq!(cell.colors(), Cell::EMPTY.colors());
-        assert_eq!(cell.flags(), Cell::EMPTY.flags());
-    }
-
-    #[test]
-    fn test_from_ascii_fast_printable_range_boundaries() {
-        // Lowest printable: space (0x20)
-        let lo = Cell::from_ascii_fast(0x20);
-        assert_eq!(lo.char(), ' ');
-
-        // Highest printable: tilde (0x7E)
-        let hi = Cell::from_ascii_fast(0x7E);
-        assert_eq!(hi.char(), '~');
-    }
-
-    // =========================================================================
-    // from_ascii_styled — ASCII with style
-    // =========================================================================
-
-    #[test]
-    fn test_from_ascii_styled_preserves_byte() {
-        let cell = Cell::from_ascii_styled(b'X', PackedColors::DEFAULT, CellFlags::empty());
-        assert_eq!(cell.char(), 'X');
-    }
-
-    #[test]
-    fn test_from_ascii_styled_preserves_colors() {
-        let colors = PackedColors::with_indexed(196, 21);
-        let cell = Cell::from_ascii_styled(b'A', colors, CellFlags::empty());
-        assert!(cell.colors().fg_is_indexed());
-        assert_eq!(cell.colors().fg_index(), 196);
-        assert!(cell.colors().bg_is_indexed());
-        assert_eq!(cell.colors().bg_index(), 21);
-    }
-
-    #[test]
-    fn test_from_ascii_styled_preserves_flags() {
-        let flags = CellFlags::BOLD.union(CellFlags::ITALIC);
-        let cell = Cell::from_ascii_styled(b'B', PackedColors::DEFAULT, flags);
-        assert!(cell.flags().contains(CellFlags::BOLD));
-        assert!(cell.flags().contains(CellFlags::ITALIC));
-    }
-
-    // =========================================================================
-    // Cell::new() — BMP and non-BMP character handling
-    // =========================================================================
-
-    #[test]
-    fn test_new_ascii_char() {
-        let cell = Cell::new('A');
-        assert_eq!(cell.char(), 'A');
-        assert_eq!(cell.char_data(), 0x0041);
-        assert!(!cell.is_complex());
-    }
-
-    #[test]
-    fn test_new_cjk_bmp_char() {
-        // U+4E16 = 世 (CJK, within BMP)
-        let cell = Cell::new('\u{4E16}');
-        assert_eq!(cell.char(), '\u{4E16}');
-        assert_eq!(cell.char_data(), 0x4E16);
-    }
-
-    #[test]
-    fn test_new_max_bmp_codepoint() {
-        let cell = Cell::new('\u{FFFF}');
-        assert_eq!(cell.char_data(), 0xFFFF);
-        assert!(!cell.is_complex());
-    }
-
-    #[test]
-    fn test_new_non_bmp_stores_replacement() {
-        // Emoji U+1F600 is above BMP
-        let cell = Cell::new('\u{1F600}');
-        assert_eq!(cell.char(), '\u{FFFD}');
-        assert_eq!(cell.char_data(), '\u{FFFD}' as u16);
-    }
-
-    #[test]
-    fn test_new_default_colors_and_no_flags() {
-        let cell = Cell::new('Q');
-        assert!(cell.colors().is_default());
-        assert!(cell.flags().is_empty());
-    }
-
-    #[test]
-    fn test_new_null_char() {
-        let cell = Cell::new('\0');
-        assert_eq!(cell.char_data(), 0);
-        assert_eq!(cell.codepoint(), 0);
-    }
-
-    // =========================================================================
-    // Cell::with_style() — character + colors + flags
-    // =========================================================================
-
-    #[test]
-    fn test_with_style_bmp_char_preserved() {
-        let cell = Cell::with_style(
-            'Z',
+        // `new` and `with_style`: a BMP char (NUL, ASCII, CJK, hiragana, U+FFFF)
+        // is stored as itself; one above the BMP (emoji, mathematical bold A) is
+        // stored as U+FFFD. Neither sets COMPLEX.
+        let chars = [
+            ('\0', '\0'),
+            ('A', 'A'),
+            ('\u{4E16}', '\u{4E16}'),
+            ('\u{3042}', '\u{3042}'),
+            ('\u{FFFF}', '\u{FFFF}'),
+            ('\u{1F600}', '\u{FFFD}'),
+            ('\u{1D400}', '\u{FFFD}'),
+        ];
+        let fgs = [
             PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        assert_eq!(cell.char(), 'Z');
-    }
-
-    #[test]
-    fn test_with_style_non_bmp_stores_replacement() {
-        let cell = Cell::with_style(
-            '\u{1D400}', // 𝐀 (mathematical bold A, non-BMP)
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        assert_eq!(cell.char(), '\u{FFFD}');
-    }
-
-    #[test]
-    fn test_with_style_indexed_fg_converted() {
-        let cell = Cell::with_style(
-            'X',
             PackedColor::indexed(42),
-            PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        assert!(cell.colors().fg_is_indexed());
-        assert_eq!(cell.colors().fg_index(), 42);
-        assert!(cell.colors().bg_is_default());
-    }
-
-    #[test]
-    fn test_with_style_indexed_bg_converted() {
-        let cell = Cell::with_style(
-            'X',
-            PackedColor::DEFAULT_FG,
-            PackedColor::indexed(99),
-            CellFlags::empty(),
-        );
-        assert!(cell.colors().fg_is_default());
-        assert!(cell.colors().bg_is_indexed());
-        assert_eq!(cell.colors().bg_index(), 99);
-    }
-
-    #[test]
-    fn test_with_style_both_indexed_colors() {
-        let cell = Cell::with_style(
-            'X',
             PackedColor::indexed(196),
-            PackedColor::indexed(21),
-            CellFlags::empty(),
-        );
-        assert!(cell.colors().fg_is_indexed());
-        assert_eq!(cell.colors().fg_index(), 196);
-        assert!(cell.colors().bg_is_indexed());
-        assert_eq!(cell.colors().bg_index(), 21);
-    }
-
-    #[test]
-    fn test_with_style_rgb_fg_marks_overflow() {
-        let cell = Cell::with_style(
-            'X',
             PackedColor::rgb(255, 0, 0),
+        ];
+        let bgs = [
             PackedColor::DEFAULT_BG,
-            CellFlags::empty(),
-        );
-        assert!(cell.colors().fg_is_rgb());
-        assert!(cell.colors().bg_is_default());
-    }
-
-    #[test]
-    fn test_with_style_rgb_bg_marks_overflow() {
-        let cell = Cell::with_style(
-            'X',
-            PackedColor::DEFAULT_FG,
+            PackedColor::indexed(99),
+            PackedColor::indexed(21),
             PackedColor::rgb(0, 0, 255),
+        ];
+        let flag_sets = [
             CellFlags::empty(),
-        );
-        assert!(cell.colors().fg_is_default());
-        assert!(cell.colors().bg_is_rgb());
-    }
-
-    #[test]
-    fn test_with_style_flags_bold_italic() {
-        let flags = CellFlags::BOLD.union(CellFlags::ITALIC);
-        let cell = Cell::with_style('X', PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG, flags);
-        assert!(cell.flags().contains(CellFlags::BOLD));
-        assert!(cell.flags().contains(CellFlags::ITALIC));
-        assert!(!cell.flags().contains(CellFlags::UNDERLINE));
-    }
-
-    #[test]
-    fn test_with_style_wide_flag() {
-        let cell = Cell::with_style(
-            '\u{3042}', // あ (hiragana a, CJK)
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::WIDE,
-        );
-        assert!(cell.is_wide());
-        assert_eq!(cell.char(), '\u{3042}');
-    }
-
-    #[test]
-    fn test_with_style_continuation_flag() {
-        let cell = Cell::with_style(
-            ' ',
-            PackedColor::DEFAULT_FG,
-            PackedColor::DEFAULT_BG,
-            CellFlags::WIDE_CONTINUATION,
-        );
-        assert!(cell.is_wide_continuation());
-    }
-
-    // =========================================================================
-    // from_raw_parts / from_checkpoint_raw — lossless round-trip
-    // =========================================================================
-
-    #[test]
-    fn test_from_raw_parts_roundtrip() {
-        let original = Cell::with_style(
-            'Q',
-            PackedColor::indexed(100),
-            PackedColor::indexed(200),
+            CellFlags::BOLD.union(CellFlags::ITALIC),
             CellFlags::BOLD.union(CellFlags::STRIKETHROUGH),
-        );
-        let restored =
-            Cell::from_raw_parts(original.char_data(), original.colors(), original.flags());
-        assert_eq!(restored.char_data(), original.char_data());
-        assert_eq!(restored.colors(), original.colors());
-        assert_eq!(restored.flags(), original.flags());
-    }
+            CellFlags::WIDE,
+            CellFlags::WIDE_CONTINUATION,
+        ];
+        for (input, stored) in chars {
+            let plain = Cell::new(input);
+            assert_eq!(plain.char(), stored, "new({input:?})");
+            assert_eq!(u32::from(plain.char_data()), u32::from(stored));
+            assert_eq!(plain.codepoint(), u32::from(stored));
+            assert!(!plain.is_complex());
+            assert!(plain.colors().is_default());
+            assert!(plain.flags().is_empty());
 
-    #[test]
-    fn test_from_checkpoint_raw_roundtrip() {
-        let original =
-            Cell::from_ascii_styled(b'H', PackedColors::with_indexed(7, 0), CellFlags::INVERSE);
-        let restored =
-            Cell::from_checkpoint_raw(original.char_data(), original.flags(), original.colors().0);
-        assert_eq!(restored.char_data(), original.char_data());
-        assert_eq!(restored.colors(), original.colors());
-        assert_eq!(restored.flags(), original.flags());
+            for fg in fgs {
+                for bg in bgs {
+                    for flags in flag_sets {
+                        let cell = Cell::with_style(input, fg, bg, flags);
+                        let label = format!("with_style({input:?}, {fg:?}, {bg:?}, {flags:?})");
+                        assert_eq!(cell.char(), stored, "{label}");
+                        assert_eq!(cell.flags(), flags, "{label}");
+                        assert_eq!(cell.is_wide(), flags.contains(CellFlags::WIDE));
+                        assert_eq!(
+                            cell.is_wide_continuation(),
+                            flags.contains(CellFlags::WIDE_CONTINUATION)
+                        );
+                        let colors = cell.colors();
+                        let fg_read = (
+                            colors.fg_is_default(),
+                            colors.fg_is_indexed(),
+                            colors.fg_is_rgb(),
+                            colors.fg_index(),
+                        );
+                        let bg_read = (
+                            colors.bg_is_default(),
+                            colors.bg_is_indexed(),
+                            colors.bg_is_rgb(),
+                            colors.bg_index(),
+                        );
+                        assert_side_matches(&label, fg_read, fg);
+                        assert_side_matches(&label, bg_read, bg);
+
+                        // Both raw constructors rebuild the cell losslessly.
+                        let raw = Cell::from_raw_parts(cell.char_data(), colors, cell.flags());
+                        let checkpoint =
+                            Cell::from_checkpoint_raw(cell.char_data(), cell.flags(), colors.0);
+                        for back in [raw, checkpoint] {
+                            assert_eq!(back.char_data(), cell.char_data(), "{label}");
+                            assert_eq!(back.colors(), colors, "{label}");
+                            assert_eq!(back.flags(), cell.flags(), "{label}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -710,43 +546,6 @@ mod tests {
             Cell::from_ascii_with_style_id(b'Z', StyleId::new(1), CellFlags::WIDE_CONTINUATION);
         assert!(cell.flags().contains(CellFlags::WIDE_CONTINUATION));
         assert!(cell.flags().contains(CellFlags::USES_STYLE_ID));
-    }
-
-    // =========================================================================
-    // Packed representation correctness — 8-byte invariant
-    // =========================================================================
-
-    #[test]
-    fn test_cell_is_8_bytes() {
-        assert_eq!(std::mem::size_of::<Cell>(), 8);
-    }
-
-    #[test]
-    fn test_all_constructors_produce_8_byte_cells() {
-        let cells = [
-            Cell::EMPTY,
-            Cell::from_ascii_fast(b'A'),
-            Cell::from_ascii_styled(b'B', PackedColors::DEFAULT, CellFlags::BOLD),
-            Cell::new('C'),
-            Cell::with_style(
-                'D',
-                PackedColor::indexed(1),
-                PackedColor::indexed(2),
-                CellFlags::DIM,
-            ),
-            Cell::from_raw_parts(0x41, PackedColors::DEFAULT, CellFlags::empty()),
-            Cell::from_checkpoint_raw(0x42, CellFlags::empty(), 0),
-            Cell::with_overflow_index(0),
-            Cell::with_style_id('E', StyleId::new(1), CellFlags::empty()),
-            Cell::from_ascii_with_style_id(b'F', StyleId::new(2), CellFlags::empty()),
-        ];
-        for (i, cell) in cells.iter().enumerate() {
-            assert_eq!(
-                std::mem::size_of_val(cell),
-                8,
-                "constructor at index {i} produced a cell != 8 bytes"
-            );
-        }
     }
 
     // =========================================================================

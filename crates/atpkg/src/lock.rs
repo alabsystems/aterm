@@ -448,6 +448,35 @@ fn prefix_is_a_real_dir(prefix: &Path) -> bool {
         .is_ok_and(|md| md.file_type().is_dir() && !crate::platform::is_reparse(&md))
 }
 
+/// Whether the existing store writer lock is available, for a parked GUI lane
+/// that already timed out waiting for another writer. This is only a hint: the
+/// caller still starts an ordinary `--wait-lock` child and rechecks the durable
+/// pass stamps before doing so. A missing, linked, inaccessible, or otherwise
+/// unsafe lock path fails closed to the lane's existing park deadline.
+///
+/// This probe opens the existing regular file read-only and takes only a
+/// nonblocking SHARED lock. It does not create the file, harden the prefix,
+/// write metadata, or briefly take the writer's exclusive lock. A live writer's
+/// exclusive flock refuses it; after that writer drops, the probe releases its
+/// shared lock before returning. A competing writer can still win the race
+/// after this observation, so the child's normal lock wait remains essential.
+#[must_use]
+pub fn store_writer_released(layout: &Layout) -> bool {
+    if !prefix_is_a_real_dir(&layout.prefix) {
+        return false;
+    }
+    let Ok(file) = crate::metadata_io::open_regular(&layout.store_lock()) else {
+        return false;
+    };
+    if file.try_lock_shared().is_err() {
+        return false;
+    }
+    // An explicit unlock matters when a thread briefly clones a descriptor;
+    // merely closing one handle need not release the advisory lock at once.
+    let _ = file.unlock();
+    prefix_is_a_real_dir(&layout.prefix)
+}
+
 /// The open-and-`try_lock` half of [`try_lock_store`], over a prefix that has already
 /// been vetted: creates the lock file `0600` if it is missing and takes the flock
 /// without blocking. What a [`lock_store_waiting`] poll repeats — a re-open by path
@@ -497,6 +526,81 @@ mod tests {
         let p = std::env::temp_dir().join(format!("atpkg-lock-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         Layout { prefix: p }
+    }
+
+    /// The contention wake's poll never writes or claims the writer lock. A
+    /// missing file stays missing; a held writer remains held; after release the
+    /// shared check answers promptly and leaves an exclusive try available.
+    #[test]
+    fn release_probe_is_read_only_and_never_claims_the_writer_lock() {
+        let layout = temp_layout("release-probe");
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        let before_missing = std::fs::metadata(&layout.prefix)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            !store_writer_released(&layout),
+            "missing is not a release signal"
+        );
+        assert!(
+            !layout.store_lock().exists(),
+            "probe did not create the lock"
+        );
+        assert_eq!(
+            std::fs::metadata(&layout.prefix)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before_missing,
+            "probe did not change the prefix"
+        );
+
+        let holder = try_lock_store(&layout).unwrap();
+        let lock_modified = std::fs::metadata(layout.store_lock())
+            .unwrap()
+            .modified()
+            .unwrap();
+        let prefix_modified = std::fs::metadata(&layout.prefix)
+            .unwrap()
+            .modified()
+            .unwrap();
+        for _ in 0..3 {
+            assert!(!store_writer_released(&layout), "the writer still holds it");
+        }
+        assert_eq!(
+            std::fs::metadata(layout.store_lock())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            lock_modified,
+            "held polls did not write the lock"
+        );
+        assert_eq!(
+            std::fs::metadata(&layout.prefix)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            prefix_modified,
+            "held polls did not write the prefix"
+        );
+        drop(holder);
+        assert!(store_writer_released(&layout), "writer dropped");
+        let next = try_lock_store(&layout).expect("the probe left no writer claim");
+        drop(next);
+        #[cfg(unix)]
+        {
+            let target = layout.prefix.join("decoy");
+            std::fs::write(&target, b"do not follow").unwrap();
+            std::fs::remove_file(layout.store_lock()).unwrap();
+            std::os::unix::fs::symlink(&target, layout.store_lock()).unwrap();
+            assert!(
+                !store_writer_released(&layout),
+                "a linked lock path is not evidence that the writer released"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), b"do not follow");
+        }
+        let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
     /// THE HOLDER RECORD (Phase 3): a lock announces who holds it, a person's typed verb

@@ -37,9 +37,9 @@ use crate::tla_check::TlaSpec;
 
 /// A source→spec refinement binding, emitted by `#[refines(machine, action, …)]`.
 ///
-/// This is the `inventory`-collectable anchor record. The struct mirrors
-/// [`crate::coverage::RefinementEntry`] but uses `&'static str` so it can live in a
-/// `const` submitted at link time (the macro span-captures `file!()`/`line!()`).
+/// This is the `inventory`-collectable anchor record. Its fields are `&'static str`
+/// so it can live in a `const` submitted at link time (the macro span-captures
+/// `file!()`/`line!()`).
 #[derive(Debug, Clone, Copy)]
 pub struct RefinementAnchor {
     /// The TLA+ machine name (e.g. `"terminal_modes"`) — matches a `Model::name`
@@ -1037,6 +1037,7 @@ pub fn model_registry() -> Vec<Model> {
         atpkg_index_successor_selection_model(),
         atpkg_index_wake_highwater_model(),
         atpkg_index_pending_park_model(),
+        atpkg_contention_release_park_model(),
         atpkg_vendor_pending_check_model(),
         // The machine-wide full-pass rule: atpkg's pass writing `status.toml`'s
         // stamps, the window's gate and the session lane reading them. Tier-1 bound
@@ -1044,12 +1045,16 @@ pub fn model_registry() -> Vec<Model> {
         atpkg_full_pass_rule_model(),
         atpkg_published_spacing_model(),
         harness_capture_worker_lifecycle_model(),
+        // The package pass record: the atpkg pass as the WRITER of `status.toml`'s stamps
+        // and the schedulers that read them. Tier-1 drives the real pass and the real
+        // `pkg_check` readers over a real record (atpkg `cli` tests).
+        atpkg_pass_stamps_model(),
+        // The index channel's writer/reader pair: tools/atpkg-index.sh's number and
+        // compare-and-swap decisions and the client's tag walk. Tier-1 in atpkg
+        // (src/net/index_publish_conformance.rs); no `#[refines]` anchors.
+        atpkg_index_publish_walk_model(),
         harness_upgrade_startup_cadence_model(),
         harness_upgrade_notice_owner_model(),
-        // The store's tag record against the tag it explains: written only when an
-        // install's heal failed, cleared by the store heal, never read by doctor.
-        // Tier-1 bound to the real writer, heal and doctor in `atpkg::install`'s tests.
-        atpkg_tag_record_model(),
         // A pending stub waiting for its program against the pass installing it: it reads
         // whether the pass runs before whether the shim resolves. Tier-1 bound to the real
         // decision (`pending_wait_step`) in `atpkg::cli`'s tests.
@@ -1165,8 +1170,7 @@ pub fn model_registry() -> Vec<Model> {
         native_updater_model(),
         // Release/updater channel state machines. The release-floor resolver and
         // journal/guard Tier-1 live in aterm-release; the archive model is the
-        // metadata-only single-head lifecycle; the updater scan binding lives in
-        // aterm-update::github.
+        // metadata-only single-head lifecycle.
         release_durable_post_intent_model(),
         roster_pair_redo_model(),
         release_channel_floor_model(),
@@ -1177,7 +1181,15 @@ pub fn model_registry() -> Vec<Model> {
         release_published_identity_model(),
         release_yank_successor_first_model(),
         release_channel_single_head_model(),
-        native_update_channel_scan_model(),
+        // Who holds the public channel's `latest`: the engine's prerelease source
+        // release and the cut's one guarded head PATCH. Tier-1 in aterm-release
+        // (tests/channel_latest.rs) over a fake GitHub; no `#[refines]` anchors.
+        release_channel_head_model(),
+        // The release claim's writer/reader contract (owner ruling R2): the release
+        // commit carries only the published code, main keeps every peer commit and
+        // ledger line, builds strictly increase, and a claimed-unpublished version is
+        // never read as fresh. Tier-1 lives in aterm-release's claim_landing_model.rs.
+        release_claim_landing_model(),
         native_update_admission_model(),
         native_update_auto_intent_model(),
         native_update_apply_ladder_model(),

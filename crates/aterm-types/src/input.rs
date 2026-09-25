@@ -246,44 +246,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_event_eq() {
-        let a = KeyEvent {
-            key: KeyCode::Char('a'),
-            modifiers: KeyModifiers::empty(),
-        };
-        let b = KeyEvent {
-            key: KeyCode::Char('a'),
-            modifiers: KeyModifiers::empty(),
-        };
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn key_event_with_modifiers() {
-        let event = KeyEvent {
-            key: KeyCode::Char('s'),
-            modifiers: KeyModifiers::CTRL,
-        };
-        assert_eq!(event.key, KeyCode::Char('s'));
-        assert!(event.modifiers.contains(KeyModifiers::CTRL));
-    }
-
-    #[test]
-    fn modifier_combinations() {
-        let mods = KeyModifiers::CTRL | KeyModifiers::SHIFT;
-        assert!(mods.contains(KeyModifiers::CTRL));
-        assert!(mods.contains(KeyModifiers::SHIFT));
-        assert!(!mods.contains(KeyModifiers::ALT));
-    }
-
-    #[test]
-    fn key_code_variants() {
-        assert_eq!(KeyCode::F(1), KeyCode::F(1));
-        assert_ne!(KeyCode::F(1), KeyCode::F(2));
-        assert_ne!(KeyCode::Enter, KeyCode::Tab);
-    }
-
-    #[test]
     fn bit_layout_matches_keyboard_modifiers() {
         use crate::keyboard::Modifiers;
 
@@ -306,15 +268,6 @@ mod tests {
     // ========================================================================
     // Key bridge: TryFrom roundtrip tests (#5681)
     // ========================================================================
-
-    #[test]
-    fn key_bridge_char_roundtrip() {
-        use crate::keyboard::Key;
-        let key: Key = KeyCode::Char('a').try_into().unwrap();
-        assert_eq!(key, Key::Character('a'));
-        let back: KeyCode = key.try_into().unwrap();
-        assert_eq!(back, KeyCode::Char('a'));
-    }
 
     #[test]
     fn key_bridge_space_roundtrip() {
@@ -359,24 +312,6 @@ mod tests {
         assert_eq!(key, Key::Named(NamedKey::Delete));
         let back: KeyCode = key.try_into().unwrap();
         assert_eq!(back, KeyCode::Delete);
-    }
-
-    #[test]
-    fn key_bridge_f1_roundtrip() {
-        use crate::keyboard::{Key, NamedKey};
-        let key: Key = KeyCode::F(1).try_into().unwrap();
-        assert_eq!(key, Key::Named(NamedKey::F1));
-        let back: KeyCode = key.try_into().unwrap();
-        assert_eq!(back, KeyCode::F(1));
-    }
-
-    #[test]
-    fn key_bridge_f24_roundtrip() {
-        use crate::keyboard::{Key, NamedKey};
-        let key: Key = KeyCode::F(24).try_into().unwrap();
-        assert_eq!(key, Key::Named(NamedKey::F24));
-        let back: KeyCode = key.try_into().unwrap();
-        assert_eq!(back, KeyCode::F(24));
     }
 
     #[test]

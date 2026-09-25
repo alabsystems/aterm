@@ -204,7 +204,7 @@ fn a_last_walk_that_never_ends_is_an_error_rather_than_a_short_roster() {
     let (stdout, stderr, ok) = ls("bnd", vec![Page::empty("/f/f1/pub/n-a/s-1/presence")], &[]);
     assert!(!ok, "an unfinished walk must not exit 0: {stdout:?}");
     assert!(
-        stderr.contains("did not finish"),
+        stderr.contains("did not end within"),
         "the failure must name itself: {stderr:?}"
     );
 }
@@ -250,7 +250,9 @@ fn the_stub_broker_really_speaks_the_last_verb() {
         Some(Request::Last { filter, after, max }) => {
             assert_eq!(filter, "/f/f1/pub/*/*/presence");
             assert_eq!(after, "", "the first page starts at the beginning");
-            assert_eq!(max, aterm_link::transport::LAST_PAGE_ROWS);
+            // Every row still owed: the broker clamps the page to its own bound,
+            // and the walk (astream's `Client::last_walk`) pages on the cursor.
+            assert_eq!(max, u32::MAX);
         }
         other => panic!("ls must open with a Last: {other:?}"),
     }

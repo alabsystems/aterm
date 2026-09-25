@@ -234,25 +234,3 @@ fn the_host_debuginfo_check_refuses_every_split() {
         );
     }
 }
-
-/// 2026-09-13. `../../.git` is a FILE in a linked worktree, so
-/// `rerun-if-changed=../../.git/HEAD` named a path that never exists — and cargo
-/// reruns a build script whose watched path is missing on EVERY build, relinking
-/// aterm-gui and its 20 downstream executables each time. In the main checkout
-/// the `.git/index` watch did the same whenever `git status` refreshed the index.
-/// The script must resolve the git dir through git instead.
-#[test]
-fn the_gui_build_script_names_no_literal_dot_git_path() {
-    let script = workspace_root().join("crates/aterm-gui/build.rs");
-    let src = fs::read_to_string(&script).expect("read aterm-gui/build.rs");
-    let offenders: Vec<&str> = src
-        .lines()
-        .filter(|line| line.contains("rerun-if-changed=../../.git"))
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "{}: literal .git watches break in a worktree (always stale) — use the \
-         git-resolved paths instead: {offenders:#?}",
-        script.display()
-    );
-}

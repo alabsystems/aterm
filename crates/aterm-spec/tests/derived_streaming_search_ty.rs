@@ -18,13 +18,15 @@
 //!      the generated TLA+ wherever installed.
 //!   2. **Wrap = 0 variant**: the same proof with wraparound navigation disabled
 //!      (Next/Prev clamp at the boundary instead of cycling).
-//!   3. **Registry lock**: the machine is enrolled in `model_registry()` so the
-//!      global strict-vacuity audit, verifier ledger, and trust-ir spec-link all
-//!      see it (the aterm-gui `spec_xref_closure` gate's seam).
-//!   4. **Action-set pin** (anti-drift, the fd_lifecycle precedent).
-//!   5. **Executable-twin spot-walks**: `m.fire` sequences reproducing the
+//!   3. **Executable-twin spot-walks**: `m.fire` sequences reproducing the
 //!      engine's documented lifecycle (scan/auto-complete, capacity, navigation
-//!      wrap + clamp, invalidation to NoResults, revival via Add, cancel).
+//!      wrap + clamp, invalidation to NoResults, revival via Add, cancel). The
+//!      walk fires every one of the nine actions, so an action deleted from the
+//!      model fails it; an added one has no resolving anchor in `operations.rs`
+//!      and fails aterm-gui's `spec_xref_closure`.
+//!
+//! Registry enrolment is not re-pinned here: `non_vacuity_ratchet.rs` names this
+//! model, so dropping it from `xref::model_registry()` fails there.
 //!
 //! Tier-1 (lockstep against the REAL engine) lives in
 //! `aterm-search/tests/conformance_streaming.rs`; the compile-time gate in
@@ -79,48 +81,6 @@ fn derived_streaming_search_holds_with_wrap_disabled() {
          (interpreter proved it above)\n{combined}"
     );
     eprintln!("StreamingSearch (Wrap=0): additionally model-checked clean by ty.");
-}
-
-/// The machine must participate in the repository-wide spec-link and
-/// strict-vacuity closure, not only its direct Tier-0/Tier-1 tests. Regression
-/// lock for the registry seam consumed by aterm-gui's closure gate.
-#[test]
-fn streaming_search_is_registered_for_global_verification() {
-    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
-        .into_iter()
-        .map(|model| model.name)
-        .collect();
-    assert!(
-        registered.contains("StreamingSearch"),
-        "StreamingSearch must resolve through the global spec↔source registry"
-    );
-}
-
-/// Anti-drift defense-in-depth (the fd_lifecycle precedent): pin the exact
-/// modeled action set. The closure gate catches an added/renamed action (no
-/// resolving anchor), but a behavior deleted from BOTH the model and its anchors
-/// leaves nothing uncovered — this pin reddens on that case.
-#[test]
-fn derived_streaming_search_action_set_is_pinned() {
-    let m = streaming_search_model();
-    let mut names: Vec<&str> = m.actions.iter().map(|a| a.name).collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "Add",
-            "Cancel",
-            "Invalidate",
-            "NextMatch",
-            "PrevMatch",
-            "Reflow",
-            "ScanHit",
-            "ScanMiss",
-            "Start"
-        ],
-        "StreamingSearch action set drifted — update the operations.rs \
-         #[refines] anchors AND this pin together"
-    );
 }
 
 /// Executable-twin spot-walks: drive the SAME model through the engine's

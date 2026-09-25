@@ -330,7 +330,7 @@ pub(crate) struct BandColors {
     /// pairing for `COLOR_HIGHLIGHT` (the message band's full-row meter, ruling
     /// 55). Theme-derived it is [`Self::bar_bg`] — the resting Primary's ink on
     /// the accent — but the band floors each word's own ink against the fill
-    /// instead (`message_band::Surface::ink`), so this is read under High
+    /// instead (`message_band::Ground::ink`), so this is read under High
     /// Contrast only.
     pub on_accent: [u8; 3],
 }

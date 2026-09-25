@@ -540,87 +540,29 @@ mod tests {
     // CJK EXTENSION G/H/I TESTS (SIP/TIP, #7775)
     // =========================================================================
 
-    /// Test CJK Unified Ideographs Extension G (U+30000-U+3134A)
-    /// These are on the Tertiary Ideographic Plane, beyond the table range,
-    /// handled by the code fallback in char_width/char_width_cjk.
+    /// CJK Unified Ideographs Extensions G (U+30000-U+3134A) and H
+    /// (U+31350-U+323AF) sit on the Tertiary Ideographic Plane, beyond the
+    /// table range, and are handled by the code fallback in
+    /// char_width/char_width_cjk; Extension I (U+2EBF0-U+2F7FF) is on the
+    /// Supplementary Ideographic Plane, within the table range. Each range is
+    /// wide at its first, a middle and its last code point, and the code point
+    /// just past Extension H is narrow again.
     #[test]
-    fn wide_cjk_extension_g() {
-        // First codepoint in Extension G
-        assert_eq!(
-            grapheme_display_width("\u{30000}"),
-            2,
-            "U+30000 start of Extension G should be wide"
-        );
-        // Middle of Extension G
-        assert_eq!(
-            grapheme_display_width("\u{30A00}"),
-            2,
-            "U+30A00 middle of Extension G should be wide"
-        );
-        // Last codepoint in Extension G
-        assert_eq!(
-            grapheme_display_width("\u{3134A}"),
-            2,
-            "U+3134A end of Extension G should be wide"
-        );
-    }
-
-    /// Test CJK Unified Ideographs Extension H (U+31350-U+323AF)
-    #[test]
-    fn wide_cjk_extension_h() {
-        // First codepoint in Extension H
-        assert_eq!(
-            grapheme_display_width("\u{31350}"),
-            2,
-            "U+31350 start of Extension H should be wide"
-        );
-        // Middle of Extension H
-        assert_eq!(
-            grapheme_display_width("\u{31A00}"),
-            2,
-            "U+31A00 middle of Extension H should be wide"
-        );
-        // Last codepoint in Extension H
-        assert_eq!(
-            grapheme_display_width("\u{323AF}"),
-            2,
-            "U+323AF end of Extension H should be wide"
-        );
-    }
-
-    /// Test CJK Unified Ideographs Extension I (U+2EBF0-U+2F7FF)
-    /// These are on the Supplementary Ideographic Plane, within the table range.
-    #[test]
-    fn wide_cjk_extension_i() {
-        // First codepoint in Extension I
-        assert_eq!(
-            grapheme_display_width("\u{2EBF0}"),
-            2,
-            "U+2EBF0 start of Extension I should be wide"
-        );
-        // Middle of Extension I
-        assert_eq!(
-            grapheme_display_width("\u{2F000}"),
-            2,
-            "U+2F000 middle of Extension I should be wide"
-        );
-        // Last codepoint in Extension I
-        assert_eq!(
-            grapheme_display_width("\u{2F7FF}"),
-            2,
-            "U+2F7FF end of Extension I should be wide"
-        );
-    }
-
-    /// Test that codepoints just beyond Extension H are NOT wide
-    #[test]
-    fn beyond_extension_h_narrow() {
-        // U+323B0 is just after Extension H ends at U+323AF
-        assert_eq!(
-            grapheme_display_width("\u{323B0}"),
-            1,
-            "U+323B0 beyond Extension H should be narrow"
-        );
+    fn cjk_extension_g_h_i_widths() {
+        for (what, grapheme, width) in [
+            ("start of Extension G", "\u{30000}", 2),
+            ("middle of Extension G", "\u{30A00}", 2),
+            ("end of Extension G", "\u{3134A}", 2),
+            ("start of Extension H", "\u{31350}", 2),
+            ("middle of Extension H", "\u{31A00}", 2),
+            ("end of Extension H", "\u{323AF}", 2),
+            ("start of Extension I", "\u{2EBF0}", 2),
+            ("middle of Extension I", "\u{2F000}", 2),
+            ("end of Extension I", "\u{2F7FF}", 2),
+            ("U+323B0, just beyond Extension H", "\u{323B0}", 1),
+        ] {
+            assert_eq!(grapheme_display_width(grapheme), width, "{what}");
+        }
     }
 
     /// Test grapheme_width aggregate for Extension G/H/I characters

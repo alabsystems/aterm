@@ -33,19 +33,19 @@
 //!   one-cell gap and hides it until the band drains). Measured on
 //!   `e05d7860e`: 130 frames with an interior dark run and 156 frames with a
 //!   gap in the live cells; here, none of either.
-//! * **THE COST** of [`Witness::walk`] and of the wake per call, and of the
-//!   whole seam frame, printed by a release-only twin — the before / after
-//!   against `e05d7860e` is the review's; the twin pins only that no single
-//!   call eats §18's 400 µs frame budget.
+//!
+//! The release-only COST twin (the walk, the wake and the whole seam frame per
+//! call against §18's 400 µs budget) was an `#[ignore]`d report nothing ran;
+//! it was retired 2026-09-24 and its source is at `e8a8c80ab`.
 
 use std::time::{Duration, Instant};
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::rainbow_kitty::ribbon::{Cell, Layer, Ribbon};
-use aterm_effects::rainbow_kitty::witness::{RowSample, WITNESS_ROWS, Witness};
-use aterm_effects::rainbow_kitty::{Config, Ctx, Dir, Event, Flow, Licence, TypedClass};
+use aterm_effects::rainbow_kitty::TypedClass;
+use aterm_effects::rainbow_kitty::ribbon::Ribbon;
+use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 
 // ===========================================================================
 // Shared
@@ -741,10 +741,7 @@ struct Composer {
     caret: usize,
     spin_i: usize,
     label: String,
-    timing: bool,
     frames: usize,
-    /// Per-frame cost of the glow calls alone, µs.
-    frame_us: Vec<u64>,
     /// `(ms, row, label, lit map, holes)` per frame with an interior dark
     /// run in the PLAN.
     holes: Vec<RowHoleFrame>,
@@ -777,9 +774,7 @@ impl Composer {
             caret: 0,
             spin_i: 0,
             label: "start".into(),
-            timing: false,
             frames: 0,
-            frame_us: Vec::new(),
             holes: Vec::new(),
             gaps: Vec::new(),
             rows_lit_max: 0,
@@ -802,13 +797,12 @@ impl Composer {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// LOCK A and the tick, timed; then the census, outside the timer.
+    /// LOCK A and the tick; then the census.
     fn frame(&mut self) {
         let c = self.term.cursor();
         let cur = self.term.cursor_visible().then_some((c.row, c.col));
         let epoch = self.term.repaint_blink_epoch();
         let now = self.now;
-        let mut spent = Duration::ZERO;
         if epoch != self.blink {
             self.blink = epoch;
             self.glow.note_repaint_blink(now);
@@ -817,26 +811,17 @@ impl Composer {
         self.term
             .row_cols_into(usize::from(c.row), &mut self.row_buf);
         let mut rows = [0u16; WITNESS_ROWS];
-        let t = Instant::now();
         self.glow.note_context(alt);
         self.glow.observe_row(c.row, c.col, &self.row_buf, now);
         self.glow.observe_ribbon_row(c.row, &self.row_buf);
         let n = self.glow.ribbon_rows(&mut rows);
-        spent += t.elapsed();
         for &r in &rows[..n] {
             self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            let t = Instant::now();
             self.glow.observe_ribbon_row(r, &self.row_buf);
-            spent += t.elapsed();
         }
         let anchor = self.term.print_anchor();
-        let t = Instant::now();
         self.glow.observe_print_anchor(anchor);
         self.glow.tick(cur, now, &self.cfg, self.g, &mut self.out);
-        spent += t.elapsed();
-        if self.timing {
-            self.frame_us.push(spent.as_micros() as u64);
-        }
         self.frames += 1;
         self.census();
     }
@@ -1008,229 +993,4 @@ fn the_owner_s_line_torn_at_the_same_column_stays_whole_into_the_swoosh() {
             "{what}: the band is out {IDLE_CEILING_MS} ms after the last key"
         );
     }
-}
-
-// ===========================================================================
-// 3. The cost (release-only)
-// ===========================================================================
-
-fn median_ns(mut v: Vec<u64>) -> (u64, u64, u64) {
-    v.sort_unstable();
-    let n = v.len().max(1);
-    (v[n / 2], v[(n * 9 / 10).min(n - 1)], v[0])
-}
-
-fn samples(rows: &[(u16, Vec<char>)]) -> Vec<RowSample<'_>> {
-    rows.iter()
-        .map(|(row, cols)| RowSample { row: *row, cols })
-        .collect()
-}
-
-/// One walk on a fresh copy of `w0` per sample.
-fn time_walk(w0: &Witness, cells: &[Cell], rows: &[RowSample<'_>], n: usize) -> (u64, u64, u64) {
-    let mut retire = Vec::with_capacity(4096);
-    let mut release = Vec::with_capacity(4096);
-    let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut w = w0.clone();
-        let t = Instant::now();
-        std::hint::black_box(w.walk(cells, rows, &mut retire, &mut release));
-        v.push(t.elapsed().as_nanos() as u64);
-    }
-    median_ns(v)
-}
-
-/// One same-row keyed move (the wake and the abandon behind it) on a fresh
-/// copy of `rib` per sample.
-fn time_move(
-    rib: &Ribbon,
-    cfg: &Config,
-    g: Geom,
-    at: Instant,
-    from: (u16, u16),
-    to: (u16, u16),
-    n: usize,
-) -> (u64, u64, u64) {
-    let ctx = Ctx {
-        now: at,
-        geom: g,
-        cfg,
-        disp: 0.6,
-        birth_disp: 0.6,
-        phase: 0.0,
-        caret: to,
-        caret_t: rib.field_at(to.0, to.1).unwrap_or(0.0),
-        caret_walk: rib.walk_origin_at(to.0, to.1),
-        mend: None,
-        surge: 0.0,
-        flow: Flow::default(),
-    };
-    let ev = Event::Move {
-        from,
-        to,
-        licence: Licence::Nav,
-        dir: if to.1 < from.1 { Dir::Left } else { Dir::Right },
-    };
-    let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut r = rib.clone();
-        let t = Instant::now();
-        r.on_event(&ev, at, &ctx);
-        std::hint::black_box(&r);
-        v.push(t.elapsed().as_nanos() as u64);
-    }
-    median_ns(v)
-}
-
-/// §18's frame budget, p50.
-const FRAME_BUDGET_US: u64 = 400;
-
-/// **THE COST, PRINTED.** Release-only (`--ignored`): the whole seam frame
-/// over the owner's line typed with every key torn; [`Witness::walk`] per
-/// call on inputs any build holds identically (the owner's line at 140
-/// columns, and a three-row band at 177 — every column a cell — whole and
-/// torn four ways); and the wake per call on a band laid by plain typing and
-/// left to its swoosh (a Home jump and a five-cell word hop). Each line is
-/// `COST <what> p50 p90 min`, ns unless it says µs. The review compares them
-/// against the same file on `e05d7860e`; the file itself pins only that no
-/// single call reaches §18's 400 µs frame budget.
-#[test]
-#[ignore = "release-only cost report; run with --release -- --ignored --nocapture"]
-fn the_walk_and_the_wake_fit_the_frame_budget_on_the_owner_s_line() {
-    let n = 400;
-    let mut worst = Vec::new();
-    let rk_cfg = Config::from_glow(&cfg(), false);
-    {
-        let mut h = Composer::new(140);
-        h.timing = true;
-        h.type_line(LINE, |k| if k > 8 { Cut::After(k - 2) } else { Cut::Whole });
-        let v = h.frame_us.clone();
-        let fmax = v.iter().copied().max().unwrap_or(0);
-        let (p50, p90, _) = median_ns(v);
-        println!("\nCOST seam-frame-us/owner-line-torn p50={p50} p90={p90} max={fmax}");
-    }
-    let t0 = Instant::now();
-    for (name, cols, rows, tears) in [
-        (
-            "owner-140x1",
-            140usize,
-            1usize,
-            vec![("torn-under-TO", 101usize), ("torn-tail-2", 109)],
-        ),
-        (
-            "band-177x3",
-            177,
-            3,
-            vec![
-                ("torn-tail-rows-2-3", 183),
-                ("torn-all-but-5", 5),
-                ("torn-last-2", 3 * 173 - 2),
-            ],
-        ),
-    ] {
-        let w = cols - 4;
-        let text: Vec<char> = LINE
-            .chars()
-            .chain(" ".chars())
-            .cycle()
-            .take(rows * w)
-            .collect();
-        let cells: Vec<Cell> = (0..rows * w)
-            .map(|i| {
-                let born = t0 + Duration::from_millis(i as u64 * 60);
-                Cell {
-                    row: (R0 + i / w) as u16,
-                    col: (2 + i % w) as u16,
-                    cohort: (1 + i / w) as u32,
-                    t: i as f32 * 0.01,
-                    born,
-                    attack_at: born,
-                    life_s: 1.7,
-                    cov0: 0.8,
-                    typing: true,
-                    retract_at: None,
-                    retire_at: None,
-                    birth_disp: 0.5,
-                    edge_cells: 0.0,
-                    layer: Layer::Base,
-                    rearm: None,
-                    released_at: None,
-                }
-            })
-            .collect();
-        let row_of = |cut: usize| -> Vec<(u16, Vec<char>)> {
-            (0..rows)
-                .map(|r| {
-                    let mut v = vec![' '; cols];
-                    v[0] = if r == 0 { '>' } else { ' ' };
-                    for c in 0..w {
-                        let i = r * w + c;
-                        if i < cut {
-                            v[2 + c] = text[i];
-                        }
-                    }
-                    ((R0 + r) as u16, v)
-                })
-                .collect()
-        };
-        let whole = row_of(usize::MAX);
-        let sw = samples(&whole);
-        let mut w0 = Witness::new();
-        let (mut ret, mut rel) = (Vec::new(), Vec::new());
-        w0.walk(&cells, &sw, &mut ret, &mut rel);
-        w0.walk(&cells, &sw, &mut ret, &mut rel);
-        let (p50, p90, min) = time_walk(&w0, &cells, &sw, n);
-        println!(
-            "COST walk-ns/{name}/whole cells={} p50={p50} p90={p90} min={min}",
-            cells.len()
-        );
-        worst.push((format!("walk/{name}/whole"), p50));
-        for (what, cut) in tears {
-            let torn = row_of(cut);
-            let st = samples(&torn);
-            let mut probe = w0.clone();
-            probe.walk(&cells, &st, &mut ret, &mut rel);
-            let (p50, p90, min) = time_walk(&w0, &cells, &st, n);
-            println!(
-                "COST walk-ns/{name}/{what} retire={} release={} p50={p50} p90={p90} min={min}",
-                ret.len(),
-                rel.len()
-            );
-            worst.push((format!("walk/{name}/{what}"), p50));
-        }
-    }
-    for (name, cols, typed) in [
-        ("owner-140x1", 140usize, LINE.len()),
-        ("band-177x2", 177, 173 + 60),
-    ] {
-        let mut h = Composer::new(cols);
-        let text: String = LINE
-            .chars()
-            .chain(" ".chars())
-            .cycle()
-            .take(typed)
-            .collect();
-        h.type_line(&text, |_| Cut::Whole);
-        h.rest(1_300);
-        let rib = h.glow.v2_ribbon().expect("ribbon").clone();
-        let (row, col) = h.at_index(h.caret);
-        let at = h.now + Duration::from_millis(4);
-        for (what, to) in [("home-jump", (row, 2u16)), ("hop-5", (row, col - 5))] {
-            let (p50, p90, min) = time_move(&rib, &rk_cfg, h.g, at, (row, col), to, n);
-            println!(
-                "COST wake-ns/{name}/{what} span={} cells={} p50={p50} p90={p90} min={min}",
-                col - to.1,
-                rib.cells().len()
-            );
-            worst.push((format!("wake/{name}/{what}"), p50));
-        }
-    }
-    let over: Vec<_> = worst
-        .iter()
-        .filter(|(_, p50)| *p50 > FRAME_BUDGET_US * 1_000)
-        .collect();
-    assert!(
-        over.is_empty(),
-        "a single call takes the whole §18 frame budget: {over:?}"
-    );
 }

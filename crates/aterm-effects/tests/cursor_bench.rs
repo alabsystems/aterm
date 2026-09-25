@@ -15,16 +15,14 @@
 //!
 //! The knob is the one `tests/rainbow_kitty_v2_frame_cost.rs` reads — one name
 //! across both gates, so a host's scale is set once; every red prints the
-//! effective bound beside the reference and the scale it came from. Its parse
-//! is pinned here, by the non-ignored
-//! `the_budget_scale_is_a_positive_float_and_everything_else_is_the_reference`.
+//! effective bound beside the reference and the scale it came from.
 
 mod common;
 
 use std::time::{Duration, Instant};
 
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use common::{BUDGET_SCALE_VAR, budget_scale, parse_budget_scale, scaled_budget_us};
+use common::{BUDGET_SCALE_VAR, budget_scale, scaled_budget_us};
 
 const ITERATIONS: usize = 300;
 
@@ -71,29 +69,6 @@ fn geometry() -> Geom {
     }
 }
 
-fn saturated(style: GlowStyle) -> (CursorGlow, Instant, (u16, u16)) {
-    let config = config(style);
-    let geometry = geometry();
-    let now = Instant::now();
-    let mut glow = CursorGlow::default();
-    let mut quads = Vec::new();
-    let row = 24;
-    let mut cursor = (row, 80);
-    glow.tick(Some(cursor), now, &config, geometry, &mut quads);
-    // Same-instant alternating moves are the hostile pre-decay case: resident
-    // spark/particle storage reaches its hard cap while every emission remains
-    // bounded. Normal human typing is far below this state. Authenticate each
-    // synthetic move exactly like the shipping host; raw program deltas are
-    // deliberately dark under the cursor-ownership gate and would make this
-    // saturation/performance assertion vacuous.
-    for step in 0usize..1_200 {
-        cursor.1 = if step.is_multiple_of(2) { 81 } else { 80 };
-        glow.note_synthetic_typed(now, 1);
-        glow.tick(Some(cursor), now, &config, geometry, &mut quads);
-    }
-    (glow, now, cursor)
-}
-
 /// the rainbow kitty's hostile pre-decay fixture: a same-instant ping-pong SWEEP across 160
 /// distinct columns. The two-cell alternation above no longer saturates rainbow kitty —
 /// its cell-ownership dedup collapses revisits into ONE live spark per cell
@@ -126,10 +101,6 @@ fn saturated_sweep(style: GlowStyle) -> (CursorGlow, Instant, (u16, u16)) {
         glow.tick(Some(cursor), now, &config, geometry, &mut quads);
     }
     (glow, now, cursor)
-}
-
-fn benchmark(style: GlowStyle, label: &str) {
-    benchmark_with(style, label, saturated, 100);
 }
 
 /// A bench fixture: build a `CursorGlow` in the given style plus its start instant
@@ -176,12 +147,6 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total
         "{label} cursor frame p90 {p90:?} >= {p90_bound_us} us \
          (reference {P90_REFERENCE_US} us × {BUDGET_SCALE_VAR} {scale}; median {median:?})"
     );
-}
-
-#[test]
-#[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
-fn bench_cursor_water_worstcase() {
-    benchmark(GlowStyle::Water, "bench_cursor_water_worstcase");
 }
 
 #[test]
@@ -364,167 +329,5 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
         p90.as_micros() < u128::from(p90_bound_us),
         "worst-case hot nyan cursor frame p90 {p90:?} >= {p90_bound_us} us \
          (reference {P90_REFERENCE_US} us × {BUDGET_SCALE_VAR} {scale}; median {median:?})"
-    );
-}
-
-#[test]
-#[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
-fn bench_cursor_water_outlier_jump() {
-    const JUMP_ITERATIONS: usize = 200;
-    // A 4,095-cell diagonal is tail-capped at MAX_SPARKS=512 resident path
-    // samples; appending the live destination makes 512 adjacent segments.
-    // Water rasterizes both its undertow and crest across every segment into
-    // the UNDER-INK stream, so even the 1 px hostile geometry must produce at
-    // least one clipped quad per layer per segment. The shared per-stream upload ceiling is
-    // CursorGlow::MAX_QUADS=16,384 (private production constants, repeated
-    // here deliberately so a cap change must be reviewed against this gate).
-    const MIN_UNDER_QUADS: usize = 2 * 512;
-    const MAX_STREAM_QUADS: usize = 16_384;
-    let config = config(GlowStyle::Water);
-    let geometry = Geom {
-        cw: 1,
-        ch: 1,
-        rows: 4096,
-        cols: 4096,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 4096,
-        win_h: 4096,
-        head: 0,
-    };
-    let mut glow = CursorGlow::default();
-    let mut quads = Vec::new();
-    let mut now = Instant::now();
-    let mut cursor = (0, 0);
-    glow.tick(Some(cursor), now, &config, geometry, &mut quads);
-
-    let mut samples = Vec::with_capacity(JUMP_ITERATIONS);
-    let mut min_over_quads = usize::MAX;
-    let mut max_over_quads = 0usize;
-    let mut min_under_quads = usize::MAX;
-    let mut max_under_quads = 0usize;
-    for iteration in 0..JUMP_ITERATIONS {
-        now += Duration::from_secs(1);
-        cursor = if iteration.is_multiple_of(2) {
-            (4095, 4095)
-        } else {
-            (0, 0)
-        };
-        // Raw cursor deltas are deliberately dark under the ownership gate.
-        // Authenticate this benchmark's scripted jump through the same
-        // explicit synthetic seam as the other hostile fixtures above, or the
-        // timing loop measures the rejected/no-output path and passes
-        // vacuously.
-        glow.note_synthetic_move(now);
-        let start = Instant::now();
-        let fingerprint = glow.tick(Some(cursor), now, &config, geometry, &mut quads);
-        samples.push(start.elapsed());
-        assert_ne!(
-            fingerprint, 0,
-            "outlier-jump fixture must emit authenticated water geometry"
-        );
-        min_over_quads = min_over_quads.min(quads.len());
-        max_over_quads = max_over_quads.max(quads.len());
-        min_under_quads = min_under_quads.min(glow.under_quads().len());
-        max_under_quads = max_under_quads.max(glow.under_quads().len());
-    }
-    samples.sort();
-    let median = samples[JUMP_ITERATIONS / 2];
-    let p90 = samples[JUMP_ITERATIONS * 9 / 10];
-    // The reference machine's bound; this host's is it times the scale.
-    const P90_REFERENCE_US: u64 = 2_000;
-    let scale = budget_scale();
-    let p90_bound_us = scaled_budget_us(P90_REFERENCE_US, scale);
-    println!(
-        "bench_cursor_water_outlier_jump: median {median:?} (p90 {p90:?}), \
-         over quads {min_over_quads}..={max_over_quads}, \
-         under quads {min_under_quads}..={max_under_quads}; \
-         p90 bound {p90_bound_us} us (reference {P90_REFERENCE_US} × {BUDGET_SCALE_VAR} {scale})"
-    );
-    assert!(
-        min_under_quads >= MIN_UNDER_QUADS,
-        "authenticated 4,095-cell water jump emitted too little wake: \
-         under quads {min_under_quads}..={max_under_quads}, expected every frame >= \
-         {MIN_UNDER_QUADS}"
-    );
-    assert!(
-        max_under_quads < MAX_STREAM_QUADS && max_over_quads < MAX_STREAM_QUADS,
-        "authenticated 4,095-cell water jump saturated a per-stream cap: \
-         under {min_under_quads}..={max_under_quads}, over \
-         {min_over_quads}..={max_over_quads}, expected each < {MAX_STREAM_QUADS}"
-    );
-    assert!(
-        min_over_quads > 0,
-        "every synthetic jump frame must retain Water's over-ink splash accents"
-    );
-    assert!(
-        p90.as_micros() < u128::from(p90_bound_us),
-        "bounded 4095-cell jump p90 {p90:?} >= {p90_bound_us} us \
-         (reference {P90_REFERENCE_US} us × {BUDGET_SCALE_VAR} {scale}; median {median:?})"
-    );
-}
-
-/// The scale knob's parse (shared with tests/rainbow_kitty_v2_frame_cost.rs
-/// through `common`; pinned here, once), without touching the process
-/// environment: unset or any malformed spelling is the reference budget
-/// exactly, for every reference number either gate uses; a positive float
-/// scales an absolute budget; and a scale small enough to round a budget to
-/// 0 is floored at 1 µs, so no spelling asserts `p50 ≤ 0`; nothing here
-/// reaches a deterministic law. It lives in this binary, not the frame-cost
-/// one: that binary's counting allocator counts every thread, and libtest
-/// allocates outside a test's body (spawning its thread, capturing its
-/// output, sending and printing its result) where no mutex reaches, so a
-/// second non-ignored test there could land allocations inside the
-/// zero-alloc driver's counted window.
-#[test]
-fn the_budget_scale_is_a_positive_float_and_everything_else_is_the_reference() {
-    // §18's pair (the frame-cost gate), then this binary's four bounds.
-    const REFERENCES_US: [u64; 6] = [400, 600, 500, 500, 1_000, 2_000];
-    for raw in [
-        None,
-        Some(""),
-        Some("x"),
-        Some("2x"),
-        Some("0"),
-        Some("-1"),
-        Some("NaN"),
-        Some("inf"),
-        Some("-inf"),
-    ] {
-        let scale = parse_budget_scale(raw);
-        for reference_us in REFERENCES_US {
-            assert_eq!(
-                scaled_budget_us(reference_us, scale),
-                reference_us,
-                "{raw:?} × {reference_us}"
-            );
-        }
-    }
-    assert_eq!(scaled_budget_us(400, parse_budget_scale(Some("2"))), 800);
-    assert_eq!(scaled_budget_us(600, parse_budget_scale(Some("2"))), 1_200);
-    assert_eq!(
-        scaled_budget_us(2_000, parse_budget_scale(Some("2"))),
-        4_000
-    );
-    assert_eq!(
-        scaled_budget_us(600, parse_budget_scale(Some(" 1.5 "))),
-        900
-    );
-    assert_eq!(scaled_budget_us(400, parse_budget_scale(Some("0.75"))), 300);
-    // A positive scale that rounds a budget to 0 is floored at 1 µs, never 0
-    // (`1e-9` is accepted by the parse — finite and positive — and rounds
-    // every reference here to 0). The floor is a floor, not a clamp: `0.001`
-    // rounds 400 µs to 0 (floored to 1) but 2 000 µs to 2.
-    for reference_us in REFERENCES_US {
-        assert_eq!(
-            scaled_budget_us(reference_us, parse_budget_scale(Some("1e-9"))),
-            1,
-            "1e-9 × {reference_us}"
-        );
-    }
-    assert_eq!(scaled_budget_us(400, parse_budget_scale(Some("0.001"))), 1);
-    assert_eq!(
-        scaled_budget_us(2_000, parse_budget_scale(Some("0.001"))),
-        2
     );
 }

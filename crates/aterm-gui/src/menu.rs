@@ -1740,10 +1740,10 @@ const VERSION_MENU: &[MenuEntry] = &[
 /// STAGED update ONLY — the always-visible bar badge means "an update is waiting, act
 /// on it", so an apply that re-execs into that build clears it at once. The post-update
 /// REALIZED celebration is NOT a bar badge; it lives in the menu's "Updated to aterm v… just
-/// now" row and the transient LEVEL-UP notice / palette twin (self-dismissing after
+/// now" row and its palette twin (self-dismissing after
 /// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]). The color emoji is safe HERE:
 /// AppKit renders NSMenu titles/items with the system font + Apple Color Emoji
-/// fallback. In-window overlay surfaces (palette rows, notice pill) must use plain `↑`
+/// fallback. In-window overlay surfaces (the palette rows) must use plain `↑`
 /// instead — the own-rendered text stack has no color-emoji face (verified coverage).
 #[must_use]
 pub(crate) fn version_menu_bar_title(attention: bool) -> String {
@@ -1836,7 +1836,7 @@ pub(crate) fn staged_apply_label(
 /// Whether the always-visible menu-bar Version arrow should show. It tracks a STAGED
 /// update ONLY (action needed) — deliberately NOT the post-update `realized`
 /// celebration. The celebration is carried by self-dismissing surfaces (the menu's
-/// "Updated to aterm v… just now" row, the LEVEL-UP notice, the palette twin), so an apply
+/// "Updated to aterm v… just now" row and its palette twin), so an apply
 /// that re-execs into the staged build (`staged` → `None`) clears the persistent bar
 /// badge the instant it lands, instead of leaving an arrow up for the full realized
 /// TTL that reads as "the update never resolved".
@@ -2469,8 +2469,8 @@ mod macos {
     /// waiting, act on it". After an apply re-execs into that build `staged` is `None`,
     /// so the bar arrow clears the instant the update lands (no 10-min lingering badge
     /// that reads as "the update never resolved"). The freshly-REALIZED celebration
-    /// still lives INSIDE the menu — its "Updated to aterm v… just now" row — and in the
-    /// transient LEVEL-UP notice / palette twin, both of which self-dismiss; only the
+    /// still lives INSIDE the menu — its "Updated to aterm v… just now" row — and in its
+    /// palette twin, both of which self-dismiss; only the
     /// always-visible bar badge is gated to the action-needed state.
     pub fn update_version_menu(
         handle: &MenuHandle,
@@ -4523,9 +4523,10 @@ mod tests {
     /// number and the hash"): a binary the release cutter did not produce —
     /// this test binary — must wear the dev counter in the third slot, the
     /// short commit hash, and the DEV marker. A release build
-    /// (`ATERM_APP_RELEASE_VERSION` present) keeps its clean `v<version>`;
-    /// that arm is proven by the discriminator being exactly the release
-    /// env's presence, which the cutter's identity self-check already pins.
+    /// (`ATERM_RELEASE_BUILD` present) keeps its clean `v<version>`; that arm
+    /// is proven by the discriminator being exactly the release marker's
+    /// presence, whose name `aterm-release`'s buildplan pins to the one it
+    /// sets.
     #[test]
     fn a_dev_build_wears_its_signature_in_the_bar_title() {
         // A test binary is never a release build — and as a const block this

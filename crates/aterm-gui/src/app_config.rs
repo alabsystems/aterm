@@ -796,6 +796,13 @@ pub(crate) struct Config {
     /// (`chrome` states, `edges`) stay live — authority must never be quieter
     /// than the chrome showing it.
     pub(crate) tab_connection_badge: Option<bool>,
+    /// EXPLAIN HEAVY LOAD (design §10.14, ruling 212): when typing slows in a
+    /// focused window while something else is loading the machine, the band
+    /// says what (`Typing slowed by cargo in tab 2`), with a level meter; the
+    /// details go to the log. Default ON. `false` stops the feature entirely:
+    /// the row withdraws, the probe is never asked for another reading, and
+    /// nothing is armed. Applied live.
+    pub(crate) explain_heavy_load: Option<bool>,
     /// Whether every FRESH session spawn also installs/updates the coding-agent
     /// primer (and the bundled skills) for every DETECTED agent — the same upsert
     /// `aterm agents install` performs, run by aterm itself on a detached thread
@@ -3535,6 +3542,12 @@ impl Config {
     /// field doc.
     pub(crate) fn tab_connection_badge_or_default(&self) -> bool {
         self.tab_connection_badge.unwrap_or(true)
+    }
+
+    /// Whether the band may explain very heavy system use (the strain row).
+    /// Opt-OUT; see the field doc.
+    pub(crate) fn explain_heavy_load_or_default(&self) -> bool {
+        self.explain_heavy_load.unwrap_or(true)
     }
 
     /// Stall threshold, bounded so a mistyped value can neither call every job
@@ -10739,6 +10752,9 @@ impl App {
         // Settings edit would apply only to sessions opened afterwards, and the
         // event loop's wait deadline would still be serving the old interval.
         self.reconfigure_session_status();
+        // `explain_heavy_load` is live: `false` parks the strain engine,
+        // withdraws its row and drops the probe thread; nothing is armed after.
+        self.reconfigure_strain();
         // Per-keystroke config caches (predictive_echo / cursor_trail_style): a reload
         // can change either, so drop the resolved values — they re-resolve on the next
         // keystroke. Keeps a live style/predict change taking effect immediately.
@@ -12136,6 +12152,21 @@ window_title_format = "description"
         // The connection mark is opt-OUT like its status siblings.
         assert!(default.tab_connection_badge_or_default());
         assert!(!cfg("tab_connection_badge = false").tab_connection_badge_or_default());
+    }
+
+    /// `explain_heavy_load` round-trips: absent reads ON (the owner asked for
+    /// the row), an explicit `false` reads OFF, an explicit `true` reads ON.
+    #[test]
+    fn explain_heavy_load_defaults_on_and_round_trips() {
+        let cfg = |s: &str| -> Config { aterm_toml::from_str(s).unwrap() };
+        assert!(Config::default().explain_heavy_load_or_default());
+        assert!(!cfg("explain_heavy_load = false").explain_heavy_load_or_default());
+        assert!(cfg("explain_heavy_load = true").explain_heavy_load_or_default());
+        assert_eq!(
+            cfg("explain_heavy_load = false").explain_heavy_load,
+            Some(false),
+            "an explicit value is kept as written"
+        );
     }
 
     /// The observation budget is DERIVED, not configured: it must never be

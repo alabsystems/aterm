@@ -4,8 +4,8 @@
 //! Stamp the cutter with the commit it was BUILT from.
 //!
 //! Every pre-claim gate proves something about the TREE — `clean_tree`,
-//! `on_main`, `head_matches_origin` — and none of them proves anything about
-//! the binary doing the proving. That gap is not hypothetical: v0.63.0 shipped
+//! `place_published` — and none of them proves anything about the binary
+//! doing the proving. That gap is not hypothetical: v0.63.0 shipped
 //! a 1.07 GB seeded image and an `-x86_64.dmg` from a tree whose source had
 //! carried the one-lean-download lane since 52c1936f, because the `aterm-release`
 //! binary that ran had been built from an older tree. It validated its own

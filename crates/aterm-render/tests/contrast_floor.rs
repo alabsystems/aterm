@@ -29,9 +29,9 @@
 //!   INDEPENDENT WCAG oracle (contrast re-derived here from the sRGB EOTF,
 //!   not shared with the shipping code) exhaustively over all grayscale
 //!   `fg × bg` pairs and over a dense RGB lattice, at ratios across the whole
-//!   `1..=21` domain. The old pole rule (`L(bg) > 0.5` picks black) is kept
-//!   as the NEGATIVE CONTROL: for mid-luminance backgrounds it falls back to
-//!   the WEAKER pole and violates the bound.
+//!   `1..=21` domain. The old pole rule (`L(bg) > 0.5` picks black, so
+//!   mid-luminance backgrounds fall back to the WEAKER pole) is the Tier-0
+//!   model's `Buggy=1` negative control above, so it has no copy here.
 
 use aterm_render::{floor_fg_contrast, floor_min_contrast_fg};
 
@@ -158,55 +158,6 @@ fn floor_meets_bound_rgb_lattice() {
     assert!(
         mid_luminance_bgs > 0,
         "non-vacuity: the mid-luminance regime is covered"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Negative control: the OLD pole rule violates the bound.
-// ---------------------------------------------------------------------------
-
-/// Reproduce the pre-W5 fallback pole choice (`L(bg) > 0.5` → black, else
-/// white — the LUMINANCE MIDPOINT, not the contrast argmax) and exhibit a
-/// concrete violation: on a mid-gray background the old rule falls back to
-/// WHITE although BLACK contrasts strictly more, so it cannot deliver
-/// `min(21, max_achievable)`. The shipping argmax rule delivers it on the
-/// same input — the law genuinely separates fix from bug.
-#[test]
-fn old_midpoint_pole_rule_violates_the_bound() {
-    fn old_floor(fg: u32, bg: u32, min: f32) -> u32 {
-        if contrast(fg, bg) >= min {
-            return fg;
-        }
-        let target: u32 = if luminance(bg) > 0.5 { 0 } else { 0x00ff_ffff };
-        let mix = |fg: u32, shift: u32, t: f32| -> u32 {
-            let f = ((fg >> shift) & 0xff) as f32;
-            let g = ((target >> shift) & 0xff) as f32;
-            (((f + (g - f) * t).round() as u32) & 0xff) << shift
-        };
-        for step in 1..=10u32 {
-            let t = step as f32 / 10.0;
-            let cand = mix(fg, 16, t) | mix(fg, 8, t) | mix(fg, 0, t);
-            if contrast(cand, bg) >= min {
-                return cand;
-            }
-        }
-        target
-    }
-
-    // Mid-gray: L ≈ 0.216 ∈ (0.179, 0.5] — black is the stronger pole.
-    let bg = gray(128);
-    let fg = gray(120); // low-contrast fg so the floor must engage
-    let bound = 21.0f32.min(max_achievable(bg));
-    let old = old_floor(fg, bg, 21.0);
-    assert!(
-        contrast(old, bg) < bound - 0.5,
-        "control: the old rule must fall short of the bound (got {}, bound {bound})",
-        contrast(old, bg)
-    );
-    let new = floor_fg_contrast(fg, bg, 21.0);
-    assert!(
-        contrast(new, bg) >= bound - EPS,
-        "the argmax rule delivers the bound on the same input"
     );
 }
 

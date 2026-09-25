@@ -421,7 +421,19 @@ struct TurnLedger {
     /// thread that is late all the time.
     turns: AtomicU64,
     long_turns: AtomicU64,
+    /// The strain engine's FREEZE mailbox (design §10.14, ruling 211): the worst
+    /// turn of at least [`FREEZE_NS`] since the host last drained it
+    /// ([`take_freeze`]), when it ended and its owner. `freeze_span_ns == 0`
+    /// is empty. Not a window stat: `reset` leaves it for its reader.
+    freeze_span_ns: AtomicU64,
+    freeze_end_ns: AtomicU64,
+    freeze_owner: AtomicU8,
 }
+
+/// A main-loop turn at least this long is a FREEZE for the strain engine
+/// (`aterm_messages::FREEZE_MS`); the host decides whether a hardware key was
+/// near enough to make it a hitch.
+const FREEZE_NS: u64 = aterm_messages::FREEZE_MS as u64 * 1_000_000;
 
 impl TurnLedger {
     const fn new() -> Self {
@@ -433,6 +445,9 @@ impl TurnLedger {
             max_at_ns: AtomicU64::new(0),
             turns: AtomicU64::new(0),
             long_turns: AtomicU64::new(0),
+            freeze_span_ns: AtomicU64::new(0),
+            freeze_end_ns: AtomicU64::new(0),
+            freeze_owner: AtomicU8::new(Breadcrumb::Startup as u8),
         }
     }
 
@@ -465,7 +480,30 @@ impl TurnLedger {
             self.max_owner.store(previous as u8, Ordering::Relaxed);
             self.max_at_ns.store(now_ns, Ordering::Relaxed);
         }
+        if span >= FREEZE_NS {
+            // Keep-worst until the host drains it: two freezes between drains
+            // are rarer than the loop's own turns, and the worse one is the one
+            // a person felt.
+            if self.freeze_span_ns.load(Ordering::Relaxed) < span {
+                self.freeze_owner.store(previous as u8, Ordering::Relaxed);
+                self.freeze_end_ns.store(now_ns, Ordering::Relaxed);
+                self.freeze_span_ns.store(span, Ordering::Relaxed);
+            }
+        }
         Some(span)
+    }
+
+    /// The worst turn of at least [`FREEZE_NS`] booked since the last take:
+    /// `(end_ns, span_ns, owner)`, and the mailbox is emptied.
+    fn take_freeze(&self) -> Option<(u64, u64, Breadcrumb)> {
+        let span = self.freeze_span_ns.swap(0, Ordering::Relaxed);
+        (span != 0).then(|| {
+            (
+                self.freeze_end_ns.load(Ordering::Relaxed),
+                span,
+                Breadcrumb::from_u8(self.freeze_owner.load(Ordering::Relaxed)),
+            )
+        })
     }
 
     fn snapshot(&self) -> TurnCensus {
@@ -562,6 +600,15 @@ fn beat_into(turns: &TurnLedger, phase: &AtomicU8, bc: Breadcrumb, now_ns: u64) 
 #[must_use]
 pub fn turn_census() -> TurnCensus {
     TURNS.snapshot()
+}
+
+/// The worst main-loop turn of at least `aterm_messages::FREEZE_MS` since the
+/// last call — `(end_ns, span_ns, owner)` on the `crate::metrics::now_ns` clock —
+/// emptying the mailbox. The strain host drains it on the main thread (the only
+/// writer is the same thread's [`beat`]), and alone decides whether a hardware
+/// key was near enough to make it a hitch.
+pub fn take_freeze() -> Option<(u64, u64, Breadcrumb)> {
+    TURNS.take_freeze()
 }
 
 /// Clear the turn census. Called by [`crate::metrics::reset`], so the census is a
@@ -1347,6 +1394,34 @@ mod tests {
             None,
             "a turn that began before this window is not this window's to price"
         );
+    }
+
+    /// THE STRAIN ENGINE'S FREEZE MAILBOX (design §10.14, ruling 211): a
+    /// turn of at least `FREEZE_MS` waits, worst first, for the host to take
+    /// it once; an ordinary long turn (a slow frame) and a designed park never
+    /// reach it.
+    #[test]
+    fn a_freeze_waits_worst_first_for_the_strain_host_and_is_taken_once() {
+        const MS: u64 = 1_000_000;
+        let turns = TurnLedger::new();
+        assert_eq!(turns.close(Breadcrumb::WindowEvent, MS), None, "arms only");
+        let t1 = MS + 450 * MS;
+        assert_eq!(turns.close(Breadcrumb::WindowEvent, t1), Some(450 * MS));
+        let t2 = t1 + 600 * MS;
+        assert_eq!(turns.close(Breadcrumb::UserEvent, t2), Some(600 * MS));
+        // A slow frame is not a freeze; a ten-minute idle is a designed park.
+        let t3 = t2 + 120 * MS;
+        assert_eq!(turns.close(Breadcrumb::WindowEvent, t3), Some(120 * MS));
+        assert_eq!(
+            turns.close(Breadcrumb::AboutToWait, t3 + 600_000 * MS),
+            None
+        );
+        assert_eq!(
+            turns.take_freeze(),
+            Some((t2, 600 * MS, Breadcrumb::UserEvent)),
+            "the worse of the two, with its end and its owner"
+        );
+        assert_eq!(turns.take_freeze(), None, "taken once");
     }
 
     /// THE READING THAT HAD NO PRODUCER. A `Wake::Output` turn parks 312 ms in

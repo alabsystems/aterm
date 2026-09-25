@@ -201,7 +201,7 @@ fn place_frame_bands_offsets_without_scaling() {
     let src = synth_frame(fw, fh);
     let (dw, dh) = (fw + 7, fh + 7);
     let mut dst = vec![0xffff_ffffu32; dw * dh];
-    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0);
+    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0..0);
 
     let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
     assert_eq!(
@@ -238,11 +238,11 @@ fn place_frame_bands_exact_fit_is_identity_and_invert_is_xor() {
     let (fw, fh) = (23usize, 11usize);
     let src = synth_frame(fw, fh);
     let mut dst = vec![0u32; fw * fh];
-    place_frame_bands(&mut dst, fw, fh, &src, fw, fh, false, BAND, 0);
+    place_frame_bands(&mut dst, fw, fh, &src, fw, fh, false, BAND, 0..0);
     assert_eq!(dst, src, "exact fit must be the identity copy");
 
     let mut inv = vec![0u32; fw * fh];
-    place_frame_bands(&mut inv, fw, fh, &src, fw, fh, true, BAND, 0);
+    place_frame_bands(&mut inv, fw, fh, &src, fw, fh, true, BAND, 0..0);
     for (i, (&a, &b)) in inv.iter().zip(src.iter()).enumerate() {
         assert_eq!(a, b ^ 0x00ff_ffff, "invert must be the bell XOR at {i}");
     }
@@ -263,7 +263,7 @@ fn place_frame_bands_crops_centred_and_handles_one_axis() {
     // what `place_frame_bands` computes internally.
     let (dw, dh) = (15usize, 9usize);
     let mut dst = vec![0u32; dw * dh];
-    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0);
+    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0..0);
     let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
     assert!(ox < 0);
     if cfg!(target_os = "linux") {
@@ -285,7 +285,7 @@ fn place_frame_bands_crops_centred_and_handles_one_axis() {
     // One-axis remainder: width +5, height exact.
     let (dw, dh) = (fw + 5, fh);
     let mut dst = vec![0u32; dw * dh];
-    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0);
+    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0..0);
     let ox = band_offset(dw, fw);
     assert_eq!(ox, 2);
     for y in 0..dh {
@@ -302,26 +302,36 @@ fn place_frame_bands_crops_centred_and_handles_one_axis() {
 }
 
 /// CHROME REACHES THE WINDOW EDGE (the message band's full-width meter,
-/// ruling 55, 2026-09-23). Beside the first `edge_rows` SOURCE rows the
+/// ruling 55, 2026-09-23). Beside the SOURCE rows in `edge_rows` the
 /// remainder bands continue the row's own first and last pixel, so a chrome
 /// band — and a meter's fill on it — runs to the true window edge on a window
 /// that is not a whole number of cells wide; every other band pixel stays the
 /// theme background (the vertical bands above and below the frame included,
-/// whatever `edge_rows` says); the continued pixels are BAND pixels, so the
-/// bell invert never flips them; and `edge_rows = 0` is byte-identical to the
-/// historical placement.
+/// whatever `edge_rows` says, and the rows ABOVE a range that starts past 0 —
+/// a surfaceless strip that keeps the padding, `ChromeBleed::first`); the
+/// continued pixels are BAND pixels, so the bell invert never flips them; and
+/// an empty range is byte-identical to the historical placement.
 #[test]
 fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
     let (fw, fh) = (20usize, 12usize);
     let src = synth_frame(fw, fh);
-    let edge_rows = 5;
     let (dw, dh) = (fw + 7, fh + 7);
     let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
     let mut historical = vec![0u32; dw * dh];
-    place_frame_bands(&mut historical, dw, dh, &src, fw, fh, false, BAND, 0);
-    for invert in [false, true] {
+    place_frame_bands(&mut historical, dw, dh, &src, fw, fh, false, BAND, 0..0);
+    for (edge_rows, invert) in [(0..5, false), (0..5, true), (2..5, false)] {
         let mut dst = vec![0u32; dw * dh];
-        place_frame_bands(&mut dst, dw, dh, &src, fw, fh, invert, BAND, edge_rows);
+        place_frame_bands(
+            &mut dst,
+            dw,
+            dh,
+            &src,
+            fw,
+            fh,
+            invert,
+            BAND,
+            edge_rows.clone(),
+        );
         let (mut continued, mut banded) = (0usize, 0usize);
         for y in 0..dh {
             for x in 0..dw {
@@ -336,7 +346,7 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
                         if invert { s ^ 0x00ff_ffff } else { s },
                         "content ({x},{y})"
                     );
-                } else if in_rows && (sy as usize) < edge_rows {
+                } else if in_rows && edge_rows.contains(&(sy as usize)) {
                     let row = sy as usize * fw;
                     let edge = if sx < 0 { src[row] } else { src[row + fw - 1] };
                     assert_eq!(d, edge, "a chrome row's band continues its edge ({x},{y})");
@@ -349,12 +359,12 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
         }
         // NON-VACUITY: both arms ran — every chrome row contributed its 7
         // remainder pixels, and the rest of the remainder stayed the band.
-        assert_eq!(continued, edge_rows * (dw - fw));
+        assert_eq!(continued, edge_rows.len() * (dw - fw));
         assert_eq!(banded, dw * dh - fw * fh - continued);
     }
     // `edge_rows` past the frame is clamped by the frame itself.
     let mut all = vec![0u32; dw * dh];
-    place_frame_bands(&mut all, dw, dh, &src, fw, fh, false, BAND, usize::MAX);
+    place_frame_bands(&mut all, dw, dh, &src, fw, fh, false, BAND, 0..usize::MAX);
     for y in 0..dh {
         let sy = y as i64 - oy;
         if sy < 0 || sy as usize >= fh {
@@ -366,6 +376,6 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
     }
     // Zero chrome rows is the historical placement, byte for byte.
     let mut zero = vec![0u32; dw * dh];
-    place_frame_bands(&mut zero, dw, dh, &src, fw, fh, false, BAND, 0);
+    place_frame_bands(&mut zero, dw, dh, &src, fw, fh, false, BAND, 0..0);
     assert_eq!(zero, historical);
 }

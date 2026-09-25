@@ -275,13 +275,10 @@ impl Glyph {
 /// What a `Not now` answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// The Full Disk Access question.
+    /// The Full Disk Access question. (The elevated-install question went with the
+    /// OS-installer protocols, 2026-09-24; a carried `not-now:admin-step:` decodes to
+    /// nothing and the loader drops it.)
     FileAccess,
-    /// The elevated-install question for these program names.
-    AdminStep {
-        /// The programs the step would install.
-        names: Vec<String>,
-    },
 }
 
 /// Plain-data INTENTS the HOST performs (`ATERM_DESIGN` §2.2: the engine
@@ -321,11 +318,6 @@ pub enum Intent {
         /// The staged build number.
         build: u64,
     },
-    /// Install these programs through the elevated step.
-    InstallElevated {
-        /// The program names.
-        names: Vec<String>,
-    },
     /// Decline a question for now.
     NotNow {
         /// Which question.
@@ -353,7 +345,6 @@ impl Intent {
             Self::OpenPath { .. } => "Open log",
             Self::OpenSystemPane { .. } => "Open Settings",
             Self::ApplyUpdate { .. } => "Install now",
-            Self::InstallElevated { .. } => "Install",
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "New window",
         }
@@ -375,9 +366,8 @@ impl Intent {
             Self::OpenConfigEditor { .. } => "Edit",
             Self::OpenPath { .. } => "Log",
             Self::OpenSystemPane { .. } => "Settings",
-            // One install verb on every surface (ruling 69): the band's
-            // short form of `Install now` is the elevated install's word too.
-            Self::ApplyUpdate { .. } | Self::InstallElevated { .. } => "Install",
+            // One install verb on every surface (ruling 69).
+            Self::ApplyUpdate { .. } => "Install",
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "Window",
         }
@@ -390,15 +380,15 @@ impl Intent {
         matches!(self, Self::NotNow { .. })
     }
 
-    /// `NotNow` | `InstallElevated`: a row carrying one is a DECISION row.
+    /// `NotNow`: a row carrying one is a DECISION row.
     #[must_use]
     pub const fn is_ask(&self) -> bool {
-        matches!(self, Self::NotNow { .. } | Self::InstallElevated { .. })
+        matches!(self, Self::NotNow { .. })
     }
 
     /// A CONSEQUENTIAL intent — a press that changes the machine or the
-    /// window rather than opening a page: `ApplyUpdate`, `InstallElevated`,
-    /// `OpenSystemPane`, `NewWindow`. The glass paints these, and only
+    /// window rather than opening a page: `ApplyUpdate`, `OpenSystemPane`,
+    /// `NewWindow`. The glass paints these, and only
     /// these, as the accent-filled Primary chip; a navigation
     /// (`OpenSettings`, `OpenPath`, `OpenConfigEditor`) or a decline
     /// (`NotNow`) is the quiet Secondary chip, so a toolchain row's
@@ -409,18 +399,14 @@ impl Intent {
     pub const fn is_consequential(&self) -> bool {
         matches!(
             self,
-            Self::ApplyUpdate { .. }
-                | Self::InstallElevated { .. }
-                | Self::OpenSystemPane { .. }
-                | Self::NewWindow
+            Self::ApplyUpdate { .. } | Self::OpenSystemPane { .. } | Self::NewWindow
         )
     }
 
     /// The log/carry form: `details`, `open-settings:/packages`,
     /// `open-config-editor:<line|->`, `open-path:<esc>`,
-    /// `open-system-pane:<pane>`, `apply-update:<build>`,
-    /// `install-elevated:<a,b>`, `not-now:file-access`,
-    /// `not-now:admin-step:<a,b>`, `new-window`.
+    /// `open-system-pane:<pane>`, `apply-update:<build>`, `not-now:file-access`,
+    /// `new-window`.
     #[must_use]
     pub fn encode(&self) -> String {
         match self {
@@ -433,12 +419,8 @@ impl Intent {
             Self::OpenPath { path } => format!("open-path:{}", escape_payload(path)),
             Self::OpenSystemPane { pane } => format!("open-system-pane:{}", escape_payload(pane)),
             Self::ApplyUpdate { build } => format!("apply-update:{build}"),
-            Self::InstallElevated { names } => format!("install-elevated:{}", join_names(names)),
             Self::NotNow { decision } => match decision {
                 Decision::FileAccess => "not-now:file-access".to_string(),
-                Decision::AdminStep { names } => {
-                    format!("not-now:admin-step:{}", join_names(names))
-                }
             },
             Self::NewWindow => "new-window".to_string(),
         }
@@ -472,17 +454,9 @@ impl Intent {
             "apply-update" => Some(Self::ApplyUpdate {
                 build: payload.parse().ok()?,
             }),
-            "install-elevated" => Some(Self::InstallElevated {
-                names: split_names(payload),
-            }),
             "not-now" => match payload.split_once(':').unwrap_or((payload, "")) {
                 ("file-access", "") => Some(Self::NotNow {
                     decision: Decision::FileAccess,
-                }),
-                ("admin-step", names) => Some(Self::NotNow {
-                    decision: Decision::AdminStep {
-                        names: split_names(names),
-                    },
                 }),
                 _ => None,
             },
@@ -524,16 +498,8 @@ pub fn every_intent() -> Vec<Intent> {
             pane: "full-disk-access".into(),
         },
         Intent::ApplyUpdate { build: 1234 },
-        Intent::InstallElevated {
-            names: vec!["clt".into(), "brew".into()],
-        },
         Intent::NotNow {
             decision: Decision::FileAccess,
-        },
-        Intent::NotNow {
-            decision: Decision::AdminStep {
-                names: vec!["clt".into()],
-            },
         },
         Intent::NewWindow,
     ]
@@ -583,24 +549,6 @@ fn unescape_payload(s: &str) -> String {
     out
 }
 
-/// Names joined with `,`; a name carrying `,` or a control character is a
-/// host mistake and is trimmed to its clean part.
-fn join_names(names: &[String]) -> String {
-    let clean: Vec<String> = names
-        .iter()
-        .map(|n| n.chars().filter(|c| *c != ',' && !c.is_control()).collect())
-        .filter(|n: &String| !n.is_empty())
-        .collect();
-    clean.join(",")
-}
-
-fn split_names(s: &str) -> Vec<String> {
-    s.split(',')
-        .filter(|n| !n.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// Which capsule a press landed on: an authored intent by index, or the
 /// implicit `Details ›`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -635,7 +583,7 @@ pub enum Hold {
     /// Details, a body press or a navigation capsule folds it (design §10.4.3,
     /// E3), because the person has seen it and gone to fix it.
     Standing,
-    /// A decision row (FDA, admin step): ranks first; leaves on `NotNow`,
+    /// A decision row (Full Disk Access): ranks first; leaves on `NotNow`,
     /// supersede or expiry.
     Ask {
         /// The question's patience.
@@ -715,6 +663,15 @@ pub struct Meter {
     /// handoff ([`crate::carry::CarriedMessage::busy`]); never spoken as a
     /// word (the row is a progress indicator with no value).
     pub busy: bool,
+    /// A MEASURED LEVEL, not progress (design ruling 208): the fill is a
+    /// gauge of how loaded the machine is — it glides up AND down, has no
+    /// glint, no percent word, no ETA and no stall tone, never completes
+    /// (it retires by a Vanish only: [`crate::MessageCenter::resolve`]
+    /// refuses it) and is admitted on the strain row alone
+    /// ([`crate::strain::level_fault`]). Only with a fill (normalized clears
+    /// it otherwise). Volatile like `busy`: never persisted, never on the
+    /// wire, never carried (the successor's strain engine starts calm).
+    pub level: bool,
 }
 
 impl Meter {
@@ -729,15 +686,33 @@ impl Meter {
         }
     }
 
+    /// A measured LEVEL ([`Meter::level`] the field): `permille` of a
+    /// resource in use, `stats` beside it — never an amount, never busy.
+    #[must_use]
+    pub fn level(permille: u16, stats: impl AsRef<str>) -> Self {
+        Self {
+            fill_permille: Some(permille.min(1000)),
+            stats: clip(stats.as_ref(), STATS_CAP),
+            level: true,
+            ..Self::default()
+        }
+    }
+
     /// A meter with its fill clamped, its stats sanitized, an amount with no
     /// total dropped, `done` clamped to `total`, a missing fill filled from
-    /// `done / total`, and `busy` only where there is still no fill.
+    /// `done / total`, and `busy` only where there is still no fill. A level
+    /// is a level only with a fill of its own, and carries no amount (a
+    /// gauge has no ETA) and no busy.
     #[must_use]
     pub fn normalized(self) -> Self {
-        let amount = self.amount.filter(|a| a.total > 0).map(|a| Amount {
-            done: a.done.min(a.total),
-            ..a
-        });
+        let level = self.level && self.fill_permille.is_some();
+        let amount = self
+            .amount
+            .filter(|a| a.total > 0 && !level)
+            .map(|a| Amount {
+                done: a.done.min(a.total),
+                ..a
+            });
         let fill_permille = self
             .fill_permille
             .map(|p| p.min(1000))
@@ -748,6 +723,7 @@ impl Meter {
             amount,
             load: self.load,
             busy: self.busy && fill_permille.is_none(),
+            level,
         }
     }
 }
@@ -800,6 +776,27 @@ pub enum Unit {
     Steps,
 }
 
+impl Unit {
+    /// The wire's word for it: `bytes`, `items` or `steps`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Items => "items",
+            Self::Steps => "steps",
+        }
+    }
+
+    /// The inverse of [`Unit::word`] (the wire's `unit=`); anything else ⇒
+    /// `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Bytes, Self::Items, Self::Steps]
+            .into_iter()
+            .find(|u| u.word() == s)
+    }
+}
+
 /// The resource a very heavy phase loads — the words that explain why the
 /// machine is slow while it lasts (design §10.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -810,13 +807,20 @@ pub enum Load {
     Disk,
     /// Verification of a large payload.
     Cpu,
-    /// macOS's own installer: disk and CPU for minutes.
-    System,
+    /// Memory is full and the machine swaps: the strain row's words for a
+    /// memory culprit (design ruling 207). Not a wire word: `notice`'s
+    /// `load=` stays the three above ([`Load::WIRE`]).
+    Memory,
 }
 
 impl Load {
     /// Every load, for the slot that must fit the widest words.
-    pub const ALL: [Load; 4] = [Self::Network, Self::Disk, Self::Cpu, Self::System];
+    pub const ALL: [Load; 4] = [Self::Network, Self::Disk, Self::Cpu, Self::Memory];
+
+    /// The loads a script may declare over the wire (`notice progress …
+    /// load=`): a machine's memory is aterm's to measure, never a script's
+    /// to claim.
+    pub const WIRE: [Load; 3] = [Self::Network, Self::Disk, Self::Cpu];
 
     /// The band's words for it.
     #[must_use]
@@ -825,8 +829,33 @@ impl Load {
             Self::Network => "network busy",
             Self::Disk => "disk busy",
             Self::Cpu => "CPU busy",
-            Self::System => "system busy",
+            Self::Memory => "memory full",
         }
+    }
+
+    /// The one-word resource — the wire's `load=` and the `messages` row's
+    /// `load=`: `network`, `disk`, `cpu` or `memory`
+    /// ([`Load::words`] stays the band's).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Disk => "disk",
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+        }
+    }
+
+    /// The inverse of [`Load::word`]; anything else ⇒ `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.word() == s)
+    }
+
+    /// [`Load::parse`] over the wire's words only ([`Load::WIRE`]).
+    #[must_use]
+    pub fn parse_wire(s: &str) -> Option<Self> {
+        Self::WIRE.into_iter().find(|l| l.word() == s)
     }
 }
 
@@ -861,6 +890,15 @@ impl Origin {
             "carried" => Some(Self::Carried),
             _ => None,
         }
+    }
+
+    /// The wire OWNS a message minted by it or keyed in its namespace (a
+    /// carried wire row's origin is `Carried`, its key is still
+    /// [`crate::WIRE_KEY_PREFIX`]'s): the one class the duplicate test and
+    /// the log ring's wire share both use (design rulings 167, 192, 194).
+    #[must_use]
+    pub fn wire_owned(self, key: Option<&str>) -> bool {
+        self == Self::Wire || key.is_some_and(|k| k.starts_with(crate::WIRE_KEY_PREFIX))
     }
 }
 
@@ -1219,13 +1257,10 @@ mod tests {
             );
             assert_eq!(
                 intent.is_ask(),
-                matches!(
-                    intent,
-                    Intent::NotNow { .. } | Intent::InstallElevated { .. }
-                ),
+                matches!(intent, Intent::NotNow { .. }),
                 "{intent:?}"
             );
-            // The accent chip marks a CONSEQUENTIAL press only: the four
+            // The accent chip marks a CONSEQUENTIAL press only: the three
             // that change the machine or the window. Every navigation and
             // the decline are quiet — `Packages` and `Software Update`
             // included.
@@ -1233,10 +1268,7 @@ mod tests {
                 intent.is_consequential(),
                 matches!(
                     intent,
-                    Intent::ApplyUpdate { .. }
-                        | Intent::InstallElevated { .. }
-                        | Intent::OpenSystemPane { .. }
-                        | Intent::NewWindow
+                    Intent::ApplyUpdate { .. } | Intent::OpenSystemPane { .. } | Intent::NewWindow
                 ),
                 "{intent:?}"
             );
@@ -1291,14 +1323,11 @@ mod tests {
             Intent::decode("open-config-editor:-"),
             Some(Intent::OpenConfigEditor { line: None })
         );
-        assert_eq!(
-            Intent::decode("not-now:admin-step:clt,brew"),
-            Some(Intent::NotNow {
-                decision: Decision::AdminStep {
-                    names: vec!["clt".into(), "brew".into()]
-                }
-            })
-        );
+        // The retired admin step's intents (2026-09-24), carried by an older window,
+        // decode to nothing: the loader drops them.
+        for retired in ["not-now:admin-step:clt,brew", "install-elevated:clt,brew"] {
+            assert_eq!(Intent::decode(retired), None, "{retired:?}");
+        }
         for hold in [
             Hold::Default,
             Hold::For(Duration::from_secs(9)),

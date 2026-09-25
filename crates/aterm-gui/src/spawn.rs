@@ -837,6 +837,15 @@ pub(crate) struct Adopted {
     /// and the tail of its alt-screen archive, when the handoff carried them and
     /// they checked out. Best-effort: `None` adopts exactly as before.
     pub control: Option<crate::handoff_carry::ControlCarry>,
+    /// REPAINT (the 2026-09-22/23 update audit, plan P0-1e/P0-2): `checkpoint` is
+    /// NOT the screen the program last drew — the producer carried a blank one on
+    /// purpose (`ScreenCarry::repaint`), or `seamless::take_incoming` refused the
+    /// carried screen and degraded this one session to a blank engine rather
+    /// than refuse the whole update. [`spawn_session`] then pulses the PTY size
+    /// so the program redraws onto the blank screen, exactly as it does for an
+    /// alt-screen adoption; without the pulse a shell or TUI would sit on an
+    /// empty window until it next happened to print.
+    pub repaint: bool,
     /// FROZEN PATH (2026-09-16): this shell was spawned by a build before the
     /// self-healing sessions (`session_store::predates_path_self_heal`) — its PATH
     /// has no `<prefix>/agents/` in front and nothing running in it will learn of
@@ -883,6 +892,31 @@ pub(crate) fn authorize_adopted_shell_nonce(
         }
         None => {}
     }
+}
+
+/// AN ADOPTED SHELL WITH NO CHECKPOINT keeps its marks' requirement STANDING.
+///
+/// Every producer carries a screen, so an adopted session reaches
+/// [`spawn_session`] without one only through the consumer's degrade
+/// (`seamless::admit_incoming_screen`): its meta did not parse, or not even a
+/// 1x1 blank fitted the aggregate the earlier sessions spent. Nothing then
+/// says what the parent's `require_shell_integration_nonce` was, and a fresh
+/// engine's default is OFF — which let any program's output in that tab forge
+/// OSC 133/633 marks and exit codes, and made `status` say `integration=off`.
+/// The shell is still signing with a nonce this process cannot know, so the
+/// requirement is set and the session reports `integration=degraded`, exactly
+/// as [`authorize_adopted_shell_nonce`] leaves a parent that carried no nonce.
+/// Before the degrade existed this adoption was refused whole, so the state
+/// was unreachable.
+pub(crate) fn hold_adopted_shell_nonce_requirement(
+    engine: &mut aterm_core::terminal::Terminal,
+    id: u64,
+) {
+    engine.set_require_shell_integration_nonce(true);
+    aterm_log::warn!(
+        "adopted session {id}: adopted without a carried screen; its OSC 133/633 marks stay \
+         dropped (status integration=degraded)"
+    );
 }
 
 #[allow(
@@ -1068,7 +1102,7 @@ pub(crate) fn spawn_session(
     // outgoing process cleared CLOEXEC so it survived the exec — the SAME shell keeps
     // running); otherwise FORK a fresh shell (every normal caller).
     let adopted = adopt.is_some();
-    let (master, pid, adopt_checkpoint, mut adopt_control) = match adopt {
+    let (master, pid, adopt_checkpoint, mut adopt_control, adopt_repaint) = match adopt {
         Some(a) => {
             // FD HYGIENE: the outgoing process cleared CLOEXEC so this master
             // survived the handoff — re-arm it NOW (mirroring what forkpty does
@@ -1077,7 +1111,7 @@ pub(crate) fn spawn_session(
             // handoff child before its own deliberate clear.
             #[cfg(unix)]
             let _ = aterm_pty::set_cloexec(a.master, true);
-            (a.master, a.pid, a.checkpoint, a.control)
+            (a.master, a.pid, a.checkpoint, a.control, a.repaint)
         }
         None => {
             // Pick the child rlimit posture by containment mode: the daily-driver modes
@@ -1120,7 +1154,7 @@ pub(crate) fn spawn_session(
                 cell_px,
             );
             match spawned {
-                Ok(aterm_pty::SpawnedShell { master, pid }) => (master, pid, None, None),
+                Ok(aterm_pty::SpawnedShell { master, pid }) => (master, pid, None, None, false),
                 Err(e) => {
                     // The child-recursion provisioning above (the `PROXIES` entry + the
                     // 0600 edge-token file) is registered BEFORE this fallible spawn, and
@@ -1240,12 +1274,24 @@ pub(crate) fn spawn_session(
     // and indices, diffing the app's next frame exactly as the old process
     // would have. It never panics on what it is given, and without it the
     // restored screen is the new baseline, as before.
-    if let Some(cp) = &adopt_checkpoint {
+    //
+    // ONE acquisition for both arms. The two arms used to take the engine lock
+    // separately, one per branch of an `if let … else if`; they never overlapped,
+    // but the lock-order census (L0-DEADLOCK, no waiver channel) reads lock
+    // lifetimes by brace depth and saw the second `term_lock` while the first
+    // guard was still in scope. Taking it once states the same thing plainly.
+    if adopt_checkpoint.is_some() || adopted {
         let mut engine = term_lock(&term);
-        engine.restore_checkpoint(cp);
-        authorize_adopted_shell_nonce(&mut engine, cp, id);
-        if let Some(control) = adopt_control.take() {
-            let _ = control.install(&mut engine);
+        if let Some(cp) = &adopt_checkpoint {
+            engine.restore_checkpoint(cp);
+            authorize_adopted_shell_nonce(&mut engine, cp, id);
+            if let Some(control) = adopt_control.take() {
+                let _ = control.install(&mut engine);
+            }
+        } else {
+            // Adopted with no screen to restore: the shell's mark authority
+            // still crosses (see `hold_adopted_shell_nonce_requirement`).
+            hold_adopted_shell_nonce_requirement(&mut engine, id);
         }
     }
 
@@ -1375,16 +1421,81 @@ pub(crate) fn spawn_session(
     // pulse: their restored screen is already exact, and a shell's line editor
     // redrawing over it would only add churn. (Deferred-reader adoptions pulse
     // here too: the repaint bytes wait in the kernel queue until attach.)
+    //
+    // A REPAINT adoption pulses on EITHER screen (the 2026-09-22/23 update
+    // audit, plan P0-1e/P0-2): its engine is blank on purpose — the producer
+    // could not carry the real screen, or this build refused the carried one
+    // and degraded that single session rather than the whole update — so there
+    // is no exact screen for a redraw to churn, and without the pulse the
+    // program would sit on an empty pane until it next printed.
     #[cfg(unix)]
-    if adopt_checkpoint
-        .as_ref()
-        .is_some_and(|cp| cp.modes.alternate_screen)
-    {
+    if adoption_needs_size_pulse(adopt_checkpoint.as_ref(), adopt_repaint) {
         aterm_pty::resize_with_cell_px(master, rows.saturating_sub(1).max(1), cols, cell_px);
         aterm_pty::resize_with_cell_px(master, rows, cols, cell_px);
     }
+    // No seamless handoff off Unix, so nothing is ever adopted for a repaint.
+    #[cfg(not(unix))]
+    let _ = adopt_repaint;
 
     Ok(session)
+}
+
+/// Whether an ADOPTED session's PTY gets the rows-1 → rows size pulse that
+/// makes the program in it redraw: when it restored onto the alternate screen
+/// (a TUI whose last full redraw died with the old window), or when its screen
+/// is blank on purpose (`Adopted::repaint` — the producer could not carry it, or
+/// this build refused it and degraded the one session instead of the update,
+/// the 2026-09-22/23 update audit). A main-screen shell restored exactly is
+/// left alone: its line editor redrawing over an exact screen is only churn.
+/// Named so the rule is tested without a PTY.
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only Unix hands PTYs across a seamless update")
+)]
+fn adoption_needs_size_pulse(
+    checkpoint: Option<&aterm_core::terminal::TerminalCheckpoint>,
+    repaint: bool,
+) -> bool {
+    repaint || checkpoint.is_some_and(|cp| cp.modes.alternate_screen)
+}
+
+#[cfg(test)]
+mod adoption_pulse_tests {
+    use super::adoption_needs_size_pulse;
+
+    /// The pulse rule, all four ways. The two REPAINT rows are the new ones:
+    /// before them a blank-on-purpose adoption on the main screen — a shell
+    /// whose carried screen the successor refused — sat on an empty pane until
+    /// the program next happened to print.
+    #[test]
+    fn a_repaint_adoption_pulses_on_either_screen_and_an_exact_shell_does_not() {
+        let main = aterm_core::terminal::Terminal::new(24, 80)
+            .checkpoint_carry(0)
+            .expect("a fresh engine is Ground");
+        let alt = {
+            let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
+            terminal.process(b"\x1b[?1049h");
+            terminal
+                .checkpoint_carry(0)
+                .expect("Ground after the DECSET")
+        };
+        assert!(
+            !adoption_needs_size_pulse(Some(&main), false),
+            "an exact main-screen shell keeps its screen"
+        );
+        assert!(
+            adoption_needs_size_pulse(Some(&alt), false),
+            "an alt-screen TUI is told to redraw, as before"
+        );
+        assert!(
+            adoption_needs_size_pulse(Some(&main), true),
+            "a blank main screen is repainted"
+        );
+        assert!(
+            adoption_needs_size_pulse(None, true),
+            "and so is a session adopted onto a blank engine with no checkpoint at all"
+        );
+    }
 }
 
 /// (Re)attach the live byte pipeline to `session`: the helper threads (cast /
@@ -4628,13 +4739,21 @@ mod reroute_path_env_tests {
     /// and started it at pri 31, the band of the program being typed into, because
     /// a thread's QoS does not cross the spawn. The probe shell now reports its own
     /// priority as its "PATH".
+    ///
+    /// The verdict is the band the shell reports, never how fast it reports it.
+    /// The budget only ends a lookup that never answers, so it is generous. The
+    /// clamp under test puts the shell, its subshell and its `ps` below every
+    /// default-band process on the machine, and a suite run beside other builds is
+    /// that load, so a healthy probe answers as late as the load makes it. A probe
+    /// still running at the deadline is killed and the lookup answers `None`, which
+    /// the `expect` below would report as a missing answer rather than a wrong band.
     #[test]
     #[cfg(target_os = "macos")]
     fn login_path_shell_runs_below_the_inherited_band() {
         let path = super::login_shell_path_with(
             "/bin/sh",
             &["-c", "printf '/pri:%s\\n' \"$(/bin/ps -o pri= -p $$)\""],
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
         )
         .expect("the probe shell answered");
         let pri: i32 = path
@@ -4653,41 +4772,70 @@ mod reroute_path_env_tests {
     /// grandchild holding the stdout pipe after the shell is killed; joining a
     /// read-to-EOF reader then waited for the grandchild, holding back `atpkg
     /// seed` and every update pass for as long as it lived.
+    ///
+    /// The bound is the grandchild's own lifetime. A lookup that waits for EOF on
+    /// the pipe the `sleep` holds cannot return before the `sleep` ends, and that
+    /// is after `JOB` because the clock starts first. Everything a healthy lookup
+    /// spends besides its budget, the fork of this process and the reap of a
+    /// shell running below the default band, grows with the machine's load, so a
+    /// few seconds of slack is not a bound it can be held to.
     #[test]
     #[cfg(unix)]
     fn login_path_budget_bounds_a_grandchild_holding_stdout() {
+        const JOB: std::time::Duration = std::time::Duration::from_secs(60);
+        let script = format!("sleep {}; printf '/a:/b\\n'", JOB.as_secs());
         let started = std::time::Instant::now();
         let path = super::login_shell_path_with(
             "/bin/sh",
-            &["-c", "sleep 8; printf '/a:/b\\n'"],
+            &["-c", script.as_str()],
             std::time::Duration::from_millis(300),
         );
+        let elapsed = started.elapsed();
         assert_eq!(path, None);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "blocked {:?}",
-            started.elapsed()
-        );
+        assert!(elapsed < JOB, "waited for the grandchild: {elapsed:?}");
     }
 
     /// …and an rc file that backgrounds a job without redirecting its stdout
     /// (`somedaemon &`) must not hold the answer hostage once the shell has
     /// printed its PATH and exited.
+    ///
+    /// The bound is the job's own lifetime, so it separates the two outcomes by
+    /// cause, not by a guess about load. The job starts after the clock does and
+    /// is killed only once the lookup has returned, so a lookup that waits for EOF
+    /// on the pipe the job holds returns after `JOB` on any machine, and one that
+    /// returns before `JOB` did not wait for the job. The budget sits well inside
+    /// `JOB` and is generous because the shell runs behind the utility clamp
+    /// (`qos::command`), below every default-band build beside the suite.
+    ///
+    /// The answer carries the job's pid so the test can end the job. A job left
+    /// to run out its minute would keep every unflagged fd this process had open
+    /// at the fork, and a sibling test's closed pipe peer would read as alive for
+    /// that long.
     #[test]
     #[cfg(unix)]
     fn login_path_returns_despite_a_backgrounded_rc_job() {
+        const JOB: std::time::Duration = std::time::Duration::from_secs(60);
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+        let script = format!("sleep {} & printf '/a:/b:%s\\n' \"$!\"", JOB.as_secs());
         let started = std::time::Instant::now();
-        let path = super::login_shell_path_with(
-            "/bin/sh",
-            &["-c", "sleep 8 & printf '/a:/b\\n'"],
-            std::time::Duration::from_secs(2),
-        );
+        let path = super::login_shell_path_with("/bin/sh", &["-c", script.as_str()], BUDGET);
+        let elapsed = started.elapsed();
+        let job = path
+            .as_deref()
+            .and_then(|line| line.strip_prefix("/a:/b:"))
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|&pid| pid > 0);
+        // Before `JOB` the job is still sleeping, so its pid is still its own.
+        if let Some(pid) = job.filter(|_| elapsed < JOB) {
+            // SAFETY: `kill` takes no pointers, and `pid` is positive, so it
+            // names one process and never a group.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "blocked {:?}",
-            started.elapsed()
+            elapsed < JOB,
+            "waited for the backgrounded job: {elapsed:?}"
         );
-        assert_eq!(path.as_deref(), Some("/a:/b"));
+        assert!(job.is_some(), "no PATH carrying the job's pid: {path:?}");
     }
 
     /// A GUI WITH A FOREGROUND CONTROLLING TERMINAL (`aterm --window` typed at a
@@ -4699,6 +4847,18 @@ mod reroute_path_env_tests {
     /// The lookup runs in a re-exec of this test binary under `forkpty`, so it has
     /// a controlling tty in the foreground, and the tty stays out of the
     /// parallel test process.
+    ///
+    /// THE ANSWER IS THE CHECK, NOT A STOPWATCH (2026-09-24). A shell stopped by
+    /// SIGTTOU never exits, and the lookup answers `None` for any shell that has
+    /// not exited by its deadline, so the regression fails the `Some` assertion
+    /// at every budget. A healthy shell answers late only on a busy machine: since
+    /// 1513cda06 the lookup starts it under `taskpolicy -c utility`
+    /// (`qos::command`), below every default-band build on the machine, and at a
+    /// load average near 20 a healthy answer took 1.34 s. The `< 1 s` bound this
+    /// test carried was set before that clamp, failed that run, and separated
+    /// nothing the `Some` assertion does not. The budget is only the backstop
+    /// that ends a regressed run, so it is generous, and it stays well inside the
+    /// parent's 60 s so the child reports its own `None`.
     #[test]
     #[cfg(unix)]
     fn login_path_answers_under_a_foreground_controlling_tty() {
@@ -4706,18 +4866,24 @@ mod reroute_path_env_tests {
         const CHILD: &str = "ATERM_TEST_LOGIN_PATH_UNDER_A_PTY";
         const ZSH: &str = "/bin/zsh";
         if std::env::var_os(CHILD).is_some() {
+            // The regression needs this process in the foreground of a
+            // controlling tty. Without that the shell has nothing to stop on, and
+            // a pass would prove nothing.
+            // SAFETY: both calls take no pointers and only read process state.
+            let (foreground, own) =
+                unsafe { (libc::tcgetpgrp(libc::STDIN_FILENO), libc::getpgrp()) };
+            assert_eq!(
+                foreground, own,
+                "the re-exec is not in the foreground of a controlling tty"
+            );
             let started = std::time::Instant::now();
             let path = super::login_shell_path_with(
                 ZSH,
                 &["-f", "-i", "-c", "printf '/a:/b\\n'"],
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(20),
             );
             let elapsed = started.elapsed();
             assert_eq!(path.as_deref(), Some("/a:/b"), "after {elapsed:?}");
-            assert!(
-                elapsed < std::time::Duration::from_secs(1),
-                "took {elapsed:?}"
-            );
             return;
         }
         if !std::path::Path::new(ZSH).exists() {

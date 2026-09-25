@@ -66,10 +66,9 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_AGENTS_DIR",
     "ATERM_REROUTE_DIR",
     "__ATERM_REROUTE_PASSTHROUGH",
-    // atpkg's shell hook → the shell integration, and the lane's own children.
+    // atpkg's shell hook → the shell integration, and a pass → its own children.
     "ATPKG_AGENTS",
     "ATPKG_SPAWNER_PID",
-    "ATPKG_LANE_PARENT",
     // Every child of the window, and the session identity it hands a shell.
     "ATERM_CHILD",
     "ATERM_SESSION_ID",
@@ -120,7 +119,6 @@ const INTERNAL_PROTOCOL: &[&str] = &[
 
 /// Compile-time values (`env!` / `option_env!`) the build derives or the cutter sets.
 const BUILD_STAMPS: &[&str] = &[
-    "ATERM_APP_RELEASE_VERSION",
     "ATERM_ATPKG_INDEX_OWNER",
     "ATERM_BINARY_TARGET",
     "ATERM_BUILD_NUMBER",
@@ -139,6 +137,7 @@ const BUILD_STAMPS: &[&str] = &[
     "ATERM_GIT_DIRTY",
     "ATERM_PUBLISH_OWNER",
     "ATERM_PUBLISH_REPO",
+    "ATERM_RELEASE_BUILD",
     "ATERM_TRUST_VERIFY",
     "ATERM_UPDATE_PIN_SHA256",
 ];
@@ -154,6 +153,9 @@ const DEV_SEAMS: &[&str] = &[
     "ATERM_DEBUG_SEAMLESS_REEXEC",
     "ATERM_DEBUG_RELAUNCH_NUDGE",
     "ATERM_DEBUG_STATUS_BARS",
+    // The strain row's fake saturated reading (strain_host.rs `debug_load`), for
+    // captures and demos.
+    "ATERM_DEBUG_STRAIN",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
     "ATERM_SESSION_MODEL",
@@ -245,6 +247,12 @@ const OUT_OF_SCOPE: &[&str] = &[
     "ATERM_VERIFY_LOG",
     "ATERM_VERIFY_SNAPSHOT",
     "ATERM_VERIFY_TIMINGS",
+    // The gate's own fixture tests move its machine lock off the per-user one
+    // (`snapshot::MACHINE_LOCK_DIR_ENV`), so a gate never waits on its own test stage.
+    "ATERM_VERIFY_MACHINE_LOCK_DIR",
+    // A gate started by the one holding the machine runs inside its hold
+    // (`snapshot::MACHINE_HOLDER_ENV`) instead of waiting on its own ancestor.
+    "ATERM_VERIFY_MACHINE_HOLDER",
     // The verify gate → the build it runs (its own provenance stamps).
     "ATERM_BUILD_GIT_COMMIT",
     "ATERM_BUILD_GIT_COMMIT_FULL",

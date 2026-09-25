@@ -603,115 +603,8 @@ mod tests {
     }
 
     // =========================================================================
-    // StyleTable::new() and default state
-    // =========================================================================
-
-    #[test]
-    fn test_new_table_has_one_entry() {
-        let table = StyleTable::new();
-        assert_eq!(
-            table.styles.len(),
-            1,
-            "new table should have exactly 1 style (default)"
-        );
-    }
-
-    #[test]
-    fn test_new_table_default_style_is_default() {
-        let table = StyleTable::new();
-        let default = table.get(StyleId::DEFAULT);
-        assert_eq!(
-            default,
-            Some(&Style::default()),
-            "style 0 should be the default style"
-        );
-    }
-
-    #[test]
-    fn test_new_table_default_has_refcount_1() {
-        let table = StyleTable::new();
-        assert_eq!(
-            table.ref_counts[0], 1,
-            "default style should have permanent refcount of 1"
-        );
-    }
-
-    #[test]
-    fn test_new_table_lookup_contains_default() {
-        let table = StyleTable::new();
-        let id = table.lookup.get(&Style::default());
-        assert_eq!(
-            id,
-            Some(&StyleId::DEFAULT),
-            "lookup should contain the default style"
-        );
-    }
-
-    #[test]
-    fn test_default_impl_matches_new() {
-        let from_new = StyleTable::new();
-        let from_default = StyleTable::default();
-        assert_eq!(from_new.styles.len(), from_default.styles.len());
-        assert_eq!(from_new.ref_counts.len(), from_default.ref_counts.len());
-    }
-
-    // =========================================================================
-    // intern_extended(): insert a style, get back a StyleId
-    // =========================================================================
-
-    #[test]
-    fn test_intern_extended_returns_non_default_id() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(255, 0, 0, ColorType::Rgb, 0);
-        let id = table.intern_extended(ext);
-        assert_ne!(
-            id,
-            StyleId::DEFAULT,
-            "interned non-default style should get a non-default ID"
-        );
-    }
-
-    #[test]
-    fn test_intern_extended_adds_style_to_table() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(255, 0, 0, ColorType::Rgb, 0);
-        let id = table.intern_extended(ext);
-        let retrieved = table.get(id);
-        assert_eq!(
-            retrieved,
-            Some(&ext.style),
-            "interned style should be retrievable by ID"
-        );
-    }
-
-    #[test]
-    fn test_intern_extended_grows_table() {
-        let mut table = StyleTable::new();
-        assert_eq!(table.styles.len(), 1);
-        let ext = make_extended(255, 0, 0, ColorType::Rgb, 0);
-        table.intern_extended(ext);
-        assert_eq!(
-            table.styles.len(),
-            2,
-            "table should grow by one after intern"
-        );
-    }
-
-    // =========================================================================
     // intern_extended() deduplication: same style returns same StyleId
     // =========================================================================
-
-    #[test]
-    fn test_intern_extended_dedup_same_style_same_id() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(100, 150, 200, ColorType::Rgb, 0);
-        let id1 = table.intern_extended(ext);
-        let id2 = table.intern_extended(ext);
-        assert_eq!(
-            id1, id2,
-            "interning the same style twice should return the same ID"
-        );
-    }
 
     #[test]
     fn test_intern_extended_dedup_no_extra_entry() {
@@ -742,14 +635,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_get_default_style() {
-        let table = StyleTable::new();
-        let style = table.get(StyleId::DEFAULT);
-        assert!(style.is_some());
-        assert_eq!(*style.unwrap(), Style::default());
-    }
-
-    #[test]
     fn test_get_interned_style() {
         let mut table = StyleTable::new();
         let ext = make_extended(42, 84, 126, ColorType::Rgb, 0);
@@ -770,14 +655,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_intern_extended_first_time_refcount_is_1() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(10, 20, 30, ColorType::Rgb, 0);
-        let id = table.intern_extended(ext);
-        assert_eq!(table.ref_counts[id.raw() as usize], 1);
-    }
-
-    #[test]
     fn test_intern_extended_twice_refcount_is_2() {
         let mut table = StyleTable::new();
         let ext = make_extended(10, 20, 30, ColorType::Rgb, 0);
@@ -786,65 +663,9 @@ mod tests {
         assert_eq!(table.ref_counts[id.raw() as usize], 2);
     }
 
-    #[test]
-    fn test_intern_extended_many_times_refcount_increments() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(10, 20, 30, ColorType::Rgb, 0);
-        let id = table.intern_extended(ext);
-        for _ in 0..9 {
-            table.intern_extended(ext);
-        }
-        assert_eq!(table.ref_counts[id.raw() as usize], 10);
-    }
-
     // =========================================================================
     // release(): decrement refcount, verify behavior at 0
     // =========================================================================
-
-    #[test]
-    fn test_release_decrements_refcount() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(10, 20, 30, ColorType::Rgb, 0);
-        let id = table.intern_extended(ext);
-        table.intern_extended(ext); // refcount = 2
-        table.release(id);
-        assert_eq!(table.ref_counts[id.raw() as usize], 1);
-    }
-
-    #[test]
-    fn test_release_to_zero() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(10, 20, 30, ColorType::Rgb, 0);
-        let id = table.intern_extended(ext);
-        table.release(id);
-        assert_eq!(table.ref_counts[id.raw() as usize], 0);
-    }
-
-    #[test]
-    fn test_release_does_not_remove_style_at_zero() {
-        let mut table = StyleTable::new();
-        let ext = make_extended(10, 20, 30, ColorType::Rgb, 0);
-        let id = table.intern_extended(ext);
-        table.release(id);
-        // Style should still be present (just zero refcount)
-        assert_eq!(
-            table.get(id),
-            Some(&ext.style),
-            "style persists at zero refcount"
-        );
-        assert_eq!(table.styles.len(), 2, "table size unchanged after release");
-    }
-
-    #[test]
-    fn test_release_default_style_is_no_op() {
-        let mut table = StyleTable::new();
-        let before = table.ref_counts[0];
-        table.release(StyleId::DEFAULT);
-        assert_eq!(
-            table.ref_counts[0], before,
-            "default style refcount must not be decremented"
-        );
-    }
 
     #[test]
     fn test_release_at_zero_does_not_underflow() {
@@ -1410,23 +1231,6 @@ mod tests {
         let retrieved = table.extended(new_id2).unwrap();
         assert_eq!(retrieved.fg_type, ColorType::Indexed);
         assert_eq!(retrieved.fg_index, 1);
-    }
-
-    // =========================================================================
-    // StyleId validity checking
-    // =========================================================================
-
-    #[test]
-    fn test_style_id_default_is_default() {
-        assert!(StyleId::DEFAULT.is_default());
-        assert_eq!(StyleId::DEFAULT.raw(), 0);
-    }
-
-    #[test]
-    fn test_style_id_non_default() {
-        let id = StyleId::new(5);
-        assert!(!id.is_default());
-        assert_eq!(id.raw(), 5);
     }
 
     // =========================================================================

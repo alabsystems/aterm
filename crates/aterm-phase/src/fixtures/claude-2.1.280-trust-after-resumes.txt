@@ -1,7 +1,7 @@
 # claude-code 2.1.280 · MEASURED 2026-09-23, `aterm ctl text` of a private headless aterm (the harness audit live probe) · the folder-trust dialog under three earlier `Resume this session with:` exits · user, host and scratch-path UUID redacted at equal length
 user@a-mac-host-name-redactedxxxxxx work1 % which claude; claude --version; echo $TERM_PROGRAM; env | grep -c -E "^(CLAU
 DE|ANTHROPIC)"
-/Users//_user0/Library/Application Support/aterm/pkg/agents/claude
+/Users/_user0/Library/Application Support/aterm/pkg/agents/claude
 2.1.280 (Claude Code)
 aterm
 0

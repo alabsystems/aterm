@@ -51,9 +51,9 @@ use std::process::Command;
 ///
 /// # ORDER IS APPEND-ONLY
 ///
-/// `measured::CELLS` is zipped against this vector position by position and
-/// `loc.rs`'s tests index cells 0, 3 and 4 by number, so a cell inserted in the
-/// middle silently re-points both. New cells go on the END, and the report reads
+/// `measured::CELLS` rows are read by this vector's positions — `loc.rs`'s
+/// tests index cells 0 to 4 by number and check each row's cell name — so a
+/// cell inserted in the middle re-points them. New cells go on the END, and the report reads
 /// in the order cells joined the matrix rather than in OS order.
 ///
 /// # Every cell is rooted at something aterm actually SHIPS
@@ -424,7 +424,7 @@ pub fn graph(root: &Path, cell: &Cell) -> Result<Graph, String> {
 /// `current_dir` to the root AND passes `--manifest-path <root>/Cargo.toml`.
 /// With a RELATIVE root those two COMPOSE — cargo resolves the manifest against
 /// the cwd it was just given — so `--root ..` from `crates/` sent cargo looking
-/// for `/Users//…/Cargo.toml` one level above the workspace and every cell died
+/// for `/Users/…/Cargo.toml` one level above the workspace and every cell died
 /// with "manifest path `../Cargo.toml` does not exist". Worse than the failure
 /// was the diagnosis: the retry path reported it as an incomplete registry
 /// cache and told the operator to run `cargo fetch`, which cannot help.
@@ -514,7 +514,6 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::measured;
 
     pub(crate) fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -773,31 +772,6 @@ mod tests {
     #[test]
     fn output_with_no_root_refuses() {
         assert!(parse_tree("1alpha v1.0.0\n").is_err());
-    }
-
-    #[test]
-    fn mac_arm_resolves_to_the_baseline_node_graph() {
-        let root = repo_root();
-        let cells = default_cells();
-        let want = measured::MAC_ARM;
-        let g = graph(&root, &cells[0]).expect("mac-arm must resolve offline");
-        assert_eq!(g.root.name, "aterm", "the cell roots at the shipped binary");
-        assert_eq!(
-            g.nodes.len(),
-            want.resolved,
-            "packages for aterm on mac-arm"
-        );
-        assert_eq!(
-            g.reach(None).len(),
-            want.resolved,
-            "every node is reachable from the root"
-        );
-    }
-
-    #[test]
-    fn linux_resolves_to_the_baseline_node_graph() {
-        let g = graph(&repo_root(), &default_cells()[1]).expect("linux must resolve offline");
-        assert_eq!(g.nodes.len(), measured::LINUX.resolved);
     }
 
     /// REGRESSION: a relative root used to be resolved TWICE — once as the

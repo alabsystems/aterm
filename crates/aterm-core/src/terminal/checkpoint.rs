@@ -404,10 +404,14 @@ pub struct TerminalCheckpoint {
     pub secure_keyboard_entry: bool,
     /// Current working directory (OSC 7).
     pub current_working_directory: Option<String>,
-    /// Parser was in Ground state at capture time (B.3.3 invariant).
+    /// The parser this checkpoint restores into is in Ground (B.3.3): either
+    /// the live parser was Ground at capture time, or the capture
+    /// ([`Terminal::checkpoint_carry_abandoning_partial`]) cancelled a
+    /// partial sequence in the copy, as CAN would.
     pub parser_ground: bool,
-    /// The authorized shell-integration nonce — set ONLY by
-    /// [`Terminal::checkpoint_carry`], the seamless-handoff projection, and
+    /// The authorized shell-integration nonce — set ONLY by the
+    /// seamless-handoff projections ([`Terminal::checkpoint_carry`] and
+    /// [`Terminal::checkpoint_carry_abandoning_partial`]), and
     /// `None` in every in-memory checkpoint. Never installed by a restore: the
     /// adopting host authorizes it explicitly (auth is a host binding, see the
     /// EXCLUDED block).
@@ -463,19 +467,108 @@ impl Terminal {
     /// lines as the visible grid and pushes everything before them into an
     /// unlimited scrollback.
     ///
-    /// This is also the one projection that carries the authorized
-    /// shell-integration nonce ([`TerminalCheckpoint::shell_integration_nonce`]):
-    /// the adopted shell keeps signing its marks with it across the update.
+    /// This (with its mid-sequence twin,
+    /// [`Self::checkpoint_carry_abandoning_partial`]) is also the one
+    /// projection that carries the authorized shell-integration nonce
+    /// ([`TerminalCheckpoint::shell_integration_nonce`]): the adopted shell
+    /// keeps signing its marks with it across the update.
     #[must_use]
     pub fn checkpoint_carry(&self, max_history: usize) -> Option<TerminalCheckpoint> {
         self.parser_is_ground().then(|| {
             let mut c = self.checkpoint_bounded(max_history, 0);
-            c.shell_integration_nonce = self
-                .shell_integration_auth
-                .nonce()
-                .map(ShellIntegrationNonce);
+            c.shell_integration_nonce = self.carried_shell_integration_nonce();
             c
         })
+    }
+
+    /// [`Self::checkpoint_carry`] for a parser that may be mid-sequence: the
+    /// same projection (visible screen plus at most `max_history` lines, the
+    /// inactive grid pinned to its visible rows), taken WITHOUT the Ground
+    /// precondition, plus the name of the parser state whose partial sequence
+    /// the projection leaves out (`None` when the parser was already Ground,
+    /// in which case the checkpoint equals `checkpoint_carry(max_history)`).
+    ///
+    /// Why it exists: a session's parser can sit outside Ground indefinitely
+    /// — an unterminated OSC/DCS/APC string (`printf '\e]0;x'`) ends only on
+    /// BEL, ST, CAN, SUB or ESC, and an ssh session stalled mid-escape or a
+    /// Ctrl-S mid-SGR leaves a CSI half-read. The park gate only waits for a
+    /// quiet PTY, so `checkpoint_carry` returning `None` made the in-session
+    /// update refuse "a terminal parser was mid-sequence" on every attempt for
+    /// as long as that tab stayed that way (the 2026-09-22/23 update audit).
+    ///
+    /// The semantics are CAN (0x18) applied to the COPY: the carried
+    /// checkpoint describes the engine as if the partial sequence had been
+    /// cancelled, so `parser_ground` is `true` and a terminal restored from it
+    /// starts in Ground and treats the next byte as fresh input. The LIVE
+    /// terminal is only read — its parser keeps the partial sequence — so a
+    /// handoff that rolls back resumes byte-exactly where it parked.
+    ///
+    /// WHAT IT COSTS DEPENDS ON THE REST OF THE SEQUENCE, and the caller owns
+    /// that. Whatever of the sequence the program still sends reaches the
+    /// restored engine's Ground parser as ordinary input: the tail of a split
+    /// `ESC [ 38;5;196 m` prints `6m`, the rest of a sixel or kitty-graphics
+    /// payload prints as screens of base64, and a split mode set is silently
+    /// lost — exactly what a CAN mid-sequence does in any terminal. For a
+    /// STALLED sequence (the program went quiet, the case this exists for) that
+    /// tail is at most a late handful of bytes, and dropping one half-received
+    /// title, colour or image is the whole cost; refusing cost the update. For
+    /// a sequence whose tail is ALREADY QUEUED on the PTY (a reader parked in
+    /// the middle of a flood) it is visible garbage in the transcript, so the
+    /// seamless capture does not abandon there: it asks
+    /// [`Self::partial_sequence_state`] first and treats a mid-sequence parser
+    /// over queued output as a timing miss, re-parked a moment later on a
+    /// sequence boundary (the 2026-09-24 review of the update audit branch).
+    #[must_use]
+    pub fn checkpoint_carry_abandoning_partial(
+        &self,
+        max_history: usize,
+    ) -> (TerminalCheckpoint, Option<&'static str>) {
+        let mut carry = self.project_bounded(max_history, 0, true);
+        carry.shell_integration_nonce = self.carried_shell_integration_nonce();
+        (carry, self.partial_sequence_state())
+    }
+
+    /// The authorized shell-integration nonce as the two seamless-handoff
+    /// projections carry it — [`Self::checkpoint_carry`] and
+    /// [`Self::checkpoint_carry_abandoning_partial`], and no other.
+    fn carried_shell_integration_nonce(&self) -> Option<ShellIntegrationNonce> {
+        self.shell_integration_auth
+            .nonce()
+            .map(ShellIntegrationNonce)
+    }
+
+    /// The parser state a partial escape sequence is sitting in (`CsiParam`,
+    /// `OscString`, `SosPmApcString`, …), or `None` at Ground — the name
+    /// [`Self::checkpoint_carry_abandoning_partial`] reports when it leaves that
+    /// sequence out.
+    ///
+    /// Exists so the seamless-update capture can decide BEFORE it projects
+    /// anything whether abandoning is safe: a parser mid-sequence over output
+    /// still queued on its PTY would have that queued tail printed as text by
+    /// the successor, so the capture misses that park (timing) instead of
+    /// carrying the session (the 2026-09-24 review of the 2026-09-22/23 update
+    /// audit fixes). A pure read of the parser; nothing is projected.
+    #[must_use]
+    pub fn partial_sequence_state(&self) -> Option<&'static str> {
+        let state = self.parser.state();
+        (!state.is_ground()).then(|| state.name())
+    }
+
+    /// Whether the engine holds an INACTIVE grid — the one a checkpoint
+    /// carries as `alt_grid` (the saved primary while the alternate screen is
+    /// up, or the alternate screen's grid kept after it was left).
+    ///
+    /// A carry's cell cost depends on it (the inactive grid is a second visible
+    /// grid), and the seamless capture must price a carry exactly as the
+    /// consumer and `screen_digest` will — with the inactive grid only when it
+    /// is really carried — BEFORE it pays for the projection. Pricing every
+    /// exact carry as if it had one made the capture refuse an exact visible
+    /// screen that fit, and then carry the same session blank at the same
+    /// geometry and cost (the 2026-09-24 review of the 2026-09-22/23 update
+    /// audit fixes). A pure read; nothing is projected.
+    #[must_use]
+    pub fn has_inactive_grid(&self) -> bool {
+        self.alt_grid.is_some()
     }
 
     fn checkpoint_with_scrollback(&self, include_scrollback: bool) -> TerminalCheckpoint {
@@ -502,7 +595,20 @@ impl Terminal {
             self.parser_is_ground(),
             "checkpoint() requires parser_is_ground() (B.3.3)"
         );
+        self.project_bounded(max_history, inactive_max_history, self.parser_is_ground())
+    }
 
+    /// The projection itself, with no parser precondition: `parser_ground` is
+    /// what the checkpoint RECORDS about the parser. [`Self::checkpoint_bounded`]
+    /// records the live state (and asserts it is Ground);
+    /// [`Self::checkpoint_carry_abandoning_partial`] records `true`, because
+    /// the partial sequence it leaves out is cancelled in the copy.
+    fn project_bounded(
+        &self,
+        max_history: usize,
+        inactive_max_history: usize,
+        parser_ground: bool,
+    ) -> TerminalCheckpoint {
         let rows = self.grid.rows();
         let cols = self.grid.cols();
         let grid_lines = self.grid.checkpoint_lines_bounded(max_history);
@@ -562,7 +668,7 @@ impl Terminal {
             taskbar_progress: self.taskbar_progress,
             secure_keyboard_entry: self.secure_keyboard_entry,
             current_working_directory: self.current_working_directory.clone(),
-            parser_ground: self.parser_is_ground(),
+            parser_ground,
             shell_integration_nonce: None,
         }
     }
@@ -1470,6 +1576,174 @@ mod tests {
         }
         assert_eq!(t.cursor().row, 55);
         assert_eq!(restored.cursor(), t.cursor());
+    }
+
+    /// The 2026-09-22/23 update audit's stuck-parser desk: `printf '\e]0;x'`
+    /// with no terminator leaves the parser in `OscString` until more output
+    /// arrives, and `checkpoint_carry` refuses (`None`) the whole time, so
+    /// the in-session update refused on every attempt. The abandoning carry
+    /// projects it anyway, names what it dropped, restores into Ground, and
+    /// leaves the LIVE parser mid-OSC so a rolled-back handoff loses nothing.
+    #[test]
+    fn an_unterminated_osc_is_carried_by_abandoning_it() {
+        let mut t = Terminal::new(4, 20);
+        t.process(b"hello\x1b]0;x");
+        assert!(!t.parser_is_ground());
+        assert!(
+            t.checkpoint_carry(0).is_none(),
+            "control: the Ground-only carry refuses this desk"
+        );
+
+        let (cp, abandoned) = t.checkpoint_carry_abandoning_partial(0);
+        assert_eq!(abandoned, Some("OscString"), "the dropped state is named");
+        assert!(
+            cp.parser_ground,
+            "the projection describes the cancelled (Ground) parser"
+        );
+        assert_eq!(cp.history_lines, 0);
+
+        // The live parser was only read: still mid-OSC, and finishing the
+        // sequence completes the ORIGINAL title — nothing was consumed.
+        assert!(!t.parser_is_ground(), "the live parser is not mutated");
+        t.process(b"\x07");
+        assert!(t.parser_is_ground());
+        assert_eq!(t.title(), "x", "the live partial OSC survived the capture");
+
+        // The restored engine starts in Ground and takes new text normally.
+        let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+        assert!(restored.parser_is_ground());
+        restored.process(b" world");
+        assert_eq!(
+            restored.row_text(0).as_deref().map(str::trim_end),
+            Some("hello world")
+        );
+        assert_eq!(restored.title(), "", "the abandoned OSC never dispatched");
+
+        // "Abandoning" is exactly CAN: a twin fed the same bytes then CAN
+        // checkpoints identically through the ordinary Ground-only carry.
+        let mut twin = Terminal::new(4, 20);
+        twin.process(b"hello\x1b]0;x\x18");
+        assert_eq!(twin.checkpoint_carry(0), Some(cp));
+    }
+
+    /// Every non-Ground state the parser can be parked in is carried, named
+    /// by its `Debug` spelling, and restored into Ground — and none of them
+    /// trips `checkpoint_bounded`'s Ground `debug_assert` (these tests run
+    /// with debug assertions on, so a path through it would panic here).
+    #[test]
+    fn every_partial_parser_state_is_carried_and_named() {
+        let partials: [(&[u8], &str); 9] = [
+            (b"\x1b", "Escape"),
+            (b"\x1b(", "EscapeIntermediate"),
+            (b"\x1b[", "CsiEntry"),
+            (b"\x1b[1;", "CsiParam"),
+            (b"\x1b[?1$", "CsiIntermediate"),
+            (b"\x1bP", "DcsEntry"),
+            (b"\x1bPq#0;2;0;0;0", "DcsPassthrough"),
+            (b"\x1b]2;half a title", "OscString"),
+            (b"\x1b_Gf=100;", "SosPmApcString"),
+        ];
+        for (partial, expected) in partials {
+            let mut t = Terminal::new(6, 30);
+            t.process(b"\x1b[1mbold\x1b[0m\r\n");
+            for i in 0..12 {
+                t.process(format!("history {i}\r\n").as_bytes());
+            }
+            t.process(partial);
+            let live_state = t.parser.state();
+            assert_eq!(live_state.name(), expected, "{partial:?}");
+
+            let (cp, abandoned) = t.checkpoint_carry_abandoning_partial(5);
+            assert_eq!(
+                abandoned.map(str::to_owned),
+                Some(format!("{live_state:?}")),
+                "{partial:?}"
+            );
+            assert_eq!(cp.history_lines, 5, "the history bound still applies");
+            assert_eq!(t.parser.state(), live_state, "live parser untouched");
+
+            let restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+            assert!(restored.parser_is_ground(), "{partial:?}");
+            assert_eq!(restored.visible_content(), t.visible_content());
+        }
+    }
+
+    /// On a Ground parser the abandoning carry IS the ordinary carry — so a
+    /// producer can call it unconditionally without changing a healthy desk's
+    /// bytes (and so the adoption digest of every healthy carry is unchanged).
+    #[test]
+    fn the_abandoning_carry_of_a_ground_parser_is_the_ordinary_carry() {
+        let t = build_rich_terminal(12, 40);
+        for max_history in [0, 3, usize::MAX] {
+            assert_eq!(
+                t.checkpoint_carry_abandoning_partial(max_history),
+                (t.checkpoint_carry(max_history).expect("Ground"), None)
+            );
+        }
+    }
+
+    /// The two pre-projection reads the seamless capture prices and gates a
+    /// carry with agree with the projection they stand in for: the partial
+    /// sequence named is the one the abandoning carry drops, and the inactive
+    /// grid is present exactly when the checkpoint carries an `alt_grid` —
+    /// before 1049 (none), on the alternate screen (the saved primary), and
+    /// after leaving it (the kept alternate grid, which is why this cannot be
+    /// read off `is_alternate_screen`).
+    #[test]
+    fn the_pre_projection_reads_agree_with_the_projection() {
+        let mut t = Terminal::new(6, 30);
+        assert_eq!(t.partial_sequence_state(), None);
+        assert!(!t.has_inactive_grid());
+        assert!(t.checkpoint_carry(0).expect("Ground").alt_grid.is_none());
+
+        t.process(b"\x1b[?1049h");
+        assert!(t.has_inactive_grid());
+        assert!(t.checkpoint_carry(0).expect("Ground").alt_grid.is_some());
+
+        t.process(b"\x1b[?1049l");
+        assert!(!t.is_alternate_screen());
+        assert_eq!(
+            t.has_inactive_grid(),
+            t.checkpoint_carry(0).expect("Ground").alt_grid.is_some(),
+            "after 1049 exit the read still matches the projection"
+        );
+
+        t.process(b"\x1b[38;5;19");
+        assert_eq!(t.partial_sequence_state(), Some("CsiParam"));
+        assert_eq!(
+            t.checkpoint_carry_abandoning_partial(0).1,
+            t.partial_sequence_state()
+        );
+        t.process(b"6m");
+        assert_eq!(t.partial_sequence_state(), None);
+    }
+
+    /// The abandoning carry is a seamless-handoff projection too, so it carries
+    /// the authorized shell-integration nonce exactly as `checkpoint_carry`
+    /// does — a tab whose parser was mid-sequence at the park keeps signing
+    /// its marks across the update (main's nonce carry, 2026-09-2x, meeting
+    /// the update audit's abandoning carry in the merge).
+    #[test]
+    fn the_abandoning_carry_carries_the_shell_integration_nonce() {
+        let nonce = [0x5Au8; 32];
+        let mut t = Terminal::new(4, 20);
+        t.authorize_shell_integration(nonce);
+        t.set_require_shell_integration_nonce(true);
+        let (ground, _) = t.checkpoint_carry_abandoning_partial(0);
+        assert_eq!(
+            ground.shell_integration_nonce,
+            Some(ShellIntegrationNonce(nonce))
+        );
+        assert_eq!(Some(ground), t.checkpoint_carry(0));
+
+        t.process(b"\x1b]0;half");
+        let (partial, abandoned) = t.checkpoint_carry_abandoning_partial(0);
+        assert_eq!(abandoned, Some("OscString"));
+        assert_eq!(
+            partial.shell_integration_nonce,
+            Some(ShellIntegrationNonce(nonce)),
+            "a mid-sequence tab keeps its nonce across the handoff"
+        );
     }
 
     /// The handoff projection carries the authorized shell-integration nonce;

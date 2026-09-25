@@ -7,24 +7,13 @@
 //!
 //! # What this module is for
 //!
-//! Under one paper master and many machine keys, a cut has to answer a question the
-//! one-key design never had to: *may THIS machine publish?* The old answer was an
-//! equality check — the configured key's public identity had to equal
-//! `UPDATE_CHANNEL_PUBKEYS[0]`, which is exactly one key, so exactly one machine could
-//! ever cut. That is precisely what the owner's decision removes, and it is the reason
-//! this module exists.
-//!
-//! The new answer is [`authorize_cut`]: the material must be a machine NAMED by a valid,
-//! unrevoked, master-signed roster whose master is one of the pinned anchors. The gate is
-//! the client's own verifier over the exact bytes to be published, run at cut time.
-//!
-//! That is the WHOLE authorization question under an armed anchor — the committed channel
-//! keyset is not part of it, because the armed client does not consult its keyset either
-//! (`aterm_update::github::fetch_authoritative_release`). What the keyset still decides is
-//! a different question, about a different audience: whether clients that PREDATE the
-//! roster can verify this release at all. That is `publish::PreRosterClients`, and it is
-//! deliberately not here — this module answers "may this machine publish?", and the answer
-//! must not silently fold in "and is everyone able to read it?".
+//! Under one paper master and many machine keys, a cut has to answer: *may THIS machine
+//! publish?* The answer is [`authorize_cut`]: the material must be a machine NAMED by a
+//! valid, unrevoked, master-signed roster whose master is one of the pinned anchors. The
+//! gate is the client's own verifier over the exact bytes to be published, run at cut
+//! time — and it is the WHOLE authorization question, because the client consults nothing
+//! else (`aterm_update::github::fetch_authoritative_release`; the pre-roster channel
+//! keyset was retired 2026-09-23).
 //!
 //! It is HALF of the client's chain, not all of it, and saying so precisely matters. The
 //! client admits a roster on two conditions: freshness, and a durable replay floor it
@@ -226,10 +215,10 @@ impl RosterDocument {
 /// again under a re-signed roster.
 ///
 /// Six hours is the honest floor for that gap: a universal build + notarization + upload
-/// runs the better part of an hour, and the deployed staging window is six hours (see the
-/// cut's own DONE line, "fleet stages within 6h"). A roster with less than that left is
-/// one the fleet will refuse before it has finished taking the release, so refusing
-/// PRE-CLAIM — while refusing is free — is strictly the better place to find out.
+/// runs the better part of an hour, and a client polls on its own schedule after that. A
+/// roster with less than that left is one the fleet will refuse before it has finished
+/// taking the release, so refusing PRE-CLAIM — while refusing is free — is strictly the
+/// better place to find out.
 pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 
 /// THE CUT-TIME GATE. Prove that `signing_pubkey` belongs to a machine the roster
@@ -428,14 +417,9 @@ pub fn authorize_cut(
 
 /// Which key the roster maps `id` to, if any — for REFUSAL MESSAGES only.
 ///
-/// It exists because a remedy that names an action is a recommendation, and a
-/// recommendation whose consequence the program can compute but does not is worse than
-/// no recommendation at all. The mismatch refusal in
-/// [`crate::publish::channel_signature_policy`] used to offer "or cut with the key that
-/// belongs to <id>" unconditionally; on the one machine where the safe path actually
-/// runs — the bootstrap box, whose `~/.aterm/machine.toml` names ITSELF while the cut
-/// must go out under the incumbent head's key — that sentence points straight at the
-/// key that strands the installed base. So the message asks this first.
+/// It exists because a remedy that names an action is a recommendation: the mismatch
+/// refusal in [`crate::publish::channel_signature_policy`] offers "or cut with the key
+/// that belongs to <id>" only when the roster actually names that machine.
 ///
 /// Returns `None` for any input it cannot answer confidently: a roster that does not
 /// verify, does not parse, or does not name the id. A refusal is already being emitted,
@@ -602,8 +586,7 @@ mod tests {
         assert_eq!(who.roster_seq, 6);
     }
 
-    /// AN UNLISTED KEY may not cut. This is the check that replaces the old
-    /// "must equal UPDATE_CHANNEL_PUBKEYS[0]" equality — same refusal, wider allowance.
+    /// AN UNLISTED KEY may not cut.
     #[test]
     fn a_key_not_on_the_roster_may_not_cut() {
         let (bytes, sig, master) = roster(&[]);

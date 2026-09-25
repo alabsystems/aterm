@@ -671,81 +671,48 @@ mod tests {
         );
     }
 
+    /// `(selector, sequence, matches?)` — each selector against the
+    /// sequences its original one-case test drove, including the near misses.
     #[test]
-    fn catch_all_matches_everything() {
-        let sel = SequenceSelector::catch_all();
-        assert!(sel.matches(&DispatchedSequence::osc(4, [])));
-        assert!(sel.matches(&DispatchedSequence::csi(Some(20), 't', [])));
-        assert!(sel.matches(&DispatchedSequence::dcs("2000p")));
-    }
-
-    #[test]
-    fn osc_52_set_matches_clipboard_write() {
-        let sel = SequenceSelector::parse("OSC 52 set").expect("parses");
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "SGVsbG8=".to_owned()]);
-        assert!(sel.matches(&seq));
-    }
-
-    #[test]
-    fn osc_52_set_does_not_match_query() {
-        let sel = SequenceSelector::parse("OSC 52 set").expect("parses");
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
-        assert!(!sel.matches(&seq));
-    }
-
-    #[test]
-    fn osc_52_query_matches_query() {
-        let sel = SequenceSelector::parse("OSC 52 query").expect("parses");
-        let seq = DispatchedSequence::osc(52, ["c".to_owned(), "?".to_owned()]);
-        assert!(sel.matches(&seq));
-    }
-
-    #[test]
-    fn osc_4_no_params_matches_any_osc_4() {
-        let sel = SequenceSelector::parse("OSC 4").expect("parses");
-        let seq = DispatchedSequence::osc(4, ["3".to_owned(), "?".to_owned()]);
-        assert!(sel.matches(&seq));
-        let seq2 = DispatchedSequence::osc(4, ["5".to_owned(), "red".to_owned()]);
-        assert!(sel.matches(&seq2));
-        // But does not match OSC 5.
-        let other = DispatchedSequence::osc(5, []);
-        assert!(!sel.matches(&other));
-    }
-
-    #[test]
-    fn csi_final_only_matches_any_csi_t() {
-        let sel = SequenceSelector::parse("CSI t").expect("parses");
-        assert!(sel.matches(&DispatchedSequence::csi(Some(20), 't', [])));
-        assert!(sel.matches(&DispatchedSequence::csi(Some(1), 't', [])));
-        assert!(!sel.matches(&DispatchedSequence::csi(Some(1), 'h', [])));
-    }
-
-    #[test]
-    fn csi_20_t_only_matches_20_t() {
-        let sel = SequenceSelector::parse("CSI 20 t").expect("parses");
-        assert!(sel.matches(&DispatchedSequence::csi(Some(20), 't', [])));
-        assert!(!sel.matches(&DispatchedSequence::csi(Some(21), 't', [])));
-    }
-
-    #[test]
-    fn dcs_2000p_matches_modal_activation() {
-        let sel = SequenceSelector::parse("DCS 2000p").expect("parses");
-        assert!(sel.matches(&DispatchedSequence::dcs("2000p")));
-        assert!(!sel.matches(&DispatchedSequence::dcs("1000p")));
-    }
-
-    #[test]
-    fn selector_longer_than_sequence_is_non_match() {
-        let sel = SequenceSelector::parse("OSC 4;*;?").expect("parses");
-        let seq = DispatchedSequence::osc(4, ["3".to_owned()]); // only one param
-        assert!(!sel.matches(&seq));
-    }
-
-    #[test]
-    fn selector_shorter_than_sequence_matches_prefix() {
-        let sel = SequenceSelector::parse("OSC 4;*").expect("parses");
-        let seq = DispatchedSequence::osc(4, ["3".to_owned(), "anything".to_owned()]);
-        assert!(sel.matches(&seq));
+    fn selector_matching() {
+        let osc = |major: u32, params: &[&str]| {
+            DispatchedSequence::osc(major, params.iter().map(|&p| p.to_owned()))
+        };
+        let csi =
+            |major: u32, final_byte: char| DispatchedSequence::csi(Some(major), final_byte, []);
+        for (selector, sequence, matches) in [
+            // The catch-all matches everything (`*` parses to `catch_all()`).
+            ("*", osc(4, &[]), true),
+            ("*", csi(20, 't'), true),
+            ("*", DispatchedSequence::dcs("2000p"), true),
+            // OSC 52 set is a clipboard write, never a query; query is the query.
+            ("OSC 52 set", osc(52, &["c", "SGVsbG8="]), true),
+            ("OSC 52 set", osc(52, &["c", "?"]), false),
+            ("OSC 52 query", osc(52, &["c", "?"]), true),
+            // A bare OSC 4 matches any OSC 4, but not OSC 5.
+            ("OSC 4", osc(4, &["3", "?"]), true),
+            ("OSC 4", osc(4, &["5", "red"]), true),
+            ("OSC 4", osc(5, &[]), false),
+            // A final-only CSI selector matches any CSI with that final.
+            ("CSI t", csi(20, 't'), true),
+            ("CSI t", csi(1, 't'), true),
+            ("CSI t", csi(1, 'h'), false),
+            ("CSI 20 t", csi(20, 't'), true),
+            ("CSI 20 t", csi(21, 't'), false),
+            ("DCS 2000p", DispatchedSequence::dcs("2000p"), true),
+            ("DCS 2000p", DispatchedSequence::dcs("1000p"), false),
+            // A selector longer than the sequence never matches; a shorter one
+            // matches as a prefix.
+            ("OSC 4;*;?", osc(4, &["3"]), false),
+            ("OSC 4;*", osc(4, &["3", "anything"]), true),
+        ] {
+            let sel = SequenceSelector::parse(selector).expect("parses");
+            assert_eq!(
+                sel.matches(&sequence),
+                matches,
+                "{selector} vs {sequence:?}"
+            );
+        }
     }
 
     #[test]

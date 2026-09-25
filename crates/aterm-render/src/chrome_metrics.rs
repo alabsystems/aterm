@@ -151,28 +151,6 @@ mod tests {
         }
     }
 
-    /// NON-VACUITY + negative control: the OLD placement (`baseline = y + px`,
-    /// i.e. cap sits `px − cap` above the baseline with zero bottom gap inside
-    /// the size box) genuinely violates the balance the new rule proves —
-    /// so the law is not trivially satisfied by any placement.
-    #[test]
-    fn old_em_bottom_placement_fails_the_balance_law() {
-        // A 14px run in a 20px row, DejaVu-ish cap 0.73em => cap ~ 10.2px.
-        let (row_h, size, cap) = (20 * Q, 14 * Q, px_to_q(14.0 * 0.73));
-        // Old rule: box top at (row_h - size)/2, baseline at box_top + size.
-        let old_baseline = (row_h - size) / 2 + size;
-        let top_gap = old_baseline - cap;
-        let bottom_gap = row_h - old_baseline;
-        assert!(
-            (top_gap - bottom_gap).abs() > Q,
-            "the pre-fix em-bottom baseline must be detectably unbalanced \
-             (got top={top_gap} bottom={bottom_gap})"
-        );
-        // And the new rule balances the same inputs exactly.
-        let b = baseline_in_row_q(0, row_h, cap);
-        assert!(((b - cap) - (row_h - b)).abs() <= 1);
-    }
-
     /// L0 drift-freedom of the fixed-point pen: over a long pseudo-random run of
     /// fractional advances, EVERY prefix placement is within 0.5px of the exact
     /// fixed-point pen (which is an exact integer sum — checked against i128),

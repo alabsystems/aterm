@@ -117,7 +117,7 @@ use std::time::{Duration, Instant};
 use aterm_containment::consent::{DrClass, FdaState};
 
 /// The marker beside `aterm.toml` (the config-dir latch idiom of
-/// `packages_screen::ADMIN_STEP_MARKER` and `connections`' first-use notice).
+/// `connections`' first-use notice, [`crate::config_marker`]).
 pub(crate) const MARKER: &str = "privacy-access-card-answered";
 
 /// A marker holds one token; anything bigger is something else wearing the

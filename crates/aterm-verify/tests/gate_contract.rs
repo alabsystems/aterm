@@ -14,9 +14,8 @@
 //! stage scripts made runnable with `chmod 0755`, and a ladder driven by shell
 //! stubs has no Windows spelling that would still be the same contract. What
 //! the attribute buys is that the file COMPILES off unix, so the rest of this
-//! crate's test targets — `profile_pin.rs`, `process_doc.rs` and every unit
-//! test in `src/` — are compiled for a non-unix target instead of being lost
-//! with it.
+//! crate's test targets — `profile_pin.rs` and every unit test in `src/` —
+//! are compiled for a non-unix target instead of being lost with it.
 #![cfg(unix)]
 
 use std::fs;
@@ -35,6 +34,11 @@ struct FakeRepo {
     root: PathBuf,
     stage2: PathBuf,
     scratch: PathBuf,
+    /// The control socket the answering smoke's `aterm-gui` links to, held
+    /// listening for the fixture's life: the smoke waits for a socket that
+    /// accepts a connect, not for a file.
+    ctl_sock: PathBuf,
+    _listener: std::os::unix::net::UnixListener,
 }
 
 impl FakeRepo {
@@ -50,15 +54,22 @@ impl FakeRepo {
         fs::create_dir_all(root.join("scripts")).expect("mkdir");
         fs::create_dir_all(root.join("libc-oracle")).expect("mkdir");
         fs::write(root.join("Cargo.toml"), b"[workspace]\n").expect("write");
+        let ctl_sock = base.join("ctl.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&ctl_sock)
+            .expect("bind the fixture's control socket");
         let me = Self {
             root,
             stage2,
             scratch,
+            ctl_sock,
+            _listener,
         };
         me.script("tools/verify.sh", "exit 0");
         me.script("tools/grep_guard.sh", "echo 'GUARD: PASS'; exit 0");
         me.script("tools/license_check.sh", "echo 'LICENSE: PASS'; exit 0");
-        me.script("tools/test-install-channel.sh", "exit 0");
+        for name in aterm_verify::stages::RELEASE_SUITES {
+            me.script(&format!("tools/{name}"), "exit 0");
+        }
         // DERIVED FROM THE ROSTER, never re-typed. This list was a hand-written copy of
         // `ATPKG_SUITES` and the two drifted the moment the roster grew: adding a suite
         // made every fixture here report `missing or not executable` for it, which reads
@@ -218,12 +229,12 @@ impl FakeRepo {
     }
 
     /// A stage2 whose driver also produces the two binaries the smokes drive:
-    /// an `aterm-gui` that binds something socket-shaped and stays up, and an
-    /// `aterm-ctl` that answers the protocol. This is what lets the control-socket
+    /// an `aterm-gui` that links its control socket to the fixture's listening
+    /// one and stays up, and an `aterm-ctl` that answers the protocol. This is what lets the control-socket
     /// smoke — launch, poll, round-trip, burst, teardown — run for real in a test.
     fn with_answering_smoke(&self) -> &Self {
         self.with_stage2(
-            r#"echo "argv: $*"
+            &r#"echo "argv: $*"
 case "$*" in
   *aterm-gui*aterm-ctl*)
     mkdir -p "$CARGO_TARGET_DIR/debug"
@@ -244,7 +255,7 @@ grep -qx '\[machine\]' "$config" || exit 84
 grep -qx 'spotlight_noindex = false' "$config" || exit 85
 grep -qx 'universal_control = "leave"' "$config" || exit 86
 mkdir -p "$XDG_RUNTIME_DIR/aterm"
-ln -s /dev/null "$XDG_RUNTIME_DIR/aterm/aterm.sock"
+ln -s '@LISTENER@' "$XDG_RUNTIME_DIR/aterm/aterm.sock"
 exec sleep 300
 GUI
     cat >"$CARGO_TARGET_DIR/debug/aterm-ctl" <<'CTL'
@@ -261,7 +272,8 @@ CTL
     chmod 755 "$CARGO_TARGET_DIR/debug/aterm-gui" "$CARGO_TARGET_DIR/debug/aterm-ctl"
     ;;
 esac
-exit 0"#,
+exit 0"#
+            .replace("@LISTENER@", &self.ctl_sock.display().to_string()),
         )
     }
 
@@ -441,6 +453,64 @@ fn the_ladder_opens_by_naming_the_toolchain_every_stage_below_will_run() {
     );
 }
 
+/// A VERDICT IS READABLE WHEN IT IS DECIDED, NOT WHEN ITS TURN TO PRINT COMES
+/// (2026-09-23). The ladder prints in declared order, so a guard that FAILED in
+/// its first second stayed unread until the build and test stages ahead of it
+/// printed — up to an hour on a real run. Every stage's finish line, with its
+/// outcome word, now goes to the run's log as it happens. Measured here with a
+/// driver that takes a second per call and a grep guard that fails at once:
+/// in the LOG the guard's `FAIL` comes before the build's finish; in the LADDER
+/// (the negative control, which is and stays in declared order) the build's
+/// block still comes first.
+#[test]
+fn every_stage_finish_is_logged_with_its_outcome_as_it_happens() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("sleep 1; exit 0");
+    repo.script("tools/grep_guard.sh", "echo 'GUARD: FAIL'; exit 1");
+    let log_path = repo.scratch.join("progress.log");
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("the log opens");
+    let ctx = repo
+        .ctx(Mode::Fast, Scope::workspace(), false)
+        .with_progress_log(Some(log));
+    let mut out: Vec<u8> = Vec::new();
+    let code = aterm_verify::run(&ctx, &mut out).expect("the ladder is writable");
+    let ladder = String::from_utf8(out).expect("utf-8");
+    assert_eq!(code, exit::FAILED, "{ladder}");
+
+    let logged = fs::read_to_string(&log_path).expect("the log was written");
+    let at = |text: &str, needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?} in:\n{text}"))
+    };
+    let guard = at(&logged, "verify: finish grep guards — FAIL (");
+    let build = at(&logged, "verify: finish build (--workspace) — ok (");
+    assert!(
+        guard < build,
+        "the guard's FAIL must be readable before the slow build finishes:\n{logged}"
+    );
+    // Every planned stage finished, and said how.
+    for spec in plan::plan(&ctx) {
+        assert!(
+            logged.contains(&format!("verify: finish {} — ", spec.title)),
+            "{} never logged its finish:\n{logged}",
+            spec.title
+        );
+    }
+    // The negative control: the ladder itself is unchanged, in declared order.
+    assert!(
+        at(&ladder, "=== build (--workspace) ===") < at(&ladder, "=== grep guards ==="),
+        "{ladder}"
+    );
+    assert!(
+        !ladder.contains("verify: finish "),
+        "stdout stays the ladder: {ladder}"
+    );
+}
+
 #[test]
 fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let repo = FakeRepo::new();
@@ -451,10 +521,10 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        34,
-        "31 gate stages (driver builds since 2026-09-13, the sealed fabric lane since \
-         2026-09-14, the conformance-release prime since 2026-09-22) plus the three \
-         --full tiers"
+        35,
+        "32 gate stages (driver builds since 2026-09-13, the sealed fabric lane since \
+         2026-09-14, the conformance-release prime since 2026-09-22, the measuring \
+         tests since 2026-09-23) plus the three --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -479,7 +549,7 @@ fn a_run_with_no_driver_fails_closed_and_never_claims_the_contract() {
     assert!(ladder.contains("VERIFY: COULD NOT RUN (mode=fast scope=workspace) — DO NOT merge"));
     let failed = labels_with(&ladder, "FAIL");
     assert!(
-        failed.iter().any(|l| l.starts_with("targo not found at ")),
+        failed.iter().any(|l| l.starts_with("targo not found")),
         "the missing driver is named: {failed:?}"
     );
     // …and the stages that need it skip by name, so the verdict can list them.
@@ -616,6 +686,7 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
         "targo build --workspace",
         "targo test --workspace --no-run (trustdoc)",
         "targo test --doc --workspace (trustdoc)",
+        "targo test --workspace --tests (trustdoc) -- measuring:: launchd_copy_tests::",
         "gate drift",
         "gate dormant",
         "gate mainloop",
@@ -644,7 +715,7 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     assert!(
         !decisions(&ladder)
             .iter()
-            .any(|(_, l)| l.starts_with("targo test --workspace --tests")),
+            .any(|(_, l)| *l == "targo test --workspace --tests (trustdoc)"),
         "{ladder}"
     );
     // Likewise the sealed rung: its aterm-gui build fails, so its suite never
@@ -744,60 +815,6 @@ fn the_sealed_rung_never_runs_before_a_fresh_aterm_gui_is_built_in_its_dir() {
             "{ladder}"
         );
     }
-}
-
-#[test]
-fn the_redraw_gate_reads_its_harness_exit_code_and_a_two_is_never_green() {
-    // The regression this stage exists for lives one layer down: drop the
-    // production `EventLoopProxy` and the harness exits 1. What is tested HERE is
-    // the layer that was missing entirely — whether anything LOOKS. Above all
-    // `2`, the harness saying no event loop is constructible on this machine: a
-    // headless box reading that as green would be the same false pass in a new
-    // place.
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::RedrawConformance)
-        .expect("the redraw gate is planned");
-
-    repo.redraw_harness(0);
-    assert_eq!(
-        tally(&[stages::run_stage(&ctx, &spec)]),
-        Tally::default(),
-        "a passing harness leaves the run clean"
-    );
-
-    repo.redraw_harness(1);
-    let t = tally(&[stages::run_stage(&ctx, &spec)]);
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "exit 1 is a finding about the tree"
-    );
-    assert_eq!(t.could_not_run.len(), 0);
-
-    repo.redraw_harness(2);
-    let r = stages::run_stage(&ctx, &spec);
-    // `from_ref`, not `[r.clone()]`: `r` is read again below, so the clone was
-    // only ever there to make a one-element slice — and cloning a stage Run to
-    // count it invites the reading that `tally` consumes what it is given.
-    let t = tally(std::slice::from_ref(&r));
-    assert_eq!(t.could_not_run.len(), 1, "exit 2 decided nothing");
-    assert_eq!(
-        t.gate_failures.len(),
-        0,
-        "…and is not a finding about the tree"
-    );
-    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
-    assert!(t.failed(), "so the run cannot end green");
-    assert!(
-        r.render()
-            .contains("  FAIL  aterm-redraw-conformance: NOT RUN"),
-        "{}",
-        r.render()
-    );
 }
 
 #[test]
@@ -1015,512 +1032,261 @@ fn a_widened_change_scoped_run_is_a_whole_tree_run_and_keeps_the_claim() {
     assert!(v.text.contains(MERGE_CONTRACT_SENTENCE));
 }
 
-/// THE SAME OBLIGATION, for the live-class auditor. The regression it exists
-/// for lives one layer down — a retyped argument or a dropped protocol in
-/// `vendor/winit`'s ported delegate, both of which left `cargo build` at 0 and
-/// the seam census at 6/6. What is tested HERE is that something LOOKS at the
-/// answer, and above all that `2` (no window server, no delegate) is never
-/// green: a headless CI box reading that as a pass would restore the identical
-/// silence in a new place.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_objc_audit_reads_its_exit_code_and_a_two_is_never_green() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::ObjcClassAudit)
-        .expect("the objc live-class audit is planned");
-
-    repo.objc_auditor(0);
-    assert_eq!(
-        tally(&[stages::run_stage(&ctx, &spec)]),
-        Tally::default(),
-        "a clean audit leaves the run clean"
-    );
-
-    repo.objc_auditor(1);
-    let t = tally(&[stages::run_stage(&ctx, &spec)]);
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "exit 1 is a finding about the tree"
-    );
-    assert_eq!(t.could_not_run.len(), 0);
-
-    repo.objc_auditor(2);
-    let r = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&r));
-    assert_eq!(t.could_not_run.len(), 1, "exit 2 decided nothing");
-    assert_eq!(
-        t.gate_failures.len(),
-        0,
-        "…and is not a finding about the tree"
-    );
-    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
-    assert!(t.failed(), "so the run cannot end green");
-    assert!(
-        r.render()
-            .contains("  FAIL  objc live-class audit: NOT RUN"),
-        "{}",
-        r.render()
-    );
-}
-
-/// The IME drive answers the same three codes, and `2` is likewise never green.
+/// Every driven stage reads its driver's EXIT CODE, and nothing that decided
+/// nothing is ever green.
 ///
-/// It is a SEPARATE stage from the audit because it asks a separate question —
-/// the audit proves the ported `WinitView` is shaped right, this proves it
-/// composes — and a separate stage is a separate exit code to misread. On a
-/// headless box the driver has no input context and answers `2`; read as a pass
-/// that would leave the whole `NSTextInputClient` surface unexercised while the
-/// ladder printed green, which is the exact failure D1 was raised for.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_objc_ime_drive_reads_its_exit_code_and_a_two_is_never_green() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::ObjcImeDrive)
-        .expect("the objc IME drive is planned");
-
-    repo.objc_ime_driver(0);
-    assert_eq!(
-        tally(&[stages::run_stage(&ctx, &spec)]),
-        Tally::default(),
-        "a clean composition leaves the run clean"
-    );
-
-    repo.objc_ime_driver(1);
-    let t = tally(&[stages::run_stage(&ctx, &spec)]);
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "exit 1 is a finding about the tree"
-    );
-    assert_eq!(t.could_not_run.len(), 0);
-
-    repo.objc_ime_driver(2);
-    let r = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&r));
-    assert_eq!(t.could_not_run.len(), 1, "exit 2 decided nothing");
-    assert_eq!(
-        t.gate_failures.len(),
-        0,
-        "…and is not a finding about the tree"
-    );
-    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
-    assert!(t.failed(), "so the run cannot end green");
-    assert!(
-        r.render().contains("  FAIL  objc IME drive: NOT RUN"),
-        "{}",
-        r.render()
-    );
-}
-
-/// THE TOOLBAR DRIVE answers FOUR codes, and neither `2` nor `3` is green.
+/// The regressions these stages exist for live one layer down — the redraw
+/// harness exits 1 when the production `EventLoopProxy` is dropped; the objc
+/// drivers exit 1 on a retyped argument or a dropped protocol in the ported
+/// classes, both of which left `cargo build` at 0. What is tested HERE is the
+/// layer that was missing entirely: that something LOOKS at the answer. Every
+/// row files `1` as a finding about the tree, and every code that means the
+/// driver could not decide (`2`: no event loop, no window server, no input
+/// context; the toolbar's `3`: its watchdog, because a context menu that
+/// really popped would never return) as could-not-run that still fails the
+/// run — a headless box reading any of them as a pass would restore the
+/// identical silence in a new place.
 ///
-/// It is a separate stage from the two beside it because it audits a separate
-/// file — `crates/aterm-gui/src/toolbar.rs`, the largest ported one, whose four
-/// declared classes were checked only by a literal table in the same file. `3`
-/// is its own code because the drive enters `-mouseDown:` IMPs directly and a
-/// context menu that actually popped would never return: a hang that reached
-/// the ladder as a generic timeout is a stage that decided nothing while
-/// looking busy.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_objc_toolbar_drive_reads_its_exit_code_and_neither_two_nor_three_is_green() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::ObjcToolbarDrive)
-        .expect("the objc toolbar drive is planned");
-
-    repo.objc_toolbar_driver(0);
-    assert_eq!(
-        tally(&[stages::run_stage(&ctx, &spec)]),
-        Tally::default(),
-        "a clean drive leaves the run clean"
-    );
-
-    repo.objc_toolbar_driver(1);
-    let t = tally(&[stages::run_stage(&ctx, &spec)]);
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "exit 1 is a finding about the tree"
-    );
-    assert_eq!(t.could_not_run.len(), 0);
-
-    for (code, words) in [(2, "NOT RUN"), (3, "HUNG")] {
-        repo.objc_toolbar_driver(code);
-        let r = stages::run_stage(&ctx, &spec);
-        let t = tally(std::slice::from_ref(&r));
-        assert_eq!(t.could_not_run.len(), 1, "exit {code} decided nothing");
-        assert_eq!(
-            t.gate_failures.len(),
-            0,
-            "…and is not a finding about the tree"
-        );
-        assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
-        assert!(t.failed(), "so the run cannot end green");
-        assert!(
-            r.render()
-                .contains(&format!("  FAIL  objc toolbar drive: {words}")),
-            "{}",
-            r.render()
-        );
-    }
-}
-
-/// The window driver's exit code, read the same way — and `2` is NOT green.
+/// The event drive is the one reading that differs: v0.72.0 died by `SIGABRT`
+/// on the first mouse move and the driver reproduces that shape, so its `3`
+/// (the trapped abort) and an untrapped signal death are THE finding, never
+/// could-not-run — the siblings' reading would file the crash under "decided
+/// nothing".
 ///
-/// THREE codes, not the toolbar's four. This driver pops no menu and enters no
-/// `-mouseDown:` IMP, so there is no modal tracking loop to hang in; anything
-/// outside `0`/`1`/`2` is reported as the SIGNAL it probably is, which is the
-/// shape of the use-after-free the drive found on its first run.
-#[cfg(target_os = "macos")]
+/// The objc rows are macOS-only (their stages are planned there); the redraw
+/// row runs on every unix.
 #[test]
-fn the_objc_window_drive_reads_its_exit_code_and_two_is_not_green() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::ObjcWindowDrive)
-        .expect("the objc window drive is planned");
-
-    repo.objc_window_driver(0);
-    assert_eq!(
-        tally(&[stages::run_stage(&ctx, &spec)]),
-        Tally::default(),
-        "a clean drive leaves the run clean"
-    );
-
-    repo.objc_window_driver(1);
-    let t = tally(&[stages::run_stage(&ctx, &spec)]);
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "exit 1 is a finding about the tree"
-    );
-    assert_eq!(t.could_not_run.len(), 0);
-
-    repo.objc_window_driver(2);
-    let r = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&r));
-    assert_eq!(t.could_not_run.len(), 1, "exit 2 decided nothing");
-    assert_eq!(
-        t.gate_failures.len(),
-        0,
-        "…and is not a finding about the tree"
-    );
-    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
-    assert!(t.failed(), "so the run cannot end green");
-    assert!(
-        r.render().contains("  FAIL  objc window drive: NOT RUN"),
-        "{}",
-        r.render()
-    );
-}
-
-/// The event driver's reading, with the one difference that matters: a
-/// SIGNAL DEATH IS A FINDING. v0.72.0 died by `SIGABRT` on the first mouse
-/// move; the driver reproduces that shape, so the stage must read "no exit
-/// status" as the gate FAILING, never as could-not-run — the siblings read a
-/// signal as harness noise, and that reading here would file the crash under
-/// "decided nothing".
-#[cfg(target_os = "macos")]
-#[test]
-fn the_objc_event_drive_reads_its_exit_code_and_a_signal_death_is_a_failure() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::ObjcEventDrive)
-        .expect("the objc event drive is planned");
-    repo.objc_event_driver(0);
-    assert_eq!(
-        tally(&[stages::run_stage(&ctx, &spec)]),
-        Tally::default(),
-        "a clean drive leaves the run clean"
-    );
-    repo.objc_event_driver(1);
-    let t = tally(&[stages::run_stage(&ctx, &spec)]);
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "exit 1 is a finding about the tree"
-    );
-    assert_eq!(t.could_not_run.len(), 0);
-    repo.objc_event_driver(2);
-    let r = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&r));
-    assert_eq!(t.could_not_run.len(), 1, "exit 2 decided nothing");
-    assert_eq!(
-        t.gate_failures.len(),
-        0,
-        "…and is not a finding about the tree"
-    );
-    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
-    assert!(t.failed(), "so the run cannot end green");
-    assert!(
-        r.render().contains("  FAIL  objc event drive: NOT RUN"),
-        "{}",
-        r.render()
-    );
-    repo.objc_event_driver(3);
-    let r = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&r));
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "exit 3 is the trapped abort: THE finding"
-    );
-    assert_eq!(
-        t.could_not_run.len(),
-        0,
-        "…and is never read as could-not-run"
-    );
-    assert!(
-        r.render().contains("  FAIL  objc event drive: ABORTED"),
-        "{}",
-        r.render()
-    );
-    repo.objc_event_driver_aborting();
-    let r = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&r));
-    assert_eq!(
-        t.gate_failures.len(),
-        1,
-        "an untrapped signal death is still THE finding, not harness noise"
-    );
-    assert_eq!(
-        t.could_not_run.len(),
-        0,
-        "…and is never read as could-not-run"
-    );
-    assert!(t.failed(), "so the run cannot end green");
-    assert!(
-        r.render().contains("  FAIL  objc event drive: ABORTED"),
-        "{}",
-        r.render()
-    );
-}
-
-/// The three drivers the objc2 exit added read their exit codes the way the
-/// window drive does — and `2` is NOT green for any of them. One test for the
-/// three, because the reading is one reading: each driver answers `0`/`1`/`2`,
-/// each stage must file `1` as a finding about the tree and `2` as could-not-
-/// run that still fails the run, and a stage that read any of the three
-/// differently would be the stage a reader had to learn separately.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_three_objc2_exit_drives_read_their_exit_codes_and_two_is_not_green() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     type Stub = fn(&FakeRepo, i32) -> &FakeRepo;
-    let rows: [(StageId, &str, Stub); 3] = [
-        (
-            StageId::ObjcAlertDrive,
-            "objc alert drive",
-            FakeRepo::objc_alert_driver,
-        ),
-        (
-            StageId::ObjcSwizzleDrive,
-            "objc swizzle drive",
-            FakeRepo::objc_swizzle_driver,
-        ),
-        (
-            StageId::ObjcBoundDrive,
-            "objc bound drive",
-            FakeRepo::objc_bound_driver,
-        ),
-    ];
-    for (id, name, stub) in rows {
+    /// A driver outcome beyond `1` that is THE finding.
+    enum Finding {
+        Exit(i32),
+        /// A stand-in that dies by an untrapped signal.
+        Signal(fn(&FakeRepo) -> &FakeRepo),
+    }
+    struct Row {
+        id: StageId,
+        /// The label the stage's verdict line carries.
+        label: &'static str,
+        stub: Stub,
+        /// Codes beyond `1` that decided nothing, and the word the line prints.
+        undecided: &'static [(i32, &'static str)],
+        /// Outcomes beyond `1` that are THE finding, and the word the line prints.
+        findings: &'static [(Finding, &'static str)],
+    }
+    let mut rows = vec![Row {
+        id: StageId::RedrawConformance,
+        label: "aterm-redraw-conformance",
+        stub: FakeRepo::redraw_harness,
+        undecided: &[(2, "NOT RUN")],
+        findings: &[],
+    }];
+    if cfg!(target_os = "macos") {
+        rows.extend([
+            Row {
+                id: StageId::ObjcClassAudit,
+                label: "objc live-class audit",
+                stub: FakeRepo::objc_auditor,
+                undecided: &[(2, "NOT RUN")],
+                findings: &[],
+            },
+            // A SEPARATE stage from the audit because it asks a separate
+            // question — the audit proves `WinitView` is shaped right, this
+            // proves it composes — and a separate stage is a separate exit code
+            // to misread.
+            Row {
+                id: StageId::ObjcImeDrive,
+                label: "objc IME drive",
+                stub: FakeRepo::objc_ime_driver,
+                undecided: &[(2, "NOT RUN")],
+                findings: &[],
+            },
+            // FOUR codes: the drive enters `-mouseDown:` IMPs directly, and a
+            // hang reaching the ladder as a generic timeout would be a stage
+            // that decided nothing while looking busy.
+            Row {
+                id: StageId::ObjcToolbarDrive,
+                label: "objc toolbar drive",
+                stub: FakeRepo::objc_toolbar_driver,
+                undecided: &[(2, "NOT RUN"), (3, "HUNG")],
+                findings: &[],
+            },
+            // THREE codes: no menu, no modal tracking loop to hang in.
+            Row {
+                id: StageId::ObjcWindowDrive,
+                label: "objc window drive",
+                stub: FakeRepo::objc_window_driver,
+                undecided: &[(2, "NOT RUN")],
+                findings: &[],
+            },
+            Row {
+                id: StageId::ObjcEventDrive,
+                label: "objc event drive",
+                stub: FakeRepo::objc_event_driver,
+                undecided: &[(2, "NOT RUN")],
+                findings: &[
+                    (Finding::Exit(3), "ABORTED"),
+                    (
+                        Finding::Signal(FakeRepo::objc_event_driver_aborting),
+                        "ABORTED",
+                    ),
+                ],
+            },
+            // The three the objc2 exit added read exactly as the window drive.
+            Row {
+                id: StageId::ObjcAlertDrive,
+                label: "objc alert drive",
+                stub: FakeRepo::objc_alert_driver,
+                undecided: &[(2, "NOT RUN")],
+                findings: &[],
+            },
+            Row {
+                id: StageId::ObjcSwizzleDrive,
+                label: "objc swizzle drive",
+                stub: FakeRepo::objc_swizzle_driver,
+                undecided: &[(2, "NOT RUN")],
+                findings: &[],
+            },
+            Row {
+                id: StageId::ObjcBoundDrive,
+                label: "objc bound drive",
+                stub: FakeRepo::objc_bound_driver,
+                undecided: &[(2, "NOT RUN")],
+                findings: &[],
+            },
+        ]);
+    }
+
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    for row in rows {
+        let name = row.label;
         let spec = plan::plan(&ctx)
             .into_iter()
-            .find(|s| s.id == id)
-            .unwrap_or_else(|| panic!("the {name} is planned"));
+            .find(|s| s.id == row.id)
+            .unwrap_or_else(|| panic!("{name}: the stage is planned"));
 
-        stub(&repo, 0);
+        (row.stub)(&repo, 0);
         assert_eq!(
             tally(&[stages::run_stage(&ctx, &spec)]),
             Tally::default(),
-            "{name}: a clean drive leaves the run clean"
+            "{name}: a clean driver leaves the run clean"
         );
 
-        stub(&repo, 1);
+        (row.stub)(&repo, 1);
         let t = tally(&[stages::run_stage(&ctx, &spec)]);
         assert_eq!(
             t.gate_failures.len(),
             1,
             "{name}: exit 1 is a finding about the tree"
         );
-        assert_eq!(t.could_not_run.len(), 0);
+        assert_eq!(t.could_not_run.len(), 0, "{name}");
 
-        stub(&repo, 2);
-        let r = stages::run_stage(&ctx, &spec);
-        let t = tally(std::slice::from_ref(&r));
-        assert_eq!(t.could_not_run.len(), 1, "{name}: exit 2 decided nothing");
-        assert_eq!(
-            t.gate_failures.len(),
-            0,
-            "{name}: …and is not a finding about the tree"
-        );
-        assert_eq!(t.skipped(), 0, "{name}: …and above all is not a quiet skip");
-        assert!(t.failed(), "{name}: so the run cannot end green");
-        assert!(
-            r.render().contains(&format!("  FAIL  {name}: NOT RUN")),
-            "{}",
-            r.render()
-        );
+        for &(code, words) in row.undecided {
+            (row.stub)(&repo, code);
+            let r = stages::run_stage(&ctx, &spec);
+            let t = tally(std::slice::from_ref(&r));
+            assert_eq!(
+                t.could_not_run.len(),
+                1,
+                "{name}: exit {code} decided nothing"
+            );
+            assert_eq!(
+                t.gate_failures.len(),
+                0,
+                "{name}: …and is not a finding about the tree"
+            );
+            assert_eq!(t.skipped(), 0, "{name}: …and above all is not a quiet skip");
+            assert!(t.failed(), "{name}: so the run cannot end green");
+            assert!(
+                r.render().contains(&format!("  FAIL  {name}: {words}")),
+                "{}",
+                r.render()
+            );
+        }
+
+        for (finding, words) in row.findings {
+            let what = match finding {
+                Finding::Exit(code) => {
+                    (row.stub)(&repo, *code);
+                    format!("exit {code}")
+                }
+                Finding::Signal(die) => {
+                    die(&repo);
+                    "an untrapped signal death".to_string()
+                }
+            };
+            let r = stages::run_stage(&ctx, &spec);
+            let t = tally(std::slice::from_ref(&r));
+            assert_eq!(
+                t.gate_failures.len(),
+                1,
+                "{name}: {what} is THE finding, not harness noise"
+            );
+            assert_eq!(
+                t.could_not_run.len(),
+                0,
+                "{name}: …and is never read as could-not-run"
+            );
+            assert!(t.failed(), "{name}: so the run cannot end green");
+            assert!(
+                r.render().contains(&format!("  FAIL  {name}: {words}")),
+                "{}",
+                r.render()
+            );
+        }
     }
 }
 
 #[test]
-fn selftest_matches_the_scripts_selftest_ladder_exactly() {
+fn selftest_skips_every_command_and_checks_only_the_harness() {
     // The reference is `tools/verify.sh --selftest` on this tree: every stage
-    // skipped with the same words, the harness invariants really checked, and a
-    // verdict that claims nothing.
+    // skipped with a selftest reason, the harness invariants really checked,
+    // and a verdict that claims nothing. The stage ORDER is plan.rs's pinned
+    // fast ladder; what is held here is the SHAPE, so a new stage moves one
+    // count rather than a transcript.
     let repo = FakeRepo::new();
     repo.with_stage2("exit 1"); // never executed under --selftest
     let (ladder, code) = repo.run(Mode::Fast, Scope::workspace(), true);
 
     assert_eq!(code, exit::PASS);
+    let (skips, decided): (Vec<_>, Vec<_>) = decisions(&ladder)
+        .into_iter()
+        .partition(|(tag, _)| *tag == "skip");
+    for (_, label) in &skips {
+        assert!(
+            label.ends_with("(selftest: not executed)") || label.ends_with("(selftest)"),
+            "a selftest skip must say it is one: {label}"
+        );
+    }
+    // One skip per command the fast ladder would run: 40 fixed rows plus the 11
+    // atpkg publish-tooling suites in `stages::ATPKG_SUITES` (the prerelease
+    // gate, the index suites, the vendor/ALab lanes and the packers among them).
+    // A LITERAL, not `40 + ATPKG_SUITES.len()`: every other test iterates that
+    // roster, so a count derived from it would let a suite leave the ladder
+    // with the whole crate green. Adding or removing a stage moves this number.
+    assert_eq!(skips.len(), 51, "{skips:#?}");
     assert_eq!(
-        decisions(&ladder),
+        skips
+            .iter()
+            .filter(|(_, label)| stages::ATPKG_SUITES
+                .iter()
+                .any(|suite| label.starts_with(suite)))
+            .count(),
+        11,
+        "one skip per atpkg publish-tooling suite: {skips:#?}"
+    );
+    // Nothing FAILS, and the only rows that pass are the selftest's actual
+    // evidence: every row above says "not executed", so without these the
+    // ladder shows a run that checked nothing and still said OK.
+    assert_eq!(
+        decided,
         [
-            ("skip", "targo build --workspace (selftest: not executed)"),
-            (
-                "skip",
-                "targo test --workspace --no-run (trustdoc) (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "targo test --workspace --tests (trustdoc) (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "targo test --doc --workspace (trustdoc) (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "targo test -p aterm-search --features regex (trustdoc) (selftest: not executed)"
-            ),
-            ("skip", "tippy lint (selftest: not executed)"),
-            ("skip", "gate lint --fmt-only (selftest: not executed)"),
-            ("skip", "grep_guard.sh (selftest)"),
-            ("skip", "test-install-channel.sh (selftest: not executed)"),
-            (
-                "skip",
-                "test-trust-gate-verdict.sh (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "test-trust-contract-probe.sh (selftest: not executed)"
-            ),
-            ("skip", "test-start-compare.sh (selftest: not executed)"),
-            ("skip", "license_check.sh (selftest)"),
-            ("skip", "gate drift (selftest: not executed)"),
-            ("skip", "gate dormant (selftest: not executed)"),
-            ("skip", "gate mainloop (selftest: not executed)"),
-            ("skip", "gate citations (selftest: not executed)"),
-            (
-                "skip",
-                "libc-oracle/run.sh (this host's native ABI cell; the other cells are decided where they are native) (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "freeze-safety-gate (6 obligations) (selftest: not executed)"
-            ),
-            ("skip", "gate counts (selftest: not executed)"),
-            ("skip", "driver builds (selftest: not executed)"),
-            (
-                "skip",
-                "targo build --locked --release -p aterm (the artifact paint/spin/untracked_stage judge) (selftest: not executed)"
-            ),
-            // The sealed fabric rung, behind the driver builds since 2026-09-14:
-            // the aterm-gui it drives, then the suite — an integration test alone
-            // (no doctests), so neither child takes a doc-driver suffix.
-            (
-                "skip",
-                "targo build -p aterm-gui -p aterm-ctl (the aterm-gui the sealed rung drives) (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "targo test -p aterm-link --features sealed --test two_nodes_sealed (selftest: not executed)"
-            ),
-            // The atpkg publish tooling, behind the driver builds since
-            // 2026-09-16 for the same reason the rung above it is: the atpkg
-            // its end-to-end pack drives, then the suites, in ATPKG_SUITES order.
-            (
-                "skip",
-                "targo build -p atpkg (the atpkg the pack suite drives) (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "test-atpkg-vendor-tooling.sh (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "test-atpkg-mirror-extras.sh (selftest: not executed)"
-            ),
-            ("skip", "test-atpkg-auto-vendor.sh (selftest: not executed)"),
-            ("skip", "test-atpkg-auto-alab.sh (selftest: not executed)"),
-            ("skip", "test-atpkg-target-pins.sh (selftest: not executed)"),
-            (
-                "skip",
-                "test-atpkg-index-target-pins.sh (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "test-atpkg-index-staging-collision.sh (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "test-atpkg-index-vendor-direct.sh (selftest: not executed)"
-            ),
-            (
-                "skip",
-                "test-atpkg-prerelease-gate.sh (selftest: not executed)"
-            ),
-            ("skip", "test-atpkg-stale-pin.sh (selftest: not executed)"),
-            (
-                "skip",
-                "test-atpkg-spec-catch-up.sh (selftest: not executed)"
-            ),
-            ("skip", "test-linux-auto-atpkg.sh (selftest: not executed)"),
-            (
-                "skip",
-                "test-atpkg-pack-one-compiler.sh (selftest: not executed)"
-            ),
             (
                 "ok",
                 "smoke helper invariants (short socket, target path, metrics, bounded reap)"
             ),
-            ("skip", "control-socket smoke (selftest)"),
-            ("skip", "gui typing-pacing smoke (selftest)"),
-            ("skip", "redraw conformance (selftest: not executed)"),
-            ("skip", "objc live-class audit (selftest: not executed)"),
-            ("skip", "objc IME drive (selftest: not executed)"),
-            ("skip", "objc toolbar drive (selftest: not executed)"),
-            ("skip", "objc window drive (selftest: not executed)"),
-            ("skip", "objc event drive (selftest: not executed)"),
-            ("skip", "objc alert drive (selftest: not executed)"),
-            ("skip", "objc swizzle drive (selftest: not executed)"),
-            ("skip", "objc bound drive (selftest: not executed)"),
-            // The six verdict cases the bash gate printed here too. They are the
-            // selftest's actual evidence: every other row above says "not
-            // executed", so without these the ladder shows a run that checked
-            // nothing and still said OK.
             ("ok", "verdict[whole tree, nothing skipped]"),
             ("ok", "verdict[a stage was skipped]"),
             ("ok", "verdict[narrowed (--scope/--changed)]"),
@@ -1889,7 +1655,10 @@ exit {suite_exit}
         );
         // The two self-contained suites: they must be handed NO `$ATPKG`, or
         // the cases that measure a producer script without one stop measuring it.
-        for name in ["test-atpkg-vendor-tooling.sh", "test-atpkg-auto-vendor.sh"] {
+        for name in [
+            "test-atpkg-vendor-tooling.sh",
+            "test-atpkg-mirror-extras.sh",
+        ] {
             repo.script(
                 &format!("tools/{name}"),
                 &format!(
@@ -1929,9 +1698,9 @@ exit {suite_exit}
         assert_eq!(
             measured,
             if build_exit == 0 {
-                "build\ntest-atpkg-vendor-tooling.sh\ntest-atpkg-auto-vendor.sh\npack fresh-atpkg\n"
+                "build\ntest-atpkg-vendor-tooling.sh\ntest-atpkg-mirror-extras.sh\npack fresh-atpkg\n"
             } else {
-                "build\ntest-atpkg-vendor-tooling.sh\ntest-atpkg-auto-vendor.sh\n"
+                "build\ntest-atpkg-vendor-tooling.sh\ntest-atpkg-mirror-extras.sh\n"
             },
             "{}",
             report.render()

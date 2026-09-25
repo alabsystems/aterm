@@ -197,16 +197,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ambiguous_width_default_is_single() {
-        assert_eq!(AmbiguousWidth::default(), AmbiguousWidth::Single);
-    }
-
-    #[test]
-    fn ligature_mode_default_is_enabled() {
-        assert_eq!(LigatureMode::default(), LigatureMode::Enabled);
-    }
-
-    #[test]
     fn text_shaping_config_default() {
         let cfg = TextShapingConfig::default();
         assert_eq!(cfg.ligature_mode, LigatureMode::Enabled);
@@ -260,13 +250,6 @@ mod tests {
         assert!(!cfg.should_disable_ligatures(Some((0, 8)), 0, 3, 8));
         // No cursor
         assert!(!cfg.should_disable_ligatures(None, 0, 3, 8));
-    }
-
-    #[test]
-    fn font_feature_new() {
-        let f = FontFeature::new(*b"calt", 1);
-        assert_eq!(f.tag, *b"calt");
-        assert_eq!(f.value, 1);
     }
 
     #[test]

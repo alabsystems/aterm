@@ -322,7 +322,9 @@ const HELP_TAIL: &str = concat!(
     "              (config > $ATERM_{FALLBACK,SYMBOL,EMOJI}_FONT alias > discovery).\n",
     "  Behaviour   gpu, scrollback_lines, columns, lines, copy_on_select,\n",
     "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
-    "              shell priority follows window focus; default on).\n",
+    "              shell priority follows window focus; default on),\n",
+    "              explain_heavy_load (the band names what slows your typing;\n",
+    "              default on).\n",
     "  Security    allow_window_ops, allow_notifications, allow_palette_reconfigure,\n",
     "              allow_kitty_file_transfer, allow_osc52_query,\n",
     "              secure_keyboard_entry (macOS)  (all opt-in, default off).\n",
@@ -506,6 +508,8 @@ const STARTER_CONFIG: &str = "\
                                    # (the version lives in the menu bar: the v<version> menu opens About)
 # confirm_multiline_paste = true   # confirm unbracketed multiline paste (macOS sheet / Windows dialog / Linux in-window banner)
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
+# explain_heavy_load = true        # when typing slows because something else loads the machine, the message band names it
+                                   # (\"Typing slowed by cargo in tab 2\"); details go to the log. false: off entirely
 
 # --- security opt-ins (all default OFF) ---------------------------------------
 # allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
@@ -1635,8 +1639,8 @@ mod tests {
         keys.dedup();
         assert_eq!(
             keys.len(),
-            155,
-            "the starter config's key count moved — update the `155 keys` line in \
+            156,
+            "the starter config's key count moved — update the `156 keys` line in \
              `aterm help config` (crates/aterm-cli/src/manual.rs, CONFIG_PAGE) and \
              this number together"
         );

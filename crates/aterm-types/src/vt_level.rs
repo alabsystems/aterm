@@ -267,65 +267,66 @@ mod tests {
         }
     }
 
+    /// Each capability against the levels either side of where it appears
+    /// (and, for sixel, where it disappears again: VT420 has no graphics).
     #[test]
-    fn c1_controls_support() {
-        assert!(!VtLevel::VT100.supports_c1_controls());
-        assert!(VtLevel::VT220.supports_c1_controls());
-        assert!(VtLevel::VT520.supports_c1_controls());
-    }
-
-    #[test]
-    fn user_defined_keys_support() {
-        assert!(!VtLevel::VT100.supports_user_defined_keys());
-        assert!(VtLevel::VT220.supports_user_defined_keys());
-        assert!(VtLevel::VT520.supports_user_defined_keys());
-    }
-
-    #[test]
-    fn drcs_support() {
-        assert!(!VtLevel::VT100.supports_drcs());
-        assert!(VtLevel::VT220.supports_drcs());
-        assert!(VtLevel::VT520.supports_drcs());
-    }
-
-    #[test]
-    fn sixel_support() {
-        assert!(!VtLevel::VT100.supports_sixel());
-        assert!(!VtLevel::VT220.supports_sixel());
-        assert!(VtLevel::VT240.supports_sixel());
-        assert!(VtLevel::VT340.supports_sixel());
-        assert!(!VtLevel::VT420.supports_sixel()); // VT420 doesn't have graphics
-        assert!(VtLevel::VT525.supports_sixel());
-    }
-
-    #[test]
-    fn mouse_support() {
-        assert!(!VtLevel::VT100.supports_mouse());
-        assert!(!VtLevel::VT220.supports_mouse());
-        assert!(VtLevel::VT320.supports_mouse());
-        assert!(VtLevel::VT520.supports_mouse());
-    }
-
-    #[test]
-    fn rectangular_ops_support() {
-        assert!(!VtLevel::VT100.supports_rectangular_ops());
-        assert!(!VtLevel::VT320.supports_rectangular_ops());
-        assert!(VtLevel::VT420.supports_rectangular_ops());
-        assert!(VtLevel::VT520.supports_rectangular_ops());
-    }
-
-    #[test]
-    fn pages_support() {
-        assert!(!VtLevel::VT100.supports_pages());
-        assert!(!VtLevel::VT320.supports_pages());
-        assert!(VtLevel::VT420.supports_pages());
-        assert!(VtLevel::VT520.supports_pages());
-    }
-
-    #[test]
-    fn sessions_support() {
-        assert!(!VtLevel::VT420.supports_sessions());
-        assert!(VtLevel::VT520.supports_sessions());
-        assert!(VtLevel::VT525.supports_sessions());
+    fn capability_boundaries() {
+        use VtLevel::{VT100, VT220, VT240, VT320, VT340, VT420, VT520, VT525};
+        type Supports = fn(VtLevel) -> bool;
+        type Boundary = (&'static str, Supports, &'static [(VtLevel, bool)]);
+        let cases: [Boundary; 8] = [
+            (
+                "c1 controls",
+                VtLevel::supports_c1_controls,
+                &[(VT100, false), (VT220, true), (VT520, true)],
+            ),
+            (
+                "user-defined keys",
+                VtLevel::supports_user_defined_keys,
+                &[(VT100, false), (VT220, true), (VT520, true)],
+            ),
+            (
+                "drcs",
+                VtLevel::supports_drcs,
+                &[(VT100, false), (VT220, true), (VT520, true)],
+            ),
+            (
+                "sixel",
+                VtLevel::supports_sixel,
+                &[
+                    (VT100, false),
+                    (VT220, false),
+                    (VT240, true),
+                    (VT340, true),
+                    (VT420, false), // VT420 doesn't have graphics
+                    (VT525, true),
+                ],
+            ),
+            (
+                "mouse",
+                VtLevel::supports_mouse,
+                &[(VT100, false), (VT220, false), (VT320, true), (VT520, true)],
+            ),
+            (
+                "rectangular ops",
+                VtLevel::supports_rectangular_ops,
+                &[(VT100, false), (VT320, false), (VT420, true), (VT520, true)],
+            ),
+            (
+                "pages",
+                VtLevel::supports_pages,
+                &[(VT100, false), (VT320, false), (VT420, true), (VT520, true)],
+            ),
+            (
+                "sessions",
+                VtLevel::supports_sessions,
+                &[(VT420, false), (VT520, true), (VT525, true)],
+            ),
+        ];
+        for (what, supports, rows) in cases {
+            for &(level, want) in rows {
+                assert_eq!(supports(level), want, "{what}: {level}");
+            }
+        }
     }
 }

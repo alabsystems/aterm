@@ -15,14 +15,12 @@
 //! `--progress-file`, so nothing here ever reaches it, and the meter never writes to
 //! stdout at all.
 //!
-//! Output and meter never share a line. atpkg's `println!`, `eprintln!` and `print!` are
-//! this module's [`println`], [`eprintln`] and [`print`] (the macros in `lib.rs`): with no
-//! meter live each is the standard macro, byte for byte and panic for panic; with one live
-//! the meter's line is cleared first and the next tick draws it again below. A line that does not end (a question waiting for an answer)
-//! stops the drawing until one does, and [`hold`] stops it while a child owns the
-//! terminal (`sudo` asking for a password). The line is cleared when the meter stops —
-//! on every return, and on Ctrl-C, whose default action is kept: the line is cleared,
-//! then the signal is raised again.
+//! Output and meter never share a line. atpkg's `println!` and `eprintln!` are this
+//! module's [`println`] and [`eprintln`] (the macros in `lib.rs`): with no meter live each
+//! is the standard macro, byte for byte and panic for panic; with one live the meter's
+//! line is cleared first and the next tick draws it again below. The line is cleared when
+//! the meter stops — on every return, and on Ctrl-C, whose default action is kept: the
+//! line is cleared, then the signal is raised again.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -391,19 +389,12 @@ fn columns() -> usize {
         .unwrap_or(80)
 }
 
-/// What is on the terminal: whether the meter's line is drawn, and how many reasons
-/// there are not to draw it (a line left open, a [`hold`]).
+/// What is on the terminal: whether the meter's line is drawn.
 struct Screen {
     drawn: bool,
-    open_line: bool,
-    holds: usize,
 }
 
-static SCREEN: Mutex<Screen> = Mutex::new(Screen {
-    drawn: false,
-    open_line: false,
-    holds: 0,
-});
+static SCREEN: Mutex<Screen> = Mutex::new(Screen { drawn: false });
 
 /// Whether a [`TtyMeter`] is running in this process — one load on every print.
 static LIVE: AtomicBool = AtomicBool::new(false);
@@ -424,13 +415,9 @@ fn clear(s: &mut Screen) {
     }
 }
 
-/// Draw `line` in place of the meter's last one (clearing it when `line` is empty),
-/// unless something owns the line now.
+/// Draw `line` in place of the meter's last one (clearing it when `line` is empty).
 fn draw(line: &str) {
     let mut s = screen_lock();
-    if s.open_line || s.holds > 0 {
-        return;
-    }
     if line.is_empty() {
         clear(&mut s);
         return;
@@ -442,17 +429,15 @@ fn draw(line: &str) {
     s.drawn = true;
 }
 
-/// Run `write` — output that `ends_line` or leaves its line open — with the meter's line
-/// out of its way. With no meter live, just `write`.
-pub(crate) fn around<R>(ends_line: bool, write: impl FnOnce() -> R) -> R {
+/// Run `write` — output that ends its line — with the meter's line out of its way. With
+/// no meter live, just `write`.
+pub(crate) fn around<R>(write: impl FnOnce() -> R) -> R {
     if !LIVE.load(Ordering::Acquire) {
         return write();
     }
     let mut s = screen_lock();
     clear(&mut s);
-    let out = write();
-    s.open_line = !ends_line;
-    out
+    write()
 }
 
 /// `println!`, the meter's line out of the way (the crate's `println!` is this).
@@ -462,7 +447,7 @@ pub(crate) fn println(args: std::fmt::Arguments<'_>) {
         return;
     }
     let text = args.to_string();
-    around(true, || std::println!("{text}"));
+    around(|| std::println!("{text}"));
 }
 
 /// `eprintln!`, the meter's line out of the way (the crate's `eprintln!` is this).
@@ -472,44 +457,7 @@ pub(crate) fn eprintln(args: std::fmt::Arguments<'_>) {
         return;
     }
     let text = args.to_string();
-    around(true, || std::eprintln!("{text}"));
-}
-
-/// `print!`, the meter's line out of the way (the crate's `print!` is this).
-pub(crate) fn print(args: std::fmt::Arguments<'_>) {
-    if !LIVE.load(Ordering::Acquire) {
-        std::print!("{args}");
-        return;
-    }
-    let text = args.to_string();
-    around(text.ends_with('\n'), || std::print!("{text}"));
-}
-
-/// The meter stays off the terminal while this is alive: a child that owns the terminal
-/// (`sudo` asking for a password, an installer's own output) must not be drawn over.
-pub(crate) struct Hold(bool);
-
-/// Clear the meter's line and keep it off until the [`Hold`] drops.
-#[must_use]
-pub(crate) fn hold() -> Hold {
-    if !LIVE.load(Ordering::Acquire) {
-        return Hold(false);
-    }
-    let mut s = screen_lock();
-    clear(&mut s);
-    s.holds += 1;
-    Hold(true)
-}
-
-impl Drop for Hold {
-    fn drop(&mut self) {
-        if self.0 {
-            let mut s = screen_lock();
-            s.holds = s.holds.saturating_sub(1);
-            // The child's last line ended wherever it ended; the next draw starts over.
-            s.open_line = false;
-        }
-    }
+    around(|| std::eprintln!("{text}"));
 }
 
 /// The meter: a thread that draws [`render_line`] of what its source shows, every
@@ -643,7 +591,6 @@ mod tests {
             bytes_total: total,
             build: None,
             bumped: false,
-            bumped_with: None,
             error: None,
         }
     }

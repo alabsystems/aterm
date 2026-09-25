@@ -1,89 +1,61 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Spec<->index<->seed coherence for the atpkg publish lane, enforced.
+//! Spec<->index coherence for the atpkg publish lane, enforced.
 //!
 //! Every rule here used to be operator discipline alone — prose in
 //! `tools/atpkg-programs.spec`'s header notes with no refusal anywhere. aterm
 //! has no CI by owner decision (tools/verify.sh); the merge contract's Test
 //! stage runs this file, so the discipline now fails a merge instead of a
-//! fleet. The invariants span three artifacts nothing else compares:
+//! fleet. The invariants span artifacts nothing else compares:
 //!
 //!   * `tools/atpkg-programs.spec` — the committed table of the LIVE published
-//!     index's pins ("tracks the live index, never a wish");
-//!   * `tools/atpkg-refresh-seed.sh` — the seed refresher whose pack lanes
-//!     decide what a release cut seals into aterm.app (§9.1);
+//!     index's pins ("tracks the live index, never a wish"), and the program set
+//!     every index lane reads;
 //!   * the root `Cargo.toml`'s `[workspace.metadata.atpkg]` — the pack surface
 //!     and the compiled-in default index account every shipped client resolves
 //!     (`crate::discovery::resolve_account`, stamped by aterm-update-core's
-//!     build.rs).
+//!     build.rs);
+//!   * the authoring scripts' tables and the client's compiled ones they mirror.
 //!
 //! A divergence between any two publishes silently: a spec row without a
 //! signed pack pins the unpublishable and wedges its whole coherence group on
-//! every client (§7); a spec row the seed lanes never pack drops out of fresh
-//! installs; a placeholder build column signs an index pinning build 0 with no
-//! refusal anywhere. Hermetic by construction: reads committed files via
+//! every client (§7); a placeholder build column signs an index pinning build 0
+//! with no refusal anywhere. Hermetic by construction: reads committed files via
 //! `CARGO_MANIFEST_DIR` only — no network, no keys, no subprocess.
 //!
 //! The textual parses deliberately MIRROR the consumers' own readers
 //! (atpkg-index.sh's `read -r name repo policy build group flags` loop and its
-//! `spec_flags_toml`; the refresher's `PLAIN_PROGRAMS`/`RUSTC_PROGRAMS`/
-//! `VENDOR_PROGRAMS` defaults and its literal `PROG=` bundle lane;
-//! atpkg-publish-lib.sh's `ATPKG_VENDOR_HOSTS`). If a consumer's grammar moves,
-//! this file must move in the same change — that forced co-review is the
-//! point, so a shape this parser no longer finds is a hard failure, never a
-//! silent skip.
+//! `spec_flags_toml`; atpkg-publish-lib.sh's `ATPKG_VENDOR_HOSTS`). If a
+//! consumer's grammar moves, this file must move in the same change — that
+//! forced co-review is the point, so a shape this parser no longer finds is a
+//! hard failure, never a silent skip.
 //!
-//! The VENDOR-FETCHED members (codex, claude, gh, emacs — `protocol =
-//! "https"` rows, authored by tools/atpkg-author-vendor.sh) and the
-//! OS-INSTALLED members (clt — `softwareupdate`; brew — `pkg`; the same
-//! script) add three rules: their rows carry the owner-decided flags (`extra`
-//! for the two agent CLIs, `system=<bin>` for gh and emacs, nothing for clt,
-//! `system=brew,requires=clt` for brew), they are EXEMPT from the seed pack
-//! lanes (never packed, never sealed — the refresher's `VENDOR_PROGRAMS` line
-//! is the exemption and must never gain a lane), and the authoring side's host
-//! allow-list must equal the client's (`crates/atpkg/src/vendor.rs`).
+//! The VENDOR-FETCHED members (codex, claude — followed on their vendors' own channels,
+//! `crates/atpkg/src/vendor_direct`) add three rules: their rows carry no flag, each
+//! stays pinned at a legacy index build no newer than the client's compiled legacy
+//! ceiling — the pin is a floor nothing re-authors (owner ruling 2026-09-23) — and the
+//! publish lane's host allow-list must equal the client's (`crates/atpkg/src/vendor.rs`).
+//! (The `-` build and the `vendor-direct` flag, which listed a program without pinning
+//! it, went on 2026-09-23; the pending gh/emacs rows and the OS-installed clt/brew rows,
+//! with the `extra` and `requires=` flags, went on 2026-09-24 — design 2026-09-22
+//! §5.3(b)/(c) — and so did the seed refresher whose `VENDOR_PROGRAMS` line exempted the
+//! vendor-fetched members from the seed pack lanes. With both, the authoring ceremony
+//! tools/atpkg-author-vendor.sh has no member left to author.)
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The trust verifier tuple locked to the trust rustc fork — the spec's
-/// `rustc` coherence group moves all-or-nothing (§7). One source of truth for
-/// tests (c) and (d); the spec's COHERENCE GROUP note is the prose twin.
+/// `rustc` coherence group moves all-or-nothing (§7). The spec's COHERENCE GROUP
+/// note is the prose twin.
 const RUSTC_TUPLE: [&str; 4] = ["trust", "trust-ir", "trust-cg", "trust-vc"];
 
-/// The owner's decisions for the vendor-fetched members: the two agent CLIs are
-/// DEFAULT-SET members (2026-09-10 — aterm is their version manager; until then they
-/// were `extra`, installed only through the typed-name consent stub), carrying NO
-/// flag, and `gh`/`emacs` are default-set members that a system install of the same
-/// name satisfies. Every one of these must be a spec row (active or pending) carrying
-/// exactly these flags, and the set is exactly the refresher's `VENDOR_PROGRAMS`
-/// exemption. The agent set must equal the client's compiled roster
-/// (`atpkg::stub::AGENT_PROGRAMS`), which treats them as default-set even under an
-/// index that still flags them.
+/// The vendor-fetched members: the two agent CLIs, DEFAULT-SET members (2026-09-10 —
+/// aterm is their version manager), carrying NO flag. Each must be a spec row, and the
+/// set is exactly the client's compiled roster (`atpkg::stub::AGENT_PROGRAMS`).
 const VENDOR_AGENTS: [&str; 2] = ["codex", "claude"];
-const VENDOR_SYSTEM: [(&str, &str); 2] = [("gh", "gh"), ("emacs", "emacs")];
-
-/// What Homebrew requires first: the Command Line Tools.
-const BREW_REQUIRES: &[&str] = &["clt"];
-
-/// The owner's direction (2026-08-27) for the OS-INSTALLED members, applied by
-/// the OS's own installer with elevation: the Command Line Tools carry NO flag
-/// (proven only by their own path — a system git never satisfies them), and
-/// Homebrew is satisfied by a `brew` on PATH and REQUIRES the Command Line
-/// Tools first (its pkg refuses to install without them). Same exemption from
-/// the seed as the vendor-fetched members.
-const OS_INSTALLED: [(&str, &[Flag]); 2] = [
-    ("clt", &[]),
-    (
-        "brew",
-        &[
-            Flag::System(std::borrow::Cow::Borrowed("brew")),
-            Flag::Requires(std::borrow::Cow::Borrowed(BREW_REQUIRES)),
-        ],
-    ),
-];
 
 /// Every known unpacked org system on the roadmap. Each must stay named in the
 /// spec's FUTURE MEMBERS / NOT-YET-PUBLISHABLE notes until it graduates to an
@@ -115,27 +87,10 @@ fn read(root: &Path, rel: &str) -> String {
 
 /// One flag of the spec's optional 6th column, as atpkg-index.sh's
 /// `spec_flags_toml` renders it into the signed `[programs.<name>]` block.
-/// (`Cow`, so the owner-decision tables above can be `const`.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Flag {
-    /// `extra` -> `extra = true`: not a default-set member.
-    Extra,
     /// `system=<bin>` -> `system = "<bin>"`: a PATH binary of that name satisfies it.
-    System(std::borrow::Cow<'static, str>),
-    /// `requires=<a>+<b>` -> `requires = ["a", "b"]`: installed before it.
-    Requires(std::borrow::Cow<'static, [&'static str]>),
-    /// `vendor-direct` -> the row is kept and `pin` carries nothing for it (design
-    /// 2026-09-22 §1.9); its BUILD column is `-`.
-    VendorDirect,
-}
-
-/// A bare program name, as atpkg-index.sh admits one in `requires=`/`system=`.
-fn bare_name_ok(n: &str) -> bool {
-    !n.is_empty()
-        && n != "."
-        && n != ".."
-        && n.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    System(String),
 }
 
 /// One spec row, in atpkg-index.sh's own grammar:
@@ -144,8 +99,7 @@ struct SpecRow {
     line_no: usize,
     name: String,
     policy: String,
-    /// `None` for a vendor-direct row, whose BUILD column is `-`: the index pins nothing.
-    build: Option<u64>,
+    build: u64,
     group: Option<String>,
     flags: Vec<Flag>,
 }
@@ -155,8 +109,8 @@ const POLICIES: [&str; 2] = ["prebuilt-only", "prebuilt-or-build"];
 /// Parse ONE row's fields under the indexer's grammar, refusing every shape
 /// the shell loop would silently tolerate or mis-sign: a wrong field count, a
 /// flag token sitting in the group column (it would sign a coherence group
-/// literally named `extra`), an unknown or duplicated flag, a `system=` value
-/// that is not a bare executable name.
+/// literally named `system=<bin>`), an unknown or duplicated flag, a `system=`
+/// value that is not a bare executable name, a build that is not a number.
 fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
     assert!(
         (4..=6).contains(&fields.len()),
@@ -165,24 +119,19 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
          — fix the row (atpkg-index.sh reads exactly those columns)",
         fields.len()
     );
-    let build = (fields[3] != "-").then(|| {
-        fields[3].parse::<u64>().unwrap_or_else(|_| {
-            panic!(
-                "tools/atpkg-programs.spec:{line_no}: build column {:?} for {:?} \
-                 is not a number — refresh it from the PACK-SPEC line the pack \
-                 lane prints at publish time (spec BUILD COLUMN note)",
-                fields[3], fields[0]
-            )
-        })
+    let build = fields[3].parse::<u64>().unwrap_or_else(|_| {
+        panic!(
+            "tools/atpkg-programs.spec:{line_no}: build column {:?} for {:?} \
+             is not a number — refresh it from the PACK-SPEC line the pack \
+             lane prints at publish time (spec BUILD COLUMN note)",
+            fields[3], fields[0]
+        )
     });
     let group = match fields.get(4) {
         Some(&"-") | None => None,
         Some(g) => {
             assert!(
-                *g != "extra"
-                    && *g != "vendor-direct"
-                    && !g.starts_with("system=")
-                    && !g.starts_with("requires="),
+                !g.starts_with("system="),
                 "tools/atpkg-programs.spec:{line_no}: {:?} has the flag {g:?} \
                  in the coherence_group column — the columns are positional; \
                  write `-` for the group first (atpkg-index.sh refuses this \
@@ -197,11 +146,7 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
         && *col != "-"
     {
         for f in col.split(',') {
-            let flag = if f == "extra" {
-                Flag::Extra
-            } else if f == "vendor-direct" {
-                Flag::VendorDirect
-            } else if let Some(bin) = f.strip_prefix("system=") {
+            let flag = if let Some(bin) = f.strip_prefix("system=") {
                 assert!(
                     !bin.is_empty()
                         && bin != "."
@@ -213,30 +158,13 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
                      needs a bare executable name ([A-Za-z0-9._+-]), got {bin:?}",
                     fields[0]
                 );
-                Flag::System(std::borrow::Cow::Owned(bin.to_string()))
-            } else if let Some(list) = f.strip_prefix("requires=") {
-                let names: Vec<&'static str> = list
-                    .split('+')
-                    .map(|n| {
-                        assert!(
-                            bare_name_ok(n) && n != fields[0],
-                            "tools/atpkg-programs.spec:{line_no}: {:?}: requires=<name> \
-                             needs a bare program name other than itself \
-                             ([A-Za-z0-9._-], + joins several), got {n:?}",
-                            fields[0]
-                        );
-                        // Leaked on purpose: a handful of names per test process.
-                        &*Box::leak(n.to_string().into_boxed_str())
-                    })
-                    .collect();
-                Flag::Requires(std::borrow::Cow::Owned(names))
+                Flag::System(bin.to_string())
             } else {
                 panic!(
                     "tools/atpkg-programs.spec:{line_no}: {:?}: unknown spec \
-                     flag {f:?} (known: extra, system=<bin>, \
-                     requires=<name>[+<name>], vendor-direct) — atpkg-index.sh refuses it; \
-                     nothing may silently drop a token from the column the \
-                     index is signed from",
+                     flag {f:?} (known: system=<bin>; extra, requires= and vendor-direct \
+                     are retired) — atpkg-index.sh refuses it; nothing may silently drop a \
+                     token from the column the index is signed from",
                     fields[0]
                 );
             };
@@ -248,22 +176,6 @@ fn parse_row(fields: &[&str], line_no: usize, what: &str) -> SpecRow {
             flags.push(flag);
         }
     }
-    // A vendor-direct row pins nothing: `-` is its build, and only its (atpkg-index.sh
-    // refuses the same shapes, but only at publish time).
-    let vendor_direct = flags.contains(&Flag::VendorDirect);
-    assert_eq!(
-        build.is_none(),
-        vendor_direct,
-        "tools/atpkg-programs.spec:{line_no}: {:?}: a `-` build and the `vendor-direct` flag \
-         go together — a vendor-direct row pins nothing, and every other row pins a build",
-        fields[0]
-    );
-    assert!(
-        !vendor_direct || group.is_none(),
-        "tools/atpkg-programs.spec:{line_no}: {:?}: a vendor-direct row joins no coherence \
-         group (a group moves pins together)",
-        fields[0]
-    );
     SpecRow {
         line_no,
         name: fields[0].to_string(),
@@ -296,35 +208,6 @@ fn active_rows(spec: &str) -> Vec<SpecRow> {
     rows
 }
 
-/// The PENDING rows: a row commented with a BARE leading `#` (no space after
-/// it — the spec header documents the shape) is a member the index does not
-/// pin yet, kept grammatical so going live is deleting one byte and taking the
-/// build from the PACK-SPEC line. A bare-`#` line that looks like a row
-/// (a known policy in column 3, a number in column 4) is parsed under the
-/// FULL grammar, so a pending row cannot rot into something the indexer would
-/// refuse — or worse, mis-sign — on the day it is uncommented.
-fn pending_rows(spec: &str) -> Vec<SpecRow> {
-    let mut rows = Vec::new();
-    for (idx, raw) in spec.lines().enumerate() {
-        let line = raw.trim();
-        let Some(rest) = line.strip_prefix('#') else {
-            continue;
-        };
-        if rest.starts_with(' ') || rest.starts_with('#') || rest.starts_with('!') {
-            continue;
-        }
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        let looks_like_row = fields.len() >= 4
-            && POLICIES.contains(&fields[2])
-            && fields[3].bytes().all(|b| b.is_ascii_digit());
-        if !looks_like_row {
-            continue;
-        }
-        rows.push(parse_row(&fields, idx + 1, "pending (commented)"));
-    }
-    rows
-}
-
 fn active_names(rows: &[SpecRow]) -> BTreeSet<String> {
     rows.iter().map(|r| r.name.clone()).collect()
 }
@@ -352,104 +235,6 @@ fn mentions_token(text: &str, name: &str) -> bool {
         from = start + 1;
     }
     false
-}
-
-/// Literal `PROG=<name>` assignments on a non-comment shell line — the bundle
-/// lane's `env PROG=trust …`. `PROG="$prog"` (the per-program loops) starts
-/// with a quote, so it never yields a token here; those loops are covered by
-/// the `PLAIN_PROGRAMS`/`RUSTC_PROGRAMS` defaults instead.
-fn literal_prog_assignments(line: &str) -> Vec<String> {
-    let bytes = line.as_bytes();
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(pos) = line[from..].find("PROG=") {
-        let start = from + pos;
-        let val_start = start + "PROG=".len();
-        let bounded = start == 0 || !is_word_byte(bytes[start - 1]);
-        if bounded {
-            let val: String = line[val_start..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if !val.is_empty() {
-                out.push(val);
-            }
-        }
-        from = val_start;
-    }
-    out
-}
-
-/// The full program set tools/atpkg-refresh-seed.sh packs on an unnarrowed
-/// run: the PLAIN_PROGRAMS default, the RUSTC_PROGRAMS siblings, and every
-/// literal `PROG=` lane (the trust bundle). Parsed textually against the
-/// script's committed shapes; a shape this cannot find is a hard failure so
-/// the script and this test can only move together.
-fn seed_pack_lanes(script: &str) -> BTreeSet<String> {
-    const PLAIN_PREFIX: &str = "PLAIN_PROGRAMS=\"${PROGRAMS_ONLY:-";
-    const RUSTC_PREFIX: &str = "RUSTC_PROGRAMS=\"";
-    let mut lanes = BTreeSet::new();
-    let mut plain_seen = false;
-    let mut rustc_seen = false;
-    for raw in script.lines() {
-        let line = raw.trim_start();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix(PLAIN_PREFIX) {
-            let list = rest.split('}').next().unwrap_or("");
-            lanes.extend(list.split_whitespace().map(str::to_string));
-            plain_seen = true;
-        }
-        if let Some(rest) = line.strip_prefix(RUSTC_PREFIX) {
-            let list = rest.split('"').next().unwrap_or("");
-            lanes.extend(list.split_whitespace().map(str::to_string));
-            rustc_seen = true;
-        }
-        lanes.extend(literal_prog_assignments(line));
-    }
-    assert!(
-        plain_seen,
-        "tools/atpkg-refresh-seed.sh no longer carries the \
-         `{PLAIN_PREFIX}…}}\"` default this test parses — if the plain pack \
-         lane changed shape, update seed_pack_lanes() in the same change so \
-         spec<->seed coverage stays enforced"
-    );
-    assert!(
-        rustc_seen,
-        "tools/atpkg-refresh-seed.sh no longer carries the \
-         `{RUSTC_PREFIX}…\"` default this test parses — if the rustc tuple \
-         lane changed shape, update seed_pack_lanes() in the same change so \
-         spec<->seed coverage stays enforced"
-    );
-    lanes
-}
-
-/// The refresher's `VENDOR_PROGRAMS="…"` line: the members it NEVER packs
-/// and NEVER seals (their bytes are the vendor's; the DMG must not carry
-/// them). It is the seed exemption for test (d) and is pinned to the owner
-/// decisions by test (g).
-fn seed_vendor_exemption(script: &str) -> BTreeSet<String> {
-    const PREFIX: &str = "VENDOR_PROGRAMS=\"";
-    let mut out = None;
-    for raw in script.lines() {
-        let line = raw.trim_start();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix(PREFIX) {
-            let list = rest.split('"').next().unwrap_or("");
-            out = Some(list.split_whitespace().map(str::to_string).collect());
-        }
-    }
-    out.unwrap_or_else(|| {
-        panic!(
-            "tools/atpkg-refresh-seed.sh no longer carries the `{PREFIX}…\"` \
-             line this test parses — it is the https-protocol seed EXEMPTION \
-             (never packed, never sealed); restore it or update \
-             seed_vendor_exemption() in the same change"
-        )
-    })
 }
 
 /// A shell `NAME="a b c"` list on a non-comment line of `script`.
@@ -501,7 +286,7 @@ fn active_rows_parse_with_published_build_numbers() {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for row in &rows {
         assert!(
-            row.build != Some(0),
+            row.build != 0,
             "tools/atpkg-programs.spec:{}: {:?} has placeholder build 0 — \
              publishing it would sign an index pinning build 0 for every \
              client; refresh the row from the PACK-SPEC line atpkg-pack.sh \
@@ -569,58 +354,7 @@ fn rustc_coherence_group_is_exactly_the_trust_tuple() {
          {RUSTC_TUPLE:?} (spec COHERENCE GROUP note, §7) — a missing member \
          version-splits the tuple, an extra unstageable member aborts the \
          whole group on every client. Fix the group column of the drifted \
-         row(s); a NEW tuple member also needs a lane in \
-         tools/atpkg-refresh-seed.sh (RUSTC_PROGRAMS)"
-    );
-}
-
-/// (d) Seed<->spec coverage, both directions: an unnarrowed
-/// tools/atpkg-refresh-seed.sh run must pack exactly the active set. A spec
-/// row the seed never packs drops out of fresh installs (the refresher's own
-/// 2b gate then refuses every refresh); a seed lane the spec omits seals pins
-/// the published index does not carry, and the two lanes' shared counter
-/// (spec INDEX COUNTER note) makes that a real client-visible split.
-#[test]
-fn seed_refresher_packs_exactly_the_active_set() {
-    let root = repo_root();
-    let spec = active_names(&active_rows(&read(&root, "tools/atpkg-programs.spec")));
-    let refresher = read(&root, "tools/atpkg-refresh-seed.sh");
-    let seed = seed_pack_lanes(&refresher);
-    let vendor = seed_vendor_exemption(&refresher);
-    // A vendor-fetched member is EXEMPT: never packed, never sealed — the
-    // client fetches its bytes from the vendor. The exemption is a list the
-    // refresher carries on purpose, so an unpacked non-vendor row still fails.
-    let unpacked: Vec<&String> = spec
-        .difference(&seed)
-        .filter(|n| !vendor.contains(*n))
-        .collect();
-    assert!(
-        unpacked.is_empty(),
-        "tools/atpkg-refresh-seed.sh has no pack lane for active spec \
-         program(s) {unpacked:?} — every fresh install's seed would omit them \
-         while the index pins them. Add each to the script's PLAIN_PROGRAMS \
-         default (or RUSTC_PROGRAMS for a trust-tuple member; or \
-         VENDOR_PROGRAMS if it is a vendor-fetched member that must never be \
-         sealed), or remove the row from tools/atpkg-programs.spec if it was \
-         never published"
-    );
-    let sealed_vendor: Vec<&String> = vendor.intersection(&seed).collect();
-    assert!(
-        sealed_vendor.is_empty(),
-        "tools/atpkg-refresh-seed.sh packs vendor-fetched program(s) \
-         {sealed_vendor:?} — their bytes are the vendor's and must NEVER be \
-         sealed into the DMG (Claude Code's license forbids redistribution; \
-         the rest are not ours to ship). Drop the lane; VENDOR_PROGRAMS is \
-         the exemption, not a pack set"
-    );
-    let unindexed: Vec<&String> = seed.difference(&spec).collect();
-    assert!(
-        unindexed.is_empty(),
-        "tools/atpkg-refresh-seed.sh packs program(s) {unindexed:?} that \
-         tools/atpkg-programs.spec does not list — the seed would seal pins \
-         the published index never carries. Land the spec row in the same \
-         change (after the FUTURE MEMBERS runway: pack, UPLOAD the signed \
-         pkg, take the real build), or drop the extra lane from the script"
+         row(s)"
     );
 }
 
@@ -706,27 +440,18 @@ fn workspace_metadata_pins_the_shipped_surface_and_public_account() {
     );
 }
 
-/// (g) The vendor-fetched members carry the OWNER'S decisions, in the table:
-/// codex and claude are extras (`extra`), gh and emacs are system-satisfied
-/// default-set members (`system=<bin>`); each is an active or a PENDING row
-/// (the FUTURE MEMBERS rule keeps it commented until a signed pkg exists),
-/// parsed under the full grammar so the day it goes live is a one-byte edit;
-/// and the refresher's `VENDOR_PROGRAMS` exemption is exactly this set — an
-/// exemption wider than the decisions would let an ordinary program skip the
-/// seed, one narrower would seal a vendor's bytes.
+/// (g) The vendor-fetched members carry the OWNER'S decisions, in the table: codex
+/// and claude are default-set rows carrying no flag, riding the index repo.
 #[test]
-fn vendor_members_carry_the_owner_decisions_and_the_seed_exemption() {
+fn vendor_members_carry_the_owner_decisions() {
     let root = repo_root();
     let spec = read(&root, "tools/atpkg-programs.spec");
-    let mut rows = active_rows(&spec);
-    rows.extend(pending_rows(&spec));
+    let rows = active_rows(&spec);
     let find = |name: &str| -> &SpecRow {
         rows.iter().find(|r| r.name == name).unwrap_or_else(|| {
             panic!(
-                "tools/atpkg-programs.spec has no row (active or `#`-pending) \
-                 for the vendor-fetched member {name:?} — restore it under \
-                 the PENDING rows at the foot of the table (spec \
-                 VENDOR-FETCHED MEMBERS note)"
+                "tools/atpkg-programs.spec has no row for the vendor-fetched member \
+                 {name:?} — restore it (spec VENDOR-FETCHED MEMBERS note)"
             )
         })
     };
@@ -740,11 +465,12 @@ fn vendor_members_carry_the_owner_decisions_and_the_seed_exemption() {
     );
     for name in VENDOR_AGENTS {
         let row = find(name);
-        assert!(
-            row.flags.is_empty() || row.flags == [Flag::VendorDirect],
-            "tools/atpkg-programs.spec:{}: {name:?} must carry NO flag but `vendor-direct` \
-             (owner decision 2026-09-10: a default-set member — aterm is its version \
-             manager — never `extra`; since the 2026-09-22 cutover it may be kept unpinned)",
+        assert_eq!(
+            row.flags,
+            vec![],
+            "tools/atpkg-programs.spec:{}: {name:?} must carry NO flag (owner decision \
+             2026-09-10: a default-set member — aterm is its version manager — never \
+             `extra`)",
             row.line_no
         );
         // Owner direction 2026-09-08: the manifest-only releases of a vendor member
@@ -760,165 +486,6 @@ fn vendor_members_carry_the_owner_decisions_and_the_seed_exemption() {
             row.line_no
         );
     }
-    for (name, bin) in VENDOR_SYSTEM {
-        let row = find(name);
-        assert_eq!(
-            row.flags,
-            vec![Flag::System(std::borrow::Cow::Borrowed(bin))],
-            "tools/atpkg-programs.spec:{}: {name:?} must carry exactly \
-             `system={bin}` (owner decision: a system install on PATH \
-             satisfies it; vendor-fetched otherwise)",
-            row.line_no
-        );
-    }
-    for (name, flags) in OS_INSTALLED {
-        let row = find(name);
-        assert_eq!(
-            row.flags,
-            flags.to_vec(),
-            "tools/atpkg-programs.spec:{}: {name:?} must carry exactly {flags:?} \
-             (owner direction 2026-08-27: clt is proven only by its own path; \
-             brew is satisfied by a system brew and requires clt first)",
-            row.line_no
-        );
-    }
-    // brew requires clt, so clt must be a row (active or pending) whenever brew is:
-    // an index pinning brew without clt would make every brew install wait on a
-    // requirement the index cannot name.
-    let brew_line = find("brew").line_no;
-    let clt_line = find("clt").line_no;
-    assert!(
-        clt_line < brew_line,
-        "tools/atpkg-programs.spec: the clt row (line {clt_line}) must precede the brew \
-         row (line {brew_line}) — brew requires clt, and the spec reads top to bottom"
-    );
-    let decided: BTreeSet<String> = VENDOR_AGENTS
-        .iter()
-        .copied()
-        .chain(VENDOR_SYSTEM.iter().map(|(n, _)| *n))
-        .chain(OS_INSTALLED.iter().map(|(n, _)| *n))
-        .map(str::to_string)
-        .collect();
-    let exemption = seed_vendor_exemption(&read(&root, "tools/atpkg-refresh-seed.sh"));
-    assert_eq!(
-        exemption, decided,
-        "tools/atpkg-refresh-seed.sh VENDOR_PROGRAMS must be exactly the \
-         vendor-fetched and OS-installed members this test pins ({decided:?}) — \
-         wider lets an ordinary program skip the seed, narrower seals a vendor's \
-         bytes"
-    );
-    // The pending rows are exactly the not-yet-published vendor and OS-installed
-    // members: a pending row for anything else has no authoring lane that prints a
-    // PACK-SPEC line for it.
-    for row in pending_rows(&spec) {
-        assert!(
-            decided.contains(&row.name),
-            "tools/atpkg-programs.spec:{}: pending row for {:?}, which is not \
-             a vendor-fetched or OS-installed member — only \
-             tools/atpkg-author-vendor.sh's programs are staged as `#`-pending \
-             rows; land anything else via the FUTURE MEMBERS runway",
-            row.line_no,
-            row.name
-        );
-    }
-    // Every `requires=` names a program the spec carries (active or pending): the
-    // index would otherwise pin a member requiring a name it cannot resolve.
-    let names: BTreeSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-    for row in &rows {
-        for flag in &row.flags {
-            if let Flag::Requires(deps) = flag {
-                for dep in deps.iter() {
-                    assert!(
-                        names.contains(dep),
-                        "tools/atpkg-programs.spec:{}: {:?} requires {dep:?}, which is not \
-                         a row of this spec",
-                        row.line_no,
-                        row.name
-                    );
-                }
-            }
-        }
-    }
-    // And the relation is acyclic — over programs, and THROUGH a coherence group (the
-    // client refuses either at index parse, `manifest::validate_requires`, so a cycle
-    // here would sign an index every client throws away).
-    let requires_of = |name: &str| -> Vec<&str> {
-        rows.iter()
-            .filter(|r| r.name == name)
-            .flat_map(|r| r.flags.iter())
-            .filter_map(|f| match f {
-                Flag::Requires(deps) => Some(deps.iter().copied().collect::<Vec<_>>()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    };
-    let group_of = |name: &str| -> Option<String> {
-        rows.iter()
-            .find(|r| r.name == name)
-            .and_then(|r| r.group.clone())
-    };
-    for row in &rows {
-        // Walk every path from the row; a return to the row, or to a member of the
-        // row's group after leaving it, is a cycle.
-        let mut stack: Vec<(String, Vec<String>, bool)> =
-            vec![(row.name.clone(), vec![row.name.clone()], false)];
-        let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
-        while let Some((node, path, left)) = stack.pop() {
-            if !seen.insert((node.clone(), left)) {
-                continue;
-            }
-            for dep in requires_of(&node) {
-                let same_group = group_of(dep).is_some() && group_of(dep) == group_of(&row.name);
-                let back = dep == row.name || (same_group && left);
-                assert!(
-                    !back,
-                    "tools/atpkg-programs.spec:{}: requires cycle {} → {dep} (the client \
-                     refuses an index carrying one)",
-                    row.line_no,
-                    path.join(" → ")
-                );
-                let mut next = path.clone();
-                next.push(dep.to_string());
-                let leaves = !(same_group || dep == row.name);
-                stack.push((dep.to_string(), next, left || leaves));
-            }
-        }
-    }
-}
-
-/// (i) The authoring script's program roster equals the members this test pins:
-/// `tools/atpkg-author-vendor.sh <name>` must exist for every pending vendor or
-/// OS-installed row (it is the only lane that prints their PACK-SPEC line), and
-/// must not offer a program the spec never mentions.
-#[test]
-fn the_authoring_script_serves_exactly_the_vendor_and_os_installed_members() {
-    let root = repo_root();
-    let script = read(&root, "tools/atpkg-author-vendor.sh");
-    let line = script
-        .lines()
-        .find(|l| l.trim_start().starts_with("case \"$PROG\" in"))
-        .and_then(|_| {
-            script
-                .lines()
-                .skip_while(|l| !l.trim_start().starts_with("case \"$PROG\" in"))
-                .nth(1)
-        })
-        .expect("tools/atpkg-author-vendor.sh dispatches on \"$PROG\"");
-    let pattern = line.trim().split(')').next().unwrap_or("");
-    let offered: BTreeSet<String> = pattern.split('|').map(str::to_string).collect();
-    let decided: BTreeSet<String> = VENDOR_AGENTS
-        .iter()
-        .copied()
-        .chain(VENDOR_SYSTEM.iter().map(|(n, _)| *n))
-        .chain(OS_INSTALLED.iter().map(|(n, _)| *n))
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        offered, decided,
-        "tools/atpkg-author-vendor.sh's program roster (the first `case \"$PROG\"` \
-         arm) must be exactly the vendor-fetched + OS-installed members"
-    );
 }
 
 impl SpecRow {
@@ -991,67 +558,6 @@ fn shim_env_rule_matches_the_client() {
         "tools/atpkg-publish-lib.sh ATPKG_SHIM_ENV_NEVER_PREFIXES must equal \
          shim_env::NEVER_SET_PREFIXES"
     );
-    // The authored claude row's entry is one the client admits, and the fix-line it
-    // earns is the self-update one — the whole point of the key.
-    let env = atpkg::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
-    assert_eq!(
-        env.fix_line("claude").as_deref(),
-        Some("Claude Code's own updater is off here (DISABLE_AUTOUPDATER=1)")
-    );
-    assert!(
-        read(&root, "tools/atpkg-author-vendor.sh").contains("SHIM_ENV=\"DISABLE_AUTOUPDATER=1\""),
-        "tools/atpkg-author-vendor.sh authors claude with SHIM_ENV=DISABLE_AUTOUPDATER=1"
-    );
-}
-
-/// (h2) The AUTHORING side's manager table equals the CLIENT's: the names
-/// (`ATPKG_MANAGERS` = `vendor::MANAGERS`, the table's name column) and the
-/// system-wide subset (`ATPKG_MANAGERS_ELEVATED` = every table row with
-/// `elevated: true`). The client's table is the authority — a signed row naming
-/// any other manager is refused before anything runs; atpkg-publish-lib.sh's
-/// copy only lets the ceremony refuse the row before it is signed. Adding a
-/// manager is one table row there, then one word here.
-#[test]
-fn manager_table_matches_the_client() {
-    let root = repo_root();
-    let lib = read(&root, "tools/atpkg-publish-lib.sh");
-    let shell = shell_list(&lib, "ATPKG_MANAGERS", "tools/atpkg-publish-lib.sh");
-    let shell_elevated = shell_list(
-        &lib,
-        "ATPKG_MANAGERS_ELEVATED",
-        "tools/atpkg-publish-lib.sh",
-    );
-    let client: BTreeSet<String> = atpkg::MANAGERS.iter().map(|m| (*m).to_string()).collect();
-    assert_eq!(
-        shell, client,
-        "tools/atpkg-publish-lib.sh ATPKG_MANAGERS must equal crates/atpkg/src/vendor.rs \
-         MANAGERS — the client's table is the authority; update the shell copy in the \
-         same change"
-    );
-    let client_elevated: BTreeSet<String> = atpkg::MANAGER_TABLE
-        .iter()
-        .filter(|m| m.elevated)
-        .map(|m| m.name.to_string())
-        .collect();
-    assert_eq!(
-        shell_elevated, client_elevated,
-        "tools/atpkg-publish-lib.sh ATPKG_MANAGERS_ELEVATED must equal the client's \
-         system-wide managers (MANAGER_TABLE rows with elevated: true)"
-    );
-    assert!(
-        shell_elevated.is_subset(&shell),
-        "every elevated manager is a manager"
-    );
-    // The shell copy of each manager's package-id charset (atpkg_package_id_ok) is
-    // pinned by the tooling test against the ids the spec rows use; here, the names
-    // the client refuses are the names the shell must refuse.
-    for name in ["yum", "npm", "uv", "APT", ""] {
-        assert!(
-            !client.contains(name),
-            "{name:?} is not a manager yet — if it just became one, the shell copy must \
-             follow in the same change"
-        );
-    }
 }
 
 /// (h) The AUTHORING side's vendor host allow-list equals the CLIENT's. The
@@ -1098,87 +604,110 @@ fn vendor_host_allow_list_matches_the_client() {
     }
 }
 
-/// THE LEGACY CEILING (design §1.3) is at or above every legacy build the committed spec
-/// pins for a vendor-direct program: an unread legacy build is replaced with no person
-/// asking only up to it, because every pin up to it carries a version at or below the
-/// floor. A row above it is a legacy pin published after the ceiling was compiled — raise
-/// the ceiling only once that build's signed version is known to be at or below the floor.
-#[test]
-fn every_legacy_vendor_pin_is_at_or_below_its_ceiling() {
-    let root = repo_root();
-    let rows = active_rows(&read(&root, "tools/atpkg-programs.spec"));
+/// Why [`vendor_direct_programs_stay_pinned_as_floors`] refuses `rows`: one line per
+/// vendor-direct program with no active row, with a row whose build is not a legacy index
+/// build, or with a legacy build above its compiled legacy ceiling.
+fn vendor_direct_pin_problems(rows: &[SpecRow]) -> Vec<String> {
+    let mut problems = Vec::new();
     for vendor in atpkg::vendor_direct::VENDORS {
-        for row in rows.iter().filter(|r| r.name == vendor.program) {
-            let Some(build) = row.build else {
-                continue; // vendor-direct: no legacy pin at all
-            };
-            assert!(
-                build <= vendor.legacy_ceiling,
-                "tools/atpkg-programs.spec:{}: {} build {} is above its compiled legacy \
-                 ceiling {} (crates/atpkg/src/vendor_direct/table.rs)",
-                row.line_no,
-                row.name,
-                build,
-                vendor.legacy_ceiling
-            );
+        match rows.iter().find(|r| r.name == vendor.program) {
+            None => problems.push(format!(
+                "no active row for the vendor-direct program {:?} — its pin stays, as a \
+                 floor; retiring it is ALLOW_OMIT on a publish, never a deleted row",
+                vendor.program
+            )),
+            Some(row) if atpkg::vendor_direct::is_vendor_build(row.build) => {
+                problems.push(format!(
+                    "tools/atpkg-programs.spec:{}: {} pins {}, a vendor-direct build id — \
+                     the index is never a byte source for one; the row keeps the legacy \
+                     index build the live index pins",
+                    row.line_no, row.name, row.build
+                ));
+            }
+            Some(row) if row.build > vendor.legacy_ceiling => {
+                problems.push(format!(
+                    "tools/atpkg-programs.spec:{}: {} build {} is above its compiled legacy \
+                     ceiling {} (crates/atpkg/src/vendor_direct/table.rs) — raise the ceiling, \
+                     and the floors with it, only once that build's signed version is known \
+                     to be at or below the floor",
+                    row.line_no, row.name, row.build, vendor.legacy_ceiling
+                ));
+            }
+            Some(_) => {}
         }
     }
+    problems
 }
 
-/// THE VENDOR-DIRECT MARKER (design 2026-09-22 §1.9) keeps a program's row and drops its
-/// pin, so it may name only a program the client follows on its vendor's own channel: on any
-/// other row the index would stop pinning a program nothing else updates. The shell's copy of
-/// that program set (atpkg-publish-lib.sh `ATPKG_VENDOR_DIRECT`, which atpkg-index.sh and
-/// every lane that carries such a row read) is the client's `vendor_direct::VENDORS`.
+/// THE VENDOR-DIRECT PROGRAMS STAY PINNED, AS FLOORS (owner ruling 2026-09-23). A client
+/// carrying the vendor-direct lane never plans them from the index and holds the newer of
+/// an installed pin and the vendor's head; an older client keeps installing the pin. So
+/// each is an active row at a legacy index build: there is no `-` (listed, not pinned)
+/// grammar any more — the parser refuses it as the indexer does — and a vendor build id
+/// would ask the index to serve bytes it never carries.
+///
+/// THE LEGACY CEILING (design §1.3) is at or above every one of those pins: an unread
+/// legacy build is replaced with no person asking only up to it, because every pin up to
+/// it carries a version at or below the floor. A row above it is a legacy pin the compiled
+/// ceiling never saw. Controls: a spec without the claude row, a claude row at a vendor
+/// build id, a claude row one build above its ceiling, and a `-` build are each refused.
 #[test]
-fn vendor_direct_rows_name_only_the_programs_the_client_follows_directly() {
+fn vendor_direct_programs_stay_pinned_as_floors() {
     let root = repo_root();
-    let client: BTreeSet<String> = atpkg::vendor_direct::VENDORS
+    let rows = active_rows(&read(&root, "tools/atpkg-programs.spec"));
+    let problems = vendor_direct_pin_problems(&rows);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+
+    let without_claude: Vec<SpecRow> = rows
         .iter()
-        .map(|v| v.program.to_string())
+        .filter(|r| r.name != "claude")
+        .map(|r| {
+            parse_row(
+                &[&r.name, "aterm", &r.policy, &r.build.to_string()],
+                r.line_no,
+                "control",
+            )
+        })
         .collect();
-    let shell = shell_list(
-        &read(&root, "tools/atpkg-publish-lib.sh"),
-        "ATPKG_VENDOR_DIRECT",
-        "tools/atpkg-publish-lib.sh",
+    let problems = vendor_direct_pin_problems(&without_claude);
+    assert!(
+        problems.len() == 1 && problems[0].contains("\"claude\""),
+        "a spec without the claude row must be refused by name: {problems:?}"
     );
-    assert_eq!(
-        shell, client,
-        "tools/atpkg-publish-lib.sh ATPKG_VENDOR_DIRECT must equal the program set of \
-         crates/atpkg/src/vendor_direct/table.rs VENDORS"
+    let vendor_id = atpkg::vendor_direct::VENDOR_BUILD_BASE + 2_000_001_000_280;
+    let mut at_vendor_id = without_claude;
+    at_vendor_id.push(parse_row(
+        &["claude", "aterm", "prebuilt-only", &vendor_id.to_string()],
+        1,
+        "control",
+    ));
+    let problems = vendor_direct_pin_problems(&at_vendor_id);
+    assert!(
+        problems.len() == 1 && problems[0].contains("vendor-direct build id"),
+        "a claude row at a vendor build id must be refused: {problems:?}"
     );
-    let spec = read(&root, "tools/atpkg-programs.spec");
-    for row in active_rows(&spec) {
-        if row.flags.contains(&Flag::VendorDirect) {
-            assert!(
-                client.contains(&row.name),
-                "tools/atpkg-programs.spec:{}: {:?} is marked vendor-direct, but the client \
-                 follows only {client:?} on their vendors' channels — the index would stop \
-                 pinning a program nothing else updates",
-                row.line_no,
-                row.name
-            );
-            assert_eq!(
-                row.repo(&spec),
-                "aterm",
-                "tools/atpkg-programs.spec:{}: a vendor-direct row keeps the index repo \
-                 its legacy manifests ride",
-                row.line_no
-            );
-        }
-    }
-    // The indexer and the lanes read the lib's list; none keeps a private copy to drift.
-    for rel in [
-        "tools/atpkg-index.sh",
-        "tools/atpkg-auto-vendor.sh",
-        "tools/atpkg-auto-alab.sh",
-        "tools/linux-auto-atpkg.sh",
-    ] {
-        assert!(
-            !read(&root, rel).contains("ATPKG_VENDOR_DIRECT=\""),
-            "{rel} re-declares ATPKG_VENDOR_DIRECT — read tools/atpkg-publish-lib.sh's"
-        );
-    }
+    let above = atpkg::vendor_direct::spec("claude")
+        .expect("claude is a vendor-direct program")
+        .legacy_ceiling
+        + 1;
+    at_vendor_id.pop();
+    at_vendor_id.push(parse_row(
+        &["claude", "aterm", "prebuilt-only", &above.to_string()],
+        1,
+        "control",
+    ));
+    let problems = vendor_direct_pin_problems(&at_vendor_id);
+    assert!(
+        problems.len() == 1 && problems[0].contains("above its compiled legacy ceiling"),
+        "a claude row above its legacy ceiling must be refused: {problems:?}"
+    );
+    let dash = std::panic::catch_unwind(|| {
+        parse_row(&["claude", "aterm", "prebuilt-only", "-"], 1, "control")
+    });
+    assert!(
+        dash.is_err(),
+        "a `-` build column must be refused, as the indexer refuses it"
+    );
 }
 
 /// The body of one `name() { … }` shell function, from its opening line to the first line

@@ -128,9 +128,8 @@ pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
 }
 
 /// The shim [`install_shim_env`] would lay — the same target derivation, the same body
-/// — RENDERED but not written, for the callers that lay a whole pass of shims in ONE
-/// go through [`crate::lay::lay_executables`] (one untracked launchd job when this
-/// process is provenance-tracked, instead of one per file).
+/// — RENDERED but not written, for the callers that render a whole pass of shims before
+/// they lay it ([`crate::lay::write_in_process`]) or compare it with what is on disk.
 pub fn shim_executable_env(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
@@ -290,7 +289,7 @@ const _: () = assert!(CMD_FRAME_HEAD.len() - 2 <= CMD_LEGACY_MIN_LINE_BYTES);
 /// `body` behind the resume-proof frame ([`CMD_FRAME_HEAD`]): `@goto :main`, the
 /// padding, `@exit /b`, `:main`, then `body` verbatim. The ONE place the frame is
 /// rendered; every `.cmd` renderer below goes through it, and so does the pending
-/// stub's (`crate::stub::stub_content_cmd_with`), the one `.cmd` writer outside this
+/// stub's (`crate::stub::stub_content_cmd`), the one `.cmd` writer outside this
 /// module.
 pub(crate) fn cmd_framed(body: &str) -> String {
     let mut s = String::with_capacity(CMD_FRAME_BYTES + body.len());

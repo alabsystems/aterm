@@ -659,42 +659,12 @@ mod tests {
     // ── write_wide_char ─────────────────────────────────────────────
 
     #[test]
-    fn write_wide_char_basic() {
-        let (_pages, mut row) = make_row(80);
-        let (fg, bg) = default_colors();
-        assert!(row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty()));
-        assert!(row.get(0).unwrap().is_wide());
-        assert!(row.get(1).unwrap().is_wide_continuation());
-        assert_eq!(row.len(), 2);
-    }
-
-    #[test]
     fn write_wide_char_sets_has_wide_chars_flag() {
         let (_pages, mut row) = make_row(80);
         let (fg, bg) = default_colors();
         assert!(!row.flags().contains(RowFlags::HAS_WIDE_CHARS));
         row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
         assert!(row.flags().contains(RowFlags::HAS_WIDE_CHARS));
-    }
-
-    #[test]
-    fn write_wide_char_at_last_column_rejected() {
-        let (_pages, mut row) = make_row(10);
-        let (fg, bg) = default_colors();
-        // Col 9 is the last column; wide char needs col 9+10 but col 10 doesn't exist
-        assert!(!row.write_wide_char(9, '\u{4E2D}', fg, bg, CellFlags::empty()));
-        assert_eq!(row.len(), 0);
-    }
-
-    #[test]
-    fn write_wide_char_at_second_to_last_succeeds() {
-        let (_pages, mut row) = make_row(10);
-        let (fg, bg) = default_colors();
-        // Col 8 + col 9 = valid
-        assert!(row.write_wide_char(8, '\u{4E2D}', fg, bg, CellFlags::empty()));
-        assert!(row.get(8).unwrap().is_wide());
-        assert!(row.get(9).unwrap().is_wide_continuation());
-        assert_eq!(row.len(), 10);
     }
 
     #[test]

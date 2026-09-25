@@ -52,10 +52,11 @@
 //! the exit condition is about to delete. Removing the `objc2` row would leave
 //! a doc example that cannot build, and nothing here would say so.
 //!
-//! So it is COUNTED, by `the_doc_fences_that_name_the_family_are_counted`,
-//! which walks the same scope for family names inside doc comments and pins the
-//! total — so it cannot grow silently and cannot be forgotten at the moment the
-//! packages leave.
+//! So it was COUNTED, by `the_doc_fences_that_name_the_family_are_counted`,
+//! which walked the same scope for family names inside doc comments and pinned
+//! the total until the packages left; the fence is `ignore`d on every platform
+//! since the W12 + W13 merge, and the counter was retired on 2026-09-24
+//! (source at `e8a8c80ab`).
 //!
 //! # What this file does NOT see, stated because the last one did not
 //!
@@ -163,25 +164,6 @@ mod recorded {
     /// the hostage. W13's port is that day, and the test is gone with the rows.
     pub const GUI_FILES: usize = 0;
     pub const WINIT_FILES: usize = 0;
-    /// The iOS slice, which no aterm target compiles. The retirement note that
-    /// replaced the `objc2` row in `vendor/winit/Cargo.toml` cites these exact
-    /// numbers.
-    pub const IOS_FILES: usize = 9;
-    pub const IOS_LINES: usize = 3_743;
-    pub const IOS_FAMILY_FILES: usize = 8;
-    pub const IOS_FAMILY_LINES: usize = 3_691;
-    /// Family names inside RUNNING doc fences in the scope — invisible to the
-    /// code rule by construction, because that rule strips `//`. See the note
-    /// at the head of this file. Files, then lines.
-    ///
-    /// 1 file / 5 lines from the thirteenth pass until the W12 + W13 merge:
-    /// `platform/macos.rs`'s application-delegate example, a live doctest on
-    /// macOS. The packages it imports left the fork with the merge, so the
-    /// example is fenced `ignore` on every platform now, with a note saying
-    /// why — see `the_doc_fences_that_name_the_family_are_counted`, which
-    /// pins that spelling so the fence cannot quietly go live again.
-    pub const DOC_FENCE_FILES: usize = 0;
-    pub const DOC_FENCE_LINES: usize = 0;
 }
 
 fn repo() -> PathBuf {
@@ -333,182 +315,6 @@ fn every_family_use_in_the_tree_is_in_scope_or_in_a_declared_slice() {
          compiled (and the endgame metric cannot see it) or it belongs to a \
          slice nobody registered:\n  {}",
         stray.join("\n  ")
-    );
-}
-
-/// What narrowing — and then retiring — the fork's macOS family rows cost,
-/// checked.
-///
-/// The retirement note in `vendor/winit/Cargo.toml` cites these numbers in
-/// prose. Prose goes stale; this does not.
-#[test]
-fn the_ios_slice_is_the_size_the_manifest_says_it_is() {
-    let repo = repo();
-    let mut files = Vec::new();
-    for p in ["src/platform_impl/ios", "src/platform/ios.rs"] {
-        let full = repo.join("vendor/winit").join(p);
-        if full.is_dir() {
-            files.extend(rs_files(&full));
-        } else {
-            files.push(full);
-        }
-    }
-    let lines = |f: &PathBuf| {
-        std::fs::read_to_string(f)
-            .expect("readable")
-            .lines()
-            .count()
-    };
-    let total: usize = files.iter().map(lines).sum();
-    let fam: Vec<&PathBuf> = files.iter().filter(|f| family_uses(f).0).collect();
-    let fam_lines: usize = fam.iter().map(|f| lines(f)).sum();
-
-    assert_eq!(
-        files.len(),
-        recorded::IOS_FILES,
-        "the iOS slice's file count moved"
-    );
-    assert_eq!(
-        total,
-        recorded::IOS_LINES,
-        "the iOS slice's line count moved"
-    );
-    assert_eq!(
-        fam.len(),
-        recorded::IOS_FAMILY_FILES,
-        "the iOS family-file count moved"
-    );
-    assert_eq!(
-        fam_lines,
-        recorded::IOS_FAMILY_LINES,
-        "the iOS family-line count moved"
-    );
-
-    // …and the rows themselves are GONE, or the whole argument above is
-    // decoration. W9 phase 3 narrowed `objc2` and `block2` to `cfg(macos)` so
-    // that an iOS backend nothing compiles could not hold them in the mac-arm
-    // graph at zero macOS uses; the W12 + W13 merge reached zero and retired
-    // all four. `the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say`
-    // holds the rows to the counts through `declared_deps`; this is the cheaper
-    // textual spelling, kept so a re-added row is named by the test that
-    // explains the narrowing that came first.
-    let manifest = std::fs::read_to_string(repo.join("vendor/winit/Cargo.toml"))
-        .expect("the fork's manifest is readable");
-    // `block2` went one step further than narrowed, and first: its last macOS
-    // use (`observer.rs`'s queued-closure block) became `aterm_objc::RcBlock`
-    // with the containment and the row left then; `tests/send_prototype_census.rs`
-    // refuses a new one. The other three left with the W12 + W13 merge.
-    for name in [FAMILY[0], BLOCK2, "objc2-app-kit", "objc2-foundation"] {
-        assert!(
-            !manifest.contains(&format!(
-                "[target.'cfg(target_os = \"macos\")'.dependencies.{name}]"
-            )),
-            "the fork's macOS `{name}` row is back — it was retired at the exit \
-             condition, and nothing on a macOS-compiled path uses it"
-        );
-    }
-}
-
-/// The family names the CODE rule cannot see, because they are behind `//`.
-///
-/// A doc comment is not compiled by this workspace — `winit` is not a member,
-/// so its doctests never run here — but it is the fork's own instruction to a
-/// reader, and an exit condition that deletes a package while the
-/// documentation still teaches that package is not finished. Counted so it
-/// cannot grow, and so the number is in front of whoever removes the rows.
-#[test]
-fn the_doc_fences_that_name_the_family_are_counted() {
-    let repo = repo();
-    let mut hits: Vec<(String, usize, String)> = Vec::new();
-    for f in scope_files() {
-        let Ok(src) = std::fs::read_to_string(&f) else {
-            continue;
-        };
-        // INSIDE A DOC CODE FENCE, and only there. A name in prose — this tree
-        // has four, all of them notes ABOUT the port — is a description, not an
-        // instruction, and counting it would make the number meaningless.
-        //
-        // The fence can be opened two ways, and `platform/macos.rs` uses the
-        // second: a `//!`/`///` line whose body starts with a fence, or a
-        // `#[doc = "```…"]` attribute. Where that attribute is `cfg_attr`'d,
-        // this walk models THE macOS BUILD — the `target_os = "macos"` arm is
-        // authoritative and the `not(...)` arm is skipped — because a scope
-        // defined as "what macOS compiles" that then read the non-macOS arm
-        // would cancel its own toggle and see nothing.
-        let mut in_fence = false;
-        let mut fence_runs = true;
-        for (i, raw) in src.lines().enumerate() {
-            let t = raw.trim_start();
-            let attr_fence = t.contains("doc = \"```") && !t.contains("not(target_os");
-            let doc_body = t.strip_prefix("//!").or_else(|| t.strip_prefix("///"));
-            if attr_fence {
-                let info = t.split("doc = \"```").nth(1).unwrap_or("");
-                in_fence = !in_fence;
-                fence_runs = !(info.starts_with("ignore") || info.starts_with("text"));
-                continue;
-            }
-            let Some(body) = doc_body else { continue };
-            if let Some(info) = body.trim_start().strip_prefix("```") {
-                in_fence = !in_fence;
-                fence_runs = !(info.starts_with("ignore") || info.starts_with("text"));
-                continue;
-            }
-            if !in_fence || !fence_runs {
-                continue;
-            }
-            // The same "followed by `::`/`;`/`,`/`}`" rule the code walk uses.
-            if code_idents(body)
-                .iter()
-                .any(|n| FAMILY.contains(&n.as_str()))
-            {
-                hits.push((
-                    f.strip_prefix(&repo).unwrap_or(&f).display().to_string(),
-                    i + 1,
-                    t.to_owned(),
-                ));
-            }
-        }
-    }
-    let mut files: Vec<String> = hits.iter().map(|(f, _, _)| f.clone()).collect();
-    files.sort();
-    files.dedup();
-    let listing = hits
-        .iter()
-        .map(|(f, l, t)| format!("{f}:{l}: {t}"))
-        .collect::<Vec<_>>()
-        .join("\n  ");
-    assert_eq!(
-        files.len(),
-        recorded::DOC_FENCE_FILES,
-        "the number of files teaching the family in doc comments moved:\n  {listing}"
-    );
-    assert_eq!(
-        hits.len(),
-        recorded::DOC_FENCE_LINES,
-        "the number of doc lines teaching the family moved:\n  {listing}"
-    );
-    // The one that USED to count is `platform/macos.rs`'s application-delegate
-    // example, whose fence was ENABLED on macOS through a `cfg_attr`. The
-    // packages it imports left the fork at the W12 + W13 merge, so it is
-    // `ignore`-fenced on every platform now and the walk above skips it by the
-    // same rule it skips any `ignore` fence. Both halves are asserted — the
-    // example is still there, and its fence is still the retired spelling — so
-    // the zero above is a measurement of THAT file and not of a deleted one,
-    // and a `cfg_attr` that quietly re-enables it fails here by name.
-    let src =
-        std::fs::read_to_string(repo.join("vendor/winit/src/platform/macos.rs")).expect("readable");
-    assert!(
-        src.contains("//! use objc2_app_kit::{NSApplication, NSApplicationDelegate};"),
-        "the application-delegate example is gone from platform/macos.rs — re-derive this count"
-    );
-    assert!(
-        !src.contains(r#"doc = "```")]"#),
-        "the application-delegate example's fence is live again — the packages it \
-         imports are not dependencies of this fork"
-    );
-    assert!(
-        src.contains("//! ```ignore\n//! use objc2::rc::Retained;"),
-        "the application-delegate example is no longer `ignore`-fenced — re-derive this count"
     );
 }
 
@@ -1029,11 +835,11 @@ fn the_manifest_rule_sees_a_renamed_dependency() {
 ///
 /// The doc fence in `vendor/winit/src/platform/macos.rs` was deliberately NOT
 /// removed with them, and `the_doc_fences_that_name_the_family_are_counted`
-/// still counts its 5 lines. It teaches a reader to write an
-/// `NSApplicationDelegate` against `objc2` — crates the FORK still depends on
-/// and still compiles against. Deleting accurate documentation ahead of the
-/// retirement it belongs to would have been cosmetic churn that also made the
-/// count lie about where the campaign stands.
+/// counted its 5 lines (the counter was retired on 2026-09-24). It teaches a
+/// reader to write an `NSApplicationDelegate` against `objc2` — crates the FORK
+/// still depends on and still compiles against. Deleting accurate documentation
+/// ahead of the retirement it belongs to would have been cosmetic churn that
+/// also made the count lie about where the campaign stands.
 #[test]
 fn the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say() {
     let repo = repo();

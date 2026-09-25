@@ -43,6 +43,32 @@ const MAX_SPLIT_DEPTH: usize = 32;
 const MAX_VIEW_METADATA_BYTES: usize = 16 * 1024;
 const MAX_EDITOR_SELECTIONS: usize = 256;
 
+/// A pane's working directory as a layout may carry it — at most
+/// `MAX_DOCUMENT_URI_BYTES` and no NUL — else `None`. The one rule both leaf
+/// shapes (`TerminalLeafRestore`, the legacy `PaneLayout::Leaf`) sanitize with,
+/// so the capture and the parse can never disagree about a directory (the
+/// 2026-09-22/23 update audit, plan P0-1f).
+fn storable_leaf_cwd(cwd: Option<String>) -> Option<String> {
+    cwd.filter(|cwd| cwd.len() <= MAX_DOCUMENT_URI_BYTES && !cwd.contains('\0'))
+}
+
+/// Strip NULs from a pane title and cut it to `MAX_DOCUMENT_URI_BYTES` at a
+/// character boundary — the title a layout may carry. Idempotent, so a sanitized
+/// capture is a fixed point of `from_toml`, which is what the update worker's
+/// layout round trip checks.
+fn sanitize_leaf_title(title: &mut String) {
+    if title.contains('\0') {
+        title.retain(|character| character != '\0');
+    }
+    if title.len() > MAX_DOCUMENT_URI_BYTES {
+        let mut end = MAX_DOCUMENT_URI_BYTES;
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title.truncate(end);
+    }
+}
+
 /// serde-stable mirror of [`crate::pane::SplitDir`] — kept separate so the on-disk format
 /// never couples to the internal enum's representation.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,6 +153,27 @@ impl TerminalLeafRestore {
             attention: self.attention.clone(),
             ..Default::default()
         }
+    }
+
+    /// Make this leaf one `RestoredView::bounded` admits, whatever wrote it.
+    ///
+    /// The SESSION half (cwd, title, profile) is program output, not operator
+    /// input: the capture copies the engine's OSC 7 directory and OSC 0/2 title
+    /// straight into the leaf. A NUL there (`file:///tmp/a%00b`) used to fail
+    /// `bounded()`, so `from_toml` refused the WHOLE manifest — and the update
+    /// worker's layout round trip filed that as a Structural preparation
+    /// failure, which latches (the 2026-09-22/23 update audit, plan P0-1f).
+    /// Now an unstorable directory or profile is dropped, and the title keeps
+    /// everything but its NULs, cut to the bound at a character boundary. The
+    /// directory only seeds a cold respawn's cwd, so losing it costs a `cd`.
+    fn sanitize(&mut self) {
+        self.cwd = storable_leaf_cwd(self.cwd.take());
+        sanitize_leaf_title(&mut self.title);
+        self.profile = self
+            .profile
+            .take()
+            .filter(|profile| profile.len() <= MAX_SETTINGS_ROUTE_BYTES && !profile.contains('\0'));
+        self.sanitize_user_metadata();
     }
 
     /// Restore files survive across versions and are operator-writable. Normalize
@@ -322,7 +369,7 @@ pub(crate) enum RestoredView {
 impl RestoredView {
     fn sanitize(&mut self) {
         match self {
-            Self::Terminal(terminal) => terminal.sanitize_user_metadata(),
+            Self::Terminal(terminal) => terminal.sanitize(),
             Self::Native(native) => {
                 let Some(reason) = native.validation_error() else {
                     return;
@@ -555,6 +602,23 @@ impl PaneLayout {
             title,
             focused,
             local_id: None,
+        }
+    }
+
+    /// The legacy mirror's leaves under the same session-metadata rule as
+    /// `TerminalLeafRestore::sanitize`: an older consumer that still reads this
+    /// projection must not be handed the NUL directory the canonical tree
+    /// dropped (the 2026-09-22/23 update audit, plan P0-1f).
+    fn sanitize_leaf_metadata(&mut self) {
+        match self {
+            PaneLayout::Leaf { cwd, title, .. } => {
+                *cwd = storable_leaf_cwd(cwd.take());
+                sanitize_leaf_title(title);
+            }
+            PaneLayout::Split { first, second, .. } => {
+                first.sanitize_leaf_metadata();
+                second.sanitize_leaf_metadata();
+            }
         }
     }
 
@@ -848,6 +912,20 @@ impl WindowLayout {
             && self.restored_tabs.iter().all(RestoredTab::shape_is_valid)
     }
 
+    /// Every tab of this window, both projections, made one `from_toml` admits:
+    /// the ONE manifest-wide sanitize, run by `RestoreManifest::new` (so every
+    /// capture — the quit's and the update's, before its `layout_digest` — is
+    /// already a fixed point) and by `from_toml` (so an older writer's layout
+    /// is recovered rather than refused).
+    fn sanitize(&mut self) {
+        for tab in &mut self.tabs {
+            tab.sanitize_leaf_metadata();
+        }
+        for tab in &mut self.restored_tabs {
+            tab.sanitize();
+        }
+    }
+
     fn migrate_legacy_tabs(&mut self) -> Option<()> {
         if !self.restored_tabs.is_empty() {
             return Some(());
@@ -961,9 +1039,7 @@ impl RestoreManifest {
     pub(crate) fn new(mut windows: Vec<WindowLayout>) -> Self {
         for window in &mut windows {
             let _ = window.migrate_legacy_tabs();
-            for tab in &mut window.restored_tabs {
-                tab.sanitize();
-            }
+            window.sanitize();
         }
         Self {
             schema: SCHEMA,
@@ -1079,9 +1155,7 @@ impl RestoreManifest {
         }
         for window in &mut manifest.windows {
             window.migrate_legacy_tabs()?;
-            for tab in &mut window.restored_tabs {
-                tab.sanitize();
-            }
+            window.sanitize();
         }
         if !manifest.windows.iter().all(WindowLayout::shape_is_valid) {
             return None;
@@ -2038,6 +2112,100 @@ metadata = "opaque=copy-me"
         assert!(
             RestoreManifest::from_toml(&aterm_toml::to_string(&manifest).unwrap()).is_none(),
             "adversarial depth must fail before runtime allocation"
+        );
+    }
+
+    /// A NUL IN A PANE'S DIRECTORY COSTS THE DIRECTORY, NEVER THE LAYOUT (the
+    /// 2026-09-22/23 update audit, plan P0-1f). A program can report a working
+    /// directory holding a NUL (OSC 7 `file:///tmp/a%00b`), and the capture
+    /// copies the engine's cwd into the pane's leaf. `bounded()` refuses a NUL,
+    /// so `from_toml` answered `None` for the WHOLE manifest — and the update
+    /// worker's layout round trip filed that as a Structural preparation
+    /// failure, which latches. The leaf's sanitize now drops the directory (and
+    /// strips NULs from the title) on BOTH sides: the capture, through
+    /// `RestoreManifest::new`, and the parse, so an older writer's layout is
+    /// adopted too.
+    #[test]
+    fn a_nul_cwd_leaf_round_trips_sanitized() {
+        let hostile = || WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            tabs: vec![PaneLayout::Leaf {
+                cwd: Some("/tmp/a\0b".into()),
+                title: "zsh\0 ~".into(),
+                focused: true,
+                local_id: Some(7),
+            }],
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: None,
+            restored_tabs: vec![RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                    cwd: Some("/tmp/a\0b".into()),
+                    title: "zsh\0 ~".into(),
+                    profile: None,
+                    local_id: Some(7),
+                    user_title: None,
+                    description: None,
+                    icon: None,
+                    role: None,
+                    attention: None,
+                    identity: None,
+                })),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        };
+        let assert_clean = |manifest: &RestoreManifest, what: &str| {
+            let RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } = &manifest.windows[0].restored_tabs[0].root
+            else {
+                panic!("{what}: the tab is still a terminal leaf");
+            };
+            assert_eq!(terminal.cwd, None, "{what}: the NUL directory is dropped");
+            assert_eq!(
+                terminal.title, "zsh ~",
+                "{what}: the title loses only its NUL"
+            );
+            assert_eq!(
+                terminal.local_id,
+                Some(7),
+                "{what}: the adoption id survives"
+            );
+            let PaneLayout::Leaf { cwd, title, .. } = &manifest.windows[0].tabs[0] else {
+                panic!("{what}: the legacy mirror is still a leaf");
+            };
+            assert_eq!(cwd, &None, "{what}: the legacy mirror drops it too");
+            assert_eq!(title, "zsh ~", "{what}: and strips the title the same way");
+        };
+
+        // THE PARSE: an older writer's raw layout, serialized without passing
+        // through the sanitizing constructor.
+        let raw = RestoreManifest {
+            schema: SCHEMA,
+            windows: vec![hostile()],
+        };
+        let wire = aterm_toml::to_string(&raw).expect("serialize the hostile fixture");
+        let parsed = RestoreManifest::from_toml(&wire).expect("a NUL directory is recoverable");
+        assert_clean(&parsed, "parse");
+
+        // THE CAPTURE: what `capture_restore_manifest` builds, and the update
+        // worker's exact check — `from_toml(to_toml(layout)) == layout`.
+        let captured = RestoreManifest::new(vec![hostile()]);
+        assert_clean(&captured, "capture");
+        let round_trip = captured
+            .to_toml()
+            .ok()
+            .and_then(|wire| RestoreManifest::from_toml(&wire));
+        assert_eq!(
+            round_trip.as_ref(),
+            Some(&captured),
+            "the worker's layout round trip holds on a sanitized capture"
         );
     }
 

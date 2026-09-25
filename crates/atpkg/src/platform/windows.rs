@@ -437,9 +437,8 @@ pub fn install_shim_to_env(
 }
 
 /// The shim [`install_shim_to_env`] lays, RENDERED but not written — the same two
-/// injection refusals, the `.cmd` body — for the callers that lay a whole pass of shims
-/// in one go ([`crate::lay::lay_executables`]; no provenance lane exists here, so it
-/// writes in-process).
+/// injection refusals, the `.cmd` body — for the callers that render a whole pass of shims
+/// before they lay it ([`crate::lay::write_in_process`]).
 pub fn shim_executable_to_env(
     shim: &Path,
     target: &Path,

@@ -2,16 +2,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Has the TOOLCHAIN package manager (atpkg) ever completed an update check on this
-//! machine — read off its `status.toml` alone, so an edge that must not link atpkg's
-//! internals (the `aterm` session lane, the window) can decide on it (R3, 2026-09-10).
+//! machine, did its last one reach the signed index, and how did it end — read off its
+//! `status.toml` alone, so an edge that must not link atpkg's internals (the `aterm` session
+//! lane, the window) can decide on it (R3, 2026-09-10).
 //!
-//! The contract is deliberately tiny and shared: atpkg stamps
-//! `last_success_at = "<RFC3339>"` into `<prefix>/status.toml` ONLY on a successful
-//! pass (every other write moves `updated_at`, which is a last-write stamp and says
-//! nothing about success). "Never checked" is therefore: the file is absent, or it
-//! carries no `last_success_at`, or that value is empty. DATA, never a line: until
-//! Phase 2 (2026-09-22) every console edge printed it on stderr; now nothing prints into
-//! a shell the user did not ask to update, and `aterm pkg doctor` reports it.
+//! THE RECORD a full `update` pass writes at its end, and nothing else writes (atpkg's
+//! recorded pass is its one writer; the derived models `AtpkgPassStamps` and
+//! `AtpkgFullPassRule` state the contract with the readers here):
+//!
+//! * `last_success_at` — a pass that REACHED the signed index: it verified an index the
+//!   channel served THIS pass, not the §14 cache's, and ran to its end. A pass served from
+//!   the cache after a refusal, offline, or whose resolve failed stamps no success: until
+//!   2026-09-23 a cache-served pass did (audit PK-3), and a sibling's failure ladder read it
+//!   as healed with nothing reached. "Never checked" is: the file is absent, or it carries no
+//!   `last_success_at`, or that value is empty.
+//! * `last_pass` / `last_pass_at` — how the pass ENDED ([`PassOutcome`]): `ok` when it stamped
+//!   that success (or had nothing to check), `offline` when no host answered, else `failed`.
+//!   The schedulers read that, never `updated_at`: every write moves `updated_at` — a vendor
+//!   door, a typed verb, a row — so "written after the last success" read as a FAILED pass and
+//!   held the session's pass up to six hours from the write (audit PK-4, and the reconcile of
+//!   2026-09-23).
+//! * `last_pass_attempted_index_build` / `last_pass_attempted_at` — the index the pass was
+//!   launched for or resolved, bound to its end in the same write, so a newer published index
+//!   is told apart from a sibling's attempt at the SAME one.
+//!
+//! DATA, never a line: until Phase 2 (2026-09-22) every console edge printed "never checked"
+//! on stderr; now nothing prints into a shell the user did not ask to update, and `aterm pkg
+//! doctor` reports it.
 //!
 //! THE MACHINE-WIDE PASS RULE lives here too (Phase 3, 2026-09-23), read by both lanes
 //! that schedule a full pass on their own — the terminal session's one-shot
@@ -22,28 +39,23 @@
 //! several aterm processes never run the same pass back to back, never within the interval
 //! of one that FAILED, so a pass that keeps failing is retried once per interval by this
 //! rule, not once per tab (the 2026-09-10 rule; the window retries its OWN failed pass on
-//! its failure ladder). What was published reaches the machine sooner through the window's
-//! hints — atpkg's next-index probe and the vendor head watch — never through this rule. It
-//! replaced the two lanes' separate interval readers and their `ATPKG_UPDATE_INTERVAL_SECS`
-//! knob, both deleted. A rate-limit hold ([`Stamps::metered_hold_in`]) is not this rule's:
-//! a pass records one only with its end, which this rule already waits an interval past.
-//!
-//! THE PASS RECORDS HOW IT ENDED (`last_pass` / `last_pass_at`, [`PassOutcome`]), and the rule
-//! reads that, never `updated_at`: every write moves `updated_at` — a vendor head-watch pass,
-//! a typed verb — so "written after the last success" read as a FAILED pass and held the
-//! session's pass back up to six hours (found in the reconcile of 2026-09-23). The rule is
-//! the derived model `AtpkgFullPassRule` (aterm-spec), bound to the real writer and readers
-//! by atpkg's and the window's conformance tests.
+//! its failure ladder, and stands down once a later pass [`healed`] it). What was published
+//! reaches the machine sooner through the window's hints — atpkg's next-index probe and the
+//! vendor head watch — never through this rule. It replaced the two lanes' separate
+//! interval readers and their `ATPKG_UPDATE_INTERVAL_SECS` knob, both deleted. There is no
+//! rate-limit hold: the pass makes no metered request (owner ruling R3), and the download
+//! host's 429 is an ordinary failure on the ladder.
 
 use std::ffi::OsString;
 use std::path::Path;
 
 /// The exit code of an atpkg update pass that reached NOTHING (Phase 3, 2026-09-22): no
-/// host answered its index listing — the link itself failed (DNS, connect, timeout, TLS);
-/// a listing refused with a status (a rate limit, a revoked token) is a failure, exit 1 —
-/// no vendor's release channel answered, and every member it lost was lost at a fetch.
-/// Not a success (it stamps no `last_success_at`), not a failure (nothing is wrong but the
-/// network), not contention (75): a pass to retry quietly and soon. Sysexits
+/// host answered its index discovery — the link itself failed (DNS, connect, timeout, TLS);
+/// a host that answered with something else (a rate limit, a 5xx, a portal's page) is a
+/// failure, exit 1 — no vendor's release channel answered, and every member it lost was
+/// lost at a fetch. Not a success (it stamps no `last_success_at` and records `offline`),
+/// not a failure the user must act on (nothing is wrong but the network), not contention
+/// (75): a pass to retry quietly and soon. Sysexits
 /// `EX_UNAVAILABLE`. Here, in the crate both atpkg and the window read, so the code the
 /// pass exits with and the code the window classifies are one constant.
 pub const PASS_OFFLINE_EXIT: u8 = 69;
@@ -61,24 +73,20 @@ pub const FULL_PASS_INTERVAL_SECS: u64 = 6 * 60 * 60;
 /// the next look sees what that pass left.
 pub const PASS_SPACING_SECS: u64 = 5 * 60;
 
-/// The longest a rate-limited listing's reset holds the metered passes: GitHub's window is an
-/// hour, so a recorded reset further ahead than this was written by a clock since set back,
-/// and is ignored rather than trusted ([`Stamps::metered_hold_in`]).
-pub const METERED_HOLD_MAX_SECS: u64 = 60 * 60;
-
 /// How a full `update` pass ended, as the pass records it in `status.toml` (`last_pass`, with
 /// `last_pass_at` the moment it ended). The one reading of a pass's outcome the schedulers
 /// take ([`Stamps::last_failed`]); `updated_at` is every writer's and proves nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassOutcome {
-    /// The pass stamped `last_success_at`: it resolved the signed index and ran to its end (a
-    /// member that failed is recorded in its own row) — `last_success_at`'s own meaning. Or
-    /// it had nothing to check (no program managed, the set not owed): no success stamp, and
-    /// the schedule counts it as one ([`Stamps::last_success`]).
+    /// The pass stamped `last_success_at`: it REACHED the signed index — verified one the
+    /// channel served this pass — and ran to its end (a member that failed is recorded in its
+    /// own row). Or it had nothing to check (no program managed, the set not owed): no success
+    /// stamp, and the schedule counts it as one ([`Stamps::last_success`]).
     Ok,
     /// No host answered ([`PASS_OFFLINE_EXIT`]): nothing was checked.
     Offline,
-    /// Anything else: the index did not resolve, nothing was installable here, a refusal.
+    /// Anything else: the index was not reached (a refusal the §14 cache stood in for, a
+    /// resolve that failed), nothing was installable here.
     Failed,
 }
 
@@ -161,10 +169,6 @@ pub struct Stamps {
     /// index. A newer published hint may bypass sibling spacing only when this
     /// witness belongs to the latest attempt; same-build failures still space.
     pub last_pass_target: Option<(i64, u64)>,
-    /// Unix seconds before which the metered GitHub API refuses this machine: the reset a
-    /// rate-limited listing named (`metered_hold_until`) — read through
-    /// [`Self::metered_hold_in`].
-    pub metered_hold_until: Option<i64>,
     /// Whether a pass is installing on the store NOW (its progress file names a live
     /// writer) — never in `status.toml`; the caller that can read the progress file sets
     /// it, and it counts as an attempt this moment.
@@ -216,7 +220,6 @@ impl Stamps {
                 .and_then(|build| u64::try_from(build).ok())
                 .unwrap_or(0),
             last_pass_target,
-            metered_hold_until: stamp("metered_hold_until"),
             in_flight: false,
         }
     }
@@ -239,14 +242,12 @@ impl Stamps {
 
     /// The latest completed full pass ATTEMPTED an older index. Only that
     /// evidence lets a strictly newer published hint bypass sibling spacing:
-    /// an in-flight pass, current rate-limit hold, older schema, or target not
-    /// bound to the latest attempt keeps the conservative wait. A failure at
-    /// the same build is deduplicated; a new build may be tried after an old
-    /// one failed if GitHub is not currently holding its metered listing.
+    /// an in-flight pass, an older schema, or a target not bound to the latest
+    /// attempt keeps the conservative wait. A failure at the same build is
+    /// deduplicated; a new build may be tried after an old one failed.
     #[must_use]
-    pub fn completed_older_index_pass(&self, published: u64, now_unix: i64) -> bool {
+    pub fn completed_older_index_pass(&self, published: u64) -> bool {
         !self.in_flight
-            && self.metered_hold_in(now_unix) == 0
             && self.last_outcome.is_some()
             && self.last_pass_target.is_some_and(|(ended, attempted)| {
                 self.last_attempt == Some(ended) && published > attempted
@@ -265,19 +266,31 @@ impl Stamps {
             _ => false,
         }
     }
+}
 
-    /// Seconds left at `now_unix` of the hold a rate-limited listing recorded: `0` when there
-    /// is none, when it has passed, or when it lies further ahead than
-    /// [`METERED_HOLD_MAX_SECS`] (a clock since set back wrote it). The window's scheduled
-    /// full passes wait it out, and park the next-index probe through it: the probe's
-    /// Releases listing is metered too, and only its own hour-long cooldown after a refusal
-    /// would stop it. The vendor head watch rides the vendors' hosts and is not held.
-    #[must_use]
-    pub fn metered_hold_in(&self, now_unix: i64) -> u64 {
-        self.metered_hold_until
-            .and_then(|until| u64::try_from(until.saturating_sub(now_unix)).ok())
-            .filter(|&left| left <= METERED_HOLD_MAX_SECS)
-            .unwrap_or(0)
+/// Whether a lane's own pass that failed at `failed_at` has been HEALED: a pass that ended
+/// `ok` — it reached the signed index, or had nothing to check — ended after it, anywhere on
+/// the machine. The window's retry reads it before it runs its failure ladder's next pass
+/// (`AtpkgPassStamps`' `HealedOnlyByAReachedPass`): a pass the §14 cache served after a
+/// refusal records `failed` and heals nothing. Pure.
+#[must_use]
+pub fn healed(stamps: &Stamps, failed_at: i64) -> bool {
+    stamps
+        .last_success
+        .is_some_and(|success| success > failed_at)
+}
+
+/// Seconds from `now_unix` until a LAUNCH owes its first `update` pass, `0` when it owes one
+/// now: at once when no pass ever succeeded or the last one failed — the failure ladder's
+/// minutes-scale retry, never a six-hour park — else the rest of [`FULL_PASS_INTERVAL_SECS`]
+/// since the last success. Pure.
+#[must_use]
+pub fn launch_due_in(stamps: &Stamps, now_unix: i64) -> u64 {
+    match stamps.last_success {
+        Some(success) if !stamps.last_failed() => {
+            remaining(success, now_unix, FULL_PASS_INTERVAL_SECS)
+        }
+        _ => 0,
     }
 }
 
@@ -309,9 +322,7 @@ pub fn full_pass_owed(stamps: &Stamps, now_unix: i64) -> Option<Owed> {
 /// the LATEST of what holds it back — a pass installing (look again after the spacing), the
 /// spacing after the last attempt, the interval after a failed attempt, the interval after
 /// the last success. Each is bounded by its own period, so a stamp a clock set back wrote
-/// never holds a lane longer than that. No rate-limit hold: one is recorded only with a pass
-/// end, and every pass end holds this rule an interval — longer than any hold
-/// ([`METERED_HOLD_MAX_SECS`]). Pure: what a lane parks for when nothing is owed yet.
+/// never holds a lane longer than that. Pure: what a lane parks for when nothing is owed yet.
 #[must_use]
 pub fn full_pass_due_in(stamps: &Stamps, now_unix: i64) -> u64 {
     let spacing = if stamps.in_flight {
@@ -474,10 +485,10 @@ mod tests {
     }
 
     /// The stamps a scheduler reads: the success, the attempt (the end the last full pass
-    /// recorded, or the success when that is later), the pass's own outcome, the index build
-    /// and the metered hold — absent, empty and unparseable all read as none. `updated_at`
-    /// is read by nothing here: until 2026-09-23 it was the attempt, and any write after the
-    /// last success (a vendor head-watch pass, a typed verb) read as a failed pass.
+    /// recorded, or the success when that is later), the pass's own outcome and the index
+    /// build — absent, empty and unparseable all read as none. `updated_at` is read by nothing
+    /// here: until 2026-09-23 it was the attempt, and any write after the last success (a
+    /// vendor head-watch pass, a typed verb) read as a failed pass (audit PK-4).
     #[test]
     fn the_stamps_are_read_off_the_record() {
         let p = scratch("stamps");
@@ -486,8 +497,7 @@ mod tests {
             &p,
             "schema = 1\nupdated_at = \"2026-09-10T09:00:00Z\"\n\
              last_success_at = \"2026-09-10T06:40:53Z\"\nlast_pass = \"failed\"\n\
-             last_pass_at = \"2026-09-10T08:34:12Z\"\nlast_index_build = 43\n\
-             metered_hold_until = \"2026-09-10T09:30:00Z\"\n",
+             last_pass_at = \"2026-09-10T08:34:12Z\"\nlast_index_build = 43\n",
         )
         .unwrap();
         assert_eq!(
@@ -498,7 +508,6 @@ mod tests {
                 last_outcome: Some(PassOutcome::Failed),
                 last_index_build: 43,
                 last_pass_target: None,
-                metered_hold_until: rfc3339_to_unix("2026-09-10T09:30:00Z"),
                 in_flight: false,
             }
         );
@@ -593,53 +602,51 @@ mod tests {
         );
     }
 
-    /// THE RATE-LIMIT HOLD (§3.2 of the 2026-09-22 design) is read off the record for the
-    /// window's gate ([`Stamps::metered_hold_in`]), on the injected clock — never longer than
-    /// [`METERED_HOLD_MAX_SECS`], so a reset a clock since set back recorded is ignored. The
-    /// machine-wide rule reads none, and needs none: every record a pass writes with a hold
-    /// — `ok` with the cache standing in, `failed`, `offline` keeping it — holds the rule an
-    /// interval from that pass's end, past the reset.
+    /// HEALED only by a pass that ended `ok` strictly after the lane's own failure — a pass the
+    /// §14 cache served after a refusal records `failed` and stamps no success, so it heals
+    /// nothing (audit PK-3, `AtpkgPassStamps`' `HealedOnlyByAReachedPass`). And a LAUNCH owes
+    /// a pass at once when no pass ever succeeded or the last one failed, else the rest of
+    /// the interval since the last success.
     #[test]
-    fn a_rate_limit_reset_is_read_for_the_window_and_outlasted_by_the_rule() {
+    fn a_failure_is_healed_only_by_a_later_ok_pass_and_a_launch_retries_it_at_once() {
         let now = 1_790_000_000_i64;
-        let held = |until: i64| Stamps {
-            metered_hold_until: Some(until),
-            ..Stamps::default()
-        };
-        assert_eq!(held(now + 1200).metered_hold_in(now), 1200);
-        assert_eq!(held(now - 1).metered_hold_in(now), 0, "passed");
-        assert_eq!(
-            held(now + 3601).metered_hold_in(now),
-            0,
-            "beyond an hour: ignored"
-        );
-        assert_eq!(held(now + 3600).metered_hold_in(now), METERED_HOLD_MAX_SECS);
-        assert_eq!(Stamps::default().metered_hold_in(now), 0);
         let at = |unix: i64| aterm_types::rfc3339::format_rfc3339(unix.unsigned_abs());
-        let reset = now + 3600;
-        for outcome in ["ok", "failed", "offline"] {
-            // As `stamp_pass_end` writes it: the end is now, the hold beside it; a pass that
-            // ended ok stamped its success in the same moment.
-            let success = if outcome == "ok" { now } else { now - 86_400 };
-            let stamps = Stamps::parse(&format!(
-                "last_success_at = \"{}\"\nlast_pass = \"{outcome}\"\nlast_pass_at = \"{}\"\n\
-                 metered_hold_until = \"{}\"\n",
-                at(success),
-                at(now),
-                at(reset),
-            ));
-            assert_eq!(stamps.metered_hold_in(now), 3600, "{outcome}");
-            assert_eq!(
-                full_pass_due_in(&stamps, now),
-                FULL_PASS_INTERVAL_SECS,
-                "{outcome}: an interval from the pass's end"
-            );
-            assert_eq!(
-                full_pass_owed(&stamps, reset),
-                None,
-                "{outcome}: not at the reset"
-            );
-        }
+        let record = |success: Option<i64>, outcome: &str, pass_at: i64| {
+            Stamps::parse(&format!(
+                "{}last_pass = \"{outcome}\"\nlast_pass_at = \"{}\"\n",
+                success.map_or(String::new(), |s| format!(
+                    "last_success_at = \"{}\"\n",
+                    at(s)
+                )),
+                at(pass_at),
+            ))
+        };
+        let own_failure = now - 600;
+        assert!(!healed(&Stamps::default(), own_failure));
+        // A sibling's pass on the cache after a refusal: `failed`, no success — not a heal.
+        let cached = record(Some(now - 7200), "failed", now - 60);
+        assert!(
+            !healed(&cached, own_failure),
+            "a cache-served pass reached nothing"
+        );
+        // A sibling's pass that reached the index after the lane's failure heals it.
+        let reached = record(Some(now - 60), "ok", now - 60);
+        assert!(healed(&reached, own_failure));
+        assert!(
+            !healed(&record(Some(own_failure), "ok", own_failure), own_failure),
+            "same second: not after"
+        );
+        let interval = i64::try_from(FULL_PASS_INTERVAL_SECS).unwrap();
+        assert_eq!(launch_due_in(&Stamps::default(), now), 0, "never checked");
+        assert_eq!(launch_due_in(&cached, now), 0, "the last pass failed");
+        assert_eq!(
+            launch_due_in(&record(Some(now - 60), "ok", now - 60), now),
+            FULL_PASS_INTERVAL_SECS - 60
+        );
+        assert_eq!(
+            launch_due_in(&record(Some(now - interval), "ok", now - interval), now),
+            0
+        );
     }
 
     /// A FULL PASS WITH NOTHING TO CHECK (no program managed, the set not owed) records `ok`

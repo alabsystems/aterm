@@ -27,10 +27,9 @@
 //!     MUST reject, proving the binding is non-vacuous.
 //!
 //! Every fixture shells the SAME armed binaries the gate uses (`trust-ir`, `ty`),
-//! located by the canonical-path search. Verification is always required
-//! (batteries-on, see [`aterm_spec::verify`]): an absent Trust `ty`/`trust-ir` FAILS
-//! the test with a build hint; build the toolchain once (`cargo build --release -p
-//! tla-cli` in $HOME/trust/first-party/ty).
+//! located by [`aterm_spec::verify`]'s discovery. Verification is always required
+//! (batteries-on): an absent Trust `ty`/`trust-ir` FAILS the test with the install
+//! hint (`aterm pkg install ty`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

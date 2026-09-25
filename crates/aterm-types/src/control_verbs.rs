@@ -258,7 +258,17 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// leaves 138 bytes, about one more row. Same accounting as the six raises
 /// above: rewording unrelated verbs' prose to make room is the drift a
 /// generated golden exists to catch.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 10496;
+///
+/// RAISED AGAIN FROM 10 496 on 2026-09-24 for the unified message system's two
+/// rows (`messages`, `notice`), taking the table from 107 entries to 109. The
+/// short `help` MEASURES 10 592 B on the wire (10 553 B of content lines after
+/// the `OK 112 …` status line, read over the raw socket on the headless live try
+/// of 2026-09-24, and the same 10 592 in
+/// `help_short_form_is_bounded_and_is_the_summary_catalog`); the cap is that
+/// plus 128 bytes, about one more row. Same accounting as the seven raises
+/// above, and the shape is unchanged: one summary row per verb under
+/// [`SUMMARY_MAX_CHARS`].
+pub const SHORT_CATALOG_MAX_BYTES: usize = 10720;
 
 /// THE ONE `subscribe` STREAM VOCABULARY.
 ///
@@ -812,6 +822,58 @@ pub const VERBS: &[VerbSpec] = &[
          raises a row; replies `OK recorded`. Owner-only: only the instance token may write to \
          the record.",
     ),
+    // `messages` is the unified message system's READ face: the log the band and
+    // Settings ▸ Messages show, one engine-built row per record (design rulings
+    // 163-198). `appstatus` stays its toolchain/update/harness projection.
+    v(
+        "messages",
+        Read,
+        Lines,
+        App,
+        "messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]: the message log, one row each",
+        "Rows ascend by id: `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> \
+         sev=<success|info|warn|error> origin=<host|wire|carried> \
+         state=<held|live|folded|stale|unseen|superseded|resolved-ok|resolved-warn|dismissed|answered|evicted|carried|withdrawn|recorded> \
+         glass=<row|-> rep=<n> key=<k|-> title=<t> detail=<d> actions=<a|-> \
+         [progress=<n>/100|level=<n>/100|busy=1] [load=<network|disk|cpu|memory>] \
+         [since_ms=<ms>]`. level= is a measured level (the system.strain row only), never \
+         progress. A bare <n> keeps the newest n (default 64, max 512); since=<id> keeps the OLDEST n above the id \
+         (default all), so paging with the last id you saw never skips a row; tag= filters; sev= is a floor (sev=warn is warn and error); \
+         live keeps unretired rows. at= is the wall clock at ingress; since_ms= is on rows \
+         retired by this process only. glass= is the band row (0 = top) or -. detail= is the \
+         lines joined by a newline, actions= the button labels joined by a comma. Free text is \
+         percent-encoded. Read-only; `appstatus` is its toolchain/update/harness projection.",
+    ),
+    // `notice` is its WRITE face: a script's records, failures and work in flight
+    // under the attention rule. Owner-only (a child edge may not raise, end or
+    // press a row), Write op-class because it mutates the band.
+    va(
+        "notice",
+        Write,
+        Status,
+        App,
+        OwnerOnly,
+        "notice <post|progress|done|dismiss|act> \u{2026}: record, show work in flight, end or press a message",
+        "Owner-only. `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..3600>] <title>[ -- \
+         <detail>]`: sev=success or info (the default) is a RECORD in the message log, never a \
+         row (`OK recorded message=<id>`); sev=warn or error is a row on the band (`OK \
+         message=<id>`). `notice progress <key> [tag=<tag>] [pct=<0..100>|done=<n>/<total>|busy] \
+         [unit=<bytes|items|steps>] [load=<network|disk|cpu>] <title>[ -- <stats>]`: one \
+         live row per key with the full-width meter (pct= or done= fill it; busy, the default, is \
+         the moving highlight and shows the elapsed time after 10 s), and with done= how long is \
+         left; a row appears after 2 s, so a quick job never flashes; send the line again to \
+         move it (an identical line costs nothing and keeps the row from going stale after 120 \
+         s). `notice done <key> [ok|warn|withdraw] [<words>]` ends it with its finish (`OK \
+         done=<id> how=<resolved-ok|resolved-warn|withdrawn>`, or `OK done=- how=gone`); warn is \
+         a brief flash, and a failure that must stay is `notice post <tag> sev=error key=<key> \
+         <title>`, which takes the row's place. `notice dismiss <id>` takes a row down; `notice \
+         act <id> <label|index|details>` presses its button as a person would (`OK \
+         acted=<label> performed=<1|0>`). A band title is at most 6 words and 48 characters with \
+         no clause; a key is 1-40 of a-z 0-9 . _ - and lives as wire.<key>; the toolchain, \
+         update and harness tags are aterm's own; at most 3 wire rows are live (the band's \
+         three), 60 new messages and 16 KiB of words a minute, 10 presses a minute (`ERR busy \
+         notice: \u{2026} retry_ms=<ms>`). No button can be authored from the socket.",
+    ),
     // `story` is the WRITE face of the PRESENCE band (round 19): a watcher's
     // decision, told to the session's window. Owner-only (a child edge must not
     // write `✓ approved` onto a band it does not drive), Write op-class because it
@@ -1146,10 +1208,13 @@ pub const VERBS: &[VerbSpec] = &[
          echo_p50_ms=/echo_p95_ms=/echo_p99_ms= echo_last_ms=/echo_max_ms= with the \
          echo_total=/echo_arms=/echo_coalesced=/echo_expired=/echo_dropped_locked= ledger that \
          qualifies them — bytes out to the PTY->the first bytes back, the ONE slice on this \
-         line that is not aterm. The line ENDS with the main-loop TURN census max_turn_ms= \
+         line that is not aterm. Near its end the line carries the main-loop TURN census max_turn_ms= \
          max_turn_owner= max_turn_at_ms= last_turn_ms= turns= long_turns= \
          long_turn_threshold_ms= (a main thread parked OUTSIDE the redraw: read the max against \
-         max_redraw_total_ms). IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
+         max_redraw_total_ms), then the STRAIN engine's strain=calm|suspect|open|off (off = config \
+         explain_heavy_load = false) with strain_probe_us_max=/strain_scan_us_max= (the probe \
+         thread's slowest machine reading and process sweep since reset; 0 until an episode \
+         first samples). IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
          is behind (a TUI sharing its scheduling band with a build has been measured echoing at \
          p99 150ms while aterm wrote every key at p99 6.29ms), the reverse means aterm is; a \
          lone max_present_latency_ms is not evidence of either. READ THE SLICES HONESTLY: present_* and input_* are OPEN INTERVALS closed by the next qualifying present, so any stretch in which nothing presented is INSIDE the number (only a 5 s discard bounds it) — a multi-second present_latency means \"nothing presented for that long\", not \"a frame took that long\"; input_* closes on the next CONTENT present, which under concurrent streaming output may be a log-line frame rather than the key's echo, so it reads LOW rather than high. Quote n_* with the percentiles, never a lone last_/max_, and note both stop at application-present return (no compositor selection, scanout or photons)",
@@ -2465,6 +2530,10 @@ pub const VERBS: &[VerbSpec] = &[
          status item's fleet scan reads this on every open under a 2 s per-peer budget, so \
          a peer whose main thread cannot answer inside it drops out of that menu rather \
          than being listed from the registry alone — one hop per open, never a poll. \
+         `sessions bridge` is the Fabric bridge's identity-only roster: `OK <n>` then \
+         `<local> <sid> nonce=<hex32>` per session, sorted by local id. It takes \
+         one registry snapshot and reads no terminal, metadata, timeline or \
+         window placement; the public `sessions` response remains unchanged. \
          `sessions status` is the bridge's one-hop status snapshot: `OK <n>` then one \
          `<local> <sid> <nonce> sid=<local> revision=<n> hold=<0|1> detail=<pct|-> agent=<word|->` \
          row per readable session. The sid and nonce fence local-id reuse; an \
@@ -3486,6 +3555,9 @@ mod tests {
             owner_only,
             [
                 "appnotice",
+                // The message band's write face; a child edge may not raise, end or
+                // press a row.
+                "notice",
                 // The presence band's write face (round 19): the watcher tells the
                 // window what it decided; a child edge may not.
                 "story",

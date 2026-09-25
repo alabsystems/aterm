@@ -226,8 +226,8 @@ fn which_move_tags_a_clean_directory() {
 /// The lane's real property is narrower and worth stating exactly: an untracked job
 /// does not ADD the tag to output that would otherwise have been clean. Everything
 /// upstream of it still has to be clean, which is why the placement moves were worth
-/// fixing and why atpkg records `the untracked lane ran, but the first file it laid
-/// still carried com.apple.provenance` as a distinct cause.
+/// fixing and why atpkg's since-deleted lanes recorded `the untracked lane ran, but the
+/// first file it laid still carried com.apple.provenance` as a distinct cause.
 #[test]
 #[ignore = "measures the host's provenance behaviour; needs launchctl"]
 fn an_untracked_job_does_not_launder_a_tagged_source() {

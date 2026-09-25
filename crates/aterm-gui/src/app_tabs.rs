@@ -5703,7 +5703,7 @@ mod mixed_tab_tests {
     /// product seam that turns a path into a URI (the file picker in
     /// `app_input::open_local_document_path`, the drag-and-drop seam in
     /// `lib::drop_file`, the config editor in `app_documents`) already funnels
-    /// through this same encoder, which emits `file:///C:/Users//...` with
+    /// through this same encoder, which emits `file:///C:/Users/...` with
     /// percent-escapes. Tests must use it too, or they test a URI no user can
     /// ever produce.
     fn file_uri(path: &std::path::Path) -> String {

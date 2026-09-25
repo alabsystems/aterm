@@ -184,56 +184,47 @@ fn runtime_join_matches_design_table_all_36_cells() {
     }
 }
 
+/// The lattice laws, over every element (every triple for associativity):
+/// commutative, idempotent, Host the identity, Pty absorbing, associative.
+/// With the 36-cell table above they also fix `dominates`, which is
+/// `join(a, b) == b` — its direction is pinned by the Hasse-chain test below.
 #[test]
-fn runtime_join_is_commutative() {
-    for &a in &OriginTag::all() {
-        for &b in &OriginTag::all() {
+fn runtime_join_obeys_the_lattice_laws() {
+    let all = OriginTag::all();
+    for &a in &all {
+        assert_eq!(runtime_join(a, a), a, "join not idempotent at {a:?}");
+        assert_eq!(
+            runtime_join(OriginTag::Host, a),
+            a,
+            "Host not a left identity at {a:?}"
+        );
+        assert_eq!(
+            runtime_join(a, OriginTag::Host),
+            a,
+            "Host not a right identity at {a:?}"
+        );
+        assert_eq!(
+            runtime_join(OriginTag::Pty, a),
+            OriginTag::Pty,
+            "Pty not absorbing at {a:?}"
+        );
+        assert_eq!(
+            runtime_join(a, OriginTag::Pty),
+            OriginTag::Pty,
+            "Pty not absorbing at {a:?}"
+        );
+        for &b in &all {
             assert_eq!(
                 runtime_join(a, b),
                 runtime_join(b, a),
-                "join is not commutative at ({:?}, {:?})",
-                a,
-                b,
+                "join is not commutative at ({a:?}, {b:?})"
             );
-        }
-    }
-}
-
-#[test]
-fn runtime_join_is_idempotent() {
-    for &a in &OriginTag::all() {
-        assert_eq!(runtime_join(a, a), a, "join not idempotent at {:?}", a);
-    }
-}
-
-#[test]
-fn runtime_join_host_is_identity() {
-    for &a in &OriginTag::all() {
-        assert_eq!(runtime_join(OriginTag::Host, a), a);
-        assert_eq!(runtime_join(a, OriginTag::Host), a);
-    }
-}
-
-#[test]
-fn runtime_join_pty_is_absorbing() {
-    for &a in &OriginTag::all() {
-        assert_eq!(runtime_join(OriginTag::Pty, a), OriginTag::Pty);
-        assert_eq!(runtime_join(a, OriginTag::Pty), OriginTag::Pty);
-    }
-}
-
-#[test]
-fn runtime_join_is_associative() {
-    // Every triple (a, b, c). 6^3 = 216 checks.
-    for &a in &OriginTag::all() {
-        for &b in &OriginTag::all() {
-            for &c in &OriginTag::all() {
-                let left = runtime_join(runtime_join(a, b), c);
-                let right = runtime_join(a, runtime_join(b, c));
+            // Every triple (a, b, c). 6^3 = 216 checks.
+            for &c in &all {
                 assert_eq!(
-                    left, right,
-                    "join not associative at ({:?}, {:?}, {:?})",
-                    a, b, c
+                    runtime_join(runtime_join(a, b), c),
+                    runtime_join(a, runtime_join(b, c)),
+                    "join not associative at ({a:?}, {b:?}, {c:?})"
                 );
             }
         }
@@ -262,57 +253,9 @@ fn public_join_returns_none_on_top() {
 
 // -- Dominance ----------------------------------------------------------
 
-#[test]
-fn dominance_reflexive() {
-    for &a in &OriginTag::all() {
-        assert!(dominates(a, a));
-    }
-}
-
-#[test]
-fn dominance_host_dominates_all() {
-    for &a in &OriginTag::all() {
-        assert!(
-            dominates(OriginTag::Host, a),
-            "Host should dominate {:?}",
-            a
-        );
-    }
-}
-
-#[test]
-fn dominance_nothing_above_host_except_host() {
-    for &a in &OriginTag::all() {
-        if a != OriginTag::Host {
-            assert!(
-                !dominates(a, OriginTag::Host),
-                "{:?} must not dominate Host",
-                a
-            );
-        }
-    }
-}
-
-#[test]
-fn dominance_pty_bottom() {
-    for &a in &OriginTag::all() {
-        assert!(dominates(a, OriginTag::Pty), "{:?} should dominate Pty", a);
-    }
-}
-
-#[test]
-fn dominance_pty_dominates_only_itself() {
-    for &a in &OriginTag::all() {
-        if a != OriginTag::Pty {
-            assert!(
-                !dominates(OriginTag::Pty, a),
-                "Pty must not dominate {:?}",
-                a
-            );
-        }
-    }
-}
-
+/// `dominates(a, b)` is `join(a, b) == b`, so the table and the laws above
+/// decide every cell; this pins the DIRECTION of the relation (an argument
+/// swap fails the ConfigFile/User pair) and records the §3 prose question.
 #[test]
 fn dominance_hasse_chain_config_user_ai() {
     // Host dominates everything.
@@ -339,30 +282,6 @@ fn dominance_hasse_chain_config_user_ai() {
 }
 
 // -- Type-level JoinWith (compile-time witness via Origin::TAG) --------
-
-#[test]
-fn typelevel_join_host_pty_is_pty() {
-    assert_eq!(
-        <<Host as JoinWith<Pty>>::Output as Origin>::TAG,
-        OriginTag::Pty
-    );
-}
-
-#[test]
-fn typelevel_join_host_host_is_host() {
-    assert_eq!(
-        <<Host as JoinWith<Host>>::Output as Origin>::TAG,
-        OriginTag::Host
-    );
-}
-
-#[test]
-fn typelevel_join_user_ai_is_ai() {
-    assert_eq!(
-        <<User as JoinWith<Ai>>::Output as Origin>::TAG,
-        OriginTag::Ai
-    );
-}
 
 #[test]
 fn typelevel_join_all_36_cells_match_runtime() {

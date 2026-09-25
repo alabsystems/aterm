@@ -355,6 +355,7 @@ const UNCAUGHT: &[(&str, &[&str])] = &[
         "ReleaseYankSuccessorFirst",
         &["CompleteMeansConverged", "YankStateBounds"],
     ),
+    ("ReleaseClaimLanding", &["ClaimStateBounds"]),
     (
         "ReleaseChannelSingleHead",
         &[
@@ -362,15 +363,6 @@ const UNCAUGHT: &[(&str, &[&str])] = &[
             "HistoricalSignatureNeverDeleted",
             "NominalCrashPreservesRemoteLease",
             "ArchiveStateBounds",
-        ],
-    ),
-    (
-        "NativeUpdateChannelScan",
-        &[
-            "MetadataFailureFetchesNothing",
-            "VerifiedFetchHonorsSignaturePolicy",
-            "RefusalIsTerminalForThisCheck",
-            "ScanBounds",
         ],
     ),
     (

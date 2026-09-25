@@ -399,55 +399,46 @@ mod tests {
         }
     }
 
-    /// Disabled ⇒ no fill, no wings, fp 0 (byte-identical to the plain cursor).
+    /// Disabled, or reduced motion / load-shed (`intensity == 0`) even at full
+    /// strength ⇒ fully inert: no fill, no wings, fp 0, settled —
+    /// byte-identical to the plain cursor.
     #[test]
-    fn disabled_is_inert() {
-        let mut cp = CursorPhaser::default();
-        let mut out = Vec::new();
-        let f = cp.tick(
-            Some((1, 1)),
-            Instant::now(),
-            0.3,
-            1.0,
-            true,
-            geom(),
-            &PhaserConfig {
-                enabled: false,
-                intensity: 1.0,
-                base: None,
-            },
-            &mut out,
-        );
-        assert!(f.fill.is_none());
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty());
-        assert!(!cp.is_active());
-    }
-
-    /// Reduced motion / load-shed (`intensity == 0`) ⇒ fully inert even at full
-    /// charge — no beam-hued fill, no wings, settled.
-    #[test]
-    fn zero_intensity_is_inert() {
-        let mut cp = CursorPhaser::default();
-        let mut out = Vec::new();
-        let f = cp.tick(
-            Some((1, 1)),
-            Instant::now(),
-            0.3,
-            1.0,
-            true,
-            geom(),
-            &PhaserConfig {
-                enabled: true,
-                intensity: 0.0,
-                base: None,
-            },
-            &mut out,
-        );
-        assert!(f.fill.is_none(), "reduced motion keeps the plain cursor");
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty());
-        assert!(!cp.is_active());
+    fn disabled_or_zero_intensity_is_inert() {
+        for (why, config) in [
+            (
+                "disabled",
+                PhaserConfig {
+                    enabled: false,
+                    intensity: 1.0,
+                    base: None,
+                },
+            ),
+            (
+                "zero intensity",
+                PhaserConfig {
+                    enabled: true,
+                    intensity: 0.0,
+                    base: None,
+                },
+            ),
+        ] {
+            let mut cp = CursorPhaser::default();
+            let mut out = Vec::new();
+            let f = cp.tick(
+                Some((1, 1)),
+                Instant::now(),
+                0.3,
+                1.0,
+                true,
+                geom(),
+                &config,
+                &mut out,
+            );
+            assert!(f.fill.is_none(), "{why}: keeps the plain cursor");
+            assert_eq!(f.fp, 0, "{why}");
+            assert!(out.is_empty(), "{why}: no additive light");
+            assert!(!cp.is_active(), "{why}: settled");
+        }
     }
 
     /// A hidden cursor draws no wings, but the fill stays resolved (harmless —

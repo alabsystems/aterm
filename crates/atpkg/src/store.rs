@@ -328,9 +328,10 @@ impl Layout {
         self.prefix.join("status.toml")
     }
 
-    /// `machine-apply.stamp` — when a terminal session last started the detached `aterm pkg
-    /// machine apply` (unix seconds, one line): the session lane claims it once a day
-    /// ([`aterm_update_core::pkg_check::claim`]) instead of walking `$HOME` at every launch.
+    /// `machine-apply.stamp` — when a launch last started `aterm pkg machine apply` (unix
+    /// seconds, one line): a terminal session and a window opening claim it once a day
+    /// between them ([`crate::machine::launch_apply_due`]) instead of walking `$HOME` at
+    /// every launch.
     #[must_use]
     pub fn machine_apply_stamp(&self) -> PathBuf {
         self.prefix.join("machine-apply.stamp")
@@ -342,14 +343,6 @@ impl Layout {
     #[must_use]
     pub fn session_pass_stamp(&self) -> PathBuf {
         self.prefix.join("session-pass.stamp")
-    }
-
-    /// `listing-headers.tmp` — where the full pass's metered index listing dumps its
-    /// response headers, read back for a rate limit's reset and removed after each listing.
-    /// One file serves: only the full pass asks for it, and it holds the store lock.
-    #[must_use]
-    pub fn listing_headers(&self) -> PathBuf {
-        self.prefix.join("listing-headers.tmp")
     }
 
     /// `progress.json` — the LIVE install-progress snapshot ([`crate::progress`]), the
@@ -468,116 +461,6 @@ impl Layout {
         self.prefix.join("declined")
     }
 
-    /// `optin/` — the per-program EXTRAS opt-in markers directory. One `0600` regular file
-    /// per extra ([`crate::manifest::Program::extra`]) this machine asked for by name —
-    /// `aterm pkg install codex`, the typed-name consent stub, Settings — so the default-set
-    /// pass unions it into the wanted set ([`crate::manifest::Index::installable_with_optins`])
-    /// on every later pass. The marker is the consent record: it is written only by an
-    /// explicit answer, and it is what ADDS work (the bump file stays reorder-only).
-    ///
-    /// Cleared by `uninstall <name>` and by `uninstall --all` (a decline): removing an extra
-    /// is withdrawing the opt-in, and a declined machine wants none of the set.
-    #[must_use]
-    pub fn optin_dir(&self) -> PathBuf {
-        self.prefix.join("optin")
-    }
-
-    /// `optin/<program>` — one opt-in marker. Only ever joined with a [`shim_allowed`]-shape
-    /// name; [`Self::record_optin`] gates the name before creating one.
-    #[must_use]
-    pub fn optin_marker(&self, program: &str) -> PathBuf {
-        self.optin_dir().join(program)
-    }
-
-    /// Whether an opt-in marker exists for `program`: a REGULAR, non-symlink file at
-    /// [`Self::optin_marker`] (the same symlink-refusing rule the other prefix markers
-    /// follow — a link planted there is not a consent this machine recorded). A name that
-    /// could never be a program answers `false` without touching the filesystem.
-    #[must_use]
-    pub fn optin_exists(&self, program: &str) -> bool {
-        if ToolName::new(program).is_none() {
-            return false;
-        }
-        std::fs::symlink_metadata(self.optin_marker(program)).is_ok_and(|m| m.file_type().is_file())
-    }
-
-    /// Record an opt-in for `program`. Idempotent; the payload is documentation for whoever
-    /// finds the file, never something read back — consent is the marker's EXISTENCE.
-    ///
-    /// # Errors
-    /// The name is not a [`shim_allowed`] shape (never joined onto the path), the directory
-    /// could not be created/hardened, or the marker could not be written.
-    pub fn record_optin(&self, program: &str) -> std::io::Result<()> {
-        if ToolName::new(program).is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "opt-in name is not an installable program name",
-            ));
-        }
-        if self.optin_exists(program) {
-            return Ok(());
-        }
-        let dir = self.optin_dir();
-        self.ensure_dir(&dir)?;
-        let path = self.optin_marker(program);
-        // Refuse to write THROUGH a planted symlink: `open_create_write` creates the file
-        // fresh; if something non-regular already sits there, leave it and fail closed.
-        if std::fs::symlink_metadata(&path).is_ok() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "opt-in marker path is occupied by something that is not a marker",
-            ));
-        }
-        let mut f = crate::platform::open_create_write(&path, 0o600)?;
-        use std::io::Write as _;
-        f.write_all(
-            b"# This machine opted in to this EXTRA (not a default-set member) by name.
-              # The default-set pass keeps it installed and current while this file exists.
-              # Removed by `aterm pkg uninstall <name>` or `aterm pkg uninstall --all`.
-",
-        )
-    }
-
-    /// Forget the opt-in for `program` (a no-op when none is recorded). Only a REGULAR
-    /// file is ever removed — a planted symlink at the marker path is left alone.
-    pub fn clear_optin(&self, program: &str) {
-        if ToolName::new(program).is_none() {
-            return;
-        }
-        let path = self.optin_marker(program);
-        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-
-    /// Forget EVERY opt-in (a decline: `uninstall --all`). Regular files only, as above.
-    pub fn clear_all_optins(&self) {
-        for name in self.optins() {
-            self.clear_optin(&name);
-        }
-    }
-
-    /// The extras this machine opted in to: every regular-file marker under `optin/` whose
-    /// name is a [`shim_allowed`] shape. Sorted (a `BTreeSet`), so the union into the wanted
-    /// set is deterministic. Missing directory ⇒ empty.
-    #[must_use]
-    pub fn optins(&self) -> std::collections::BTreeSet<String> {
-        let mut out = std::collections::BTreeSet::new();
-        let Ok(entries) = std::fs::read_dir(self.optin_dir()) else {
-            return out;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if self.optin_exists(name) {
-                out.insert(name.to_string());
-            }
-        }
-        out
-    }
-
     /// `retired/` — the per-program RETIREMENT markers directory. One `0600` regular file
     /// per program whose managed copy atpkg retired in favour of a system install
     /// (`cli::satisfy_by_system`); its first line is the day it happened (`YYYY-MM-DD`),
@@ -590,7 +473,7 @@ impl Layout {
         self.prefix.join("retired")
     }
 
-    /// `retired/<program>` — one retirement marker (name-gated like [`Self::optin_marker`]).
+    /// `retired/<program>` — one retirement marker, name-gated by [`ToolName`].
     #[must_use]
     pub fn retired_marker(&self, program: &str) -> PathBuf {
         self.retired_dir().join(program)
@@ -1218,71 +1101,6 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
     }
 }
 
-/// The record a provenance-tracked installer leaves when the tree it staged came out
-/// carrying `com.apple.provenance` and the heal could not clear it
-/// ([`crate::install::verify_and_stage_with`]): a SIBLING file
-/// `store/<program>/<build>.tracked-install`, outside the hashed tree like `.ready`, whose
-/// `why=` line says how. For the log and a person debugging, never for glass. The store
-/// heal removes it once the build measures clean or is no longer active
-/// ([`crate::provenance::heal_store`]); `aterm pkg doctor` reads the files, not this.
-fn tracked_install_marker_path(build_dir: &Path) -> Option<PathBuf> {
-    let name = crate::call1(std::path::Path::file_name, build_dir)?;
-    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
-    let mut marker = String::from(name);
-    marker.push_str(TRACKED_INSTALL_SUFFIX);
-    Some(build_dir.with_file_name(marker))
-}
-
-/// The suffix of the tracked-install record beside a build dir.
-pub const TRACKED_INSTALL_SUFFIX: &str = ".tracked-install";
-
-/// Write the tracked-install record beside `build_dir` (temp + rename): `why` is the one
-/// line the installer had — which lane failure, or the measured-tagged witness — and the
-/// time. Called by the stage BEFORE the build is marked complete, so a record that could
-/// not be written leaves an unmarked (re-stageable) build rather than a marked, tagged,
-/// unexplained one.
-pub fn record_tracked_install(build_dir: &Path, why: &str) -> std::io::Result<()> {
-    let dest = tracked_install_marker_path(build_dir).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
-    })?;
-    let parent = dest.parent().unwrap_or(build_dir);
-    let mut tmp_name = String::from(".tracked-install.tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = parent.join(tmp_name);
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut body = String::from("tracked-install v1\nwhy=");
-    // One line: the reader takes the `why=` line whole.
-    body.push_str(&why.replace(['\n', '\r'], " "));
-    body.push_str("\nat=");
-    body.push_str(&crate::dec_u64(secs));
-    body.push('\n');
-    crate::call2(std::fs::write, &tmp, body.as_bytes())?;
-    std::fs::rename(&tmp, &dest)
-}
-
-/// The recorded reason `build_dir` was staged tagged, if a record is there and readable.
-/// `None` is "no record" — never a claim about the tree's attributes, which `doctor`
-/// scans directly.
-#[must_use]
-pub fn tracked_install_record(build_dir: &Path) -> Option<String> {
-    let marker = tracked_install_marker_path(build_dir)?;
-    let text = std::fs::read_to_string(marker).ok()?;
-    text.lines()
-        .find_map(|l| l.strip_prefix("why="))
-        .map(str::to_string)
-}
-
-/// Remove the tracked-install record beside `build_dir`, if any — a clean stage of the
-/// same build number, and every discard, so the record never outlives its cause.
-pub fn clear_tracked_install(build_dir: &Path) {
-    if let Some(marker) = tracked_install_marker_path(build_dir) {
-        let _ = std::fs::remove_file(marker);
-    }
-}
-
 /// The suffix of the stage-refusal memo beside a build dir (`<build>.refused`).
 pub const STAGE_REFUSAL_SUFFIX: &str = ".refused";
 
@@ -1802,22 +1620,14 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
 }
 
 /// Delete every stage-scratch sibling of `build_dir` left behind by an earlier run, after
-/// first stopping any lane helper that may still be writing into one
-/// ([`crate::stage_helper::stop_orphaned_lane_jobs`]) and recovering the swap window
-/// ([`recover_interrupted_swap`]) so a crash there does not get swept as debris.
-///
-/// The store lock alone does not prove nothing is still writing: the staging lane's
-/// extractor is a launchd job, not the submitter's child, so a `kill -9` of the stager
-/// drops the lock while its helper keeps extracting. Stop the jobs, wait, then delete.
+/// recovering the swap window ([`recover_interrupted_swap`]) so a crash there does not get
+/// swept as debris. The caller holds the store lock, which every stager takes.
 ///
 /// Nothing else reclaims this scratch — GC only sees numeric, marker-bearing dirs — and a
 /// non-directory at a scratch path is reclaimed by neither sweeper while blocking every
 /// later swap of that build. A superseded *directory* is spared while `<build>` is absent
 /// and the recovery above declined to move it: it is the only copy of the build on disk.
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
-    // Stop first, delete second: a launchd-parented lane helper outlives the stager that
-    // submitted it, and the store lock it dropped says nothing about the helper.
-    crate::stage_helper::stop_orphaned_lane_jobs();
     let recovered = recover_interrupted_swap(build_dir);
     // Not debris: while nothing stands at `<build>`, a superseded sibling is the only copy
     // of that build on disk — a swap window [`recover_interrupted_swap`] could not close.
@@ -2028,9 +1838,6 @@ pub(crate) fn discard_build(build_dir: &Path) {
     // reinstall under this build number writes its own from its own signed manifest,
     // and must never re-lay shims with an environment a discarded build declared.
     crate::shim_env::remove_sidecar(build_dir);
-    // And the tracked-install record (`<build>.tracked-install`): the cause it named is
-    // gone with the tree, and a clean reinstall must not be reported under it.
-    clear_tracked_install(build_dir);
     // And the digest-refusal memo (`<build>.refused`): it is a statement about the bytes
     // a pin named, and a later reinstall under this build number must start from the
     // signed manifest, never from a verdict about a tree that is gone.
@@ -2634,42 +2441,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
-    /// The tracked-install record: written beside the build, read back as its `why=`
-    /// line (newlines folded), absent reads as `None`, cleared explicitly and by
-    /// `discard_build`.
-    #[test]
-    fn the_tracked_install_record_round_trips_and_goes_with_the_build() {
-        let h = temp_home("tracked-install");
-        let l = Layout { prefix: h.clone() };
-        let build = l.build_dir("trust", 8590);
-        std::fs::create_dir_all(build.join("bin")).unwrap();
-        assert_eq!(tracked_install_record(&build), None);
-        record_tracked_install(
-            &build,
-            "the untracked lane could not run (launchctl\nfailed)",
-        )
-        .unwrap();
-        let marker = build.with_file_name("8590.tracked-install");
-        assert!(marker.is_file(), "a sibling, outside the tree");
-        assert_eq!(
-            tracked_install_record(&build).as_deref(),
-            Some("the untracked lane could not run (launchctl failed)")
-        );
-        let text = std::fs::read_to_string(&marker).unwrap();
-        assert!(text.starts_with("tracked-install v1\nwhy="), "{text}");
-        assert!(text.lines().any(|l| l.starts_with("at=")), "{text}");
-        clear_tracked_install(&build);
-        assert_eq!(tracked_install_record(&build), None);
-        clear_tracked_install(&build); // idempotent
-        record_tracked_install(&build, "again").unwrap();
-        discard_build(&build);
-        assert!(
-            !build.exists() && !marker.exists(),
-            "the discard takes the record"
-        );
-        let _ = std::fs::remove_dir_all(&h);
-    }
-
     /// The refusal's PURE half: what it binds, and for how long. A memo binds only the
     /// digests it was recorded for, only from the SECOND identical verdict, and only
     /// until its cooldown lapses — the three escapes that keep a bandwidth cooldown from
@@ -2861,69 +2632,6 @@ mod tests {
         std::fs::create_dir_all(next.join("bin")).unwrap();
         discard_build(&next);
         assert_eq!(stage_refusal(&next), None, "the discard takes it too");
-        let _ = std::fs::remove_dir_all(&h);
-    }
-
-    /// The EXTRAS opt-in markers: recorded by name (idempotent, `0600`, regular file),
-    /// listed, cleared one at a time and all at once; a name that could never be a
-    /// program is refused rather than joined onto the path; a planted symlink is never a
-    /// consent, never written through, never removed.
-    #[test]
-    fn optin_markers_record_list_clear_and_refuse_links() {
-        let h = temp_home("optin");
-        let l = Layout { prefix: h.clone() };
-        assert!(l.optins().is_empty());
-        assert!(!l.optin_exists("codex"));
-        l.record_optin("codex").unwrap();
-        l.record_optin("codex").unwrap(); // idempotent
-        assert!(l.optin_exists("codex"));
-        assert_eq!(l.optin_marker("codex"), h.join("optin").join("codex"));
-        assert_eq!(l.optins(), ["codex".to_string()].into_iter().collect());
-        #[cfg(unix)]
-        {
-            let mode = std::fs::metadata(l.optin_marker("codex"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600, "a marker is private state");
-        }
-        for bad in ["", ".", "..", "../evil", "a/b", "a\\b", "sudo", "git"] {
-            assert!(l.record_optin(bad).is_err(), "{bad:?} must be refused");
-            assert!(!l.optin_exists(bad));
-        }
-        assert!(!h.join("optin").join("evil").exists());
-        #[cfg(unix)]
-        {
-            let target = h.join("elsewhere");
-            std::fs::write(&target, b"not a marker").unwrap();
-            std::os::unix::fs::symlink(&target, l.optin_marker("claude")).unwrap();
-            assert!(!l.optin_exists("claude"), "a planted link is not a consent");
-            assert!(!l.optins().contains("claude"));
-            assert!(
-                l.record_optin("claude").is_err(),
-                "never write through a planted link"
-            );
-            l.clear_optin("claude");
-            assert!(
-                std::fs::symlink_metadata(l.optin_marker("claude")).is_ok(),
-                "a link is never what clear removes"
-            );
-            assert_eq!(std::fs::read(&target).unwrap(), b"not a marker");
-        }
-        l.clear_optin("codex");
-        assert!(!l.optin_exists("codex"));
-        l.clear_optin("codex"); // absent: a no-op
-        l.record_optin("codex").unwrap();
-        l.record_optin("gh").unwrap();
-        assert_eq!(
-            l.optins(),
-            ["codex".to_string(), "gh".to_string()]
-                .into_iter()
-                .collect()
-        );
-        l.clear_all_optins();
-        assert!(l.optins().is_empty());
         let _ = std::fs::remove_dir_all(&h);
     }
 

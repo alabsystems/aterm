@@ -106,8 +106,8 @@ fn state(current_version: &str, has_section: bool, published: bool) -> RemoteSta
 
 /// The whole table in one place, spec §5's sentence as executable rows, under
 /// the single-version scheme: `RemoteState.current_version` IS the release
-/// version derived from `[workspace.package] version` (DEV → 0), so the
-/// default cut NEVER invents a successor. "workspace-derived version already
+/// version, `[workspace.package] version` as written, so a cut NEVER invents a
+/// successor. "workspace-derived version already
 /// rolled into `## [X.Y.Z]` + no published vX.Y.Z release ⇒ recut" —
 /// everything else is a fresh cut of that same version (or a refusal).
 #[test]
@@ -119,60 +119,52 @@ fn remote_derived_cut_mode_decision_table() {
         version: v.to_string(),
     };
 
-    // (workspace-derived version, section?, published?, --set-version) → want
-    let table: &[(&str, bool, bool, Option<&str>, CutMode)] = &[
-        // Steady state: Cargo.toml says 0.3.1, so the cut is v0.3.0 — the
-        // operator's bump is the ONLY thing that advances the version.
-        ("0.3.0", false, false, None, fresh("0.3.0")),
-        // Explicit override on a clean tree.
-        ("0.3.0", false, false, Some("1.0.0"), fresh("1.0.0")),
+    // (workspace version, section?, published?) → want
+    let table: &[(&str, bool, bool, CutMode)] = &[
+        // Steady state: the operator's bump is the ONLY thing that advances the
+        // version.
+        ("0.3.0", false, false, fresh("0.3.0")),
         // THE wedge signature: roll+claim landed, nothing published ⇒ recut.
-        ("0.2.0", true, false, None, recut("0.2.0")),
-        // Same wedge, version named explicitly ⇒ still a recut.
-        ("0.2.0", true, false, Some("0.2.0"), recut("0.2.0")),
-        // Wedged 0.2.0 exists but the operator wants a different version:
-        // their call — the tag/cut-elsewhere gates still stand.
-        ("0.2.0", true, false, Some("0.3.0"), fresh("0.3.0")),
-        // Bumped but never rolled (no section): fresh cut of the named
-        // version — the roll happens inside the claim.
-        ("0.2.0", false, false, Some("0.2.0"), fresh("0.2.0")),
+        ("0.2.0", true, false, recut("0.2.0")),
         // Negative control for the RETIRED ledger-tail bump: the old default
         // path answered fresh("0.10.0") here. There is no arithmetic left.
-        ("0.9.0", false, false, None, fresh("0.9.0")),
-        ("1.99.0", false, false, None, fresh("1.99.0")),
+        ("0.9.0", false, false, fresh("0.9.0")),
+        ("1.99.0", false, false, fresh("1.99.0")),
     ];
-    for (short, section, published, set, want) in table {
-        let got = verify::derive_cut_mode(&state(short, *section, *published), *set)
-            .unwrap_or_else(|e| panic!("({short}, {section}, {published}, {set:?}) errored: {e}"));
-        assert_eq!(&got, want, "({short}, {section}, {published}, {set:?})");
+    for (short, section, published, want) in table {
+        let got = verify::derive_cut_mode(&state(short, *section, *published))
+            .unwrap_or_else(|e| panic!("({short}, {section}, {published}) errored: {e}"));
+        assert_eq!(&got, want, "({short}, {section}, {published})");
     }
 }
 
-/// Cutting twice without bumping `[workspace.package] version` is refused —
-/// by name AND on the plain default path, which is the shape the operator
-/// actually hits. The message must name the Cargo.toml bump (with the exact
-/// next version) and keep the yank escape hatch.
+/// Cutting twice without bumping `[workspace.package] version` is refused. The
+/// message must name the Cargo.toml bump (with the exact next version) and keep
+/// the yank escape hatch.
 #[test]
 fn recutting_a_published_version_is_refused() {
-    for set in [Some("0.2.0"), None] {
-        let err = verify::derive_cut_mode(&state("0.2.0", true, true), set)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("v0.2.0 is already published"),
-            "{set:?}: {err}"
-        );
-        assert!(
-            err.contains("bump [workspace.package] version in Cargo.toml"),
-            "{set:?}: {err}"
-        );
-        assert!(err.contains("the next release is v0.3.0"), "{set:?}: {err}");
-        assert!(err.contains("cargo ship yank <build>"), "{set:?}: {err}");
-    }
+    let err = verify::derive_cut_mode(&state("0.2.0", true, true))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("v0.2.0 is already published"), "{err}");
+    assert!(
+        err.contains("bump [workspace.package] version in Cargo.toml on main"),
+        "{err}"
+    );
+    assert!(err.contains("the next release is v0.3.0"), "{err}");
+    assert!(
+        err.contains("`pub stage aterm` and `pub publish aterm`, then cut"),
+        "a cut builds the published commit, so the next version must be published \
+         first: {err}"
+    );
+    assert!(
+        err.contains("targo --unverified ship yank <build>"),
+        "{err}"
+    );
 
     // A published version with no rolled section is the same refusal: the
     // guard keys on "published", never on the changelog.
-    assert!(verify::derive_cut_mode(&state("0.2.0", false, true), None).is_err());
+    assert!(verify::derive_cut_mode(&state("0.2.0", false, true)).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -225,21 +217,15 @@ fn pipeline_step_order_is_the_spec_7_order() {
             // failure is loud and resumable rather than a silently
             // private-only release the fleet can never see.
             "mirror",
+            // `unlock` is LAST (2026-09-23): the website follows the cut AFTER
+            // the pipeline, best-effort and unjournaled, so a site failure can
+            // never park the journal and block the next cut.
             "unlock",
-            // The website follows the cut AFTER unlock: the release is fully
-            // live, mirrored and lease-free before alab.systems is touched, so
-            // a site failure parks the journal here — loud and resumable —
-            // while the release itself is complete and safe.
-            "site"
         ]
     );
     assert!(
-        publish::is_post_unlock_step("site"),
-        "site must never demand or reacquire the release lease"
-    );
-    assert!(
-        !publish::is_post_unlock_step("mirror") && !publish::is_post_unlock_step("unlock"),
-        "every release-object step stays lease-guarded"
+        !STEPS.contains(&"site"),
+        "the retired `site` step must never be journaled again"
     );
 }
 
@@ -329,134 +315,10 @@ fn current_journal_done_state_is_an_exact_canonical_prefix() {
     assert!(malformed_owner.save(&path).is_err());
 }
 
-#[test]
-fn completed_legacy_journal_stays_complete_instead_of_reclassifying_archive() {
-    let dir = tmpdir("journal-legacy-complete");
-    let path = dir.join("cut-state.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "version = \"0.52.0\"\nbuild_number = 520\ncommit = \"{}\"\n\
-             done = [\"build\", \"selfcheck\", \"draft\", \"upload\", \"preflip\", \
-             \"tag\", \"flip\", \"cask\", \"verify\"]\n",
-            "a".repeat(40)
-        ),
-    )
-    .unwrap();
-
-    let legacy = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(legacy.format, 1, "missing format is the legacy protocol");
-    assert!(
-        !legacy.manifest_signed,
-        "legacy signed state is unknown/false"
-    );
-    assert_eq!(
-        legacy.first_incomplete(),
-        None,
-        "a completed v1 journal must remain clearable, never enter v5 recovery"
-    );
-    legacy.ensure_resumable().unwrap();
-}
-
-/// Format 7 REMOVED the `cask` step. A finished v6 journal still lists it, so
-/// walking one against the current 12-step list must not reclassify it — the
-/// mirror of the v1/v5 guarantees above, for a removal rather than an insertion.
-#[test]
-fn completed_v6_journal_with_cask_stays_complete_after_the_step_was_removed() {
-    let dir = tmpdir("journal-v6-complete");
-    let path = dir.join("cut-state.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "format = 6\nversion = \"0.11.0\"\nbuild_number = 1785698378\n\
-             commit = \"{}\"\n\
-             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
-             \"preflip\", \"tag\", \"flip\", \"archive\", \"cask\", \"verify\", \
-             \"mirror\", \"unlock\"]\n",
-            "b".repeat(40)
-        ),
-    )
-    .unwrap();
-
-    let v6 = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(v6.format, 6);
-    assert_eq!(
-        v6.first_incomplete(),
-        None,
-        "a completed v6 journal must stay complete once `cask` left STEPS"
-    );
-    v6.ensure_resumable().unwrap();
-}
-
-/// The other half of the removal: an UNFINISHED v6 journal that still owes the
-/// retired `cask` step must not be silently reported as further along than it
-/// is. It walks STEPS_V6, so `cask` is still its next step, and — being below
-/// the current format — it fails closed into stopped-publisher recovery.
-#[test]
-fn unfinished_v6_journal_still_owes_cask_and_fails_closed() {
-    let dir = tmpdir("journal-v6-incomplete");
-    let path = dir.join("cut-state.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "format = 6\nversion = \"0.11.0\"\nbuild_number = 1785698378\n\
-             commit = \"{}\"\n\
-             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
-             \"preflip\", \"tag\", \"flip\", \"archive\"]\n",
-            "c".repeat(40)
-        ),
-    )
-    .unwrap();
-
-    let v6 = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(
-        v6.first_incomplete(),
-        Some("cask"),
-        "an unfinished v6 journal walks the step list it was written against"
-    );
-    assert!(
-        v6.ensure_resumable().is_err(),
-        "a below-current-format unfinished journal must fail closed"
-    );
-}
-
-/// Format 8 APPENDED the post-unlock `site` step. A finished v7 journal — the
-/// exact file every cut through v0.63.0 left on its cutting machine — never
-/// owed it, so walking one against the current 13-step list must not misfile
-/// the finished cut as "resumable at site" (which would block the next cut
-/// behind a step that was never owed). The insertion twin of the v6 `cask`
-/// removal guarantee above.
-#[test]
-fn completed_v7_journal_stays_complete_after_site_was_appended() {
-    let dir = tmpdir("journal-v7-complete");
-    let path = dir.join("cut-state.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "format = 7\nversion = \"0.61.0\"\nbuild_number = 1787774830\n\
-             commit = \"{}\"\nrelease_id = 55\ndraft_create_issued = true\n\
-             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
-             \"preflip\", \"tag\", \"flip\", \"archive\", \"verify\", \
-             \"mirror\", \"unlock\"]\n",
-            "e".repeat(40)
-        ),
-    )
-    .unwrap();
-
-    let v7 = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(v7.format, 7);
-    assert_eq!(
-        v7.first_incomplete(),
-        None,
-        "a completed v7 journal must stay complete once `site` joined STEPS"
-    );
-    v7.ensure_resumable().unwrap();
-}
-
 /// The website hook's exit contract, pinned: `publish/post-promote` documents
-/// 0 synced-or-deferred, 3 no site checkout, 4 live-site lag — the three
-/// outcomes that complete the step — and ONLY a code outside that contract
-/// (1 hard failure, 2 usage, or a signal) fails it and parks the journal.
+/// 0 synced-or-deferred, 3 no site checkout, 4 live-site lag — and ONLY a code
+/// outside that contract (1 hard failure, 2 usage, or a signal) is a failure,
+/// which since 2026-09-23 is a loud WARNING and never a parked journal.
 #[test]
 fn the_site_hook_exit_contract_is_pinned() {
     use publish::{SiteHookOutcome, site_hook_outcome};
@@ -467,77 +329,242 @@ fn the_site_hook_exit_contract_is_pinned() {
         assert_eq!(
             site_hook_outcome(failing),
             SiteHookOutcome::Failed,
-            "{failing:?} must fail the step (loud, resumable) — never pass silently"
+            "{failing:?} must be reported as a failure — never pass silently"
         );
     }
 }
 
-/// A current-format cut that failed only its website step parks at `site`:
-/// resumable (the release is live, mirrored and unlocked — only the site is
-/// owed), and recognizably POST-unlock, so a resume must not reacquire the
-/// lease its own `unlock` already CAS-deleted.
+/// ONE JOURNAL FORMAT (2026-09-23; 10 since 2026-09-24). Every older format — the
+/// format-9 file 0.92 left ending in the retired `site` step, the format-8 file
+/// 0.91 left parked at it, the v7 one every cut through v0.63.0
+/// left, a v1 file with no `format` at all — is refused on load in one sentence
+/// that names the file, the cut, and the two ways forward (delete it, or finish it
+/// with the cutter that wrote it), instead of being walked against a frozen step
+/// list. The negative control is the same done list at the current format, which
+/// loads, and an in-flight current journal, which still blocks a fresh cut.
 #[test]
-fn a_site_parked_journal_is_resumable_and_post_unlock() {
-    let dir = tmpdir("journal-site-parked");
+fn an_older_journal_format_is_refused_in_one_sentence() {
+    let dir = tmpdir("journal-older-format");
     let path = dir.join("cut-state.toml");
-    let mut j = journal();
-    j.release_id = Some(55);
-    j.draft_create_issued = true;
-    j.done = STEPS
-        .iter()
-        .take_while(|step| **step != "site")
-        .map(|step| (*step).to_string())
-        .collect();
-    j.save(&path).unwrap();
+    let through_unlock = "\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
+         \"preflip\", \"tag\", \"flip\", \"archive\", \"verify\", \"mirror\", \"unlock\"";
+    let write = |format: &str, done: &str| {
+        std::fs::write(
+            &path,
+            format!(
+                "{format}version = \"0.91.0\"\nbuild_number = 1790120000\n\
+                 commit = \"{}\"\nrelease_id = 55\ndraft_create_issued = true\n\
+                 done = [{done}]\n",
+                "f".repeat(40)
+            ),
+        )
+        .unwrap();
+    };
+    for (format, done, named) in [
+        // Both format-9 step lists: main's, which kept `site`, and this cutter's
+        // first, which had already dropped it — one number, two lists, so neither
+        // may reach the prefix check (the_finished_0_92_journal_... below).
+        (
+            "format = 9\n",
+            format!("{through_unlock}, \"site\""),
+            "format-9",
+        ),
+        ("format = 9\n", through_unlock.to_string(), "format-9"),
+        (
+            "format = 8\n",
+            format!("{through_unlock}, \"site\""),
+            "format-8",
+        ),
+        ("format = 8\n", through_unlock.to_string(), "format-8"),
+        ("format = 7\n", through_unlock.to_string(), "format-7"),
+        ("", "\"build\", \"selfcheck\"".to_string(), "format-1"),
+    ] {
+        write(format, &done);
+        let error = Journal::load(&path)
+            .expect_err("an older journal is refused, never walked")
+            .to_string();
+        assert!(error.contains(named), "{error}");
+        assert!(error.contains("v0.91.0 build 1790120000"), "{error}");
+        assert!(error.contains("delete it if that cut finished"), "{error}");
+        assert!(error.contains("the cutter that wrote it"), "{error}");
+        assert_eq!(error.matches(". ").count(), 0, "one sentence: {error}");
+    }
 
-    let parked = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(parked.first_incomplete(), Some("site"));
-    parked.ensure_resumable().unwrap();
-    assert!(
-        parked
-            .first_incomplete()
-            .is_some_and(publish::is_post_unlock_step),
-        "the resume entry point must be classified post-unlock (no lease reacquisition)"
+    // NEGATIVE CONTROL: the same finished list at the current format loads and is
+    // cleared by the next cut; an in-flight one blocks it, by name.
+    write(
+        &format!("format = {}\n", publish::JOURNAL_FORMAT),
+        through_unlock,
     );
-    assert!(
-        parked.is_done("unlock") && parked.is_done("mirror"),
-        "a site park exists only after the release is fully mirrored and unlocked"
+    let finished = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(finished.first_incomplete(), None);
+    assert!(publish::fresh_cut_journal_triage(Some(&finished), publish::CutKind::Real).unwrap());
+    write(
+        &format!("format = {}\n", publish::JOURNAL_FORMAT),
+        "\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \"preflip\", \
+           \"tag\", \"flip\", \"archive\", \"verify\"",
     );
+    let in_flight = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(in_flight.first_incomplete(), Some("mirror"));
+    let error = publish::fresh_cut_journal_triage(Some(&in_flight), publish::CutKind::Real)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("already in progress") && error.contains("mirror"),
+        "{error}"
+    );
+    // A retired `site` entry after a current-format list is corruption, not history.
+    write(
+        &format!("format = {}\n", publish::JOURNAL_FORMAT),
+        &format!("{through_unlock}, \"site\""),
+    );
+    assert!(Journal::load(&path).is_err());
+    assert!(!publish::fresh_cut_journal_triage(None, publish::CutKind::Real).unwrap());
 }
 
-/// A format-7 journal written by the PREVIOUS cutter still carries the
-/// retired `lite_dmg_sha256` key (the `aterm-<v>-lite.dmg` lane, retired
-/// 2026-08-26). It must keep loading — serde ignores the unknown key — and
-/// its mirrored asset set is judged by today's ONE-DMG exact set: a channel
-/// head that already received the lean twin is refused at the mirror's
-/// exact-set gate for a human to inspect, never silently converged. An
-/// UNFINISHED v7 journal walks the step list it was written against (no
-/// `site` owed) and, being below the current format, fails closed into
-/// stopped-publisher recovery — the same rule every earlier format bump kept.
+/// THE JOURNAL v0.92.0 LEFT BEHIND, verbatim (`dist/cut-state.toml` in the checkout
+/// that cut it, 2026-09-24). `main`'s cutter wrote it at ITS format 9, which kept
+/// the retired `site` step after `unlock` — thirteen entries. This cutter had also
+/// numbered its own twelve-step list 9, so the format refusal let the file through
+/// and `validate` failed with a prefix error naming neither the file nor a remedy,
+/// in front of every cut, dry run, `--abandon` and recover launched from that
+/// checkout. Now it gets the one-sentence refusal every retired format gets.
+///
+/// Negative control: the same finished cut written at the current format with the
+/// current step list loads, reads as finished, and is cleared by the next cut —
+/// so the refusal is about the number, never the cut.
 #[test]
-fn a_journal_carrying_the_retired_lite_digest_key_still_loads() {
-    let dir = tmpdir("journal-retired-lite-key");
+fn the_finished_0_92_journal_main_cut_is_refused_by_name() {
+    const V0_92_JOURNAL: &str = r#"format = 9
+version = "0.92.0"
+build_number = 1790278596
+commit = "e8a8c80ab93cdf5bdfd048e22514b663874bb57a"
+min_build = 1786131079
+arm64_only = false
+manifest_signed = true
+signature_required = true
+signature_pubkey = "YOHw0OoefQ79NdE8qsQFobIMR7QXChpreYBi2Of74Uo="
+signature_machine_id = "m3"
+release_id = 396027000
+draft_create_issued = true
+upload_intents = ["aterm-0.92.0.dmg", "aterm-0.92.0.dmg.sha256", "aterm-0.92.0-mac.zip", "aterm-0.92.0-mac.zip.sha256", "aterm-appcast.toml", "aterm-0.92.0-build.txt", "aterm-machines.toml", "aterm-machines.toml.sig", "aterm-appcast.toml.sig", "aterm-0.92.0-dSYM.zip"]
+mirror_release_id = 396014794
+mirror_create_issued = true
+mirror_upload_intents = ["aterm-0.92.0-mac.zip", "aterm-0.92.0-mac.zip.sha256", "aterm-0.92.0.dmg", "aterm-0.92.0.dmg.sha256", "aterm-mac.zip", "aterm-mac.zip.sha256", "aterm-machines.toml", "aterm-machines.toml.sig", "aterm.dmg", "aterm.dmg.sha256", "aterm-appcast.toml", "aterm-appcast.toml.sig"]
+done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip", "archive", "verify", "mirror", "unlock", "site"]
+"#;
+    assert_ne!(
+        publish::JOURNAL_FORMAT,
+        9,
+        "9 names two step lists; the current format must be a number no other cutter wrote"
+    );
+    let dir = tmpdir("journal-v0-92");
     let path = dir.join("cut-state.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "format = 7\nversion = \"0.61.0\"\nbuild_number = 1787762776\n\
-             commit = \"{}\"\nrelease_id = 55\ndraft_create_issued = true\n\
-             lite_dmg_sha256 = \"{}\"\n\
-             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
-             \"preflip\", \"tag\", \"flip\"]\n",
-            "d".repeat(40),
-            "c6".repeat(32)
-        ),
-    )
-    .unwrap();
+    std::fs::write(&path, V0_92_JOURNAL).unwrap();
+    let error = Journal::load(&path)
+        .expect_err("main's finished 0.92 journal is refused, never walked")
+        .to_string();
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("format-9 cut journal"), "{error}");
+    assert!(error.contains("v0.92.0 build 1790278596"), "{error}");
+    assert!(
+        error.contains("claim e8a8c80ab93cdf5bdfd048e22514b663874bb57a"),
+        "{error}"
+    );
+    assert!(error.contains("delete it if that cut finished"), "{error}");
+    assert!(
+        !error.contains("prefix of the canonical pipeline"),
+        "{error}"
+    );
+    assert_eq!(error.matches(". ").count(), 0, "one sentence: {error}");
 
-    let old = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(old.first_incomplete(), Some("archive"));
-    let error = old.ensure_resumable().unwrap_err().to_string();
-    assert!(error.contains("format 7"), "{error}");
-    assert!(error.contains("cannot be resumed safely"), "{error}");
+    // NEGATIVE CONTROL: the same cut at the current format, without the retired
+    // step, is a finished journal the next cut clears.
+    let current = V0_92_JOURNAL
+        .replacen(
+            "format = 9\n",
+            &format!("format = {}\n", publish::JOURNAL_FORMAT),
+            1,
+        )
+        .replacen(", \"site\"]", "]", 1);
+    std::fs::write(&path, current).unwrap();
+    let finished = Journal::load(&path)
+        .expect("the current format loads")
+        .expect("present");
+    assert_eq!(finished.version, "0.92.0");
+    assert_eq!(finished.done.len(), publish::STEPS.len());
+    assert_eq!(finished.first_incomplete(), None);
+    assert!(publish::fresh_cut_journal_triage(Some(&finished), publish::CutKind::Real).unwrap());
+}
 
+/// A FAILING WEBSITE HOOK LEAVES THE CUT COMPLETE. The hook stub exits 1 (the
+/// post-promote contract's "hard failure"); the follow-up reports a WARNING that
+/// names the release complete and prints the exact retry command, the journal on
+/// disk stays complete, and the next fresh cut is not refused by it. Before
+/// 2026-09-23 this exact failure parked the journal at `site` and refused every
+/// following cut with "a cut is already in progress".
+#[test]
+fn a_failing_site_hook_warns_and_leaves_the_journal_complete() {
+    let dir = tmpdir("journal-site-hook-fails");
+    let path = dir.join("cut-state.toml");
+    let mut complete = journal();
+    complete.release_id = Some(55);
+    complete.draft_create_issued = true;
+    complete.done = STEPS.iter().map(|step| (*step).to_string()).collect();
+    complete.save(&path).unwrap();
+
+    let hook = dir.join("post-promote");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut ran = Vec::new();
+    let follow = publish::site_follows_the_cut(&hook, "0.92.0", &mut |h| {
+        ran.push(h.to_path_buf());
+        Ok(Some(1))
+    });
+    assert_eq!(ran, vec![hook.clone()], "the hook is asked once");
+    assert_eq!(
+        follow,
+        publish::SiteFollow::Ran {
+            version: "0.92.0".into(),
+            outcome: publish::SiteHookOutcome::Failed,
+            failure: Some("exit 1".into()),
+        }
+    );
+    let lines = follow.lines().join("\n");
+    assert!(lines.contains("WARNING"), "{lines}");
+    assert!(lines.contains("COMPLETE"), "{lines}");
+    assert!(
+        lines.contains("PUB_VERSION=0.92.0 publish/post-promote --latest"),
+        "the exact retry command: {lines}"
+    );
+
+    let after = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(after.first_incomplete(), None, "the journal stays complete");
+    assert!(
+        publish::fresh_cut_journal_triage(Some(&after), publish::CutKind::Real).unwrap(),
+        "and the next cut is not refused by it"
+    );
+
+    // A hook that cannot even be started is the same warning, never an error…
+    let unstartable = publish::site_follows_the_cut(&hook, "0.92.0", &mut |_| {
+        Err(std::io::Error::other("permission denied"))
+    });
+    assert!(
+        unstartable.lines().join("\n").contains("cannot run"),
+        "{unstartable:?}"
+    );
+    // …a success says so, and a tree with no hook skips without running anything.
+    let synced = publish::site_follows_the_cut(&hook, "0.92.0", &mut |_| Ok(Some(0)));
+    assert!(synced.lines()[0].contains("synced"), "{synced:?}");
+    let absent = publish::site_follows_the_cut(&dir.join("absent"), "0.92.0", &mut |_| {
+        panic!("an absent hook is never run")
+    });
+    assert_eq!(absent, publish::SiteFollow::NoHook);
+}
+
+/// The public channel's exact asset set carries ONE DMG and refuses the retired
+/// `-lite` twin (2026-08-26) as a foreign object, never silently converging it.
+#[test]
+fn the_exact_asset_set_refuses_the_retired_lite_twin() {
     // Today's exact set has exactly one DMG and no retired name…
     let set = mirror::required_asset_names("0.61.0", false, false);
     assert!(
@@ -554,65 +581,6 @@ fn a_journal_carrying_the_retired_lite_digest_key_still_loads() {
     let err = mirror::validate_mirror_asset_set_with_linux(&stale, "0.61.0", false, false, &[])
         .expect_err("the retired twin on the channel head is a foreign object");
     assert!(err.to_string().contains("aterm-0.61.0-lite.dmg"), "{err}");
-}
-
-#[test]
-fn unfinished_legacy_journal_fails_closed_before_remote_resume() {
-    let dir = tmpdir("journal-legacy-incomplete");
-    let path = dir.join("cut-state.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "version = \"0.52.0\"\nbuild_number = 520\ncommit = \"{}\"\n\
-             done = [\"build\", \"selfcheck\", \"draft\"]\n",
-            "b".repeat(40)
-        ),
-    )
-    .unwrap();
-
-    let legacy = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(legacy.first_incomplete(), Some("upload"));
-    let error = legacy.ensure_resumable().unwrap_err().to_string();
-    assert!(error.contains("format 1"), "{error}");
-    assert!(error.contains("cannot be resumed safely"), "{error}");
-    assert!(error.contains("cargo ship recover v0.52.0"), "{error}");
-    assert!(error.contains(&"b".repeat(40)), "{error}");
-}
-
-#[test]
-fn completed_v4_loads_but_unfinished_v4_fails_closed() {
-    let dir = tmpdir("journal-v4-policy");
-    let path = dir.join("cut-state.toml");
-    // Spelled out rather than derived from STEPS: a v4 journal is walked
-    // against the FORMAT-5 list, so it must carry the v5-era steps —
-    // including the retired `cask`. Deriving it from the current STEPS
-    // would silently under-fill the fixture whenever a step is removed.
-    let completed = format!(
-        "format = 4\nversion = \"0.54.0\"\nbuild_number = 540\ncommit = \"{}\"\n\
-         release_id = 54\ndone = [\"lock\", \"build\", \"selfcheck\", \"draft\", \
-         \"upload\", \"preflip\", \"tag\", \"flip\", \"archive\", \"cask\", \
-         \"verify\", \"unlock\"]\n",
-        "c".repeat(40)
-    );
-    std::fs::write(&path, completed).unwrap();
-    let loaded = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(loaded.format, 4);
-    assert_eq!(loaded.first_incomplete(), None);
-    loaded.ensure_resumable().unwrap();
-
-    std::fs::write(
-        &path,
-        format!(
-            "format = 4\nversion = \"0.54.0\"\nbuild_number = 540\ncommit = \"{}\"\n\
-             release_id = 54\ndone = [\"lock\", \"build\", \"selfcheck\", \"draft\"]\n",
-            "c".repeat(40)
-        ),
-    )
-    .unwrap();
-    let unfinished = Journal::load(&path).unwrap().unwrap();
-    let error = unfinished.ensure_resumable().unwrap_err().to_string();
-    assert!(error.contains("format 4"), "{error}");
-    assert!(error.contains("cannot be resumed safely"), "{error}");
 }
 
 #[test]
@@ -669,12 +637,14 @@ fn journal_rejects_min_build_above_its_claim() {
     assert!(err.contains("exceeds the journaled build"), "{err}");
     assert!(!path.exists(), "an invalid journal must not reach disk");
 
-    // Negative control for an older or hand-edited journal: load validates the
-    // same invariant instead of trusting a syntactically valid TOML record.
+    // Negative control for a hand-edited journal: load validates the same
+    // invariant instead of trusting a syntactically valid TOML record.
     std::fs::write(
         &path,
         format!(
-            "version = \"0.55.0\"\nbuild_number = 550\ncommit = \"{}\"\nmin_build = 551\n",
+            "format = {}\nversion = \"0.55.0\"\nbuild_number = 550\ncommit = \"{}\"\n\
+             min_build = 551\n",
+            publish::JOURNAL_FORMAT,
             "a".repeat(40)
         ),
     )
@@ -728,25 +698,27 @@ fn version_helpers_port_the_shell_derivations() {
     assert_eq!(publish::workspace_version(decoy).unwrap(), "0.25.0");
     assert!(publish::workspace_version("[workspace]\n").is_err());
 
-    // The workspace MAJOR.MINOR.0 passes through byte-exactly — the patch
-    // component is only reset by `release_version_from_workspace`.
+    // The workspace version passes through byte-exactly.
     let dev = "[workspace.package]\nversion = \"0.2.1\"\n";
     assert_eq!(publish::workspace_version(dev).unwrap(), "0.2.1");
 
-    // THE cut-over rule: a release is the workspace version with DEV → 0.
-    assert_eq!(
-        publish::release_version_from_workspace("0.2.1").unwrap(),
-        "0.2.0"
-    );
+    // A release IS the workspace version as written, and that is MAJOR.MINOR.0.
     assert_eq!(
         publish::release_version_from_workspace("0.2.0").unwrap(),
-        "0.2.0",
-        "a DEV-0 workspace version is already its own release version"
+        "0.2.0"
     );
-    assert_eq!(
-        publish::release_version_from_workspace("1.10.7").unwrap(),
-        "1.10.0"
-    );
+    // NEGATIVE CONTROL: a non-zero patch is refused, never rewritten — the binary
+    // reports the version as written, so a rewrite would ship an app whose version
+    // is not its release's.
+    for patched in ["0.2.1", "1.10.7"] {
+        let err = publish::release_version_from_workspace(patched)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a release is MAJOR.MINOR.0") && err.contains("Bump the MINOR"),
+            "{patched:?} → {err}"
+        );
+    }
     for bad in ["0.2", "0.2.1.1", "v0.2.1", "01.2.1", "0.2.x", ""] {
         let err = publish::release_version_from_workspace(bad)
             .unwrap_err()
@@ -774,8 +746,8 @@ fn version_helpers_port_the_shell_derivations() {
         "MINOR overflow must fail closed, never wrap"
     );
 
-    // The REAL workspace manifest parses, is canonical, and its release
-    // version is the same number with DEV reset.
+    // The REAL workspace manifest parses, is canonical, and is its own release
+    // version.
     let real = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
         .expect("read the real Cargo.toml");
     let v = publish::workspace_version(&real).expect("real manifest must parse");
@@ -786,50 +758,9 @@ fn version_helpers_port_the_shell_derivations() {
     );
     let release = publish::release_version_from_workspace(&v)
         .expect("the real workspace version must be canonical MAJOR.MINOR.0");
-    let mut parts = v.split('.');
     assert_eq!(
-        release,
-        format!("{}.{}.0", parts.next().unwrap(), parts.next().unwrap()),
-        "the release version is the workspace version with DEV reset to 0"
-    );
-}
-
-/// A cut rolls the changelog and NOTHING else. The workspace
-/// `MAJOR.MINOR.0` version is now the single source of the release version,
-/// so the cutter reading it must never also rewrite it: bumping Cargo.toml
-/// stays the operator's deliberate act, and Cargo.lock is byte-untouched.
-#[test]
-fn release_file_regeneration_preserves_source_version_and_lock() {
-    let root = tmpdir("regen-preserves-source");
-    let cargo = "[workspace.package]\nversion = \"0.59.1\"\n";
-    let lock = "[[package]]\nname = \"aterm\"\nversion = \"0.59.1\"\n";
-    let changelog = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- Left the workspace version to the operator.\n\n## [0.58.0] - 2026-07-22\n\n- Prior release.\n";
-    std::fs::write(root.join("Cargo.toml"), cargo).unwrap();
-    std::fs::write(root.join("Cargo.lock"), lock).unwrap();
-    std::fs::write(root.join(changelog::CHANGELOG_FILE), changelog).unwrap();
-
-    // The version being cut is the workspace 0.59.1 with DEV reset.
-    let cut = publish::release_version_from_workspace(
-        &publish::workspace_version(cargo).expect("fixture manifest parses"),
-    )
-    .unwrap();
-    assert_eq!(cut, "0.59.0");
-    let paths = publish::regen_release_files(&root, &cut, "2026-07-23").unwrap();
-
-    assert_eq!(paths, vec![changelog::CHANGELOG_FILE.to_string()]);
-    assert_eq!(
-        std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
-        cargo,
-        "a cut never rewrites the workspace version it derived from"
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("Cargo.lock")).unwrap(),
-        lock
-    );
-    let rolled = std::fs::read_to_string(root.join(changelog::CHANGELOG_FILE)).unwrap();
-    assert_eq!(
-        changelog::rolled_body(&rolled, &cut).unwrap(),
-        "### Fixed\n- Left the workspace version to the operator."
+        release, v,
+        "the release version is the workspace version as written"
     );
 }
 
@@ -1512,67 +1443,19 @@ fn signing_is_never_required_by_history_but_metadata_stays_coherent() {
     assert!(publish::channel_signature_required(&orphan).is_err());
 }
 
-/// The COMMITTED channel anchor (`aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS[0]`
-/// — it used to ALSO live in `[workspace.metadata.aterm] update_channel_pubkey`, two
-/// separately edited values nothing compared), as folded into the signing verdict by
-/// `committed_channel_signature_policy` — the seam behind
-/// `preflight_signature_policy`, which every flavor (cut, resume via
-/// revalidate, recovery, the yank successor) derives its policy from.
-const CHANNEL_PIN: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
-/// A different valid Ed25519 key (the RFC 8032 vector also used above).
+/// A valid Ed25519 key (the RFC 8032 vector also used above).
 const OTHER_KEY: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
 
 #[test]
-fn a_committed_pin_makes_a_keyless_cut_fail_closed_before_any_claim() {
-    // v0.16.0's exact failure: no signing material, so the cutter treated the
-    // missing per-machine opt-in as permission and published the pinned public
-    // channel unsigned. With the anchor committed this is a hard pre-claim error
-    // that names the anchor, where it lives, and the rule.
-    let error = publish::committed_channel_signature_policy(Some(CHANNEL_PIN), None)
-        .expect_err("a keyless machine may not cut for a pinned channel")
-        .to_string();
-    assert!(error.contains(CHANNEL_PIN), "{error}");
-    assert!(error.contains("aterm-update-core::pins"), "{error}");
-    assert!(
-        error.contains("no signing material was supplied"),
-        "{error}"
-    );
-    assert!(
-        error.contains("may not cut for a pinned channel"),
-        "{error}"
-    );
-    // Pre-claim by contract, so a keyless refusal burns no ledger number.
-    assert!(error.contains("no ledger claim was made"), "{error}");
-}
-
-#[test]
-fn a_signing_key_that_is_not_the_committed_pin_is_refused_naming_both() {
-    let error = publish::committed_channel_signature_policy(Some(CHANNEL_PIN), Some(OTHER_KEY))
-        .expect_err("key substitution under a committed pin")
-        .to_string();
-    assert!(
-        error.contains(CHANNEL_PIN) && error.contains(OTHER_KEY),
-        "the refusal must name both identities: {error}"
-    );
-}
-
-#[test]
-fn the_matching_key_under_a_committed_pin_is_required_and_proceeds() {
-    let policy =
-        publish::committed_channel_signature_policy(Some(CHANNEL_PIN), Some(CHANNEL_PIN)).unwrap();
-    assert!(policy.required);
-    assert_eq!(policy.pubkey.as_deref(), Some(CHANNEL_PIN));
-}
-
-#[test]
-fn without_a_committed_pin_signing_stays_per_machine_opt_in() {
-    // Forks and private channels commit no pin, so their behavior is exactly
-    // the pre-pin contract: keyless cuts unsigned, a configured key signs.
-    let unsigned = publish::committed_channel_signature_policy(None, None).unwrap();
+fn without_a_paper_master_signing_stays_per_machine_opt_in() {
+    // Forks and private channels pin no master, so their behavior is per-machine
+    // opt-in: keyless cuts unsigned, a configured key signs. (With the master pinned
+    // — this tree — a keyless cut refuses pre-claim; `machine_roster.rs` pins that.)
+    let unsigned = publish::unrostered_signature_policy(None).unwrap();
     assert!(!unsigned.required);
     assert_eq!(unsigned.pubkey, None);
 
-    let opted_in = publish::committed_channel_signature_policy(None, Some(OTHER_KEY)).unwrap();
+    let opted_in = publish::unrostered_signature_policy(Some(OTHER_KEY)).unwrap();
     assert!(opted_in.required);
     assert_eq!(opted_in.pubkey.as_deref(), Some(OTHER_KEY));
 }
@@ -2781,22 +2664,20 @@ fn cli_parses_the_whole_spec_5_surface() {
     );
     // A yank publishes a real cut before it deletes anything, and since the paper
     // master was armed that cut refuses pre-claim unless it is told which profile
-    // signs and whether stranding pre-roster clients is acceptable. Pinned here
-    // because the way this breaks is a parse that SUCCEEDS and drops the answers.
+    // signs. Pinned here because the way this breaks is a parse that SUCCEEDS and
+    // drops the answer.
     assert_eq!(
         parse(&[
             "yank",
             "1783918101",
             "--release-credentials",
-            "/keys/m3.toml",
-            publish::PRE_ROSTER_STRANDING_FLAG,
+            "/keys/m3.toml"
         ])
         .unwrap(),
         cli::Cmd::Yank {
             build: 1_783_918_101,
             opts: verify::YankOptions {
                 release_credentials: Some(PathBuf::from("/keys/m3.toml")),
-                strand_pre_roster_clients: true,
             }
         }
     );
@@ -2811,8 +2692,6 @@ fn cli_parses_the_whole_spec_5_surface() {
     let cli::Cmd::Cut { opts, abandon, .. } = parse(&[
         "cut",
         "--dry-run",
-        "--set-version",
-        "v0.27.0",
         "--min-build",
         "42",
         "--gate",
@@ -2823,7 +2702,6 @@ fn cli_parses_the_whole_spec_5_surface() {
     };
     assert!(abandon.is_none());
     assert!(opts.dry_run && opts.gate && opts.arm64_only && !opts.resume);
-    assert_eq!(opts.set_version.as_deref(), Some("0.27.0"));
     assert_eq!(opts.min_build, Some(42));
 
     let cli::Cmd::Cut { opts, .. } =
@@ -2877,14 +2755,13 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
             vec!["provision", "--id", "m2", "--id", "m3"],
             "--id given twice",
         ),
-        // --set-version now REQUIRES the canonical three-component form;
-        // the retired two-component spelling is just another malformed one.
-        (vec!["cut", "--set-version", "0.26"], "MAJOR.MINOR.PATCH"),
-        (
-            vec!["cut", "--set-version", "0.26.0.1"],
-            "MAJOR.MINOR.PATCH",
-        ),
-        (vec!["cut", "--set-version", "01.26.0"], "MAJOR.MINOR.PATCH"),
+        // The version is Cargo.toml's, and nothing on the command line
+        // overrides it: the retired override is an unknown flag.
+        (vec!["cut", "--set-version", "0.26.0"], "unknown cut flag"),
+        // --abandon takes only the canonical three-component form; the
+        // retired two-component spelling is just another malformed one.
+        (vec!["cut", "--abandon", "0.26"], "MAJOR.MINOR.PATCH"),
+        (vec!["cut", "--abandon", "01.26.0"], "MAJOR.MINOR.PATCH"),
         (vec!["cut", "--min-build", "abc"], "not a u64"),
         (
             vec![
@@ -2960,53 +2837,31 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
     }
 }
 
-/// THE PRE-ROSTER ACKNOWLEDGEMENT IS A COMMAND-LINE FLAG, and it behaves like one.
-///
-/// It exists because the cutter cannot know whether any client older than the machine
-/// roster is still in the field, and publishing under a rostered key that no such client
-/// carries wedges every one of them permanently. So it is asserted per cut, on the
-/// command, exactly like `--old-publisher-stopped` — never inferred, never remembered in
-/// a file, and never silently ignored.
-///
-/// Kills the mutation "accept it on a resume too": a resume does not re-ask the question
-/// (it continues a cut under a key it cannot change), so accepting the flag there would
-/// take an acknowledgement and do nothing with it.
+/// THE RETIRED PRE-ROSTER FLAG IS REFUSED BY NAME, in one sentence, on every verb that
+/// used to take it — a leftover spelling in a script or a runbook must not read as an
+/// unknown flag, and must never be silently accepted.
 #[test]
-fn the_pre_roster_stranding_flag_is_explicit_per_cut_and_never_silently_ignored() {
-    let cli::Cmd::Cut { opts, .. } = parse(&["cut", publish::PRE_ROSTER_STRANDING_FLAG]).unwrap()
-    else {
-        panic!("expected Cut");
-    };
-    assert!(opts.strand_pre_roster_clients);
-
-    // Absent by default — the fail-closed state, and the one every ordinary cut is in.
-    let cli::Cmd::Cut { opts, .. } = parse(&["cut"]).unwrap() else {
-        panic!("expected Cut");
-    };
-    assert!(!opts.strand_pre_roster_clients);
-
-    // A RESUME may not carry it: the journal already fixed the key, and the flag would
-    // be accepted and ignored. Refusing is the honest answer.
-    let err = parse(&["cut", "--resume", publish::PRE_ROSTER_STRANDING_FLAG]).unwrap_err();
+fn the_retired_strand_flag_is_refused_in_one_sentence() {
+    for args in [
+        vec!["cut", cli::RETIRED_STRAND_FLAG],
+        vec!["cut", "--dry-run", cli::RETIRED_STRAND_FLAG],
+        vec!["yank", "1783918101", cli::RETIRED_STRAND_FLAG],
+    ] {
+        let err = parse(&args).unwrap_err();
+        assert_eq!(err, cli::RETIRED_STRAND_REFUSAL, "{args:?}");
+        assert!(
+            err.contains("retired") && err.contains("drop the flag"),
+            "{err}"
+        );
+        assert_eq!(err.matches(". ").count(), 0, "one sentence: {err}");
+    }
+    // Negative control: a cut without it parses, and the usage no longer teaches it.
+    assert!(parse(&["cut"]).is_ok());
     assert!(
-        err.contains("--resume combines with no other cut flag"),
-        "{err}"
+        !cli::USAGE.contains(cli::RETIRED_STRAND_FLAG),
+        "{}",
+        cli::USAGE
     );
-    let err = parse(&[
-        "cut",
-        "--abandon",
-        "v0.26.0",
-        publish::PRE_ROSTER_STRANDING_FLAG,
-    ])
-    .unwrap_err();
-    assert!(err.contains("--abandon combines with no other"), "{err}");
-
-    // The operator can find out what it means without reading the source.
-    assert!(
-        cli::USAGE.contains(publish::PRE_ROSTER_STRANDING_FLAG),
-        "an acknowledgement nobody can discover is not one"
-    );
-    assert!(cli::USAGE.contains("never update again"), "{}", cli::USAGE);
 }
 
 #[test]
@@ -3050,6 +2905,7 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
         &owner,
         false,
         false,
+        None,
         None,
     )
     .unwrap_err()

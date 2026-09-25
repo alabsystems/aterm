@@ -33,8 +33,6 @@
 #[allow(dead_code)]
 mod rain_common;
 
-use std::time::Instant;
-
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_effects::matrix_rain::RainVisibility;
@@ -965,94 +963,5 @@ fn gpu_scissor_animating_rain_byte_identical() {
     assert!(
         got_d != got_s,
         "draining must visibly change the frame (non-vacuous)"
-    );
-}
-
-/// Diagnostic (run with `--ignored --nocapture`): the changed-frame GPU
-/// encode/instance-build cost for a 1-ROW change at 50x200 via the SCISSORED
-/// present path vs a FULL repaint of the same frame. Both read the whole texture
-/// back (constant cost), so the delta is the scissor's encode/fill saving. Not an
-/// assertion — prints the reduction.
-#[test]
-#[ignore = "diagnostic benchmark; run with --ignored --nocapture"]
-fn gpu_scissor_changed_frame_cost() {
-    let Some(mut gpu) = fresh_gpu() else { return };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (50usize, 200usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    // Fill every row so a full repaint is non-trivial.
-    for r in 0..rows {
-        term.process(format!("\x1b[{};1Hline {r:02} ", r + 1).as_bytes());
-        term.process(b"the quick brown fox jumps over the lazy dog 0123456789 abcdef");
-    }
-    gpu.set_cursor_blink_phase(true);
-    gpu.set_cursor_style_override(None);
-
-    // Prime the present path (first frame is a full repaint, fills present_prev).
-    let in0 = term.cell_frame(rows, cols);
-    gpu.present_encode_poll(&mut win, &in0);
-
-    const N: u32 = 500;
-
-    // Measure the ENCODE + instance-build + GPU fill only (no readback — it is
-    // scope-independent and would swamp the scissor's saving).
-    //
-    // SCISSORED 1-row change: toggle a single char on row 0 each iter — exactly
-    // one dirty row ⇒ a one-band scissor + one row's instances.
-    let scissor_before = gpu.scissor_taken();
-    let t = Instant::now();
-    for i in 0..N {
-        let ch = if i % 2 == 0 { b'A' } else { b'B' };
-        term.process(b"\x1b[1;1H");
-        term.process(&[ch]);
-        let input = term.cell_frame(rows, cols);
-        gpu.present_encode_poll(&mut win, &input);
-    }
-    let scissor_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
-    let scissor_inst = gpu.last_instances();
-    assert_eq!(
-        gpu.scissor_taken() - scissor_before,
-        u64::from(N),
-        "all iters should scissor"
-    );
-
-    // FULL repaint of the SAME 1-row-change frames on a SEPARATE renderer. Toggle
-    // the display_offset every frame so `compute_dirty_rows` returns FullRepaint
-    // (a scrollback change is never reusable) — this forces the full Clear+all-
-    // rows encode for the SAME screen, isolating the repaint scope.
-    let mut full = fresh_gpu().expect("GPU available");
-    let mut win_full = aterm_gpu::WindowGpu::new();
-    full.set_cursor_blink_phase(true);
-    let mut input_a = term.cell_frame(rows, cols);
-    let mut input_b = input_a.clone();
-    input_b.display_offset = 1; // a different offset ⇒ forced full repaint
-    // Prime with B so the loop's first frame (A) already differs ⇒ every
-    // strictly-alternating frame's offset differs from the prior ⇒ all full.
-    full.present_encode_poll(&mut win_full, &input_b);
-    let full_before = full.full_repaints();
-    let t = Instant::now();
-    for i in 0..N {
-        let input = if i % 2 == 0 { &input_a } else { &input_b };
-        full.present_encode_poll(&mut win_full, input);
-    }
-    let full_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
-    let full_inst = full.last_instances();
-    std::hint::black_box((&mut input_a, &mut input_b));
-    assert_eq!(
-        full.full_repaints() - full_before,
-        u64::from(N),
-        "all iters should full-repaint"
-    );
-
-    eprintln!(
-        "1-row change @ {rows}x{cols} (encode only, no readback): \
-         SCISSOR present = {scissor_us:.1} us/frame, \
-         FULL repaint = {full_us:.1} us/frame, reduction = {:.2}x",
-        full_us / scissor_us.max(0.0001),
-    );
-    eprintln!(
-        "instances built: SCISSOR (1 dirty row) = {scissor_inst}, FULL ({rows} rows) = {full_inst}, \
-         reduction = {:.1}x",
-        full_inst as f64 / scissor_inst.max(1) as f64,
     );
 }

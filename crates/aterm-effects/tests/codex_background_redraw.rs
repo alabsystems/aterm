@@ -143,31 +143,31 @@ impl Host {
     }
 }
 
+/// A background redraw of an UNCHANGED composer — the row cleared and the
+/// same text laid back — keeps the typed band, whether the redraw arrives in
+/// one batch or across two frames with the cursor hidden between them.
 #[test]
-fn an_unchanged_composer_redrawn_in_one_batch_keeps_its_typed_band() {
-    let mut h = Host::new();
-    for b in b"abcdefgh" {
-        h.key(*b);
+fn an_unchanged_composer_redrawn_in_one_batch_or_across_frames_keeps_its_typed_band() {
+    let redraws: [(&str, &[&[u8]]); 2] = [
+        ("one batch", &[b"\x1b[21;1H\x1b[2K  abcdefgh"]),
+        (
+            "across frames",
+            &[b"\x1b[?25l\x1b[21;1H\x1b[2K", b"  abcdefgh\x1b[?25h"],
+        ),
+    ];
+    for (how, batches) in redraws {
+        let mut h = Host::new();
+        for b in b"abcdefgh" {
+            h.key(*b);
+        }
+        for batch in batches {
+            h.program(batch);
+        }
+        for b in b"ijklmnop" {
+            h.key(*b);
+        }
+        assert_eq!(h.live(20), (2..18).collect::<Vec<_>>(), "{how}");
     }
-    h.program(b"\x1b[21;1H\x1b[2K  abcdefgh");
-    for b in b"ijklmnop" {
-        h.key(*b);
-    }
-    assert_eq!(h.live(20), (2..18).collect::<Vec<_>>());
-}
-
-#[test]
-fn an_unchanged_composer_redrawn_across_frames_keeps_its_typed_band() {
-    let mut h = Host::new();
-    for b in b"abcdefgh" {
-        h.key(*b);
-    }
-    h.program(b"\x1b[?25l\x1b[21;1H\x1b[2K");
-    h.program(b"  abcdefgh\x1b[?25h");
-    for b in b"ijklmnop" {
-        h.key(*b);
-    }
-    assert_eq!(h.live(20), (2..18).collect::<Vec<_>>());
 }
 
 #[test]

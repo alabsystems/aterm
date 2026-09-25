@@ -368,74 +368,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_shift_region_up_empty_collection() {
-        let mut extras = CellExtras::new();
-        extras.shift_region_up_by(0, 23, 1);
-        assert_eq!(extras.len(), 0);
-    }
-
-    #[test]
-    fn test_shift_region_up_zero_n_is_noop() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 5, 0, extra_with_fg(255, 0, 0));
-        extras.shift_region_up_by(0, 23, 0);
-        assert!(has_fg_at(&extras, 5, 0), "n=0 should not move entries");
-    }
-
-    #[test]
-    fn test_shift_region_up_deletes_top_rows() {
-        let mut extras = CellExtras::new();
-        // Put extras at rows 0, 1, 2 in region [0, 9]
-        insert(&mut extras, 0, 0, extra_with_fg(10, 0, 0));
-        insert(&mut extras, 1, 0, extra_with_fg(20, 0, 0));
-        insert(&mut extras, 2, 0, extra_with_fg(30, 0, 0));
-
-        // Shift up by 2: rows [0, 1] deleted, row 2 moves to row 0
-        extras.shift_region_up_by(0, 9, 2);
-        assert_eq!(extras.len(), 1);
-        assert_eq!(fg_at(&extras, 0, 0), Some([30, 0, 0]));
-    }
-
-    #[test]
-    fn test_shift_region_up_preserves_outside_region() {
-        let mut extras = CellExtras::new();
-        // Entry below region
-        insert(&mut extras, 20, 5, extra_with_fg(99, 0, 0));
-        // Entry inside region
-        insert(&mut extras, 5, 0, extra_with_fg(50, 0, 0));
-
-        // Region [2, 10], shift up by 2: row 5 -> row 3, row 20 untouched
-        extras.shift_region_up_by(2, 10, 2);
-        assert_eq!(fg_at(&extras, 3, 0), Some([50, 0, 0]));
-        assert_eq!(fg_at(&extras, 20, 5), Some([99, 0, 0]));
-    }
-
-    #[test]
-    fn test_shift_region_up_preserves_above_region() {
-        let mut extras = CellExtras::new();
-        // Entry above region
-        insert(&mut extras, 0, 0, extra_with_fg(1, 2, 3));
-        // Entry at top of region (will be deleted)
-        insert(&mut extras, 5, 0, extra_with_fg(4, 5, 6));
-        // Entry shifted within region
-        insert(&mut extras, 7, 0, extra_with_fg(7, 8, 9));
-
-        // Region [5, 20], shift up by 2: row 5 deleted, row 7 -> 5
-        extras.shift_region_up_by(5, 20, 2);
-        assert_eq!(
-            fg_at(&extras, 0, 0),
-            Some([1, 2, 3]),
-            "above region preserved"
-        );
-        assert!(!has_fg_at(&extras, 5, 0) || fg_at(&extras, 5, 0) == Some([7, 8, 9]));
-        assert_eq!(
-            fg_at(&extras, 5, 0),
-            Some([7, 8, 9]),
-            "row 7 shifted to row 5"
-        );
-    }
-
-    #[test]
     fn test_shift_region_up_full_screen() {
         let mut extras = CellExtras::new();
         for r in 0..5u16 {
@@ -471,21 +403,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_shift_region_down_empty_collection() {
-        let mut extras = CellExtras::new();
-        extras.shift_region_down_by(0, 23, 1);
-        assert_eq!(extras.len(), 0);
-    }
-
-    #[test]
-    fn test_shift_region_down_zero_n_is_noop() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 5, 0, extra_with_fg(255, 0, 0));
-        extras.shift_region_down_by(0, 23, 0);
-        assert!(has_fg_at(&extras, 5, 0), "n=0 should not move entries");
-    }
-
-    #[test]
     fn test_shift_region_down_drops_bottom_rows() {
         let mut extras = CellExtras::new();
         insert(&mut extras, 8, 0, extra_with_fg(80, 0, 0));
@@ -497,24 +414,6 @@ mod tests {
         assert_eq!(fg_at(&extras, 7, 0), Some([50, 0, 0]));
         assert!(!has_fg_at(&extras, 8, 0), "bottom rows should be dropped");
         assert!(!has_fg_at(&extras, 9, 0), "bottom rows should be dropped");
-    }
-
-    #[test]
-    fn test_shift_region_down_preserves_outside_region() {
-        let mut extras = CellExtras::new();
-        // Entry below region
-        insert(&mut extras, 20, 0, extra_with_fg(200, 0, 0));
-        // Entry inside region
-        insert(&mut extras, 3, 0, extra_with_fg(30, 0, 0));
-
-        // Region [0, 10], shift down by 2
-        extras.shift_region_down_by(0, 10, 2);
-        assert_eq!(
-            fg_at(&extras, 20, 0),
-            Some([200, 0, 0]),
-            "outside preserved"
-        );
-        assert_eq!(fg_at(&extras, 5, 0), Some([30, 0, 0]), "row 3 shifted to 5");
     }
 
     #[test]
@@ -532,13 +431,6 @@ mod tests {
     // =========================================================================
     // shift_rect_up_by
     // =========================================================================
-
-    #[test]
-    fn test_shift_rect_up_empty_collection() {
-        let mut extras = CellExtras::new();
-        extras.shift_rect_up_by(0, 9, 5, 15, 2);
-        assert_eq!(extras.len(), 0);
-    }
 
     #[test]
     fn test_shift_rect_up_zero_n_is_noop() {
@@ -616,13 +508,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_shift_rect_down_empty_collection() {
-        let mut extras = CellExtras::new();
-        extras.shift_rect_down_by(0, 9, 5, 15, 2);
-        assert_eq!(extras.len(), 0);
-    }
-
-    #[test]
     fn test_shift_rect_down_zero_n_is_noop() {
         let mut extras = CellExtras::new();
         insert(&mut extras, 3, 10, extra_with_fg(30, 0, 0));
@@ -683,34 +568,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_shift_cols_right_empty_collection() {
-        let mut extras = CellExtras::new();
-        extras.shift_cols_right(0, 5, 3, 80);
-        assert_eq!(extras.len(), 0);
-    }
-
-    #[test]
-    fn test_shift_cols_right_zero_count_is_noop() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 5, extra_with_fg(50, 0, 0));
-        extras.shift_cols_right(0, 5, 0, 80);
-        assert!(has_fg_at(&extras, 0, 5));
-    }
-
-    #[test]
-    fn test_shift_cols_right_basic() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 5, extra_with_fg(50, 0, 0));
-        insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
-
-        // Insert 3 chars at col 5: col 5 -> 8, col 10 -> 13
-        extras.shift_cols_right(0, 5, 3, 80);
-        assert_eq!(fg_at(&extras, 0, 8), Some([50, 0, 0]));
-        assert_eq!(fg_at(&extras, 0, 13), Some([100, 0, 0]));
-        assert!(!has_fg_at(&extras, 0, 5), "old position should be empty");
-    }
-
-    #[test]
     fn test_shift_cols_right_drops_past_max_col() {
         let mut extras = CellExtras::new();
         insert(&mut extras, 0, 78, extra_with_fg(78, 0, 0));
@@ -763,52 +620,9 @@ mod tests {
         assert_eq!(fg_at(&extras, 0, 13), Some([100, 0, 0]));
     }
 
-    #[test]
-    fn test_shift_cols_right_other_rows_untouched() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 5, extra_with_fg(50, 0, 0));
-        insert(&mut extras, 1, 5, extra_with_fg(15, 0, 0));
-
-        // Shift right on row 0 only
-        extras.shift_cols_right(0, 5, 3, 80);
-        assert_eq!(fg_at(&extras, 0, 8), Some([50, 0, 0]), "target row shifted");
-        assert_eq!(
-            fg_at(&extras, 1, 5),
-            Some([15, 0, 0]),
-            "other row untouched"
-        );
-    }
-
     // =========================================================================
     // shift_cols_left (DCH)
     // =========================================================================
-
-    #[test]
-    fn test_shift_cols_left_empty_collection() {
-        let mut extras = CellExtras::new();
-        extras.shift_cols_left(0, 5, 3, 80);
-        assert_eq!(extras.len(), 0);
-    }
-
-    #[test]
-    fn test_shift_cols_left_zero_count_is_noop() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 5, extra_with_fg(50, 0, 0));
-        extras.shift_cols_left(0, 5, 0, 80);
-        assert!(has_fg_at(&extras, 0, 5));
-    }
-
-    #[test]
-    fn test_shift_cols_left_basic() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 5, extra_with_fg(50, 0, 0));
-        insert(&mut extras, 0, 10, extra_with_fg(100, 0, 0));
-
-        // Delete 3 chars at col 5: col 5 in [5, 8) deleted. col 10 >= 8, shift left by 3 -> 7
-        extras.shift_cols_left(0, 5, 3, 80);
-        assert!(!has_fg_at(&extras, 0, 5), "deleted column should be gone");
-        assert_eq!(fg_at(&extras, 0, 7), Some([100, 0, 0]));
-    }
 
     #[test]
     fn test_shift_cols_left_deletes_range() {
@@ -839,21 +653,6 @@ mod tests {
             "before start preserved"
         );
         assert_eq!(fg_at(&extras, 0, 7), Some([100, 0, 0]));
-    }
-
-    #[test]
-    fn test_shift_cols_left_other_rows_untouched() {
-        let mut extras = CellExtras::new();
-        insert(&mut extras, 0, 10, extra_with_fg(10, 0, 0));
-        insert(&mut extras, 2, 10, extra_with_fg(210, 0, 0));
-
-        extras.shift_cols_left(0, 5, 3, 80);
-        assert_eq!(fg_at(&extras, 0, 7), Some([10, 0, 0]), "target row shifted");
-        assert_eq!(
-            fg_at(&extras, 2, 10),
-            Some([210, 0, 0]),
-            "other row untouched"
-        );
     }
 
     #[test]

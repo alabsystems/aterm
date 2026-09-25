@@ -158,6 +158,11 @@ pub(crate) struct UpdateProjection {
     pub(crate) checked_at: Option<i64>,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
+    /// macOS: what the automatic-checks switch means for this process where it is not
+    /// simply on ([`UpdateState::automatic_checks_detail`]), said AFTER when the last
+    /// check ran — never instead of it (2026-09-24). `None` while [`Self::detail`] holds
+    /// a stage or trouble, and always on Linux, whose detail leads with it.
+    pub(crate) automatic_checks_note: Option<String>,
 }
 
 impl UpdateProjection {
@@ -410,6 +415,10 @@ impl UpdateState {
     /// Snapshot the exact state the existing update card paints for native tab
     /// presentation and semantic introspection.
     pub(crate) fn projection(&self) -> UpdateProjection {
+        let detail = self.detail();
+        let automatic_checks_note = (detail.is_none() && !self.linux_host)
+            .then(|| self.automatic_checks_detail())
+            .flatten();
         UpdateProjection {
             linux_host: self.linux_host,
             linux: self.linux.clone(),
@@ -435,7 +444,8 @@ impl UpdateState {
             channel_unreadable: self.channel_unreadable && self.enabled && !self.checking,
             checked_at: self.checked_at,
             headline: self.headline(),
-            detail: self.detail(),
+            detail,
+            automatic_checks_note,
         }
     }
 
@@ -602,13 +612,12 @@ impl UpdateState {
     }
 
     /// The secondary detail line under the headline, in plain words: the version on
-    /// offer, what is wrong and what happens next — and, with nothing staged and no
-    /// trouble, what the automatic-checks switch means for this process
-    /// ([`Self::automatic_checks_detail`]). `None` for a healthy page with nothing staged
-    /// and the switch as it runs — the surface says when the last check ran instead
-    /// ([`UpdateProjection::checked_line`]). Build numbers belong in About; the
-    /// updater's own decision sentences stay in `aterm ctl update status` and the log,
-    /// which the page links to (Settings ▸ Messages).
+    /// offer, what is wrong and what happens next. `None` for a healthy macOS page with
+    /// nothing staged — the surface says when the last check ran instead
+    /// ([`UpdateProjection::checked_line`]), followed by what the automatic-checks switch
+    /// means for this process ([`UpdateProjection::automatic_checks_note`]). Build numbers
+    /// belong in About; the updater's own decision sentences stay in `aterm ctl update
+    /// status` and the log, which the page links to (Settings ▸ Messages).
     fn detail(&self) -> Option<String> {
         if self.linux_host {
             let direction = if !self.installable || self.linux.is_none() {
@@ -745,8 +754,9 @@ impl UpdateState {
             return Some(format!("{trouble}; aterm keeps trying.{LOG_POINTER}"));
         }
         // After the trouble above, as the headline has it: a failing or stranded
-        // channel's cause is worth more than the switch's timing.
-        self.automatic_checks_detail()
+        // channel's cause is worth more than the switch's timing, which rides
+        // `automatic_checks_note` after the last check's time.
+        None
     }
 }
 
@@ -1072,7 +1082,11 @@ mod tests {
             "the updater still runs here: a person's check works"
         );
         assert_eq!(off.headline, "Automatic checks are off.");
-        let detail = off.detail.expect("the page says what is off");
+        // The detail slot keeps the last check's time; the switch's sentence follows it.
+        assert_eq!(off.detail, None);
+        let detail = off
+            .automatic_checks_note
+            .expect("the page says what is off");
         assert!(
             detail.starts_with("Nothing checks for updates by itself"),
             "{detail}"
@@ -1083,7 +1097,7 @@ mod tests {
         );
         let on = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
         assert_eq!(on.headline, "You\u{2019}re up to date.");
-        assert_eq!(on.detail, None);
+        assert_eq!((on.detail, on.automatic_checks_note), (None, None));
         // A build a person checked for and staged is still ready to install.
         let staged = UpdateState::from_status(828, "0.5.14", Some(&staged_status()), false)
             .with_automatic_checks(false, false)
@@ -1103,6 +1117,7 @@ mod tests {
             stranded.detail.as_deref(),
             Some("the channel is unreadable")
         );
+        assert_eq!(stranded.automatic_checks_note, None);
     }
 
     /// THE PAGE SPEAKS FOR THIS PROCESS, NOT THE SWITCH (2026-09-23 review). The updater
@@ -1124,7 +1139,9 @@ mod tests {
         };
         let stopping = page(true, false);
         assert_eq!(stopping.headline, "You\u{2019}re up to date.");
-        let detail = stopping.detail.expect("the pending stop is named");
+        let detail = stopping
+            .automatic_checks_note
+            .expect("the pending stop is named");
         assert!(
             detail.starts_with("Automatic checks stop next launch"),
             "{detail}"
@@ -1135,7 +1152,9 @@ mod tests {
         );
         let starting = page(false, true);
         assert_eq!(starting.headline, "Automatic checks are off.");
-        let detail = starting.detail.expect("the pending start is named");
+        let detail = starting
+            .automatic_checks_note
+            .expect("the pending start is named");
         assert!(
             detail.starts_with("Automatic checks start next launch"),
             "{detail}"
@@ -1147,9 +1166,9 @@ mod tests {
         // Neither sentence names the switch by one of the wordings the card fits to its
         // width.
         for detail in [
-            page(false, false).detail,
-            page(false, true).detail,
-            page(true, false).detail,
+            page(false, false).automatic_checks_note,
+            page(false, true).automatic_checks_note,
+            page(true, false).automatic_checks_note,
         ] {
             let detail = detail.expect("a sentence");
             assert!(

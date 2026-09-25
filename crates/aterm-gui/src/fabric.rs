@@ -7231,7 +7231,7 @@ mod inbox_hold {
                  by the 30 s default: waited {waited:?}"
             );
             // THE CASE THE GRACE EXISTS FOR: the asker's bridge records `expired`
-            // AFTER `dl=` has passed — its sweep runs on a 250 ms tick and the
+            // AFTER `dl=` has passed — its sweep arms that deadline and the
             // verdict still has to be delivered back — and the wait answers the
             // verdict, not `ERR timeout`. (Reviewed: with the bound at `dl=`
             // alone this answered `ERR timeout` every time.)
@@ -8948,6 +8948,16 @@ mod inbox_hold {
                 "posts a text row on the pull-down status bars, or a note to their \
                  record (chrome, not the grid); it puts no bytes on a PTY and retires \
                  no session, and it is Owner-only at the socket besides",
+            ),
+            (
+                "notice",
+                "records, shows or ends a message on the band (chrome, not the \
+                 grid); it puts no bytes on a PTY and retires no session, and it \
+                 is Owner-only at the socket besides. `act` presses a row's \
+                 capsule, which reaches nothing an Owner verb does not already \
+                 (`update apply`, `open`, `spawn`): `Install now` re-execs the \
+                 instance, the residual `update` names, and `Install` still meets \
+                 macOS's own password dialog",
             ),
             (
                 "story",

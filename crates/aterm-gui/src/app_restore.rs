@@ -257,6 +257,14 @@ impl App {
                 }
             })
             .collect();
+        // THE MANIFEST-WIDE SANITIZE, before anyone hashes this capture:
+        // `RestoreManifest::new` runs `WindowLayout::sanitize`, the same pass
+        // `from_toml` runs, so the capture is a fixed point of the parse. The
+        // update worker checks exactly that (`from_toml(to_toml(layout)) ==
+        // layout`), and `layout_digest` is taken over this value — a NUL
+        // directory a program reported (OSC 7 `%00`) used to break the round
+        // trip and file a Structural failure (the 2026-09-22/23 update audit,
+        // plan P0-1f). Now the leaf just loses the directory.
         restore::RestoreManifest::new(windows)
     }
 
@@ -4943,6 +4951,7 @@ mod tests {
     /// reads only the id: the stub spawn never touches the fd or the pid.
     fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         crate::spawn::Adopted {
+            repaint: false,
             local_id,
             master: -1,
             pid: -1,

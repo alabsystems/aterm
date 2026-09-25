@@ -27,8 +27,10 @@ fn not_regular() -> io::Error {
     )
 }
 
+/// Open an existing regular metadata file without following its final link.
+/// The store-lock release probe reuses this admission without reading bytes.
 #[cfg(unix)]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
@@ -41,8 +43,9 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Windows form of the existing regular-file admission, refusing reparse points.
 #[cfg(windows)]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -61,8 +64,9 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Portable fallback with before/after regular-file checks on other targets.
 #[cfg(not(any(unix, windows)))]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     let before = std::fs::symlink_metadata(path)?;
     if !before.file_type().is_file() {
         return Err(not_regular());

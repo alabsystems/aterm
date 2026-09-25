@@ -3,10 +3,10 @@
 // Author: Andrew Yates
 
 //! Source-scan gate: the THREE app-owned render paths (application-present
-//! composition, SIGUSR1 `snapshot`, control-socket `image`) suppress the
-//! transient effects — visual-bell invert, drag-drop wash, level-up glow —
-//! through the same overlay policy. Bell/drag and the landing celebration yield
-//! to `WindowState::overlay_open()`; the functional charging rim stays visible.
+//! composition, SIGUSR1 `snapshot`, control-socket `image`) resolve the
+//! transient effects — visual-bell invert, drag-drop wash, upgrade rim —
+//! through the same overlay policy. Bell and drag yield to
+//! `WindowState::overlay_open()`; the functional upgrade rim stays visible.
 //!
 //! # Why a source-scanning test
 //!
@@ -62,9 +62,9 @@ fn application_present_uses_the_phase_aware_overlay_policy() {
         "let overlay_open = ws0.overlay_open();",
         "let invert = ws0.bell_flash.is_active(Instant::now()) && !overlay_open;",
         "let drag_hover = ws0.drag_hover && !overlay_open;",
-        // ...and the surge consults the SAME local, with only its functional
-        // charging phase admitted over a modal (LevelUp's policy below).
-        "self.level_up .as_ref() .filter(|l| !overlay_open || l.paints_over_overlay())",
+        // ...and the upgrade rim, the one functional effect, is admitted
+        // over a modal unfiltered (its policy below).
+        "} else { self.level_up .as_ref() .map(|l| OverlayGlow {",
     ] {
         assert!(
             src.contains(needle),
@@ -81,7 +81,7 @@ fn application_present_uses_the_phase_aware_overlay_policy() {
 }
 
 #[test]
-fn shared_visual_policy_keeps_only_the_charging_exception() {
+fn shared_visual_policy_keeps_only_the_upgrade_rim_exception() {
     let src = normalized_section(
         "src/app_render.rs",
         "pub(crate) fn host_visual_state(",
@@ -91,19 +91,20 @@ fn shared_visual_policy_keeps_only_the_charging_exception() {
         "let overlay_open = window.overlay_open();",
         "let invert = window.bell_flash.is_active(now) && !overlay_open;",
         "if window.drag_hover && !overlay_open {",
-        "self.level_up .as_ref() .filter(|l| !overlay_open || l.paints_over_overlay())",
+        "self.level_up .as_ref() .map(|level| OverlayGlow {",
     ] {
         assert!(src.contains(needle), "shared visual policy lost `{needle}`");
     }
-    let phase = normalized_section(
-        "src/level_up.rs",
-        "pub(crate) const fn paints_over_overlay(",
-        "pub(crate) const fn phase(",
-    );
-    assert!(
-        phase.contains("matches!(self.phase, Phase::Charging)"),
-        "the overlay exception belongs only to Charging, never the Landing celebration"
-    );
+    // The exception is sound only while the rim is the ONE thing `level_up`
+    // can paint: a celebration phase admitted over a modal would be the
+    // pre-audit divergence again (the landing burst was deleted 2026-09-24).
+    let rim = normalized("src/level_up.rs");
+    for gone in ["Phase::Landing", "fn landing(", "arrow_tray"] {
+        assert!(
+            !rim.contains(gone),
+            "a celebration came back into the upgrade rim: `{gone}`"
+        );
+    }
 }
 
 /// Structural closure of the fallback capture policy, including its consumers.

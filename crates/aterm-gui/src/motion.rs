@@ -132,12 +132,11 @@ pub(crate) enum MotionEffect {
     /// than an ease: an effect that answers PROGRAM OUTPUT is exactly the kind
     /// a motion-sensitive user needs GONE, not merely gentler.
     OutputStreak,
-    /// The UPGRADE SURGE's border (`crate::level_up`): the pulse, the climb,
-    /// the landing burst, the hue travel, the thickening and the arrow's rise
-    /// all scale with this amplitude. 0 ⇒ a STILL rim at a fixed alpha and
-    /// thickness for each phase, and an arrow that fades in place — the
-    /// information (an update is applying; it landed) is kept, the movement
-    /// is removed: the notice pill's rule, not the matrix rain's.
+    /// The UPGRADE RIM (`crate::level_up`): the pulse, the climb, the hue
+    /// travel and the thickening all scale with this amplitude. 0 ⇒ a STILL
+    /// rim at a fixed alpha and thickness — the information (an update is
+    /// applying) is kept, the movement is removed: the notice pill's rule, not
+    /// the matrix rain's.
     UpgradeSurge,
     /// The PRESENCE rim's one edge ripple (`crate::presence`): a 300 ms flash
     /// along the driven window's rim when a peer's turn submit verifiably
@@ -708,7 +707,7 @@ mod tests {
         assert!(saw_denied);
     }
 
-    /// Negative control: a partial policy that forgets the level-up flourish is
+    /// Negative control: a partial policy that forgets the level-up gate is
     /// observably different at the exact point the exhaustive table checks.
     #[test]
     fn serious_mode_policy_catches_an_ungated_effect() {

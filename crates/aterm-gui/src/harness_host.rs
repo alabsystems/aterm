@@ -346,11 +346,13 @@ type WantedFn = dyn Fn(&str) -> bool + Send + Sync;
 type BodyFn = dyn Fn(&WorkerJob) -> BodyEnd + Send + Sync;
 type BadgeFn = dyn Fn(&str, Option<&str>) + Send + Sync;
 type EpochFn = dyn Fn() -> u64 + Send + Sync;
+type BackoffFn = dyn Fn(usize) -> Duration + Send + Sync;
 
 /// The host's seams onto the process: which sessions run an agent, whether
-/// one still does, one run of the loop, the faulted badge, and how many
-/// supervisor claims have been released (a held session's retry gate). The
-/// production set reads the store and talks to the control socket
+/// one still does, one run of the loop, the faulted badge, how many
+/// supervisor claims have been released (a held session's retry gate), and
+/// how long a failed run waits before its restart. The production set reads
+/// the store, talks to the control socket and waits [`restart_backoff`]
 /// ([`start_default`]); the tests inject their own.
 #[derive(Clone)]
 pub(crate) struct Hooks {
@@ -359,6 +361,7 @@ pub(crate) struct Hooks {
     pub(crate) body: Arc<BodyFn>,
     pub(crate) badge: Arc<BadgeFn>,
     pub(crate) claim_epoch: Arc<EpochFn>,
+    pub(crate) backoff: Arc<BackoffFn>,
 }
 
 /// Stop one worker: its flag, then its connection's cut.
@@ -403,23 +406,16 @@ fn faulted_badge(why: &str) -> String {
 /// a failure that repeats at once is not retried at once, so a transient
 /// one of under a second no longer spends the whole budget in that second
 /// and faults the session (the reliability review of 2026-09-24). The wait
-/// is on the host's bell, cut short by a stop — nothing polls.
+/// is on the host's bell, cut short by a stop — nothing polls. The worker
+/// reads it through [`Hooks::backoff`], so a test chooses the length of the
+/// wait it stops instead of racing a schedule compiled into the build.
 fn restart_backoff(n: usize) -> Duration {
-    #[cfg(not(test))]
     const STEPS: [Duration; 5] = [
         Duration::from_secs(1),
         Duration::from_secs(5),
         Duration::from_secs(15),
         Duration::from_secs(30),
         Duration::from_secs(60),
-    ];
-    #[cfg(test)]
-    const STEPS: [Duration; 5] = [
-        Duration::from_millis(10),
-        Duration::from_millis(20),
-        Duration::from_millis(30),
-        Duration::from_millis(40),
-        Duration::from_millis(50),
     ];
     STEPS[n.saturating_sub(1).min(STEPS.len() - 1)]
 }
@@ -473,7 +469,7 @@ fn worker_main(mut job: WorkerJob, hooks: &Hooks) -> WorkerExit {
             (hooks.badge)(&job.sid, Some(&faulted_badge(&why)));
             return WorkerExit::Faulted(why);
         }
-        let pause = restart_backoff(failed);
+        let pause = (hooks.backoff)(failed);
         aterm_log::warn!(
             "harness @{}: restarting the supervisor ({failed} of {RESTART_BUDGET} this hour) in \
              {} ms: {why}",
@@ -1151,6 +1147,7 @@ pub(crate) fn start_default(
             body: Arc::new(move |job| hosted_body(&k1, job)),
             badge: Arc::new(move |sid, text| set_badge(&k2, sid, text)),
             claim_epoch: Arc::new(|| CLAIM_EPOCH.load(Ordering::SeqCst)),
+            backoff: Arc::new(restart_backoff),
         },
     )
 }
@@ -1313,7 +1310,16 @@ mod tests {
                     .push((sid.to_string(), text.map(str::to_string)));
             }),
             claim_epoch: Arc::new(move || w4.released.load(Ordering::SeqCst)),
+            backoff: Arc::new(quick_backoff),
         }
+    }
+
+    /// The restart schedule the tests run under: [`restart_backoff`]'s shape
+    /// — growing, capped at the fifth — in tens of milliseconds, so a
+    /// session's whole budget is spent within a test.
+    fn quick_backoff(n: usize) -> Duration {
+        const STEPS: [u64; 5] = [10, 20, 30, 40, 50];
+        Duration::from_millis(STEPS[n.saturating_sub(1).min(STEPS.len() - 1)])
     }
 
     fn until(what: &str, pred: impl Fn() -> bool) {
@@ -1378,8 +1384,17 @@ mod tests {
         // The program left: the worker is stopped (through its interrupter).
         world.set(&[("s-x", Agent::Codex)]);
         until("detached", || host.live().is_empty());
+        // A reaped worker's body has returned, so this count is final: one
+        // run, no restart after the stop, and no run for the codex session.
+        assert_eq!(world.runs.load(Ordering::SeqCst), 1);
         world.set(&[("s-c", Agent::Claude)]);
-        until("attached again", || host.live() == ["s-c"]);
+        // `live` moves when the host SPAWNS a worker; the body counts its
+        // run when that thread is first scheduled, which a loaded machine
+        // does later. The attach is a fresh run of the loop, so wait for the
+        // run, not only the thread.
+        until("attached again", || {
+            host.live() == ["s-c"] && world.runs.load(Ordering::SeqCst) >= 2
+        });
         assert_eq!(world.runs.load(Ordering::SeqCst), 2);
         host.shutdown_and_join();
     }
@@ -1518,11 +1533,18 @@ mod tests {
         let host = HostHandle::start(on(), false, false, hooks(&world, body));
         until("faulted badge", || !world.badges.lock().unwrap().is_empty());
         let spent = started.elapsed();
-        let floor: Duration = (1..=RESTART_BUDGET).map(restart_backoff).sum();
+        let floor: Duration = (1..=RESTART_BUDGET).map(quick_backoff).sum();
         assert!(spent >= floor, "{spent:?} < {floor:?}");
         host.shutdown_and_join();
 
         // A stop during a backoff ends the worker without waiting it out.
+        // The backoff here is an hour, so only the stop can end the worker
+        // within `until`'s bound. The first failure enters the session's
+        // history before the wait begins, and the wait reads the stop flag
+        // before it parks, so a stop that lands in between is seen too. The
+        // tests' 10 to 50 ms schedule raced the test thread instead: one held
+        // past their 150 ms sum by a loaded machine let a sixth run fault the
+        // session, and a wait no stop could cut would have passed.
         let world = Arc::new(World::default());
         world.set(&[("s-c", Agent::Claude)]);
         let w = Arc::clone(&world);
@@ -1530,11 +1552,17 @@ mod tests {
             w.runs.fetch_add(1, Ordering::SeqCst);
             BodyEnd::Failed("transient".to_string())
         });
-        let host = HostHandle::start(on(), false, false, hooks(&world, body));
-        until("first run", || world.runs.load(Ordering::SeqCst) >= 1);
+        let mut h = hooks(&world, body);
+        h.backoff = Arc::new(|_| Duration::from_secs(3600));
+        let host = HostHandle::start(on(), false, false, h);
+        until("in the first backoff", || host.faults_of("s-c") >= 1);
         world.set(&[]);
         until("worker gone", || host.live().is_empty());
-        assert!(world.runs.load(Ordering::SeqCst) <= RESTART_BUDGET);
+        assert_eq!(
+            world.runs.load(Ordering::SeqCst),
+            1,
+            "the stop ended the first backoff; no restart ran"
+        );
         host.shutdown_and_join();
     }
 
@@ -1747,8 +1775,9 @@ mod tests {
             }
             w.roster.lock().unwrap().clone()
         });
-        let g = Arc::clone(&gate);
-        // parking_body, with an interrupter that also counts its cuts.
+        let (g, w) = (Arc::clone(&gate), Arc::clone(&world));
+        // parking_body, with an interrupter that also counts its cuts, and a
+        // run counted once that interrupter is published.
         hooks.body = Arc::new(move |job: &WorkerJob| {
             let g = Arc::clone(&g);
             let me = std::thread::current();
@@ -1756,13 +1785,21 @@ mod tests {
                 g.cuts.fetch_add(1, Ordering::SeqCst);
                 me.unpark();
             }));
+            w.runs.fetch_add(1, Ordering::SeqCst);
             while !job.stop.load(Ordering::SeqCst) {
                 std::thread::park();
             }
             BodyEnd::Stopped
         });
         let host = HostHandle::start(on(), false, false, hooks);
-        until("a worker for s-g", || host.live() == ["s-g"]);
+        // `live` moves at the spawn; only a published interrupter can be
+        // cut. A worker not yet scheduled has none, and suspend's flag alone
+        // stops it (the body reads the flag after publishing), so the count
+        // below would be 0 for a reason that is not the defect.
+        until("a worker for s-g, its interrupter published", || {
+            host.live() == ["s-g"] && world.runs.load(Ordering::SeqCst) >= 1
+        });
+        assert_eq!(world.runs.load(Ordering::SeqCst), 1);
         // Hold the host thread inside its next roster read.
         gate.armed.lock().unwrap().0 = true;
         ring();
@@ -1909,6 +1946,7 @@ mod tests {
                     p3.badge_on.store(text.is_some(), Ordering::SeqCst)
                 }),
                 claim_epoch: Arc::new(move || p4.released.load(Ordering::SeqCst)),
+                backoff: Arc::new(quick_backoff),
             }
         }
 

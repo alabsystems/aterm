@@ -36,8 +36,8 @@
 # `cargo forge mirror config` and diff. Cargo ignores this table.
 [aterm-mirror]
 format = 1
-registry-packages = 508
-registry-lock-sha256 = "15e89254d3fad349e2fad03e08fd2fed23f402dfe4a49279d1c70c7f60f2dc11"
+registry-packages = 495
+registry-lock-sha256 = "4425d5e9ad9594299333c85c496d0e3914bfce93f4d95b95adfda3078e4bfcfe"
 local-registry = "mirror"
 
 # Source replacement is ALL-OR-NOTHING for crates.io, which is why the mirror

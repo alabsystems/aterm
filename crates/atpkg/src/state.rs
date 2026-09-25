@@ -18,20 +18,15 @@
 //! * `managed <build> — SHADOWED by <path>` — atpkg's copy is installed, but a binary
 //!   earlier on `PATH` runs instead (a warning, never a fault, never "fixed"); a vendor
 //!   build is named by its version here too;
-//! * `extra — not installed (opt in: aterm pkg install <name>)` — listed, pinned, waiting
-//!   for consent;
-//! * `installed via <protocol>: <path>` — obtained through another protocol (`pkg`,
-//!   `system-pm`) and proven present by one of the row's `provides` paths;
-//! * `needs admin — run: aterm pkg install <name>` — the row needs elevation the
-//!   unattended pass cannot supply;
 //! * `unavailable on <target>: <hint>` — the pinned build carries no row for this target;
-//! * `blocked by <dep>: <dep state>` — the program `requires` `<dep>`
-//!   ([`crate::manifest::Program::requires`]) and `<dep>` is not installed, system-
-//!   satisfied or installed through its protocol; the tail is the DEPENDENCY's own row,
-//!   so the line says whose act unblocks it. Deferred, retried every pass, never a fault.
 //! * `held: pinned build <N> is not published for <target>; staying on build <current>` —
 //!   an installed member whose group's new pin carries no artifact for this target (a
 //!   sibling's row names it: `held: <owner>'s pinned build …`). Deferred, never a fault.
+//!
+//! (`extra — not installed …`, `installed via …`, `needs admin …` and `blocked by …` went
+//! with the extras and the OS-installer protocols, design 2026-09-22 §5.3(b)/(c),
+//! 2026-09-24; a row an older pass wrote in one of them is an unknown spelling, rewritten
+//! by the next pass.)
 //!
 //! Every constructor here is the ONLY place its spelling lives; the parsers beside them
 //! (`system_path`, `managed_pin`, …) read the same words back so `doctor` and `which` can
@@ -46,16 +41,9 @@ pub const MANAGED_PREFIX: &str = "managed ";
 pub const SYSTEM_PREFIX: &str = "system: ";
 /// The tail every system-satisfied row carries before the optional retirement note.
 pub const SYSTEM_TAIL: &str = " — not managed by aterm";
-/// The head of an extra that has not been opted in to.
-pub const EXTRA_PREFIX: &str = "extra — not installed";
 /// The whole row of an AGENT PROGRAM ([`crate::stub::AGENT_PROGRAMS`]) the pass has not
-/// installed yet: default-set on this client, so it is COMING — never `extra — not
-/// installed (opt in: …)`, the row an older pass wrote under the opt-in policy.
+/// installed yet: default-set, so it is COMING.
 pub const AGENT_INSTALLING: &str = "agent program — installing";
-/// The head of a member obtained through another protocol.
-pub const INSTALLED_VIA_PREFIX: &str = "installed via ";
-/// The head of a member waiting on elevation.
-pub const NEEDS_ADMIN_PREFIX: &str = "needs admin";
 /// The head of a member the pinned build does not serve on this target.
 pub const UNAVAILABLE_PREFIX: &str = "unavailable on ";
 /// The hint an index row that names none falls back to.
@@ -66,10 +54,6 @@ pub const UNAVAILABLE_DEFAULT_HINT: &str = "no build is published for this targe
 /// both default-set arms, so `which`/`doctor`/Settings read the same words — a
 /// `tombstoned:` prefix, which doctor counts as a FAULT (it is one: the fix is upstream).
 pub const TOMBSTONED_PIN: &str = "tombstoned: pin yanked/below floor";
-/// The head of a member waiting on one of its `requires`: `blocked by <dep>: <dep state>`.
-/// Distinct from the `blocked:` FAULT prefix `doctor` matches (`blocked: no build for this
-/// architecture`, the toolset-wide verdict): a space, not a colon, follows the word.
-pub const BLOCKED_PREFIX: &str = "blocked by ";
 /// The head of an installed member held on its current build because its coherence
 /// group's new pin is not published for this target: `held: …`.
 pub const HELD_PREFIX: &str = "held: ";
@@ -92,6 +76,11 @@ pub const TOOLSET_REMOVED: &str = "removed on this machine: nothing to install";
 /// signed index could not be reached — the one exit-2 verdict a retry can change, so the
 /// window's loop retries it where it lets every other exit 2 settle.
 pub const TOOLSET_INDEX_UNREACHABLE: &str = "unavailable: index unreachable";
+/// The `*toolset*` row of an update that installed nothing on an empty store because the
+/// process runs under Rosetta translation, so the architecture it reports is not this
+/// Mac's: nothing is asked of the index, and running natively is the fix. Written over
+/// whatever an earlier pass left, so the window never reads that pass's row as this one's.
+pub const TOOLSET_TRANSLATED: &str = "unavailable: running under Rosetta translation";
 
 /// Whether `state` is the machine-wide no-build-for-this-architecture verdict
 /// ([`TOOLSET_UNSERVED`] / [`TOOLSET_UNSERVED_BLOCKED`]).
@@ -293,11 +282,35 @@ pub fn agent_passed_through(build: u64, stub: &Path, foreign: &Path) -> String {
     s.push_str(&stub.display().to_string());
     s.push_str(" passes through to ");
     s.push_str(&foreign.display().to_string());
-    s.push_str(
-        ", this shell's own copy (the managed copy leads inside aterm only; aterm help reroute)",
-    );
+    s.push_str(", ");
+    s.push_str(OWN_COPY_OUTSIDE_ATERM);
     s
 }
+
+/// `managed <build> — not what runs outside aterm: <foreign> runs here, this shell's own
+/// copy (the managed copy leads inside aterm only; aterm help reroute)`.
+///
+/// [`agent_passed_through`]'s row where no reroute stub answers first on this shell's
+/// `PATH` (2026-09-24) — an iTerm shell has no reroute directory on it at all, or one
+/// behind the foreign copy — whether the stub is laid or not (the same day's review: it
+/// decides nothing in such a shell). Outside aterm the user's own copy is the design
+/// either way (owner law, 03513b5d7), so this names no remedy: the rc hook
+/// [`agent_shadowed_in_shell`] names demotes `agents/` outside aterm, so sourcing it there
+/// does nothing, and its no-hook `PATH` line would undo the law. Never recorded.
+#[must_use]
+pub fn agent_own_copy_outside_aterm(build: u64, foreign: &Path) -> String {
+    let mut s = String::from(MANAGED_PREFIX);
+    s.push_str(&crate::vendor_direct::build_label(build));
+    s.push_str(" — not what runs outside aterm: ");
+    s.push_str(&foreign.display().to_string());
+    s.push_str(" runs here, ");
+    s.push_str(OWN_COPY_OUTSIDE_ATERM);
+    s
+}
+
+/// The shared tail of the two outside-aterm rows.
+const OWN_COPY_OUTSIDE_ATERM: &str =
+    "this shell's own copy (the managed copy leads inside aterm only; aterm help reroute)";
 
 /// The tail of [`agent_shadowed_in_shell`] after `managed <build> — `: `SHADOWED in this
 /// shell by <path>: its PATH has …; a tab opened on this build puts agents/ first on its own`. For a shell a
@@ -335,40 +348,11 @@ pub fn agent_shell_shadow_tail(
     s
 }
 
-/// `extra — not installed (opt in: aterm pkg install <name>)`.
-#[must_use]
-pub fn extra_not_installed(name: &str) -> String {
-    let mut s = String::from(EXTRA_PREFIX);
-    s.push_str(" (opt in: aterm pkg install ");
-    s.push_str(name);
-    s.push(')');
-    s
-}
-
 /// `agent program — installing` ([`AGENT_INSTALLING`]): the one row a wanted agent program
 /// carries between adoption and its install.
 #[must_use]
 pub fn agent_installing() -> String {
     String::from(AGENT_INSTALLING)
-}
-
-/// `installed via <protocol>: <path>`.
-#[must_use]
-pub fn installed_via(protocol: &str, path: &Path) -> String {
-    let mut s = String::from(INSTALLED_VIA_PREFIX);
-    s.push_str(protocol);
-    s.push_str(": ");
-    s.push_str(&path.display().to_string());
-    s
-}
-
-/// `needs admin — run: aterm pkg install <name>`.
-#[must_use]
-pub fn needs_admin(name: &str) -> String {
-    let mut s = String::from(NEEDS_ADMIN_PREFIX);
-    s.push_str(" — run: aterm pkg install ");
-    s.push_str(name);
-    s
 }
 
 /// `unavailable on <target>: <hint>` — `hint` empty ⇒ [`UNAVAILABLE_DEFAULT_HINT`].
@@ -383,33 +367,6 @@ pub fn unavailable(target: &str, hint: &str) -> String {
         hint
     });
     s
-}
-
-/// `blocked by <dep>: <dep state>` — the program requires `dep` and `dep` is not yet
-/// installed, system-satisfied or installed through its protocol. `dep_state` is the
-/// dependency's OWN canonical row (`needs admin — run: aterm pkg install clt`, `extra —
-/// not installed (opt in: aterm pkg install codex)`, `error: …`), quoted verbatim, so the
-/// blocked row names the act that unblocks it. A per-program DEFERRED state, not a fault:
-/// the next pass retries, and nothing downloads for a blocked program.
-#[must_use]
-pub fn blocked(dep: &str, dep_state: &str) -> String {
-    let mut s = String::from(BLOCKED_PREFIX);
-    s.push_str(dep);
-    s.push_str(": ");
-    s.push_str(dep_state);
-    s
-}
-
-/// `Some((dep, dep_state))` for a `blocked by <dep>: <dep state>` state; `None` for every
-/// other state. The inverse of [`blocked`] (a dependency name never contains `: `).
-#[must_use]
-pub fn blocked_by(state: &str) -> Option<(&str, &str)> {
-    let rest = state.strip_prefix(BLOCKED_PREFIX)?;
-    let (dep, dep_state) = rest.split_once(": ")?;
-    if dep.is_empty() || dep_state.is_empty() {
-        return None;
-    }
-    Some((dep, dep_state))
 }
 
 /// `held: pinned build <N> is not published for <target>; staying on build <current>` —
@@ -448,18 +405,6 @@ pub fn system_retired(state: &str) -> Option<&str> {
     let rest = state.strip_prefix(SYSTEM_PREFIX)?;
     let note = rest.rsplit_once(" (managed copy retired ")?.1;
     note.strip_suffix(')')
-}
-
-/// `Some((protocol, path))` for an `installed via <protocol>: <path>` state; `None` for
-/// every other state. The inverse of [`installed_via`].
-#[must_use]
-pub fn installed_via_path(state: &str) -> Option<(&str, &str)> {
-    let rest = state.strip_prefix(INSTALLED_VIA_PREFIX)?;
-    let (protocol, path) = rest.split_once(": ")?;
-    if protocol.is_empty() || path.is_empty() {
-        return None;
-    }
-    Some((protocol, path))
 }
 
 /// `Some((build, index))` for a `managed <build> — pinned by index <N>` state; `None`
@@ -528,10 +473,10 @@ pub fn source_words(program: &str, state: &str, last_index_build: u64) -> String
 /// Why a row is NOT current, when it says so: a one-word `result` (what the package log and
 /// the Activity list call it) and the `reason` in the row's own words. `None` for a row that
 /// is current or says nothing wrong — pinned by its index, its vendor's latest, a vendor
-/// build no lane has judged yet, system-satisfied, installed through another protocol, an
-/// extra waiting for consent, an agent on its way, a SHADOWED row (per-shell truth, never a
-/// fault) — and for any spelling this build does not know. Reads the canonical spellings
-/// above and the fault prefixes `doctor` matches; never a second vocabulary.
+/// build no lane has judged yet, system-satisfied, an agent on its way, a SHADOWED row
+/// (per-shell truth, never a fault) — and for any spelling this build does not know.
+/// Reads the canonical spellings above and the fault prefixes `doctor` matches; never a
+/// second vocabulary.
 #[must_use]
 pub fn not_current(state: &str) -> Option<(&'static str, &str)> {
     if let Some((_, why)) = vendor_row(state) {
@@ -577,8 +522,6 @@ pub fn not_current(state: &str) -> Option<(&'static str, &str)> {
         || state.starts_with(UNAVAILABLE_PREFIX)
     {
         "unavailable"
-    } else if state.starts_with(NEEDS_ADMIN_PREFIX) || state.starts_with(BLOCKED_PREFIX) {
-        "waiting"
     } else {
         return None;
     };
@@ -646,8 +589,11 @@ mod tests {
             vendor_source("0.156.0", "OpenAI"),
             shadowed(1971, Path::new("/opt/homebrew/bin/ay")),
             system(Path::new("/usr/bin/git"), None),
-            extra_not_installed("vendorx"),
             agent_installing(),
+            // Rows an older pass wrote in the retired spellings (§5.3(b)/(c)): unknown now.
+            String::from("extra — not installed (opt in: aterm pkg install vendorx)"),
+            String::from("needs admin — run: aterm pkg install clt"),
+            String::from("blocked by clt: needs admin — run: aterm pkg install clt"),
             String::from("active"),
             String::new(),
         ] {
@@ -700,10 +646,6 @@ mod tests {
         assert_eq!(
             not_current(&held_unpublished(None, 12, "x86_64-apple-darwin", 11)).map(|n| n.0),
             Some("held")
-        );
-        assert_eq!(
-            not_current(&needs_admin("clt")).map(|n| n.0),
-            Some("waiting")
         );
         assert_eq!(
             not_current(TOOLSET_INDEX_UNREACHABLE).map(|n| n.0),
@@ -803,32 +745,12 @@ mod tests {
             "managed 6808 — SHADOWED by /Users//dev/.local/bin/trust"
         );
         assert_eq!(
-            extra_not_installed("codex"),
-            "extra — not installed (opt in: aterm pkg install codex)"
-        );
-        assert_eq!(
-            installed_via("pkg", Path::new("/opt/homebrew/bin/brew")),
-            "installed via pkg: /opt/homebrew/bin/brew"
-        );
-        assert_eq!(
-            needs_admin("homebrew"),
-            "needs admin — run: aterm pkg install homebrew"
-        );
-        assert_eq!(
             unavailable("x86_64-unknown-linux-gnu", "Emacs is a macOS-only member"),
             "unavailable on x86_64-unknown-linux-gnu: Emacs is a macOS-only member"
         );
         assert_eq!(
             unavailable("aarch64-pc-windows-msvc", ""),
             "unavailable on aarch64-pc-windows-msvc: no build is published for this target"
-        );
-        assert_eq!(
-            blocked("clt", &needs_admin("clt")),
-            "blocked by clt: needs admin — run: aterm pkg install clt"
-        );
-        assert_eq!(
-            blocked("codex", &extra_not_installed("codex")),
-            "blocked by codex: extra — not installed (opt in: aterm pkg install codex)"
         );
         // The alias fix-line is a SEPARATE sentence: the SHADOWED state never carries it,
         // so a row that was written and read back stays byte-identical.
@@ -920,55 +842,17 @@ mod tests {
             Some((6808, "/x/trust"))
         );
         assert_eq!(shadowed_by(&managed(6808, 41)), None);
-        assert_eq!(
-            installed_via_path(&installed_via("pkg", Path::new("/opt/homebrew/bin/brew"))),
-            Some(("pkg", "/opt/homebrew/bin/brew"))
-        );
-        assert_eq!(
-            installed_via_path(&installed_via(
-                "softwareupdate",
-                Path::new("/Library/Developer/CommandLineTools/usr/bin/git")
-            )),
-            Some((
-                "softwareupdate",
-                "/Library/Developer/CommandLineTools/usr/bin/git"
-            ))
-        );
-        assert_eq!(installed_via_path(&needs_admin("brew")), None);
-        assert_eq!(installed_via_path("installed via pkg: "), None);
-        // The blocked row quotes the dependency's row VERBATIM, colons and all, and the
-        // parser gives it back whole.
-        let b = blocked("clt", &needs_admin("clt"));
-        assert_eq!(
-            blocked_by(&b),
-            Some(("clt", "needs admin — run: aterm pkg install clt"))
-        );
-        let nested = blocked("brew", &blocked("clt", "error: x: y"));
-        assert_eq!(
-            blocked_by(&nested),
-            Some(("brew", "blocked by clt: error: x: y"))
-        );
-        assert_eq!(blocked_by(&needs_admin("brew")), None);
-        assert_eq!(blocked_by("blocked by clt: "), None);
-        assert_eq!(blocked_by("blocked: no build for this architecture"), None);
         assert!(is_managed(&managed(1, 1)) && is_managed(&shadowed(1, Path::new("/p"))));
         for other in [
             "active",
             "error: x",
-            &extra_not_installed("codex"),
-            &needs_admin("brew"),
             &unavailable("t", ""),
-            &installed_via("pkg", Path::new("/p")),
-            &blocked("clt", &needs_admin("clt")),
             &held_unpublished(None, 6, "t", 5),
             &held_unpublished(Some("tb"), 6, "t", 3),
         ] {
             assert_eq!(system_path(other), None, "{other}");
             assert_eq!(managed_pin(other), None, "{other}");
             assert!(!is_managed(other), "{other}");
-            if !other.starts_with(INSTALLED_VIA_PREFIX) {
-                assert_eq!(installed_via_path(other), None, "{other}");
-            }
         }
     }
 
@@ -984,11 +868,7 @@ mod tests {
             vendor_source("0.156.0", "OpenAI"),
             system(Path::new("/p"), Some("2026-01-01")),
             shadowed(1, Path::new("/p")),
-            extra_not_installed("codex"),
-            installed_via("pkg", Path::new("/p")),
-            needs_admin("brew"),
             unavailable("t", "h"),
-            blocked("clt", &needs_admin("clt")),
             held_unpublished(None, 6, "t", 5),
             held_unpublished(Some("tb"), 6, "t", 3),
         ] {

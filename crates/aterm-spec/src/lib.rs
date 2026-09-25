@@ -53,7 +53,6 @@ pub use aterm_spec_macros::{refines, spec_invariant, spec_unmodeled, ty_model};
 // live in `xref` (TRUST_NATIVE_TLA §2.1).
 pub use inventory;
 
-pub mod coverage;
 pub mod derive;
 pub mod interp;
 pub mod ir;

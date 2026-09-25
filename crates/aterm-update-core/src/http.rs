@@ -384,26 +384,6 @@ fn api_get_args() -> [&'static str; 11] {
     ]
 }
 
-/// One short, anonymous listing hint. Unlike the full signed update's API read,
-/// the background hint never retries or waits thirty seconds on a dead link.
-fn api_get_quick_args() -> [&'static str; 13] {
-    [
-        "-sS",
-        "--max-time",
-        "5",
-        "--connect-timeout",
-        "3",
-        "--max-filesize",
-        "16777216",
-        "-H",
-        "Accept: application/vnd.github+json",
-        "-H",
-        "X-GitHub-Api-Version: 2022-11-28",
-        "-w",
-        "\n%{http_code}",
-    ]
-}
-
 /// GET a GitHub API JSON resource, returning the raw body bytes. Distinguishes an
 /// authentication failure (401/403 — expired/revoked/insufficient token, or no token
 /// against a private repo) from a rate limit and from a transient error, so the
@@ -423,177 +403,8 @@ fn api_get_quick_args() -> [&'static str; 13] {
 // Audited (update-atpkg); droppable with the byte-exact contract lane.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, HttpError> {
-    // No header sink, therefore an argv that is EXACTLY `api_get_args()` (asserted in
-    // `the_plain_lane_argv_is_unchanged`). Every existing caller's bytes, errors,
-    // retries and wording are the historical ones.
-    api_get_with_headers(url, token, None)
-}
-
-/// A single five-second anonymous API GET for an untrusted background wake hint.
-/// The signed update pass still uses [`api_get_classified`] with its full retries.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn api_get_classified_quick(url: &str) -> Result<Vec<u8>, HttpError> {
-    api_get_with_policy(url, None, None, true)
-}
-
-/// [`api_get_args`] plus the response-header dump, when the caller wants one.
-///
-/// Kept as its own function so a unit test can assert BOTH sides: with no sink the list
-/// is byte-identical to the historical `api_get_args()`, and with one the flag pair
-/// appears exactly once and still BEFORE the `--` end-of-options marker `curl_argv`
-/// appends (a caller-side `--` is the v0.5.10 auto-update-bricking regression).
-fn api_get_args_dumping(header_dump: Option<&str>) -> Vec<&str> {
-    let mut args: Vec<&str> = api_get_args().to_vec();
-    if let Some(dump) = header_dump {
-        // `--dump-header`, not `-D -`: the body is captured from stdout and the status
-        // trailer is appended to it, so response headers must land in a FILE or they
-        // would corrupt both. The sink is a caller-owned path inside its own `0700`
-        // directory.
-        args.push("--dump-header");
-        args.push(dump);
-    }
-    args
-}
-
-/// The `x-ratelimit-*` block of a GitHub API response, and its `retry-after`, read back
-/// from a curl `--dump-header` capture.
-///
-/// Every field is optional because every field is server-supplied: a proxy may strip
-/// any of them, and a consumer that needs one must treat its absence as "unknown", never
-/// as "plenty". `reset` and `retry_after` are unix epochs, already clamped by the parser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RateLimitHeaders {
-    /// `x-ratelimit-limit`: the hourly allowance (~60 anonymous, 5000 with a token).
-    pub limit: Option<u32>,
-    /// `x-ratelimit-remaining`: what is left in the current window.
-    pub remaining: Option<u32>,
-    /// `x-ratelimit-used`: what this window has already spent.
-    pub used: Option<u32>,
-    /// `x-ratelimit-reset`: when the window renews, unix seconds — clamped to
-    /// `now + 3600`, because the window is an hour and a value past that is a lie
-    /// (a skewed clock, a mangled header) that would otherwise hold a machine off
-    /// GitHub indefinitely.
-    pub reset: Option<u64>,
-    /// `retry-after` in delta-seconds (a secondary rate limit's), as the unix second it
-    /// names — clamped like `reset`. The HTTP-date form is not read.
-    pub retry_after: Option<u64>,
-}
-
-impl RateLimitHeaders {
-    /// When a REFUSED request may be made again, by GitHub's documented rule: after
-    /// `retry-after` when it was sent, else at `x-ratelimit-reset` when the window is spent
-    /// (`x-ratelimit-remaining: 0`); `None` when neither names a time.
-    #[must_use]
-    pub fn resume_at(&self) -> Option<u64> {
-        self.retry_after
-            .or_else(|| self.reset.filter(|_| self.remaining == Some(0)))
-    }
-}
-
-/// How far past `now` a server-supplied reset epoch is believed. GitHub's window is an
-/// hour, so nothing honest can be further out.
-const RATE_LIMIT_RESET_HORIZON_SECS: u64 = 3600;
-
-/// Parse the rate-limit headers out of a header dump's LAST block (the response whose
-/// body was kept — a redirect chain writes one block per hop, and a block boundary is
-/// an `HTTP/` status line). Names are matched case-insensitively (GitHub emits them
-/// lowercase; a proxy may not); a non-numeric value is treated as absent, never as 0 or
-/// as a guess. `None` when the last block carries none of the five.
-///
-/// `now` is injected so the clamp is testable without a clock.
-#[must_use]
-pub fn parse_rate_limit_headers(text: &str, now: u64) -> Option<RateLimitHeaders> {
-    let mut found = RateLimitHeaders::default();
-    let mut any = false;
-    for line in text.lines() {
-        // A new hop: everything read so far belonged to a response we did not keep.
-        if line.starts_with("HTTP/") {
-            found = RateLimitHeaders::default();
-            any = false;
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("x-ratelimit-limit") {
-            found.limit = value.parse().ok();
-            any |= found.limit.is_some();
-        } else if name.eq_ignore_ascii_case("x-ratelimit-remaining") {
-            found.remaining = value.parse().ok();
-            any |= found.remaining.is_some();
-        } else if name.eq_ignore_ascii_case("x-ratelimit-used") {
-            found.used = value.parse().ok();
-            any |= found.used.is_some();
-        } else if name.eq_ignore_ascii_case("x-ratelimit-reset") {
-            found.reset = value
-                .parse::<u64>()
-                .ok()
-                .map(|reset| reset.min(now.saturating_add(RATE_LIMIT_RESET_HORIZON_SECS)));
-            any |= found.reset.is_some();
-        } else if name.eq_ignore_ascii_case("retry-after") {
-            found.retry_after = value
-                .parse::<u64>()
-                .ok()
-                .map(|secs| now.saturating_add(secs.min(RATE_LIMIT_RESET_HORIZON_SECS)));
-            any |= found.retry_after.is_some();
-        }
-    }
-    any.then_some(found)
-}
-
-/// [`parse_rate_limit_headers`] over the file curl dumped headers into, against the
-/// wall clock. Absent or unreadable file ⇒ `None`.
-#[must_use]
-pub fn rate_limit_from_header_dump(path: &Path) -> Option<RateLimitHeaders> {
-    let raw = std::fs::read(path).ok()?;
-    parse_rate_limit_headers(&String::from_utf8_lossy(&raw), unix_now_secs())
-}
-
-/// Unix seconds now, `0` on a clock before the epoch (which only makes the reset clamp
-/// tighter — the safe direction).
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// [`api_get_classified`], additionally dumping the response HEADERS into
-/// `header_sink` so the caller can read the `x-ratelimit-*` block back
-/// ([`rate_limit_from_header_dump`]) — the token lane's evidence for holding a check
-/// until the server's own reset instead of guessing.
-///
-/// The sink is unlinked before every attempt: a reset epoch a later hold rides on must
-/// describe THIS response, never a previous one's. `None` spawns the exact
-/// historical argv and touches no file.
-// Skip: same audited display-lossy Err-path class as `api_get`.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn api_get_with_headers(
-    url: &str,
-    token: Option<&str>,
-    header_sink: Option<&Path>,
-) -> Result<Vec<u8>, HttpError> {
-    api_get_with_policy(url, token, header_sink, false)
-}
-
-#[cfg_attr(trust_verify, trust::skip)]
-fn api_get_with_policy(
-    url: &str,
-    token: Option<&str>,
-    header_sink: Option<&Path>,
-    quick: bool,
-) -> Result<Vec<u8>, HttpError> {
-    let sink = header_sink.and_then(|p| p.to_str());
-    let args = if quick {
-        api_get_quick_args().to_vec()
-    } else {
-        api_get_args_dumping(sink)
-    };
-    let attempts = if quick { 1 } else { CURL_ATTEMPTS };
-    // Bounded: `last` is true on attempt `attempts` (one for a hint, three for a
-    // full API read), and every branch returns there.
+    let args = api_get_args();
+    // Bounded: `last` is true on attempt `CURL_ATTEMPTS`, and every branch returns there.
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -601,15 +412,7 @@ fn api_get_with_policy(
             // curl's own inter-retry backoff, preserved: 1 s, then 2 s.
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
-        let last = attempt >= attempts;
-        if let Some(sink) = header_sink {
-            // Never let a PREVIOUS response's headers be read as THIS one's. curl
-            // truncates the dump file on open, so this is belt-and-suspenders — but a
-            // reset epoch read out of a response we did not receive is the one way a
-            // hold could be pointed at the wrong window. A failure to remove is
-            // harmless (worst case: no headers, i.e. no hold, the historical back-off).
-            let _ = std::fs::remove_file(sink);
-        }
+        let last = attempt >= CURL_ATTEMPTS;
         // The token is passed in unchanged on every attempt — never re-read or
         // re-validated per attempt, so a rotation mid-loop cannot split the lanes.
         let out = curl_fetch(&args, url, token).map_err(HttpError::Transport)?;
@@ -2168,88 +1971,6 @@ mod tests {
         );
     }
 
-    /// The LAST block wins (a redirect chain writes one per hop), names match
-    /// case-insensitively, a non-numeric value is absent, and the reset is clamped to
-    /// one hour past `now` — the window is an hour, so anything further is a lie.
-    #[test]
-    fn rate_limit_headers_are_read_from_the_last_block_and_clamped() {
-        let now = 1_788_390_000;
-        let dump = "HTTP/2 302
-x-ratelimit-limit: 60
-x-ratelimit-remaining: 59
-                    x-ratelimit-used: 1
-x-ratelimit-reset: 1788390100
-
-                    HTTP/2 403
-X-RateLimit-Limit: 60
-X-RateLimit-Remaining: 1
-                    X-RateLimit-Used: 23
-X-RateLimit-Reset: 1788392970
-
-";
-        let h = super::parse_rate_limit_headers(dump, now).expect("headers present");
-        assert_eq!(
-            h,
-            super::RateLimitHeaders {
-                limit: Some(60),
-                remaining: Some(1),
-                used: Some(23),
-                reset: Some(1_788_392_970),
-                retry_after: None,
-            }
-        );
-        assert_eq!(
-            h.resume_at(),
-            None,
-            "the window is not spent: no time named"
-        );
-        // A reset beyond the horizon is clamped to now + 3600.
-        let far = "HTTP/2 403
-x-ratelimit-remaining: 0
-x-ratelimit-reset: 9999999999
-";
-        let h = super::parse_rate_limit_headers(far, now).unwrap();
-        assert_eq!(h.reset, Some(now + 3600));
-        assert_eq!(h.remaining, Some(0));
-        assert_eq!(
-            h.resume_at(),
-            Some(now + 3600),
-            "a spent window resumes at its reset"
-        );
-        // A secondary limit's `retry-after` (delta-seconds) wins, clamped the same way; the
-        // HTTP-date form is not read.
-        let secondary = "HTTP/2 403
-x-ratelimit-remaining: 12
-x-ratelimit-reset: 1788392970
-Retry-After: 120
-";
-        let h = super::parse_rate_limit_headers(secondary, now).unwrap();
-        assert_eq!(h.retry_after, Some(now + 120));
-        assert_eq!(h.resume_at(), Some(now + 120));
-        let long = "HTTP/2 429\nretry-after: 99999\n";
-        let h = super::parse_rate_limit_headers(long, now).unwrap();
-        assert_eq!(h.resume_at(), Some(now + 3600));
-        let dated = "HTTP/2 429\nretry-after: Wed, 21 Oct 2026 07:28:00 GMT\n";
-        assert_eq!(super::parse_rate_limit_headers(dated, now), None);
-        // A later hop WITHOUT the headers yields none — the kept response had none.
-        let stripped = "HTTP/2 302
-x-ratelimit-remaining: 40
-
-HTTP/2 200
-                        content-type: text/plain
-";
-        assert_eq!(super::parse_rate_limit_headers(stripped, now), None);
-        // Non-numeric values are absent, not zero.
-        let junk = "HTTP/2 200
-x-ratelimit-remaining: lots
-x-ratelimit-limit: 60
-";
-        let h = super::parse_rate_limit_headers(junk, now).unwrap();
-        assert_eq!(h.remaining, None);
-        assert_eq!(h.limit, Some(60));
-        assert_eq!(super::parse_rate_limit_headers("", now), None);
-    }
-
     /// The web lane is the SAME request as the API lane with a different URL: same
     /// flags, same header, same `--` guard, no auth channel. Nothing about the transfer
     /// changes with the host — only where the bytes come from.
@@ -2280,12 +2001,11 @@ x-ratelimit-limit: 60
 
     use super::{
         CURL_ATTEMPTS, HINT_BOUNDS, HttpError, LANE_BOUNDS, RELEASE_ASSET_DOWNLOAD_BOUND,
-        api_get_args, api_get_args_dumping, api_get_quick_args, curl_argv, curl_bin, curl_fetch,
-        curl_prepared, download_bytes_args, download_max_time_secs, download_resume_args,
-        download_resume_args_https_only, download_to_args, download_to_resumable,
-        download_to_resumable_https_only, head_args, keep_partial, keep_partial_after_failure,
-        location_header, part_path, range_refused, resume_plan, token_config_safe,
-        transient_api_status, vendor_get_args,
+        api_get_args, curl_argv, curl_bin, curl_fetch, curl_prepared, download_bytes_args,
+        download_max_time_secs, download_resume_args, download_resume_args_https_only,
+        download_to_args, download_to_resumable, download_to_resumable_https_only, head_args,
+        keep_partial, keep_partial_after_failure, location_header, part_path, range_refused,
+        resume_plan, token_config_safe, transient_api_status, vendor_get_args,
     };
     use std::process::Command;
 
@@ -2713,73 +2433,13 @@ x-ratelimit-limit: 60
             );
         }
     }
-    /// The historical lane must be BYTE-IDENTICAL. `api_get_classified` delegates to the
-    /// header-dumping form, so the one thing that could regress every existing caller is
-    /// the argv growing a flag; with no sink it must be exactly the list it always was.
-    #[test]
-    fn the_plain_lane_argv_is_unchanged() {
-        assert_eq!(
-            api_get_args_dumping(None),
-            api_get_args().to_vec(),
-            "a plain GET must spawn the historical option list, unchanged"
-        );
-    }
-
-    #[test]
-    fn a_listing_hint_has_one_short_bounded_anonymous_get() {
-        let args = api_get_quick_args();
-        assert!(args.windows(2).any(|pair| pair == ["--max-time", "5"]));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--connect-timeout", "3"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--max-filesize", "16777216"])
-        );
-        assert!(!args.contains(&"--retry"));
-        let argv = curl_argv(
-            &args,
-            "https://api.github.com/repos/alabsystems/aterm/releases?per_page=100&page=1",
-            false,
-        );
-        assert!(!argv.iter().any(|arg| arg == "--config"));
-        assert_eq!(argv[argv.len() - 2], "--");
-    }
-
-    /// …and a header-dumping one adds EXACTLY one flag pair, in front of the `--` marker
-    /// `curl_argv` appends (callers must never place their own — the v0.5.10 bricking
-    /// regression).
-    #[test]
-    fn a_header_dump_adds_exactly_the_sink() {
-        let args = api_get_args_dumping(Some("/tmp/aterm-updates/list.headers"));
-        let base = api_get_args().len();
-        assert_eq!(
-            args.len(),
-            base + 2,
-            "one flag pair and nothing else: {args:?}"
-        );
-        assert_eq!(args[base], "--dump-header");
-        assert_eq!(args[base + 1], "/tmp/aterm-updates/list.headers");
-        assert!(
-            !args.contains(&"--"),
-            "no caller-side end-of-options marker: {args:?}"
-        );
-        // The base list survives verbatim underneath.
-        assert_eq!(&args[..base], &api_get_args()[..]);
-        // The GitHub listing lane never asks conditionally: a 304 there still spends the
-        // anonymous rate limit (cdn.rs). Only `vendor_get` sends If-None-Match.
-        assert!(!args.iter().any(|a| a.starts_with("If-None-Match")));
-    }
-
     /// Conditional requests exist ONLY on the vendor lane: no GitHub lane's option list
-    /// carries an `If-None-Match`, with or without a header sink.
+    /// carries an `If-None-Match`.
     #[test]
     fn only_the_vendor_lane_asks_conditionally() {
         let cap = "1024";
-        let lanes: [Vec<&str>; 6] = [
+        let lanes: [Vec<&str>; 5] = [
             api_get_args().to_vec(),
-            api_get_args_dumping(Some("/tmp/aterm-updates/list.headers")),
             head_args().to_vec(),
             download_bytes_args(cap).to_vec(),
             download_to_args(cap, "600", "/tmp/x").to_vec(),

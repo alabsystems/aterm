@@ -119,24 +119,6 @@ fn main() -> ExitCode {
 
     // --- the front door -----------------------------------------------------
 
-    // THE HIDDEN HELPER VERBS, routed by NAME and not by argv0. The untracked lane
-    // submits a launchd job that runs THIS binary on `__stage-payload` / `__lay-files`,
-    // and since the provenance fix it runs an untagged binary IN PLACE — under whatever
-    // name it has on disk, which for the shipped app is `…/Contents/MacOS/aterm`. The
-    // argv0 alias only fires for a binary literally named `atpkg` (a byte COPY is), so
-    // the in-place arm arrived here and died in the mode fork: measured 2026-09-13 on the
-    // installed bundle binary, exit 2 and `aterm-gui: unknown option '__lay-files'`, which
-    // made `aterm pkg install` from the shipped app refuse with a fresh message. They are
-    // dispatched above the verb match for the same reason `atpkg`'s own CLI dispatches
-    // them above its: they are unlisted, they are not `aterm_cli::Verb`s, and no roster
-    // or help surface may grow a row for them.
-    if first == atpkg::stage_helper::HIDDEN_VERB
-        || first == atpkg::lay::HIDDEN_VERB
-        || first == atpkg::seam::HIDDEN_VERB
-    {
-        return atpkg::cli::main_entry(rest.to_vec());
-    }
-
     // THE RETIRED HOOK SHAPE `<aterm> hook run <event> …` — what `aterm link hook
     // install` wrote on 2026-09-14 before 7bcb0503a spelled it `link hook run`. It
     // is not a verb and joins no roster: it reaches the fabric bridge's retired
@@ -536,7 +518,7 @@ fn main() -> ExitCode {
     //
     //  -  under the MACHINE-WIDE rule the window's loop runs its six-hour walk on
     //     (`pkg_check::full_pass_owed`: never succeeded, or the last success six hours
-    //     old; no pass installing now or attempted anywhere on the machine in the last
+    //     old; no pass installing now or ended anywhere on the machine in the last
     //     five minutes, and none that failed in the last six hours, so a pass that keeps
     //     failing is retried once per interval, not by every tab, and no tab queues a
     //     waiter behind a pass in flight), a DETACHED one-shot `aterm pkg update` — its own process group,
@@ -559,17 +541,17 @@ fn main() -> ExitCode {
     // (then also spelled `auto_update = false`, or an environment kill switch), or simply
     // a pass that ran an hour ago, never got them from this lane at all. They take no store lock, need no index and
     // no network, and `machine apply` prints nothing when nothing changed — but they walk
-    // `$HOME`, so the lane runs them ONCE A DAY, on its own stamp beside `status.toml`
-    // (`machine-apply.stamp`), not at every launch. Interactive launches only, for the
-    // same reason the pass above is gated that way: a harness driving a session over
-    // pipes must not touch the real machine.
+    // `$HOME`, so they run ONCE A DAY, on the slot a window's launch claims too
+    // (`atpkg::machine::launch_apply_due`), not at every launch. Interactive launches only,
+    // for the same reason the pass above is gated that way: a harness driving a session
+    // over pipes must not touch the real machine.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     if cfg!(target_os = "macos")
         && session_lane_is_interactive()
         && let Some(layout) = layout.as_ref()
-        && machine_apply_due(layout, now)
+        && atpkg::machine::launch_apply_due(layout, now)
     {
         spawn_detached_machine_apply();
     }
@@ -655,22 +637,6 @@ fn session_lane_is_interactive() -> bool {
     stdin_is_terminal() && aterm_cli::session_model_seam().is_none()
 }
 
-/// How often a terminal session runs `aterm pkg machine apply`: once a day, on the lane's
-/// own claim. The window runs it as it opens, a package pass after an edit to `[machine]`
-/// (or an apply that did not finish), and Settings' Apply now at once.
-const MACHINE_APPLY_EVERY_SECS: u64 = 24 * 60 * 60;
-
-/// Whether this launch runs the daily `aterm pkg machine apply`: it claims the lane's
-/// once-a-day slot in `machine-apply.stamp` (Phase 3). The walk of `$HOME` it costs used
-/// to run at EVERY session launch — every tab.
-fn machine_apply_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
-    aterm_update_core::pkg_check::claim(
-        &layout.machine_apply_stamp(),
-        now_unix,
-        MACHINE_APPLY_EVERY_SECS,
-    )
-}
-
 /// Whether this launch spawns the detached pass: the MACHINE-WIDE rule the window's loop
 /// runs its six-hour walk on ([`aterm_update_core::pkg_check::full_pass_owed`]) over the
 /// stamps every lane reads ([`atpkg::status::pass_stamps`]: the outcome the last pass
@@ -689,7 +655,7 @@ fn session_pass_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
 }
 
 /// One DETACHED `aterm pkg machine apply` — the lock-free host settings, once a day
-/// ([`machine_apply_due`]).
+/// ([`atpkg::machine::launch_apply_due`]).
 ///
 /// Separate from [`spawn_detached_pkg_update`] because the two are gated differently on
 /// purpose: a package pass is due or it is not, and a user may switch it off entirely;
@@ -1879,8 +1845,8 @@ mod tests {
     /// `[packages] enabled = false` (then also `auto_update = false`, or an environment
     /// kill switch, both gone since 2026-09-23, or simply a pass that ran an hour ago)
     /// got them from this lane never. Since Phase 3
-    /// (2026-09-22) the gate is their own daily claim ([`machine_apply_due`]), not every
-    /// launch. A scrape, in the idiom of atpkg's own placement test, because the
+    /// (2026-09-22) the gate is the daily claim ([`atpkg::machine::launch_apply_due`]),
+    /// not every launch. A scrape, in the idiom of atpkg's own placement test, because the
     /// alternative is spawning a real detached child in a unit test.
     #[test]
     fn the_session_lane_applies_the_machine_settings_outside_every_package_gate() {
@@ -1901,7 +1867,7 @@ mod tests {
         );
         assert!(start <= call);
         let daily = src[..call]
-            .rfind("&& machine_apply_due(layout, now)")
+            .rfind("&& atpkg::machine::launch_apply_due(layout, now)")
             .expect("the one-shot is gated on its daily claim");
         assert!(
             !src[daily..call].contains("packages.enabled()"),
@@ -1931,10 +1897,11 @@ mod tests {
     }
 
     /// THE SESSION LANE'S DUE RULE (Phase 3): the machine-wide rule — never checked or six
-    /// hours since the last success, and no pass attempted anywhere in the last five
-    /// minutes — then the lane's own claim, so the second of two tabs opened together
-    /// spawns nothing. A fresh success, or a sibling's attempt a minute ago, is no pass.
-    /// (A record that shows only FAILED attempts is the next test's.)
+    /// hours since the last success, and no pass ended anywhere in the last five minutes —
+    /// then the lane's own claim, so the second of two tabs opened together spawns nothing.
+    /// A fresh success, or a sibling's pass that failed a minute ago, is no pass; a vendor
+    /// door's later write (`updated_at` alone) is no pass either. (A record that shows only
+    /// FAILED passes is the next test's.)
     #[test]
     fn the_session_pass_is_due_on_the_machine_rule_and_claimed_once() {
         let layout = scratch_layout("pass");
@@ -1964,6 +1931,18 @@ mod tests {
         let walk = i64::try_from(aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS).unwrap();
         assert!(!session_pass_due(&layout, success + walk - 1));
         assert!(session_pass_due(&layout, success + walk), "six hours on");
+        // A vendor door wrote a row an hour after that success: no pass, nothing held back.
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2026-09-21T14:00:00Z\"\n\
+             last_success_at = \"2026-09-21T13:00:00Z\"\n",
+        )
+        .unwrap();
+        let claim = i64::try_from(aterm_update_core::pkg_check::PASS_SPACING_SECS).unwrap();
+        assert!(
+            session_pass_due(&layout, success + walk + claim),
+            "six hours on, past the last claim: owed"
+        );
         // A sibling's pass ended a minute ago and recorded a failure: the walk waits for what
         // it left, and then the interval after it, not five minutes (the next test).
         std::fs::write(
@@ -1997,11 +1976,11 @@ mod tests {
     }
 
     /// A PASS THAT KEEPS FAILING IS NOT RESPAWNED BY EVERY TAB (the 2026-09-10 rule, kept
-    /// through Phase 3): a record whose passes never succeed — an unserved triple exits 2
-    /// and stamps no success — owes nothing for the interval after its last attempt, as the
-    /// lane's old attempt-age rule answered; the spacing alone would have let a tab opened
-    /// five minutes on spawn another detached pass. And a pass INSTALLING now is not queued
-    /// behind: no unobserved waiter per tab.
+    /// through Phase 3): a record whose passes never reach the index — a proxy that refuses
+    /// the download host stamps a failure each time — owes nothing for the interval after
+    /// its last failure; the spacing alone would have let a tab opened five minutes on spawn
+    /// another detached pass. And a pass INSTALLING now is not queued behind: no unobserved
+    /// waiter per tab.
     #[test]
     fn a_failing_or_running_pass_is_not_respawned_by_every_tab() {
         let layout = scratch_layout("failing");
@@ -2047,60 +2026,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&layout.prefix);
         let _ = std::fs::remove_dir_all(&fresh.prefix);
-    }
-
-    /// NO TAB SPAWNS INSIDE A RATE-LIMIT HOLD (§3.2 of the 2026-09-22 design), and reads
-    /// none to get there: a hold is recorded only with a pass's end — as atpkg's own writer
-    /// lays it here, a success a day old, then a rate-limited pass that failed, or one the
-    /// cache stood in for — and that end holds the tab's rule an interval, past any reset.
-    #[test]
-    fn a_rate_limit_hold_is_outlasted_by_the_pass_that_recorded_it() {
-        use aterm_update_core::pkg_check::{FULL_PASS_INTERVAL_SECS, PassOutcome, rfc3339_to_unix};
-        let walk = i64::try_from(FULL_PASS_INTERVAL_SECS).unwrap();
-        for (label, outcome) in [
-            ("held-failed", PassOutcome::Failed),
-            ("held-ok", PassOutcome::Ok),
-        ] {
-            let layout = scratch_layout(label);
-            let ended = "2026-09-22T13:00:00Z";
-            let end = rfc3339_to_unix(ended).expect("stamp");
-            let success = if outcome == PassOutcome::Ok {
-                ended
-            } else {
-                "2026-09-21T13:00:00Z"
-            };
-            atpkg::status::stamp_success(&layout, success).unwrap();
-            atpkg::status::stamp_pass_end(
-                &layout,
-                ended,
-                outcome,
-                atpkg::status::MeteredHold::Until(end + 20 * 60),
-            )
-            .unwrap();
-            for at in [end + 60, end + 20 * 60, end + walk - 1] {
-                assert!(!session_pass_due(&layout, at), "{label} at +{}", at - end);
-            }
-            assert!(
-                session_pass_due(&layout, end + walk),
-                "{label}: an interval on"
-            );
-            let _ = std::fs::remove_dir_all(&layout.prefix);
-        }
-    }
-
-    /// The `[machine]` one-shot runs once a day from the session lane, not at every
-    /// launch: the first launch claims the day, the rest of it spawns nothing.
-    #[test]
-    fn the_machine_one_shot_is_claimed_once_a_day() {
-        let layout = scratch_layout("machine");
-        let now = 1_790_000_000_i64;
-        let day = i64::try_from(MACHINE_APPLY_EVERY_SECS).unwrap();
-        assert!(machine_apply_due(&layout, now));
-        assert!(!machine_apply_due(&layout, now + 60));
-        assert!(!machine_apply_due(&layout, now + day - 1));
-        assert!(machine_apply_due(&layout, now + day));
-        assert!(layout.machine_apply_stamp().is_file());
-        let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
     /// The detached pass runs on the window's argv — the lock wait and the progress file

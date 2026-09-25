@@ -773,44 +773,69 @@ mod tests {
         assert_eq!(got.as_deref(), Some(hint.as_path()));
     }
 
-    /// Assert one cell against its row in [`measured::CELLS`]. Every count the
-    /// baseline carries is checked at once, so a cell needs exactly one test
-    /// and an extraction needs exactly one edit — in `measured.rs`, not here.
-    fn assert_matches_baseline(cell_index: usize) {
-        let want = measured::CELLS[cell_index];
+    /// Hold one cell AT OR UNDER its row in [`measured::CELLS`] AND its
+    /// ceilings in `tools/forge-budget.tsv`, and return the survey so a caller
+    /// can ask it more without a second `cargo tree`.
+    ///
+    /// Every third-party metric the TSV ratchets is a CEILING here: a cell may
+    /// shrink under its rows, and may not grow past either. Both, because
+    /// `gate forge` (the TSV's own gate) is manual: with the measured row
+    /// alone, one edit to a const in `measured.rs` would let the surface grow
+    /// under a green `verify --fast`. `measured::ratchet_agreement` keeps the
+    /// TSV at or under the measured row, so growth needs the ratchet edit.
+    /// These were equality pins until 2026-09-24, so every successful
+    /// retirement turned them red until the rows were re-copied. `resolved`
+    /// and `workspace` are not held: they are not surface, and a retirement
+    /// that lands as a new first-party crate raises them. (Two mac-arm figures
+    /// are still compared exactly elsewhere: the duplicate-name list below,
+    /// and `survey`'s report and JSON tests, which check the printed totals
+    /// against the row.)
+    fn assert_within_baseline(cell_index: usize) -> CellSurvey {
+        use crate::measured::ratchet_agreement::{load, ratcheted, tsv_ceilings};
+        let row = measured::CELLS[cell_index];
         let s = survey(cell_index);
-        assert_eq!(s.cell.name, want.cell, "baseline row is for another cell");
-        let third = s.third_party().count();
-        let got = measured::Baseline {
-            cell: want.cell,
-            resolved: s.graph.nodes.len(),
-            workspace: s.graph.nodes.len() - third,
-            third_party: third,
-            third_party_loc: s.third_party_loc(),
-            // Every build script is arbitrary code the compiler runs, and
-            // `targo trust` marks all of them `-Ztrust-verify=off`
-            // unconditionally — hence a pinned row of its own.
-            build_scripts: s.build_scripts(),
-            proc_macros: s.proc_macros(),
-            duplicate_names: s.duplicate_names().len(),
-        };
-        assert_eq!(
-            got, want,
-            "cell `{}` has moved off the measured baseline",
-            want.cell
+        assert_eq!(s.cell.name, row.cell, "baseline row is for another cell");
+        // In `ratcheted`'s order: third_party_packages, third_party_loc,
+        // build_scripts, proc_macros, duplicate_names.
+        let live = [
+            s.third_party().count() as u64,
+            s.third_party_loc(),
+            s.build_scripts() as u64,
+            s.proc_macros() as u64,
+            s.duplicate_names().len() as u64,
+        ];
+        let tsv = tsv_ceilings(&load(), cell_index);
+        let mut grown: Vec<String> = Vec::new();
+        for ((got, (metric, in_row)), (_, in_tsv)) in live.into_iter().zip(ratcheted(&row)).zip(tsv)
+        {
+            if got > in_row {
+                grown.push(format!("{metric} {got} > {in_row} (measured.rs)"));
+            }
+            if got > in_tsv {
+                grown.push(format!(
+                    "{metric} {got} > {in_tsv} (tools/forge-budget.tsv)"
+                ));
+            }
+        }
+        assert!(
+            grown.is_empty(),
+            "cell `{}` has grown past its measured baseline: {grown:?}. A deliberate \
+             addition re-measures the row in measured.rs AND ratchets \
+             tools/forge-budget.tsv (`cargo forge budget --allow-regress`), with the \
+             reason in the commit",
+            row.cell
         );
+        s
     }
 
     #[test]
-    fn mac_arm_matches_the_measured_baseline() {
-        assert_matches_baseline(0);
-    }
-
-    #[test]
-    fn mac_arm_third_party_loc_matches_the_baseline() {
-        assert_eq!(
-            survey(0).third_party_loc(),
-            measured::MAC_ARM.third_party_loc
+    fn mac_arm_stays_within_the_measured_baseline() {
+        let s = assert_within_baseline(0);
+        // macOS carries the native a11y-appkit surface; AccessKit is linux-only
+        // (see the linux test). Checked on the mac-arm survey, where it can fail.
+        assert!(
+            !s.graph.nodes.iter().any(|p| p.name == "accesskit"),
+            "macOS must not carry AccessKit — it has the native a11y-appkit path"
         );
     }
 
@@ -839,15 +864,30 @@ mod tests {
     }
 
     #[test]
-    fn linux_matches_the_measured_baseline() {
-        assert_matches_baseline(1);
+    fn linux_stays_within_the_measured_baseline() {
+        let s = assert_within_baseline(1);
+        // AccessKit is PRESENT on linux, deliberately. It was dropped from the
+        // default feature set on 2026-08-25 and made an UNCONDITIONAL linux
+        // dependency on 2026-08-26 (crates/aterm-gui/Cargo.toml, owner's call):
+        // measured with the feature off, the AT-SPI registry reports zero
+        // applications for aterm while a GTK app sits in the same registry, so a
+        // blind linux user gets no terminal at all rather than a degraded one.
+        // Asserting presence, not absence: the regression to catch is the stack
+        // silently changing shape, not the owner choosing to ship accessibility.
+        for present in ["accesskit", "accesskit_unix", "accesskit_winit"] {
+            assert!(
+                s.graph.nodes.iter().any(|p| p.name == present),
+                "`{present}` left the linux graph — linux carries the AccessKit \
+                 tree unconditionally; if that changed, linux ships no a11y surface"
+            );
+        }
     }
 
     #[test]
-    fn windows_and_both_wasm_modules_match_the_measured_baseline() {
-        assert_matches_baseline(2);
-        assert_matches_baseline(3);
-        assert_matches_baseline(4);
+    fn windows_and_both_wasm_modules_stay_within_the_measured_baseline() {
+        assert_within_baseline(2);
+        assert_within_baseline(3);
+        assert_within_baseline(4);
     }
 
     /// THE CLAIM THE TWO wasm CELLS MAKE, CHECKED RATHER THAN ASSUMED.

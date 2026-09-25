@@ -12,9 +12,10 @@
 //! Two identities close that:
 //!
 //!  * [`SourceIdentity`] — HEAD plus the working-tree state of every path that
-//!    differs from it (tracked changes, untracked non-ignored files, and edits an
-//!    assume-unchanged or skip-worktree flag hides from git), each
-//!    as a blob id and exec bit, a link target, or "absent". It is a statement
+//!    differs from it (tracked changes, untracked non-ignored files, edits an
+//!    assume-unchanged or skip-worktree flag hides from git, and each
+//!    submodule's checkout — its commit and, recursively, its own such paths),
+//!    each as a blob id and exec bit, a link target, a commit, or "absent". It is a statement
 //!    about the CONTENT a compiler would read, so the same change reads the same
 //!    whether it is staged or not, and in the caller's checkout or a snapshot
 //!    synced from it ([`crate::snapshot`] compares exactly these values).
@@ -242,8 +243,26 @@ pub enum PathState {
     Symlink {
         target: PathBuf,
     },
-    /// A directory where a path was listed (a gitlink), or anything else
-    /// that is neither a file nor a link.
+    /// A directory that is the top of a git checkout of its own — a submodule
+    /// checkout — at this commit (or `(unborn)`). Only its HEAD: what its
+    /// working tree holds beyond HEAD is captured path by path, under
+    /// `<path>/`, by [`TreeState::capture`].
+    ///
+    /// WHY (2026-09-24, when `vendor/astream` became a submodule). A gitlink
+    /// used to read as [`PathState::Other`] — "a directory" — so two checkouts
+    /// whose submodules sat at DIFFERENT commits, or held different edits,
+    /// compared equal, and a snapshot whose submodule was never populated at
+    /// all compared equal to a caller whose was: the sync's proof proved
+    /// nothing about the source cargo actually reads from there.
+    Gitlink {
+        head: String,
+    },
+    /// A submodule the index records whose checkout is not there — never
+    /// initialised, deinitialised, or its `.git` broken. A build of this tree
+    /// cannot read that source, so it is NOT the tree HEAD names.
+    Unpopulated,
+    /// Anything else that is neither a file nor a link (a plain directory
+    /// where a path was listed).
     Other,
 }
 
@@ -255,6 +274,8 @@ impl PathState {
                 format!("{} {blob}", if *exec { "100755" } else { "100644" })
             }
             PathState::Symlink { target } => format!("120000 {}", target.display()),
+            PathState::Gitlink { head } => format!("160000 {head}"),
+            PathState::Unpopulated => "unpopulated".to_string(),
             PathState::Other => "other".to_string(),
         }
     }
@@ -270,10 +291,18 @@ pub struct TreeState {
 
 impl TreeState {
     /// Capture `root`'s state. `None` when git cannot answer.
+    ///
+    /// SUBMODULES ARE PART OF THE TREE. Every gitlink the index records is
+    /// either populated — and then its own state is captured the same way,
+    /// recursively, each of its dirty paths entered as `<gitlink>/<path>`,
+    /// and the gitlink itself entered as [`PathState::Gitlink`] whenever git
+    /// lists it as differing from HEAD (another commit checked out, or dirty
+    /// content) — or it is [`PathState::Unpopulated`]. A populated submodule
+    /// exactly at its gitlink with nothing dirty adds nothing, so a clean
+    /// checkout with submodules still has no dirty state at all.
     #[must_use]
     pub fn capture(root: &Path, path_env: &OsStr) -> Option<Self> {
-        let head = stdout_line(git(root, path_env).args(["rev-parse", "--verify", "-q", "HEAD"]))
-            .unwrap_or_else(|| "(unborn)".to_string());
+        let head = head_of(root, path_env);
         // Tracked paths whose working tree differs from HEAD — staged or not,
         // which is the point: the compiler reads the working tree.
         let tracked = if head == "(unborn)" {
@@ -290,14 +319,42 @@ impl TreeState {
             ]))?
         };
         let untracked = untracked_paths(root, path_env)?;
-        let hidden = flag_hidden_edits(root, path_env)?;
+        let index = index_entries(root, path_env)?;
+        let hidden = hidden_among(root, path_env, &index)?;
         let paths: Vec<String> = split_z(&tracked)
             .into_iter()
             .chain(untracked)
             .chain(hidden)
             .filter(|p| !is_gate_state(p))
             .collect();
-        let dirty = path_states(root, path_env, &paths)?;
+        let mut dirty = path_states(root, path_env, &paths)?;
+        for link in gitlinks_among(&index) {
+            if is_gate_state(&link) {
+                continue;
+            }
+            let full = root.join(&link);
+            match std::fs::symlink_metadata(&full) {
+                // Missing: git's diff lists it as deleted, which is the same
+                // fact from the other side — the source is not there.
+                Err(_) => {
+                    dirty.insert(link, PathState::Unpopulated);
+                }
+                Ok(m) if m.is_dir() => {
+                    if !is_git_toplevel(&full, path_env) {
+                        dirty.insert(link, PathState::Unpopulated);
+                        continue;
+                    }
+                    let sub = Self::capture(&full, path_env)?;
+                    for (p, s) in sub.dirty {
+                        dirty.insert(format!("{link}/{p}"), s);
+                    }
+                }
+                // A file or link where a submodule belongs is already listed by
+                // the diff, as what it is. Never followed: a link to an
+                // ancestor would recurse forever.
+                Ok(_) => {}
+            }
+        }
         Some(Self { head, dirty })
     }
 
@@ -394,21 +451,79 @@ fn split_z(bytes: &[u8]) -> Vec<String> {
 /// index says. An unedited flagged file matches its entry and is not listed.
 #[must_use]
 pub fn flag_hidden_edits(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
+    hidden_among(root, path_env, &index_entries(root, path_env)?)
+}
+
+/// One index entry, as `git ls-files -v -s` prints it.
+struct IndexEntry {
+    /// The `-v` tag: lowercase for assume-unchanged, `S` for skip-worktree.
+    tag: char,
+    mode: String,
+    blob: String,
+    path: String,
+}
+
+/// Every index entry of `root`, one `git ls-files -v -s -z` — the one listing
+/// both the flag census and the submodule census read.
+fn index_entries(root: &Path, path_env: &OsStr) -> Option<Vec<IndexEntry>> {
     let out = stdout_bytes(git(root, path_env).args(["ls-files", "-v", "-s", "-z"]))?;
     // `<tag> <mode> <blob> <stage>\t<path>`
-    let mut flagged: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut entries = Vec::new();
     for rec in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         let tab = rec.iter().position(|b| *b == b'\t')?;
         let (meta, path) = (String::from_utf8_lossy(&rec[..tab]), &rec[tab + 1..]);
         let mut fields = meta.split(' ');
         let (tag, mode, blob) = (fields.next()?, fields.next()?, fields.next()?);
-        let hidden = tag
-            .chars()
-            .next()
-            .is_some_and(|t| t.is_ascii_lowercase() || t == 'S');
-        let path = String::from_utf8_lossy(path).into_owned();
-        if hidden && !is_gate_state(&path) {
-            flagged.insert(path, (mode.to_string(), blob.to_string()));
+        entries.push(IndexEntry {
+            tag: tag.chars().next()?,
+            mode: mode.to_string(),
+            blob: blob.to_string(),
+            path: String::from_utf8_lossy(path).into_owned(),
+        });
+    }
+    Some(entries)
+}
+
+/// The gitlinks (mode 160000) among `entries`, each once, sorted.
+fn gitlinks_among(entries: &[IndexEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.mode == GITLINK_MODE)
+        .map(|e| e.path.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The index mode of a gitlink — a submodule's recorded commit.
+pub const GITLINK_MODE: &str = "160000";
+
+/// Every submodule path `root`'s index records (never the gate's own state).
+/// `None` when git cannot answer.
+#[must_use]
+pub fn gitlinks(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
+    Some(
+        gitlinks_among(&index_entries(root, path_env)?)
+            .into_iter()
+            .filter(|p| !is_gate_state(p))
+            .collect(),
+    )
+}
+
+/// `root`'s HEAD commit, or `(unborn)`.
+#[must_use]
+pub fn head_of(root: &Path, path_env: &OsStr) -> String {
+    stdout_line(git(root, path_env).args(["rev-parse", "--verify", "-q", "HEAD"]))
+        .unwrap_or_else(|| "(unborn)".to_string())
+}
+
+/// [`flag_hidden_edits`] over an index already listed.
+fn hidden_among(root: &Path, path_env: &OsStr, entries: &[IndexEntry]) -> Option<Vec<String>> {
+    let mut flagged: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for e in entries {
+        let hidden = e.tag.is_ascii_lowercase() || e.tag == 'S';
+        if hidden && !is_gate_state(&e.path) {
+            flagged.insert(e.path.clone(), (e.mode.clone(), e.blob.clone()));
         }
     }
     if flagged.is_empty() {
@@ -441,6 +556,7 @@ fn matches_index_entry(
                 && hash_stdin(path_env, target.as_os_str().as_encoded_bytes()).as_deref()
                     == Some(blob)
         }
+        Some(PathState::Gitlink { head }) => mode == GITLINK_MODE && head == blob,
         _ => false,
     }
 }
@@ -501,6 +617,9 @@ pub fn path_states(
                 files.push((p.clone(), is_exec(&m)));
                 continue;
             }
+            Ok(m) if m.is_dir() && is_git_toplevel(&full, path_env) => PathState::Gitlink {
+                head: head_of(&full, path_env),
+            },
             Ok(_) => PathState::Other,
         };
         states.insert(p.clone(), state);

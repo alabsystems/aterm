@@ -161,18 +161,6 @@ pub(crate) fn is_clone_of(src: &Path, at: &Path) -> bool {
     attributes_match(&s, &a) && distinct_files(file_identity(&s), file_identity(&a))
 }
 
-/// Whether `a` and `b` are regular files (never symlinks) with the same length, permission
-/// bits and modification time, whatever their inodes — a clone of the other, or the same
-/// file. What identifies the build a view was laid from, including a view laid as hard
-/// links before clones.
-#[must_use]
-pub(crate) fn same_attributes(a: &Path, b: &Path) -> bool {
-    let (Ok(x), Ok(y)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) else {
-        return false;
-    };
-    attributes_match(&x, &y)
-}
-
 fn attributes_match(s: &std::fs::Metadata, a: &std::fs::Metadata) -> bool {
     if !s.is_file() || !a.is_file() {
         return false;
@@ -399,10 +387,9 @@ mod tests {
             .set_modified(t)
             .unwrap();
         assert!(
-            same_attributes(&trustc, &rustc),
-            "length, mode and time cannot tell them apart"
+            is_clone_of(&trustc, &rustc),
+            "length, mode and time cannot tell them apart, so neither can the clone identity"
         );
-        assert!(is_clone_of(&trustc, &rustc), "nor can the clone identity");
         assert!(!same_bytes(&trustc, &rustc).unwrap(), "the bytes can");
         let clone = dir.join("clone");
         clone_file(&trustc, &clone).unwrap();

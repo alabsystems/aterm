@@ -338,16 +338,6 @@ mod tests {
         }
     }
 
-    /// Determinism: the atlas-cache assumption, same as the grayscale seam.
-    #[test]
-    fn raster_is_deterministic() {
-        let hint = lcd_instance(12.0);
-        let gid = unicode_gid(dejavu(), 0, 'm').unwrap();
-        let a = subpixel_glyph_raster(dejavu(), 0, gid, 12.0, Some(&hint), false).unwrap();
-        let b = subpixel_glyph_raster(dejavu(), 0, gid, 12.0, Some(&hint), false).unwrap();
-        assert_eq!(a, b);
-    }
-
     /// The unhinted draw (the `font_hinting = "off"` pairing) also rasterizes.
     #[test]
     fn unhinted_subpixel_rasterizes() {

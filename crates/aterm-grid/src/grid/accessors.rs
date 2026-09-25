@@ -1231,30 +1231,4 @@ impl Grid {
     pub(crate) fn detach_scrollback(&mut self) -> Option<aterm_scrollback::ScrollbackStorage> {
         self.storage.scrollback.take()
     }
-
-    /// Intern a style and return its ID.
-    #[cfg(test)]
-    pub(crate) fn intern_style(&mut self, style: crate::Style) -> crate::StyleId {
-        self.storage.styles.intern(style)
-    }
-
-    /// Get a style by its ID.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn get_style(&self, id: crate::StyleId) -> Option<&crate::Style> {
-        self.storage.styles.get(id)
-    }
-
-    /// Get style table statistics.
-    #[cfg(any(test, feature = "testing"))]
-    #[must_use]
-    pub fn style_stats(&self) -> crate::style::StyleTableStats {
-        self.storage.styles.stats()
-    }
-
-    /// Clear all styles except the default.
-    #[cfg(test)]
-    pub(crate) fn clear_styles(&mut self) {
-        self.storage.styles.clear();
-    }
 }

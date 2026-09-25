@@ -7,9 +7,10 @@
 //!
 //! Every number below is a real measurement of this checkout, taken by the very
 //! code the tests exercise (`cargo forge survey`, cross-checked against
-//! `tools/forge-budget.tsv`). They stay PINNED on purpose: a graph that moves
-//! without anyone deciding it should move is exactly the failure this crate was
-//! built to catch, and an assertion is the only thing that notices.
+//! `tools/forge-budget.tsv`). The cell rows are CEILINGS in `loc`'s tests: a
+//! graph that grows without anyone deciding it should is exactly the failure
+//! this crate was built to catch, and an assertion is the only thing that
+//! notices.
 //!
 //! They live in ONE file for an equally deliberate reason. The entire point of
 //! forge is that the third-party surface SHRINKS. Before this module, every
@@ -24,10 +25,21 @@
 //! # These are not the ratchet
 //!
 //! `tools/forge-budget.tsv` is the ratchet: it enforces that the surface only
-//! ever decreases, and `cargo forge budget` is the gate on it. This module is
-//! the EQUALITY pin — "the graph is exactly this today" — which catches motion
-//! in either direction, including motion the ratchet is happy about but nobody
-//! asked for.
+//! ever decreases, and `cargo forge budget` is the gate on it — a manual one
+//! (`gate forge` is outside the `verify --fast` ladder). This module is the
+//! ceiling `cargo test -p aterm-forge` holds automatically, and the two are
+//! TIED by `ratchet_agreement` (below): every cell must have all five ratchet rows
+//! (a missing row is only an advisory UNRATCHETED line to the gate), no TSV
+//! ceiling may sit above its row here, and `loc`'s cell tests hold the live
+//! graph under BOTH files — so growing the surface takes an edit to the TSV,
+//! not just to a const in this file.
+//!
+//! These rows were EQUALITY pins until 2026-09-24, catching motion in either
+//! direction; the downward half made every retirement a red suite until the
+//! rows were re-copied, so it was dropped. A retirement now leaves this file
+//! alone, `cargo forge budget --update` lowers the TSV, and everything stays
+//! green. The dominator anchors below are RECORDS of what was measured, not
+//! asserted by any test: re-measure one with `cargo forge blame`.
 //!
 //! # Re-measuring
 //!
@@ -514,7 +526,8 @@ pub struct Baseline {
 //     CLASSIFIER FIX, not a re-measurement of the same question. The first
 //     pass of this note read ten, because `loc::measure` decided
 //     `is_third_party` from a DIRECTORY PREFIX: everything not under `crates/`
-//     was somebody else's code. `vendor/astream` is a copy of
+//     was somebody else's code. `vendor/astream` was then a copy of (and
+//     since 2026-09-24 is a git submodule of)
 //     `github.com/alabsystems/astream`, whose owner is this repository's
 //     owner — the same account, not a similar name — vendored for a BUILD
 //     reason and reached by `path = …`, so the prefix rule billed 3 packages
@@ -660,6 +673,28 @@ pub struct Baseline {
 //     browser modules never reach `aterm-gui`, so [`WASM_CPU`] and
 //     [`WASM_GPU`] are untouched.
 //
+// RE-MEASURED 2026-09-24 — `aterm-sysprobe` ENTERED EVERY NATIVE CELL, one
+//     workspace crate and nothing else. The strain row (design §10.14,
+//     ruling 210) reads the machine — Mach host statistics, `sysctlbyname`,
+//     libproc and `NSProcessInfo` on macOS, pure `/proc` parsers for Linux —
+//     through `crates/aterm-sysprobe`, and `aterm-gui` depends on it, so every
+//     cell that ships the window moves by one. Measured with `cargo forge
+//     survey` over all six native cells on this tree, not inferred from the
+//     edge:
+//
+//       mac-arm   123 -> 124 resolved, 76 -> 77 workspace
+//       linux     273 -> 274, 78 -> 79
+//       win       163 -> 164, 72 -> 73
+//       mac-x64, linux-arm, win-arm: identical to their siblings, as always
+//
+//     Nothing else moves by a line on any cell: its dependencies are
+//     `aterm-messages` everywhere and, on macOS only, `libc` (the first-party
+//     one) and `aterm-objc` — all three already in every graph that reaches
+//     them — so third-party packages, LOC, build scripts, proc macros and
+//     duplicate names all stand, and `tools/forge-budget.tsv` does not move.
+//     The browser modules never reach `aterm-gui`, so [`WASM_CPU`] and
+//     [`WASM_GPU`] are untouched.
+//
 // RE-MEASURED 2026-09-15 — THE winit FORK GREW BY 610 LINES, and nothing else
 //     moved anywhere. Two commits landed in `vendor/winit` after the round-13
 //     re-pin (dd444ac8b, the commit these constants were last measured at), and
@@ -760,8 +795,8 @@ pub struct Baseline {
 //     column.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 123,
-    workspace: 76,
+    resolved: 124,
+    workspace: 77,
     third_party: 47,
     third_party_loc: 441_498,
     build_scripts: 10,
@@ -771,8 +806,8 @@ pub const MAC_ARM: Baseline = Baseline {
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 273,
-    workspace: 78,
+    resolved: 274,
+    workspace: 79,
     third_party: 195,
     third_party_loc: 2_789_707,
     build_scripts: 32,
@@ -782,8 +817,8 @@ pub const LINUX: Baseline = Baseline {
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 163,
-    workspace: 72,
+    resolved: 164,
+    workspace: 73,
     third_party: 91,
     third_party_loc: 3_588_067,
     build_scripts: 19,
@@ -861,8 +896,8 @@ pub const WASM_GPU: Baseline = Baseline {
 /// every field.
 pub const MAC_X64: Baseline = Baseline {
     cell: "mac-x64",
-    resolved: 123,
-    workspace: 76,
+    resolved: 124,
+    workspace: 77,
     third_party: 47,
     third_party_loc: 441_498,
     build_scripts: 10,
@@ -874,8 +909,8 @@ pub const MAC_X64: Baseline = Baseline {
 /// Identical to [`LINUX`] in every field.
 pub const LINUX_ARM: Baseline = Baseline {
     cell: "linux-arm",
-    resolved: 273,
-    workspace: 78,
+    resolved: 274,
+    workspace: 79,
     third_party: 195,
     third_party_loc: 2_789_707,
     build_scripts: 32,
@@ -887,8 +922,8 @@ pub const LINUX_ARM: Baseline = Baseline {
 /// ARM64 host. Identical to [`WIN`] in every field.
 pub const WIN_ARM: Baseline = Baseline {
     cell: "win-arm",
-    resolved: 163,
-    workspace: 72,
+    resolved: 164,
+    workspace: 73,
     third_party: 91,
     third_party_loc: 3_588_067,
     build_scripts: 19,
@@ -947,20 +982,17 @@ pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 0;
 
 /// One measured `dom(C) = reach(root) \ reach(root, block C)`.
 ///
-/// These are the regression teeth: a dominator is the only honest answer to
-/// "what does this dependency cost", and it moves for reasons a package count
-/// alone never shows — see [`MAC_ARM_DOMINATORS`] on `wgpu`.
+/// A dominator is the only honest answer to "what does this dependency cost",
+/// and it moves for reasons a package count alone never shows — see
+/// [`MAC_ARM_DOMINATORS`] on `wgpu`. The rows are recorded measurements; since
+/// 2026-09-24 no test re-asserts them (the cell ceilings in `loc` do the
+/// bounding, and `dominator`'s tests check the shape of every real cost).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dom {
     pub name: &'static str,
     /// The version, when the NAME alone does not identify one package in the
-    /// cell. `None` asserts uniqueness — the test fails loudly if a name it
-    /// was given without a version later resolves twice, which is a real
-    /// change worth seeing. `Some` is required for a duplicated name: five of
-    /// them exist on mac-arm ([`MAC_ARM_DUPLICATE_NAMES`]). None of the five
-    /// anchors is currently a duplicated name, so every one carries `None` —
-    /// which means the anchors also assert, as a side effect, that no anchor has
-    /// silently started resolving twice.
+    /// cell; `None` means the name resolved once when it was measured. `Some`
+    /// is required for a duplicated name ([`MAC_ARM_DUPLICATE_NAMES`]).
     pub version: Option<&'static str>,
     /// Packages removed, INCLUDING the target. A leaf costs 1, never 0.
     pub pkgs: usize,
@@ -968,8 +1000,9 @@ pub struct Dom {
     pub loc: u64,
 }
 
-/// The mac-arm anchors, in dominator-LOC order — which makes this list exactly
-/// the head of `dominator::ranked`, and the ranking test asserts that.
+/// The mac-arm anchors, in dominator-LOC order — the head of
+/// `dominator::ranked` when last measured (a test asserted that until
+/// 2026-09-24).
 ///
 /// `wgpu` GREW here TWICE, for the same reason both times — a package two
 /// parents held in is billed to neither, and retiring one parent leaves the
@@ -1223,135 +1256,112 @@ pub const UREQ_DESIGN_NOTE: Dom = Dom {
     loc: 71_834,
 };
 
+/// THE TIE BETWEEN THIS FILE AND `tools/forge-budget.tsv`, read without a
+/// `cargo tree` (the TSV alone, in milliseconds).
+///
+/// The repository keeps the same measurement in two places, and only this one
+/// is under an automatic gate. On 2026-08-30 they had drifted 12 to 14
+/// packages apart on every cell with nobody told, and two judged escapes
+/// followed: deleting a scope's rows from the TSV outright (the whole
+/// `wasm-gpu` scope) left the gate GREEN — the figures fall to an advisory
+/// "UNRATCHETED" list — and the metrics nothing compared could be hand-raised
+/// in the TSV alone, bypassing `--allow-regress`'s reason rule.
+///
+/// The relation held is `TSV ceiling <= measured row`, not equality: a
+/// retirement lowers the TSV (`--update`) and leaves this file alone. The
+/// other direction — a const here raised with the TSV left where it was — is
+/// caught by `loc`'s cell tests, which hold the live graph under both.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::resolve::default_cells;
+pub(crate) mod ratchet_agreement {
+    use super::{Baseline, CELLS};
+    use crate::budget::{self, Row};
 
-    /// The table is indexed by cell position elsewhere, so the positions must
-    /// agree with the cell matrix or a test would pin the wrong cell's numbers.
-    #[test]
-    fn the_baseline_rows_line_up_with_the_cell_matrix() {
-        let cells = default_cells();
-        assert_eq!(cells.len(), CELLS.len());
-        for (cell, base) in cells.iter().zip(CELLS) {
-            assert_eq!(cell.name, base.cell, "baseline row out of order");
-        }
+    /// The ratchet's scope string for each [`CELLS`] row, in order. Not derived
+    /// from the triple: `wasm32-unknown-unknown` carries two cells, so the
+    /// browser modules append their handle (`budget::scope_of`). Spelled out
+    /// rather than recomputed so a change to either side of the pairing is a
+    /// diff.
+    const SCOPES: [(&str, &str); 8] = [
+        ("mac-arm", "shipped.aarch64-apple-darwin"),
+        ("linux", "shipped.x86_64-unknown-linux-gnu"),
+        ("win", "shipped.x86_64-pc-windows-msvc"),
+        ("wasm-cpu", "shipped.wasm32-unknown-unknown.wasm-cpu"),
+        ("wasm-gpu", "shipped.wasm32-unknown-unknown.wasm-gpu"),
+        ("mac-x64", "shipped.x86_64-apple-darwin"),
+        ("linux-arm", "shipped.aarch64-unknown-linux-gnu"),
+        ("win-arm", "shipped.aarch64-pc-windows-msvc"),
+    ];
+
+    /// The five per-cell metrics the TSV ratchets, in its spelling, with
+    /// `base`'s figure for each. (`packages` is the sixth shipped metric and
+    /// is deliberately unseeded there — `budget`'s module doc says why.)
+    pub(crate) fn ratcheted(base: &Baseline) -> [(&'static str, u64); 5] {
+        [
+            ("third_party_packages", base.third_party as u64),
+            ("third_party_loc", base.third_party_loc),
+            ("build_scripts", base.build_scripts as u64),
+            ("proc_macros", base.proc_macros as u64),
+            ("duplicate_names", base.duplicate_names as u64),
+        ]
     }
 
-    /// Internal arithmetic, checked here so no per-cell test has to restate it.
+    /// The real `tools/forge-budget.tsv`. An absent or empty file is NOT
+    /// skipped: it is every row missing at once.
+    pub(crate) fn load() -> Vec<Row> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/aterm-forge sits two levels under the workspace root");
+        budget::load(root).unwrap_or_else(|e| panic!("{}: {e}", budget::BUDGET_PATH))
+    }
+
+    /// The TSV ceiling for each of [`ratcheted`]'s metrics in cell `index`,
+    /// in the same order. A missing row PANICS, by scope and metric.
+    pub(crate) fn tsv_ceilings(rows: &[Row], index: usize) -> [(&'static str, u64); 5] {
+        let (cell, scope) = SCOPES[index];
+        assert_eq!(CELLS[index].cell, cell, "CELLS order changed");
+        ratcheted(&CELLS[index]).map(|(metric, _)| {
+            let ceiling = rows
+                .iter()
+                .find(|r| r.scope == scope && r.metric == metric)
+                .map(|r| r.ceiling)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{cell}: {} has NO `{metric}` row for scope `{scope}`. A measured \
+                         cell with no ratchet row is a SILENT GREEN — the gate lists its \
+                         figure as advisory and moves on — and `--update` cannot add rows, \
+                         so nothing but this assertion holds the scope in the file. Write \
+                         the row.",
+                        budget::BUDGET_PATH
+                    )
+                });
+            (metric, ceiling)
+        })
+    }
+
     #[test]
-    fn every_row_partitions_its_graph_into_workspace_and_third_party() {
-        for base in CELLS {
-            assert_eq!(
-                base.workspace + base.third_party,
-                base.resolved,
-                "cell `{}` does not partition",
-                base.cell
-            );
-            assert!(base.third_party_loc > 0 && base.proc_macros > 0);
+    fn every_cell_has_all_five_ratchet_rows_and_none_above_its_measured_row() {
+        let rows = load();
+        for (index, base) in CELLS.iter().enumerate() {
+            for ((metric, ceiling), (_, measured)) in
+                tsv_ceilings(&rows, index).into_iter().zip(ratcheted(base))
+            {
+                assert!(
+                    ceiling <= measured,
+                    "{}: {} ceiling for `{metric}` is {ceiling}, above measured::{}'s \
+                     {measured}. A TSV row raised alone skips `--allow-regress`'s reason \
+                     rule; a deliberate raise re-measures the row here in the same change.",
+                    base.cell,
+                    budget::BUDGET_PATH,
+                    base.cell.to_uppercase().replace('-', "_"),
+                );
+            }
         }
     }
 }
 
 #[cfg(test)]
-mod ratchet_agreement {
-    use super::*;
-
-    /// THE TRIPWIRE THAT WAS MISSING. This repository keeps the same
-    /// measurement in TWO places — the ceilings in `tools/forge-budget.tsv`
-    /// (enforced by `cargo run -p xtask -- gate forge`) and the baselines above
-    /// (enforced only by `cargo test -p aterm-forge`) — and only one of them is
-    /// in the required gate.
-    ///
-    /// So they drifted, and nobody was told. Every retirement wave ran
-    /// `cargo forge budget --update` and left this file alone, until on
-    /// 2026-08-30 the baselines were **12 to 14 packages stale on every cell**:
-    /// mac-arm claimed 101 packages / 1,487,430 LOC against a live 89 /
-    /// 1,248,254, and `cargo test -p aterm-forge` had been RED with 13 failures
-    /// for several waves. The largest single stale row asserted a dominator for
-    /// `libc`, which by then was not third-party at all — it had been retired to
-    /// the workspace member `crates/aterm-libc`.
-    ///
-    /// The two files are re-derived from the same live graph by the same code,
-    /// so EQUALITY is the honest relation, not "ceiling >= baseline". Slack
-    /// between them is exactly the state that hid the drift. A wave that
-    /// ratchets one and forgets the other now fails here immediately, naming
-    /// both numbers.
-    #[test]
-    fn the_ratchet_and_these_baselines_are_the_same_measurement() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("crates/aterm-forge sits two levels under the workspace root")
-            .to_path_buf();
-        let rows = match crate::budget::load(&root) {
-            Ok(r) => r,
-            // A checkout with no ratchet file yet is not a drift.
-            Err(_) => return,
-        };
-        if rows.is_empty() {
-            return;
-        }
-
-        // The ratchet's scope strings, in CELLS order. Not derived from the
-        // triple: wasm32-unknown-unknown carries two cells, so the triple stopped
-        // being a unique key for a cell on 2026-08-30 and the two browser modules
-        // append their handle (`budget::scope_of`). Spelled out here rather than
-        // recomputed so that a change to either side of the pairing is a diff.
-        let scopes = [
-            ("mac-arm", "shipped.aarch64-apple-darwin"),
-            ("linux", "shipped.x86_64-unknown-linux-gnu"),
-            ("win", "shipped.x86_64-pc-windows-msvc"),
-            ("wasm-cpu", "shipped.wasm32-unknown-unknown.wasm-cpu"),
-            ("wasm-gpu", "shipped.wasm32-unknown-unknown.wasm-gpu"),
-            ("mac-x64", "shipped.x86_64-apple-darwin"),
-            ("linux-arm", "shipped.aarch64-unknown-linux-gnu"),
-            ("win-arm", "shipped.aarch64-pc-windows-msvc"),
-        ];
-        for (base, (cell, scope)) in CELLS.iter().zip(scopes) {
-            assert_eq!(base.cell, cell, "CELLS order changed");
-            let scope = scope.to_string();
-            let ceiling = |metric: &str| -> Option<u64> {
-                rows.iter()
-                    .find(|r| r.scope == scope && r.metric == metric)
-                    .map(|r| r.ceiling)
-            };
-            // EVERY metric, and the row must EXIST. Two judged escapes forced
-            // both halves: with `if let Some` arms, deleting a cell's rows from
-            // the TSV outright left the gate GREEN (the figures fell to an
-            // advisory "UNRATCHETED" list) and this suite at 149/0 — the whole
-            // `wasm-gpu` scope could vanish unbounded; and the three metrics the
-            // arms did not cover (`build_scripts`, `proc_macros`,
-            // `duplicate_names`) could be hand-raised in the TSV alone,
-            // bypassing the >=80-char-reason rule, with nothing going red.
-            let require = |metric: &str, want: u64| {
-                let got = ceiling(metric).unwrap_or_else(|| {
-                    panic!(
-                        "{cell}: tools/forge-budget.tsv has NO `{metric}` row for scope \
-                         `{scope}`. A measured cell with no ratchet row is a SILENT GREEN — \
-                         the gate lists its figures as advisory and moves on — and \
-                         `--update` cannot add rows, so nothing but this assertion holds \
-                         the scope in the file. Write the row."
-                    )
-                });
-                assert_eq!(
-                    got,
-                    want,
-                    "{cell}: tools/forge-budget.tsv says {got} for `{metric}` but \
-                     measured::{} says {want}. One measurement, two files — ratchet BOTH \
-                     in the same change.",
-                    cell.to_uppercase().replace('-', "_"),
-                );
-            };
-            require("third_party_packages", base.third_party as u64);
-            require("third_party_loc", base.third_party_loc);
-            require("build_scripts", base.build_scripts as u64);
-            require("proc_macros", base.proc_macros as u64);
-            require("duplicate_names", base.duplicate_names as u64);
-        }
-    }
-
+mod ledger_agreement {
     /// `vendor/forge.toml`'s `[forge] cells` block is a GENERATED record of
     /// [`crate::resolve::default_cells`] — `policy::seed_from_vendor` emits it
     /// and nothing reads it back for measurement. A judge proved the gap:

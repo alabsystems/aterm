@@ -38,8 +38,8 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProvenanceFacts {
     /// `atpkg::provenance::measure_tracked` — `Some(true)` tracked, `Some(false)` not,
-    /// `None` the probe could not be written or read back. Not `process_is_tracked`, which
-    /// fails closed to "tracked" and would log a guess as a measurement.
+    /// `None` the probe could not be written or read back — never a guess logged as a
+    /// measurement.
     pub(crate) tracked: Option<bool>,
     /// Neither the bundle ROOT, its executable, nor any file inside it carries
     /// `com.apple.provenance` or `com.apple.quarantine`. `None` when this process does not

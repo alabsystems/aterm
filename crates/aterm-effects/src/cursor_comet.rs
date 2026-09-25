@@ -355,48 +355,36 @@ mod tests {
             accent: 0x00C8_EAFF,
         }
     }
-    /// Disabled ⇒ no fill, no coma, fp 0 (byte-identical to the plain cursor).
-    #[test]
-    fn disabled_is_inert() {
-        let mut nc = CursorComet::default();
-        let mut out = Vec::new();
-        let f = nc.tick(
-            Some((1, 1)),
-            Instant::now(),
-            1.0,
-            geom(),
-            &CometConfig {
-                enabled: false,
-                ..cfg()
-            },
-            &mut out,
-        );
-        assert!(f.fill.is_none());
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty());
-        assert!(!nc.is_active());
-    }
 
-    /// Reduced motion / load-shed (`intensity == 0`) ⇒ fully inert even at full blaze.
+    /// Disabled, or reduced motion / load-shed (`intensity == 0`) even at full
+    /// strength ⇒ fully inert: no fill, no coma, fp 0, settled —
+    /// byte-identical to the plain cursor.
     #[test]
-    fn zero_intensity_is_inert() {
-        let mut nc = CursorComet::default();
-        let mut out = Vec::new();
-        let f = nc.tick(
-            Some((1, 1)),
-            Instant::now(),
-            1.0,
-            geom(),
-            &CometConfig {
-                intensity: 0.0,
-                ..cfg()
-            },
-            &mut out,
-        );
-        assert!(f.fill.is_none(), "reduced motion keeps the plain cursor");
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty());
-        assert!(!nc.is_active());
+    fn disabled_or_zero_intensity_is_inert() {
+        for (why, config) in [
+            (
+                "disabled",
+                CometConfig {
+                    enabled: false,
+                    ..cfg()
+                },
+            ),
+            (
+                "zero intensity",
+                CometConfig {
+                    intensity: 0.0,
+                    ..cfg()
+                },
+            ),
+        ] {
+            let mut nc = CursorComet::default();
+            let mut out = Vec::new();
+            let f = nc.tick(Some((1, 1)), Instant::now(), 1.0, geom(), &config, &mut out);
+            assert!(f.fill.is_none(), "{why}: keeps the plain cursor");
+            assert_eq!(f.fp, 0, "{why}");
+            assert!(out.is_empty(), "{why}: no additive light");
+            assert!(!nc.is_active(), "{why}: settled");
+        }
     }
 
     /// A hidden cursor draws no coma, but the fill stays resolved (harmless —

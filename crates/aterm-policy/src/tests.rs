@@ -217,16 +217,6 @@ fn hardened_denies_unmatched() {
     );
 }
 
-#[test]
-fn permissive_executes_unmatched() {
-    assert_eq!(profiles::permissive().defaults.unmatched, Response::Execute);
-}
-
-#[test]
-fn standard_warns_on_unmatched() {
-    assert_eq!(profiles::standard().defaults.unmatched, Response::Warn);
-}
-
 // ---------------------------------------------------------------------------
 // Hardened-specific invariants from techlead brief
 // ---------------------------------------------------------------------------
@@ -385,46 +375,49 @@ fn assert_snapshot_matches_engine(eng: &PolicyEngine, label: &str) {
     }
 }
 
+/// Each built-in profile's snapshot agrees with its engine (the §6.1
+/// invariant), and pins the values the profile implies at Pty origin:
+/// `(label, engine, allow_* for osc52 query/set, window ops, notifications,
+/// palette — or `None` where the profile's rules leave them to the
+/// invariant alone, nonce required)`.
 #[test]
-fn mirror_snapshot_matches_effective_response_on_permissive() {
-    let eng = PolicyEngine::new(profiles::permissive());
-    assert_snapshot_matches_engine(&eng, "permissive");
-    // Permissive's wildcard `response any` catches every Pty-origin probe
-    // with Execute, and nonce is not required.
-    let snap = eng.mirror_snapshot();
-    assert!(snap.allow_osc52_query);
-    assert!(snap.allow_osc52_set);
-    assert!(snap.allow_window_ops);
-    assert!(snap.allow_notifications);
-    assert!(snap.allow_palette_reconfigure);
-    assert!(!snap.require_shell_integration_nonce);
-}
-
-#[test]
-fn mirror_snapshot_matches_effective_response_on_standard() {
-    let eng = PolicyEngine::standard();
-    assert_snapshot_matches_engine(&eng, "standard");
-    // Standard requires the nonce; every per-field allow_* bool is observed
-    // as `true` at Pty origin because the rules' strict origin_min gates
-    // fall through to the `response any` wildcard (see engine::tests
-    // `standard_clipboard_set_from_pty_falls_through_to_unmatched`).
-    let snap = eng.mirror_snapshot();
-    assert!(snap.require_shell_integration_nonce);
-}
-
-#[test]
-fn mirror_snapshot_matches_effective_response_on_hardened() {
-    let eng = PolicyEngine::hardened();
-    assert_snapshot_matches_engine(&eng, "hardened");
-    // Hardened's unmatched-default is Drop; no rule fires at Pty origin so
-    // every allow_* probe returns Drop → bool = false.
-    let snap = eng.mirror_snapshot();
-    assert!(!snap.allow_osc52_query);
-    assert!(!snap.allow_osc52_set);
-    assert!(!snap.allow_window_ops);
-    assert!(!snap.allow_notifications);
-    assert!(!snap.allow_palette_reconfigure);
-    assert!(snap.require_shell_integration_nonce);
+fn mirror_snapshot_matches_effective_response_on_every_builtin() {
+    for (label, eng, allows, nonce) in [
+        // Permissive's wildcard `response any` catches every Pty-origin probe
+        // with Execute, and nonce is not required.
+        (
+            "permissive",
+            PolicyEngine::new(profiles::permissive()),
+            Some(true),
+            false,
+        ),
+        // Standard requires the nonce; every per-field allow_* bool is observed
+        // as `true` at Pty origin because the rules' strict origin_min gates
+        // fall through to the `response any` wildcard (see engine::tests
+        // `builtin_profile_decisions`, "standard clip set, pty").
+        ("standard", PolicyEngine::standard(), None, true),
+        // Hardened's unmatched-default is Drop; no rule fires at Pty origin so
+        // every allow_* probe returns Drop → bool = false.
+        ("hardened", PolicyEngine::hardened(), Some(false), true),
+    ] {
+        assert_snapshot_matches_engine(&eng, label);
+        let snap = eng.mirror_snapshot();
+        if let Some(allow) = allows {
+            for (field, value) in [
+                ("allow_osc52_query", snap.allow_osc52_query),
+                ("allow_osc52_set", snap.allow_osc52_set),
+                ("allow_window_ops", snap.allow_window_ops),
+                ("allow_notifications", snap.allow_notifications),
+                ("allow_palette_reconfigure", snap.allow_palette_reconfigure),
+            ] {
+                assert_eq!(value, allow, "{label}: {field}");
+            }
+        }
+        assert_eq!(
+            snap.require_shell_integration_nonce, nonce,
+            "{label}: nonce"
+        );
+    }
 }
 
 #[test]

@@ -123,12 +123,9 @@
 //!
 //! # Not decided here
 //!
-//! A root laid by a provenance-tracked process (the pass the GUI spawns) would be tagged:
-//! every file such a process creates carries com.apple.provenance, and a toolchain run from
-//! tagged files tags what it writes. (The hard-link form tagged the store itself; a clone
-//! never writes the store.) So a tracked process lays roots through the view's untracked
-//! launchd lane ([`ensure_root_with`], `crate::seam::run_view_job`) and keeps a standing
-//! root rather than lay one from this process when that lane cannot run. Not covered:
+//! A root laid by a provenance-tracked process carries com.apple.provenance, like every file
+//! such a process creates; the store heal at the end of the door clears it in place
+//! ([`crate::provenance::heal_store`], whose roots include `compat/`). Not covered:
 //! `cargo +trust clippy` (the bundle ships no `cargo-clippy`), and every
 //! consumer that runs `store/trust/current/bin` by absolute path (aterm-verify's store
 //! discovery, `tools/bootstrap-publisher.sh`, the release gates).
@@ -535,118 +532,6 @@ fn trust_tool_build(layout: &Layout, target: &Path) -> Option<u64> {
 /// name. Nothing is ever byte-copied, and a shim rendered afterwards routes only if
 /// [`route_for_shim`] still finds a complete root.
 pub fn ensure_root(layout: &Layout, build_dir: &Path, depth: Depth) -> io::Result<Ensured> {
-    // MEASURED, once per process: a probe file written into the temp dir and read back
-    // — never under `compat/`, which this function must not create for a build that
-    // needs no root and must refuse, untouched, when a link stands at its name.
-    let tracked =
-        cfg!(target_os = "macos") && crate::provenance::process_is_tracked(&std::env::temp_dir());
-    ensure_root_with(
-        layout,
-        build_dir,
-        depth,
-        tracked,
-        &crate::lay::lane_for_this_binary(),
-        crate::lay::tracked_policy(),
-    )
-}
-
-/// [`ensure_root`] with the untracked lane's three inputs explicit. The root is one clone
-/// per file of the build, and every file a provenance-tracked process creates is tagged, so
-/// a tracked process hands the laying to the launchd job the view uses
-/// ([`crate::seam::run_view_job`], a `ViewJob::Root`). When the lane cannot
-/// run: a root that already STANDS is kept as it is (one build behind at worst, refreshed
-/// next pass) rather than lay a tagged one from this process; with no root at all it is
-/// built in-process under [`crate::lay::TrackedPolicy::Allow`] (tippy would refuse the
-/// store otherwise) and its tag cleared ([`crate::provenance::heal_laid`]), and is
-/// refused under `Refuse`.
-pub fn ensure_root_with(
-    layout: &Layout,
-    build_dir: &Path,
-    depth: Depth,
-    tracked: bool,
-    lane: &crate::lay::Lane,
-    policy: crate::lay::TrackedPolicy,
-) -> io::Result<Ensured> {
-    let helper = match (tracked, lane) {
-        (true, crate::lay::Lane::Helper(exe)) => exe,
-        _ => return ensure_root_in_process(layout, build_dir, depth),
-    };
-    // Nothing to LAY — no lane needed — when the build ships one compiler as one file,
-    // when a link or a file stands where the root would go (refused, untouched, by the
-    // in-process body's own rule), or when the standing root already matches at the
-    // asked depth. Every one of those reads and never links, so the process may do it.
-    if let Some(n) = trust_build_of(layout, build_dir)
-        && (matches!(needs_root(build_dir), Ok(None))
-            || blocked(layout, n).is_some()
-            || root_matches(build_dir, &root_dir(layout, n), depth))
-    {
-        return ensure_root_in_process(layout, build_dir, depth);
-    }
-    match crate::seam::run_view_job(
-        helper,
-        layout,
-        &crate::seam::ViewJob::Root {
-            build_dir: build_dir.to_path_buf(),
-        },
-        build_dir,
-    ) {
-        Ok(line) => Ok(ensured_from_word(
-            line.strip_prefix("root ").unwrap_or(&line),
-        )),
-        Err(why) => match policy {
-            crate::lay::TrackedPolicy::Refuse => Err(io::Error::other(
-                crate::lay::tracked_refusal("laying the trust exec root", &why),
-            )),
-            crate::lay::TrackedPolicy::Allow => {
-                let build = trust_build_of(layout, build_dir);
-                if build.is_some_and(|n| crate::seam::is_real_dir(&root_dir(layout, n).join("bin")))
-                {
-                    crate::provenance::log_line(&format!(
-                        "could not refresh the trust exec root ({why}); the one that stands \
-                         is kept until the next pass"
-                    ));
-                    return Ok(Ensured::Present);
-                }
-                // No root yet: laid in-process (the store is not touched), then cleared.
-                let ensured = ensure_root_in_process(layout, build_dir, depth)?;
-                if let Some(n) = build {
-                    crate::provenance::heal_laid(
-                        layout,
-                        "the trust exec root",
-                        &[root_dir(layout, n)],
-                    );
-                }
-                Ok(ensured)
-            }
-        },
-    }
-}
-
-/// The word the view helper answers for an [`Ensured`], and back.
-#[must_use]
-pub fn ensured_word(e: Ensured) -> &'static str {
-    match e {
-        Ensured::Plain => "plain",
-        Ensured::Present => "present",
-        Ensured::Built => "built",
-    }
-}
-
-fn ensured_from_word(word: &str) -> Ensured {
-    match word.trim() {
-        "plain" => Ensured::Plain,
-        "built" => Ensured::Built,
-        _ => Ensured::Present,
-    }
-}
-
-/// [`ensure_root`]'s body IN THIS PROCESS — what an untracked process runs directly and
-/// the launchd helper runs for a tracked one.
-pub fn ensure_root_in_process(
-    layout: &Layout,
-    build_dir: &Path,
-    depth: Depth,
-) -> io::Result<Ensured> {
     let Some(n) = trust_build_of(layout, build_dir) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1004,28 +889,11 @@ pub fn strays(layout: &Layout) -> Vec<(PathBuf, Stray)> {
 /// root whose build is gone or whose build no longer [`needs_root`] (renamed aside, then
 /// removed). Other names are not atpkg's and are left alone. A `compat/trust` or `compat`
 /// that is not a real directory is not walked: [`ensure_root`] refuses to lay into it,
-/// and says so.
-///
-/// # Why it is safe here
-///
-/// Callers hold the store lock, but that lock speaks only for the processes that take it,
-/// and the lane that lays a root is not one of them: a provenance-tracked pass hands the lay
-/// to a launchd job ([`ensure_root_with`] submits a [`crate::seam::ViewJob::Root`]), so the
-/// helper is launchd's child and holds no lock of its own. A `kill -9` of that pass drops
-/// the store lock while its helper keeps laying into the very `.<n>.tmp-<pid>` and
-/// `.<n>.old-<pid>` names this sweep removes as debris.
-///
-/// So the orphaned lane jobs are stopped, and waited out, before a single entry is read — as
-/// [`crate::store::sweep_stage_scratch`], `gc`'s partial sweep and `seam`'s view-debris
-/// sweep do it. Only this prefix, only these stems, and a job whose owner pid is alive
-/// (another pass in flight, or a pid since reused) is left alone.
+/// and says so. Callers hold the store lock, which every writer of a root takes.
 #[must_use]
 pub fn sweep(layout: &Layout) -> Report {
     #[cfg(unix)]
     {
-        // Stop first, delete second: a launchd-parented lane helper outlives the pass that
-        // submitted it, and the store lock that pass dropped says nothing about the helper.
-        crate::stage_helper::stop_orphaned_lane_jobs();
         let mut report = Report::default();
         let Some(dir) = walkable_roots_dir(layout) else {
             return report;
@@ -1178,8 +1046,7 @@ pub fn remove_all(layout: &Layout) -> io::Result<()> {
 /// 4. re-render each grouped shim through `platform::shim_executable_to_env` with the
 ///    environment it already exports, and keep those whose bytes differ — routed where a
 ///    root now stands, back to plain where none does;
-/// 5. lay them in ONE [`crate::lay::lay_executables`] call, so a provenance-tracked pass
-///    uses one untracked job, as every shim-laying pass does.
+/// 5. lay them ([`crate::lay::write_in_process`]).
 ///
 /// A second run finds nothing to do. This is what reaches the shims no install rewrites:
 /// the pass short-circuits an up-to-date program before it lays a shim, and the alias
@@ -1238,7 +1105,7 @@ pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
         }
     }
     if !files.is_empty() {
-        match crate::lay::lay_executables(&files) {
+        match files.iter().try_for_each(crate::lay::write_in_process) {
             Ok(()) => report.routed.extend(files.into_iter().map(|f| f.path)),
             Err(e) => report.errors.push(format!(
                 "{} trust shim(s) not re-laid ({e}); they run as they were",
@@ -2310,7 +2177,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 0,
-                None,
                 None,
                 "doctor",
                 // The macOS tag is a fact about which process wrote the fixture, and the

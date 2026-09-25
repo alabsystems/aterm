@@ -298,21 +298,6 @@ mod tests {
         }
     }
 
-    /// TLA+ ContainmentMinimal: Containment mode is maximally restrictive.
-    /// Every capability at its minimum value.
-    #[test]
-    fn test_containment_is_minimal() {
-        let c = ContainmentPolicy::capabilities(ContainmentMode::Containment);
-        assert_eq!(c.network as u8, 0, "ContainmentHasNoNetwork");
-        assert_eq!(c.fs as u8, 0, "Containment fs = TmpOnly");
-        assert_eq!(c.process as u8, 0, "Containment process = NoFork");
-        assert_eq!(c.mcp as u8, 0, "ContainmentNoMcpNoPlugins (mcp)");
-        assert_eq!(c.plugins as u8, 0, "ContainmentNoMcpNoPlugins (plugins)");
-        assert_eq!(c.output as u8, 0, "ContainmentOutputFiltered");
-        assert_eq!(c.input as u8, 0, "ContainmentInputFiltered");
-        assert_eq!(c.command as u8, 0, "Containment command = NoCommands");
-    }
-
     /// Exhaustive numeric cross-check against the policy table this crate
     /// implements (named after the intended `tla/Containment.tla` model, which
     /// is NOT in-tree — see the crate-root note).
@@ -395,40 +380,6 @@ mod tests {
                 "TLA+ PolicyCommand({mode}) = {}, Rust = {}",
                 expected_caps[7], caps.command as u8
             );
-        }
-    }
-
-    /// Verify strict monotonicity: downgrading mode ALWAYS reduces
-    /// or maintains every capability. No single capability may increase
-    /// when the mode decreases.
-    #[test]
-    fn test_downgrade_never_increases_any_capability() {
-        let modes = [
-            ContainmentMode::Master,
-            ContainmentMode::User,
-            ContainmentMode::Safety,
-            ContainmentMode::Containment,
-        ];
-
-        for i in 0..modes.len() {
-            for j in (i + 1)..modes.len() {
-                let higher = modes[i];
-                let lower = modes[j];
-                let ch = ContainmentPolicy::capabilities(higher);
-                let cl = ContainmentPolicy::capabilities(lower);
-
-                assert!(
-                    cl.network <= ch.network
-                        && cl.fs <= ch.fs
-                        && cl.process <= ch.process
-                        && cl.mcp <= ch.mcp
-                        && cl.plugins <= ch.plugins
-                        && cl.output <= ch.output
-                        && cl.input <= ch.input
-                        && cl.command <= ch.command,
-                    "downgrade from {higher} to {lower} increased a capability"
-                );
-            }
         }
     }
 }

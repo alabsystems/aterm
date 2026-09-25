@@ -309,6 +309,26 @@ pub fn is_socket_or_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Is the control socket at `path` LISTENING? A connect the kernel takes into
+/// the backlog, dropped at once — the server's own `socket_is_live` probe. The
+/// socket FILE ([`is_socket_or_symlink`]) is not that signal: `bind(2)` creates
+/// it before `listen(2)`, and a client that dials in between is refused
+/// (`ECONNREFUSED`), which a loaded machine turns from a microsecond window into
+/// a smoke stage's first `aterm-ctl` call failing (2026-09-24).
+#[cfg(unix)]
+#[must_use]
+pub fn socket_listening(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+/// Off unix std has no `AF_UNIX` client to probe with, so the bound FILE is the
+/// signal there, exactly as before the listening probe existed.
+#[cfg(not(unix))]
+#[must_use]
+pub fn socket_listening(path: &Path) -> bool {
+    is_socket_or_symlink(path)
+}
+
 /// Windows has no `S_IFSOCK`: a bound `AF_UNIX` socket lands on disk as a REPARSE
 /// POINT, which `FileType::is_socket` (absent there) could not report anyway. So the
 /// honest analogue tests the reparse attribute alongside the symlink case — still

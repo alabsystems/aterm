@@ -6020,8 +6020,15 @@ mod tests {
             "PRECONDITION: the last writer really did close, so the wait had a \
              real EOF to wake on; got {after_wake:?}"
         );
+        // The line that separates the two behaviours is the SLICE, not an idle
+        // machine's latency: a primitive blind to fifo EOF sleeps out the whole
+        // 2 s slice, a correct one wakes at the ~100 ms close plus scheduling
+        // delay. 1.5 s sits between them with room on both sides. The old 900 ms
+        // bound measured the machine instead — the full merge contract on
+        // 2026-09-24, at load average 34 from an unrelated solver farm, woke
+        // correctly in 950 ms and failed.
         assert!(
-            wait_readable_took < std::time::Duration::from_millis(900),
+            wait_readable_took < std::time::Duration::from_millis(1500),
             "`wait_readable_briefly` must WAKE when a fifo's last writer closes \
              (~100 ms here) rather than sleeping out its 2 s slice — it took \
              {wait_readable_took:?}, which is what a readiness primitive blind to \
@@ -7351,8 +7358,8 @@ mod tests {
 ///
 /// `ty` is located by the same fixed canonical path search. VERIFICATION GATE
 /// (honesty ratchet, batteries-on, see [`aterm_spec::verify`]): verification is always
-/// required — an absent Trust `ty` FAILS the test with a build hint (`cargo build
-/// --release -p tla-cli` in $HOME/trust/first-party/ty).
+/// required — an absent Trust `ty` FAILS the test with the install hint (`aterm pkg
+/// install ty`).
 #[cfg(test)]
 mod writeall_conformance {
     use super::{WriteStep, classify_write_result, write_all};

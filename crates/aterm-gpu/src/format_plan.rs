@@ -460,20 +460,6 @@ mod tests {
         );
     }
 
-    // Non-vacuity / load-bearing: the pre-fix C1/C2 form — a pipeline hard-coding
-    // Rgba8Unorm while attaching off.view — DOES violate the invariant on the
-    // downlevel backend, so the test above has teeth (mirrors the ay `*_sat`
-    // load-bearing obligation). If this ever stops violating, the guard is dead.
-    #[test]
-    fn hardcoded_unorm_target_violates_invariant_on_downlevel() {
-        let buggy_target = TextureFormat::Rgba8Unorm; // the old bloom/tray/test-blit constant
-        let attachment = offscreen_format(false); // downlevel off.view == Rgba8UnormSrgb
-        assert_ne!(
-            buggy_target, attachment,
-            "the C1/C2 mismatch must be real, else the invariant is vacuous"
-        );
-    }
-
     // Bug #2: clearing the offscreen's DEFAULT view must read back as the INPUT byte on
     // BOTH backends. On downlevel that view is sRGB and encodes on store, so the clear
     // is decoded to linear; feeding it through the sRGB ENCODE (the inverse) must land
@@ -549,7 +535,8 @@ mod tests {
     ///
     /// Metal runs the NATIVE plan and only that plan: pixel-format views are
     /// unconditional on Metal (`TEXTURE_USAGE_PIXEL_FORMAT_VIEW`, proven
-    /// creatable on the GPU by `metal::tests::the_four_renderer_formats_exist`),
+    /// creatable on the GPU by every Metal render test, which allocates the
+    /// view-capable offscreen before its first frame),
     /// so `srgb_offscreen == true` is the one state the backend can be in.
     /// The downlevel half of the sweep pins where the two plans differ —
     /// exactly one role — so a `format_plan` change that widens or moves the

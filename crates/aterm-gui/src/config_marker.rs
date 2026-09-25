@@ -4,13 +4,14 @@
 //! Config-directory MARKER files — the small "the person already answered
 //! this" records that sit beside `aterm.toml`.
 //!
-//! Three surfaces keep one: the first-launch admin card
-//! (`packages_screen::ADMIN_STEP_MARKER`), the session-connections first-use
-//! notice (`connections`), and the macOS access card
-//! (`consent_card::MARKER`). They share a threat model — a planted link, a
-//! directory, or an oversized file at the marker path must be neither read
-//! through, written through, nor mistaken for a record — and until this module
-//! they shared it by copy. The rules, once:
+//! Two surfaces keep one: the session-connections first-use notice
+//! (`connections`) and the macOS access card (`consent_card::MARKER`). (The
+//! first-launch admin card's marker went with that card, 2026-09-24; a
+//! `packages-admin-step-dismissed` file left beside `aterm.toml` is inert.)
+//! They share a threat model — a planted link, a directory, or an oversized
+//! file at the marker path must be neither read through, written through, nor
+//! mistaken for a record — and until this module they shared it by copy. The
+//! rules, once:
 //!
 //! * **Reading** opens the path without following a final-component link and
 //!   checks the HANDLE (not a separate stat something could swap under) — the

@@ -71,7 +71,16 @@ const REGISTERED: &[(&str, &str)] = &[
         "crates/aterm-update/src/check_lane.rs",
         "`Lane::try_lock` is a `std::sync::Mutex`, not an `flock`: an in-process mutex is \
          not carried by a file descriptor and a fork cannot hold it. The FILE lock in the \
-         same module is the one that had to be polled, and is.",
+         same module is an `aterm_update_core::FileLock`, whose drop is `LOCK_UN` \
+         (2026-09-24), so it is sampled once.",
+    ),
+    (
+        "crates/aterm-update-core/src/sys.rs",
+        "every lock released here is an `aterm_update_core::FileLock`, whose drop is \
+         `LOCK_UN` (2026-09-24) — pinned by \
+         `a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives` with a live \
+         duplicate of the descriptor — so a drop then one sample is sound; the bounded \
+         tests beside it re-acquire through `acquire_within`, whose subject is waiting.",
     ),
     (
         "crates/atpkg/src/lock.rs",

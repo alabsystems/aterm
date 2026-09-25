@@ -31,13 +31,14 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     match spec.id {
         StageId::Build => build(ctx, &mut r),
         StageId::Test => test(ctx, &mut r),
+        StageId::MeasuringTests => measuring_tests(ctx, &mut r),
         StageId::Doctests => doctests(ctx, &mut r),
         StageId::RegexLane => regex_lane(ctx, &mut r),
         StageId::SealedLane => sealed_lane(ctx, &mut r),
         StageId::Tippy => tippy(ctx, &mut r),
         StageId::Formatting => formatting(ctx, &mut r),
         StageId::GrepGuards => grep_guards(ctx, &mut r),
-        StageId::InstallChannel => install_channel(ctx, &mut r),
+        StageId::ReleaseTooling => release_tooling(ctx, &mut r),
         StageId::AtpkgTooling => atpkg_tooling(ctx, &mut r),
         StageId::TrustGateVerdict => trust_gate_verdict(ctx, &mut r),
         StageId::TrustContractProbe => trust_contract_probe(ctx, &mut r),
@@ -119,10 +120,51 @@ pub fn test_compile_args(scope: &Scope) -> Vec<String> {
 /// the 86 doctest units and 78 example/extra-crate-type build units, which
 /// run nothing here. Cargo runs no test after a compile error, so skipping
 /// this child after a failed compile decides what the single child decided.
+///
+/// It SKIPS [`MEASURING_TESTS`] — libtest's own `--skip`, handed to every test
+/// binary after `--` — and [`measuring_args`] runs exactly those, alone.
 #[must_use]
 pub fn test_run_args(scope: &Scope) -> Vec<String> {
     let mut a = test_base_args(scope);
     a.push("--tests".to_string());
+    a.push("--".to_string());
+    for name in MEASURING_TESTS {
+        a.push("--skip".to_string());
+        a.push(name.to_string());
+    }
+    a
+}
+
+/// THE TESTS THAT MEASURE THE MACHINE (2026-09-23): libtest name filters for
+/// every test whose verdict depends on how busy the box is — the paint and spin
+/// matrices (`aterm-conformance`), under a `measuring` module, and
+/// `aterm-update`'s launchd copy tests, whose deadlines are one to five seconds.
+/// (`atpkg`'s untracked staging, laying and view lanes were the third family
+/// until they were deleted on 2026-09-24.)
+///
+/// Until this list they ran inside the parallel test run, which therefore had
+/// to wait for every side lane and for tippy's whole-workspace compile before it
+/// could start (a paint take's driver was measured descheduled for 50 ms beside
+/// tippy, 2026-09-18) — and still went red when a peer's build loaded the box.
+/// Now the test run skips them and the exclusive `measuring tests` stage runs
+/// them with nothing else in flight.
+///
+/// THE TWO STAGES ARE COMPLEMENTS BY CONSTRUCTION: the same selection, one with
+/// `--skip <each>` and one with `<each>` as the filter, so a name that matches
+/// by accident moves a test into the measuring stage and never out of the run.
+/// A new measuring suite joins by putting its tests in a `measuring` module.
+pub const MEASURING_TESTS: [&str; 2] = ["measuring::", "launchd_copy_tests::"];
+
+/// `targo --unverified test <scope> --no-fail-fast --tests -- <MEASURING_TESTS>`
+/// — the exclusive stage's one child: the test run's own selection, filtered to
+/// exactly the tests that run skipped. The compile is the test stage's, so this
+/// is a fingerprint check before it runs anything.
+#[must_use]
+pub fn measuring_args(scope: &Scope) -> Vec<String> {
+    let mut a = test_base_args(scope);
+    a.push("--tests".to_string());
+    a.push("--".to_string());
+    a.extend(MEASURING_TESTS.iter().map(|s| (*s).to_string()));
     a
 }
 
@@ -400,43 +442,28 @@ fn kani_cmd(
 }
 
 /// Where trust-mc lives — the same order `scripts/verify-kani-proofs.sh` uses:
-///
-/// 1. `$TRUST_MC_SYSROOT` — an explicit location, never fallen back from.
-/// 2. `<atpkg prefix>/store/trust-mc/current` — what `aterm pkg install
-///    trust-mc` lays down, and the only sysroot most machines have. Taken when
-///    it carries the driver (`bin/trust-mc-driver`); the managed bundle ships
-///    no `cargo-trust-mc` name — the script derives that symlink OUTSIDE the
-///    store, which is tree_root-attested and immutable.
-/// 3. `$HOME/trust/first-party/trust-mc/target/trust-mc` — a from-source dev build.
+/// `$TRUST_MC_SYSROOT` (an explicit development location, never fallen back from),
+/// else `<atpkg prefix>/store/trust-mc/current` — what `aterm pkg install trust-mc`
+/// lays down, reported even when absent so the availability check names the place
+/// the remedy fills. The managed bundle ships no `cargo-trust-mc` name — the script
+/// derives that symlink OUTSIDE the store, which is tree_root-attested and immutable.
+/// No build tree is probed: `$HOME/trust/first-party` was retired 2026-08-29, and a
+/// stale checkout there shadowed the store until 2026-09-24.
 #[must_use]
 pub fn trust_mc_sysroot(env: &crate::EnvSnapshot) -> std::path::PathBuf {
-    if let Some(explicit) = &env.trust_mc_sysroot {
-        return explicit.clone();
-    }
-    let store = crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref())
-        .join("store/trust-mc/current");
-    if is_executable_file(&store.join("bin/trust-mc-driver"))
-        || is_executable_file(&store.join("bin/cargo-trust-mc"))
-    {
-        return store;
-    }
-    env.home.join("trust/first-party/trust-mc/target/trust-mc")
+    env.trust_mc_sysroot.clone().unwrap_or_else(|| {
+        crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref())
+            .join("store/trust-mc/current")
+    })
 }
 
 /// Where the `ay` solver lives, in the script's order: `$AY_BIN_DIR`, else the
-/// atpkg shim dir (`<prefix>/bin`, where `aterm pkg install ay` shims it), else
-/// the from-source dev build `$HOME/trust/first-party/ay/target/release`.
+/// atpkg shim dir (`<prefix>/bin`, where `aterm pkg install ay` shims it).
 #[must_use]
 pub fn ay_bin_dir(env: &crate::EnvSnapshot) -> std::path::PathBuf {
-    if let Some(explicit) = &env.ay_bin_dir {
-        return explicit.clone();
-    }
-    let shims =
-        crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref()).join("bin");
-    if is_executable_file(&shims.join("ay")) {
-        return shims;
-    }
-    env.home.join("trust/first-party/ay/target/release")
+    env.ay_bin_dir.clone().unwrap_or_else(|| {
+        crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref()).join("bin")
+    })
 }
 
 /// The redraw harness's target name — the `[[bin]]`, the built file and the
@@ -1292,6 +1319,48 @@ fn test(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
+// 2.2) MEASURING TESTS — the tests the run above skipped ([`MEASURING_TESTS`]),
+//    run EXCLUSIVELY: with nothing else in flight, as the smokes are, because
+//    their verdicts depend on how busy the machine is. One child, the test
+//    run's own selection with the filter inverted; never demoted, because the
+//    paint and spin rows launch the aterm they judge.
+// ---------------------------------------------------------------------------
+
+/// The measuring stage's child: [`measuring_args`], with trustdoc bound the
+/// way the test run binds it so both see one environment.
+fn measuring_cmd(ctx: &Ctx, bind: bool) -> Cmd {
+    let c = targo(ctx, measuring_args(&ctx.scope));
+    if bind { with_trustdoc(ctx, c) } else { c }
+}
+
+fn measuring_tests(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
+        r.skip("measuring tests (no targo)");
+        return;
+    }
+    if ctx.scope.selects_nothing() {
+        r.skip(format!(
+            "targo test {} --tests (change-scoped run selected no crates)",
+            ctx.scope.label()
+        ));
+        return;
+    }
+    // The test run's doc-driver binding and label suffix, so the two children
+    // carry one environment and read as one selection split in two.
+    let (suffix, bind) = match doc_driver(ctx) {
+        DocDriver::Stage2 => (" (trustdoc)", true),
+        DocDriver::Ambient => (" (caller's RUSTDOC)", false),
+        DocDriver::BarePath | DocDriver::Absent => ("", false),
+    };
+    let label = format!(
+        "targo test {} --tests{suffix} -- {}",
+        ctx.scope.label(),
+        MEASURING_TESTS.join(" ")
+    );
+    run_labeled(ctx, r, &label, &measuring_cmd(ctx, bind));
+}
+
+// ---------------------------------------------------------------------------
 // 2.5) DOCTESTS
 // ---------------------------------------------------------------------------
 fn doctests(ctx: &Ctx, r: &mut Report) {
@@ -1583,32 +1652,64 @@ fn grep_guards(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 3.5) BOOTSTRAP UPDATE CHANNEL — keep tools/install.sh aligned with the in-app
-//    updater's complete-catalog numeric arbitration and exact asset identity.
+// 3.5) RELEASE TOOLING — the hermetic shell suites over the scripts a release
+//    runs through, each a decision of its own. A missing suite is a
+//    cannot-run, never a skip.
 // ---------------------------------------------------------------------------
-fn install_channel(ctx: &Ctx, r: &mut Report) {
-    let t = ctx.tools_dir().join("test-install-channel.sh");
-    if is_executable_file(&t) {
-        run_labeled(ctx, r, "test-install-channel.sh", &Cmd::new(&t));
-    } else {
-        r.cannot_run(format!(
-            "test-install-channel.sh missing or not executable ({})",
-            t.display()
-        ));
+
+/// The release-tooling suites, in the order the stage runs them. Every one is
+/// offline and stubbed (its header says so) and takes seconds.
+///
+/// * `test-install-channel.sh` keeps tools/install.sh aligned with the in-app
+///   updater's head pointer, tag grammar and exact asset identity, and pins the
+///   Linux lane's head-only choice of target.
+/// * `test-publish-export.sh` runs publish/manifest.txt and
+///   publish/transforms.sh the way the publication engine does. It is the only
+///   check that the export's rewrites stay narrow: dev never applies them, so a
+///   widened `/Users/` rewrite would pass every Rust test here while the PUBLIC
+///   source's `relocate.rs` machine-local prefix read `"/Users//"`. It also
+///   holds config.sh's version clause to the `aterm MAJOR.MINOR.0` shape.
+/// * `test-release-preflight.sh` drives tools/release-preflight.sh against a
+///   fixture checkout and a stub engine.
+/// * `test-after-cut.sh` drives publish/after-cut, the step that ends a release,
+///   over the real site-sync.py download election: a release that fails the
+///   shape check never reaches the site. It joined on 2026-09-24, after going
+///   red unseen: the election began requiring a complete app inventory (DMG,
+///   mac.zip and the signed appcast pair), the suite's DMG-only fixtures stopped
+///   electing anything, and with no gate running it nothing said so.
+///
+/// A suite no gate runs is a test that passes forever.
+pub const RELEASE_SUITES: [&str; 4] = [
+    "test-install-channel.sh",
+    "test-publish-export.sh",
+    "test-release-preflight.sh",
+    "test-after-cut.sh",
+];
+
+fn release_tooling(ctx: &Ctx, r: &mut Report) {
+    for name in RELEASE_SUITES {
+        let t = ctx.tools_dir().join(name);
+        if is_executable_file(&t) {
+            run_labeled(ctx, r, name, &Cmd::new(&t));
+        } else {
+            r.cannot_run(format!(
+                "{name} missing or not executable ({})",
+                t.display()
+            ));
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // 3.52) ATPKG PUBLISH TOOLING — the deterministic shell suites over the
-//    producer scripts (tools/atpkg-author-vendor.sh, atpkg-index.sh,
-//    atpkg-publish.sh, atpkg-mirror-public.sh and the vendor lane
-//    tools/atpkg-auto-vendor.sh). Every vendor, key and gh call is stubbed
-//    (their headers say so): no network, no token, no repo mutation. Until
+//    producer scripts (tools/atpkg-index.sh, atpkg-publish.sh,
+//    atpkg-mirror-public.sh, atpkg-auto-alab.sh). Every vendor, key and gh
+//    call is stubbed (their headers say so): no network, no token, no repo mutation. Until
 //    2026-09-08 neither suite ran under any gate, so a change to the scripts
 //    that sign the toolchain index could land unmeasured (the audit finding).
 //    test-atpkg-pack-one-compiler.sh pins the sysroot-bundle pack's one-compiler
 //    contract (atpkg-pack-bundle.sh): keyless and offline, everything under one
-//    mktemp dir. Same posture as install_channel: a missing suite is a
+//    mktemp dir. Same posture as release_tooling: a missing suite is a
 //    cannot-run, never a skip.
 //
 //    test-atpkg-mirror-extras.sh runs atpkg-mirror-public.sh itself (DRY_RUN, a
@@ -1624,7 +1725,7 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 //    sees nothing wrong.
 //
 //    A DRIVER-LANE STAGE SINCE 2026-09-16 (it prints after the sealed rung; the
-//    ladder order is `plan.rs`, which carries the measurement). The third suite
+//    ladder order is `plan.rs`, which carries the measurement). The last suite
 //    PACKS with a real atpkg, and where that pack can run at all a missing
 //    binary is a gap in the run rather than a platform limit — so it fails.
 //    Its first child builds that binary in this lane, the pack runs only if
@@ -1654,7 +1755,7 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 ///
 /// `test-atpkg-spec-catch-up.sh` joined them on 2026-09-17: the rustc-group lane
 /// authors four rows of `tools/atpkg-programs.spec` and hands the indexer the whole
-/// table, and a row another publisher had moved (the vendor tracker's `claude`, three
+/// table, and a row another publisher had moved (the retired vendor tracker's `claude`, three
 /// times in six days) was refused as a pin downgrade — correctly — and answered with
 /// a hand edit each time. The lane now catches every row outside its group up to the
 /// public baseline's pin (`atpkg_spec_catch_up`: never lower, never a group row, every
@@ -1662,51 +1763,48 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 /// the catch-up, and drives the lane end to end in STAGE mode with the pack scripts
 /// stubbed.
 ///
-/// Three joined on 2026-09-23 with the vendor-direct cutover (design 2026-09-22 §1.9):
-/// `test-atpkg-index-vendor-direct.sh` is new (the cutover index keeps the vendor rows and
-/// pins nothing for them; the drop, a dropped row and a re-pin are each typed);
-/// `test-atpkg-auto-alab.sh` drives the ALab lane, which now carries those rows into the
-/// spec it derives; and `test-atpkg-prerelease-gate.sh` pins `--prerelease` on every
-/// release-create site of the indexer and the lib — both sat in `tools/` wired into
-/// nothing, and the second had rotted (its gh stub predates `atpkg_gh_release`'s
-/// public-immutability probe). The other orphans stay out: `test-atpkg-seed-extras.sh`
-/// and `test-atpkg-pack-toolchain.sh` cover the seed stager and the packers, which this
-/// change did not touch, and `test-atpkg-pack-arch-gate.sh` already runs under
-/// `aterm-release`'s `pack_arch_gate` test.
-pub const ATPKG_SUITES: [&str; 13] = [
+/// `test-atpkg-pack-toolchain.sh` joined them on 2026-09-24. It covers the two packers
+/// (`atpkg-pack.sh`, `atpkg-pack-bundle.sh`): which Trust driver they resolve (the store's
+/// `targo`, never rustup's or a foreign one off PATH), and, in its B7–B11, the VERSION a
+/// sysroot bundle signs. That version is derived from what is packed, and the pack refuses
+/// when nothing names one. Before B7–B11 the bundle pack signed a literal `0.0.0`: the
+/// seed refresher that used to pass it a version had been deleted. The suite had been
+/// left out of this list while the packers were untouched, so the new checks guarded a
+/// signing producer that no gate ran. It is offline, with every store and compiler a stub
+/// under one mktemp dir. `test-atpkg-pack-arch-gate.sh` is the one `tools/test-atpkg-*.sh`
+/// not listed here: `aterm-release`'s `pack_arch_gate` test runs it.
+pub const ATPKG_SUITES: [&str; 11] = [
     "test-atpkg-vendor-tooling.sh",
     "test-atpkg-mirror-extras.sh",
-    "test-atpkg-auto-vendor.sh",
-    "test-atpkg-auto-alab.sh",
+    "test-atpkg-prerelease-gate.sh",
     "test-atpkg-target-pins.sh",
     "test-atpkg-index-target-pins.sh",
-    "test-atpkg-index-staging-collision.sh",
-    "test-atpkg-index-vendor-direct.sh",
-    "test-atpkg-prerelease-gate.sh",
-    "test-atpkg-stale-pin.sh",
+    "test-atpkg-index-publish.sh",
     "test-atpkg-spec-catch-up.sh",
+    "test-atpkg-auto-alab.sh",
     "test-linux-auto-atpkg.sh",
+    "test-atpkg-pack-toolchain.sh",
     "test-atpkg-pack-one-compiler.sh",
 ];
 
-/// THREE SUITES OVER `atpkg-index.sh` JOINED ON 2026-09-17, and two of them had been
-/// sitting in `tools/` wired into NOTHING — the same shape the mirror-extras note above
-/// describes, in the same directory, over the script that signs the toolchain index:
-/// `test-atpkg-index-target-pins.sh` (28 checks over `TARGET_PINS`' rendering and its
-/// per-target downgrade gate) and `test-atpkg-index-staging-collision.sh` (42 checks over
-/// the staging registry). A suite no gate runs is a test that passes forever.
+/// TWO SUITES OVER `atpkg-index.sh` JOINED ON 2026-09-17 after sitting in `tools/` wired
+/// into NOTHING — the same shape the mirror-extras note above describes, in the same
+/// directory, over the script that signs the toolchain index:
+/// `test-atpkg-index-target-pins.sh` (`TARGET_PINS`' rendering and its per-target
+/// downgrade gate) and `test-atpkg-index-publish.sh` (then the never-clobber upload; since
+/// 2026-09-23 the whole public publish: baseline+1, packs first, the compare-and-swap).
+/// `test-atpkg-prerelease-gate.sh` joined on 2026-09-23 for the same reason: it pins that
+/// every atpkg release create carries --prerelease, and nothing ran it (it had gone red).
+/// A suite no gate runs is a test that passes forever.
 ///
-/// `test-atpkg-stale-pin.sh` is new, and it pins the arm that let the compiler go stale in
-/// public. The STALE-PIN GATE refuses an ALab pin below the repo's newest signed vX.Y.Z
-/// release; when the pin was ABOVE that release the gate printed `NOTE — … a pack cut past
-/// the last promote` and moved on — a bound returned as a fact, since the comparison had
-/// just established that the release says nothing about staleness. The whole trust tuple
-/// takes that arm by construction (its bundle is packed from a stage2, never from a tag), so
-/// nothing ever judged it: measured 2026-09-17, trust pinned 8595, newest release v0.8.0
-/// counts 7888, `$HOME/trust` HEAD counts 9454 — 859 commits of compiler, published as index
-/// after index of "up to date". The gate now asks the repo's own source and refuses under
-/// the same `ALLOW_STALE_PINS` escape; the suite drives a real git checkout with a tag at
-/// build 2 and HEAD at build 10.
+/// The indexer's stale-pin gate and its suite are gone (2026-09-23): its verdict depended
+/// on each operator's local checkouts and every automated caller lifted it. The ALab lane
+/// (`tools/atpkg-auto-alab.sh`) is where a pin behind its repo's newest signed release is
+/// decided, and `test-atpkg-auto-alab.sh` joined the gate the same day. That lane builds
+/// beside the machine key and signs the output, its suite is the only proof that it
+/// builds only what was signed, and until then no gate ran it. It SKIPs off macOS, where
+/// the lane cannot run.
+///
 /// The one suite that drives a real `atpkg` rather than stubs of its own
 /// making: section D of the pack contract, the end-to-end pack.
 pub const ATPKG_DRIVEN_SUITE: &str = "test-atpkg-pack-one-compiler.sh";
@@ -2089,10 +2187,10 @@ fn driver_builds(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 5b) CONFORMANCE RELEASE ARTIFACT — the RELEASE `aterm` that paint, spin and
-//    the untracked-staging suite JUDGE. They share one helper
+// 5b) CONFORMANCE RELEASE ARTIFACT — the RELEASE `aterm` that paint and spin
+//    JUDGE. They share one helper
 //    (`crates/aterm-conformance/tests/support/mod.rs`, `release_bin`) and one
-//    directory, so the first of the three to run pays for the whole release
+//    directory, so the first of the two to run pays for the whole release
 //    build inside its own test time — and cargo runs test binaries ONE AT A
 //    TIME, so nothing else in the gate is running while it does. This row moves
 //    that build to t0 in a lane of its own, so the helper's own invocation
@@ -2121,13 +2219,13 @@ fn driver_builds(ctx: &Ctx, r: &mut Report) {
 //    The row still takes the OTHER ~120 s off the critical path and makes the
 //    lane's dependency graph warm, which is why it is worth having as written.
 //
-//    AND THE SAME DEFECT ALREADY COSTS THE GATE, WITHOUT THIS ROW. The
+//    AND THE SAME DEFECT ALREADY COST THE GATE, WITHOUT THIS ROW. The
 //    recorded fingerprint above holds `CARGO_PKG_NAME = "aterm-conformance"`,
-//    so `atpkg`'s `untracked_stage` — which presents `atpkg` — invalidates
-//    exactly that subtree after paint and spin have built it, every run. That
-//    is the likeliest reason the two slowest suites of the 2026-09-22 `--fast`
-//    were `untracked_stage` (424 s) and `paint` (417 s) rather than one slow
-//    suite and one fast one, and the helper's own comment ("after the first
+//    so `atpkg`'s `untracked_stage` (deleted 2026-09-24) — which presented
+//    `atpkg` — invalidated exactly that subtree after paint and spin had built
+//    it, every run. That is the likeliest reason the two slowest suites of the
+//    2026-09-22 `--fast` were `untracked_stage` (424 s) and `paint` (417 s)
+//    rather than one slow suite and one fast one, and the helper's own comment ("after the first
 //    Cargo freshness check the other suite is warm") holds only WITHIN a
 //    package. The fix belongs in `release_bin`, in one sweep — clear
 //    `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_LINKS` and `CARGO_PKG_*` from the
@@ -2138,7 +2236,7 @@ fn driver_builds(ctx: &Ctx, r: &mut Report) {
 
 /// The ladder label of this row's one child.
 pub const CONFORMANCE_RELEASE_LABEL: &str =
-    "targo build --locked --release -p aterm (the artifact paint/spin/untracked_stage judge)";
+    "targo build --locked --release -p aterm (the artifact paint/spin judge)";
 
 /// The exact command the prime spawns — extracted so a test asserts on THIS and
 /// not on a replica.
@@ -3062,9 +3160,9 @@ mod tests {
         // and build scripts track them (`ring`, `aterm-update-core`), so a
         // forwarded one makes this shared directory package-specific: the gate
         // child, which has none of them, would then build a copy the suites
-        // rebuild — and `paint` (aterm-conformance) and `untracked_stage`
-        // (atpkg) would go on invalidating each other's, 208.9 s per
-        // alternation MEASURED 2026-09-22.
+        // rebuild — `paint` (aterm-conformance) and atpkg's since-deleted
+        // `untracked_stage` invalidated each other's, 208.9 s per alternation
+        // MEASURED 2026-09-22.
         for var in [
             r#""CARGO_PKG_""#,
             r#""CARGO_MANIFEST_DIR""#,
@@ -3342,6 +3440,8 @@ mod tests {
             test_run_args(&Scope::crate_only("aterm-grid")),
             test_compile_args(&Scope::changed("main", vec!["aterm-gui".into()], true)),
             test_run_args(&Scope::changed("main", vec!["aterm-gui".into()], true)),
+            measuring_args(&Scope::workspace()),
+            measuring_args(&Scope::crate_only("aterm-grid")),
             doctest_args(&Scope::workspace()),
             doctest_args(&Scope::crate_only("aterm-grid")),
             regex_lane_args(),
@@ -3352,104 +3452,6 @@ mod tests {
                  scope: {argv:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_workspace_argv_is_what_the_script_ran() {
-        let s = Scope::workspace();
-        assert_eq!(build_args(&s), ["--unverified", "build", "--workspace"]);
-        assert_eq!(
-            test_compile_args(&s),
-            [
-                "--unverified",
-                "test",
-                "--workspace",
-                "--no-fail-fast",
-                "--no-run"
-            ]
-        );
-        assert_eq!(
-            test_run_args(&s),
-            [
-                "--unverified",
-                "test",
-                "--workspace",
-                "--no-fail-fast",
-                "--tests"
-            ]
-        );
-        assert_eq!(
-            doctest_args(&s),
-            [
-                "--unverified",
-                "test",
-                "--doc",
-                "--workspace",
-                "--no-fail-fast"
-            ]
-        );
-        assert_eq!(
-            regex_lane_args(),
-            [
-                "--unverified",
-                "test",
-                "-p",
-                "aterm-search",
-                "--features",
-                "regex",
-                "--no-fail-fast"
-            ]
-        );
-        assert_eq!(
-            xtask_gate_args("mainloop"),
-            [
-                "--unverified",
-                "run",
-                "-q",
-                "-p",
-                "xtask",
-                "--",
-                "gate",
-                "mainloop"
-            ]
-        );
-        assert_eq!(
-            freeze_gate_args(),
-            [
-                "--unverified",
-                "build",
-                "--manifest-path",
-                "tools/freeze-safety-gate/Cargo.toml"
-            ]
-        );
-        assert_eq!(
-            differential_args(),
-            [
-                "--unverified",
-                "test",
-                "-p",
-                "aterm-bench",
-                "--test",
-                "differential"
-            ]
-        );
-        assert_eq!(
-            libc_oracle_cmd(&ctx(Scope::workspace()))
-                .expect("absolute fixture root")
-                .argv(),
-            ["/repo/libc-oracle/run.sh"]
-        );
-        assert_eq!(
-            tippy_args(&s),
-            [
-                "--workspace",
-                "--all-targets",
-                "--keep-going",
-                "--",
-                "-D",
-                "warnings"
-            ]
-        );
     }
 
     #[test]
@@ -3677,12 +3679,15 @@ mod tests {
         for bind in [false, true] {
             let [compile, run] = test_cmds(&c, bind);
             assert!(compile.demoted, "targo test --no-run");
-            assert!(
-                !run.demoted,
-                "targo test --tests runs the paint and spin guards"
-            );
+            assert!(!run.demoted, "targo test --tests runs code");
             assert_eq!(compile.argv()[1..], test_compile_args(&c.scope)[..]);
             assert_eq!(run.argv()[1..], test_run_args(&c.scope)[..]);
+            let measuring = measuring_cmd(&c, bind);
+            assert!(
+                !measuring.demoted,
+                "the measuring tests run the paint and spin guards"
+            );
+            assert_eq!(measuring.argv()[1..], measuring_args(&c.scope)[..]);
         }
         assert!(
             tippy_cmd(
@@ -3850,59 +3855,27 @@ mod tests {
     }
 
     #[test]
-    fn trust_mc_and_ay_resolve_env_then_store_then_source() {
+    fn trust_mc_and_ay_resolve_env_then_store_and_never_a_build_tree() {
         // The order the script uses, decided in one place so the availability
-        // check and the run can never disagree. Explicit env wins outright; the
-        // atpkg store is taken only when it really holds the tool; the
-        // from-source dev build is the last resort.
+        // check and the run can never disagree: explicit env wins outright, else
+        // the store — even with a from-source checkout sitting under home.
         let home = crate::mktemp_dir("atv-kani").expect("mktemp");
         let prefix = crate::toolchain::default_atpkg_prefix(&home);
+        for dev in [
+            "trust/first-party/trust-mc/target/trust-mc/bin",
+            "trust/first-party/ay/target/release",
+        ] {
+            std::fs::create_dir_all(home.join(dev)).expect("mkdir");
+        }
         let env = EnvSnapshot {
             home: home.clone(),
             ..EnvSnapshot::default()
         };
         assert_eq!(
             trust_mc_sysroot(&env),
-            home.join("trust/first-party/trust-mc/target/trust-mc"),
-            "no store, no override: the dev default"
-        );
-        assert_eq!(
-            ay_bin_dir(&env),
-            home.join("trust/first-party/ay/target/release")
-        );
-
-        // `aterm pkg install trust-mc` / `ay` shape: the live-build link for the
-        // sysroot, the shim dir for the solver.
-        let mc = prefix.join("store/trust-mc/current/bin");
-        std::fs::create_dir_all(&mc).expect("mkdir");
-        std::fs::write(mc.join("trust-mc-driver"), b"#!/bin/sh\nexit 0\n").expect("write");
-        // The chmod is the only unix-shaped line, so it is the only one gated:
-        // where there is no execute bit `is_executable_file` is existence, so
-        // the file above already satisfies the same premise and the ORDER law
-        // this test is about stays pinned on every target.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                mc.join("trust-mc-driver"),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .expect("chmod");
-        }
-        let shims = prefix.join("bin");
-        std::fs::create_dir_all(&shims).expect("mkdir");
-        std::fs::write(shims.join("ay"), b"#!/bin/sh\nexit 0\n").expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(shims.join("ay"), std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        assert_eq!(
-            trust_mc_sysroot(&env),
             prefix.join("store/trust-mc/current")
         );
-        assert_eq!(ay_bin_dir(&env), shims);
+        assert_eq!(ay_bin_dir(&env), prefix.join("bin"));
 
         let env = EnvSnapshot {
             trust_mc_sysroot: Some(PathBuf::from("/explicit/sysroot")),
@@ -3912,6 +3885,25 @@ mod tests {
         assert_eq!(trust_mc_sysroot(&env), PathBuf::from("/explicit/sysroot"));
         assert_eq!(ay_bin_dir(&env), PathBuf::from("/explicit/ay"));
         std::fs::remove_dir_all(&home).ok();
+
+        // …and the script's own defaults, for a run by hand with neither variable set,
+        // are that same order: it fell back to the $HOME/trust/first-party trees until
+        // 2026-09-24, a month after they left the delivery, where the gate never would.
+        let script = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/verify-kani-proofs.sh"),
+        )
+        .expect("the kani lane's script ships");
+        for default in [
+            r#"TRUST_MC_SYSROOT="${TRUST_MC_SYSROOT:-$STORE_TMC}""#,
+            r#"AY_BIN_DIR="${AY_BIN_DIR:-$PKG_PREFIX/bin}""#,
+        ] {
+            assert!(script.contains(default), "the script's default: {default}");
+        }
+        assert!(
+            !script.contains("first-party/trust-mc/target")
+                && !script.contains("ay/target/release"),
+            "the script probes no build tree"
+        );
     }
 
     #[test]
@@ -3923,7 +3915,7 @@ mod tests {
         build(&c, &mut r);
         let (outcome, label) = r.outcomes().next().expect("a decision");
         assert_eq!(outcome, crate::Outcome::Fail(crate::Severity::CouldNotRun));
-        assert!(label.starts_with("targo not found at "), "{label}");
+        assert!(label.starts_with("targo not found"), "{label}");
         assert!(
             label.contains("x.py build --stage 2"),
             "the diagnostic says how to fix it"
@@ -3955,7 +3947,7 @@ mod tests {
     fn a_missing_helper_script_can_never_pass() {
         let c = ctx(Scope::workspace());
         let script_stages: [fn(&Ctx, &mut Report); 4] =
-            [grep_guards, install_channel, start_compare, license_headers];
+            [grep_guards, release_tooling, start_compare, license_headers];
         for stage in script_stages {
             let mut r = Report::new("s");
             stage(&c, &mut r);
@@ -3967,6 +3959,83 @@ mod tests {
             );
             assert!(label.contains("missing or not executable"), "{label}");
         }
+    }
+
+    /// Each release suite is a decision of its own, run from the tree the gate
+    /// verifies: a red suite fails the stage under its own name while its
+    /// siblings still run, and a missing one is a cannot-run. The first pass,
+    /// over three green suites, is the negative control: the stage decides
+    /// three `ok`s, so the red and missing rows below are the suites' doing.
+    #[cfg(unix)]
+    #[test]
+    fn every_release_suite_runs_and_decides_on_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::mktemp_dir("atv-release-suites").expect("mktemp");
+        let tools = tmp.join("tools");
+        std::fs::create_dir_all(&tools).expect("mkdir");
+        let suite = |name: &str, body: &str| {
+            let path = tools.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        for name in RELEASE_SUITES {
+            suite(name, "exit 0");
+        }
+        let mut c = ctx(Scope::workspace());
+        c.root = tmp.clone();
+        let decide = |c: &Ctx| {
+            let mut r = Report::new("release tooling");
+            release_tooling(c, &mut r);
+            r.outcomes()
+                .map(|(o, l)| (o, l.to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        let green = decide(&c);
+        assert_eq!(
+            green,
+            RELEASE_SUITES
+                .iter()
+                .map(|n| (Outcome::Ok, (*n).to_string()))
+                .collect::<Vec<_>>()
+        );
+
+        suite("test-publish-export.sh", "echo widened >&2; exit 1");
+        std::fs::remove_file(tools.join("test-release-preflight.sh")).expect("rm");
+        let mixed = decide(&c);
+        assert_eq!(mixed.len(), RELEASE_SUITES.len(), "{mixed:?}");
+        assert_eq!(
+            mixed[0],
+            (Outcome::Ok, "test-install-channel.sh".to_string())
+        );
+        assert_eq!(
+            mixed[1],
+            (
+                Outcome::Fail(Severity::GateFailed),
+                "test-publish-export.sh".to_string()
+            )
+        );
+        assert_eq!(mixed[2].0, Outcome::Fail(Severity::CouldNotRun));
+        assert!(
+            mixed[2]
+                .1
+                .starts_with("test-release-preflight.sh missing or not executable"),
+            "{mixed:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The roster names suites this tree carries, so the stage runs them rather
+    /// than reporting its own roster as broken. Negative control: a name the
+    /// tree does not carry is not found by the same check.
+    #[cfg(unix)]
+    #[test]
+    fn every_release_suite_is_an_executable_file_in_this_tree() {
+        let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
+        for name in RELEASE_SUITES {
+            assert!(is_executable_file(&tools.join(name)), "tools/{name}");
+        }
+        assert!(!is_executable_file(&tools.join("test-no-such-suite.sh")));
     }
 
     #[test]
@@ -4151,7 +4220,11 @@ mod tests {
             Scope::changed("main", vec!["aterm-gui".into()], true),
         ] {
             let compile = test_compile_args(&s);
-            let run = test_run_args(&s);
+            let full = test_run_args(&s);
+            // The libtest arguments after `--` choose which COMPILED tests run;
+            // they change nothing cargo builds, so they sit outside this law.
+            let sep = full.iter().position(|a| a == "--").expect("libtest args");
+            let run = &full[..sep];
             assert_eq!(compile.last().map(String::as_str), Some("--no-run"));
             assert_eq!(run.last().map(String::as_str), Some("--tests"));
             assert_eq!(
@@ -4159,10 +4232,59 @@ mod tests {
                 run[..run.len() - 1],
                 "the two children differ only in the selector"
             );
-            for a in [&compile, &run] {
+            for a in [compile.as_slice(), run] {
                 assert!(!a.iter().any(|x| x == "--doc"), "{a:?}");
             }
             assert!(!run.iter().any(|x| x == "--no-run"), "{run:?}");
+        }
+    }
+
+    /// THE TEST RUN AND THE MEASURING STAGE ARE COMPLEMENTS (2026-09-23): the
+    /// same cargo selection in every scope, one skipping each filter and one
+    /// running exactly those, so no test can fall between the two stages
+    /// whatever the filters happen to match. The negative control is the
+    /// pre-split argv, which skipped nothing and ran the measuring tests in
+    /// the parallel run.
+    #[test]
+    fn the_test_run_and_the_measuring_stage_split_one_selection_by_one_filter_list() {
+        for s in [
+            Scope::workspace(),
+            Scope::crate_only("aterm-conformance"),
+            Scope::changed("main", vec!["atpkg".into(), "aterm-update".into()], true),
+        ] {
+            let run = test_run_args(&s);
+            let measuring = measuring_args(&s);
+            let split = |a: &[String]| {
+                let at = a.iter().position(|x| x == "--").expect("libtest args");
+                (a[..at].to_vec(), a[at + 1..].to_vec())
+            };
+            let (run_cargo, run_libtest) = split(&run);
+            let (m_cargo, m_libtest) = split(&measuring);
+            assert_eq!(run_cargo, m_cargo, "one selection: {run:?} / {measuring:?}");
+            let skipped: Vec<&str> = run_libtest
+                .chunks(2)
+                .map(|pair| {
+                    assert_eq!(pair[0], "--skip", "{run_libtest:?}");
+                    pair[1].as_str()
+                })
+                .collect();
+            let filtered: Vec<&str> = m_libtest.iter().map(String::as_str).collect();
+            assert_eq!(skipped, MEASURING_TESTS, "{run:?}");
+            assert_eq!(filtered, MEASURING_TESTS, "{measuring:?}");
+            assert!(
+                !m_libtest.iter().any(|x| x.starts_with('-')),
+                "{measuring:?}"
+            );
+        }
+        // The negative control: the argv before the split skipped nothing, so
+        // the measuring tests ran in the parallel run.
+        let before = test_base_args(&Scope::workspace());
+        assert!(!before.iter().any(|a| a == "--skip"), "{before:?}");
+        // …and every filter names a module, so it can only match a test path
+        // (`measuring::row`), never a bare function name that happens to
+        // contain the word.
+        for f in MEASURING_TESTS {
+            assert!(f.ends_with("::"), "{f}");
         }
     }
 

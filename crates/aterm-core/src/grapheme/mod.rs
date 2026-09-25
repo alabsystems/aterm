@@ -13,6 +13,6 @@ pub use aterm_grapheme::{GraphemeInfo, byte_to_column, column_to_char_index, gra
 // Re-export crate-internal API
 pub(crate) use aterm_grapheme::split_graphemes;
 
-// Re-export test-only API (used by tests/proptest/scrollback.rs)
+// Re-export test-only API (used by test_support/proptest/grapheme.rs)
 #[cfg(test)]
 pub(crate) use aterm_grapheme::grapheme_display_width;

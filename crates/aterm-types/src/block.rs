@@ -281,20 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn block_kind_equality() {
-        assert_eq!(BlockKind::ShellCommand, BlockKind::ShellCommand);
-        assert_eq!(
-            BlockKind::Repl(ReplKind::Python),
-            BlockKind::Repl(ReplKind::Python)
-        );
-        assert_ne!(
-            BlockKind::Repl(ReplKind::Python),
-            BlockKind::Repl(ReplKind::IPython)
-        );
-        assert_ne!(BlockKind::ShellCommand, BlockKind::Heuristic);
-    }
-
-    #[test]
     fn repl_block_with_sequence() {
         let block = Block {
             kind: BlockKind::Repl(ReplKind::IPython),

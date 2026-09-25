@@ -129,7 +129,10 @@
 //! borrowed, scoped   8.8 – 9.0 ns/op   objc_loadWeak + its own push/pop
 //! ```
 //!
-//! (`--release`, 2×10⁶ loads per arm, four runs, m21.) **The "cheap" load is
+//! (`--release`, 2×10⁶ loads per arm, four runs, m21; the test that printed
+//! these on every run, `the_plus_zero_load_is_not_the_cheaper_one`, was retired
+//! on 2026-09-24 and its source is at `e8a8c80ab:crates/aterm-objc/tests/weak.rs`.)
+//! **The "cheap" load is
 //! 1.7x the cost of the +1 load**, and objc4 says why in one line: it defines
 //! `objc_loadWeak(location)` as `objc_autorelease(objc_loadWeakRetained(location))`.
 //! The borrowed form does not SKIP the retain — it does the same retain and
@@ -313,9 +316,9 @@ impl WeakSlot {
     /// `objc_autorelease(objc_loadWeakRetained(…))`, so it is 1.7x the cost of
     /// [`WeakObj::load`] rather than cheaper than it. Reach for `load`.
     ///
-    /// It stays bound because it is part of the runtime's weak ABI and the
-    /// cost measurement needs both arms; it is not a building block for a
-    /// safe API.
+    /// It stays bound because it is part of the runtime's weak ABI (the
+    /// module docs record the measurement that retired it as a fast path);
+    /// it is not a building block for a safe API.
     ///
     /// # Safety
     /// The slot must be INITIALISED, and the returned pointer is BORROWED: it

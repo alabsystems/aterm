@@ -28,12 +28,11 @@
 //! 3. **IDEMPOTENT.** A key that is already a member is a no-op ([`Edit::AlreadyPresent`]),
 //!    not a second entry. Running `setup` twice, or re-running `join` after an interrupted
 //!    run, must converge rather than accumulate: a duplicate member fails
-//!    `pins::tests::keyset_has_no_duplicates` and, semantically, records a rotation that
-//!    never happened.
+//!    `pins::tests::the_master_keyset_has_no_empty_members_and_no_duplicates` and,
+//!    semantically, records a rotation that never happened.
 //! 4. **ADDITIVE.** Existing members survive, in order, with the new key appended at the
-//!    TAIL. Index 0 is a contract (`update_channel_signing_pubkey()`); reordering it
-//!    strands every client that has not adopted the new head, and release selection has no
-//!    fallback, so that is a permanent wedge rather than a delayed update.
+//!    TAIL. Index 0 is the head a rotation promotes deliberately; reordering it silently
+//!    would change which master a build names as current.
 //! 5. **REFUSE RATHER THAN GUESS.** Every shape this module does not recognise exactly —
 //!    a missing constant, two declarations of it, an unterminated block, an entry line
 //!    that is not a plain quoted literal with its trailing comma, a member that is already
@@ -51,23 +50,15 @@
 //! It does not commit, does not stage, and does not know what git is. Arming a trust
 //! anchor is a reviewed act: the tool edits the working tree and prints the diff to read.
 
-/// The paper-master anchor's constant name.
+/// The paper-master anchor's constant name — the one trust anchor this writer edits.
 pub const MASTER_ANCHOR: &str = "PAPER_MASTER_PUBKEYS";
-
-/// The release-channel keyset's constant name.
-pub const CHANNEL_ANCHOR: &str = "UPDATE_CHANNEL_PUBKEYS";
-
-/// The ceiling `pins::tests::keyset_is_bounded` enforces. A keyset is a rotation window,
-/// not an accumulator, so the writer refuses to push it past the bound rather than
-/// producing an edit whose own test suite rejects it.
-pub const MAX_CHANNEL_MEMBERS: usize = 4;
 
 /// The ceiling `pins::tests::the_master_keyset_has_no_empty_members_and_no_duplicates`
 /// enforces: a master rotation window holds at most two.
 pub const MAX_MASTER_MEMBERS: usize = 2;
 
 /// The exact number of base64 characters an Ed25519 public key encodes to (32 bytes → 44
-/// with one `=` of padding). `pins::tests::anchors_are_well_formed_base64_ed25519` asserts
+/// with one `=` of padding). `pins::tests::the_master_is_a_well_formed_base64_ed25519_key` asserts
 /// it; catching a wrong-length value HERE means it never reaches the file.
 const KEY_B64_LEN: usize = 44;
 
@@ -136,8 +127,8 @@ impl std::fmt::Debug for Anchor {
 }
 
 impl Anchor {
-    /// The head member — the key a build SIGNS with, for [`CHANNEL_ANCHOR`]. `None` only
-    /// for an empty (unpinned, inert) anchor.
+    /// The head member — the current master, for [`MASTER_ANCHOR`]. `None` only for an
+    /// empty (unpinned, inert) anchor.
     #[must_use]
     pub fn head(&self) -> Option<&str> {
         self.members.first().map(String::as_str)
@@ -581,6 +572,11 @@ pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), 
 mod tests {
     use super::*;
 
+    /// The generic writer is exercised over a fixture constant (the real anchor is the
+    /// master, whose two-member ceiling would cramp these shape tests).
+    const FIXTURE: &str = "FIXTURE_KEYS";
+    const FIXTURE_MAX: usize = 4;
+
     /// Obviously synthetic 44-character base64 keys. They are shaped like real anchors
     /// (that is the point — the writer's shape checks must pass) and are used nowhere but
     /// here.
@@ -603,7 +599,7 @@ mod tests {
              pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n\
              \n\
              /// The channel keyset. ORDER IS A CONTRACT: index 0 is the head.\n\
-             pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\n\
+             pub const FIXTURE_KEYS: &[&str] = &[\n\
              \x20   // K1 — HEAD: the key this build signs with.\n\
              \x20   \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n\
              \x20   // K2 — accept-only.\n\
@@ -629,7 +625,7 @@ mod tests {
         assert!(master.members.is_empty());
         assert_eq!(master.head(), None);
 
-        let channel = read_anchor(&src, CHANNEL_ANCHOR).expect("the open form parses");
+        let channel = read_anchor(&src, FIXTURE).expect("the open form parses");
         assert_eq!(channel.members, vec![K1.to_string(), K2.to_string()]);
         assert_eq!(channel.head(), Some(K1), "index 0 is the head");
     }
@@ -640,14 +636,8 @@ mod tests {
     fn appending_the_same_key_twice_produces_one_entry() {
         let src = fixture();
         let (once, members) = changed(
-            append_member(
-                &src,
-                CHANNEL_ANCHOR,
-                NEW,
-                &["first pass"],
-                MAX_CHANNEL_MEMBERS,
-            )
-            .expect("the first append plans"),
+            append_member(&src, FIXTURE, NEW, &["first pass"], FIXTURE_MAX)
+                .expect("the first append plans"),
         );
         assert_eq!(
             members,
@@ -655,14 +645,8 @@ mod tests {
         );
         assert_eq!(once.matches(NEW).count(), 1, "one entry after one append");
 
-        let second = append_member(
-            &once,
-            CHANNEL_ANCHOR,
-            NEW,
-            &["second pass"],
-            MAX_CHANNEL_MEMBERS,
-        )
-        .expect("the second append plans");
+        let second = append_member(&once, FIXTURE, NEW, &["second pass"], FIXTURE_MAX)
+            .expect("the second append plans");
         match second {
             Edit::AlreadyPresent { members } => {
                 assert_eq!(
@@ -673,7 +657,7 @@ mod tests {
             Edit::Changed { .. } => panic!("a re-append must be a no-op, not a second entry"),
         }
         // ...and re-reading the once-written text still sees exactly one.
-        let after = read_anchor(&once, CHANNEL_ANCHOR).unwrap();
+        let after = read_anchor(&once, FIXTURE).unwrap();
         assert_eq!(after.members.iter().filter(|m| *m == NEW).count(), 1);
         assert_eq!(once.matches(NEW).count(), 1);
     }
@@ -684,10 +668,8 @@ mod tests {
     #[test]
     fn the_existing_keys_survive_and_the_head_stays_at_index_zero() {
         let src = fixture();
-        let (text, _) = changed(
-            append_member(&src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap(),
-        );
-        let after = read_anchor(&text, CHANNEL_ANCHOR).unwrap();
+        let (text, _) = changed(append_member(&src, FIXTURE, NEW, &["m3"], FIXTURE_MAX).unwrap());
+        let after = read_anchor(&text, FIXTURE).unwrap();
         assert_eq!(
             after.members,
             vec![K1.to_string(), K2.to_string(), NEW.to_string()],
@@ -696,10 +678,9 @@ mod tests {
         assert_eq!(after.head(), Some(K1), "the head is never reordered");
 
         // A second machine appends behind the first, still without disturbing the head.
-        let (text2, _) = changed(
-            append_member(&text, CHANNEL_ANCHOR, NEW2, &["m11"], MAX_CHANNEL_MEMBERS).unwrap(),
-        );
-        let after2 = read_anchor(&text2, CHANNEL_ANCHOR).unwrap();
+        let (text2, _) =
+            changed(append_member(&text, FIXTURE, NEW2, &["m11"], FIXTURE_MAX).unwrap());
+        let after2 = read_anchor(&text2, FIXTURE).unwrap();
         assert_eq!(after2.head(), Some(K1));
         assert_eq!(after2.members.len(), 4);
     }
@@ -709,16 +690,8 @@ mod tests {
     #[test]
     fn nothing_outside_the_edited_block_is_disturbed() {
         let src = fixture();
-        let (text, _) = changed(
-            append_member(
-                &src,
-                CHANNEL_ANCHOR,
-                NEW,
-                &["provenance"],
-                MAX_CHANNEL_MEMBERS,
-            )
-            .unwrap(),
-        );
+        let (text, _) =
+            changed(append_member(&src, FIXTURE, NEW, &["provenance"], FIXTURE_MAX).unwrap());
         // Every original line still present, in order, with exactly two lines added.
         let before: Vec<&str> = src.lines().collect();
         let after: Vec<&str> = text.lines().collect();
@@ -772,7 +745,7 @@ mod tests {
         assert!(!text.contains("= &[];"), "the empty form is gone");
         // The channel anchor, in the same file, is untouched.
         assert_eq!(
-            read_anchor(&text, CHANNEL_ANCHOR).unwrap().members,
+            read_anchor(&text, FIXTURE).unwrap().members,
             vec![K1.to_string(), K2.to_string()]
         );
     }
@@ -804,7 +777,7 @@ mod tests {
         );
 
         let (text, members) = changed(
-            append_member(&src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS)
+            append_member(&src, FIXTURE, NEW, &["m3"], FIXTURE_MAX)
                 .expect("a line with trailing whitespace is still a line"),
         );
         assert_eq!(
@@ -822,7 +795,7 @@ mod tests {
             "no key bytes leaked into the comment: {text}"
         );
         // And it reads back — which is what the writer's own pre-write check now enforces.
-        assert_eq!(read_anchor(&text, CHANNEL_ANCHOR).unwrap().members, members);
+        assert_eq!(read_anchor(&text, FIXTURE).unwrap().members, members);
     }
 
     /// A MULTIBYTE CHARACTER PLUS TRAILING WHITESPACE DOES NOT PANIC.
@@ -832,23 +805,22 @@ mod tests {
     /// memory. `pins.rs`'s own keyset comments are full of em-dashes.
     #[test]
     fn a_multibyte_comment_with_trailing_whitespace_does_not_panic() {
-        let src = "pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\n\
+        let src = "pub const FIXTURE_KEYS: &[&str] = &[\n\
              \x20   // é    \n\
              \x20   \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n\
              ];\n";
-        let anchor = read_anchor(src, CHANNEL_ANCHOR).expect("this must not panic");
+        let anchor = read_anchor(src, FIXTURE).expect("this must not panic");
         assert_eq!(anchor.members, vec![K1.to_string()]);
         assert_eq!(
             anchor.indent, "    ",
             "the indent is the leading run and nothing else"
         );
-        let (text, _) =
-            changed(append_member(src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap());
+        let (text, _) = changed(append_member(src, FIXTURE, NEW, &["m3"], FIXTURE_MAX).unwrap());
         assert!(
             text.contains("    // é    \n"),
             "the comment survives verbatim: {text}"
         );
-        assert_eq!(read_anchor(&text, CHANNEL_ANCHOR).unwrap().members.len(), 2);
+        assert_eq!(read_anchor(&text, FIXTURE).unwrap().members.len(), 2);
     }
 
     /// A CRLF FILE KEEPS ITS CRLF ENDINGS. Cosmetic, but a trust anchor's diff is read by a
@@ -857,11 +829,10 @@ mod tests {
     #[test]
     fn a_crlf_file_keeps_its_line_endings() {
         let src = "pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\r\n\
-             pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\r\n\
+             pub const FIXTURE_KEYS: &[&str] = &[\r\n\
              \x20   \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\r\n\
              ];\r\n";
-        let (text, _) =
-            changed(append_member(src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap());
+        let (text, _) = changed(append_member(src, FIXTURE, NEW, &["m3"], FIXTURE_MAX).unwrap());
         assert!(text.contains("    // m3\r\n"), "{text:?}");
         assert!(
             !text.contains("// m3\n    \""),
@@ -888,24 +859,24 @@ mod tests {
     #[test]
     fn unrecognised_shapes_are_refused_not_guessed_at() {
         // Absent.
-        let err = read_anchor("// nothing here\n", CHANNEL_ANCHOR).unwrap_err();
+        let err = read_anchor("// nothing here\n", FIXTURE).unwrap_err();
         assert!(err.contains("no `pub const"), "{err}");
         assert!(err.contains("will not guess"), "{err}");
 
         // Declared twice.
         let twice = fixture().replace(
             "pub const PKG_ROOT_PUBKEY: &str = \"whatever\";",
-            "pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[];",
+            "pub const FIXTURE_KEYS: &[&str] = &[];",
         );
-        let err = read_anchor(&twice, CHANNEL_ANCHOR).unwrap_err();
+        let err = read_anchor(&twice, FIXTURE).unwrap_err();
         assert!(err.contains("2 declarations"), "{err}");
 
         // A spelling this writer does not know: a fixed-size array.
         let arrayed = fixture().replace(
-            "pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[",
-            "pub const UPDATE_CHANNEL_PUBKEYS: &[&str; 2] = &[",
+            "pub const FIXTURE_KEYS: &[&str] = &[",
+            "pub const FIXTURE_KEYS: &[&str; 2] = &[",
         );
-        let err = read_anchor(&arrayed, CHANNEL_ANCHOR).unwrap_err();
+        let err = read_anchor(&arrayed, FIXTURE).unwrap_err();
         assert!(err.contains("refusing to guess"), "{err}");
 
         // An entry that is not a plain quoted literal.
@@ -913,7 +884,7 @@ mod tests {
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",",
             "    SOME_OTHER_CONST,",
         );
-        let err = read_anchor(&computed, CHANNEL_ANCHOR).unwrap_err();
+        let err = read_anchor(&computed, FIXTURE).unwrap_err();
         assert!(err.contains("does not recognise"), "{err}");
         assert!(err.contains("SOME_OTHER_CONST"), "{err}");
 
@@ -923,25 +894,25 @@ mod tests {
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",",
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\"",
         );
-        assert!(read_anchor(&no_comma, CHANNEL_ANCHOR).is_err());
+        assert!(read_anchor(&no_comma, FIXTURE).is_err());
 
         // A stray ITEM inside the block — the terminator went missing and the next
         // top-level declaration was swallowed. Caught as an unrecognised line, which is
         // the right refusal: the writer has no idea where this list ends.
         let swallowed = fixture().replace("];\n", "");
-        let err = read_anchor(&swallowed, CHANNEL_ANCHOR).unwrap_err();
+        let err = read_anchor(&swallowed, FIXTURE).unwrap_err();
         assert!(err.contains("does not recognise"), "{err}");
         assert!(err.contains("PKG_ROOT_PUBKEY"), "{err}");
 
         // Genuinely unterminated: the block runs to end of file.
-        let unterminated = "pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\n    \"x\",\n";
-        let err = read_anchor(unterminated, CHANNEL_ANCHOR).unwrap_err();
+        let unterminated = "pub const FIXTURE_KEYS: &[&str] = &[\n    \"x\",\n";
+        let err = read_anchor(unterminated, FIXTURE).unwrap_err();
         assert!(err.contains("never closed"), "{err}");
 
         // ...and NONE of these produced an edit. The negative control: the same file
         // WITHOUT the damage plans successfully, so the refusals are about the damage.
-        assert!(append_member(&computed, CHANNEL_ANCHOR, NEW, &[], 4).is_err());
-        assert!(append_member(&fixture(), CHANNEL_ANCHOR, NEW, &[], 4).is_ok());
+        assert!(append_member(&computed, FIXTURE, NEW, &[], 4).is_err());
+        assert!(append_member(&fixture(), FIXTURE, NEW, &[], 4).is_ok());
     }
 
     /// An anchor already holding an empty member is a brick; the writer refuses to append
@@ -954,11 +925,8 @@ mod tests {
         );
         // The read still succeeds — the shape is legal — so the refusal is a real decision
         // and not a parse accident.
-        assert_eq!(
-            read_anchor(&bricked, CHANNEL_ANCHOR).unwrap().members[0],
-            ""
-        );
-        let err = append_member(&bricked, CHANNEL_ANCHOR, NEW, &[], 4).unwrap_err();
+        assert_eq!(read_anchor(&bricked, FIXTURE).unwrap().members[0], "");
+        let err = append_member(&bricked, FIXTURE, NEW, &[], 4).unwrap_err();
         assert!(err.contains("empty string"), "{err}");
         assert!(err.contains("brick"), "{err}");
     }
@@ -969,20 +937,20 @@ mod tests {
     fn a_malformed_key_is_refused_before_any_edit_is_planned() {
         let src = fixture();
         let truncated = &NEW[..43];
-        let err = append_member(&src, CHANNEL_ANCHOR, truncated, &[], 4).unwrap_err();
+        let err = append_member(&src, FIXTURE, truncated, &[], 4).unwrap_err();
         assert!(err.contains("exactly 44"), "{err}");
         assert!(err.contains("43"), "{err}");
 
         let unpadded = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         assert_eq!(unpadded.len(), 44, "the fixture must be the right length");
-        assert!(append_member(&src, CHANNEL_ANCHOR, unpadded, &[], 4).is_err());
+        assert!(append_member(&src, FIXTURE, unpadded, &[], 4).is_err());
 
         let bad_alphabet = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \"=";
         assert_eq!(bad_alphabet.len(), 44);
-        let err = append_member(&src, CHANNEL_ANCHOR, bad_alphabet, &[], 4).unwrap_err();
+        let err = append_member(&src, FIXTURE, bad_alphabet, &[], 4).unwrap_err();
         assert!(err.contains("non-base64"), "{err}");
 
-        assert!(append_member(&src, CHANNEL_ANCHOR, "", &[], 4).is_err());
+        assert!(append_member(&src, FIXTURE, "", &[], 4).is_err());
     }
 
     /// The ceiling the pins tests enforce is enforced HERE, so the writer never produces
@@ -1006,19 +974,18 @@ mod tests {
     #[test]
     fn verification_catches_a_write_that_did_not_land() {
         let src = fixture();
-        let (text, members) = changed(
-            append_member(&src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap(),
-        );
-        verify_members(&text, CHANNEL_ANCHOR, &members).expect("the intended write verifies");
+        let (text, members) =
+            changed(append_member(&src, FIXTURE, NEW, &["m3"], FIXTURE_MAX).unwrap());
+        verify_members(&text, FIXTURE, &members).expect("the intended write verifies");
 
         // The write never happened (the original file is still on disk).
-        let err = verify_members(&src, CHANNEL_ANCHOR, &members).unwrap_err();
+        let err = verify_members(&src, FIXTURE, &members).unwrap_err();
         assert!(err.contains("holds 2 keys but 3 were intended"), "{err}");
 
         // One character of the key was corrupted in flight.
         let mangled = text.replace(NEW, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=");
         assert_ne!(mangled, text, "the mutation must actually change the text");
-        let err = verify_members(&mangled, CHANNEL_ANCHOR, &members).unwrap_err();
+        let err = verify_members(&mangled, FIXTURE, &members).unwrap_err();
         assert!(err.contains("[2]"), "{err}");
         assert!(err.contains("was intended"), "{err}");
 
@@ -1028,10 +995,10 @@ mod tests {
             m.swap(0, 2);
             m
         };
-        assert!(verify_members(&text, CHANNEL_ANCHOR, &reordered).is_err());
+        assert!(verify_members(&text, FIXTURE, &reordered).is_err());
 
         // The file was truncated to nothing readable.
-        let err = verify_members("// gone\n", CHANNEL_ANCHOR, &members).unwrap_err();
+        let err = verify_members("// gone\n", FIXTURE, &members).unwrap_err();
         assert!(err.contains("could not be read back"), "{err}");
     }
 
@@ -1046,22 +1013,14 @@ mod tests {
             "/../aterm-update-core/src/pins.rs"
         );
         let src = std::fs::read_to_string(path).expect("the anchor file is in the tree");
-        let channel = read_anchor(&src, CHANNEL_ANCHOR).expect("the channel keyset is readable");
-        assert_eq!(
-            channel.members,
-            aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS
-                .iter()
-                .map(|k| (*k).to_string())
-                .collect::<Vec<_>>(),
-            "what the writer reads out of the source must be what the compiler compiled in"
-        );
         let master = read_anchor(&src, MASTER_ANCHOR).expect("the master anchor is readable");
         assert_eq!(
             master.members,
             aterm_update_core::pins::PAPER_MASTER_PUBKEYS
                 .iter()
                 .map(|k| (*k).to_string())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            "what the writer reads out of the source must be what the compiler compiled in"
         );
     }
 }

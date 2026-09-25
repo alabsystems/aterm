@@ -26,50 +26,34 @@
 //! an external-only analysis reports a prominent one-line notice and returns early
 //! where its tool is absent (the [`ty_escalation`]-family idiom).
 //!
-//! ## The checker is part of Trust
+//! ## The checkers are atpkg programs
 //!
-//! `ty`/`trust-ir` live in the Trust toolchain (`$HOME/trust/first-party/{ty,trust-ir}`),
-//! NOT a standalone checkout. Build them once:
-//!
-//! ```sh
-//! cargo build --release -p tla-cli   # in $HOME/trust/first-party/ty       -> ty
-//! cargo build --release              # in $HOME/trust/first-party/trust-ir -> trust-ir
-//! cargo build --release -p ay --bin ay --features cli
-//!                                    # in $HOME/trust/first-party/ay       -> ay
-//! ```
-//!
-//! `ay` needs its own line because a plain `cargo build --release` DOES NOT BUILD
-//! IT: the binary carries `required-features = ["cli"]` and `cli` is not a default
-//! feature, so the workspace build compiles every sibling crate, reports
-//! "Finished", and leaves whatever `ay` was already at `target/release/ay`
-//! untouched — including a stale one that discovery then prefers over every newer
-//! build on the machine (measured 2026-08-31: a 0.10.0 artifact from a plain
-//! `cargo build --release` reddened `sparkle_v2_ay_certificates` with
-//! `got=unknown` while 0.5.0, 0.13.0 and 0.22.0 elsewhere all discharged it).
-//!
-//! [`find_ty`]/[`find_trust_ir`] then discover them automatically at their canonical
-//! release paths — or anywhere the full-toolchain bootstrap (`build/<triple>/…`)
-//! dropped them, or through the atpkg-managed store's shim, or on `PATH`, in that
-//! order: a developer tree wins over the managed store (owner policy). The home
-//! directory (`$HOME`, or `%USERPROFILE%` on Windows), `%LOCALAPPDATA%` (Windows)
-//! and `PATH` are the only environment access; there is no path override and
-//! nothing to remember to set.
+//! `ty`, `trust-ir` and `ay` arrive with the Trust toolchain's package set —
+//! `aterm pkg install --default-set`, or one at a time (`aterm pkg install ty`) —
+//! and nothing here is built from source. [`find_ty`]/[`find_trust_ir`]/[`find_ay`]
+//! discover each through the atpkg store's shim (`<prefix>/bin/<tool>`), then on
+//! `PATH`. That is the whole order: the `$HOME/trust/first-party` cargo builds, the
+//! `$HOME/trust/build` bootstrap stages and the standalone `~/ay` checkout were probed
+//! FIRST until 2026-09-24, a month after they were retired from the delivery
+//! (2026-08-29) — and on m3 a `$HOME/trust/first-party/trust-ir` 0.2.0 from 2026-08-17
+//! was shadowing the store's 0.14.0 on every spec-link run. A developer who wants
+//! their own build points the shim at it: `aterm pkg link <tool> <checkout>`. The
+//! home directory (`$HOME`, or `%USERPROFILE%` on Windows), `%LOCALAPPDATA%`
+//! (Windows) and `PATH` are the only environment access.
 //!
 //! ## The tier names the binary it ran
 //!
-//! Because a developer tree SHADOWS the store, which binary answered is not
-//! obvious — and it used to be invisible: a passing check named no binary, and
-//! the path reached output only inside a failure panic. The first discovery of
-//! each tool in a process now writes one line straight to stderr (not through
+//! Which binary answered used to be invisible: a passing check named no binary,
+//! and the path reached output only inside a failure panic. The first discovery
+//! of each tool in a process now writes one line straight to stderr (not through
 //! `eprintln!`, which libtest swallows for a passing test):
 //!
 //! ```text
-//! VERIFY ESCALATION TIER: ty = $HOME/trust/build/host/stage1/bin/ty [bootstrap tree $HOME/trust/build; ty 0.15.0; built 2026-09-16] — discovery prefers the developer tree (owner policy), so this shadows the managed store's store/trust/9192/bin/ty (built 2026-09-19), store/ty/3007/bin/ty (built 2026-09-24)
+//! VERIFY ESCALATION TIER: ty = ~/Library/Application Support/aterm/pkg/store/ty/3007/bin/ty [atpkg managed store; ty 0.15.0; built 2026-09-24] — the managed store also holds store/trust/9192/bin/ty (built 2026-09-19)
 //! ```
 //!
-//! (Measured on m3, 2026-09-24. A `built` date is the file's mtime in UTC —
-//! a reinstall moves it — because `--version` does not change between builds of
-//! one package version.)
+//! (A `built` date is the file's mtime in UTC — a reinstall moves it — because
+//! `--version` does not change between builds of one package version.)
 //!
 //! It costs one `--version` spawn per tool per process (bounded at five
 //! seconds), a few `stat`s and a 256-byte head read per candidate; store
@@ -109,11 +93,9 @@ use std::sync::Mutex;
 use crate::derive::Model;
 use crate::interp;
 
-/// Discover the Trust `ty` model-checker. Searches, in order: the canonical
-/// first-party cargo build, any full-toolchain bootstrap stage build, the
-/// atpkg-managed store's shim, then `ty` on `PATH` (see [`locate_ty`] for which
-/// tier answered). The home directory, `PATH` and (Windows) `%LOCALAPPDATA%` are
-/// the only environment access.
+/// Discover the Trust `ty` model-checker: the atpkg-managed store's shim, then
+/// `ty` on `PATH` (see [`locate_ty`] for which tier answered). The home directory,
+/// `PATH` and (Windows) `%LOCALAPPDATA%` are the only environment access.
 ///
 /// The first discovery of each tool in a process prints ONE
 /// `VERIFY ESCALATION TIER: ty = …` line straight to stderr naming the binary,
@@ -130,10 +112,8 @@ pub fn find_trust_ir() -> Option<PathBuf> {
     locate_trust_ir().map(|l| l.path)
 }
 
-/// Discover the Trust `ay` SAT/SMT/CHC solver. Mirrors [`find_ty`] exactly
-/// (canonical first-party build → full-toolchain bootstrap stage scan → store
-/// shim → PATH), plus the standalone `~/ay` release checkout some proof
-/// bundles' `verify.sh` scripts also probe. Used by the always-on
+/// Discover the Trust `ay` SAT/SMT/CHC solver. Mirrors [`find_ty`] exactly (store
+/// shim → PATH). Used by the always-on
 /// `sparkle_v2_ay_certificates` gate: hand-encoded SMT-LIB2 certificates are
 /// re-checked fail-closed, the same honesty ratchet as the `ty` Tier-0 gates.
 #[must_use]
@@ -144,38 +124,28 @@ pub fn find_ay() -> Option<PathBuf> {
 /// [`find_ty`], plus WHERE the binary came from.
 #[must_use]
 pub fn locate_ty() -> Option<Located> {
-    discover("ty", "ty/target/release", false)
+    discover("ty")
 }
 
 /// [`find_trust_ir`], plus where the binary came from.
 #[must_use]
 pub fn locate_trust_ir() -> Option<Located> {
-    discover("trust-ir", "trust-ir/target/release", false)
+    discover("trust-ir")
 }
 
 /// [`find_ay`], plus where the binary came from.
 #[must_use]
 pub fn locate_ay() -> Option<Located> {
-    discover("ay", "ay/target/release", true)
+    discover("ay")
 }
 
-/// The discovery tier that answered. The precedence is the variants' order
-/// (with `StandaloneAy` last, `ay` only) and is the owner's policy — a live
-/// `$HOME/trust` wins over the managed store; this type only makes the answer
-/// visible.
+/// The discovery tier that answered, in precedence order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrustBinOrigin {
-    /// `$HOME/trust/first-party/<tool>/target/release/<tool>` — a developer cargo build.
-    FirstParty,
-    /// `$HOME/trust/build/<triple>/{stage2-tools-bin/<triple>,stage1/bin}/<tool>` —
-    /// a full-toolchain bootstrap on a machine that builds Trust.
-    Bootstrap,
     /// The atpkg-managed store, through its `<prefix>/bin/<tool>` shim.
     Store,
     /// `<tool>` on `PATH`.
     Path,
-    /// `ay` only: the standalone `~/ay/target/release/ay` checkout.
-    StandaloneAy,
 }
 
 impl TrustBinOrigin {
@@ -183,20 +153,9 @@ impl TrustBinOrigin {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::FirstParty => "first-party cargo build $HOME/trust/first-party",
-            Self::Bootstrap => "bootstrap tree $HOME/trust/build",
             Self::Store => "atpkg managed store",
             Self::Path => "PATH",
-            Self::StandaloneAy => "standalone ~/ay checkout",
         }
-    }
-
-    /// A developer tree that discovery prefers over the managed store.
-    fn is_developer_tree(self) -> bool {
-        matches!(
-            self,
-            Self::FirstParty | Self::Bootstrap | Self::StandaloneAy
-        )
     }
 }
 
@@ -213,71 +172,32 @@ pub struct Located {
 // Skip: environment + filesystem discovery and a stderr report.
 // Build-tooling discovery; every miss returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
-fn discover(bin: &'static str, first_party_rel_dir: &str, standalone_ay: bool) -> Option<Located> {
+fn discover(bin: &'static str) -> Option<Located> {
     let homes = home_dirs();
     let store_bin = atpkg_store_bin_dir();
     let path_var = std::env::var_os("PATH");
-    let found = find_trust_bin(
-        bin,
-        first_party_rel_dir,
-        &homes,
-        store_bin.as_deref(),
-        path_var.as_deref(),
-    )
-    .or_else(|| {
-        standalone_ay
-            .then(|| locate_standalone_ay_in(&homes))
-            .flatten()
-    });
+    let found = find_trust_bin(bin, store_bin.as_deref(), path_var.as_deref());
     report_provenance_once(bin, found.as_ref(), &homes, store_bin.as_deref());
     found
 }
 
-/// Shared discovery — THE precedence: the canonical
-/// `$HOME/trust/first-party/<rel_dir>/<bin>` cargo build, then any matching tool the
-/// full-toolchain bootstrap left under `$HOME/trust/build/<triple>/…`, then the atpkg
-/// store shim, then `<bin>` on `PATH`. All filesystem probes use the platform
-/// executable name (`ty` vs `ty.exe`). The environment (homes, the store's
-/// `bin/` dir, the `PATH` value) is passed in EXPLICITLY so the order is
-/// testable over a temp HOME without mutating the process environment.
-// Skip: drop glue for the `&[PathBuf]` search (std/alloc internals — the
-// drop-glue lane). Build-tooling discovery; every miss returns None
-// (fail-closed).
+/// Shared discovery — THE precedence: the atpkg store shim, then `<bin>` on `PATH`,
+/// with the platform executable name (`ty` vs `ty.exe`). The environment (the
+/// store's `bin/` dir, the `PATH` value) is passed in EXPLICITLY so the order is
+/// testable without mutating the process environment.
+///
+/// The store comes first because atpkg's `bin/` reaches PATH only in INTERACTIVE
+/// shells (aterm's integration, or the rc block atpkg appends), never in a `cargo
+/// test` process. A shim is trusted only when it resolves to a real file (a
+/// dangling link after a GC must not satisfy discovery).
+// Skip: build-tooling discovery; every miss returns None (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 fn find_trust_bin(
     bin: &str,
-    first_party_rel_dir: &str,
-    homes: &[PathBuf],
     store_bin_dir: Option<&Path>,
     path_var: Option<&std::ffi::OsStr>,
 ) -> Option<Located> {
     let exe = exe_name(bin);
-    for home in homes {
-        let canonical = home
-            .join("trust/first-party")
-            .join(first_party_rel_dir)
-            .join(&exe);
-        if canonical.exists() {
-            return Some(Located {
-                path: canonical,
-                origin: TrustBinOrigin::FirstParty,
-            });
-        }
-        if let Some(p) = scan_trust_bootstrap(&home.join("trust/build"), &exe) {
-            return Some(Located {
-                path: p,
-                origin: TrustBinOrigin::Bootstrap,
-            });
-        }
-    }
-    // The atpkg-managed store (batteries-included installs): the per-tool shim
-    // under the manager-owned prefix. Probed after the developer checkouts (a
-    // live $HOME/trust always wins) and before PATH — atpkg's bin/ reaches PATH
-    // only in INTERACTIVE shells (aterm's integration, or the rc block atpkg
-    // appends to an existing rc; APPENDED either way), never in a `cargo test`
-    // / CI process, so without this probe a seeded toolchain is invisible to
-    // those. A shim is trusted only when it resolves to a real file
-    // (a dangling link after a GC must not satisfy discovery).
     if let Some(p) = store_bin_dir.and_then(|d| resolve_store_shim(&d.join(&exe))) {
         return Some(Located {
             path: p,
@@ -288,22 +208,6 @@ fn find_trust_bin(
         path,
         origin: TrustBinOrigin::Path,
     })
-}
-
-/// `ay`'s last resort: the standalone `~/ay` checkout, probed the same
-/// Windows-aware way as the shared discovery (all candidate homes + the
-/// platform exe name) rather than `$HOME` only.
-#[cfg_attr(trust_verify, trust::skip)]
-fn locate_standalone_ay_in(homes: &[PathBuf]) -> Option<Located> {
-    let exe = exe_name("ay");
-    homes
-        .iter()
-        .map(|home| home.join("ay/target/release").join(&exe))
-        .find(|p| p.exists())
-        .map(|path| Located {
-            path,
-            origin: TrustBinOrigin::StandaloneAy,
-        })
 }
 
 /// The atpkg store's `bin/` directory. The prefix mirrors
@@ -443,7 +347,7 @@ fn home_dirs() -> Vec<PathBuf> {
     homes
 }
 
-/// On Windows, rewrite a POSIX-style `/c/Users//…` home to `C:/Users//…`; otherwise
+/// On Windows, rewrite a POSIX-style `/c/Users/…` home to `C:/Users/…`; otherwise
 /// pass through unchanged.
 fn normalize_home(dir: String) -> String {
     if cfg!(windows) {
@@ -453,29 +357,6 @@ fn normalize_home(dir: String) -> String {
         }
     }
     dir
-}
-
-/// Best-effort scan of the full-toolchain bootstrap output
-/// (`$HOME/trust/build/<triple>/{stage2-tools-bin/<triple>,stage1/bin}/<exe>`) — the
-/// layout `x.py`/bootstrap produces when the whole Trust compiler is built.
-// Skip: the `read_dir` iterator's `next` is an absent std body under the
-// generic trait path (fs iteration); every I/O miss returns None
-// (fail-closed). Build-tooling discovery, not runtime code.
-#[cfg_attr(trust_verify, trust::skip)]
-fn scan_trust_bootstrap(build: &Path, exe: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(build).ok()?.flatten() {
-        let triple_dir = entry.path();
-        let triple = entry.file_name();
-        for cand in [
-            triple_dir.join("stage2-tools-bin").join(&triple).join(exe),
-            triple_dir.join("stage1").join("bin").join(exe),
-        ] {
-            if cand.exists() {
-                return Some(cand);
-            }
-        }
-    }
-    None
 }
 
 /// `PATH` lookup via `std::env::split_paths` — portable, no shell dependency.
@@ -490,19 +371,13 @@ fn path_search_in(exe: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathB
 }
 
 // ---------------------------------------------------------------------------
-// PROVENANCE: the escalation tier names the binary it ran.
-//
-// Discovery prefers a developer tree over the managed store — that order is the
-// owner's policy and is not changed here. What WAS wrong is that it was silent:
-// a passing check printed "additionally model-checked clean by ty" and nothing
-// about WHICH ty, and the binary path reached output only inside a failure
-// panic. Measured 2026-09-23 on m3: every derived-model check ran
-// `$HOME/trust/build/host/stage1/bin/ty` (a bootstrap build from 2026-09-16) and
-// every spec-link ran `$HOME/trust/first-party/trust-ir` 0.2.0 from 2026-08-17
-// while the managed store held trust-ir 0.14.0 — a stale override nothing
-// reported. Now the first discovery of each tool in a process prints one line
-// naming the binary, its tier, its `--version`, its build date, and every
-// managed-store copy it shadowed.
+// PROVENANCE: the escalation tier names the binary it ran. Measured 2026-09-23
+// on m3, before discovery lost its developer-tree tiers: every derived-model
+// check ran a bootstrap `$HOME/trust/build/host/stage1/bin/ty` and every spec-link
+// a first-party trust-ir 0.2.0 while the managed store held 0.14.0 — a stale
+// override nothing reported. The first discovery of each tool in a process
+// prints one line naming the binary, its tier, its `--version`, its build date,
+// and every other managed-store copy.
 // ---------------------------------------------------------------------------
 
 /// A copy of a tool in the atpkg store: `<prefix>/store/<program>/current/bin/<exe>`.
@@ -709,10 +584,8 @@ fn render_provenance(
         .collect::<Vec<_>>()
         .join(", ");
     let Some(found) = found else {
-        let standalone = if bin == "ay" { ", ~/ay" } else { "" };
         let mut line = format!(
-            "VERIFY ESCALATION TIER: {bin} = NOT FOUND (probed $HOME/trust/first-party, \
-             $HOME/trust/build, the atpkg store shim, PATH{standalone})"
+            "VERIFY ESCALATION TIER: {bin} = NOT FOUND (probed the atpkg store shim, PATH)"
         );
         if !shadowed.is_empty() {
             let why = match shim {
@@ -747,14 +620,7 @@ fn render_provenance(
         built.unwrap_or("date unknown"),
     );
     if !shadowed.is_empty() {
-        if found.origin.is_developer_tree() {
-            line.push_str(&format!(
-                " — discovery prefers the developer tree (owner policy), so this shadows the \
-                 managed store's {copies}"
-            ));
-        } else {
-            line.push_str(&format!(" — the managed store also holds {copies}"));
-        }
+        line.push_str(&format!(" — the managed store also holds {copies}"));
     }
     line
 }
@@ -893,14 +759,14 @@ const PENDING_STUB_HEAD: u64 = 256;
 /// The self-identifying line atpkg writes into every pending-program stub.
 const PENDING_STUB_MARKER: &[u8] = b"atpkg pending-program stub";
 
-/// Locate the Trust `ty` model-checker for `label`, or PANIC with a build hint.
+/// Locate the Trust `ty` model-checker for `label`, or PANIC with the install hint.
 /// Verification is ALWAYS required — no env var, no skip. A conformance test that
 /// cannot reach `ty` FAILS rather than reporting a false `ok`.
 #[must_use]
 pub fn ty(label: &str) -> PathBuf {
     require(
         "ty",
-        "cargo build --release -p tla-cli   (in $HOME/trust/first-party/ty)",
+        "aterm pkg install ty   (or `aterm pkg install --default-set`)",
         find_ty(),
         label,
     )
@@ -912,7 +778,7 @@ pub fn ty(label: &str) -> PathBuf {
 pub fn trust_ir(label: &str) -> PathBuf {
     require(
         "trust-ir",
-        "cargo build --release   (in $HOME/trust/first-party/trust-ir)",
+        "aterm pkg install trust-ir   (or `aterm pkg install --default-set`)",
         find_trust_ir(),
         label,
     )
@@ -924,7 +790,7 @@ pub fn trust_ir(label: &str) -> PathBuf {
 pub fn ay(label: &str) -> PathBuf {
     require(
         "ay",
-        "cargo build --release -p ay --bin ay --features cli   (in $HOME/trust/first-party/ay)",
+        "aterm pkg install ay   (or `aterm pkg install --default-set`)",
         find_ay(),
         label,
     )
@@ -949,7 +815,7 @@ fn require(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> 
     found.unwrap_or_else(|| {
         panic!(
             "VERIFICATION GATE: Trust `{bin}` not found — `{label}` could NOT be \
-             model-checked / spec-linked. Build the Trust toolchain once: {build_hint}. \
+             model-checked / spec-linked. Install it once: {build_hint}. \
              Verification is always required; this test FAILS rather than reporting a \
              false ok."
         )
@@ -993,7 +859,7 @@ fn escalation(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) 
 pub fn ty_escalation(label: &str) -> Option<PathBuf> {
     escalation(
         "ty",
-        "cargo build --release -p tla-cli   (in $HOME/trust/first-party/ty)",
+        "aterm pkg install ty   (or `aterm pkg install --default-set`)",
         find_ty(),
         label,
     )
@@ -1006,7 +872,7 @@ pub fn ty_escalation(label: &str) -> Option<PathBuf> {
 pub fn trust_ir_escalation(label: &str) -> Option<PathBuf> {
     escalation(
         "trust-ir",
-        "cargo build --release   (in $HOME/trust/first-party/trust-ir)",
+        "aterm pkg install trust-ir   (or `aterm pkg install --default-set`)",
         find_trust_ir(),
         label,
     )
@@ -1017,7 +883,7 @@ pub fn trust_ir_escalation(label: &str) -> Option<PathBuf> {
 pub fn ay_escalation(label: &str) -> Option<PathBuf> {
     escalation(
         "ay",
-        "cargo build --release -p ay --bin ay --features cli   (in $HOME/trust/first-party/ay)",
+        "aterm pkg install ay   (or `aterm pkg install --default-set`)",
         find_ay(),
         label,
     )
@@ -1129,8 +995,9 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// under a `Soundness mode: Sound` banner. The trigger is the same singleton
 /// ample set — drop the stutter action from `Next` and the full 128 states
 /// appear. A 2026-07-20 bootstrap stage build on the same disk is correct
-/// (`POR: 0/127 states reduced`), but `find_trust_bin` probes the first-party
-/// path first and therefore always takes the broken one.
+/// (`POR: 0/127 states reduced`), but `find_trust_bin` probed the first-party
+/// path first and therefore always took the broken one (it probes neither
+/// since 2026-09-24).
 ///
 /// So this is not a historical note and not a belt-and-braces flag. It is the
 /// only thing standing between this workspace and a checker that answers
@@ -1485,8 +1352,7 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
             eprintln!(
                 "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
                  the interpreter cannot evaluate and Trust `ty` is not installed — this \
-                 obligation did not run. Build ty once: cargo build --release -p tla-cli \
-                 (in $HOME/trust/first-party/ty).",
+                 obligation did not run. Install ty once: aterm pkg install ty.",
                 m.name
             );
             Err(NotRun { model: m.name })
@@ -1575,8 +1441,7 @@ pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun>
             eprintln!(
                 "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
                  the interpreter cannot evaluate and Trust `ty` is not installed — this \
-                 obligation did not run. Build ty once: cargo build --release -p tla-cli \
-                 (in $HOME/trust/first-party/ty).",
+                 obligation did not run. Install ty once: aterm pkg install ty.",
                 m.name
             );
             Err(NotRun { model: m.name })
@@ -2551,13 +2416,7 @@ mod tests {
             p
         }
         fn locate(&self, bin: &str, path_var: Option<&std::ffi::OsStr>) -> Option<Located> {
-            find_trust_bin(
-                bin,
-                &format!("{bin}/target/release"),
-                &[self.home()],
-                Some(&self.store_bin()),
-                path_var,
-            )
+            find_trust_bin(bin, Some(&self.store_bin()), path_var)
         }
         fn line(&self, bin: &str, found: Option<&Located>) -> String {
             provenance_line(
@@ -2576,61 +2435,7 @@ mod tests {
         }
     }
 
-    /// Cell 1 — bootstrap PRESENT, store PRESENT (m3's shape, measured
-    /// 2026-09-23): discovery keeps the owner's order and takes the bootstrap
-    /// build, and the line says so AND names the store copy it shadowed.
-    /// Before this change nothing on a passing run named either path.
-    #[cfg(unix)]
-    #[test]
-    fn provenance_bootstrap_present_store_present_names_both() {
-        let s = Scratch::new("bs-st");
-        let boot = s.file("home/trust/build/host/stage1/bin/ty");
-        s.store_copy("ty", "3007", "ty");
-        s.store_copy("trust", "9192", "ty");
-        let found = s.locate("ty", None).expect("bootstrap ty is found");
-        assert_eq!(found.origin, TrustBinOrigin::Bootstrap);
-        assert_eq!(found.path, boot);
-        let line = s.line("ty", Some(&found));
-        assert!(
-            line.starts_with(
-                "VERIFY ESCALATION TIER: ty = $HOME/trust/build/host/stage1/bin/ty \
-                 [bootstrap tree $HOME/trust/build; ty 9.9.9; built 2"
-            ),
-            "the line names the binary, its tier, its version and its build date: {line}"
-        );
-        assert!(
-            line.contains(
-                "discovery prefers the developer tree (owner policy), so this shadows the \
-                 managed store's store/trust/9192/bin/ty (built 2"
-            ) && line.contains("store/ty/3007/bin/ty (built 2"),
-            "every shadowed store copy is named beside the chosen one: {line}"
-        );
-    }
-
-    /// Cell 2 — bootstrap PRESENT, store ABSENT: the bootstrap build, and no
-    /// store clause (there is nothing to shadow).
-    #[test]
-    fn provenance_bootstrap_present_store_absent_has_no_store_clause() {
-        let s = Scratch::new("bs-nost");
-        s.file(&format!(
-            "home/trust/build/aarch64-apple-darwin/stage1/bin/{}",
-            exe_name("ty")
-        ));
-        let found = s.locate("ty", None).expect("bootstrap ty is found");
-        assert_eq!(found.origin, TrustBinOrigin::Bootstrap);
-        let line = s.line("ty", Some(&found));
-        assert!(
-            line.contains("[bootstrap tree $HOME/trust/build; ty 9.9.9; built "),
-            "{line}"
-        );
-        assert!(
-            !line.contains("store/"),
-            "no store, no store clause: {line}"
-        );
-        assert!(!line.contains(" — "), "{line}");
-    }
-
-    /// Cell 3 — bootstrap ABSENT, store PRESENT, PATH empty. With no usable
+    /// Store PRESENT, PATH empty. With no usable
     /// `ty` shim (m3's store lost its own-name `ty`/`ay` shims to a trust
     /// rollback, measured 2026-09-23) nothing is found, and the line names the
     /// store copy and WHY discovery missed it instead of implying the tool is
@@ -2638,7 +2443,7 @@ mod tests {
     /// symlink — the store tier answers and the line says so.
     #[cfg(unix)]
     #[test]
-    fn provenance_bootstrap_absent_store_present_names_the_unreached_copy() {
+    fn provenance_store_present_names_the_unreached_copy() {
         let s = Scratch::new("nobs-st");
         s.store_copy("ty", "3007", "ty");
         let shim = s.store_bin().join("ty");
@@ -2707,59 +2512,53 @@ mod tests {
         assert_eq!(found.origin, TrustBinOrigin::Store);
     }
 
-    /// Cell 4 — bootstrap ABSENT, store ABSENT: not found, and the plain
-    /// notice with no store clause.
+    /// Nothing installed: not found, and the plain notice with no store clause.
     #[test]
     fn provenance_nothing_installed_is_a_plain_not_found() {
         let s = Scratch::new("none");
         assert_eq!(s.locate("ty", None), None);
         assert_eq!(
             s.line("ty", None),
-            "VERIFY ESCALATION TIER: ty = NOT FOUND (probed $HOME/trust/first-party, \
-             $HOME/trust/build, the atpkg store shim, PATH)"
+            "VERIFY ESCALATION TIER: ty = NOT FOUND (probed the atpkg store shim, PATH)"
         );
     }
 
-    /// The owner's order, pinned: first-party beats bootstrap beats the store
-    /// shim beats PATH; `ay` alone falls back to the standalone `~/ay` checkout.
+    /// THE order, pinned: the store shim beats PATH, and a developer tree under home
+    /// — a first-party cargo build, a bootstrap stage, a standalone `~/ay` — is never
+    /// a candidate (m3's stale first-party trust-ir 0.2.0 shadowed store 1123 until
+    /// 2026-09-24). Another copy in the store is named beside the chosen one.
     #[cfg(unix)]
     #[test]
-    fn discovery_order_is_first_party_bootstrap_store_path() {
+    fn discovery_order_is_store_then_path_and_no_developer_tree() {
         let s = Scratch::new("order");
+        s.file("home/trust/first-party/trust-ir/target/release/trust-ir");
+        s.file("home/trust/build/host/stage1/bin/trust-ir");
+        s.file("home/ay/target/release/ay");
+        assert_eq!(
+            s.locate("trust-ir", None),
+            None,
+            "no developer tree is probed"
+        );
+        assert_eq!(s.locate("ay", None), None, "no standalone ~/ay either");
+
         let on_path = s.file("pathdir/trust-ir");
         let path_var = std::ffi::OsString::from(on_path.parent().unwrap());
         let got = s.locate("trust-ir", Some(&path_var)).unwrap();
-        assert_eq!(got.origin, TrustBinOrigin::Path);
+        assert_eq!((got.origin, got.path), (TrustBinOrigin::Path, on_path));
 
         let store = s.store_copy("trust-ir", "1123", "trust-ir");
+        s.store_copy("trust", "9192", "trust-ir");
         std::os::unix::fs::symlink(&store, s.store_bin().join("trust-ir")).unwrap();
-        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
-        assert_eq!(got.origin, TrustBinOrigin::Store);
-
-        s.file("home/trust/build/host/stage1/bin/trust-ir");
-        let got = s.locate("trust-ir", Some(&path_var)).unwrap();
-        assert_eq!(got.origin, TrustBinOrigin::Bootstrap);
-
-        let fp = s.file("home/trust/first-party/trust-ir/target/release/trust-ir");
         let got = s.locate("trust-ir", Some(&path_var)).unwrap();
         assert_eq!(
             (got.origin, got.path.clone()),
-            (TrustBinOrigin::FirstParty, fp)
+            (TrustBinOrigin::Store, store)
         );
-        // m3's trust-ir shape: a first-party 0.2.0 over store 1123 — the stale
-        // override this change exists to make visible.
         let line = s.line("trust-ir", Some(&got));
         assert!(
-            line.contains("[first-party cargo build $HOME/trust/first-party; ")
-                && line.contains("shadows the managed store's store/trust-ir/1123/bin/trust-ir"),
+            line.contains("[atpkg managed store; ")
+                && line.contains(" — the managed store also holds store/trust/9192/bin/trust-ir"),
             "{line}"
-        );
-
-        assert_eq!(locate_standalone_ay_in(&[s.home()]), None);
-        s.file("home/ay/target/release/ay");
-        assert_eq!(
-            locate_standalone_ay_in(&[s.home()]).map(|l| l.origin),
-            Some(TrustBinOrigin::StandaloneAy)
         );
     }
 

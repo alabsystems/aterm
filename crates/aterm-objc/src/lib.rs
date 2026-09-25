@@ -178,21 +178,26 @@
 //!   `"C"` spelling, because a `nounwind` callee on the path a raise takes was
 //!   MEASURED to skip that frame's `Drop`s or abort with `failed to initiate
 //!   panic`. What catches the raise is [`exception`], at the trampoline. What
-//!   is still open, in two places: `aterm-gpu`'s private `metal/ffi.rs` sends
-//!   keep the `"C"` spelling, so a Metal raise inside a frame of that crate
-//!   skips that frame's destructors on its way to the containment above it;
-//!   and every send still made through an `objc2` binding or `msg_send!` in
-//!   the vendored winit macOS backend and in `aterm-gui` is `"C"` too —
+//!   was open, in two places (the first still is): `aterm-gpu`'s private
+//!   `metal/ffi.rs` sends keep the `"C"` spelling, so a Metal raise inside a
+//!   frame of that crate skips that frame's destructors on its way to the
+//!   containment above it; and every send that was made through an `objc2`
+//!   binding or `msg_send!` in the vendored winit macOS backend and in
+//!   `aterm-gui` was `"C"` too —
 //!   `objc-sys 0.3.5` spells `objc_msgSend` `extern "C"` unless its
 //!   `unstable-c-unwind` feature is on, and that feature enables
 //!   `#![feature(c_unwind)]`, a nightly gate the release's x86_64 compat
 //!   slice (built on upstream stable) refuses with E0554. MEASURED against
 //!   this tree: a raise through such a send is still contained above, but the
-//!   frame that made it skips its own `Drop`s. `tests/send_prototype_census.rs`
-//!   pins the number of those lines so it only goes down. Third-party BLOCKS
-//!   are gone from every raise path: `block2`'s `nounwind` invoke was measured
-//!   to abort the process on a raise beneath it even with a containment
-//!   outside, and its three sites are [`RcBlock`] now.
+//!   frame that made it skips its own `Drop`s. That second place is CLOSED:
+//!   the W12 + W13 merge (2026-09-05) took the last such send out of both,
+//!   neither manifest declares an `objc2`-family dependency any more, so such
+//!   a send cannot compile there, and `tests/objc2_exit_condition.rs` refuses
+//!   a re-added dependency row. (The line-count ceiling that tracked the port
+//!   down to zero was retired with it.) Third-party BLOCKS are gone from every
+//!   raise path: `block2`'s `nounwind` invoke was measured to abort the
+//!   process on a raise beneath it even with a containment outside, and its
+//!   three sites are [`RcBlock`] now.
 //! * **`S3` — `dealloc` runs on whatever thread performs the last release.**
 //!   [`ClassBuilder::register`] hands the object to the Objective-C runtime,
 //!   and nothing in that runtime promises the final `release` comes from the

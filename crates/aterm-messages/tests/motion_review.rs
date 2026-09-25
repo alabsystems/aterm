@@ -46,6 +46,7 @@ fn meter(done: u64) -> Meter {
         }),
         load: None,
         busy: false,
+        level: false,
     }
 }
 
@@ -161,6 +162,70 @@ fn fed(start: u64) -> (MessageCenter, MessageId, Instant) {
         );
     }
     (c, id, t)
+}
+
+/// NEGATIVE CONTROL for host deadline memoization: the painted percent and
+/// current ETA word can stay the same while a new reading moves the *next*
+/// ETA boundary. A cache keyed only by today's visible text would miss it.
+#[test]
+fn same_painted_progress_can_move_the_next_eta_boundary() {
+    let mut witness = None;
+    for start in [1_000_000, 10_000_000, 25_000_000, 40_000_000, 55_000_000] {
+        let (base, id, last) = fed(start);
+        let mut before_layout = present(&base, 120);
+        assert!(before_layout.rows[0].eta.is_some(), "ETA slot is painted");
+        // Compare the ETA clock itself, without a simultaneous elapsed-word
+        // tick masking its deadline in a layout that has both slots.
+        before_layout.rows[0].elapsed = None;
+        let old_meter = base.live(id).unwrap().msg.meter.as_ref().unwrap().clone();
+        for delay in [500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000] {
+            let at = last + ms(delay);
+            let word = base.motion(&before_layout, at, Look::STILL).rows[0]
+                .eta
+                .clone();
+            let next = base.motion_deadline(&before_layout, at, Look::STILL);
+            for advance in [0, 100, 1_000, 10_000, 50_000, 100_000, 200_000] {
+                let mut candidate = base.clone();
+                let mut reading = old_meter.clone();
+                reading.amount.as_mut().unwrap().done += advance;
+                // The UI still says the same whole percent: this is new
+                // estimator evidence, not a different painted fill.
+                assert!(candidate.restate(
+                    id,
+                    Restatement {
+                        meter: Some(Some(reading)),
+                        ..Restatement::default()
+                    },
+                    at,
+                ));
+                let mut after_layout = present(&candidate, 120);
+                after_layout.rows[0].elapsed = None;
+                let after_word = candidate.motion(&after_layout, at, Look::STILL).rows[0]
+                    .eta
+                    .clone();
+                let after_next = candidate.motion_deadline(&after_layout, at, Look::STILL);
+                if before_layout.rows[0].pct == after_layout.rows[0].pct
+                    && word == after_word
+                    && next.is_some()
+                    && after_next.is_some()
+                    && next != after_next
+                {
+                    witness = Some((start, delay, advance, next, after_next));
+                    break;
+                }
+            }
+            if witness.is_some() {
+                break;
+            }
+        }
+        if witness.is_some() {
+            break;
+        }
+    }
+    assert!(
+        witness.is_some(),
+        "an unchanged painted percent/ETA can still need a new future deadline"
+    );
 }
 
 // ---- deadlines vs. what is drawn ---------------------------------------------

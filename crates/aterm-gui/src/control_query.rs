@@ -1162,7 +1162,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_gpu_cell_pipeline_ms={} \
          effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
          effect_pipelines_built={} \
-         first_present_ms={:.2} first_visible_ms={:.2}{}{}\n",
+         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1340,6 +1340,9 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // whole, never as a lone max: the count and the long-turn tally are what
         // separate one hitch from a main thread that is late all the time.
         crate::watchdog::turn_census_fields_text(),
+        // STRAIN (design §10.14, ruling 211): the engine's state and what one
+        // reading and one sweep cost the probe thread at worst.
+        crate::strain_host::metrics_fields_text(),
     )
 }
 
@@ -1738,7 +1741,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_gpu_cell_pipeline_ms\":{},\
          \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
          \"effect_pipelines_built\":\"{}\",\
-         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}}}",
+         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1880,6 +1883,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         crate::echo_rtt::percentile_fields_json(),
         // Field-for-field twin of the text summary's turn-census fragment.
         crate::watchdog::turn_census_fields_json(),
+        // Field-for-field twin of the text summary's strain fragment.
+        crate::strain_host::metrics_fields_json(),
     ))
 }
 
@@ -3878,6 +3883,47 @@ pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String 
     }
 }
 
+/// `messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]` -> `OK <count>` and
+/// one `message <id> …` row per record: the message log — the band and Settings ▸
+/// Messages — as text (design §5.1, rulings 163-179, 175 for `origin=`/`busy=1`/
+/// `load=`). The arguments are parsed HERE by the engine
+/// (`aterm_messages::wire::parse_read_args`), so junk is a usage error and never a
+/// wake; the rows are built on the MAIN THREAD (`Wake::ReadMessages`) by the engine
+/// (`wire::message_rows`), every free field percent-encoded, so a title can never
+/// break the line grammar. Read-only: no authority crosses the wake.
+pub(crate) fn cmd_messages(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let query = match aterm_messages::wire::parse_read_args(rest) {
+        Ok(query) => query,
+        Err(usage) => return format!("ERR {usage}\n"),
+    };
+    match control_media::call_main(proxy, |reply| Wake::ReadMessages { query, reply }) {
+        Ok(rows) if rows.is_empty() => "OK 0\n".to_string(),
+        Ok(rows) => format!("OK {}\n{}\n", rows.len(), rows.join("\n")),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
+/// `notice <post|progress|done|dismiss|act> …` -> one status line: the message
+/// band's WRITE face (design §5.2, rulings 163-179). The outside world's voice under
+/// the attention rule — an info/success `post` is a record (ruling 163), a warn/error
+/// `post` a row, `progress` a script's animated work in flight on one row per key
+/// (`wire.<key>`, ruling 167), `done` its finish; `dismiss` and `act` do what a
+/// person's click would. Every usage, key, lane-tag and title-form refusal is
+/// answered HERE by the engine (`wire::NoticeRequest::parse`, ruling 177), so junk
+/// is never a wake; the caps, the mint budget, the paint pacing and every reply word
+/// are the engine's too (`wire::apply`, rulings 169-170), run on the MAIN THREAD
+/// (`Wake::Notice`). Owner-only at the socket.
+pub(crate) fn cmd_notice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let request = match aterm_messages::wire::NoticeRequest::parse(rest) {
+        Ok(request) => request,
+        Err(refusal) => return format!("ERR {refusal}\n"),
+    };
+    match control_media::call_main(proxy, |reply| Wake::Notice { request, reply }) {
+        Ok(line) => format!("{line}\n"),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
 pub(crate) fn cmd_title(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
     format!("OK {}\n", t.title())
@@ -5232,6 +5278,50 @@ mod tests {
                 "stamp over {lines:?} must hash the rows `text` served:\n{served:?}"
             );
         }
+    }
+
+    /// The agent-status sweep keeps only its live-zone tail, but its stamp
+    /// must still be the hash of the ENTIRE `text` frame. Check both across
+    /// a deep grid, a resize, and both sides of an alternate-screen switch;
+    /// Unicode, combining marks, trailing spaces and blank rows exercise the
+    /// exact bytes the shared visible-row construction emits.
+    #[test]
+    fn agent_frame_stream_matches_whole_screen_text_across_grid_changes() {
+        fn parity(t: &Terminal, phase: &str) {
+            let text = super::screen_text(t);
+            let all: Vec<&str> = text.split_terminator('\n').collect();
+            assert_eq!(
+                all.len(),
+                t.rows() as usize,
+                "{phase}: every row is present"
+            );
+            for tail in [0, 1, crate::presence::CLASSIFY_ROWS, 100] {
+                let (fp, rows) = crate::session_status::screen_agent_frame(t, tail);
+                let from = all.len().saturating_sub(tail);
+                let expected: Vec<String> =
+                    all[from..].iter().map(|row| (*row).to_string()).collect();
+                assert_eq!(
+                    fp,
+                    crate::turn_ledger::fnv1a_64(text.as_bytes()),
+                    "{phase}: fingerprint for tail={tail}"
+                );
+                assert_eq!(rows, expected, "{phase}: last {tail} rows");
+            }
+        }
+
+        let mut t = Terminal::new(48, 80);
+        parity(&t, "blank main grid");
+        for n in 0..46 {
+            t.process(format!("line {n:02}: 世界 e\u{301} trail   \r\n").as_bytes());
+        }
+        parity(&t, "deep Unicode main grid");
+        t.process(b"\x1b[?1049h\x1b[H");
+        t.process("代替 screen e\u{301}  ".as_bytes());
+        parity(&t, "alternate grid");
+        t.resize(24, 100);
+        parity(&t, "resized alternate grid");
+        t.process(b"\x1b[?1049l");
+        parity(&t, "restored main grid");
     }
 
     /// The `modes` doc names the frame and the keys; this pins both, so the
@@ -6697,6 +6787,41 @@ mod tests {
             !owner.is_empty() && owner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
             "the turn owner must be a stable snake_case label: {owner}"
         );
+    }
+
+    /// STRAIN (design §10.14, ruling 211) rides both forms: the engine's state
+    /// word and the probe's worst reading and sweep cost, read OUT OF the
+    /// fragment like the turn census's, so a field added there is pinned here.
+    #[test]
+    fn the_strain_fields_ride_the_metrics_summary_in_both_forms() {
+        let fragment = crate::strain_host::metrics_fields_text();
+        let names: Vec<&str> = fragment
+            .split_whitespace()
+            .map(|field| field.split_once('=').expect("key=value").0)
+            .collect();
+        assert_eq!(
+            names,
+            ["strain", "strain_probe_us_max", "strain_scan_us_max"],
+            "{fragment}"
+        );
+        let text = super::cmd_metrics(None, "");
+        for name in &names {
+            assert!(text.contains(&format!(" {name}=")), "{name}: {text}");
+        }
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+        for name in &names {
+            assert!(value.get(name).is_some(), "{name}: {reply}");
+        }
+        let word = value
+            .get("strain")
+            .and_then(aterm_json::Value::as_str)
+            .expect("the state is a word");
+        assert!(["calm", "suspect", "open", "off"].contains(&word), "{word}");
     }
 
     /// ITEM 6 wire shape. The per-owner ledger is a self-labelling field in

@@ -162,13 +162,13 @@ fn boot_with(tag: &str, columns: &str) -> Option<Instance> {
             );
             return None;
         }
-        if is_socket_or_symlink(&sock_path) {
+        if is_socket_or_symlink(&sock_path) && launch_isolation::control_listening(&sock_path) {
             return Some(inst);
         }
         std::thread::sleep(POLL_GAP);
     }
     eprintln!(
-        "SKIP: control socket never appeared; log tail:\n{}",
+        "SKIP: control socket never started listening; log tail:\n{}",
         log_tail(&inst.log)
     );
     None
@@ -221,9 +221,10 @@ fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
     let out = ctl(inst, args);
     assert!(
         out.status.success(),
-        "aterm ctl {args:?} failed: stdout={:?} stderr={:?}",
+        "aterm ctl {args:?} failed: stdout={:?} stderr={:?}\ninstance log tail:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+        log_tail(&inst.log),
     );
     String::from_utf8(out.stdout).expect("utf-8")
 }
@@ -247,14 +248,27 @@ fn type_line(inst: &Instance, sid: &str, line: &str) {
 /// `await match <re>` on the session: the server's latched watcher. `<re>`
 /// is one wire token (`.` for a space).
 fn await_match(inst: &Instance, sid: &str, re: &str) {
-    let reply = ctl_ok(
+    if let Err(reply) = awaited(inst, sid, re) {
+        panic!("`{re}` never reached the screen: {reply}");
+    }
+}
+
+/// [`await_match`] handing the reply back (`aterm ctl` exits non-zero on
+/// `OK timeout`), so a test holding a [`Supervisor`] can stop it first and
+/// say what its loop printed — the one record of which side stalled.
+fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
+    let out = ctl(
         inst,
         &[&format!("@{sid}"), "await", "match", re, "timeout=20000"],
     );
-    assert!(
-        reply.starts_with("OK") && !reply.starts_with("OK timeout"),
-        "`{re}` never reached the screen: {reply}"
-    );
+    let reply = String::from_utf8_lossy(&out.stdout).into_owned();
+    if out.status.success() && reply.starts_with("OK") && !reply.starts_with("OK timeout") {
+        return Ok(());
+    }
+    Err(format!(
+        "{reply:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    ))
 }
 
 /// The lines of `path` once it holds `n` of them, or panic after `within`
@@ -346,9 +360,22 @@ const DONE: &str = "Fixed the parser; the suite is green.";
 /// under it), `$2` the key log, `$3` the submit log, `$4` the screen the
 /// first person's line ends on, `$5` the columns, `$6` `mangle` to show a
 /// composer text over 40 characters as a pasted-text placeholder. The
-/// composer is redrawn on every character: `❯ <text>` from the caret row
-/// (the terminal wraps it), the rows under it moved down past it, the
-/// cursor after the text.
+/// composer is redrawn once per READ of the terminal, as Claude Code renders
+/// a burst of input in one frame — in two frames, half the new text and then
+/// all of it: `❯ <text>` from the caret row (the terminal wraps it), the rows
+/// under it moved down past it, the cursor after the text. Never once per
+/// BYTE (2026-09-24): a redraw cost three spawns (`dd`, two `cat`s), so the
+/// 150-character continuation cost ~450 — 1.8-3.7 s at a concurrent gate's
+/// load of 20-43 — and outran the supervisor's read-back settle
+/// (`SETTLE_CAP`, 1.5 s): it read part of the text, pressed no Enter, and the
+/// decision screen never came. And no spawn INSIDE a frame (third audit,
+/// 2026-09-24): the caret row and the rows under it are read once per screen,
+/// so both frames are written by builtins alone — a spawn stalled past the
+/// 500 ms settle between clearing the composer and drawing its text latched
+/// the supervisor on a half-drawn composer. The two frames are therefore back
+/// to back, and this test does not claim to catch a supervisor that reads
+/// without settling: the settle itself is pinned by the scripted
+/// `await idle 500 timeout 1500` exchanges in `aterm-agent`'s supervise tests.
 const FAKE_WORKER: &str = r#"#!/bin/sh
 dir="$1"; keys="$2"; subs="$3"; after="$4"; cols="$5"; mangle="$6"
 stty raw -echo
@@ -356,36 +383,59 @@ stty raw -echo
 exec 3<&0
 cr=$(printf '\r'); esc=$(printf '\033')
 cur=ready; buf=""
-draw() { cur="$1"; printf '\033[H\033[2J'; cat "$dir/$1.scr"; }
+# The caret row and the rows under it are read once per SCREEN, so a composer
+# frame is written by builtins alone: no spawn can stall between clearing the
+# composer and drawing its text, or between the half frame and the whole one,
+# for longer than the supervisor's 500 ms settle.
+draw() {
+  cur="$1"; printf '\033[H\033[2J'; cat "$dir/$1.scr"
+  IFS= read -r row < "$dir/$1.row"
+  below=$(cat "$dir/$1.below"; printf .); below="${below%.}"
+}
 compose() {
-  row=$(cat "$dir/$cur.row"); shown="$buf"
+  shown="$buf"
   if [ "$mangle" = mangle ] && [ ${#buf} -gt 40 ]; then shown="[Pasted text #1]"; fi
   n=$(( (2 + ${#shown} + cols - 1) / cols )); [ "$n" -lt 1 ] && n=1
-  printf '\033[%s;1H\033[J\033[%s;1H' "$row" "$((row + n))"
-  cat "$dir/$cur.below"
-  printf '\033[%s;1H❯ %s' "$row" "$shown"
+  printf '\033[%s;1H\033[J\033[%s;1H%s\033[%s;1H❯ %s' \
+    "$row" "$((row + n))" "$below" "$row" "$shown"
+}
+fill() {
+  got=$(dd bs=512 count=1 <&3 2>/dev/null)
+  printf '%s' "$got" >> "$keys"
+  chunk="$chunk$got"
+}
+frames() {
+  full="$buf"; half=$(( ${#full} / 2 ))
+  if [ "$half" -gt 0 ]; then
+    buf=$(printf '%s' "$full" | cut -c1-"$half"); compose
+  fi
+  buf="$full"; compose
 }
 draw ready
 while :; do
-  c=$(dd bs=1 count=1 <&3 2>/dev/null)
-  [ -z "$c" ] && continue
-  printf '%s' "$c" >> "$keys"
-  if [ "$c" = "$cr" ]; then
-    printf 'SUBMIT:%s\n' "$buf" >> "$subs"
-    buf=""
-    n=$(wc -l < "$subs" | tr -d ' ')
-    draw busy
-    sleep 2
-    if [ "$n" = 1 ]; then draw "$after"; else draw stop; fi
-  elif [ "$c" = "$esc" ]; then
-    rest=$(dd bs=2 count=1 <&3 2>/dev/null)
-    printf '%s' "$rest" >> "$keys"
-    if [ "$rest" = "[C" ] && [ -z "$buf" ] && [ "$cur" = goal ]; then
-      buf="keep going"; compose
+  chunk=""; fill
+  [ -z "$chunk" ] && continue
+  typed=0
+  while [ -n "$chunk" ]; do
+    rest="${chunk#?}"; c="${chunk%"$rest"}"; chunk="$rest"
+    if [ "$c" = "$cr" ]; then
+      printf 'SUBMIT:%s\n' "$buf" >> "$subs"
+      buf=""; typed=0
+      n=$(wc -l < "$subs" | tr -d ' ')
+      draw busy
+      sleep 2
+      if [ "$n" = 1 ]; then draw "$after"; else draw stop; fi
+    elif [ "$c" = "$esc" ]; then
+      while [ ${#chunk} -lt 2 ]; do fill; done
+      rest="${chunk#??}"; csi="${chunk%"$rest"}"; chunk="$rest"
+      if [ "$csi" = "[C" ] && [ -z "$buf" ] && [ "$cur" = goal ]; then
+        buf="keep going"; typed=1
+      fi
+    else
+      buf="$buf$c"; typed=1
     fi
-  else
-    buf="$buf$c"; compose
-  fi
+  done
+  if [ "$typed" = 1 ]; then frames; fi
 done
 "#;
 
@@ -640,12 +690,20 @@ fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
         let sid = boot_session(&inst);
         let rules = inst.tmp.join("rules.txt");
         std::fs::write(&rules, RULES).expect("the rules file");
-        let (_keys, subs) = start_worker_with(&inst, &sid, "done", "64", mangle);
+        let (keys, subs) = start_worker_with(&inst, &sid, "done", "64", mangle);
         let sup = Supervisor::start_with(&inst, &sid, TurnEndTiming::default(), Some(rules));
         type_line(&inst, &sid, "go");
         await_match(&inst, &sid, "Fixed.the.parser");
         if !mangle {
-            await_match(&inst, &sid, "I.need.your.decision");
+            if let Err(reply) = awaited(&inst, &sid, "I.need.your.decision") {
+                let out = sup.stop();
+                panic!(
+                    "the decision never reached the screen ({reply}); submitted {:?}; keys \
+                     {:?}; the loop said:\n{out}",
+                    std::fs::read_to_string(&subs).unwrap_or_default(),
+                    std::fs::read_to_string(&keys).unwrap_or_default(),
+                );
+            }
             let out = sup.stop();
             let submitted = lines_when(&subs, 2, Duration::from_secs(1));
             assert_eq!(

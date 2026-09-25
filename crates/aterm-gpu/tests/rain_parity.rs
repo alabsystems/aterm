@@ -23,7 +23,8 @@
 //   * the combined frame (sprites + halos) stays within the sprite bar;
 //   * empty rain channels are byte-identical on the GPU — atlas with no
 //     quads, and a populated input after `clear_overlays` (the
-//     rain_disabled_bytes_identical pin, GPU side).
+//     rain_disabled_bytes_identical pin, GPU side) — the rain row of
+//     `tests/empty_channels_gpu.rs`.
 //
 // Gated: no GPU or no font -> the tests no-op (return), like the other
 // parity gates. Byte-exact additive gates additionally skip on downlevel
@@ -244,59 +245,5 @@ fn scissored_path_rain_row_filter_matches_full_render() {
     assert!(
         delta <= 2,
         "scissored-path rain parity broke the pinned sprite bar: {delta} > 2"
-    );
-}
-
-/// Empty rain channels are byte-identical on the GPU — the
-/// rain_disabled_bytes_identical pin (design §10, GPU side): a disabled or
-/// drained feature must leave the frame untouched. Covers an atlas with no
-/// quads (uploads but draws nothing) and a populated input restored to empty
-/// by `clear_overlays` (the introspection-capture contract).
-#[test]
-fn rain_disabled_bytes_identical_on_gpu() {
-    let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (6usize, 20usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l$ matrix off");
-
-    // Pre-feature frame: a cell_frame's rain channels default empty/None.
-    let base_input = term.cell_frame(rows, cols);
-    assert!(base_input.rain_quads.is_empty());
-    assert!(base_input.rain_atlas.is_none());
-    assert!(base_input.rain_add.is_empty());
-    let base = gpu.render_input(&mut win, &base_input, None).pixels;
-
-    // A genuine baked atlas + emission from the real engine.
-    let mut scene = RainScene::new(rows, cols, cpu.cell_size(), &base_input);
-    scene.drive_until_raining();
-
-    // Atlas but no quads: uploads, draws nothing, bytes identical.
-    let mut atlas_only = term.cell_frame(rows, cols);
-    atlas_only.rain_atlas = scene.atlas();
-    assert!(
-        atlas_only.rain_atlas.is_some(),
-        "the engine must have baked an atlas"
-    );
-    let atlas_only_px = gpu.render_input(&mut win, &atlas_only, None).pixels;
-    assert_eq!(
-        base, atlas_only_px,
-        "a rain atlas with no quads must be byte-identical on the GPU"
-    );
-
-    // Populated (must paint), then clear_overlays (must restore the bare frame).
-    let mut cleared = term.cell_frame(rows, cols);
-    scene.apply(&mut cleared);
-    assert!(!cleared.rain_quads.is_empty() && !cleared.rain_add.is_empty());
-    let painted = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_ne!(base, painted, "a live rain frame must paint on the GPU");
-    cleared.clear_overlays();
-    let stripped = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_eq!(
-        base, stripped,
-        "clear_overlays must restore the bare GPU frame (quads + halos cleared, atlas nulled)"
     );
 }

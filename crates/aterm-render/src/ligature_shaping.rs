@@ -965,29 +965,6 @@ mod tests {
         assert_eq!(out[3], ColumnGlyph::Ligated(911));
     }
 
-    /// M4 — the amended gate accepts the two grid-mappable forms and its
-    /// admit-off behaviour is byte-identical to the legacy 1:1 accept. (Companion
-    /// to the `gate_*` kani proofs; the exhaustive lattice lives in
-    /// `tests/ligature_slice.rs`.)
-    #[test]
-    fn classify_shape_admissible_forms() {
-        // 1:1 (Fira/JetBrains) always accepts, flag or not.
-        assert_eq!(classify_shape(2, 2, false), ShapeVerdict::OneToOne);
-        assert_eq!(classify_shape(2, 2, true), ShapeVerdict::OneToOne);
-        assert_eq!(classify_shape(1, 1, false), ShapeVerdict::OneToOne);
-        // N:1 collapse: rejected without the flag (legacy), admitted with it.
-        assert_eq!(classify_shape(3, 1, false), ShapeVerdict::Reject);
-        assert_eq!(classify_shape(3, 1, true), ShapeVerdict::Collapsed);
-        assert_eq!(classify_shape(2, 1, true), ShapeVerdict::Collapsed);
-        // Partial collapse / expansion / degenerate: always rejected.
-        assert_eq!(classify_shape(3, 2, true), ShapeVerdict::Reject);
-        assert_eq!(classify_shape(2, 3, true), ShapeVerdict::Reject);
-        assert_eq!(classify_shape(1, 1, true), ShapeVerdict::OneToOne);
-        // A lone cell can never collapse (needs N>=2).
-        assert_eq!(classify_shape(1, 1, true), ShapeVerdict::OneToOne);
-        assert_eq!(classify_shape(0, 0, true), ShapeVerdict::Reject);
-    }
-
     /// M4 — `slice_tile_bands` produces a contiguous, disjoint, complete partition;
     /// a non-multiple width leaves the remainder in the final (narrower) band.
     #[test]

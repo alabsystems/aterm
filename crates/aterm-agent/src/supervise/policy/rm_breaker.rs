@@ -46,7 +46,7 @@
 //! the root itself), with no glob at or above the first component under the
 //! root, no `..`, no `.git`, not the cwd or an ancestor of it, and past every
 //! default `rm_policy` deny pattern (the filesystem root, the home directory
-//! and its ancestors, `/Users//<x>`, a glob in the first component). An operand
+//! and its ancestors, `/Users/<x>`, a glob in the first component). An operand
 //! built on a `$(mktemp …)` variable may not glob at all: were `mktemp` to
 //! fail, the variable is empty and `"$D"/*` is `/*`.
 //!

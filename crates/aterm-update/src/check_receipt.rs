@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Completed network checks have their own receipt. Apply/status writers never
-//! refresh this clock or erase a server hold, and another source cannot reuse it.
+//! refresh this clock or its deferral, and another source cannot reuse it.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,42 +26,25 @@ struct Receipt {
     current_build: u64,
     source: String,
     outcome: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    held_until: Option<String>,
 }
 
-pub(crate) fn record(
-    staging: &Staging,
-    current_build: u64,
-    source: &Source,
-    deferred: bool,
-    held_until: Option<u64>,
-) {
+pub(crate) fn record(staging: &Staging, current_build: u64, source: &Source, deferred: bool) {
     record_at(
         staging,
         current_build,
         source,
         deferred,
-        held_until,
         crate::unix_now_secs(),
     );
 }
 
-fn record_at(
-    staging: &Staging,
-    current_build: u64,
-    source: &Source,
-    deferred: bool,
-    held_until: Option<u64>,
-    now: u64,
-) {
+fn record_at(staging: &Staging, current_build: u64, source: &Source, deferred: bool, now: u64) {
     let record = Receipt {
         schema: 1,
         updated_at: aterm_types::rfc3339::format_rfc3339(now),
         current_build,
         source: source_key(source),
         outcome: if deferred { "deferred" } else { "completed" },
-        held_until: held_until.map(aterm_types::rfc3339::format_rfc3339),
     };
     let Ok(text) = aterm_toml::to_string(&record) else {
         return;
@@ -127,7 +110,7 @@ mod tests {
         for age in 0..=2 {
             for same_source in [false, true] {
                 for same_build in [false, true] {
-                    record_at(&staging, 42, &source("one"), false, None, now - age);
+                    record_at(&staging, 42, &source("one"), false, now - age);
                     let bytes = std::fs::read(path(&staging)).unwrap();
                     // This is the genuine writer used during AND after a check by
                     // the apply lane. It must not acquire the check's provenance.
@@ -171,34 +154,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(staging.root);
     }
 
+    /// A deferral recorded by a completed check survives every later apply/status
+    /// write, and widens every sibling's window; a malformed or legacy record
+    /// authorizes no skip.
     #[test]
-    fn apply_writes_cannot_clear_a_completed_checks_server_hold() {
+    fn apply_writes_cannot_clear_a_completed_checks_deferral() {
         let _guard = crate::STRANDED_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::status::clear_check_note();
-        let staging = Staging::scratch("check-receipt-hold");
+        let staging = Staging::scratch("check-receipt-deferral");
         let source = source("one");
         let now = crate::unix_now_secs();
-        record_at(&staging, 42, &source, true, Some(now + 600), now);
+        let base = Duration::from_secs(1800);
+        // 25 minutes old: past the base window (21 min), inside the widened one (42).
+        record_at(&staging, 42, &source, true, now - 25 * 60);
         crate::status::record(&staging, 42, "update apply refused: live terminals");
-        let (_, timer) =
-            crate::checker_skip_for(&staging, 42, &source, Duration::from_secs(1800), now).unwrap();
-        assert_eq!(timer.held, Some(now + 600));
-        assert!(
-            crate::checker_skip_for(&staging, 42, &source, Duration::from_secs(1800), now + 600)
-                .is_none()
-        );
+        let (reason, _) = crate::checker_skip_for(&staging, 42, &source, base, now).unwrap();
+        assert!(reason.contains("deferred"), "{reason}");
+        // Negative control: the same age as a completed check skips nothing.
+        record_at(&staging, 42, &source, false, now - 25 * 60);
+        assert!(crate::checker_skip_for(&staging, 42, &source, base, now).is_none());
         // Receipt failures do not wedge: malformed/legacy records authorize no skip.
         std::fs::write(
             path(&staging),
             "schema = 1\nupdated_at = \"2026-09-14T00:00:00Z\"\n",
         )
         .unwrap();
-        assert!(
-            crate::checker_skip_for(&staging, 42, &source, Duration::from_secs(1800), now)
-                .is_none()
-        );
+        assert!(crate::checker_skip_for(&staging, 42, &source, base, now).is_none());
         let _ = std::fs::remove_dir_all(staging.root);
     }
 }

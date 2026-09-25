@@ -23,9 +23,9 @@
 //!
 //! The URL is a PURE FUNCTION of `(owner, repo, tag, name)` and is never read out of a
 //! server response. `tag` comes from the evergreen pointer's strictly-parsed `Location`
-//! (the app updater's web lane) or from a release listing's `tag_name` (the token lane,
-//! and atpkg's listing lane), and `name` is a publisher-convention asset name, so
-//! nothing about which bytes are fetched can be steered by a memo or a listing field.
+//! (the app updater) or from signed data the caller already holds (atpkg's index build
+//! number and its signed rows), and `name` is a publisher-convention asset name, so
+//! nothing about which bytes are fetched can be steered by a server response.
 //! Selection and every trust check stay exactly where they were — the same bytes reach
 //! the same verifiers.
 //!
@@ -54,13 +54,12 @@ pub fn path_segment_safe(segment: &str) -> bool {
 /// The browser download URL for asset `name` of release `tag` in `owner/repo`, or
 /// `None` when any of the four is not a safe path segment.
 ///
-/// What `None` means is the caller's: on the app updater's web lane it is a REFUSAL (no
-/// listing exists to fall back to, and nothing off this host is ever fetched there); on
-/// atpkg's listing lane the caller falls back to the asset API URL the listing handed
-/// it (metered, but proven to work). Every name the publisher emits — `aterm-appcast.toml`, its `.sig`,
-/// `aterm-machines.toml`, its `.sig`, `aterm-<ver>-mac.zip`, `aterm-<ver>.dmg`, and the
-/// `vMAJOR.MINOR.PATCH` tag — passes the predicate; atpkg's `atpkg-<program>-<build>`
-/// tags and `pkg-<program>-<build>.toml` / `<program>-<build>.tar.zst` names do too.
+/// `None` is a REFUSAL for every caller: there is no listing to fall back to, and
+/// nothing off this host is ever fetched. Every name the publisher emits —
+/// `aterm-appcast.toml`, its `.sig`, `aterm-machines.toml`, its `.sig`,
+/// `aterm-<ver>-mac.zip`, `aterm-<ver>.dmg`, and the `vMAJOR.MINOR.PATCH` tag — passes
+/// the predicate; atpkg's `atpkg-<program>-<build>` tags and
+/// `pkg-<program>-<build>.toml` / `<program>-<build>.tar.zst` names do too.
 #[must_use]
 pub fn release_download_url(owner: &str, repo: &str, tag: &str, name: &str) -> Option<String> {
     if !(path_segment_safe(owner)

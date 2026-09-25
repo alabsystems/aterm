@@ -641,7 +641,23 @@ struct Screen {
 }
 
 fn screen(c: &mut Client, sid: &str) -> Option<Screen> {
-    let (head, body) = c.request_counted(&format!("@{sid} text --json")).ok()?;
+    screen_query(c, &format!("@{sid} text --json"))
+}
+
+/// Claude's composer is pinned near the bottom. The continuation wait needs
+/// only that slice while a draft is present; a positive result is confirmed
+/// against the whole screen before it can authorize a turn.
+const CONTINUATION_TAIL_ROWS: usize = 20;
+
+fn screen_tail(c: &mut Client, sid: &str) -> Option<Screen> {
+    screen_query(
+        c,
+        &format!("@{sid} text --json tail={CONTINUATION_TAIL_ROWS}"),
+    )
+}
+
+fn screen_query(c: &mut Client, request: &str) -> Option<Screen> {
+    let (head, body) = c.request_counted(request).ok()?;
     if !head.starts_with("OK") {
         return None;
     }
@@ -693,6 +709,30 @@ fn composer_empty(c: &mut Client, sid: &str, scr: &Screen) -> bool {
         _ => false,
     };
     upgrade::composer_is_empty(&scr.rows, scr.cursor, dim)
+}
+
+/// The idle continuation can wait for two minutes with a person's draft in
+/// the composer. Read only the bottom rows on those repeated negative polls.
+/// A missing cursor/caret makes that slice inconclusive; an unreadable tail
+/// may be an older host, so fall back to the full-screen path for this wait.
+/// A positive tail is never enough to type a continuation: the full screen
+/// must independently show an empty composer.
+fn continuation_composer_empty(c: &mut Client, sid: &str, tail_available: &mut bool) -> bool {
+    if *tail_available {
+        match screen_tail(c, sid) {
+            Some(scr)
+                if scr.cursor.is_some_and(|(row, _)| row < scr.rows.len())
+                    && aterm_phase::phase::composer_index(&scr.rows).is_some() =>
+            {
+                if !composer_empty(c, sid, &scr) {
+                    return false;
+                }
+            }
+            Some(_) => {}
+            None => *tail_available = false,
+        }
+    }
+    screen(c, sid).is_some_and(|scr| composer_empty(c, sid, &scr))
 }
 
 /// Whether one `cell` reply — `OK <grapheme%enc> <fg> <bg> <attrs>[ link=…]`,
@@ -763,6 +803,30 @@ struct St {
     /// The last reason this upgrade was held back that the ledger was told
     /// ([`held_back`]), so it is said once, not every sweep.
     noted: String,
+    /// The model the agent's last turn named when it answered READY
+    /// ([`upgrade::transcript_model`] over the tail that proved the answer), or
+    /// empty when no turn named one. Said in the continuation and in the
+    /// outcome, never acted on: the relaunch carries the launch's own flags.
+    model_before: String,
+    /// Where that tail read ended in the transcript, in bytes: the resumed
+    /// session's first turn is the first one written past it. `0`: no mark was
+    /// taken (a restart an older build began), and the resumed model is then
+    /// unconfirmed rather than read from the start of the conversation.
+    mark: u64,
+    /// The `--model` the relaunch line keeps from the launch
+    /// ([`upgrade::launch_model`]), or empty when the launch named none: what
+    /// decides the model a resumed session comes back on, said in the outcome.
+    launch_model: String,
+    /// Set once the continuation is typed while the resumed session's first
+    /// answer is still to be read ([`confirm`]): the second (since the epoch)
+    /// past which a sweep that still finds none records the model as
+    /// unconfirmed. `0`: nothing is pending. The phase is DONE by then, never
+    /// in flight again, so nothing ever types the continuation twice.
+    confirm_by: u64,
+    /// The build the relaunched process runs — its session file's `version`,
+    /// the one its transcript rows carry — and its pid, for the `done` row.
+    resumed_on: String,
+    resumed_pid: u32,
 }
 
 impl St {
@@ -798,6 +862,9 @@ impl St {
             ("tab", &self.tab),
             ("line", &self.line),
             ("noted", &self.noted),
+            ("model_before", &self.model_before),
+            ("launch_model", &self.launch_model),
+            ("resumed_on", &self.resumed_on),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -810,6 +877,9 @@ impl St {
             ("pid", u64::from(self.pid)),
             ("notice_pid", u64::from(self.notice_pid)),
             ("shell", u64::from(self.shell)),
+            ("mark", self.mark),
+            ("confirm_by", self.confirm_by),
+            ("resumed_pid", u64::from(self.resumed_pid)),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -849,11 +919,22 @@ impl St {
             tab: s("tab"),
             line: s("line"),
             noted: s("noted"),
+            model_before: s("model_before"),
+            mark: n("mark"),
+            launch_model: s("launch_model"),
+            confirm_by: n("confirm_by"),
+            resumed_on: s("resumed_on"),
+            resumed_pid: small("resumed_pid"),
         })
     }
 
     fn in_flight(&self) -> bool {
         matches!(self.phase, Phase::Exiting { .. } | Phase::Relaunched { .. })
+    }
+
+    /// Whether a typed continuation's model is still to be read ([`confirm`]).
+    fn confirming(&self) -> bool {
+        self.phase == Phase::Done && self.confirm_by != 0
     }
 
     fn notice_belongs_to(&self, sf: &SessionFile, tab: &str) -> bool {
@@ -944,8 +1025,13 @@ fn session_files(home: &Path) -> Option<Vec<SessionFile>> {
         if path.extension().is_none_or(|x| x != "json") {
             continue;
         }
+        let file_pid = path.file_stem()?.to_str()?.parse::<u32>().ok()?;
         let text = std::fs::read_to_string(path).ok()?;
-        files.push(upgrade::parse_session_file(&text).ok()?);
+        let file = upgrade::parse_session_file(&text).ok()?;
+        if file.pid != file_pid {
+            return None;
+        }
+        files.push(file);
     }
     Some(files)
 }
@@ -1061,6 +1147,56 @@ fn host_candidates<'a>(
         .collect()
 }
 
+/// A quiet window need not parse every historical Claude session JSON file.
+/// Session filenames are PIDs (`<pid>.json`), so a cheap group read can prove
+/// that none of those processes owns a foreground tab in this instance. An
+/// unrecognised filename or directory error falls through to the complete
+/// scan, and an in-flight restart always does: `orphans` may have work even
+/// after the old Claude process has exited. This is only a negative filter;
+/// every candidate and every act still gets the existing complete, fresh
+/// session-file and PTY-ownership checks.
+fn host_may_have_work(opts: &Opts, tabs: &[LiveTab]) -> bool {
+    // A missing foreground group cannot prove that any session is foreign.
+    if tabs.iter().any(|tab| tab.fgpgid.is_none()) {
+        return true;
+    }
+    let groups: Vec<i64> = tabs.iter().filter_map(|tab| tab.fgpgid).collect();
+    if !groups.is_empty() {
+        let Ok(entries) = std::fs::read_dir(opts.home.join(".claude/sessions")) else {
+            return true;
+        };
+        for entry in entries {
+            let Ok(path) = entry.map(|e| e.path()) else {
+                return true;
+            };
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(pid) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u32>().ok())
+            else {
+                return true;
+            };
+            if process_group(pid).is_some_and(|group| groups.contains(&group)) {
+                return true;
+            }
+        }
+    }
+    let Ok(states) = std::fs::read_dir(state_dir(opts)) else {
+        return false;
+    };
+    states.flatten().any(|entry| {
+        let path = entry.path();
+        path.extension().is_some_and(|ext| ext == "json")
+            && std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| St::from_json(&text))
+                .is_some_and(|st| st.in_flight() && tab_is_live(tabs, &st.tab))
+    })
+}
+
 /// The host need not inspect a process or build a whole process table when
 /// every known target is already at or below the version Claude reported.
 /// A native target remains a possibility until the process is examined, and
@@ -1089,6 +1225,29 @@ fn session_file_of(home: &Path, pid: u32) -> Option<SessionFile> {
     upgrade::parse_session_file(&t).ok()
 }
 
+/// How much of a transcript's end is read for the READY answer and the model
+/// the agent ran.
+const TAIL_BYTES: u64 = 262_144;
+
+/// How much of a transcript past the restart's mark is read for the resumed
+/// session's first turn. Measured 2026-09-24 (the owner's session, 2.1.281 to
+/// 2.1.282): a queued task notification, three system rows and the
+/// continuation came before it — a few KiB.
+const SINCE_BYTES: u64 = 4 << 20;
+
+/// How long after the continuation the resumed session's first answer may
+/// still be what the model is confirmed from. NEVER WAITED FOR: the visit that
+/// types the continuation reads once and a later sweep ([`confirmations`])
+/// reads again, until this has passed. A sweep runs its visits one after
+/// another and its orphan pass after all of them, so a visit that blocked on
+/// the answer would age every restart left exiting toward [`STALE_S`] — and
+/// the answer can take all of this (a long first thought, retries, a usage
+/// limit that writes only `<synthetic>` rows). Measured 2026-09-24: 10 s (a
+/// thinking block, the first row a turn writes); the `turn` that types the
+/// continuation settles on the agent's screen, so the first read usually has
+/// it.
+const MODEL_WAIT: Duration = Duration::from_secs(120);
+
 /// The one transcript holding `session`.
 fn transcript(home: &Path, session: &str) -> Option<PathBuf> {
     let mut found = None;
@@ -1116,14 +1275,43 @@ fn transcript(home: &Path, session: &str) -> Option<PathBuf> {
 /// of real transcripts, and most of a CJK-heavy one). Lossy spoils only the
 /// already-cut first line (a U+FFFD that [`upgrade::transcript_has_ready`] skips
 /// as not JSON), and a last line caught half-written while Claude appends.
-fn tail(path: &Path, bytes: u64) -> String {
+///
+/// Returned with the byte offset where the bytes read END — the mark a later
+/// read starts from ([`since`]), taken from what was read rather than from a
+/// length asked separately, so an append landing between the two is never
+/// skipped by both.
+fn tail_to_end(path: &Path, bytes: u64) -> (String, u64) {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (String::new(), 0);
+    };
+    let len = f.metadata().map_or(0, |m| m.len());
+    let start = len.saturating_sub(bytes);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return (String::new(), 0);
+    }
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    let end = start.saturating_add(buf.len() as u64);
+    (lossy(buf), end)
+}
+
+/// At most `cap` bytes of `path` from byte `from` on, decoded lossily like
+/// [`tail_to_end`]. Empty when the file is shorter than `from`: a transcript
+/// that shrank was rewritten, and nothing in it can be told to come after the
+/// mark.
+fn since(path: &Path, from: u64, cap: u64) -> String {
     let Ok(mut f) = std::fs::File::open(path) else {
         return String::new();
     };
-    let len = f.metadata().map_or(0, |m| m.len());
-    let _ = f.seek(SeekFrom::Start(len.saturating_sub(bytes)));
+    if f.metadata().map_or(0, |m| m.len()) < from || f.seek(SeekFrom::Start(from)).is_err() {
+        return String::new();
+    }
     let mut buf = Vec::new();
-    let _ = f.read_to_end(&mut buf);
+    let _ = f.take(cap).read_to_end(&mut buf);
+    lossy(buf)
+}
+
+fn lossy(buf: Vec<u8>) -> String {
     String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
@@ -1158,20 +1346,28 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
             }];
         }
     };
+    // Files only, and whatever else this sweep finds: first.
+    let confirmed = confirmations(opts);
     if live_tabs.is_some_and(<[LiveTab]>::is_empty) {
-        return Vec::new();
+        return confirmed;
+    }
+    if live_tabs.is_some_and(|tabs| !host_may_have_work(opts, tabs)) {
+        return confirmed;
     }
     let Some(files) = session_files(&opts.home) else {
-        return vec![Report {
+        let mut reports = confirmed;
+        reports.push(Report {
             pid: 0,
             tab: "-".to_string(),
             session: "-".to_string(),
             from: "-".to_string(),
             to: "-".to_string(),
             step: "wait:session-files-unreadable".to_string(),
-        }];
+        });
+        return reports;
     };
-    let mut reports = if let Some(tabs) = live_tabs {
+    let mut reports = confirmed;
+    reports.extend(if let Some(tabs) = live_tabs {
         // Read installed versions only after a cheap PTY-group match. A window
         // with no Claude job does not execute a managed twin just to ask its
         // version; a matched but current job stops before `ps` and argv reads.
@@ -1220,7 +1416,7 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
             .iter()
             .map(|sf| visit_with_claim(opts, sf, Some(&files), &t, &targets, &Live, None, None))
             .collect()
-    };
+    });
     reports.extend(orphans(opts, &files, live_tabs));
     reports
 }
@@ -1568,6 +1764,11 @@ fn visit_with_claim(
         return said(r, "current");
     };
     r.to = format!("{}({})", target.version, target.source.as_str());
+    // The restart before this one has not said its model yet: a new upgrade
+    // would start from a fresh state and lose that outcome's `done` row.
+    if prior.as_ref().is_some_and(St::confirming) {
+        return said(r, "wait:confirming");
+    }
     let now = now_s();
     let mut st = match prior {
         Some(st) if st.to == target.version.to_string() => st,
@@ -1612,9 +1813,17 @@ fn visit_with_claim(
         st.last_seq = scr.seq;
         st.seq_since_s = now;
     }
-    let ready = !st.marker.is_empty()
-        && transcript(&opts.home, &sf.session_id)
-            .is_some_and(|p| upgrade::transcript_has_ready(&tail(&p, 262_144), &st.marker));
+    // The transcript's tail, read once an announcement is out: the READY
+    // answer is looked for in it, and at a restart it also says which model
+    // the agent ran and where the resumed session's own turns will start.
+    let recent = if st.marker.is_empty() {
+        None
+    } else {
+        transcript(&opts.home, &sf.session_id).map(|p| tail_to_end(&p, TAIL_BYTES))
+    };
+    let ready = recent
+        .as_ref()
+        .is_some_and(|(text, _)| upgrade::transcript_has_ready(text, &st.marker));
     let facts = Facts {
         status: sf.status.clone(),
         status_age_s: now.saturating_sub(sf.status_updated_at_ms / 1000),
@@ -1682,12 +1891,31 @@ fn visit_with_claim(
             result
         }
         Step::Terminate if opts.dry_run => said(r, "would-restart"),
-        Step::Terminate => restart(
-            opts, r, &mut st, &mut c, &tab, sf, &args.argv, &target, t, k, host_claim,
-        ),
+        Step::Terminate => {
+            // What the agent ran, from the tail that just proved its READY
+            // answer, and where that read ended: the resumed session's turns
+            // are the ones past it. Recorded before the signal with the rest
+            // of the relaunch; a restart that waits instead takes both again.
+            (st.model_before, st.mark) = model_and_mark(recent.as_ref());
+            st.launch_model = upgrade::launch_model(&args.argv).unwrap_or_default();
+            restart(
+                opts, r, &mut st, &mut c, &tab, sf, &args.argv, &target, t, k, host_claim,
+            )
+        }
     };
     save(opts, &sf.session_id, &st);
     result
+}
+
+/// What a restart records of the transcript before its signal, from the tail
+/// the READY answer was read in ([`tail_to_end`]): the model the agent's last
+/// turn named (empty when none did) and where that read ended (`0` for no
+/// read) — the mark past which the resumed session's first turn is looked for
+/// ([`resumed_model`]).
+fn model_and_mark(recent: Option<&(String, u64)>) -> (String, u64) {
+    recent.map_or((String::new(), 0), |(text, end)| {
+        (upgrade::transcript_model(text).unwrap_or_default(), *end)
+    })
 }
 
 /// Restarts a previous sweep left between the exit and the new process: the
@@ -2257,7 +2485,7 @@ fn carry_on(
     key: &str,
     new: &SessionFile,
 ) -> Report {
-    carry_on_with_tab_probe(opts, r, st, c, key, new, |c, pid, tab| {
+    carry_on_with_tab_probe(opts, r, st, c, key, new, MODEL_WAIT, |c, pid, tab| {
         process_in_tab(c, pid, tab, None, None)
     })
 }
@@ -2265,6 +2493,9 @@ fn carry_on(
 /// The tab probe is a seam for the race between the first ownership read and
 /// the final typed continuation. Production uses the kernel-backed PTY claim
 /// for BOTH reads; a test changes its answer after the first one.
+/// `confirm_within` is how long after the continuation the resumed session's
+/// first answer may still confirm the model ([`confirm`]): [`MODEL_WAIT`] in
+/// production, short where a test proves the bound. It is never waited for.
 #[allow(clippy::too_many_arguments)]
 fn carry_on_with_tab_probe(
     opts: &Opts,
@@ -2273,6 +2504,7 @@ fn carry_on_with_tab_probe(
     c: &mut Client,
     key: &str,
     new: &SessionFile,
+    confirm_within: Duration,
     mut tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
 ) -> Report {
     r.pid = new.pid;
@@ -2280,6 +2512,7 @@ fn carry_on_with_tab_probe(
     let tab = tab.as_str();
     let home = opts.home.clone();
     let mut conversation_changed = false;
+    let mut tail_available = true;
     let settled = wait_until(Duration::from_secs(120), || {
         let Some(sf) = session_file_of(&home, new.pid) else {
             return false;
@@ -2288,7 +2521,7 @@ fn carry_on_with_tab_probe(
             conversation_changed = true;
             return true;
         }
-        sf.status == "idle" && screen(c, tab).is_some_and(|s| composer_empty(c, tab, &s))
+        sf.status == "idle" && continuation_composer_empty(c, tab, &mut tail_available)
     });
     if conversation_changed {
         return said(r, "wait:conversation-changed");
@@ -2318,23 +2551,146 @@ fn carry_on_with_tab_probe(
         return said(r, format!("wait:{why}"));
     }
     let to = Version::parse(&latest.version);
+    let before = (!st.model_before.is_empty()).then(|| st.model_before.clone());
     let typed = settled
         && match (&from, &to) {
             (Some(f), Some(t)) => {
                 if !tab_probe(c, new.pid, tab) {
                     return said(r, "wait:tab-ownership-changed");
                 }
-                turn(c, tab, &upgrade::continue_prompt(f, t)).is_ok()
+                turn(c, tab, &upgrade::continue_prompt(f, t, before.as_deref())).is_ok()
             }
             _ => false,
         };
     st.phase = Phase::Done;
     r.from.clone_from(&st.from);
     r.to = format!("{}({})", latest.version, st.source);
-    let r = said(r, if typed { "done" } else { "done:no-continue" });
-    ledger(opts, &r, &latest.session_id);
+    if !typed {
+        let r = said(r, "done:no-continue");
+        ledger(opts, &r, &outcome(st, &latest.version, None));
+        save(opts, key, st);
+        return r;
+    }
+    // TYPED, and on disk before anything else is read: a sweep that dies from
+    // here on leaves a restart that is DONE, never one in flight that the next
+    // sweep would carry on — telling the agent twice. What is still owed is
+    // only the model after, read now and, while the answer may still come, by
+    // a later sweep.
+    st.resumed_on.clone_from(&latest.version);
+    st.resumed_pid = new.pid;
+    st.confirm_by = now_s().saturating_add(confirm_within.as_secs());
     save(opts, key, st);
-    r
+    confirm(opts, &r, st, key, now_s()).unwrap_or_else(|| {
+        let r = said(r, "continued");
+        ledger(
+            opts,
+            &r,
+            "the continuation is typed; the resumed session had not answered yet, and a later \
+             sweep reads its model",
+        );
+        r
+    })
+}
+
+/// THE MODEL AFTER, for a restart whose continuation was typed: the resumed
+/// session's first answer ([`resumed_model`]) is its `done` row, and so is
+/// having none once `confirm_by` has passed (`done:model-unconfirmed`) — at
+/// once when no mark was taken. Either ends the confirmation, saved, and is
+/// `r` with that step. `None` while the answer may still come.
+///
+/// A model other than the one before is the expected outcome for a session
+/// launched without --model (it takes the current default), so it changes
+/// nothing but the words. Only a model that could not be confirmed changes
+/// the step.
+fn confirm(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64) -> Option<Report> {
+    let after = resumed_model(&opts.home, key, st.mark, &st.resumed_on);
+    if after.is_none() && st.mark != 0 && now < st.confirm_by {
+        return None;
+    }
+    let r = said(
+        r.clone(),
+        if after.is_some() {
+            "done"
+        } else {
+            "done:model-unconfirmed"
+        },
+    );
+    ledger(opts, &r, &outcome(st, &st.resumed_on, after.as_deref()));
+    st.confirm_by = 0;
+    save(opts, key, st);
+    Some(r)
+}
+
+/// The owner's outcome line ([`upgrade::restart_outcome`]) from what the
+/// restart recorded, the model after as `after`.
+fn outcome(st: &St, to: &str, after: Option<&str>) -> String {
+    upgrade::restart_outcome(
+        to,
+        recorded(&st.model_before),
+        after,
+        recorded(&st.launch_model),
+    )
+}
+
+/// A recorded field, `None` when it is empty (nothing was recorded).
+fn recorded(s: &str) -> Option<&str> {
+    (!s.is_empty()).then_some(s)
+}
+
+/// THE CONFIRMATIONS a carry-on left pending ([`confirm`]): each restart whose
+/// continuation was typed before its resumed session had answered is read
+/// again, and says its `done` row once the answer is written or its time is
+/// up. Only files are read and written — no tab is asked or typed into — so
+/// every sweep runs it first, whatever else it finds; a hand-run sweep for one
+/// tab (`only_sid`) confirms only that tab's.
+fn confirmations(opts: &Opts) -> Vec<Report> {
+    if opts.dry_run {
+        return Vec::new();
+    }
+    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+        return Vec::new();
+    };
+    let now = now_s();
+    let mut out = Vec::new();
+    for e in dir.flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let Some(mut st) = load(opts, &session).filter(St::confirming) else {
+            continue;
+        };
+        if opts.only_sid.as_ref().is_some_and(|s| *s != st.tab) {
+            continue;
+        }
+        let r = Report {
+            pid: st.resumed_pid,
+            tab: st.tab.clone(),
+            session: session.clone(),
+            from: st.from.clone(),
+            to: format!("{}({})", st.resumed_on, st.source),
+            step: String::new(),
+        };
+        out.extend(confirm(opts, &r, &mut st, &session, now));
+    }
+    out
+}
+
+/// THE RESUMED MODEL: the model the first assistant turn the relaunched build
+/// `version` wrote past the restart's mark names
+/// ([`upgrade::transcript_first_model`]) — the new process's own answer, since
+/// the resumed conversation writes no assistant turn until it is asked. One
+/// read, never a wait. `None`: no mark was taken, the transcript is not found,
+/// or the session has not answered yet.
+fn resumed_model(home: &Path, session: &str, mark: u64, version: &str) -> Option<String> {
+    if mark == 0 {
+        return None;
+    }
+    let path = transcript(home, session)?;
+    upgrade::transcript_first_model(&since(&path, mark, SINCE_BYTES), version)
 }
 
 fn continuation_session(home: &Path, pid: u32, key: &str) -> Option<SessionFile> {

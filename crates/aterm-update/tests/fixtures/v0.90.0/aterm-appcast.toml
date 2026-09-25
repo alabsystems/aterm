@@ -1,0 +1,138 @@
+schema = 1
+version = "0.90.0"
+build_number = 1790019739
+commit = "067039ceb439a4a59c1516615228a975c9ea94bd"
+dmg = "aterm-0.90.0.dmg"
+sha256 = "b742bb77053915595581d510193643b6a28f4ecbc3146b7a6672a070b2d77deb"
+url = "https://github.com/alabsystems/aterm/releases/download/v0.90.0/aterm-0.90.0.dmg"
+zip = "aterm-0.90.0-mac.zip"
+zip_sha256 = "a62f870e09c2da8674166b91a1cd95a313f272b560c5e5e42adfd91660337589"
+min_os = "11.0"
+team_id = "A66A9P66Z7"
+pub_date = "2026-09-21T19:51:59Z"
+min_build = 1786131079
+machine_id = "m3"
+roster_seq = 4
+changelog = '''
+### Fixed
+
+- **A build no longer goes stale because a DIFFERENT checkout fetched.** `aterm-gui`'s build
+  script stamps the binary with its commit, so it asked git for that commit and told cargo to
+  rebuild whenever the files holding the answer changed. Those files live in the git directory
+  that every linked worktree SHARES — 29 of them on the machine this was measured on — so a
+  `fetch`, `gc` or `pack-refs` in any one checkout invalidated that crate's compile in all of
+  them, including in the middle of a verification run that had already compiled it. The build
+  script now accepts the stamp from whoever already knows it, and a build given one asks git
+  nothing and watches nothing; the local gate resolves it once and hands it to every step, so a
+  run's builds are reproducible as well as undisturbed. Nothing changes for an ordinary build,
+  which still works it out for itself.
+- **The gate pins how many threads its tests use, instead of inheriting it.** It read that
+  setting from whatever shell launched it, so the same merge contract measured a different thing
+  depending on who typed the command — and a wrapper capping it, which is exactly what a person
+  reaches for when spawn-heavy tests flake under load, silently doubled the cost of every
+  CPU-bound test binary. The value is now chosen by the gate, overridable with
+  `ATERM_VERIFY_TEST_THREADS`, and recorded in the run's own notes.
+
+### Changed
+
+- **The automatic update has one ladder and one bound: it lands within 15 minutes of being
+  staged, whatever the terminal is doing.** Measured 2026-09-20 on the owner's daily driver:
+  v0.89.0 was staged and verified at 16:38 UTC and never applied. The log shows eleven identical
+  cycles — armed, two minutes waiting for an idle moment, then ten minutes refusing twice a
+  second with "terminal output is still streaming", then "stood down to manual-only … re-arms by
+  itself later", then thirty minutes of nothing — because a Claude Code session's spinner keeps
+  every session inside the 500 ms output epoch for as long as the agent thinks. Each rung of that
+  loop was a bound placed on the previous rung's wait (an idle grace, a keystroke gap, a typing
+  hold, a lapsing latch), and none of them ended in the update landing. The lane now walks ONE
+  ladder from the instant a build is armed (`native_update_auto_intent::apply_phase`): a quiet
+  moment is preferred for 2 minutes; then, while an aterm window is focused, a gap in output for
+  3 more; then only a gap in typing for 10 more; then it lands. Activity delays the landing inside
+  that bound and can never latch the lane manual-only — that latch is now written by the
+  physical-failure schedule alone, which is what its name always said. The activity-revoked
+  retry spacing (2 s → 15 min) saturates at its last rung instead of exhausting into a two-hour
+  latch, the preflight-block cooldown is ten minutes rather than the two hours it borrowed from
+  that latch, and the lane logs one line per phase change instead of one per poll (13,156 lines,
+  84 % of the log, in one evening). `aterm ctl update status` gains `apply_phase=` while the
+  automatic lane owns the apply, and the ready row says "applies by itself at the next quiet
+  moment, and within 15 min regardless". A derived model (`NativeUpdateApplyLadder`) proves the
+  bound and catches the old stand-down as a wedge; a Tier-1 conformance binds the shipping
+  predicate — the one both the entry gate and the park gate read — to the model's guard over
+  every phase and every combination of the terminal facts. The record is
+  `docs/DESIGN-auto-apply-ladder-2026-09-21.md`.
+- **The libc ABI oracle decides one cell per box, natively, under Trust — and needs no rustup.**
+  The merge contract's `libc-oracle/run.sh` used to type-check five cross cells and read their
+  rustdoc on stock `stable`/`1.95.0` toolchains resolved through rustup, so a box provisioned the
+  product's way (the atpkg store, no rustup) could not pass the contract at all. The owner's
+  direction: "avoid extra dependencies and especially we are avoiding rustc because we have
+  trust!" A cell is now decided where it is native — the `FLEET_HOST_TRIPLES` rule the forge
+  cells already follow — by the Trust sysroot alone, and the driver prints a `### CELLS` report
+  naming each cell's disposition. Coverage changes with it: `aarch64-unknown-linux-gnu` and the
+  two zero-surface targets (`x86_64-pc-windows-msvc`, `wasm32-unknown-unknown`) have no fleet
+  host and are decided by no gate until a box hosts them or Trust ships their std.
+  `libc-oracle/gen/regen.sh`, the authoring ceremony, still harvests every triple and is the one
+  stock-toolchain user left, outside the contract. Two sentences elsewhere caught up with this:
+  the workspace `Cargo.toml`'s `libc` patch-row comment and `libc-oracle/conformance/src/lib.rs`'s
+  header no longer describe the six-cell cross check as coverage. And the driver's exit contract
+  now holds inside the python children too: `gen/symgate.py` exits 3 when the reference libc
+  cannot be documented under Trust (a compiler failure, not a shim finding), and `run.sh`
+  propagates a child's 3 as COULD NOT RUN instead of folding it into a finding; a shim that fails
+  to document is still a finding.
+
+### Fixed
+
+- **A wedged bridge no longer reads `connected`.** `fabric=` gains a fifth value,
+  `stale`: a bridge that is attached, has NOT reported its link down, and has
+  answered nothing for work the instance handed it. That is the hung-helper case,
+  which neither `stalled` (the bridge SAID its link is down) nor `disconnected`
+  (its fds closed) can see — a helper that hangs holds both lanes open and reports
+  nothing, and its instance used to read `connected` for as long as it hung. A
+  `post --wait` against one answers `ERR fabric stale id=<n> queued=1` instead of
+  sitting out its whole wait, and so does `post --wait-ack`'s second wait — the
+  longer of the two, bounded by the sender's `dl=` rather than by `--wait`. The
+  clock belongs to the OLDEST post the bridge still owes, so a landing that
+  leaves other posts queued re-arms it rather than clearing it. It is measured from the WORK, not from the ack's age:
+  a quiet link's `fabric_link_age_ms=` grows without bound by design, so reading
+  that as staleness would refuse the wait on every `ask` on a healthy idle fleet.
+  `aterm fabric status` shows it on the BRIDGES row and names the fix.
+- **A reconnect no longer re-applies every halt the fleet ever had.** The bridge's
+  fleet subscription resumed from offset 0, replaying the whole halt history — and
+  `on_fleet_record` APPLIES each halt as it arrives, so the first `state=on` in the
+  log held every session on the instance until the walk reached its matching `off`,
+  a hold nothing on the bus justified. It now resumes from the mark of the `Last`
+  read the attach already makes, which is gap-free across the seam.
+- **A session whose instance died is no longer advertised as live forever.** The
+  only `Will` on the bus is the node's, so when an instance went away its node row
+  flipped to `state=gone` while every session row under it stayed retained at
+  `state=live` — and `aterm fabric status` reported "mail to it is undeliverable"
+  with no way to ever clear it. The bridge now retires such a row after five
+  minutes of seeing it unhosted, and the report lists it as `gone` instead of
+  warning — and no longer claims such a row is advertised LIVE. It retires only
+  rows this incarnation wrote and rows of an incarnation whose WILL it found on
+  the node face at attach, which is the only local proof that process is gone, so
+  two bridges sharing a node id cannot retire each other's live sessions. A ghost
+  whose death nobody witnessed is left alone.
+- **`ask` now gets its answer by default.** Receipts were ON for a node configured
+  by `aterm fabric on` and OFF for every other way a bridge starts — including the
+  shell script that configures most of them. With them off nothing can release a
+  `post --wait-ack`, so `ask` waited out its full deadline and reported a timeout
+  for a question that had been answered. The default is now ON however the bridge
+  was set up; `--no-receipts` and `[fabric] receipts = false` still turn it off.
+- **An interrupted build-directory migration in a config-pointed repo is now FINISHED, not
+  just named.** Pass 1 writes the `[build] target-dir` the killed pass was about to write —
+  no link, and only into a tree nothing points anywhere yet.
+
+### Changed
+
+- **The fabric lost six faces nothing used — 5,127 lines of `aterm-link`, 13.8%.**
+  The `term/in` drive face (a second keystroke path with no writer in the tree:
+  holders, epochs' fencing role, mirror leases, the feed journal and its replay
+  budget), `--screen` (the one face that put terminal CONTENT on an append-forever
+  log, off by default), `glance.json`'s writer (a durable file format whose own
+  header had said since it was written that no reader is built), `aterm link tui`
+  (a transcript reader that duplicated `aterm fabric tail`), `replay.rs` (a
+  consistent-cut auditor nothing called) and the `wake`/`pin`/`lash` subcommands
+  that existed only to say they were not implemented. Cross-host driving is
+  `aterm drive --dial` and is unaffected.
+  The `term/in` SUBJECT stays reserved and the node capability ring is unchanged at
+  eight grants, so an older node's record is still recognised — and then not served.
+'''

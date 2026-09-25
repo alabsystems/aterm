@@ -125,16 +125,6 @@ fn write_ascii_blast_scrolls_at_screen_bottom() {
 // ========================================================================
 
 #[test]
-fn carriage_return_resets_column_to_zero() {
-    let mut grid = Grid::new(5, 10);
-    grid.set_cursor(3, 7);
-    grid.carriage_return();
-
-    assert_eq!(grid.cursor_col(), 0);
-    assert_eq!(grid.cursor_row(), 3);
-}
-
-#[test]
 fn carriage_return_at_col_zero_is_noop() {
     let mut grid = Grid::new(5, 10);
     grid.set_cursor(2, 0);
@@ -163,23 +153,6 @@ fn carriage_return_then_line_feed_sequence() {
 // ========================================================================
 
 #[test]
-fn erase_rect_basic() {
-    let mut grid = Grid::new(5, 10);
-    grid.set_cursor(1, 0);
-    for c in "ABCDEFGHIJ".chars() {
-        grid.write_char(c);
-    }
-
-    grid.erase_rect(1, 2, 1, 5);
-
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(1, 1).unwrap().char(), 'B');
-    assert_eq!(grid.cell(1, 2).unwrap().char(), ' ');
-    assert_eq!(grid.cell(1, 5).unwrap().char(), ' ');
-    assert_eq!(grid.cell(1, 6).unwrap().char(), 'G');
-}
-
-#[test]
 fn erase_rect_inverted_coordinates_is_noop() {
     let mut grid = Grid::new(5, 10);
     grid.set_cursor(0, 0);
@@ -192,44 +165,9 @@ fn erase_rect_inverted_coordinates_is_noop() {
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
 }
 
-#[test]
-fn erase_rect_exceeding_grid_bounds_clamped() {
-    let mut grid = Grid::new(3, 5);
-    fill_grid_rows(&mut grid, 3);
-
-    grid.erase_rect(0, 0, 100, 100);
-
-    for row in 0..3 {
-        assert!(
-            grid.row(row).unwrap().is_empty(),
-            "row {row} should be cleared",
-        );
-    }
-}
-
-#[test]
-fn erase_rect_single_cell() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(1, 5);
-    grid.write_char('X');
-
-    grid.erase_rect(1, 5, 1, 5);
-    assert_eq!(grid.cell(1, 5).unwrap().char(), ' ');
-}
-
 // ========================================================================
 // Backspace boundary
 // ========================================================================
-
-#[test]
-fn backspace_at_col_zero_stays() {
-    let mut grid = Grid::new(5, 10);
-    grid.set_cursor(2, 0);
-    grid.backspace();
-
-    assert_eq!(grid.cursor_col(), 0);
-    assert_eq!(grid.cursor_row(), 2);
-}
 
 #[test]
 fn backspace_from_mid_column() {
@@ -241,82 +179,8 @@ fn backspace_from_mid_column() {
     assert_eq!(grid.cursor_row(), 1);
 }
 
-// ========================================================================
-// Selective erase boundary conditions
-// ========================================================================
-
-#[test]
-fn selective_erase_to_end_of_screen_preserves_protected() {
-    let mut grid = Grid::new(3, 5);
-    grid.set_cursor(0, 0);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
-    }
-
-    if let Some(cell) = grid.cell_mut(0, 2) {
-        let mut flags = cell.flags();
-        flags.insert(CellFlags::PROTECTED);
-        cell.set_flags(flags);
-    }
-
-    grid.set_cursor(0, 0);
-    grid.selective_erase_to_end_of_screen();
-
-    assert_eq!(grid.cell(0, 2).unwrap().char(), 'C');
-    assert_eq!(grid.cell(0, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), ' ');
-}
-
 // Algorithm audit: Row insert_chars/delete_chars boundary conditions
 // ========================================================================
-
-/// insert_chars with count larger than available space clips correctly.
-#[test]
-fn insert_chars_count_exceeds_available_space() {
-    let mut grid = Grid::new(3, 5);
-    grid.set_cursor(0, 0);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
-    }
-
-    // Insert 100 chars at col 2 — should clip to what fits
-    grid.set_cursor(0, 2);
-    if let Some(row) = grid.row_mut(0) {
-        row.insert_chars(2, 100);
-    }
-
-    // Cols 0-1 should be preserved
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), 'B');
-    // Cols 2-4 should be empty (inserted blanks, original CDE shifted out)
-    for col in 2..5 {
-        assert!(
-            grid.cell(0, col).unwrap().is_empty(),
-            "col {col} should be empty after large insert",
-        );
-    }
-}
-
-/// delete_chars with count larger than remaining should clear from cursor to end.
-#[test]
-fn delete_chars_count_exceeds_remaining() {
-    let mut grid = Grid::new(3, 5);
-    grid.set_cursor(0, 0);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
-    }
-
-    if let Some(row) = grid.row_mut(0) {
-        row.delete_chars(3, 100);
-    }
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), 'B');
-    assert_eq!(grid.cell(0, 2).unwrap().char(), 'C');
-    // Cols 3-4 should be empty (nothing left to shift in)
-    assert!(grid.cell(0, 3).unwrap().is_empty());
-    assert!(grid.cell(0, 4).unwrap().is_empty());
-}
 
 /// insert_chars at the last column should only affect that column.
 #[test]

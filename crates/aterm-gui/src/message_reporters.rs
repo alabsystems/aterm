@@ -18,7 +18,7 @@
 //! Everything else — confirmations, "done", FYI, precautionary notices,
 //! disclosures, repeats — is a [`Hold::LogOnly`] RECORD that Settings ▸
 //! Messages and `messages.log` keep. A glass title is a few words, verb- or
-//! noun-first, with no clauses ([`GLASS_TITLE_WORDS`], [`GLASS_TITLE_CHARS`]);
+//! noun-first, with no clauses ([`aterm_messages::GLASS_TITLE_WORDS`], [`GLASS_TITLE_CHARS`]);
 //! `detail[0]` is painted only when it changes what the person does
 //! (`Message::no_excerpt` otherwise); every other word waits behind Details.
 //!
@@ -51,8 +51,9 @@
 //! # A failed gesture (R9–R14)
 //!
 //! The floating card (`notice.rs`, retired 2026-09-23) carried a gesture's
-//! failure, the two decisions (Full Disk Access, the admin step), their
-//! follow-ups and a handful of disclosures. They are messages now, sorted by
+//! failure, its decisions (Full Disk Access; the admin step was deleted
+//! with the OS-installer protocols, 2026-09-24), their follow-ups and a
+//! handful of disclosures. They are messages now, sorted by
 //! the owner's attention rule ([`attention`], ruling 76): the glass carries
 //! work in flight, very heavy system use while it lasts, and a decision or a
 //! failure the person must act on — everything else is a [`Hold::LogOnly`]
@@ -64,8 +65,8 @@
 use std::time::Duration;
 
 use aterm_messages::{
-    DETAIL_LINES_CAP, Decision, Glyph, HOLD_ASK, HOLD_GESTURE, Hold, Intent, Load, Message,
-    Severity, TITLE_CAP, Tag, tags,
+    DETAIL_LINES_CAP, Decision, Glyph, HOLD_ASK, HOLD_GESTURE, Hold, Intent, Message, Severity,
+    TITLE_CAP, Tag, tags,
 };
 
 use crate::native_settings::SettingsRoute;
@@ -90,28 +91,21 @@ pub(crate) enum Attention {
     Record,
 }
 
-/// Glass titles: a few words, verb- or noun-first, no clauses.
-pub(crate) const GLASS_TITLE_WORDS: usize = 6;
+/// Glass titles: a few words, verb- or noun-first, no clauses — ONE copy, the
+/// engine's (design ruling 179), so the wire's `notice` and every builder here
+/// meet the same form. Only the character cap is read here now: the one builder
+/// that counted words, the admin step's `capped_title`, went with the admin row
+/// (design 2026-09-22 §5.3(b)).
+use aterm_messages::GLASS_TITLE_CHARS;
 
-/// The WORDS of a title: whitespace tokens carrying a letter or a digit, so a
-/// route's `▸` and a name's `&` spend no word (review 2026-09-24).
-pub(crate) fn title_words(title: &str) -> usize {
-    title
-        .split_whitespace()
-        .filter(|token| token.chars().any(char::is_alphanumeric))
-        .count()
-}
-/// …and short enough to survive beside two capsules.
-pub(crate) const GLASS_TITLE_CHARS: usize = 48;
-
-/// Classify `msg`, or say why it may not be on the glass: a record is a
-/// record; a confirmation, an FYI and progress with no indicator are not
+/// Classify `msg`, or say why it may not be on the glass: a measured level
+/// off the strain row is refused; a record is a record; a confirmation, an FYI and progress with no indicator are not
 /// allowed on the glass; a live row with its indicator — a fill or busy
 /// (ruling 139: the indicator is the meter's state, never the hold's) — is
 /// progress; a live row that waits on the person (Warn or Error, still) is a
 /// failure the person acts on; an ask or a consequential capsule is a
 /// decision; a warning or an error a failure.
-/// Every non-record title is at most [`GLASS_TITLE_WORDS`] words and
+/// Every non-record title is at most [`aterm_messages::GLASS_TITLE_WORDS`] words and
 /// [`GLASS_TITLE_CHARS`] characters, carries no clause seam (` — `, `; `,
 /// `: `) and does not end in a period.
 #[cfg_attr(
@@ -122,6 +116,11 @@ pub(crate) const GLASS_TITLE_CHARS: usize = 48;
     )
 )]
 pub(crate) fn attention(msg: &Message) -> Result<Attention, &'static str> {
+    // A measured LEVEL is Progress on the strain row alone (tag `system`,
+    // key `system.strain`); anywhere else it is refused (design ruling 208).
+    if let Some(fault) = aterm_messages::strain::level_fault(msg) {
+        return Err(fault);
+    }
     if msg.hold == Hold::LogOnly {
         return Ok(Attention::Record);
     }
@@ -149,21 +148,8 @@ pub(crate) fn attention(msg: &Message) -> Result<Attention, &'static str> {
     } else {
         return Err("an FYI on glass");
     };
-    let title = msg.title.as_str();
-    if title_words(title) > GLASS_TITLE_WORDS {
-        return Err("a glass title over six words");
-    }
-    if title.chars().count() > GLASS_TITLE_CHARS {
-        return Err("a glass title over 48 characters");
-    }
-    if [" \u{2014} ", "; ", ": "]
-        .iter()
-        .any(|seam| title.contains(seam))
-    {
-        return Err("a clause in a glass title");
-    }
-    if title.ends_with('.') {
-        return Err("a sentence for a glass title");
+    if let Some(fault) = aterm_messages::text::glass_title_fault(&msg.title) {
+        return Err(fault);
     }
     Ok(class)
 }
@@ -228,21 +214,8 @@ pub(crate) const KEY_FILE_ACCESS: &str = "privacy.fda";
 /// only pane the codec carries (`messages_host::privacy_pane`).
 pub(crate) const PANE_FULL_DISK_ACCESS: &str = "full-disk-access";
 
-/// The key the first-launch admin-step question, its live install row and
-/// that install's failure share (R18/R19/R14): the install supersedes the
-/// ask, and a failed install supersedes the live row.
-pub(crate) const KEY_ADMIN_STEP: &str = "packages.admin-step";
-
 /// The key of the install-posture row (R21): one per launch.
 pub(crate) const KEY_INSTALL_POSTURE: &str = "packages.posture";
-
-/// How long the admin install's LIVE row (R19) may go without its pass
-/// ending before it folds `Stale`: the backstop for a finish that never
-/// arrives, never the install's expected length. Apple's Command Line Tools
-/// come through `softwareupdate`, a download of most of a gigabyte, and
-/// Homebrew's installer follows them; the pass's own end resolves the row
-/// long before this on any working network.
-pub(crate) const STALE_ADMIN_INSTALL: Duration = Duration::from_mins(45);
 
 /// The roll-up's tail when a family has more sentences than a message
 /// holds lines: where the whole list lives.
@@ -1047,36 +1020,6 @@ pub(crate) fn restored_tab_failed(error: &str) -> Message {
     .no_excerpt()
 }
 
-/// R14 — the admin step's *Install* was refused before it started (an inert
-/// manager, a packages verb already running): the press is never silently
-/// swallowed, and the reason — which says to wait — is `detail[0]`.
-pub(crate) fn admin_install_refused(message: &str) -> Message {
-    gesture_failure(
-        tags::PACKAGES,
-        Severity::Error,
-        "Admin install did not start",
-        message,
-    )
-}
-
-/// R14 — the admin install STARTED and its pass ended in failure: the
-/// outcome of the person's own press, so it supersedes the live install row
-/// (the shared [`KEY_ADMIN_STEP`]) for a gesture's short hold, the reason
-/// behind Details. Settings ▸ Packages carries the rest of the story.
-pub(crate) fn admin_install_failed(message: &str) -> Message {
-    gesture_failure(
-        tags::PACKAGES,
-        Severity::Error,
-        "Admin install failed",
-        message,
-    )
-    .no_excerpt()
-    .action(Intent::OpenSettings {
-        route: SettingsRoute::Packages.path().to_string(),
-    })
-    .key(KEY_ADMIN_STEP)
-}
-
 /// The Open-log press refused (the path was not a regular file under the log
 /// dir, or nothing could be spawned to open it): the person's gesture, so a
 /// short row naming the path behind Details.
@@ -1128,114 +1071,6 @@ pub(crate) fn file_access_granted() -> Message {
     )
     .hold(Hold::LogOnly)
     .key(KEY_FILE_ACCESS)
-}
-
-/// A program the admin step installs, by the name a person knows it by —
-/// the title's words; the vendor's whole line (`admin_vendor_line`) rides
-/// behind Details.
-fn admin_program_name(name: &str) -> &str {
-    match name {
-        "clt" => "Command Line Tools",
-        "brew" => "Homebrew",
-        other => other,
-    }
-}
-
-/// `clt`, `brew` → `Command Line Tools and Homebrew`; three or more →
-/// `A, B and C` (door order).
-fn admin_program_list(names: &[String]) -> String {
-    let named: Vec<&str> = names.iter().map(|n| admin_program_name(n)).collect();
-    match named.split_last() {
-        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-        Some((last, _)) => (*last).to_string(),
-        None => String::new(),
-    }
-}
-
-/// A title naming `names` programs when there are at most two and the
-/// words fit the glass title's cap, else `fallback` (the count).
-fn capped_title(names: usize, text: String, fallback: impl FnOnce() -> String) -> String {
-    if names <= 2
-        && title_words(&text) <= GLASS_TITLE_WORDS
-        && text.chars().count() <= GLASS_TITLE_CHARS
-    {
-        text
-    } else {
-        fallback()
-    }
-}
-
-/// R18 — THE FIRST-LAUNCH ADMIN STEP: one or more index programs need an
-/// administrator (`needs admin — run: aterm pkg install <name>`) and the
-/// unattended pass can never supply the password. A DECISION row — *Install*
-/// runs the `--elevate=osascript` door (macOS's own dialog), *Not now*
-/// records a dismissal for this exact set — held for `HOLD_ASK`. The TITLE
-/// names what the decision installs — `Install Command Line Tools and
-/// Homebrew` (or `Install 3 programs` past the cap): at 80 columns an excerpt
-/// asked the person to approve an unnamed install (review 2026-09-23). What
-/// Install does and each vendor's installer ride behind Details.
-pub(crate) fn admin_step(names: &[String]) -> Message {
-    let title = capped_title(
-        names.len(),
-        format!("Install {}", admin_program_list(names)),
-        || format!("Install {} programs", names.len()),
-    );
-    Message::new(tags::PACKAGES, Severity::Info, title)
-        .line("Install opens macOS's own password dialog")
-        .lines(
-            names
-                .iter()
-                .map(|n| crate::packages_screen::admin_vendor_line(n)),
-        )
-        .action(Intent::InstallElevated {
-            names: names.to_vec(),
-        })
-        .action(Intent::NotNow {
-            decision: Decision::AdminStep {
-                names: names.to_vec(),
-            },
-        })
-        .no_excerpt()
-        .hold(Hold::Ask { for_: HOLD_ASK })
-        .key(KEY_ADMIN_STEP)
-}
-
-/// The admin install's title: what is coming, by name, in the words its own
-/// question asked — `Installing Command Line Tools and Homebrew` — or, past
-/// two names or the glass title's cap, the count (`Installing 3 programs`).
-fn admin_install_title(names: &[String]) -> String {
-    capped_title(
-        names.len(),
-        format!("Installing {}", admin_program_list(names)),
-        || format!("Installing {} programs", names.len()),
-    )
-}
-
-/// R19 — the admin install was accepted and is RUNNING (ruling 148): work in
-/// flight and very heavy system use (macOS's own installer loads disk and
-/// CPU for minutes), so a LIVE row, BUSY (ruling 139) with the system load
-/// declared, naming what is coming, until the packages pass that carries it
-/// ends: the pass's outcome resolves it (`App::finish_admin_install`), a
-/// failure superseding it with [`admin_install_failed`]. It supersedes the
-/// question by the shared key. `STALE_ADMIN_INSTALL` is only the backstop for
-/// an end that never arrives. Its ONE detail (ruling 62) is the one thing the
-/// person must do — the password macOS's own dialog asks for (2026-09-23) —
-/// painted, because it changes what the person does (ruling 77). No
-/// capsule: work in flight is not a decision (ruling 101), and a `Packages`
-/// capsule cut the title to `Installing Com…` at 60 columns (review
-/// 2026-09-24); the failure keeps it.
-pub(crate) fn admin_install_started(names: &[String]) -> Message {
-    Message::new(tags::PACKAGES, Severity::Info, admin_install_title(names))
-        .glyph(Glyph::or_fallback('\u{21e3}'))
-        .line("enter your password in the macOS dialog")
-        .meter(aterm_messages::Meter {
-            load: Some(Load::System),
-            ..aterm_messages::Meter::busy("")
-        })
-        .hold(Hold::Live {
-            stale_after: STALE_ADMIN_INSTALL,
-        })
-        .key(KEY_ADMIN_STEP)
 }
 
 /// A HARNESS NOTE (`aterm ctl appnotice harness <text>`: an agent harness's acts,
@@ -1394,7 +1229,7 @@ mod tests {
         );
         let mut all = warns.into_messages();
         all.push(crash_message(&crate::logging::CrashEvidence {
-            path: std::path::PathBuf::from("/Users//_an/Library/Logs/aterm/crash-1-1.log.seen"),
+            path: std::path::PathBuf::from("/Users/_an/Library/Logs/aterm/crash-1-1.log.seen"),
             head: vec!["aterm-gui 0.1.0 crashed at unix 1.000".into()],
         }));
         all.push(launch_load_failure(
@@ -1466,10 +1301,6 @@ mod tests {
         all.extend(gesture_failures());
         all.push(file_access_question());
         all.push(file_access_granted());
-        let both = ["clt".to_string(), "brew".to_string()];
-        all.push(admin_step(&both));
-        all.push(admin_install_started(&both));
-        all.push(admin_install_failed("User canceled. (-128)"));
         for posture in [
             aterm_update::which_copy::InstallPosture::MountedImage,
             aterm_update::which_copy::InstallPosture::Translocated,
@@ -1532,7 +1363,6 @@ mod tests {
             restore_stopped_early(),
             shell_lost_in_update("descriptor 9 was closed"),
             restored_tab_failed("exec failed"),
-            admin_install_refused("a packages operation is already running"),
         ]
     }
 
@@ -1704,89 +1534,13 @@ mod tests {
             !restore_stopped_early().excerpt,
             "its line restates the title: behind Details"
         );
-        // The install's own failure supersedes its live row by key, and
-        // points at the page with the rest of the story.
-        let failed = admin_install_failed("User canceled.");
-        assert_eq!(failed.key.as_deref(), Some(KEY_ADMIN_STEP));
-        assert_eq!(failed.hold, Hold::For(HOLD_GESTURE));
-        assert_eq!(
-            failed.actions,
-            [Intent::OpenSettings {
-                route: "/packages".to_string()
-            }]
-        );
     }
 
-    /// THE REST OF THE RETIRED TOAST UNDER THE ATTENTION RULE: the two
-    /// questions are decision rows; the admin install is LIVE work in flight
-    /// naming what is coming; a crippled install is a row only when there is
-    /// something to fix; the grant and the connection disclosure are records that
-    /// never touch the glass.
+    /// THE REST OF THE RETIRED TOAST UNDER THE ATTENTION RULE: a crippled
+    /// install is a row only when there is something to fix; the grant and the
+    /// connection disclosure are records that never touch the glass.
     #[test]
-    fn decisions_and_work_in_flight_are_rows_and_the_rest_are_records() {
-        let both = ["clt".to_string(), "brew".to_string()];
-        // R18 — a decision naming what it installs in its TITLE.
-        let ask = admin_step(&both);
-        assert_eq!(ask.title, "Install Command Line Tools and Homebrew");
-        assert!(
-            !ask.excerpt,
-            "the title and the capsules alone on the glass"
-        );
-        assert_eq!(ask.detail[0], "Install opens macOS's own password dialog");
-        assert!(
-            ask.detail[1].starts_with("Apple Command Line Tools"),
-            "{:?}",
-            ask.detail
-        );
-        assert_eq!(admin_step(&both[..1]).title, "Install Command Line Tools");
-        let three = ["clt".to_string(), "brew".to_string(), "xquartz".to_string()];
-        assert_eq!(admin_step(&three).title, "Install 3 programs");
-        assert_eq!(
-            ask.actions,
-            [
-                Intent::InstallElevated {
-                    names: both.to_vec()
-                },
-                Intent::NotNow {
-                    decision: Decision::AdminStep {
-                        names: both.to_vec()
-                    }
-                }
-            ]
-        );
-        assert_eq!(ask.hold, Hold::Ask { for_: HOLD_ASK });
-        assert_eq!(ask.key.as_deref(), Some(KEY_ADMIN_STEP));
-        // R19 — live work in flight, naming the goal; supersedes the ask.
-        let started = admin_install_started(&both);
-        assert_eq!(started.title, "Installing Command Line Tools and Homebrew");
-        assert_eq!(
-            started.hold,
-            Hold::Live {
-                stale_after: STALE_ADMIN_INSTALL
-            }
-        );
-        assert_eq!(started.key.as_deref(), Some(KEY_ADMIN_STEP));
-        let meter = started.meter.as_ref().expect("the comet");
-        assert_eq!(meter.fill_permille, None, "indeterminate");
-        assert!(meter.busy, "work in flight declares busy (ruling 139)");
-        assert_eq!(meter.load, Some(Load::System), "macOS's installer is heavy");
-        assert!(
-            started.excerpt,
-            "the password prompt changes what the person does"
-        );
-        assert_eq!(
-            started.detail,
-            ["enter your password in the macOS dialog"],
-            "the one thing the person must do is the only detail (ruling 62)"
-        );
-        assert!(
-            started.actions.is_empty(),
-            "work in flight is not a decision: no capsule to cut the title (ruling 101)"
-        );
-        assert_eq!(
-            admin_install_started(&both[1..]).title,
-            "Installing Homebrew"
-        );
+    fn the_rest_of_the_retired_toast_is_rows_only_where_there_is_something_to_fix() {
         // R21 — a row only where the person has something to fix.
         use aterm_update::which_copy::InstallPosture;
         assert!(install_posture(InstallPosture::Installed).is_none());
@@ -1847,7 +1601,7 @@ mod tests {
     /// head follows it; `Open log` carries the same path.
     #[test]
     fn the_crash_row_names_the_artifact_in_its_detail_not_its_title() {
-        let path = "/Users//_an/Library/Logs/aterm/crash-signal-1-1.log.seen";
+        let path = "/Users/_an/Library/Logs/aterm/crash-signal-1-1.log.seen";
         let msg = crash_message(&crate::logging::CrashEvidence {
             path: std::path::PathBuf::from(path),
             head: vec!["aterm-gui 0.1.0 crashed".into(), "fatal signal 11".into()],
@@ -2507,12 +2261,17 @@ mod tests {
                 .unwrap_or_else(|why| panic!("{why}: {:?} ({:?})", msg.title, msg.hold));
             *classes.entry(format!("{class:?}")).or_insert(0usize) += 1;
         }
-        for class in ["Progress", "Decision", "Failure", "Record"] {
+        // This module's builders are decisions, failures and records; its one
+        // progress row (the admin install) went with the OS-installer protocols
+        // (2026-09-24), and the live-work rows are `toolchain_words`', whose
+        // own test holds them to the rule as `Progress`.
+        for class in ["Decision", "Failure", "Record"] {
             assert!(
                 classes.contains_key(class),
-                "the fixture exercises every class: {classes:?}"
+                "the fixture exercises every class it builds: {classes:?}"
             );
         }
+        assert!(!classes.contains_key("Progress"), "{classes:?}");
         // The rule refuses what it must.
         let fyi = Message::new(tags::SYSTEM, Severity::Info, "Something happened");
         assert_eq!(attention(&fyi), Err("an FYI on glass"));
@@ -2534,8 +2293,29 @@ mod tests {
         assert_eq!(attention(&sentence), Err("a sentence for a glass title"));
         // Words, not tokens: a route's `▸` and a name's `&` spend none.
         assert_eq!(
-            title_words("Open Privacy & Security \u{25b8} Full Disk Access"),
+            aterm_messages::text::title_words("Open Privacy & Security \u{25b8} Full Disk Access"),
             6
+        );
+        // A measured LEVEL is Progress on the strain row alone (ruling 208).
+        let level = |tag: Tag, key: &str| {
+            Message::new(tag, Severity::Info, "Typing slowed by yes in tab 2")
+                .key(key)
+                .hold(Hold::Live {
+                    stale_after: aterm_messages::STALE_STRAIN,
+                })
+                .meter(aterm_messages::Meter::level(900, "7.1 of 8 cores"))
+        };
+        assert_eq!(
+            attention(&level(tags::SYSTEM, aterm_messages::STRAIN_KEY)),
+            Ok(Attention::Progress)
+        );
+        assert_eq!(
+            attention(&level(tags::UPDATE, aterm_messages::STRAIN_KEY)),
+            Err("a level off the strain row")
+        );
+        assert_eq!(
+            attention(&level(tags::SYSTEM, "system.other")),
+            Err("a level off the strain row")
         );
     }
 
@@ -2608,45 +2388,6 @@ mod tests {
             msg.detail.iter().all(|l| !l.contains("  ")),
             "{:?}",
             msg.detail
-        );
-    }
-
-    /// R19 COMPLETES IN ITS FINISHED FORM (design ruling 154): `Installed
-    /// Command Line Tools and Homebrew`, `Installed 3 programs` — with nothing
-    /// else on the row moving at 60, 80, 120 and 160 (the password excerpt
-    /// included).
-    #[test]
-    fn the_admin_install_completes_in_its_finished_form() {
-        use crate::message_band::assert_completes_in_place as completes;
-        let two = ["clt".to_string(), "brew".to_string()];
-        completes(
-            &admin_install_started(&two),
-            "Installed Command Line Tools and Homebrew",
-        );
-        let three = ["clt".to_string(), "brew".to_string(), "xquartz".to_string()];
-        completes(&admin_install_started(&three), "Installed 3 programs");
-        completes(
-            &admin_install_started(&["brew".to_string()]),
-            "Installed Homebrew",
-        );
-    }
-
-    /// §10.2 #14: the admin install's title names what is coming while the
-    /// names fit the glass title's cap, and counts them when they would not.
-    #[test]
-    fn the_admin_install_title_falls_back_under_the_cap() {
-        let two = ["clt".to_string(), "brew".to_string()];
-        assert_eq!(
-            admin_install_started(&two).title,
-            "Installing Command Line Tools and Homebrew"
-        );
-        let three = ["clt".to_string(), "brew".to_string(), "xquartz".to_string()];
-        let msg = admin_install_started(&three);
-        assert_eq!(msg.title, "Installing 3 programs");
-        assert_eq!(attention(&msg), Ok(Attention::Progress));
-        assert_eq!(
-            admin_install_started(&["brew".to_string()]).title,
-            "Installing Homebrew"
         );
     }
 

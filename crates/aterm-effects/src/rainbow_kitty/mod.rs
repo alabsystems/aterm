@@ -7943,83 +7943,6 @@ mod tests {
         out
     }
 
-    /// THE BEFORE CAPTURE'S SCHEDULE, 13 s (`capture-before`, 2026-09-05):
-    /// 44 keys of prose at 10 cps from 0.5 s, two ctrl-a / ctrl-e round
-    /// trips over the 44 cells, four backspaces, an Enter, then idle to the
-    /// end — ~4.6 s of typing. The row the "expected arms per frame"
-    /// projection is measured on.
-    fn capture_script(t0: Instant) -> Vec<(Instant, Event)> {
-        const TEXT: &[u8] = b"echo the quick brown fox jumps over the lazy dog";
-        let mut out = Vec::new();
-        let mut col: u16 = 4;
-        let mut at = t0 + secs(0.5);
-        for &b in &TEXT[..44] {
-            let ch = b as char;
-            let class = if ch == ' ' {
-                TypedClass::Space
-            } else {
-                TypedClass::Glyph
-            };
-            out.push((
-                at,
-                Event::Move {
-                    from: (SIM_ROW, col),
-                    to: (SIM_ROW, col + 1),
-                    licence: Licence::Typed,
-                    dir: Dir::Right,
-                },
-            ));
-            out.push((
-                at,
-                Event::Typed {
-                    cells: 1,
-                    shifted: false,
-                    class,
-                },
-            ));
-            col += 1;
-            at += secs(0.1);
-        }
-        let end = col;
-        for (t, to) in [(5.5, 4), (6.0, end), (6.6, 4), (7.1, end)] {
-            let from = col;
-            col = to;
-            out.push((
-                t0 + secs(t),
-                Event::Move {
-                    from: (SIM_ROW, from),
-                    to: (SIM_ROW, col),
-                    licence: Licence::Nav,
-                    dir: if col > from { Dir::Right } else { Dir::Left },
-                },
-            ));
-        }
-        for k in 0..4u16 {
-            let at = t0 + secs(8.0 + 0.083 * f32::from(k));
-            out.push((
-                at,
-                Event::Move {
-                    from: (SIM_ROW, col),
-                    to: (SIM_ROW, col - 1),
-                    licence: Licence::Typed,
-                    dir: Dir::Left,
-                },
-            ));
-            col -= 1;
-            out.push((at, Event::Erase));
-        }
-        out.push((
-            t0 + secs(9.0),
-            Event::Move {
-                from: (SIM_ROW, col),
-                to: (SIM_ROW + 1, 0),
-                licence: Licence::Return,
-                dir: Dir::Down,
-            },
-        ));
-        out
-    }
-
     /// A 40-cell same-row nav jump at `t0` — a meteor with `T = 90 ms`.
     fn meteor_script(t0: Instant) -> Vec<(Instant, Event)> {
         vec![(
@@ -8088,90 +8011,6 @@ mod tests {
             .iter()
             .filter(|(t, d, _)| d.is_some() && *t >= origin + secs(a) && *t < origin + secs(b))
             .count()
-    }
-
-    /// **THE CENSUS** (informational; `--nocapture`): how many wakes per
-    /// second each producer asks for, alone and folded, during (a) 12 cps
-    /// prose, (b) the 1.5 s after the last key — grace, reach, retract and
-    /// fade of the swoosh separately — and (c) `T .. T + 320` of a meteor.
-    /// The numbers behind the cadence law, re-measured on every run.
-    #[test]
-    fn cadence_census_prints_what_each_producer_asks_for() {
-        let cfg = config();
-        let asks: [(&str, Ask<'_>); 4] = [
-            ("engine  ", &|e, now| e.next_change_deadline(now)),
-            ("meteor  ", &|e, now| e.meteor.next_change_deadline(now)),
-            ("ribbon  ", &|e, now| e.ribbon.next_change_deadline(now)),
-            ("stardust", &|e, now| e.stardust.next_change_deadline(now)),
-        ];
-        println!();
-        println!(
-            "cadence census — arms per second: prose | +0..0.5 | grace 0.5..0.75 | reach 0.75..0.9 | retract 0.9..1.3 | fade 1.3..1.54 | tail 0..1.5 | idle at | meteor T..T+320"
-        );
-        for (name, ask) in asks {
-            let t0 = Instant::now();
-            let script = prose_script(t0, 24);
-            let last = script.last().map(|e| e.0).unwrap_or(t0);
-            let mut eng = engine_with_sky();
-            let turns = drive(&mut eng, &cfg, &script, t0, last + secs(2.6), ask);
-            let prose = arms_in(&turns, t0, 0.0, 2.0) as f32 / 2.0;
-            let w = |a: f32, b: f32| arms_in(&turns, last, a, b) as f32 / (b - a);
-            let idle = turns
-                .iter()
-                .find(|(t, d, _)| *t >= last && d.is_none())
-                .map_or_else(
-                    || "NEVER".to_string(),
-                    |(t, _, _)| {
-                        format!(
-                            "{:.0} ms",
-                            t.saturating_duration_since(last).as_secs_f32() * 1000.0
-                        )
-                    },
-                );
-            let tm = Instant::now();
-            let mut eng = engine_with_sky();
-            let flight = timing::flight(40.0).as_secs_f32();
-            let turns_m = drive(
-                &mut eng,
-                &cfg,
-                &meteor_script(tm),
-                tm,
-                tm + secs(flight + 0.32),
-                ask,
-            );
-            let meteor = arms_in(&turns_m, tm, 0.0, flight + 0.32) as f32 / (flight + 0.32);
-            println!(
-                "  {name} | {prose:6.1} | {:6.1} | {:6.1} | {:6.1} | {:6.1} | {:6.1} | {:6.1} | {idle:>8} | {meteor:6.1}",
-                w(0.0, 0.5),
-                w(0.5, 0.75),
-                w(0.75, 0.9),
-                w(0.9, 1.3),
-                w(ribbon::SWOOSH_TOTAL_S - 0.24, ribbon::SWOOSH_TOTAL_S),
-                w(0.0, 1.5),
-            );
-        }
-        // The BEFORE capture's 13 s schedule, on the engine's fold: every
-        // wake is one rendered frame and books one arm, so the wake count
-        // is the renders the engine asks the host for — against the
-        // capture's 937 (v1) and 1252 (v2 before this law).
-        let t0 = Instant::now();
-        let mut eng = engine_with_sky();
-        let turns = drive(
-            &mut eng,
-            &cfg,
-            &capture_script(t0),
-            t0,
-            t0 + secs(13.0),
-            &|e, now| e.next_change_deadline(now),
-        );
-        let arms = turns.iter().filter(|(_, d, _)| d.is_some()).count();
-        let brisk = turns.iter().filter(|(_, _, b)| *b).count();
-        println!(
-            "  capture schedule 13 s: {} wakes (renders), {arms} arms, {brisk} at frame cadence — {:.1} wakes/s, {:.2} arms per wake",
-            turns.len(),
-            turns.len() as f32 / 13.0,
-            arms as f32 / turns.len().max(1) as f32
-        );
     }
 
     /// **THE TAIL LAW** (§18, the owner's "efficient"): after the last key,
@@ -8683,71 +8522,54 @@ mod tests {
     ///
     /// RED before the fix: `(3, 4)` lit — a row of rainbow on the text the
     /// scroll moved — and `(2, 4)` dark.
-    #[test]
-    fn a_scroll_carries_the_pre_move_caret_with_the_text_it_names() {
-        let ms = Duration::from_millis;
-        let t0 = Instant::now();
-        let mut eng = engaged();
-        blank_row(&mut eng, 2);
-        blank_row(&mut eng, 3);
-        eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
-        tick_at(&mut eng, t0);
-        // A key and a one-shot move buffered: `pre_move` names the caret
-        // `(3, 5)`, and the key belongs one column left of it.
-        eng.on_event(typed(1), t0 + ms(100));
-        eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
-        // …and the scroll lands before their frame.
-        eng.translate_scroll(1, geom().ch as u16);
-        tick_at(&mut eng, t0 + ms(120));
-        assert!(
-            eng.ribbon()
-                .cells()
-                .iter()
-                .any(|c| c.typing && (c.row, c.col) == (2, 4)),
-            "the key rides the scroll with its glyph: {:?}",
-            typing_cells(&eng)
-        );
-        assert!(
-            eng.ribbon().cells().iter().all(|c| !c.typing || c.row != 3),
-            "…and nothing of it is left a row below: {:?}",
-            typing_cells(&eng)
-        );
-    }
-
+    ///
     /// …AND A BAND MOVE CARRIES IT TOO. The band seam is the one Codex's
     /// inline viewport takes on every streamed line, and it translates the
-    /// same buffered events under the same record. Same fixture as the
-    /// sibling above and the same two assertions, so the two seams can never
-    /// drift apart — the band `[0..=10] −1` moves row 3 to row 2 exactly as
-    /// the one-row scroll does.
+    /// same buffered events under the same record: the band `[0..=10] −1`
+    /// moves row 3 to row 2 exactly as the one-row scroll does. One fixture,
+    /// one pair of assertions, a row per seam, so the two can never drift
+    /// apart.
     ///
-    /// RED before the fix: `(3, 4)` lit, `(2, 4)` dark.
+    /// RED before the fix, both seams: `(3, 4)` lit, `(2, 4)` dark.
     #[test]
-    fn a_band_move_carries_the_pre_move_caret_with_the_text_it_names() {
-        let ms = Duration::from_millis;
-        let t0 = Instant::now();
-        let mut eng = engaged();
-        blank_row(&mut eng, 2);
-        blank_row(&mut eng, 3);
-        eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
-        tick_at(&mut eng, t0);
-        eng.on_event(typed(1), t0 + ms(100));
-        eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
-        eng.translate_band(0, 10, -1, geom().ch as u16, 0);
-        tick_at(&mut eng, t0 + ms(120));
-        assert!(
-            eng.ribbon()
-                .cells()
-                .iter()
-                .any(|c| c.typing && (c.row, c.col) == (2, 4)),
-            "the key rides the band with its glyph: {:?}",
-            typing_cells(&eng)
-        );
-        assert!(
-            eng.ribbon().cells().iter().all(|c| !c.typing || c.row != 3),
-            "…and nothing of it is left a row below: {:?}",
-            typing_cells(&eng)
-        );
+    fn a_scroll_or_a_band_move_carries_the_pre_move_caret_with_the_text_it_names() {
+        /// The seam, and the move it makes before the buffered frame.
+        type Seam = (&'static str, fn(&mut Engine));
+        let seams: [Seam; 2] = [
+            ("scroll", |eng| eng.translate_scroll(1, geom().ch as u16)),
+            ("band", |eng| {
+                eng.translate_band(0, 10, -1, geom().ch as u16, 0)
+            }),
+        ];
+        for (seam, shift) in seams {
+            let ms = Duration::from_millis;
+            let t0 = Instant::now();
+            let mut eng = engaged();
+            blank_row(&mut eng, 2);
+            blank_row(&mut eng, 3);
+            eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+            tick_at(&mut eng, t0);
+            // A key and a one-shot move buffered: `pre_move` names the caret
+            // `(3, 5)`, and the key belongs one column left of it.
+            eng.on_event(typed(1), t0 + ms(100));
+            eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
+            // …and the seam moves the text before their frame.
+            shift(&mut eng);
+            tick_at(&mut eng, t0 + ms(120));
+            assert!(
+                eng.ribbon()
+                    .cells()
+                    .iter()
+                    .any(|c| c.typing && (c.row, c.col) == (2, 4)),
+                "the key rides the {seam} with its glyph: {:?}",
+                typing_cells(&eng)
+            );
+            assert!(
+                eng.ribbon().cells().iter().all(|c| !c.typing || c.row != 3),
+                "…and nothing of it is left a row below ({seam}): {:?}",
+                typing_cells(&eng)
+            );
+        }
     }
 
     /// **A PRE-MOVE CARET CARRIED OFF THE TOP IS FORGOTTEN, NOT CLAMPED** —
@@ -8831,72 +8653,60 @@ mod tests {
         );
     }
 
-    /// **A RESET FORGETS THE PRE-MOVE CARET WITH THE EVENTS IT INDEXED.**
-    /// `reset` cleared `events` but not
-    /// [`Engine::pre_move`], so a one-shot move buffered before a style
-    /// switch or a layout change left `(index, caret)` standing into the
-    /// next frame — and a key typed then was replayed at a caret in a
-    /// coordinate space the reset had forgotten.
+    /// **A RESET — OR A CURTAIN — FORGETS THE PRE-MOVE CARET WITH THE EVENTS
+    /// IT INDEXED.** `reset` cleared `events` but not [`Engine::pre_move`],
+    /// so a one-shot move buffered before a style switch or a layout change
+    /// left `(index, caret)` standing into the next frame — and a key typed
+    /// then was replayed at a caret in a coordinate space the reset had
+    /// forgotten. `curtain` — the path the host takes at the COORDINATE-SPACE
+    /// seams (tab switch, pane focus move, session migration, alt-screen enter
+    /// and exit) while rainbow kitty owns the frame, which is the shipped
+    /// default — kept the same bug after `reset` was fixed: a key typed in the
+    /// NEW space was replayed at the OLD space's caret, on a row of a pane no
+    /// longer on glass, and its own echo stayed dark. One fixture and one pair
+    /// of assertions, a row per seam, so the two can never drift apart again.
     ///
-    /// RED before the fix: `(3, 4)` lit after the reset.
+    /// RED before the fix: `(3, 4)` lit after the reset / the curtain.
     #[test]
-    fn a_reset_forgets_the_pre_move_caret_with_the_events_it_indexed() {
+    fn a_reset_or_a_curtain_forgets_the_pre_move_caret_with_the_events_it_indexed() {
         let ms = Duration::from_millis;
-        let t0 = Instant::now();
-        let mut eng = engaged();
-        blank_row(&mut eng, 2);
-        eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
-        tick_at(&mut eng, t0);
-        // A key and a one-shot move buffered, then the reset before their
-        // frame.
-        eng.on_event(typed(1), t0 + ms(100));
-        eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
-        eng.reset();
-        // The next frame, in the new space: a key and its own echo.
-        let k = t0 + ms(200);
-        eng.on_event(typed(1), k);
-        eng.on_event(mv((7, 0), (7, 10), Licence::Typed), k + ms(8));
-        tick_at(&mut eng, k + ms(8));
-        assert!(
-            eng.field_at(3, 4).is_none(),
-            "the key is not replayed at a caret the reset forgot"
-        );
-        assert!(eng.field_at(7, 9).is_some(), "…it lays at its own echo");
-    }
-
-    /// …AND THE CURTAIN FORGETS IT TOO. `reset` was fixed for the bug above;
-    /// `curtain` — the path the host takes at the COORDINATE-SPACE seams (tab
-    /// switch, pane focus move, session migration, alt-screen enter and exit)
-    /// while rainbow kitty owns the frame, which is the shipped default — kept
-    /// clearing `events` and leaving `pre_move`, the record that indexes them.
-    /// So a key typed in the NEW space was replayed at the OLD space's caret,
-    /// on a row of a pane no longer on glass, and its own echo stayed dark.
-    ///
-    /// Same fixture as the sibling, and the same two assertions, so the two
-    /// seams can never drift apart again — plus the control that nothing
-    /// buffered behaves the same either way.
-    #[test]
-    fn a_curtain_forgets_the_pre_move_caret_with_the_events_it_indexed() {
-        let ms = Duration::from_millis;
-        let t0 = Instant::now();
-        let mut eng = engaged();
-        blank_row(&mut eng, 2);
-        eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
-        tick_at(&mut eng, t0);
-        eng.on_event(typed(1), t0 + ms(100));
-        eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
-        eng.curtain(t0 + ms(120));
-        // Well past the curtain's own easing, so nothing it draws can answer
-        // for the assertion below.
-        let k = t0 + ms(900);
-        eng.on_event(typed(1), k);
-        eng.on_event(mv((7, 0), (7, 10), Licence::Typed), k + ms(8));
-        tick_at(&mut eng, k + ms(8));
-        assert!(
-            eng.field_at(3, 4).is_none(),
-            "the key was replayed at a caret the curtain forgot"
-        );
-        assert!(eng.field_at(7, 9).is_some(), "…it lays at its own echo");
+        /// The seam, the forgetting call, and when the next key lands.
+        type Seam = (&'static str, fn(&mut Engine, Instant), u64);
+        let seams: [Seam; 2] = [
+            ("reset", |eng, _| eng.reset(), 200),
+            // Well past the curtain's own easing, so nothing it draws can
+            // answer for the assertion below.
+            (
+                "curtain",
+                |eng, t0| eng.curtain(t0 + Duration::from_millis(120)),
+                900,
+            ),
+        ];
+        for (seam, forget, key_ms) in seams {
+            let t0 = Instant::now();
+            let mut eng = engaged();
+            blank_row(&mut eng, 2);
+            eng.on_event(mv((3, 0), (3, 5), Licence::Typed), t0);
+            tick_at(&mut eng, t0);
+            // A key and a one-shot move buffered, then the seam before their
+            // frame.
+            eng.on_event(typed(1), t0 + ms(100));
+            eng.on_event(mv((3, 5), (3, 20), Licence::Nav), t0 + ms(110));
+            forget(&mut eng, t0);
+            // The next frame, in the new space: a key and its own echo.
+            let k = t0 + ms(key_ms);
+            eng.on_event(typed(1), k);
+            eng.on_event(mv((7, 0), (7, 10), Licence::Typed), k + ms(8));
+            tick_at(&mut eng, k + ms(8));
+            assert!(
+                eng.field_at(3, 4).is_none(),
+                "the key is not replayed at a caret the {seam} forgot"
+            );
+            assert!(
+                eng.field_at(7, 9).is_some(),
+                "…it lays at its own echo ({seam})"
+            );
+        }
     }
 
     /// **A KEY TYPED AT A CARET THE ENGINE NEVER LEARNED IS HELD.**

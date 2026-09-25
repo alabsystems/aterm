@@ -249,13 +249,6 @@ mod tests {
         assert!(lane.try_lock().is_ok());
     }
 
-    /// How long a lock this process has released may still read as HELD,
-    /// because a sibling test's `fork` has not `exec`ed yet. Measured at up to
-    /// ~523 ms under pathological load (`crates/aterm-pty/src/unix.rs:739-744`); the
-    /// budget is an order of magnitude over that, and a lock that is really
-    /// held still fails the assertion after it.
-    const SPAWN_RELEASE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-
     #[test]
     fn a_dedup_wait_releases_both_locks_and_does_not_block_manual_check() {
         let staging = crate::paths::Staging::scratch("checker-wait-release");
@@ -276,26 +269,14 @@ mod tests {
         after_skip(gate, guard, 30, || {
             waited = true;
             let lane_free = lane.try_lock().is_ok();
-            // THE FILE LOCK IS POLLED, NOT SAMPLED ONCE (2026-09-17). `after_skip`
-            // has dropped `gate`, which closes THIS process's descriptor for the
-            // lock file — but `flock` is released only when EVERY descriptor on
-            // that open file description is closed, and a `fork`/`posix_spawn`
-            // anywhere else in this test binary copies every open descriptor into
-            // the child, which holds them until it `exec`s (`FD_CLOEXEC` closes at
-            // exec, never at fork). This binary has 26 `Command::new` sites in
-            // `verify.rs` and `install.rs`, so a sibling's fork window is ordinary
-            // here; it has been measured at up to ~523 ms under load, against the
-            // 30 ms this closure waits.
-            //
-            // `Duration::ZERO` made that window a FAILURE: it is a single
-            // `try_lock`, so one `WouldBlock` answered `file_held = 1` and the
-            // derived invariant `NoSleepingCheckOwner` failed on a lock that was
-            // already released. The CLAIM IS UNCHANGED — the scheduler must not
-            // hold the file lock across its sleep — and a lock genuinely held
-            // across the sleep still fails here, after waiting out the window
-            // rather than instead of waiting it out.
+            // SAMPLED ONCE. `after_skip` has dropped `gate`, and a dropped
+            // `FileLock` is free at once (`LOCK_UN`, 2026-09-24) even while a
+            // sibling test's fork still holds a copy of its descriptor — so the
+            // five-second poll this used to need to wait out that window is gone,
+            // and one `WouldBlock` here means the lock really is held across the
+            // sleep.
             let file_free =
-                aterm_update_core::FileLock::acquire_within(&file_path, SPAWN_RELEASE_WINDOW)
+                aterm_update_core::FileLock::acquire_within(&file_path, std::time::Duration::ZERO)
                     .is_ok();
             let mut state = model.init_state();
             state.insert("sleeping", 1);

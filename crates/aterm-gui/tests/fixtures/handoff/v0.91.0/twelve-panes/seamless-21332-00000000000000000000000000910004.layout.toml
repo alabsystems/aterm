@@ -1,0 +1,178 @@
+schema = 2
+
+[[windows]]
+rows = 46
+cols = 168
+active_tab = 0
+outer_x = 96
+outer_y = 48
+active_item = 0
+
+[[windows.restored_tabs]]
+focused_path = ["first", "first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "split"
+axis = "horizontal"
+ratio = 0.5
+
+[windows.restored_tabs.root.first.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 0
+
+[windows.restored_tabs.root.first.second]
+node = "leaf"
+
+[windows.restored_tabs.root.first.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 1
+
+[windows.restored_tabs.root.second]
+node = "split"
+axis = "horizontal"
+ratio = 0.5
+
+[windows.restored_tabs.root.second.first]
+node = "leaf"
+
+[windows.restored_tabs.root.second.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "vim"
+local_id = 2
+
+[windows.restored_tabs.root.second.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 3
+
+[[windows.restored_tabs]]
+focused_path = ["first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 4
+
+[windows.restored_tabs.root.second]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.second.first]
+node = "leaf"
+
+[windows.restored_tabs.root.second.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+local_id = 5
+
+[windows.restored_tabs.root.second.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 6
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 7
+
+[[windows]]
+rows = 40
+cols = 140
+active_tab = 0
+outer_x = 96
+outer_y = 48
+active_item = 0
+
+[[windows.restored_tabs]]
+focused_path = ["first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 8
+
+[windows.restored_tabs.root.second]
+node = "split"
+axis = "horizontal"
+ratio = 0.5
+
+[windows.restored_tabs.root.second.first]
+node = "leaf"
+
+[windows.restored_tabs.root.second.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "vim"
+local_id = 9
+
+[windows.restored_tabs.root.second.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 10
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 11

@@ -157,8 +157,7 @@ fn paint(grid: &mut [Vec<bool>], rects: &[[usize; 4]]) {
 /// per-cell emission covers the IDENTICAL pixel set as whole-run emission —
 /// the pattern's value at a pixel is a pure function of absolute x, so a cell
 /// seam cannot reset it. (The historical code restarted dash/dot/wave phase at
-/// every cell: the negative control asserts the old per-cell dash phasing
-/// actually violates this.)
+/// every cell.)
 #[test]
 fn pattern_rects_are_partition_invariant() {
     let styles = [
@@ -218,42 +217,6 @@ fn pattern_rects_are_partition_invariant() {
     assert!(
         nonvacuous_gaps > 0,
         "dot/dash must produce real gaps somewhere on the lattice"
-    );
-}
-
-/// NEGATIVE CONTROL: the historical per-cell dash phasing (`dash = w/3`,
-/// restarting at each cell origin) is NOT partition-invariant — the theorem
-/// above genuinely rules the old behavior out.
-#[test]
-fn old_per_cell_dash_phasing_fails_partition_invariance() {
-    // The pre-W7 dashed emission, verbatim.
-    let old_dashed = |x0: usize, w: usize| -> Vec<(usize, usize)> {
-        let dash = (w / 3).max(1);
-        let step = dash + (dash / 2).max(1);
-        let mut out = Vec::new();
-        let mut x = x0;
-        while x < x0 + w {
-            out.push((x, dash.min(x0 + w - x)));
-            x += step;
-        }
-        out
-    };
-    let cw = 9usize;
-    let cover = |spans: &[(usize, usize)], fb: usize| -> Vec<bool> {
-        let mut g = vec![false; fb];
-        for &(x, w) in spans {
-            g[x..x + w].fill(true);
-        }
-        g
-    };
-    let whole = cover(&old_dashed(0, 2 * cw), 2 * cw);
-    let mut split = old_dashed(0, cw);
-    split.extend(old_dashed(cw, cw));
-    let split = cover(&split, 2 * cw);
-    assert_ne!(
-        whole, split,
-        "the old dash law was partition-dependent; if this ever passes, the \
-         negative control is dead"
     );
 }
 

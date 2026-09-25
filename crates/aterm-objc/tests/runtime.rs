@@ -6,7 +6,6 @@
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_char;
-use std::time::Instant;
 
 use aterm_objc::{
     Id, Obj, Sel, autoreleasepool, class, class_name, class_of, msg, ns_string, ns_string_to_rust,
@@ -187,82 +186,6 @@ fn a_cache_slot_survives_concurrent_first_use() {
         "racing fills disagreed: {seen:?}"
     );
     assert_eq!(seen[0], sel_uncached(c"isEqual:").as_ptr().addr());
-}
-
-/// The measurement behind [`aterm_objc::sel!`]: the cached send path must not be
-/// SLOWER than `metal/ffi.rs`'s uncached one.
-///
-/// Ignored by default because it is a timing test. Run it with
-/// `cargo test -p aterm-objc --release -- --ignored --nocapture`.
-///
-/// Arms alternate ABBA within each round and the reported figure is the median
-/// of the per-round ratios, because a single A-then-B pass on this box is
-/// dominated by whichever arm warmed the caches.
-#[test]
-#[ignore = "timing measurement; run explicitly"]
-fn cached_selectors_are_not_slower_than_uncached() {
-    const ROUNDS: usize = 9;
-    const ITERS: usize = 200_000;
-
-    let s = ns_string("measurement").expect("NSString");
-    let obj = s.id();
-
-    // Each arm does the SAME work: resolve `-length`, send it, sum the answers.
-    // The only difference is how the selector is resolved.
-    let uncached = |obj: Id| -> (u128, usize) {
-        let t = Instant::now();
-        let mut acc = 0usize;
-        for _ in 0..ITERS {
-            // SAFETY: `-length` on a live NSString is `-(NSUInteger)`.
-            acc += unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
-                f(obj, sel_uncached(c"length"))
-            };
-        }
-        (t.elapsed().as_nanos(), acc)
-    };
-    let cached = |obj: Id| -> (u128, usize) {
-        let t = Instant::now();
-        let mut acc = 0usize;
-        for _ in 0..ITERS {
-            // SAFETY: as above.
-            acc += unsafe {
-                let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
-                f(obj, sel!(length))
-            };
-        }
-        (t.elapsed().as_nanos(), acc)
-    };
-
-    let mut ratios = Vec::new();
-    for round in 0..ROUNDS {
-        // ABBA within the round.
-        let (a1, x1) = uncached(obj);
-        let (b1, y1) = cached(obj);
-        let (b2, y2) = cached(obj);
-        let (a2, x2) = uncached(obj);
-        assert_eq!(
-            (x1, x2),
-            (y1, y2),
-            "the arms did not compute the same thing"
-        );
-        let un = (a1 + a2) as f64 / 2.0;
-        let ca = (b1 + b2) as f64 / 2.0;
-        println!(
-            "round {round}: uncached {:.1} ns/send, cached {:.1} ns/send, ratio {:.3}",
-            un / ITERS as f64,
-            ca / ITERS as f64,
-            ca / un
-        );
-        ratios.push(ca / un);
-    }
-    ratios.sort_by(f64::total_cmp);
-    let median = ratios[ROUNDS / 2];
-    println!("median cached/uncached ratio: {median:.3}");
-    assert!(
-        median <= 1.0,
-        "the cached send path is SLOWER than the uncached one (ratio {median:.3})"
-    );
 }
 
 #[test]

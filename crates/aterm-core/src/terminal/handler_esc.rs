@@ -301,8 +301,20 @@ impl TerminalHandler<'_> {
                     _ => LineSize::DoubleWidth, // DECDWL
                 };
                 let row = self.grid.cursor().row;
+                let mut changed = false;
                 if let Some(row_data) = self.grid.row_mut(row) {
+                    changed = row_data.line_size() != size;
                     row_data.set_line_size(size);
+                }
+                // A line-size change is a CONTENT change of the row: every
+                // reader keyed on `content_gen` (the scrolled-back viewport's
+                // proofs, the incoming-row apron memo, a peer polling
+                // `content_seq`) must see it. DECDWL/DECDHL also erase the
+                // hidden half below (which marks it), but DECSWL wrote only the
+                // row flag — so a strip memoized while the row was double-width
+                // slid in double-width after `ESC # 5` (audit, 2026-09-24).
+                if changed {
+                    self.grid.mark_content_cell(row, 0);
                 }
                 let cols = self.grid.cols();
                 if matches!(

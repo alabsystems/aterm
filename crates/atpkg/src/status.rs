@@ -49,8 +49,7 @@ pub struct ProgramStatus {
     /// The program's state line. For a program the index names it is one of the CANONICAL
     /// spellings of [`crate::state`] — `managed <build> — pinned by index <N>` (a
     /// vendor-direct program: `managed <version> — <Vendor> latest`), `system:
-    /// <path> — not managed by aterm`, `managed <build> — SHADOWED by <path>`, `extra — not
-    /// installed (opt in: …)`, `installed via <protocol>: <path>`, `needs admin — …`,
+    /// <path> — not managed by aterm`, `managed <build> — SHADOWED by <path>`,
     /// `unavailable on <target>: <hint>` — the same words the pass log, `doctor` and
     /// `which` print. Faults keep their prefixed free text (`"error: …"`, `"tombstoned:
     /// yanked@N"`, `"deferred: …"`, `"rejected: unsigned index at build N"`, …), which
@@ -86,27 +85,16 @@ pub struct Status {
     /// a newer record simply ignores the key.
     #[serde(default)]
     pub seams: Vec<String>,
-    /// RFC3339 UTC time of the last SUCCESSFUL update pass — stamped by
-    /// [`stamp_success`] alone, never by the per-program writers, which move
-    /// `updated_at` on every write (a failed resolve, a shadow reconcile, a seed offer
-    /// row) and so made "N day(s) since the last successful update" a sentence about
-    /// the last write of any kind (2026-09-10 audit). Empty ⇒ no successful pass has
-    /// completed since this field existed: [`never_checked`] reads it, and `aterm pkg
-    /// doctor` reports it (no verb prints it on stderr since Phase 2, 2026-09-22). A
-    /// record written before the field parses as empty — a machine that has been
-    /// updating for a month reads "never checked" for exactly one pass, then the next
-    /// success stamps it.
+    /// RFC3339 UTC time of the last full update pass that REACHED the signed index — verified
+    /// one the channel served this pass, not the §14 cache's — and ran to its end. Stamped
+    /// by [`stamp_success`] alone, at the pass's end (the derived model `AtpkgPassStamps`
+    /// states the contract its readers decide on, `aterm_update_core::pkg_check`). Until
+    /// 2026-09-23 a pass served from the cache stamped it too (audit PK-3), and a separate
+    /// `last_index_reached_at` said whether the index had been reached; this stamp now means
+    /// exactly that, and the other is gone. Empty ⇒ no pass has reached the index here:
+    /// [`never_checked`] reads it, and `aterm pkg doctor` reports it.
     #[serde(default)]
     pub last_success_at: String,
-    /// RFC3339 UTC time the signed index LISTING was last REACHED over the network —
-    /// as against served from the §14 cache after a rate limit, an outage or a proxy
-    /// refused it. Stamped by [`stamp_index_freshness`] from what the resolve measured
-    /// ([`crate::flow::last_resolve`]); a pass that ran on the cache leaves it where
-    /// it was. `last_success_at` could not say this: a cached resolve is a pass that
-    /// "succeeded", and every surface stayed green while the managed `claude` could
-    /// freeze at an old pin (audit 2026-09-14). Empty before 2026-09-15.
-    #[serde(default)]
-    pub last_index_reached_at: String,
     /// The `index_build` the last pass resolved, and when it last CHANGED — the
     /// publisher's own pulse. `doctor`'s "publishing looks frozen" used to read a clock
     /// that advances on every no-op pass, so a dead vendor lane, a stuck lock or an
@@ -116,11 +104,12 @@ pub struct Status {
     /// See [`Self::last_index_build`]. Empty before 2026-09-15.
     #[serde(default)]
     pub index_build_changed_at: String,
-    /// How the last full `update` pass ended — `ok`, `offline` or `failed`
-    /// ([`aterm_update_core::pkg_check::PassOutcome`]) — stamped by [`stamp_pass_end`]
-    /// alone. What the schedulers read of a pass: `updated_at` moves on every write, and
-    /// read as a pass's end it turned a vendor head-watch write into a failed pass. Empty
-    /// before 2026-09-23.
+    /// How the last full `update` pass ended — `ok` (it reached the signed index, or had
+    /// nothing to check), `offline` or `failed` (a pass the §14 cache served after a refusal
+    /// included) ([`aterm_update_core::pkg_check::PassOutcome`]) — stamped by
+    /// [`stamp_pass_end`] alone. What the schedulers read of a pass: `updated_at` moves on
+    /// every write — a vendor door, a typed verb, a row — and read as a pass's end it turned
+    /// a vendor head-watch write into a failed pass (audit PK-4). Empty before 2026-09-23.
     #[serde(default)]
     pub last_pass: String,
     /// RFC3339 UTC time that pass ended. See [`Self::last_pass`].
@@ -139,11 +128,14 @@ pub struct Status {
     /// known pass end; comparing this stamp avoids borrowing its old target.
     #[serde(default)]
     pub last_pass_attempted_at: String,
-    /// RFC3339 UTC time before which the metered GitHub API refuses this machine: the reset
-    /// a rate-limited index listing named (`retry-after`, or `x-ratelimit-reset` with the
-    /// window spent). The schedulers hold the next full pass until it; empty when none.
+    /// How many full passes have recorded their end on this store — bumped by
+    /// [`stamp_pass_end`] alone, so a queued pass can tell exactly whether one ended
+    /// since it was queued. `last_pass_at` is whole seconds, and an end stamped in the
+    /// second a waiter first found the lock held could not be told from one before the
+    /// wait, so it ran back to back (the gap `AtpkgFullPassRule` recorded until
+    /// 2026-09-24). Zero before then; an older binary carries it through unmoved.
     #[serde(default)]
-    pub metered_hold_until: String,
+    pub pass_seq: u64,
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
@@ -154,25 +146,16 @@ pub struct Status {
     pub extra: BTreeMap<String, aterm_toml::Value>,
 }
 
-/// Stamp what the pass's index resolve MEASURED: `last_index_reached_at = now` when the
-/// listing answered over the network (`reached`), and `last_index_build` /
-/// `index_build_changed_at` when `index_build` differs from the one recorded (a `None`
-/// build — a pass with no index in hand — changes neither). Best-effort like every
+/// Stamp the index build the pass resolved: `last_index_build` / `index_build_changed_at`
+/// when `index_build` differs from the one recorded (a `None` build — a pass with no index in
+/// hand — changes neither) — the publisher's pulse `doctor` reads. Best-effort like every
 /// status write; `updated_at` moves with it. Seeded through [`seed_for_rewrite`]: a corrupt
 /// record is kept aside and rebuilt, one unreadable for another reason is left alone.
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
-pub fn stamp_index_freshness(
-    layout: &Layout,
-    now: &str,
-    reached: bool,
-    index_build: Option<u64>,
-) -> io::Result<()> {
+pub fn stamp_index_build(layout: &Layout, now: &str, index_build: Option<u64>) -> io::Result<()> {
     let mut status = seed_for_rewrite(layout)?;
-    if reached {
-        status.last_index_reached_at = now.to_string();
-    }
     if let Some(build) = index_build
         && build != status.last_index_build
     {
@@ -194,14 +177,13 @@ pub fn never_checked(layout: &Layout) -> bool {
     read(layout).is_none_or(|s| s.last_success_at.trim().is_empty())
 }
 
-/// Stamp `last_success_at = now` (and `updated_at`, which every write moves) on the
-/// record, creating a minimal one when none exists. Called by the CLI at the END of a
-/// pass that resolved the signed index and ran to its end — the one event that makes
-/// "packages can be updated on this machine" true. A member that FAILED inside such a
-/// pass is recorded in its own row, not here: until 2026-09-14 only a zero-failure pass
-/// stamped this, so one refused member kept every verb saying no check had ever run.
-/// Best-effort like every status write, and seeded through [`seed_for_rewrite`]: a corrupt
-/// record is kept aside and rebuilt, one unreadable for another reason is left alone.
+/// Stamp a full pass that REACHED the signed index and ran to its end: `last_success_at =
+/// now` (and `updated_at`, which every write moves), creating a minimal record when none
+/// exists. The pass's end — `ok` — is [`stamp_pass_end`]'s, written by the same pass. The one event that makes "packages can be updated on
+/// this machine" true. A member that FAILED inside such a pass is recorded in its own row,
+/// not here: the pass reached the index and is stamped as having done so. Best-effort like
+/// every status write, and seeded through [`seed_for_rewrite`]: a corrupt record is kept
+/// aside and rebuilt, one unreadable for another reason is left alone.
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
@@ -212,20 +194,10 @@ pub fn stamp_success(layout: &Layout, now: &str) -> io::Result<()> {
     write(layout, &status)
 }
 
-/// What a full pass leaves of the metered hold ([`stamp_pass_end`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MeteredHold {
-    /// Its listing was refused until this unix second: hold the next full pass until then.
-    Until(i64),
-    /// Its listing answered: whatever hold stood is over.
-    Lifted,
-    /// It learned nothing about the budget (offline, no listing asked): leave it.
-    Kept,
-}
-
 /// Stamp how a full `update` pass ended — `last_pass` (the outcome's word) and
-/// `last_pass_at = now` — and what it learned of the metered hold, with `updated_at` as
-/// every write moves it. The ONE writer of those keys, called once at the pass's end
+/// `last_pass_at = now` — with `updated_at` as every write moves it. A pass that did NOT
+/// reach the signed index records `failed` or `offline` here and stamps no success, so the
+/// walk's interval and "never checked" still count from the last pass that did. The ONE writer of those keys, called once at the pass's end
 /// (`cli`'s recorded pass); the schedulers read them through
 /// [`aterm_update_core::pkg_check::Stamps`]. Seeded through [`seed_for_rewrite`] like
 /// every stamp writer.
@@ -236,9 +208,8 @@ pub fn stamp_pass_end(
     layout: &Layout,
     now: &str,
     outcome: aterm_update_core::pkg_check::PassOutcome,
-    hold: MeteredHold,
 ) -> io::Result<()> {
-    stamp_pass_end_with_index(layout, now, outcome, hold, 0)
+    stamp_pass_end_with_index(layout, now, outcome, 0)
 }
 
 /// [`stamp_pass_end`] with this pass's target or resolved index, written in
@@ -251,7 +222,6 @@ pub fn stamp_pass_end_with_index(
     layout: &Layout,
     now: &str,
     outcome: aterm_update_core::pkg_check::PassOutcome,
-    hold: MeteredHold,
     attempted_index_build: u64,
 ) -> io::Result<()> {
     let mut status = seed_for_rewrite(layout)?;
@@ -266,16 +236,9 @@ pub fn stamp_pass_end_with_index(
         .filter(|stamp| !stamp.contains('.'))
         .map(|stamp| format!("{stamp}.000000000Z"));
     status.last_pass_at = witness_at.clone().unwrap_or_else(|| now.to_string());
+    status.pass_seq = status.pass_seq.saturating_add(1);
     status.last_pass_attempted_index_build = attempted_index_build;
     status.last_pass_attempted_at = witness_at.unwrap_or_default();
-    match hold {
-        MeteredHold::Until(until) => {
-            status.metered_hold_until =
-                aterm_types::rfc3339::format_rfc3339(u64::try_from(until).unwrap_or(0));
-        }
-        MeteredHold::Lifted => status.metered_hold_until.clear(),
-        MeteredHold::Kept => {}
-    }
     status.updated_at = now.to_string();
     write(layout, &status)
 }
@@ -296,6 +259,13 @@ pub fn pass_stamps(layout: &Layout, now_unix: i64) -> aterm_update_core::pkg_che
         in_flight: crate::progress::pass_running(layout, u64::try_from(now_unix).unwrap_or(0)),
         ..stamps
     }
+}
+
+/// How many full passes have recorded their end on this store ([`Status::pass_seq`]);
+/// zero with no readable record.
+#[must_use]
+pub fn pass_seq(layout: &Layout) -> u64 {
+    read(layout).map_or(0, |status| status.pass_seq)
 }
 
 impl Status {
@@ -355,14 +325,13 @@ fn only_stamps_differ(a: &Status, b: &Status) -> bool {
         updated_at: String::new(),
         outcome: String::new(),
         last_success_at: String::new(),
-        last_index_reached_at: String::new(),
         last_index_build: 0,
         index_build_changed_at: String::new(),
         last_pass: String::new(),
         last_pass_at: String::new(),
         last_pass_attempted_index_build: 0,
         last_pass_attempted_at: String::new(),
-        metered_hold_until: String::new(),
+        pass_seq: 0,
         ..s.clone()
     };
     unstamped(a) == unstamped(b)
@@ -790,36 +759,53 @@ mod tests {
         Layout { prefix: p }
     }
 
-    /// The freshness stamps (2026-09-15): the reach time moves only when the listing
-    /// answered; the build-changed time moves only when the build differs from the one
-    /// recorded; a pass with no index in hand moves neither.
+    /// The pass-end stamps: a pass that reached the index stamps its success and ends `ok`;
+    /// one that did not ends `failed` and keeps the success where it was; and the
+    /// build-changed time moves only when the build differs from the one recorded (a pass
+    /// with no index in hand moves neither build field).
     #[test]
-    fn index_freshness_stamps_only_what_the_resolve_measured() {
+    fn the_pass_end_stamps_say_what_the_pass_did() {
+        use aterm_update_core::pkg_check::{PassOutcome, Stamps};
         let dir = std::env::temp_dir().join(format!("atpkg-status-fresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let layout = Layout {
             prefix: dir.clone(),
         };
-        stamp_index_freshness(&layout, "2026-09-15T10:00:00Z", true, Some(32)).unwrap();
+        stamp_success(&layout, "2026-09-15T10:00:00Z").unwrap();
+        stamp_pass_end(&layout, "2026-09-15T10:00:00Z", PassOutcome::Ok).unwrap();
+        stamp_index_build(&layout, "2026-09-15T10:00:00Z", Some(32)).unwrap();
         let s = read(&layout).unwrap();
-        assert_eq!(s.last_index_reached_at, "2026-09-15T10:00:00Z");
+        assert_eq!(s.last_success_at, "2026-09-15T10:00:00Z");
+        assert_eq!(s.last_pass, "ok");
         assert_eq!(s.last_index_build, 32);
         assert_eq!(s.index_build_changed_at, "2026-09-15T10:00:00Z");
-        // A cached pass: the reach time stays, the build is the same, nothing moves.
-        stamp_index_freshness(&layout, "2026-09-16T10:00:00Z", false, Some(32)).unwrap();
+        assert!(!Stamps::read(&layout.status()).last_failed());
+        // A pass that did not reach the index: it ends `failed`, the success stays.
+        stamp_pass_end(&layout, "2026-09-16T10:00:00Z", PassOutcome::Failed).unwrap();
+        stamp_index_build(&layout, "2026-09-16T10:00:00Z", Some(32)).unwrap();
         let s = read(&layout).unwrap();
-        assert_eq!(s.last_index_reached_at, "2026-09-15T10:00:00Z");
+        assert_eq!(s.last_success_at, "2026-09-15T10:00:00Z");
+        assert_eq!(s.last_pass, "failed");
+        assert_eq!(s.last_pass_at, "2026-09-16T10:00:00Z");
         assert_eq!(s.index_build_changed_at, "2026-09-15T10:00:00Z");
         assert_eq!(s.updated_at, "2026-09-16T10:00:00Z");
-        // A reached pass on a newer build: both move.
-        stamp_index_freshness(&layout, "2026-09-17T10:00:00Z", true, Some(33)).unwrap();
+        assert!(Stamps::read(&layout.status()).last_failed());
+        // A pass that reached it on a newer build: `ok` again, both build fields move.
+        stamp_success(&layout, "2026-09-17T10:00:00Z").unwrap();
+        stamp_pass_end(&layout, "2026-09-17T10:00:00Z", PassOutcome::Ok).unwrap();
+        stamp_index_build(&layout, "2026-09-17T10:00:00Z", Some(33)).unwrap();
         let s = read(&layout).unwrap();
-        assert_eq!(s.last_index_reached_at, "2026-09-17T10:00:00Z");
+        assert_eq!(s.last_success_at, "2026-09-17T10:00:00Z");
+        assert_eq!(s.last_pass, "ok");
+        assert!(
+            !Stamps::read(&layout.status()).last_failed(),
+            "the success heals"
+        );
         assert_eq!(s.last_index_build, 33);
         assert_eq!(s.index_build_changed_at, "2026-09-17T10:00:00Z");
         // No index in hand: the build fields are untouched.
-        stamp_index_freshness(&layout, "2026-09-18T10:00:00Z", true, None).unwrap();
+        stamp_index_build(&layout, "2026-09-18T10:00:00Z", None).unwrap();
         let s = read(&layout).unwrap();
         assert_eq!(s.last_index_build, 33);
         assert_eq!(s.index_build_changed_at, "2026-09-17T10:00:00Z");
@@ -830,15 +816,8 @@ mod tests {
     fn pass_end_binds_its_index_target_and_clears_unknown_successors() {
         use aterm_update_core::pkg_check::{PassOutcome, Stamps};
         let l = layout("pass-target");
-        stamp_index_freshness(&l, "2026-09-24T12:00:00Z", true, Some(44)).unwrap();
-        stamp_pass_end_with_index(
-            &l,
-            "2026-09-24T12:01:00Z",
-            PassOutcome::Ok,
-            MeteredHold::Lifted,
-            45,
-        )
-        .unwrap();
+        stamp_index_build(&l, "2026-09-24T12:00:00Z", Some(44)).unwrap();
+        stamp_pass_end_with_index(&l, "2026-09-24T12:01:00Z", PassOutcome::Ok, 45).unwrap();
         let status = read(&l).unwrap();
         assert_eq!(status.last_index_build, 44);
         assert_eq!(status.last_pass_attempted_index_build, 45);
@@ -846,9 +825,8 @@ mod tests {
         assert!(status.last_pass_at.ends_with(".000000000Z"));
         let stamps = Stamps::read(&l.status());
         assert_eq!(stamps.last_pass_target.map(|(_, build)| build), Some(45));
-        let now = aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-24T12:02:00Z").unwrap();
-        assert!(!stamps.completed_older_index_pass(45, now));
-        assert!(stamps.completed_older_index_pass(46, now));
+        assert!(!stamps.completed_older_index_pass(45));
+        assert!(stamps.completed_older_index_pass(46));
 
         // An older atpkg binary knows `last_pass_at`, but carries both new
         // fields through its flattened extra map unchanged. Even an old pass
@@ -859,22 +837,16 @@ mod tests {
         write(&l, &old_writer).unwrap();
         let stale = Stamps::read(&l.status());
         assert_eq!(stale.last_pass_target, None);
-        assert!(!stale.completed_older_index_pass(46, now));
+        assert!(!stale.completed_older_index_pass(46));
 
-        stamp_pass_end(
-            &l,
-            "2026-09-24T12:02:00Z",
-            PassOutcome::Failed,
-            MeteredHold::Kept,
-        )
-        .unwrap();
+        stamp_pass_end(&l, "2026-09-24T12:02:00Z", PassOutcome::Failed).unwrap();
         let next = Stamps::read(&l.status());
         assert_eq!(read(&l).unwrap().last_pass_attempted_index_build, 0);
         assert_eq!(
             next.last_pass_target, None,
             "the old target is not borrowed"
         );
-        assert!(!next.completed_older_index_pass(46, now));
+        assert!(!next.completed_older_index_pass(46));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -906,14 +878,13 @@ mod tests {
             outcome: "up to date".into(),
             seams: Vec::new(),
             last_success_at: "2026-06-29T00:00:00Z".into(),
-            last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
             last_pass: String::new(),
             last_pass_at: String::new(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 3,
             programs,
             extra: Default::default(),
         };
@@ -1059,7 +1030,7 @@ mod tests {
             }
         }
         // A record rebuilt from the store names what the store holds.
-        stamp_index_freshness(&l, "2026-09-16T00:00:00Z", true, Some(7)).unwrap();
+        stamp_index_build(&l, "2026-09-16T00:00:00Z", Some(7)).unwrap();
         assert_eq!(read(&l).unwrap().last_index_build, 7);
         // HEALED IN PLACE, even inside a hold: the rebuilt record is on disk the moment the
         // corrupt one is kept aside — never "no record" for the length of a pass, which a
@@ -1158,7 +1129,7 @@ mod tests {
             let _held = hold(&l);
             let _inner = hold(&l);
             stamp_success(&l, "2026-09-17T00:00:00Z").unwrap();
-            stamp_index_freshness(&l, "2026-09-17T00:00:00Z", true, Some(9)).unwrap();
+            stamp_index_build(&l, "2026-09-17T00:00:00Z", Some(9)).unwrap();
             let mut s = seed_for_rewrite(&l).unwrap();
             s.outcome = "up to date (index build 9)".into();
             write(&l, &s).unwrap();
@@ -1283,14 +1254,13 @@ mod tests {
             outcome: "up to date".into(),
             seams: vec!["rustup:trust".into()],
             last_success_at: String::new(),
-            last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
             last_pass: String::new(),
             last_pass_at: String::new(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 3,
             programs,
             extra: Default::default(),
         };
@@ -1424,8 +1394,8 @@ mod tests {
     /// reaches at `Buggy=0` is laid down in a real store by the real writers
     /// ([`full_pass_rule_tier1::realize`]) and read back as the session lane reads it
     /// ([`pass_stamps`], then [`aterm_update_core::pkg_check::full_pass_owed`]): the failure
-    /// it reads is the model's `verdict`, the hold and the pass in flight are the record's,
-    /// and the lane starts a pass exactly when `SessionLook` does.
+    /// it reads is the model's `verdict`, the pass in flight is the record's, and the lane
+    /// starts a pass exactly when `SessionLook` does.
     ///
     /// THE HISTORICAL DEFECT, REPLAYED ON REAL TEXT (the negative control): the reader this
     /// replaced ([`full_pass_rule_tier1::legacy_stamps`], ac5b4c144's order of `updated_at`
@@ -1450,11 +1420,6 @@ mod tests {
             let stamps = pass_stamps(&l, now);
             let look = looks(&model, "SessionLook", state);
             assert_eq!(stamps.last_failed(), look["verdict"] == 1, "{state:?}");
-            assert_eq!(
-                stamps.metered_hold_in(now) > 0,
-                state["hold"] > 0,
-                "{state:?}"
-            );
             assert_eq!(stamps.in_flight, state["running"] >= 1, "{state:?}");
             assert_eq!(
                 pkg_check::full_pass_owed(&stamps, now).is_some(),
@@ -1532,7 +1497,7 @@ mod tests {
 /// THE TIER-1 FIXTURES OF THE DERIVED MODEL `AtpkgFullPassRule` (aterm-spec), shared by
 /// this module's conformance (the writers and the session lane) and `cli`'s (a queued
 /// pass's stand-down). A model tick is a wall-clock age on each side of the spacing and of
-/// the interval; a hold tick, minutes inside GitHub's hour.
+/// the interval.
 #[cfg(test)]
 pub(crate) mod full_pass_rule_tier1 {
     use super::*;
@@ -1541,15 +1506,13 @@ pub(crate) mod full_pass_rule_tier1 {
 
     pub(crate) type State = BTreeMap<&'static str, i64>;
     pub(crate) const AGE_SECS: [i64; 5] = [60, 15 * 60, 3 * 3600, 6 * 3600 + 60, 9 * 3600];
-    const HOLD_SECS: [i64; 3] = [0, 10 * 60, 30 * 60];
     /// What a reader sees of a state: the record and the pass in flight.
-    const RECORD: [&str; 7] = [
+    const RECORD: [&str; 6] = [
         "rec",
         "pass_age",
         "ever_ok",
         "ok_age",
         "write_age",
-        "hold",
         "running",
     ];
 
@@ -1600,8 +1563,8 @@ pub(crate) mod full_pass_rule_tier1 {
 
     /// `state`'s record laid down at `now` in a fresh store by the real writers: the success
     /// ([`stamp_success`]); with `records_pass_end`, each pass's end ([`stamp_pass_end`]: the
-    /// success's own, `ok`, then a failed one, with the hold a rate limit named) — without
-    /// it the writer of before `last_pass`, whose failed pass left a bare write; another
+    /// success's own, `ok`, then a failed one) — without it the writer of before
+    /// `last_pass`, whose failed pass left a bare write; another
     /// writer's row after the last pass ([`write`], as the vendor head watch writes one);
     /// and a live progress file while a pass is `running`.
     pub(crate) fn realize(
@@ -1617,33 +1580,18 @@ pub(crate) mod full_pass_rule_tier1 {
         let layout = Layout { prefix: p };
         let at = |ticks: i64| now - AGE_SECS[usize::try_from(ticks).unwrap()];
         let stamp = |unix: i64| aterm_types::rfc3339::format_rfc3339(unix.unsigned_abs());
-        let hold = |fallback: MeteredHold| match state["hold"] {
-            0 => fallback,
-            left => MeteredHold::Until(now + HOLD_SECS[usize::try_from(left).unwrap()]),
-        };
         let (rec, pass_age) = (state["rec"], state["pass_age"]);
         if state["ever_ok"] == 1 {
             // Strictly before a failed pass that ended in the same saturated age.
             let success = stamp(at(state["ok_age"]) - i64::from(rec == 2));
             stamp_success(&layout, &success).unwrap();
             if records_pass_end {
-                let own = if rec == 1 {
-                    hold(MeteredHold::Lifted)
-                } else {
-                    MeteredHold::Lifted
-                };
-                stamp_pass_end(&layout, &success, PassOutcome::Ok, own).unwrap();
+                stamp_pass_end(&layout, &success, PassOutcome::Ok).unwrap();
             }
         }
         if rec == 2 {
             if records_pass_end {
-                stamp_pass_end(
-                    &layout,
-                    &stamp(at(pass_age)),
-                    PassOutcome::Failed,
-                    hold(MeteredHold::Kept),
-                )
-                .unwrap();
+                stamp_pass_end(&layout, &stamp(at(pass_age)), PassOutcome::Failed).unwrap();
             } else {
                 let mut status = seed_for_rewrite(&layout).unwrap();
                 status.updated_at = stamp(at(pass_age));

@@ -2021,6 +2021,15 @@ pub(crate) enum UpdateOutcome {
     Failed {
         message: String,
     },
+    /// The park's capture refused the desk deterministically (the 2026-09-22/23
+    /// update audit, plan P0-3): a FAILURE to every surface — the ledger records
+    /// it, so `failing_applies` moves and `update status` names the session —
+    /// but the automatic lane keeps its intent and retries once the desk
+    /// changes. Neither `Failed`, which the automatic reducer answers with a
+    /// latch, nor `Deferred`, which is the machine being busy.
+    CaptureRefused {
+        message: String,
+    },
 }
 
 /// One user-initiated packages verb, executed by the host against the
@@ -2031,16 +2040,6 @@ pub(crate) enum UpdateOutcome {
 pub(crate) enum PackagesRequest {
     /// `atpkg update` — check/update every installed managed program now.
     CheckUpdate,
-    /// `atpkg install <name> --elevate=never` — the Install control on an EXTRA's
-    /// Packages row (`docs/DESIGN-which-copy-runs-2026-08-27.md` S9). The explicit
-    /// door records the opt-in marker itself before it installs; `--elevate=never`
-    /// means a windowed child can never wait on a password prompt nobody sees.
-    InstallExtra { name: String },
-    /// `atpkg install <name> --elevate=osascript` for each name IN ORDER — the GUI
-    /// door for the `needs admin` rows (§17.8): one process per program, dependency
-    /// first (`clt` before `brew`), macOS's own administrator dialog for each
-    /// installer. Stops at the first failure. macOS only: nowhere else has a GUI door.
-    InstallElevated { names: Vec<String> },
     /// `atpkg install --default-set` — the explicit ALab-toolset consent click.
     InstallDefaultSet,
     /// `atpkg uninstall --all` — remove the whole managed toolset and reclaim its
@@ -2242,6 +2241,10 @@ pub(crate) struct ViewMotionCx {
     /// The process-wide serious-mode override. Unlike Reduce Motion, this also
     /// suppresses static cursor trails and post-processing in authored previews.
     pub(crate) serious: bool,
+    /// CAN this run use a GPU (`App::gpu_capable`): a live device, or an intent
+    /// not yet redeemed. Settings states GPU-backed availability from it, injected
+    /// like every other host fact here, never read from a process global.
+    pub(crate) backend_gpu: bool,
 }
 
 impl Default for ViewMotionCx {
@@ -2252,6 +2255,7 @@ impl Default for ViewMotionCx {
             performance_reduced: false,
             system_dark: false,
             serious: false,
+            backend_gpu: false,
         }
     }
 }

@@ -215,10 +215,11 @@
 //! the solver) and everything ABOVE the text was made louder: the hot edge
 //! in the spectrum at the transient cap, the wave at twice its swing. The
 //! max-channel pin
-//! beside `letters_stay_legible_under_the_ribbon_on_the_default_dark_theme`
+//! beside `the_bed_sits_at_the_bar_not_under_it_on_the_default_dark_theme`
 //! holds the number so a future change to the bar has something to move,
-//! and `the_bed_sits_at_the_bar_not_under_it_on_the_default_dark_theme`
-//! holds the other side: light left under the bar is diminished light.
+//! and that test holds both sides of the bar on the default dark theme: the
+//! bed never composites under it (legibility), and light left under the bar
+//! is diminished light.
 //!
 //! ## Contract notes (stage 2)
 //!
@@ -9431,28 +9432,6 @@ mod tests {
     // -- §2.2 L3, §3.2: the bed's one ceiling ------------------------------
 
     #[test]
-    fn letters_stay_legible_under_the_ribbon_on_the_default_dark_theme() {
-        let budget = bed_luma_budget(DEFAULT_FG);
-        let mut worst = f32::INFINITY;
-        for i in 0..=512u32 {
-            let t = i as f32 / 512.0;
-            let ink = bed_ink(spectrum(t), budget);
-            // Every level the emitter can composite — the body's own request
-            // AND the strip's accent above it — not merely the bed's ceiling:
-            // the bar must hold on the whole ramp, not only at the top of it.
-            for cov in 1..=(BODY_FRAME_TOP as u32) {
-                let cov = cov as u8;
-                let lit = over_premul(DEFAULT_BG, premul_rgb(ink, cov), cov);
-                worst = worst.min(contrast(DEFAULT_FG, lit));
-            }
-        }
-        assert!(
-            worst >= BODY_CONTRAST_BAR,
-            "the bed composited to {worst:.3}:1 against the default foreground; the bar is {BODY_CONTRAST_BAR}:1"
-        );
-    }
-
-    #[test]
     fn the_dimmest_stop_of_the_bed_composites_at_a_max_channel_of_about_80_under_the_bar() {
         // "Dim and muddy" gets a NUMBER. Under L3's 5.25:1 bar every stop is
         // put on `bed_luma_budget(fg)`, and a warm stop at that luminance IS
@@ -9923,102 +9902,6 @@ mod tests {
                     "Nord at cov {cov}, t {t:.3}: #{lit:06X} is under the scanner's colour floor"
                 );
             }
-        }
-    }
-
-    /// **THE INK TABLE** — not a pin: every anchor and the crossing's roof,
-    /// the bed's ink before (the walk toward white from the stop itself) and
-    /// after (`onto_luma` + `BED_SAT_FLOOR`) on Nord and the default theme,
-    /// and the hot edge's ink the same way — the numbers the module doc and
-    /// `RAINBOW-KITTY-V2.md` quote, printed from the code that makes them.
-    ///
-    /// `targo --unverified test -p aterm-effects --lib -- --ignored --nocapture the_bed_and_hot_edge_ink_table`
-    #[test]
-    #[ignore = "a table for the record, not a pin"]
-    fn the_bed_and_hot_edge_ink_table() {
-        use crate::spectrum::{SPECTRUM_ANCHORS, SPECTRUM_LUT, SPECTRUM_LUT_LEN};
-        let old_bed = |rgb: u32, budget: f32| {
-            if relative_luminance(rgb) > budget {
-                solve_for_luma(|k| scale_rgb(rgb, k), budget)
-            } else {
-                solve_for_luma(|w| toward_white(rgb, w), budget)
-            }
-        };
-        let old_hot = |rgb: u32| {
-            if relative_luminance(rgb) >= HOT_EDGE_LUMA_FLOOR {
-                rgb
-            } else {
-                solve_for_luma(|w| toward_white(rgb, w), HOT_EDGE_LUMA_FLOOR)
-            }
-        };
-        let rgb = |c: u32| {
-            format!(
-                "({:3},{:3},{:3})",
-                (c >> 16) & 0xff,
-                (c >> 8) & 0xff,
-                c & 0xff
-            )
-        };
-        let names = [
-            "red", "orange", "yellow", "green", "blue", "indigo", "violet",
-        ];
-        let mut stops: Vec<(String, u32)> = names
-            .iter()
-            .zip(SPECTRUM_ANCHORS)
-            .map(|(n, c)| ((*n).to_string(), c))
-            .collect();
-        // …and eight samples off the green→blue crossing itself, which since
-        // 2026-09-15 is the drawn arc rather than an authored roof.
-        for i in 0..8 {
-            let t = 0.5 + 0.5 * (i as f32 + 0.5) / 8.0;
-            let at = (t * (SPECTRUM_LUT_LEN - 1) as f32) as usize;
-            stops.push((
-                format!("cross[{i}]"),
-                SPECTRUM_LUT[at.min(SPECTRUM_LUT_LEN - 1)],
-            ));
-        }
-        println!();
-        for (theme, fg, bg) in [
-            ("Nord", NORD_FG, NORD_BG),
-            ("default", DEFAULT_FG, DEFAULT_BG),
-        ] {
-            let budget = bed_luma_budget(fg);
-            let cov = UNDER_COV_CAP as u8;
-            println!("bed on {theme} (budget Y {budget:.4}):");
-            println!(
-                "  stop      arc                 old ink          S     @236 (peak)          new ink          S     @236 (peak)          Y new  fg/bed@236"
-            );
-            for (name, c) in &stops {
-                let (o, n) = (old_bed(*c, budget), bed_ink(*c, budget));
-                let (oc, nc) = (
-                    over_premul(bg, premul_rgb(o, cov), cov),
-                    over_premul(bg, premul_rgb(n, cov), cov),
-                );
-                println!(
-                    "  {name:9} {} #{c:06X}  {} {:.2}  {} ({:3})  {} {:.2}  {} ({:3})  {:.4} {:.3}",
-                    rgb(*c),
-                    rgb(o),
-                    sat(o),
-                    rgb(oc),
-                    max_channel(oc),
-                    rgb(n),
-                    sat(n),
-                    rgb(nc),
-                    max_channel(nc),
-                    relative_luminance(n),
-                    contrast(fg, nc)
-                );
-            }
-        }
-        println!("hot edge (floor Y {HOT_EDGE_LUMA_FLOOR:.2}):");
-        println!("  stop      old ink   S     new ink   S");
-        for (name, c) in &stops {
-            let (o, n) = (old_hot(*c), hot_edge_ink(*c));
-            println!(
-                "  {name:9} #{o:06X}   {:.2}  #{n:06X}   {:.2}",
-                sat(o),
-                sat(n)
-            );
         }
     }
 

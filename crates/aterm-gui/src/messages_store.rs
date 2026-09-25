@@ -49,6 +49,14 @@
 //!   compaction this replaced ran only for a cold launch — never for a
 //!   seamless successor, which is every automatic update's launch — and its
 //!   rename stranded any other running writer's lines in an unlinked inode.
+//! * **The wire rotates on its own budget** (design ruling 200). Every line
+//!   about a record a script made (`notice`, [`aterm_messages::Shelf::Wire`])
+//!   goes to the sibling `messages.wire.log` — opened at the first such line,
+//!   rotated past [`WIRE_TAIL_BYTES`] to `messages.wire.log.1` — so a flood
+//!   turns over only the wire's history on disk, never aterm's crash record
+//!   or config errors. A launch reads both tails and replays them merged by
+//!   id (every line of one record is in one file, in order). Should the wire
+//!   file not open, its lines go to `messages.log`: the log never drops.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -59,7 +67,9 @@ use std::sync::{Arc, Mutex};
 use crate::qos;
 
 use aterm_messages::log::MAX_LINE_BYTES;
-use aterm_messages::{LogLine, MessageLog};
+use aterm_messages::{LogLine, MessageLog, Shelf};
+
+use crate::logging::{RotatingFile, RotationBudget};
 
 /// The file's name under the log directory.
 pub(crate) const FILE_NAME: &str = "messages.log";
@@ -81,10 +91,26 @@ pub(crate) const BUDGET: crate::logging::RotationBudget = crate::logging::Rotati
 /// The writer channel's depth: how many lines may wait for the thread before
 /// the caller waits for a slot.
 pub(crate) const QUEUE_CAP: usize = 512;
+/// The wire's file, beside [`FILE_NAME`] (design ruling 200).
+pub(crate) const WIRE_FILE_NAME: &str = "messages.wire.log";
+/// The wire's file rotates past this, and a launch reads this much of its
+/// tail: 256 KiB holds the ring's wire share ([`aterm_messages::WIRE_LOG_SHARE`])
+/// of ordinary notices several times over, and the pair stays near 512 KiB.
+pub(crate) const WIRE_TAIL_BYTES: u64 = 256 * 1024;
+/// The wire file's rotation: [`BUDGET`]'s looks at [`WIRE_TAIL_BYTES`].
+pub(crate) const WIRE_BUDGET: RotationBudget = RotationBudget {
+    rotate_at: WIRE_TAIL_BYTES,
+    ..BUDGET
+};
 
 /// `<log_dir>/messages.log`; `None` when there is no log dir (no `$HOME`).
 pub(crate) fn path() -> Option<PathBuf> {
     crate::logging::log_dir().map(|dir| dir.join(FILE_NAME))
+}
+
+/// The wire's file beside the log at `path`.
+pub(crate) fn wire_path(path: &Path) -> PathBuf {
+    path.with_file_name(WIRE_FILE_NAME)
 }
 
 /// What a launch read.
@@ -120,23 +146,41 @@ pub(crate) fn load_for_launch(path: &Path) -> Loaded {
 /// is offered to the codec, junk is counted and skipped. A symlink, a
 /// directory or an unreadable file is nothing — a message log is never worth
 /// refusing to launch over.
+///
+/// The wire's pair ([`wire_path`]) is read the same way, at most
+/// [`WIRE_TAIL_BYTES`], and the two are replayed as ONE sequence ordered by
+/// id — a stable sort, so a record's own lines (all in one file) keep their
+/// order and the ring stays oldest-first (design ruling 200).
 pub(crate) fn load_tail(path: &Path, tail: u64) -> Loaded {
+    let mut lines = Vec::new();
+    let mut skipped = read_pair(path, tail, &mut lines);
+    skipped += read_pair(&wire_path(path), tail.min(WIRE_TAIL_BYTES), &mut lines);
+    lines.sort_by_key(LogLine::id);
     let mut log = MessageLog::empty();
+    for line in lines {
+        log.replay(line);
+    }
+    Loaded { log, skipped }
+}
+
+/// The last `tail` bytes across `path` and its `.1`, decoded into `out`
+/// oldest first; the count of lines the codec refused.
+fn read_pair(path: &Path, tail: u64, out: &mut Vec<LogLine>) -> usize {
     let mut skipped = 0;
     let current = regular_len(path);
     let older_budget = tail.saturating_sub(current.unwrap_or(0));
     if older_budget > 0 {
         let older = crate::logging::rotated_path(path);
         if let Some(text) = read_tail(&older, older_budget) {
-            skipped += replay_into(&mut log, &text);
+            skipped += decode_into(out, &text);
         }
     }
     if current.is_some()
         && let Some(text) = read_tail(path, tail)
     {
-        skipped += replay_into(&mut log, &text);
+        skipped += decode_into(out, &text);
     }
-    Loaded { log, skipped }
+    skipped
 }
 
 /// The length of `path` when it is a regular file (never followed).
@@ -168,13 +212,13 @@ fn read_tail(path: &Path, tail: u64) -> Option<String> {
     })
 }
 
-/// Replay every whole line of `text` into `log`; the count of lines the codec
-/// refused.
-fn replay_into(log: &mut MessageLog, text: &str) -> usize {
+/// Decode every whole line of `text` into `out`; the count of lines the
+/// codec refused.
+fn decode_into(out: &mut Vec<LogLine>, text: &str) -> usize {
     let mut skipped = 0;
     for line in text.split('\n').filter(|l| !l.is_empty()) {
         match LogLine::decode(line) {
-            Ok(decoded) => log.replay(decoded),
+            Ok(decoded) => out.push(decoded),
             Err(_) => skipped += 1,
         }
     }
@@ -193,24 +237,66 @@ fn encoded(line: &LogLine) -> String {
     s
 }
 
+/// The two appenders behind the one lock: aterm's own file, and the wire's
+/// (design ruling 200), opened at its first line.
+struct Files {
+    host: RotatingFile,
+    wire: WireFile,
+}
+
+/// The wire's file: not yet needed, open, or refused (its lines then go to
+/// the host's file — the log never drops).
+enum WireFile {
+    Unopened(PathBuf, RotationBudget),
+    Open(RotatingFile),
+    Refused,
+}
+
+impl Files {
+    /// The appender a `shelf` line lands in, opening the wire's on first use.
+    fn for_shelf(&mut self, shelf: Shelf) -> &mut RotatingFile {
+        if shelf == Shelf::Wire
+            && let WireFile::Unopened(path, budget) = &self.wire
+        {
+            self.wire = match RotatingFile::open(path.clone(), *budget) {
+                Ok(file) => WireFile::Open(file),
+                Err(error) => {
+                    aterm_log::warn!(
+                        "messages log: {} not opened ({error}); the wire's lines go to {}",
+                        path.display(),
+                        FILE_NAME
+                    );
+                    WireFile::Refused
+                }
+            };
+        }
+        match (shelf, &mut self.wire) {
+            (Shelf::Wire, WireFile::Open(file)) => file,
+            _ => &mut self.host,
+        }
+    }
+}
+
 /// Append one line under the file lock, rotating first when a look is due
-/// ([`BUDGET`]). No rotation note is written: a note is not a codec line, and
-/// the loader would count it as junk. A write the disk refuses is the one path
-/// that loses a line.
-fn write_line(file: &Mutex<crate::logging::RotatingFile>, line: &str) {
+/// ([`BUDGET`], [`WIRE_BUDGET`]). No rotation note is written: a note is not
+/// a codec line, and the loader would count it as junk. A write the disk
+/// refuses is the one path that loses a line.
+fn write_line(files: &Mutex<Files>, line: &str, shelf: Shelf) {
     if line.is_empty() {
         return;
     }
-    let mut f = file
+    let mut files = files
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    f.append(line.as_bytes(), |_| String::new());
+    files
+        .for_shelf(shelf)
+        .append(line.as_bytes(), |_| String::new());
 }
 
 /// What the caller hands the writer thread: a line to append, or a flush
 /// mark the thread answers once every line queued before it is on disk.
 enum Job {
-    Line(String),
+    Line(String, Shelf),
     Flush(mpsc::SyncSender<()>),
 }
 
@@ -220,7 +306,7 @@ enum Job {
 pub(crate) struct Writer {
     /// `None` only during drop, so the receiver sees the channel close.
     tx: Option<mpsc::SyncSender<Job>>,
-    file: Arc<Mutex<crate::logging::RotatingFile>>,
+    files: Arc<Mutex<Files>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The folder the file lives in — the log dir, where `aterm.log`,
     /// `packages.log` and the crash reports sit beside it.
@@ -232,22 +318,24 @@ impl Writer {
     /// when the file cannot be opened or the thread not spawned (logged —
     /// the app runs, the record does not).
     pub(crate) fn spawn(path: &Path) -> Option<Writer> {
-        Self::spawn_with(path, BUDGET)
+        Self::spawn_with(path, BUDGET, WIRE_BUDGET)
     }
 
-    /// [`Self::spawn`] under `budget` — the tests' way to rotate a small file.
+    /// [`Self::spawn`] under `budget` (and `wire_budget` for the wire's
+    /// file) — the tests' way to rotate a small file.
     pub(crate) fn spawn_with(
         path: &Path,
-        budget: crate::logging::RotationBudget,
+        budget: RotationBudget,
+        wire_budget: RotationBudget,
     ) -> Option<Writer> {
-        let (mut writer, rx) = match Self::open(path, QUEUE_CAP, budget) {
+        let (mut writer, rx) = match Self::open(path, QUEUE_CAP, budget, wire_budget) {
             Ok(pair) => pair,
             Err(error) => {
                 aterm_log::warn!("messages log: {} not opened ({error})", path.display());
                 return None;
             }
         };
-        let file = Arc::clone(&writer.file);
+        let files = Arc::clone(&writer.files);
         let spawned = std::thread::Builder::new()
             .name("aterm-messages-log".into())
             .spawn(move || {
@@ -256,7 +344,7 @@ impl Writer {
                 qos::set_self(qos::Role::Background);
                 for job in rx {
                     match job {
-                        Job::Line(line) => write_line(&file, &line),
+                        Job::Line(line, shelf) => write_line(&files, &line, shelf),
                         Job::Flush(done) => {
                             let _ = done.send(());
                         }
@@ -279,14 +367,16 @@ impl Writer {
     fn open(
         path: &Path,
         cap: usize,
-        budget: crate::logging::RotationBudget,
+        budget: RotationBudget,
+        wire_budget: RotationBudget,
     ) -> std::io::Result<(Writer, mpsc::Receiver<Job>)> {
-        let file = crate::logging::RotatingFile::open(path.to_path_buf(), budget)?;
+        let host = RotatingFile::open(path.to_path_buf(), budget)?;
+        let wire = WireFile::Unopened(wire_path(path), wire_budget);
         let (tx, rx) = mpsc::sync_channel::<Job>(cap);
         Ok((
             Writer {
                 tx: Some(tx),
-                file: Arc::new(Mutex::new(file)),
+                files: Arc::new(Mutex::new(Files { host, wire })),
                 thread: None,
                 folder: path.parent().map(Path::to_path_buf),
             },
@@ -305,26 +395,27 @@ impl Writer {
     /// `Disconnected`).
     #[cfg(test)]
     fn unattended(path: &Path, cap: usize) -> (Writer, mpsc::Receiver<Job>) {
-        Self::open(path, cap, BUDGET).expect("a temp file opens")
+        Self::open(path, cap, BUDGET, WIRE_BUDGET).expect("a temp file opens")
     }
 
-    /// Append `lines`, oldest first, in that order on disk. `try_send` to
+    /// Append `lines`, oldest first, in that order on disk, each to its
+    /// shelf's file. `try_send` to
     /// the thread; on `Full` (the thread is behind) the caller waits for a
     /// slot — one write long, and no longer than the write-it-yourself
     /// fallback took under the same file lock — so the file keeps the
     /// order the engine emitted; on `Disconnected` (the thread died) the
     /// line is written here, so nothing is dropped.
-    pub(crate) fn append(&self, lines: &[LogLine]) {
-        for line in lines {
+    pub(crate) fn append(&self, lines: &[(LogLine, Shelf)]) {
+        for (line, shelf) in lines {
             let encoded = encoded(line);
             if encoded.is_empty() {
                 continue;
             }
             let Some(tx) = &self.tx else {
-                write_line(&self.file, &encoded);
+                write_line(&self.files, &encoded, *shelf);
                 continue;
             };
-            let job = match tx.try_send(Job::Line(encoded)) {
+            let job = match tx.try_send(Job::Line(encoded, *shelf)) {
                 Ok(()) => continue,
                 Err(TrySendError::Full(job)) => match tx.send(job) {
                     Ok(()) => continue,
@@ -332,8 +423,8 @@ impl Writer {
                 },
                 Err(TrySendError::Disconnected(job)) => job,
             };
-            if let Job::Line(line) = job {
-                write_line(&self.file, &line);
+            if let Job::Line(line, shelf) = job {
+                write_line(&self.files, &line, shelf);
             }
         }
     }
@@ -368,8 +459,25 @@ impl Drop for Writer {
 mod tests {
     use super::*;
     use aterm_messages::{
-        LOG_CAP, LogRecord, LogState, Message, MessageId, Retired, Severity, WallStamp, tags,
+        LOG_CAP, LogRecord, LogState, Message, MessageId, Origin, Retired, Severity, WallStamp,
+        tags,
     };
+
+    /// `lines` shelved as aterm's own.
+    fn host(lines: &[LogLine]) -> Vec<(LogLine, Shelf)> {
+        lines.iter().map(|l| (l.clone(), Shelf::Host)).collect()
+    }
+
+    /// A record the wire posted.
+    fn wire_posted(id: u64, title: &str) -> LogLine {
+        let mut msg = Message::new(tags::SYSTEM, Severity::Warn, title);
+        msg.origin = Origin::Wire;
+        LogLine::Posted(LogRecord::from_posted(
+            MessageId::from_raw(id).unwrap(),
+            WallStamp { unix_ms: id },
+            &msg,
+        ))
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -491,7 +599,7 @@ mod tests {
         let (writer, rx) = Writer::unattended(&path, 2);
         drop(rx);
         let lines: Vec<LogLine> = (1..=5).map(|i| posted(i, &format!("m{i}"))).collect();
-        writer.append(&lines);
+        writer.append(&host(&lines));
         let on_disk = read_lines(&path);
         assert_eq!(on_disk.len(), 5, "written by the caller for a dead thread");
         for (line, id) in on_disk.iter().zip(1..=5u64) {
@@ -514,7 +622,7 @@ mod tests {
         let many: Vec<LogLine> = (1..=(QUEUE_CAP as u64 + 50))
             .map(|i| posted(i, &format!("m{i}")))
             .collect();
-        writer.append(&many);
+        writer.append(&host(&many));
         // A flush returns only once everything before it is on disk.
         writer.flush();
         let flushed = read_lines(&path);
@@ -560,11 +668,11 @@ mod tests {
     fn the_log_rotates_while_running_and_stays_bounded() {
         let dir = scratch("rotate");
         let path = dir.join(FILE_NAME);
-        let writer = Writer::spawn_with(&path, TINY).expect("the writer");
+        let writer = Writer::spawn_with(&path, TINY, TINY).expect("the writer");
         let mut id = 0;
         while (id as usize) * 60 < 3 * TINY.rotate_at as usize {
             id += 1;
-            writer.append(&[posted(id, &format!("m{id}"))]);
+            writer.append(&host(&[posted(id, &format!("m{id}"))]));
         }
         writer.flush();
         let bound = TINY.rotate_at + TINY.check_bytes + MAX_LINE_BYTES as u64;
@@ -626,16 +734,16 @@ mod tests {
     fn a_second_writer_follows_the_rotation() {
         let dir = scratch("follow");
         let path = dir.join(FILE_NAME);
-        let a = Writer::spawn_with(&path, TINY).expect("writer A");
-        let b = Writer::spawn_with(&path, TINY).expect("writer B");
+        let a = Writer::spawn_with(&path, TINY, TINY).expect("writer A");
+        let b = Writer::spawn_with(&path, TINY, TINY).expect("writer B");
         let mut id = 0;
         while !crate::logging::rotated_path(&path).exists() {
             id += 1;
-            a.append(&[posted(id, &format!("a{id}"))]);
+            a.append(&host(&[posted(id, &format!("a{id}"))]));
             a.flush();
             assert!(id < 1000, "A rotated");
         }
-        b.append(&[posted(id + 1, "from B")]);
+        b.append(&host(&[posted(id + 1, "from B")]));
         b.flush();
         let current = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -686,7 +794,7 @@ mod tests {
         let writer = Writer::spawn(&path).expect("a writer over a temp file");
         let n = QUEUE_CAP as u64 + 20;
         let lines: Vec<LogLine> = (1..=n).flat_map(|i| [posted(i, "m"), retired(i)]).collect();
-        writer.append(&lines);
+        writer.append(&host(&lines));
         drop(writer);
         let loaded = load_tail(&path, TAIL_BYTES);
         assert_eq!(loaded.skipped, 0, "every line decodes");
@@ -698,6 +806,117 @@ mod tests {
                 "record {i} must read back as Folded, not as a dead process's open row"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SCRIPT'S FLOOD NEVER ROTATES ATERM'S RECORD OFF DISK (design ruling
+    /// 200): one host record, then three wire budgets of wire records. The
+    /// wire's lines land in `messages.wire.log` and rotate there, bounded;
+    /// `messages.log` holds the host line alone and never rotated; a launch
+    /// reads the host record back beside the wire's newest.
+    #[test]
+    fn a_wire_flood_never_rotates_aterms_own_record_off_disk() {
+        let dir = scratch("wire-shelf");
+        let path = dir.join(FILE_NAME);
+        let writer = Writer::spawn_with(&path, BUDGET, TINY).expect("the writer");
+        assert!(
+            !wire_path(&path).exists(),
+            "no wire file until the wire writes"
+        );
+        writer.append(&[
+            (posted(1, "crash record"), Shelf::Host),
+            (retired(1), Shelf::Host),
+        ]);
+        let mut id = 1;
+        while (id as usize) * 60 < 3 * TINY.rotate_at as usize {
+            id += 1;
+            writer.append(&[
+                (wire_posted(id, &format!("w{id}")), Shelf::Wire),
+                (retired(id), Shelf::Wire),
+            ]);
+        }
+        writer.flush();
+        let host_lines = read_lines(&path);
+        assert_eq!(host_lines.len(), 2, "{host_lines:?}");
+        assert!(
+            !crate::logging::rotated_path(&path).exists(),
+            "messages.log never rotated"
+        );
+        let wire = wire_path(&path);
+        let bound = TINY.rotate_at + TINY.check_bytes + MAX_LINE_BYTES as u64;
+        let current = std::fs::metadata(&wire).unwrap().len();
+        let older = std::fs::metadata(crate::logging::rotated_path(&wire))
+            .expect("the wire's file rotated")
+            .len();
+        assert!(current <= bound && older <= bound, "{current} / {older}");
+        drop(writer);
+        let loaded = load_tail(&path, TAIL_BYTES);
+        assert_eq!(loaded.skipped, 0);
+        let crash = loaded.log.get(MessageId::from_raw(1).unwrap());
+        assert_eq!(
+            crash.map(|r| &r.state),
+            Some(&LogState::Retired(Retired::Folded)),
+            "the host record reads back"
+        );
+        let newest = loaded.log.get(MessageId::from_raw(id).unwrap()).unwrap();
+        assert!(newest.wire_owned());
+        assert_eq!(newest.state, LogState::Retired(Retired::Folded));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A LAUNCH MERGES THE TWO FILES BY ID (design ruling 200): records
+    /// interleaved across `messages.log` and `messages.wire.log` load
+    /// oldest-first by id, each meeting its own `Retired`, and ids continue
+    /// past the newest of either; the wire's tail is read at most
+    /// [`WIRE_TAIL_BYTES`].
+    #[test]
+    fn a_launch_merges_the_two_files_by_id() {
+        let dir = scratch("wire-merge");
+        let path = dir.join(FILE_NAME);
+        write_lines(
+            &path,
+            &[
+                encoded(&posted(1, "h1")),
+                encoded(&posted(3, "h3")),
+                encoded(&retired(1)),
+                encoded(&posted(6, "h6")),
+            ],
+        );
+        write_lines(
+            &wire_path(&path),
+            &[
+                encoded(&wire_posted(2, "w2")),
+                encoded(&wire_posted(4, "w4")),
+                encoded(&retired(2)),
+                encoded(&wire_posted(5, "w5")),
+            ],
+        );
+        let loaded = load_tail(&path, TAIL_BYTES);
+        let ids: Vec<u64> = loaded.log.records().map(|r| r.id.raw()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6], "oldest first, by id");
+        for (id, how) in [
+            (1, Retired::Folded),
+            (2, Retired::Folded),
+            (4, Retired::Stale),
+        ] {
+            let rec = loaded.log.get(MessageId::from_raw(id).unwrap()).unwrap();
+            assert_eq!(rec.state, LogState::Retired(how), "record {id}");
+        }
+        assert_eq!(loaded.log.next_id(), MessageId::from_raw(7).unwrap());
+        // A wire file past its tail is read only for its last WIRE_TAIL_BYTES.
+        let big: Vec<String> = (10..10 + 2 * WIRE_TAIL_BYTES / 64)
+            .map(|i| encoded(&wire_posted(i, &format!("w{i}"))))
+            .collect();
+        write_lines(&wire_path(&path), &big);
+        let loaded = load_tail(&path, TAIL_BYTES);
+        let wire_bytes: u64 = loaded
+            .log
+            .records()
+            .filter(|r| r.wire_owned())
+            .map(|r| encoded(&LogLine::Posted(r.clone())).len() as u64)
+            .sum();
+        assert!(wire_bytes <= WIRE_TAIL_BYTES, "{wire_bytes}");
+        assert!(loaded.log.get(MessageId::from_raw(6).unwrap()).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

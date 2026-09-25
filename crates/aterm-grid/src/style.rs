@@ -353,8 +353,6 @@ pub use style_table::StyleTable;
 #[cfg(any(test, kani, feature = "testing"))]
 #[path = "style_test_helpers.rs"]
 mod style_test_helpers;
-#[cfg(any(test, feature = "testing"))]
-pub(crate) use style_test_helpers::StyleTableStats;
 #[cfg(test)]
 use style_test_helpers::take_style_intern_ops;
 

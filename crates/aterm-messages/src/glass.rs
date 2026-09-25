@@ -46,14 +46,14 @@
 //!
 //!    An ACTION EXCERPT — a painted `detail[0]` on a moving row, which the
 //!    host paints only when it changes what the person does (ruling 77):
-//!    R19's `enter your password in the macOS dialog`, the flow row's typing
-//!    hold — is the one thing on such a row the person must read. Its joint
-//!    and its first [`DETAIL_FLOOR`] cells join `fixed` (`3 + min(width,
-//!    DETAIL_FLOOR)`), so the capsules' short forms and the title's elision
-//!    pay for it; only when the title at [`TITLE_MIN`] still cannot does it
-//!    go, before the degenerate step. Its row's load slot is not in `fixed`:
+//!    the flow row's typing hold — is the one thing on such a row the person
+//!    must read. Its joint and its first [`DETAIL_FLOOR`] cells join `fixed`
+//!    (`3 + min(width, DETAIL_FLOOR)`), so the capsules' short forms and the
+//!    title's elision pay for it; only when the title at [`TITLE_MIN`] still
+//!    cannot does it go, before the degenerate step. Its row's load slot is not in `fixed`:
 //!    it is an extra after the excerpt (review 2026-09-24 — at 80 columns
-//!    the slot reserved at `network busy` left R19's password no room).
+//!    the slot reserved at `network busy` left the retired admin install's
+//!    password line no room).
 //! 2. `room = budget − fixed`, `fixed` measured with the LONG capsules
 //!    whatever they became: the short forms fit the head, and the cells they
 //!    free never re-buy an extra a wider row already gave up — so once the
@@ -589,6 +589,11 @@ pub struct RowSpec<'a> {
     /// bring the ETA slot and the load slot. A still fill (a held row's)
     /// brings neither.
     pub animated: bool,
+    /// The fill is a measured LEVEL ([`crate::Meter::level`], ruling 208):
+    /// the whole row still, but no percent — the elapsed clock (how long
+    /// the strain has lasted) and the load slot in its place — and never
+    /// an ETA.
+    pub level: bool,
     /// Reserve the ETA slot (a live determinate row whose reporter supplies
     /// an amount).
     pub eta: bool,
@@ -605,6 +610,7 @@ impl RowSpec<'_> {
     /// The activity cells the fixed head reserves (module doc, step 1).
     fn activity(&self) -> Activity {
         match (self.fill(), self.busy, self.animated) {
+            (Some(_), _, _) if self.level => Activity::LiveLevel,
             (Some(_), _, true) => Activity::LiveBar,
             (Some(_), _, false) => Activity::HeldBar,
             (None, true, _) => Activity::LiveBusy,
@@ -627,6 +633,9 @@ enum Activity {
     LiveBar,
     /// A busy row: the elapsed slot (and the load slot it may bring).
     LiveBusy,
+    /// A measured level: the elapsed slot (and the load slot it may bring)
+    /// over its fill — never a percent, never an ETA.
+    LiveLevel,
     /// A still fill: the percent.
     HeldBar,
 }
@@ -636,7 +645,7 @@ impl Activity {
         match self {
             Self::None => 0,
             Self::LiveBar | Self::HeldBar => PCT_W,
-            Self::LiveBusy => 1 + ELAPSED_W,
+            Self::LiveBusy | Self::LiveLevel => 1 + ELAPSED_W,
         }
     }
 }
@@ -655,6 +664,7 @@ pub fn overflow_spec(hidden: usize, links: Links) -> RowSpec<'static> {
         meter: None,
         busy: false,
         animated: false,
+        level: false,
         eta: false,
         load: None,
         load_slot: false,
@@ -778,8 +788,10 @@ fn load_slot_width(width: &dyn Fn(&str) -> usize) -> usize {
 /// Whether the row lays out the load slot: a moving activity on a row that
 /// reserves one (or shows words now).
 fn reserves_load(spec: &RowSpec<'_>, activity: Activity) -> bool {
-    matches!(activity, Activity::LiveBar | Activity::LiveBusy)
-        && (spec.load_slot || spec.load.is_some())
+    matches!(
+        activity,
+        Activity::LiveBar | Activity::LiveBusy | Activity::LiveLevel
+    ) && (spec.load_slot || spec.load.is_some())
 }
 
 /// The load slot's cells, joint included, when the row lays it out in the
@@ -795,14 +807,15 @@ fn load_cells(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> us
 
 /// Whether the row's excerpt is an ACTION excerpt: a PAINTED `detail[0]`
 /// on a MOVING row. The host paints a moving row's excerpt only when it
-/// changes what the person does (ruling 77) — the admin install's `enter
-/// your password in the macOS dialog`, the flow row's typing hold — so it is
-/// the one thing on the row the person must read: it outranks the load slot
+/// changes what the person does (ruling 77) — the flow row's typing hold —
+/// so it is the one thing on the row the person must read: it outranks the load slot
 /// and is paid for by the capsules' short forms and the title's elision,
 /// never dropped while they can pay (module doc, step 1; review 2026-09-24).
 fn action_excerpt(spec: &RowSpec<'_>, activity: Activity) -> bool {
-    matches!(activity, Activity::LiveBar | Activity::LiveBusy)
-        && spec.detail0.is_some_and(|d| !d.is_empty())
+    matches!(
+        activity,
+        Activity::LiveBar | Activity::LiveBusy | Activity::LiveLevel
+    ) && spec.detail0.is_some_and(|d| !d.is_empty())
 }
 
 /// The cells an action excerpt reserves in the fixed head: its joint and
@@ -1072,7 +1085,7 @@ fn place(
             pct = Some((col + slot.saturating_sub(width(&text)), text));
             col += slot;
         }
-        (Activity::LiveBusy, _) => {
+        (Activity::LiveBusy | Activity::LiveLevel, _) => {
             col += 1;
             elapsed = Some(col);
             col += ELAPSED_W;
@@ -1250,6 +1263,7 @@ pub(crate) mod tests {
                     detail0: Some(CRASH_DETAIL),
                     meter: None,
                     animated: false,
+                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1268,6 +1282,7 @@ pub(crate) mod tests {
                     detail0: Some("Full Disk Access may already be enabled"),
                     meter: None,
                     animated: false,
+                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1293,6 +1308,7 @@ pub(crate) mod tests {
                     detail0: Some(STAGED_MANUAL),
                     meter: None,
                     animated: false,
+                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1311,6 +1327,7 @@ pub(crate) mod tests {
                     detail0: Some(STAGED_AUTO),
                     meter: None,
                     animated: false,
+                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1329,6 +1346,7 @@ pub(crate) mod tests {
                     detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
                     meter: None,
                     animated: false,
+                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1347,6 +1365,7 @@ pub(crate) mod tests {
                     detail0: Some("trust \u{00b7} extracting"),
                     meter: Some((Some(420), "512 MB / 1.2 GB")),
                     animated: true,
+                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -1375,6 +1394,7 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((Some(420), "45 MB / 74 MB")),
                     animated: true,
+                    level: false,
                     busy: false,
                     eta: true,
                     load: None,
@@ -1393,6 +1413,7 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
+                    level: false,
                     busy: false,
                     eta: true,
                     load: Some(Load::Disk),
@@ -1413,6 +1434,7 @@ pub(crate) mod tests {
                     detail0: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
+                    level: false,
                     busy: false,
                     eta: true,
                     load: None,
@@ -1420,8 +1442,11 @@ pub(crate) mod tests {
                     capsules: caps(&[]),
                 },
             ),
+            // The longest action excerpt the band was measured with — the
+            // retired admin install's row (deleted 2026-09-24), kept as a
+            // fixture — beside a load slot.
             (
-                "admin-install",
+                "action-excerpt",
                 RowSpec {
                     kind: RowKind::Message(id(9)),
                     severity: Severity::Info,
@@ -1431,9 +1456,10 @@ pub(crate) mod tests {
                     detail0: Some("enter your password in the macOS dialog"),
                     meter: Some((None, "")),
                     animated: true,
+                    level: false,
                     busy: true,
                     eta: false,
-                    load: Some(Load::System),
+                    load: Some(Load::Disk),
                     load_slot: true,
                     capsules: caps(&[]),
                 },
@@ -1449,6 +1475,7 @@ pub(crate) mod tests {
                     detail0: Some("keys typed now arrive in a moment"),
                     meter: Some((None, "")),
                     animated: true,
+                    level: false,
                     busy: true,
                     eta: false,
                     load: None,
@@ -1467,6 +1494,7 @@ pub(crate) mod tests {
                     detail0: Some("trust \u{2014} extracting 120 MB / 900 MB"),
                     meter: Some((Some(430), "3 of 10")),
                     animated: false,
+                    level: false,
                     busy: false,
                     eta: false,
                     load: None,
@@ -2013,6 +2041,7 @@ pub(crate) mod tests {
             meter: Some((None, "")),
             busy: true,
             animated: false,
+            level: false,
             eta: false,
             load: None,
             load_slot: false,
@@ -2158,6 +2187,7 @@ pub(crate) mod tests {
             detail0: Some(&detail),
             meter: None,
             animated: false,
+            level: false,
             busy: false,
             eta: false,
             load: None,
@@ -2214,6 +2244,7 @@ pub(crate) mod tests {
                 meter: Some((fill, "")),
                 busy: false,
                 animated,
+                level: false,
                 eta: false,
                 load: None,
                 load_slot: false,
@@ -2322,29 +2353,28 @@ pub(crate) mod tests {
                 160,
                 " ⇣ Installing ALab tools  42%                              3 of 10 programs                                                                          Details ›  ",
             ),
-            // R19's password is an ACTION excerpt (M13, ruling 148): it
-            // outranks the load slot and `Details ›`, and the title elides
-            // for it — at 80 it used to be the one word the row did not
-            // paint (review 2026-09-24).
+            // An ACTION excerpt (M13, ruling 148) outranks the load slot and
+            // `Details ›`, and the title elides for it — at 80 it used to be
+            // the one word the row did not paint (review 2026-09-24).
             (
-                "admin-install",
+                "action-excerpt",
                 60,
                 " ⇣ Installing Command Line T… · enter your password…        ",
             ),
             (
-                "admin-install",
+                "action-excerpt",
                 80,
                 " ⇣ Installing Command Line Tools and Homebrew · enter your password…            ",
             ),
             (
-                "admin-install",
+                "action-excerpt",
                 120,
                 " ⇣ Installing Command Line Tools and Homebrew · enter your password in the macOS dialog                      Details ›  ",
             ),
             (
-                "admin-install",
+                "action-excerpt",
                 160,
-                " ⇣ Installing Command Line Tools and Homebrew · enter your password in the macOS dialog        · system busy                                         Details ›  ",
+                " ⇣ Installing Command Line Tools and Homebrew · enter your password in the macOS dialog        · disk busy                                           Details ›  ",
             ),
             (
                 "busy-excerpt",
@@ -2393,7 +2423,7 @@ pub(crate) mod tests {
             "download",
             "first-run",
             "first-run-lull",
-            "admin-install",
+            "action-excerpt",
             "busy-excerpt",
             "held-meter",
         ] {

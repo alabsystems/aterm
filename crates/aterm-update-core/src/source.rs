@@ -37,8 +37,7 @@ pub const DEFAULT_REPO: &str = env!("ATERM_DEFAULT_REPO");
 /// account this project belongs to" must not drift with the channel. (The package
 /// index reads its own key — [`ATPKG_INDEX_OWNER`] — because binding it here
 /// pointed default installs at the private staging repo; this constant remains
-/// that key's absent-key fallback and the slug atpkg's token chain resolves
-/// against.)
+/// that key's absent-key fallback.)
 pub const PUBLISH_OWNER: &str = env!("ATERM_PUBLISH_OWNER");
 
 /// Repository name this project is published under, the companion to

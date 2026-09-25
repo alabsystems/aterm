@@ -4,14 +4,16 @@
 //! CHANGE-SCOPED SELECTION (`--changed`): the missing middle between a bare
 //! `targo check` and a whole-tree run.
 //!
-//! This header named "the ~2 s pre-push L0 hook" as the lower end until
-//! 2026-08-31. No such hook runs, and none ever will: `.githooks/pre-push` was
-//! advisory from 2026-08-24, and since 2026-09-17 it CHECKS A RECEIPT
-//! ([`crate::receipt`]) instead of running anything — microseconds, and it
-//! races no other push. So nothing between an ungated commit and `origin/main`
-//! executes this tier or any other; what the hook enforces is that a
-//! whole-tree run already did, which is precisely why the tier has to be cheap
-//! enough to be run by hand.
+//! A PRE-FLIGHT, NEVER AN ADMISSION. `.githooks/pre-push` checks a receipt
+//! ([`crate::receipt`]) and admits only a whole-tree run's, because the cone
+//! below is not everything a change can break: a crate's TESTS read files no
+//! dependency edge names. `aterm-census` reads `aterm-gui`'s `app_render.rs`,
+//! `aterm-release` reads `tools/` and `CHANGELOG.md`, `atpkg-keys` reads
+//! `tools/atpkg-index.sh`; a lexical scan on 2026-09-23 found 56 of the 93
+//! members naming a path outside their own directory. A selection sound
+//! against that would carry most of the workspace, the heavy suites among it,
+//! and cost what the whole-tree run costs. So this tier is what you run before
+//! the whole one, never instead of it.
 //!
 //! The set is "crates whose own files changed" CLOSED UNDER `depends on` — a
 //! change to `aterm-grid` must re-test `aterm-gui`, or the tier is a trap rather

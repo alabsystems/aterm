@@ -219,6 +219,184 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
     Ok(rolled)
 }
 
+/// The two changelogs a release claim writes (2026-09-23, owner ruling R2), from
+/// the PUBLISHED commit's `source` and main's current `main`:
+///
+/// * the RELEASE commit's — `source` rolled ([`roll`]): its `[Unreleased]` becomes
+///   `## [version] - date`, so the notes that ship are exactly the entries the
+///   published commit carried. A `source` that already has the section (published
+///   after an earlier roll) is taken as it stands.
+/// * MAIN's — [`roll_shipped`]: the same section, carrying the same shipped body,
+///   and main's `[Unreleased]` keeps every entry peers added after the publish,
+///   because those ship in the NEXT release. A `main` that already has the section
+///   (an earlier claim of this version whose cut wedged) is taken as it stands.
+pub fn claim_changelogs(
+    source: &str,
+    main: &str,
+    version: &str,
+    date: &str,
+) -> Result<(String, String)> {
+    let source_rolled = has_section(source, version);
+    let release = if source_rolled {
+        source.to_string()
+    } else {
+        roll(source, version, date)?
+    };
+    let landing = if has_section(main, version) {
+        main.to_string()
+    } else if source_rolled {
+        return Err(Error::new(format!(
+            "the published commit's {CHANGELOG_FILE} already carries \"## [{version}]\" and \
+             main's does not — main has dropped a released section; restore it before cutting"
+        )));
+    } else {
+        roll_shipped(main, source, version, date)?
+    };
+    Ok((release, landing))
+}
+
+/// Roll `main` for a release whose notes are `source`'s `[Unreleased]` body — the
+/// published commit's — rather than main's own.
+///
+/// The result is `main` with `## [version] - date` inserted below `[Unreleased]`,
+/// carrying `source`'s `[Unreleased]` body verbatim, and main's `[Unreleased]`
+/// reduced to the entries that body does not contain (compared as whole entries —
+/// a bullet with its continuation lines — each shipped entry matching at most one),
+/// each under its own `###` heading. When main's `[Unreleased]` IS `source`'s, the
+/// result is byte-identical to [`roll`]`(main, …)`. An entry a peer EDITED after the
+/// publish is a different entry: its new text stays unreleased, its old text ships.
+pub fn roll_shipped(main: &str, source: &str, version: &str, date: &str) -> Result<String> {
+    if has_section(main, version) {
+        return Err(Error::new(format!(
+            "{CHANGELOG_FILE} already has a \"## [{version}]\" section — already rolled"
+        )));
+    }
+    let shipped = unreleased_body(source)?;
+    let lines: Vec<&str> = main.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("## [Unreleased]"))
+        .ok_or_else(|| {
+            Error::new(format!(
+                "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
+            ))
+        })?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("## "))
+        .map_or(lines.len(), |p| start + 1 + p);
+    let leftovers = unshipped_entries(&lines[start + 1..end], &shipped);
+
+    let mut out: Vec<&str> = lines[..=start].to_vec();
+    out.push("");
+    out.extend(leftovers.iter().map(String::as_str));
+    let heading = format!("## [{version}] - {date}");
+    out.push(&heading);
+    out.extend(shipped.iter().copied());
+    out.extend_from_slice(&lines[end..]);
+    let mut rolled = out.join("\n");
+    if main.ends_with('\n') {
+        rolled.push('\n');
+    }
+    Ok(rolled)
+}
+
+/// The raw lines of `text`'s `[Unreleased]` body, between its header and the next
+/// `## ` heading.
+fn unreleased_body(text: &str) -> Result<Vec<&str>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("## [Unreleased]"))
+        .ok_or_else(|| {
+            Error::new(format!(
+                "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
+            ))
+        })?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("## "))
+        .map_or(lines.len(), |p| start + 1 + p);
+    Ok(lines[start + 1..end].to_vec())
+}
+
+/// One unit of a changelog section body: a `###` heading, or an entry — a line
+/// that starts a bullet (or a paragraph after a blank or a heading) plus every
+/// following non-blank line that does not start another.
+enum Unit<'a> {
+    Heading(&'a str),
+    Entry(Vec<&'a str>),
+}
+
+fn units<'a>(body: &[&'a str]) -> Vec<Unit<'a>> {
+    let mut out = Vec::new();
+    let mut entry: Option<Vec<&'a str>> = None;
+    for &line in body {
+        let starts_entry = line.starts_with("- ") || line.starts_with("* ");
+        if (line.trim().is_empty() || line.starts_with("### ") || starts_entry)
+            && let Some(done) = entry.take()
+        {
+            out.push(Unit::Entry(done));
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with("### ") {
+            out.push(Unit::Heading(line));
+        } else if let Some(open) = entry.as_mut() {
+            open.push(line);
+        } else {
+            entry = Some(vec![line]);
+        }
+    }
+    if let Some(done) = entry {
+        out.push(Unit::Entry(done));
+    }
+    out
+}
+
+/// The entries of `main_body` that `shipped` does not carry, each shipped entry
+/// consuming at most one match, rendered under their headings with a blank line
+/// after every heading and every entry. Empty when everything shipped.
+fn unshipped_entries(main_body: &[&str], shipped: &[&str]) -> Vec<String> {
+    let mut remaining: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for unit in units(shipped) {
+        if let Unit::Entry(lines) = unit {
+            *remaining.entry(lines.join("\n")).or_default() += 1;
+        }
+    }
+    let mut out = Vec::new();
+    let mut heading: Option<&str> = None;
+    let mut heading_written = false;
+    for unit in units(main_body) {
+        match unit {
+            Unit::Heading(line) => {
+                heading = Some(line);
+                heading_written = false;
+            }
+            Unit::Entry(lines) => {
+                let key = lines.join("\n");
+                if let Some(count) = remaining.get_mut(&key)
+                    && *count > 0
+                {
+                    *count -= 1;
+                    continue;
+                }
+                if let Some(line) = heading
+                    && !heading_written
+                {
+                    out.push(line.to_string());
+                    out.push(String::new());
+                    heading_written = true;
+                }
+                out.extend(lines.iter().map(|l| (*l).to_string()));
+                out.push(String::new());
+            }
+        }
+    }
+    out
+}
+
 /// Extract a rolled section's body VERBATIM (spec §3: used once, verbatim,
 /// for manifest + `gh release create --notes-file` + the in-app notes): the
 /// raw lines between `## [<version>]` and the next `## [` heading, trimmed of
@@ -595,6 +773,70 @@ fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SOURCE: &str = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- **One** — shipped.\n  A continuation line.\n\n- **Two** — shipped.\n\n## [0.91.0] - 2026-09-22\n\n- older.\n";
+
+    /// Main that has not moved: the roll is exactly [`roll`], byte for byte.
+    #[test]
+    fn roll_shipped_of_an_unmoved_main_is_the_plain_roll() {
+        assert_eq!(
+            roll_shipped(SOURCE, SOURCE, "0.92.0", "2026-09-23").unwrap(),
+            roll(SOURCE, "0.92.0", "2026-09-23").unwrap()
+        );
+    }
+
+    /// Main moved after the publish: what the published commit carried ships,
+    /// what peers added stays unreleased under its own heading — an entry whose
+    /// text a peer EDITED is a new entry, so its new text stays and its old ships.
+    #[test]
+    fn roll_shipped_keeps_what_peers_added_after_the_publish_unreleased() {
+        let main = SOURCE
+            .replace(
+                "### Fixed\n\n- **One**",
+                "### Added\n\n- **New** — a peer's.\n\n### Fixed\n\n- **Peer fix** — after the publish.\n\n- **One**",
+            )
+            .replace("- **Two** — shipped.", "- **Two** — shipped, then reworded.");
+        let rolled = roll_shipped(&main, SOURCE, "0.92.0", "2026-09-23").unwrap();
+        assert_eq!(
+            rolled,
+            "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- **New** — a peer's.\n\n\
+             ### Fixed\n\n- **Peer fix** — after the publish.\n\n\
+             - **Two** — shipped, then reworded.\n\n\
+             ## [0.92.0] - 2026-09-23\n\n### Fixed\n\n- **One** — shipped.\n  A continuation line.\n\n\
+             - **Two** — shipped.\n\n## [0.91.0] - 2026-09-22\n\n- older.\n"
+        );
+        // NEGATIVE CONTROL: the plain roll of main would ship the peers' entries.
+        let plain = roll(&main, "0.92.0", "2026-09-23").unwrap();
+        assert!(
+            rolled_body(&plain, "0.92.0").unwrap().contains("a peer's"),
+            "{plain}"
+        );
+        assert!(
+            !rolled_body(&rolled, "0.92.0").unwrap().contains("a peer's"),
+            "{rolled}"
+        );
+    }
+
+    #[test]
+    fn claim_changelogs_takes_an_existing_section_as_it_stands() {
+        let rolled = roll(SOURCE, "0.92.0", "2026-09-23").unwrap();
+        // Main already rolled by an earlier claim of this version (a recut).
+        let (release, landing) = claim_changelogs(SOURCE, &rolled, "0.92.0", "2026-09-24").unwrap();
+        assert_eq!(release, roll(SOURCE, "0.92.0", "2026-09-24").unwrap());
+        assert_eq!(landing, rolled, "main is never rolled twice");
+        // A published commit that was itself rolled ships its section as it stands.
+        let (release, landing) =
+            claim_changelogs(&rolled, &rolled, "0.92.0", "2026-09-24").unwrap();
+        assert_eq!(
+            (release.as_str(), landing.as_str()),
+            (rolled.as_str(), rolled.as_str())
+        );
+        // …but main having dropped that section is refused, not papered over.
+        let error = claim_changelogs(&rolled, SOURCE, "0.92.0", "2026-09-24")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dropped a released section"), "{error}");
+    }
 
     /// The release body opens for NEWCOMERS and still carries the changelog
     /// VERBATIM below the rule — the "used once, verbatim" contract (spec §3)

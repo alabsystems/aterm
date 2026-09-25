@@ -215,6 +215,11 @@ pub struct Live {
     pub glide: Option<(u16, Instant)>,
     /// Re-seeded from the carry and not yet past the handoff commit.
     carried_pending: bool,
+    /// The wall clock at `posted_at`, the anchor [`Live::wall_at`] adds the
+    /// monotonic life to: the stamp for a post, the host's wall at the seed
+    /// for a carried row (whose stamp is the PARENT's ingress, design
+    /// ruling 204).
+    wall_anchor: u64,
 }
 
 /// `now + d`, finite whatever `d` is.
@@ -257,6 +262,7 @@ impl Live {
             load_slot: load.is_some(),
             glide: None,
             carried_pending: false,
+            wall_anchor: stamp.unix_ms,
             msg,
         }
     }
@@ -284,6 +290,13 @@ impl Live {
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.msg.meter.as_ref().is_some_and(|m| m.busy)
+    }
+
+    /// Whether the row's fill is a measured LEVEL ([`Meter::level`]): it
+    /// glides both ways, never glints, never completes (design ruling 208).
+    #[must_use]
+    pub fn is_level(&self) -> bool {
+        self.msg.meter.as_ref().is_some_and(|m| m.level)
     }
 
     /// The activity byte the fingerprint folds and the motion epoch keys
@@ -321,13 +334,13 @@ impl Live {
         hold_span(self.msg.hold, self.msg.severity)
     }
 
-    /// The wall clock now, from the ingress stamp plus the monotonic
-    /// elapsed — the engine reads no clock of its own.
+    /// The wall clock now: the wall at `posted_at` (the ingress stamp, or
+    /// the seed's wall for a carried row) plus the monotonic elapsed — the
+    /// engine reads no clock of its own.
     #[must_use]
     pub fn wall_at(&self, now: Instant) -> u64 {
         let elapsed = now.saturating_duration_since(self.posted_at).as_millis();
-        self.stamp
-            .unix_ms
+        self.wall_anchor
             .saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX))
     }
 
@@ -347,19 +360,34 @@ impl Live {
         }
     }
 
-    /// A duplicate of `msg`: the same key AND the same words, or no key on
-    /// either side and the same tag and words.
-    fn duplicates(&self, msg: &Message) -> bool {
+    /// A duplicate of `msg`: the same owner class
+    /// ([`crate::model::Origin::wire_owned`]: a wire post never folds into a
+    /// host row, nor a host post into a wire row, design ruling 192), and
+    /// then the same key, words, actions, severity and hold kind (a change of
+    /// severity, or between work in flight and a held row, supersedes:
+    /// ruling 193), or no key on either side and the same tag and words.
+    pub(crate) fn duplicates(&self, msg: &Message) -> bool {
+        let owner = |m: &Message| m.origin.wire_owned(m.key.as_deref());
+        if owner(&self.msg) != owner(msg) {
+            return false;
+        }
         let same_words = self.msg.title == msg.title && self.msg.detail == msg.detail;
+        let in_flight = |h: Hold| matches!(h, Hold::Live { .. });
         match (&self.msg.key, &msg.key) {
-            (Some(a), Some(b)) => a == b && same_words && self.msg.actions == msg.actions,
+            (Some(a), Some(b)) => {
+                a == b
+                    && same_words
+                    && self.msg.actions == msg.actions
+                    && self.msg.severity == msg.severity
+                    && in_flight(self.msg.hold) == in_flight(msg.hold)
+            }
             (None, None) => self.msg.tag == msg.tag && same_words,
             _ => false,
         }
     }
 
     /// The load words the row shows now, if any.
-    fn shown_load(&self) -> Option<Load> {
+    pub(crate) fn shown_load(&self) -> Option<Load> {
         self.load.filter(|_| self.load_shown).map(|(l, _)| l)
     }
 }
@@ -429,6 +457,10 @@ pub struct MessageCenter {
     committed_rows: u16,
     shrink_since: Option<Instant>,
     revision: u64,
+    /// Restatements can move a future ETA boundary without changing the
+    /// words painted now. Hosts use this to retire cached motion deadlines
+    /// even when the Settings/glass revision correctly stays unchanged.
+    motion_input_epoch: u64,
     born: Instant,
 }
 
@@ -445,6 +477,7 @@ impl MessageCenter {
             committed_rows: 0,
             shrink_since: None,
             revision: 0,
+            motion_input_epoch: 0,
             born: now,
         }
     }
@@ -580,6 +613,15 @@ impl MessageCenter {
         echo: Option<EchoKind>,
         now: Instant,
     ) -> Live {
+        // A LEVEL leaves by a Vanish only, whatever named its echo: it
+        // never wipes to 100 % under a ✓ nor flashes a fault (ruling 208).
+        let echo = echo.map(|kind| {
+            if self.live[i].is_level() {
+                EchoKind::Vanish
+            } else {
+                kind
+            }
+        });
         if let Some(kind) = echo {
             self.record_echo(i, kind, now);
         }
@@ -654,6 +696,7 @@ impl MessageCenter {
         let Some(i) = self.index(id) else {
             return false;
         };
+        self.motion_input_epoch = self.motion_input_epoch.wrapping_add(1);
         let row = &mut self.live[i];
         let activity = row.activity();
         let before = row.msg.clone();
@@ -742,11 +785,17 @@ impl MessageCenter {
 
     /// The reporter finished with it: retires now as `Resolved(outcome)` —
     /// a live row on the glass echoes Complete (`Ok`: the work was
-    /// delivered) or Fault (`Warn`).
+    /// delivered) or Fault (`Warn`). A measured LEVEL ([`Meter::level`]) is
+    /// never resolved — a machine's load has no outcome to claim, and a ✓
+    /// on it would say the strain was "done": `false`, and the row stays for
+    /// its reporter's [`Self::withdraw`] (a Vanish) (design ruling 208).
     pub fn resolve(&mut self, id: MessageId, outcome: Outcome, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
         };
+        if self.live[i].is_level() {
+            return false;
+        }
         self.retire_at(i, Retired::Resolved(outcome), now);
         self.rebalance(now);
         true
@@ -800,6 +849,31 @@ impl MessageCenter {
             return false;
         };
         self.retire_at_with(i, Retired::Withdrawn, Some(echo), now);
+        self.rebalance(now);
+        true
+    }
+
+    /// [`Self::withdraw`] whose log entry keeps `title` and `detail` as its
+    /// final words: an episode's live row that becomes its own record (the
+    /// strain row's fold, ruling 209), so the log — and Settings ▸ Messages —
+    /// holds ONE entry per episode instead of the withdrawn row beside a
+    /// record that repeats it. The glass sees the row it showed (its echo is
+    /// taken before the words change); `false` when no such live row.
+    pub fn withdraw_as(
+        &mut self,
+        id: MessageId,
+        title: &str,
+        detail: &[String],
+        now: Instant,
+    ) -> bool {
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        self.record_echo(i, EchoKind::Vanish, now);
+        let row = &mut self.live[i];
+        row.msg.title = title.to_string();
+        row.msg.detail = detail.to_vec();
+        self.retire_at_with(i, Retired::Withdrawn, None, now);
         self.rebalance(now);
         true
     }
@@ -1326,10 +1400,23 @@ impl MessageCenter {
         self.log.drain_pending()
     }
 
+    /// [`Self::drain_new_for_persist`], each line with its file
+    /// ([`crate::Shelf`], design ruling 200).
+    pub fn drain_shelved_for_persist(&mut self) -> Vec<(LogLine, crate::Shelf)> {
+        self.log.drain_shelved()
+    }
+
     /// Bumps on every observable change — the Settings projection gate.
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Changes on every live restatement, including a visually identical
+    /// progress heartbeat that may re-anchor a future ETA tick.
+    #[must_use]
+    pub fn motion_input_epoch(&self) -> u64 {
+        self.motion_input_epoch
     }
 
     /// The repaint-key term: **`0` when `committed_rows() == 0`** (FL-1),
@@ -1371,6 +1458,7 @@ impl MessageCenter {
                     h.str(&m.stats);
                     h.byte(u8::from(m.amount.is_some()));
                     h.byte(u8::from(m.busy));
+                    h.byte(u8::from(m.level));
                 }
                 None => h.byte(0),
             }
@@ -1403,7 +1491,8 @@ impl MessageCenter {
 
     /// The first grid instant at or after `d` — and after `now`, so the
     /// frame computed at the wake is exactly the frame the deadline promised.
-    fn grid_after(&self, now: Instant, d: Instant) -> Instant {
+    /// The wire's paced paint lands here too (design ruling 190).
+    pub(crate) fn grid_after(&self, now: Instant, d: Instant) -> Instant {
         let d = d.max(now);
         let since = d.saturating_duration_since(self.born).as_millis();
         let frame = ANIM_FRAME.as_millis().max(1);
@@ -1512,8 +1601,9 @@ impl MessageCenter {
                         .glide
                         .map(|(_, since)| since + FILL_GLIDE)
                         .filter(|end| q < *end);
+                    let glints = look.graded && !stalled && !row.is_level();
                     let travel_end = glint_at(q, epoch)
-                        .filter(|_| look.graded && !stalled)
+                        .filter(|_| glints)
                         .and_then(|phase| q.checked_sub(phase))
                         .map(|start| start + GLINT_TRAVEL);
                     let busy_until = glide_end.into_iter().chain(travel_end).max();
@@ -1540,7 +1630,7 @@ impl MessageCenter {
                         busy_until.and_then(|end| first_change(next_frame, end + ANIM_FRAME));
                     match changed {
                         Some(g) => fold(g),
-                        None if look.graded && !stalled => {
+                        None if glints => {
                             // At rest: the next travel's first frame that
                             // shows its glint — not its start, where the
                             // centre is still off the fill. A fill under half
@@ -1582,16 +1672,20 @@ impl MessageCenter {
     /// rows first, in order). No log lines: the parent's record is its own
     /// to the end (it flushes its writer before it execs), and the
     /// successor's begins at Commit. An unrevealed row is not carried (its
-    /// work ends with this process), nor are the echoes, the estimator, the
-    /// load or the motion epoch.
+    /// work ends with this process), nor is a measured LEVEL (the strain
+    /// row: the successor measures for itself and starts calm), nor are the
+    /// echoes, the estimator, the load or the motion epoch.
     #[must_use]
     pub fn carried(&self) -> Carry {
-        let mut live: Vec<CarriedMessage> =
-            self.on_glass().map(|l| carried_message(l, true)).collect();
+        let mut live: Vec<CarriedMessage> = self
+            .on_glass()
+            .filter(|l| !l.is_level())
+            .map(|l| carried_message(l, true))
+            .collect();
         live.extend(
             self.live
                 .iter()
-                .filter(|l| l.revealed && !self.glass.contains(&l.id))
+                .filter(|l| l.revealed && !l.is_level() && !self.glass.contains(&l.id))
                 .map(|l| carried_message(l, false)),
         );
         Carry {
@@ -1607,8 +1701,11 @@ impl MessageCenter {
     /// raised. A seeded row is revealed, and keeps its indicator: its fill,
     /// or `busy` (until the commit stills it unless restated,
     /// [`MessageCenter::after_handoff_commit`]); an older parent's carry has
-    /// no `busy` and reads as still (design ruling 139).
-    pub fn seed_carried(&mut self, carry: &Carry, now: Instant) {
+    /// no `busy` and reads as still (design ruling 139). `wall` is the
+    /// host's wall clock at `now`: a seeded row's life in THIS process is
+    /// measured from it, never from the parent's ingress stamp (design
+    /// ruling 204).
+    pub fn seed_carried(&mut self, carry: &Carry, wall: WallStamp, now: Instant) {
         for c in &carry.live {
             let (Some(id), Some(severity), Ok(tag), Some(hold)) = (
                 MessageId::from_raw(c.id),
@@ -1646,6 +1743,7 @@ impl MessageCenter {
             .normalized();
             let stamp = WallStamp { unix_ms: c.unix_ms };
             let mut entry = Live::new(id, msg, stamp, now);
+            entry.wall_anchor = wall.unix_ms.max(stamp.unix_ms);
             entry.fold_at = None;
             entry.stale_at = Some(at(now, STALE_HANDOFF));
             entry.carried_pending = true;
@@ -1821,6 +1919,7 @@ fn message_layout(
     }
     let stats = msg.meter.as_ref().map_or("", |m| m.stats.as_str());
     let moving_fill = ind.moving && ind.fill.is_some();
+    let level = msg.meter.as_ref().is_some_and(|m| m.level) && ind.fill.is_some();
     let spec = RowSpec {
         kind,
         severity: msg.severity,
@@ -1831,7 +1930,8 @@ fn message_layout(
         meter: msg.meter.as_ref().map(|_| (ind.fill, stats)),
         busy: ind.busy && ind.fill.is_none(),
         animated: moving_fill,
-        eta: moving_fill && msg.meter.as_ref().is_some_and(|m| m.amount.is_some()),
+        level,
+        eta: moving_fill && !level && msg.meter.as_ref().is_some_and(|m| m.amount.is_some()),
         load: load.filter(|_| ind.moving),
         load_slot: load_slot && ind.moving,
         capsules,
@@ -1881,7 +1981,12 @@ fn moving_bar(row: &Live, data: u16, t: Instant, epoch: Instant, graded: bool) -
         return stalled_bar(data, graded);
     }
     let shown = row.shown_fill(t).unwrap_or(data);
-    let glint = if graded { glint_at(t, epoch) } else { None };
+    // A measured LEVEL carries no glint: it is not work in flight (ruling 208).
+    let glint = if graded && !row.is_level() {
+        glint_at(t, epoch)
+    } else {
+        None
+    };
     bar(shown, glint, graded)
 }
 
@@ -1921,7 +2026,7 @@ fn live_motion(row: &Live, layout: &RowLayout, q: Instant, look: Look) -> RowMot
                 row.shown_fill(q).unwrap_or(data)
             };
             let glint_ms = glint_at(q, epoch)
-                .filter(|_| look.graded && !stalled && bar_glints(shown))
+                .filter(|_| look.graded && !stalled && !row.is_level() && bar_glints(shown))
                 .map(anim_ms);
             (
                 moving_bar(row, data, q, epoch, look.graded),
@@ -3251,7 +3356,7 @@ mod tests {
         let carry = parent.carried();
         assert!(carry.live.iter().all(|m| m.busy), "{:?}", carry.live);
         let mut successor = fresh(now);
-        successor.seed_carried(&carry, now);
+        successor.seed_carried(&carry, stamp(0), now);
         assert!(successor.busy_on_glass());
         assert!(successor.restate(
             flow,
@@ -3276,7 +3381,7 @@ mod tests {
             m.busy = false;
         }
         let mut older = fresh(now);
-        older.seed_carried(&old, now);
+        older.seed_carried(&old, stamp(0), now);
         assert!(!busy_of(&older, flow));
     }
 
@@ -3344,7 +3449,7 @@ mod tests {
 
         let later = now + Duration::from_secs(5);
         let mut child = fresh(later);
-        child.seed_carried(&carry, later);
+        child.seed_carried(&carry, stamp(5_000), later);
         assert_eq!(child.live_rows().count(), 4);
         assert_eq!(
             child.log().next_id().raw(),
@@ -3431,7 +3536,7 @@ mod tests {
         junk.live[3].hold = "forever".into();
         junk.next_id = 900;
         let mut c = fresh(later);
-        c.seed_carried(&junk, later);
+        c.seed_carried(&junk, stamp(5_000), later);
         assert_eq!(c.live_rows().count(), 1);
         assert_eq!(c.log().next_id().raw(), 900);
         // Before commit the cap is the only exit. A restate of a carried
@@ -3739,7 +3844,7 @@ mod tests {
         let carry = parent.carried();
         let later = now + Duration::from_secs(5);
         let mut child = fresh(later);
-        child.seed_carried(&carry, later);
+        child.seed_carried(&carry, stamp(5_000), later);
         assert!(child.restate(
             held,
             Restatement {

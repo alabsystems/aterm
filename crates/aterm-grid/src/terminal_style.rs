@@ -289,142 +289,68 @@ mod tests {
     use crate::style::{Color, ColorType, StyleAttrs};
 
     // =========================================================================
-    // CurrentStyle::default — empty/no attributes
+    // CurrentStyle::default, and one attribute or colour changed from it
     // =========================================================================
 
     #[test]
-    fn test_default_fg_is_default() {
+    fn default_style_is_empty_and_cached_as_default() {
+        // One test in place of seven single-field reads.
         let style = CurrentStyle::default();
-        assert!(style.fg.is_default(), "default fg should be DEFAULT_FG");
-    }
-
-    #[test]
-    fn test_default_bg_is_default() {
-        let style = CurrentStyle::default();
-        assert!(style.bg.is_default(), "default bg should be DEFAULT_BG");
-    }
-
-    #[test]
-    fn test_default_flags_empty() {
-        let style = CurrentStyle::default();
-        assert!(style.flags.is_empty(), "default flags should be empty");
-    }
-
-    #[test]
-    fn test_default_not_protected() {
-        let style = CurrentStyle::default();
-        assert!(!style.protected, "default should not be protected");
-    }
-
-    #[test]
-    fn test_default_is_default_cached() {
-        let style = CurrentStyle::default();
-        assert!(
-            style.is_default(),
-            "default style should report is_default()"
-        );
-    }
-
-    #[test]
-    fn test_default_no_style_extras() {
-        let style = CurrentStyle::default();
-        assert!(
-            !style.has_style_extras(),
-            "default style should not need style extras"
-        );
-    }
-
-    #[test]
-    fn test_default_attrs_empty() {
-        let style = CurrentStyle::default();
+        assert!(style.fg.is_default(), "fg is DEFAULT_FG");
+        assert!(style.bg.is_default(), "bg is DEFAULT_BG");
+        assert!(style.flags.is_empty(), "no flags");
+        assert!(!style.protected, "not protected");
+        assert!(style.is_default(), "cached is_default");
+        assert!(!style.has_style_extras(), "no style extras");
         assert_eq!(
             style.build_style().attrs,
             StyleAttrs::empty(),
-            "default rendition should denote empty StyleAttrs"
+            "the default rendition denotes empty StyleAttrs"
         );
     }
 
-    // =========================================================================
-    // Setting/clearing individual attributes
-    // =========================================================================
-
     #[test]
-    fn test_set_bold_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::BOLD);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::BOLD));
-        assert!(!style.is_default(), "bold style is not default");
-    }
-
-    #[test]
-    fn test_set_italic_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::ITALIC);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::ITALIC));
-        assert!(!style.is_default());
-    }
-
-    #[test]
-    fn test_set_underline_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::UNDERLINE);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::UNDERLINE));
-    }
-
-    #[test]
-    fn test_set_dim_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::DIM);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::DIM));
-        assert!(!style.is_default());
-    }
-
-    #[test]
-    fn test_set_blink_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::BLINK);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::BLINK));
-    }
-
-    #[test]
-    fn test_set_inverse_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::INVERSE);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::INVERSE));
-    }
-
-    #[test]
-    fn test_set_hidden_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::HIDDEN);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::HIDDEN));
-    }
-
-    #[test]
-    fn test_set_strikethrough_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::STRIKETHROUGH);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::STRIKETHROUGH));
-    }
-
-    #[test]
-    fn test_set_overline_flag() {
-        let mut style = CurrentStyle::default();
-        style.flags.insert(CellFlags::OVERLINE);
-        style.update_cached_colors();
-        assert!(style.flags.contains(CellFlags::OVERLINE));
-        assert!(
-            style.has_style_extras(),
-            "overline is an extended flag requiring style extras"
-        );
+    fn one_attribute_or_colour_leaves_the_default() {
+        // (label, flag, fg, bg, needs style extras). Each row was its own test.
+        // Style extras are needed for the extended flag bits (11-13) and RGB.
+        let d_fg = PackedColor::DEFAULT_FG;
+        let d_bg = PackedColor::DEFAULT_BG;
+        let empty = CellFlags::empty();
+        let rows = [
+            ("bold", CellFlags::BOLD, d_fg, d_bg, false),
+            ("italic", CellFlags::ITALIC, d_fg, d_bg, false),
+            ("underline", CellFlags::UNDERLINE, d_fg, d_bg, false),
+            ("dim", CellFlags::DIM, d_fg, d_bg, false),
+            ("blink", CellFlags::BLINK, d_fg, d_bg, false),
+            ("inverse", CellFlags::INVERSE, d_fg, d_bg, false),
+            ("hidden", CellFlags::HIDDEN, d_fg, d_bg, false),
+            ("strikethrough", CellFlags::STRIKETHROUGH, d_fg, d_bg, false),
+            (
+                "overline (extended bits)",
+                CellFlags::OVERLINE,
+                d_fg,
+                d_bg,
+                true,
+            ),
+            ("indexed fg 1", empty, PackedColor::indexed(1), d_bg, false),
+            ("indexed bg 4", empty, d_fg, PackedColor::indexed(4), false),
+            ("rgb fg", empty, PackedColor::rgb(255, 128, 0), d_bg, true),
+            ("rgb bg", empty, d_fg, PackedColor::rgb(0, 64, 128), true),
+        ];
+        for (label, flag, fg, bg, extras) in rows {
+            let mut style = CurrentStyle {
+                fg,
+                bg,
+                ..CurrentStyle::default()
+            };
+            style.flags.insert(flag);
+            style.update_cached_colors();
+            assert!(style.flags.contains(flag), "{label}: flag set");
+            assert_eq!(style.fg, fg, "{label}: fg");
+            assert_eq!(style.bg, bg, "{label}: bg");
+            assert!(!style.is_default(), "{label}: no longer default");
+            assert_eq!(style.has_style_extras(), extras, "{label}: style extras");
+        }
     }
 
     #[test]
@@ -451,64 +377,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Setting fg/bg colors (indexed, RGB)
+    // Several colours at once
     // =========================================================================
-
-    #[test]
-    fn test_set_indexed_fg_color() {
-        let mut style = CurrentStyle {
-            fg: PackedColor::indexed(1),
-            ..CurrentStyle::default()
-        };
-        style.update_cached_colors();
-        assert!(!style.is_default(), "indexed fg is not default");
-        assert!(style.fg.is_indexed());
-        assert_eq!(style.fg.index(), 1);
-    }
-
-    #[test]
-    fn test_set_indexed_bg_color() {
-        let mut style = CurrentStyle {
-            bg: PackedColor::indexed(4),
-            ..CurrentStyle::default()
-        };
-        style.update_cached_colors();
-        assert!(!style.is_default(), "indexed bg is not default");
-        assert!(style.bg.is_indexed());
-        assert_eq!(style.bg.index(), 4);
-    }
-
-    #[test]
-    fn test_set_rgb_fg_color() {
-        let mut style = CurrentStyle {
-            fg: PackedColor::rgb(255, 128, 0),
-            ..CurrentStyle::default()
-        };
-        style.update_cached_colors();
-        assert!(!style.is_default());
-        assert!(style.fg.is_rgb());
-        assert!(
-            style.has_style_extras(),
-            "RGB fg requires style extras overflow"
-        );
-        let (r, g, b) = style.fg.rgb_components();
-        assert_eq!((r, g, b), (255, 128, 0));
-    }
-
-    #[test]
-    fn test_set_rgb_bg_color() {
-        let mut style = CurrentStyle {
-            bg: PackedColor::rgb(0, 64, 128),
-            ..CurrentStyle::default()
-        };
-        style.update_cached_colors();
-        assert!(!style.is_default());
-        assert!(style.bg.is_rgb());
-        assert!(
-            style.has_style_extras(),
-            "RGB bg requires style extras overflow"
-        );
-    }
 
     #[test]
     fn test_both_rgb_colors() {

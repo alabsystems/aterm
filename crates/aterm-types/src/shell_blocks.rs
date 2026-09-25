@@ -10,7 +10,7 @@
 //! Terminal query/manipulation APIs that consume these types live in
 //! `aterm-core`'s terminal shell/block accessors.
 
-use crate::shell_types::current_time_ms;
+use crate::shell_types::{current_time_ms, elapsed_ms};
 
 /// The state of an output block.
 ///
@@ -194,12 +194,7 @@ impl OutputBlock {
     /// Returns `None` if timestamps are incomplete or inconsistent.
     #[must_use]
     pub fn exec_duration_ms(&self) -> Option<u64> {
-        match (self.command_exec_start_time_ms, self.command_end_time_ms) {
-            // saturating_sub: exact under the `end >= start` guard (which the
-            // verifier cannot chain into the arm's arithmetic).
-            (Some(start), Some(end)) if end >= start => Some(end.saturating_sub(start)),
-            _ => None,
-        }
+        elapsed_ms(self.command_exec_start_time_ms, self.command_end_time_ms)
     }
 
     /// Calculate the total command duration in milliseconds.
@@ -209,12 +204,7 @@ impl OutputBlock {
     /// Returns `None` if either timestamp is missing or inconsistent.
     #[must_use]
     pub fn command_duration_ms(&self) -> Option<u64> {
-        match (self.prompt_time_ms, self.command_end_time_ms) {
-            // saturating_sub: exact under the `end >= start` guard (which the
-            // verifier cannot chain into the arm's arithmetic).
-            (Some(start), Some(end)) if end >= start => Some(end.saturating_sub(start)),
-            _ => None,
-        }
+        elapsed_ms(self.prompt_time_ms, self.command_end_time_ms)
     }
 
     /// Get the typed row span for the prompt portion of this block.

@@ -101,15 +101,17 @@ struct Proof {
 /// Injected only through private functions in unit tests. Production callers
 /// always use these committed anchors; no environment or enrollment file can
 /// replace the authority.
+///
+/// The paper master is the ONE anchor (K1 retired, 2026-09-23): an appcast is
+/// authorized by a machine the master-signed roster admits, never by a bare channel
+/// key, so a build that pins no master verifies no update channel at all.
 #[derive(Clone, Copy)]
 struct Pins<'a> {
     masters: &'a [&'a str],
-    channels: &'a [&'a str],
 }
 
 const PRODUCTION_PINS: Pins<'static> = Pins {
     masters: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-    channels: aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS,
 };
 
 fn uid() -> u32 {
@@ -665,48 +667,41 @@ fn authorize_one(
     proof: &Proof,
     pins: Pins<'_>,
 ) -> Result<Manifest, String> {
-    let attribution = if pins.masters.is_empty() {
-        crate::sig::verify_detached_any(pins.channels, &proof.appcast, &proof.signature)
-            .map_err(|e| format!("Linux appcast signature refused: {e:?}"))?;
-        None
-    } else {
-        let verified = aterm_update_core::verify_roster(
-            pins.masters,
-            proof.roster.clone(),
-            &proof.roster_signature,
-        )
-        .map_err(|e| format!("machine roster signature refused: {e:?}"))?;
-        let roster = aterm_update_core::Roster::parse(&verified)
-            .map_err(|e| format!("machine roster refused: {e:?}"))?;
-        let unix = now()?;
-        roster
-            .admit(state.roster_floor, unix)
-            .map_err(|e| format!("machine roster admission refused: {e:?}"))?;
-        state.roster_floor = state.roster_floor.max(roster.roster_seq);
-        for machine in &roster.revoked {
-            if !state.revoked_machines.contains(machine) {
-                state.revoked_machines.push(machine.clone());
-            }
+    if pins.masters.is_empty() {
+        return Err("this build pins no paper master, so it verifies no update channel".into());
+    }
+    let verified = aterm_update_core::verify_roster(
+        pins.masters,
+        proof.roster.clone(),
+        &proof.roster_signature,
+    )
+    .map_err(|e| format!("machine roster signature refused: {e:?}"))?;
+    let roster = aterm_update_core::Roster::parse(&verified)
+        .map_err(|e| format!("machine roster refused: {e:?}"))?;
+    let unix = now()?;
+    roster
+        .admit(state.roster_floor, unix)
+        .map_err(|e| format!("machine roster admission refused: {e:?}"))?;
+    state.roster_floor = state.roster_floor.max(roster.roster_seq);
+    for machine in &roster.revoked {
+        if !state.revoked_machines.contains(machine) {
+            state.revoked_machines.push(machine.clone());
         }
-        // Observation is durable even if the admitted roster revokes this appcast's
-        // signer. Never retry a revoked signer under an older roster afterwards.
-        context.save(state)?;
-        Some(
-            roster
-                .authorize_appcast(&proof.appcast, &proof.signature, unix)
-                .map_err(|e| format!("Linux appcast authorization refused: {e:?}"))?,
-        )
-    };
+    }
+    // Observation is durable even if the admitted roster revokes this appcast's
+    // signer. Never retry a revoked signer under an older roster afterwards.
+    context.save(state)?;
+    let attribution = roster
+        .authorize_appcast(&proof.appcast, &proof.signature, unix)
+        .map_err(|e| format!("Linux appcast authorization refused: {e:?}"))?;
     let text = std::str::from_utf8(&proof.appcast).map_err(|e| e.to_string())?;
     let manifest = Manifest::parse(text)?;
-    if let Some(attribution) = attribution {
-        if state.revoked_machines.contains(&attribution.machine_id) {
-            return Err("appcast signer is in the durable revocation set".into());
-        }
-        attribution
-            .bind(manifest.machine_id.as_deref(), manifest.roster_seq)
-            .map_err(|e| format!("Linux appcast signer attribution refused: {e:?}"))?;
+    if state.revoked_machines.contains(&attribution.machine_id) {
+        return Err("appcast signer is in the durable revocation set".into());
     }
+    attribution
+        .bind(manifest.machine_id.as_deref(), manifest.roster_seq)
+        .map_err(|e| format!("Linux appcast signer attribution refused: {e:?}"))?;
     state.min_build = state.min_build.max(manifest.min_build.unwrap_or(0));
     context.save(state)?;
     Ok(manifest)
@@ -1203,48 +1198,6 @@ fn authenticate_tag(
     Ok(manifest)
 }
 
-/// The head's authenticated policy is observed even when that release has no
-/// native payload. Older payloads are judged under that SAME current roster,
-/// never their historically attached (possibly now revoked) authorizations.
-fn older_native_candidate(
-    context: &Context,
-    state: &mut State,
-    head_tag: &str,
-    head_proof: &Proof,
-    candidates: &[aterm_update_core::release_catalog::ReleaseCandidate],
-    pins: Pins<'_>,
-    mut fetch: impl FnMut(
-        &aterm_update_core::release_catalog::ReleaseCandidate,
-        &Proof,
-    ) -> Result<Proof, String>,
-) -> Result<(String, Manifest, Proof), String> {
-    let head_key = aterm_update_core::tag::parse_release_tag(head_tag)
-        .map_err(|e| format!("invalid head: {e:?}"))?;
-    for candidate in candidates {
-        // Untrusted inventory is only a discovery hint, never authorization.
-        // Mac-only history (including retired signers) cannot wedge a Linux
-        // channel that offers no native payload in those unrelated releases.
-        if !candidate.has_linux(native()?) {
-            continue;
-        }
-        let tag = &candidate.tag;
-        let key = aterm_update_core::tag::parse_release_tag(tag)
-            .map_err(|e| format!("invalid catalog tag: {e:?}"))?;
-        if key >= head_key {
-            continue;
-        }
-        let proof = fetch(candidate, head_proof)?;
-        let manifest = authenticate_tag(context, state, tag, &proof, pins)?;
-        if manifest.linux_artifact(native()?)?.is_some() {
-            return Ok((tag.clone(), manifest, proof));
-        }
-    }
-    Err(format!(
-        "no authenticated {} Linux executable is published in the release channel",
-        native()?.triple()
-    ))
-}
-
 fn discovered_head(
     pointer: Result<aterm_update_core::pointer::Pointer, aterm_update_core::pointer::PointerError>,
 ) -> Result<String, String> {
@@ -1287,49 +1240,32 @@ fn check_locked(
             )
         },
     ))?;
-    let mut tags = None;
-    let (tag, proof) = match download_proof(source, &head, None) {
-        Ok(proof) => (head, proof),
+    // The channel is read on the release download host alone — the pointer, then the
+    // head's own tag-specific assets — and never listed through the GitHub API (owner
+    // ruling R3). A head that is not an app release YET (its appcast answers 404) or that
+    // carries no executable for this architecture has nothing to install: a healthy,
+    // recorded outcome, and the next check reads the head again. The cut owns the head
+    // (it moves `latest` only to a release carrying its app assets), so neither state
+    // outlasts a cut that ships this target.
+    let proof = match download_proof(source, &head, None) {
+        Ok(proof) => proof,
         Err(error) if error.starts_with("missing appcast: ") => {
-            let catalog = aterm_update_core::release_catalog::candidates(source, None)?;
-            let tag = catalog
-                .iter()
-                .find(|candidate| candidate.current_appcast)
-                .ok_or("no signed app release is published")?
-                .tag
-                .clone();
-            let proof = download_proof(source, &tag, None)?;
-            tags = Some(catalog);
-            (tag, proof)
+            state.outcome =
+                format!("channel head {head} has no app manifest yet — nothing to install from it");
+            return context.save(state);
         }
         Err(error) => return Err(error),
     };
+    let tag = head;
     let manifest = authenticate_tag(context, state, &tag, &proof, PRODUCTION_PINS)?;
     let target = native()?;
-    let (tag, manifest, proof) = if manifest.linux_artifact(target)?.is_some() {
-        (tag, manifest, proof)
-    } else {
-        let tags = match tags {
-            Some(tags) => tags,
-            None => aterm_update_core::release_catalog::candidates(source, None)?,
-        };
-        older_native_candidate(
-            context,
-            state,
-            &tag,
-            &proof,
-            &tags,
-            PRODUCTION_PINS,
-            |candidate, roster| {
-                download_named_proof(
-                    source,
-                    &candidate.tag,
-                    &candidate.appcast_name(),
-                    Some(roster),
-                )
-            },
-        )?
-    };
+    if manifest.linux_artifact(target)?.is_none() {
+        state.outcome = format!(
+            "channel head {tag} carries no {} executable — nothing to install from it",
+            target.triple()
+        );
+        return context.save(state);
+    }
     let artifact = manifest
         .linux_artifact(target)?
         .ok_or("elected Linux artifact disappeared")?;

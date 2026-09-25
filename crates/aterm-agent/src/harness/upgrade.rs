@@ -29,17 +29,28 @@
 //!    original flags ([`rewrite_argv`]) and `--resume <sessionId>`, healing a
 //!    stale shell's PATH in the same line when the tab needs it.
 //! 4. **Continue** — once the new process has re-registered the SAME session,
-//!    type one turn telling the agent it was upgraded and to carry on
-//!    ([`continue_prompt`]).
+//!    type one turn telling the agent it was upgraded, and which model it ran
+//!    before the restart, and to carry on ([`continue_prompt`]).
+//! 5. **Confirm** — read the model the resumed session's first answer names
+//!    ([`transcript_first_model`], past the mark the restart took, in the new
+//!    build's rows) and record it beside the one before ([`restart_outcome`]).
+//!    The rewrite keeps an explicit `--model` ([`launch_model`]) and adds none,
+//!    so a session launched without one comes back on Claude Code's default at
+//!    the relaunch: a change is the expected outcome and is only said, with
+//!    what decided it; a session that has not answered in time is said to be
+//!    UNCONFIRMED.
 //!
 //! Everything here is PURE: parsers, the target rule, the argv rewrite, the
-//! line, the prompts and the two gates, each over facts a driver measured. The
-//! driver (`cli::run_upgrade`) owns the I/O; the facts it feeds in are named at
-//! each function. The session file `~/.claude/sessions/<pid>.json` is Claude
-//! Code's own record (measured 2.1.278-2.1.281: `pid`, `sessionId`, `cwd`,
-//! `version`, `status` busy|shell|idle|waiting, `statusUpdatedAt` ms, `procStart`,
-//! `kind`, `entrypoint`); it is a third party's file, so every read refuses on an
-//! unexpected shape rather than guessing.
+//! line, the prompts, the model reads, the outcome line and the two gates,
+//! each over facts a driver measured. The driver (`cli::run_upgrade`) owns the
+//! I/O; the facts it feeds in are named at each function. The session file
+//! `~/.claude/sessions/<pid>.json` is Claude Code's own record (measured
+//! 2.1.278-2.1.281: `pid`, `sessionId`, `cwd`, `version`, `status`
+//! busy|shell|idle|waiting, `statusUpdatedAt` ms, `procStart`, `kind`,
+//! `entrypoint`); it is a third party's file, so every read refuses on an
+//! unexpected shape rather than guessing. So is the transcript
+//! (`~/.claude/projects/<dir>/<sessionId>.jsonl`), read for the READY answer
+//! and the model.
 
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -422,7 +433,19 @@ fn maybe_option(tok: &str) -> bool {
 /// An unknown flag ([`ArgvRefusal::UnknownFlag`]) or one whose session is not a
 /// TUI resumable in place ([`ArgvRefusal::NotResumable`]).
 pub fn rewrite_argv(argv: &[String], session_id: &str) -> Result<Vec<String>, ArgvRefusal> {
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<String> = carried(argv)?
+        .into_iter()
+        .flat_map(|(_, tokens)| tokens.iter().cloned())
+        .collect();
+    out.push("--resume".to_string());
+    out.push(session_id.to_string());
+    Ok(out)
+}
+
+/// Every flag [`rewrite_argv`] carries, in argv order: its name and its tokens
+/// as the CLI parsed them (`--model=<v>` is one token, `--model <v>` two).
+fn carried(argv: &[String]) -> Result<Vec<(&str, &[String])>, ArgvRefusal> {
+    let mut out = Vec::new();
     let mut i = 1;
     while i < argv.len() {
         let tok = &argv[i];
@@ -472,12 +495,27 @@ pub fn rewrite_argv(argv: &[String], session_id: &str) -> Result<Vec<String>, Ar
             }
         }
         if fate == Fate::Keep {
-            out.extend(argv[start..i].iter().cloned());
+            out.push((name, &argv[start..i]));
         }
     }
-    out.push("--resume".to_string());
-    out.push(session_id.to_string());
     Ok(out)
+}
+
+/// THE MODEL THE RELAUNCH ASKS FOR: the value of the `--model` [`rewrite_argv`]
+/// keeps from `argv` — the last one, as Claude's parser takes it — or `None`
+/// when the launch named none, or its argv is one the rewrite refuses.
+#[must_use]
+pub fn launch_model(argv: &[String]) -> Option<String> {
+    let flags = carried(argv).ok()?;
+    let (_, tokens) = flags
+        .into_iter()
+        .rev()
+        .find(|(name, _)| *name == "--model")?;
+    match tokens {
+        [one] => one.split_once('=').map(|(_, v)| v.to_string()),
+        [_, value] => Some(value.clone()),
+        _ => None,
+    }
 }
 
 /// The tab's shell, as its executable names it.
@@ -729,13 +767,116 @@ pub fn prepare_prompt(from: &Version, to: &Version, source: Source, marker: &str
 }
 
 /// THE CONTINUATION, typed once the relaunched process holds the same session.
+/// `ran` is the model the session's last turn before the restart named
+/// ([`transcript_model`]), said in one neutral clause so the agent — and the
+/// person reading the tab — knows what it ran before; `None` (no turn named
+/// one) leaves the clause out.
 #[must_use]
-pub fn continue_prompt(from: &Version, to: &Version) -> String {
+pub fn continue_prompt(from: &Version, to: &Version, ran: Option<&str>) -> String {
+    let resumed = match ran {
+        Some(model) => format!("; it ran {model} before the restart and was resumed"),
+        None => " and resumed".to_string(),
+    };
     format!(
-        "[aterm harness] Upgraded: this session was restarted on Claude Code {to} (from {from}) \
-         and resumed. Continue where you left off; if you were waiting on the user, say so in \
-         one line."
+        "[aterm harness] Upgraded: this session was restarted on Claude Code {to} (from \
+         {from}){resumed}. Continue where you left off; if you were waiting on the user, say so \
+         in one line."
     )
+}
+
+/// THE MODEL the LAST assistant turn in `jsonl` (a transcript's tail) names as
+/// `message.model` — what the session ran when it last answered. Read like
+/// [`transcript_has_ready`] reads the same tail: a line that is not JSON (the
+/// tail's cut first line, a last line caught half-written) is skipped.
+///
+/// A row is a turn of THE SESSION'S model only when it is an `assistant` row,
+/// not a subagent's (`isSidechain`), and its model looks like a model id
+/// ([`is_model_id`]). Claude Code writes assistant rows of its own that name
+/// `<synthetic>` (measured 2026-09-24: 34 in the owner's session transcripts,
+/// 22 of them in one, and 90 counting subagents' files — a limit notice,
+/// an API error, and `No response requested.` written just after a restart);
+/// those are skipped, never taken as the model.
+#[must_use]
+pub fn transcript_model(jsonl: &str) -> Option<String> {
+    assistant_models(jsonl, None).last()
+}
+
+/// THE MODEL the FIRST assistant turn in `jsonl` that the build `version`
+/// wrote names, by the rules of [`transcript_model`] — for the bytes past a
+/// restart's mark, whose first answer from the NEW build is the resumed
+/// session's own. Every transcript row carries the `version` that wrote it
+/// (measured 2026-09-24: all 25,018 assistant rows in the owner's session
+/// transcripts), so a row the old process wrote past the mark — alive past its
+/// SIGTERM for one more turn — is skipped, and so is a row naming no version.
+#[must_use]
+pub fn transcript_first_model(jsonl: &str, version: &str) -> Option<String> {
+    assistant_models(jsonl, Some(version)).next()
+}
+
+/// Every model the session's assistant turns in `jsonl` name, in order — only
+/// the rows the build `version` wrote, when one is given.
+fn assistant_models<'a>(
+    jsonl: &'a str,
+    version: Option<&'a str>,
+) -> impl Iterator<Item = String> + 'a {
+    jsonl.lines().filter_map(move |line| {
+        if !line.contains("assistant") {
+            return None;
+        }
+        let v = aterm_json::from_str::<Value>(line).ok()?;
+        if v.get("type").and_then(Value::as_str) != Some("assistant")
+            || v.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || version.is_some_and(|want| v.get("version").and_then(Value::as_str) != Some(want))
+        {
+            return None;
+        }
+        let model = v.get("message")?.get("model")?.as_str()?;
+        is_model_id(model).then(|| model.to_string())
+    })
+}
+
+/// Whether `m` looks like a model id: 1 to 256 bytes of ASCII letters, digits
+/// and `. _ - : @ / [ ]` — `claude-opus-5-5`, `claude-opus-5-5[1m]`, a cloud
+/// provider's `us.anthropic.…-v1:0`, `…@<date>` or an inference profile's ARN
+/// (well past 64 bytes). `<synthetic>` is not one, and neither is anything with
+/// a space or a control character: the id is typed into the tab in the
+/// continuation, so a third party's file never puts a keystroke there, nor an
+/// unbounded run of bytes.
+fn is_model_id(m: &str) -> bool {
+    (1..=256).contains(&m.len())
+        && m.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-:@/[]".contains(&b))
+}
+
+/// THE OUTCOME LINE for the owner, once the resumed session has answered (or
+/// has not): the build it restarted on and the model its first answer named.
+/// A model other than the one before is said with what decided the model
+/// after, the expected outcome and not a fault: `kept`, the `--model` the
+/// relaunch kept from the launch ([`launch_model`]) — which undoes a `/model`
+/// choice made since and resolves an alias against the new build — or, with
+/// none kept, the rule that a session launched without one takes whatever
+/// Claude Code's default is at the relaunch. `after` of `None` is UNCONFIRMED,
+/// with the model before when there was one.
+#[must_use]
+pub fn restart_outcome(
+    to: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+    kept: Option<&str>,
+) -> String {
+    let head = format!("claude restarted on {to} · model");
+    match (before, after) {
+        (Some(b), Some(a)) if b != a => {
+            let why = kept.map_or_else(
+                || "a session launched without --model takes the current default".to_string(),
+                |m| format!("the relaunch kept the launch's --model {m}"),
+            );
+            format!("{head} {b} -> {a} ({why}; /model changes it)")
+        }
+        (_, Some(a)) => format!("{head} {a}"),
+        (Some(b), None) => format!("{head} unconfirmed (it ran {b} before the restart)"),
+        (None, None) => format!("{head} unconfirmed"),
+    }
 }
 
 /// Whether the transcript's assistant turns carry `marker` as a line of their

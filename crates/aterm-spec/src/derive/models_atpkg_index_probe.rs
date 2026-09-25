@@ -6,8 +6,8 @@
 use super::*;
 
 /// The GUI package lane owns at most one asynchronous index probe across park
-/// slices. A positive near HEAD may be offered while the far/listing helpers
-/// remain owned; their final answer cannot offer that same build twice. A
+/// slices. A positive HEAD may be offered while the probe's other HEAD is still
+/// out; its final answer cannot offer that same build twice. A
 /// vendor completion may be chosen while the probe is still running; an index
 /// answer already offered at the decision point wins over the vendor.
 /// A vendor answer harvested in that same slice survives the index, bump, or
@@ -189,33 +189,43 @@ pub fn atpkg_index_pending_park_model() -> Model {
     }
 }
 
-/// One `Probe*` action is one locked range attempt, which may issue several
-/// bounded HEADs before writing its single stamp. `age` advances in 30-second
-/// ticks; the near range's missing and published hints cool for one tick, an
-/// ordinary error for ten, and a listing API rate limit for 120.
-/// A changed durable floor bypasses an old stamp immediately. Tier-1
-/// drives `atpkg::index_probe::probe_range` and its real lock/stamp file.
+/// One `Probe*` action is one locked attempt — the pair of HEADs, `floor + 1` and
+/// `floor + 2` — before its single stamp is written. `age` advances in 30-second ticks
+/// (`atpkg::index_probe::INTERVAL`); a missing pair and a published hint cool for one
+/// tick, an error (the download host's 429 included) for ten. A changed durable floor
+/// bypasses an old stamp immediately. Tier-1 drives `atpkg::index_probe::probe_next` and
+/// its real lock/stamp file.
 ///
-/// `Buggy=1` admits a second lock owner and a second range attempt inside its
-/// cooldown, lengthens the near published cooldown to five minutes, and shortens
-/// error/rate-limit cooldowns to one tick. Each
-/// invariant has its own counterexample: mutual exclusion alone is insufficient
-/// to prevent duplicate work after the first owner releases the lock.
+/// Until 2026-09-23 a second locked range (`floor + 3`, `floor + 4`, every five minutes)
+/// also fetched an anonymous Releases listing when its HEADs missed, and a rate-limited
+/// listing stamped an hour (`ProbeRateLimited`, marker 4). Every cooldown held, so nothing
+/// here was violated, yet in the steady state that listing ran every five minutes on every
+/// machine (audit PK-2): a request budget, not a cooldown. It is gone with its action and
+/// its range (owner ruling R3; the publisher's contiguous index builds left the far range
+/// nothing to find). That the probe spends no metered request is a fact of the code, whose
+/// only transport is the HEAD, not a property of this model; `atpkg::index_probe`'s tests
+/// pin it with a recording transport over a hundred steady-state ticks.
+///
+/// `Buggy=1` admits a second lock owner and a second attempt inside its cooldown,
+/// lengthens the published cooldown to five minutes, and shortens the error cooldown to
+/// one tick. Each invariant has its own counterexample: mutual exclusion alone is
+/// insufficient to prevent duplicate work after the first owner releases the lock.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_probe_cooldown_model() -> Model {
     crate::ty_model! {
         AtpkgIndexProbeCooldown {
             const Buggy = 0;
-            const MaxAge = 120;
+            // Saturates past the longest cooldown (an error's ten ticks).
+            const MaxAge = 11;
             // 0 unlocked, 1 lock held before stamp decision, 2 decided/written.
             var phase = 0;
             var floor = 1;
             var stamp_floor = 0;
-            // marker: 0 absent, 1 missing, 2 error, 3 published, 4 rate-limited.
+            // marker: 0 absent, 1 missing, 2 error, 3 published.
             var marker = 0;
             var ttl = 0;
-            var age = 120;
+            var age = 11;
             var duplicate = 0;
 
             action Acquire when (
@@ -287,38 +297,22 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
                 age = 0;
                 phase = 2;
             }
-            action ProbeRateLimited when (
-                phase == 1 &&
-                (stamp_floor <= floor - 1 || age > ttl - 1 || Buggy == 1)
-            ) {
-                duplicate = if stamp_floor == floor && age <= ttl - 1 {
-                    1
-                } else {
-                    duplicate
-                };
-                stamp_floor = floor;
-                marker = 4;
-                ttl = if Buggy == 1 { 1 } else { 120 };
-                age = 0;
-                phase = 2;
-            }
             invariant OneOwner: phase <= 2;
             invariant NoDuplicateRangeInsideCooldown: duplicate == 0;
             invariant StampMatchesOutcome:
                 (marker == 0 && ttl == 0) ||
                 (marker == 1 && ttl == 1) ||
                 (marker == 2 && ttl == 10) ||
-                (marker == 3 && ttl == 1) ||
-                (marker == 4 && ttl == 120);
+                (marker == 3 && ttl == 1);
         }
     }
 }
 
-/// Three independently stamped hints are aggregated after all three have had
-/// their chance to run. A published higher build wins over an earlier lower
-/// build and over uncertainty; `Missing` is valid only when every hint really
-/// answered missing. `Buggy=1` replays the old first-hit and false-missing
-/// behavior. Tier-1 drives `successor_with` with real HEAD/listing closures.
+/// The probe's two HEADs — `floor + 1` (Low) and `floor + 2` (High) — are aggregated
+/// after both have had their chance to run. A published higher build wins over an
+/// earlier lower build and over uncertainty; `Missing` is valid only when both HEADs
+/// really answered missing. `Buggy=1` replays the old first-hit and false-missing
+/// behavior. Tier-1 drives `atpkg::index_probe::successor_with` over real HEAD answers.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_successor_selection_model() -> Model {
@@ -329,32 +323,27 @@ pub fn atpkg_index_successor_selection_model() -> Model {
             var first = 0;
             var highest = 0;
             var uncertain = 0;
-            // 0 undecided, 1 missing, 2 deferred, 3/4/5 published ranks.
+            // 0 undecided, 1 missing, 2 deferred, 3/5 published ranks (floor+1, floor+2).
             var chosen = 0;
 
-            action ObserveMissing when (seen <= 2) {
+            action ObserveMissing when (seen <= 1) {
                 seen = seen + 1;
             }
-            action ObserveDeferred when (seen <= 2) {
+            action ObserveDeferred when (seen <= 1) {
                 seen = seen + 1;
                 uncertain = 1;
             }
-            action ObserveLow when (seen <= 2) {
+            action ObserveLow when (seen <= 1) {
                 seen = seen + 1;
                 first = if first == 0 { 3 } else { first };
                 highest = if highest <= 2 { 3 } else { highest };
             }
-            action ObserveMiddle when (seen <= 2) {
-                seen = seen + 1;
-                first = if first == 0 { 4 } else { first };
-                highest = if highest <= 3 { 4 } else { highest };
-            }
-            action ObserveHigh when (seen <= 2) {
+            action ObserveHigh when (seen <= 1) {
                 seen = seen + 1;
                 first = if first == 0 { 5 } else { first };
                 highest = 5;
             }
-            action Choose when (seen == 3 && chosen == 0) {
+            action Choose when (seen == 2 && chosen == 0) {
                 chosen = if Buggy == 1 && first > 0 {
                     first
                 } else if Buggy == 1 {

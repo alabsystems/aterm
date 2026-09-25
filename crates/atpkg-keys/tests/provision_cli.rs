@@ -37,7 +37,7 @@
 
 use aterm_update_core::roster::{Roster, verify_roster};
 use atpkg_keys::master::parse_master;
-use atpkg_keys::pins_edit::{CHANNEL_ANCHOR, MASTER_ANCHOR, read_anchor};
+use atpkg_keys::pins_edit::{MASTER_ANCHOR, read_anchor};
 use atpkg_keys::roster_ops::{add, empty};
 use std::io::Read as _;
 use std::io::Write as _;
@@ -49,15 +49,14 @@ use std::process::{Child, Command, Output, Stdio};
 /// An obviously synthetic master. It appears nowhere outside tests.
 const PAPER: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
 
-/// The real head of the shipped keyset, used here purely as a realistic incumbent whose
-/// survival is being asserted.
+/// A realistic machine key for a roster entry this test writes by hand.
 const HEAD_KEY: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
 
 /// 2026-08-04T00:00:00Z.
 const NOW: u64 = 1_785_801_600;
 
-/// A `pins.rs` in the two shapes the real file uses. The argument is either empty (the
-/// unarmed anchor) or a single key to arm it with.
+/// A `pins.rs` master anchor. The argument is either empty (the unarmed anchor) or a
+/// single key to arm it with.
 fn pins_fixture(master_entry: &str) -> String {
     let mut s = String::from(
         "// Copyright 2026 Andrew Yates\n\
@@ -72,14 +71,6 @@ fn pins_fixture(master_entry: &str) -> String {
         s.push_str(master_entry);
         s.push_str("\",\n];\n");
     }
-    s.push_str(
-        "\n\
-         /// The channel keyset. ORDER IS A CONTRACT: index 0 is the head.\n\
-         pub const UPDATE_CHANNEL_PUBKEYS: &[&str] = &[\n\
-         \x20   // K1 — HEAD.\n\
-         \x20   \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",\n\
-         ];\n",
-    );
     s
 }
 
@@ -831,8 +822,6 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
             &p(&dir, "roster.toml"),
             "--key",
             &p(&dir, "m3.key"),
-            "--head-id",
-            "m21",
         ],
     );
     assert!(
@@ -881,33 +870,16 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
         "the tool wrote the anchor the operator would otherwise have pasted"
     );
 
-    // THE KEYSET IS UNTOUCHED. The minted machine is authorized by the ROSTER; a keyset
-    // entry would be a grant no `machine-revoke` could ever take back, made to clients
-    // this tool cannot reach anyway.
-    let channel = read_anchor(&src, CHANNEL_ANCHOR).unwrap();
-    assert_eq!(channel.members, vec![HEAD_KEY.to_string()]);
-    assert_eq!(
-        channel.head(),
-        Some(HEAD_KEY),
-        "the incumbent head survives"
-    );
-    // THE ROSTER NAMES THE INCUMBENT FIRST, THEN THIS MACHINE. Without the first entry,
-    // committing this anchor would leave the machine holding the head key — the one key
-    // clients that predate the roster can verify — unable to cut.
+    // THE ROSTER NAMES THIS MACHINE, and only it: no incumbent is seeded.
     let bytes = std::fs::read(p(&dir, "roster.toml")).unwrap();
     let sig = std::fs::read(p(&dir, "roster.toml.sig")).unwrap();
     let roster = Roster::parse(&verify_roster(&[&master_pub], bytes, &sig).expect("verifies"))
         .expect("parses");
-    assert_eq!(roster.machines.len(), 2);
-    assert_eq!(
-        roster.machines[0].id, "m21",
-        "--head-id named the incumbent"
-    );
-    assert_eq!(roster.machines[0].pubkey, HEAD_KEY);
-    assert_eq!(roster.machines[1].id, "m3");
+    assert_eq!(roster.machines.len(), 1);
+    assert_eq!(roster.machines[0].id, "m3");
     // THE MINTED KEY IS ON THE ROSTER AND IN NO ANCHOR — read from the roster, because
     // the anchor file is no longer a place it could be read from.
-    let machine_pub = roster.machines[1].pubkey.clone();
+    let machine_pub = roster.machines[0].pubkey.clone();
     assert!(
         !src.contains(&machine_pub),
         "the minted key must appear nowhere in the anchor file: {src}"
@@ -930,23 +902,13 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
         run.stdout
     );
     assert!(
-        run.stdout.contains("no pre-roster client is left"),
-        "{}",
-        run.stdout
-    );
-    assert!(
-        run.stdout.contains("--strand-pre-roster-clients"),
-        "{}",
-        run.stdout
-    );
-    assert!(
         run.stdout.contains("the ONLY roster this master signs"),
         "{}",
         run.stdout
     );
     assert!(
-        run.stdout.contains("incumbent keyset head"),
-        "{}",
+        !run.stdout.contains("--strand-pre-roster-clients") && !run.stdout.contains("keyset"),
+        "no retired lane is taught: {}",
         run.stdout
     );
 
@@ -1161,18 +1123,11 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
     );
     assert!(!good.stdout.contains(PAPER), "{}", good.stdout);
 
-    // `join` edited NO trust anchor: neither the master nor the keyset moved.
+    // `join` edited NO trust anchor.
     let src = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
     assert_eq!(
         read_anchor(&src, MASTER_ANCHOR).unwrap().members,
         vec![master_pub.clone()]
-    );
-    let keyset = read_anchor(&src, CHANNEL_ANCHOR).unwrap();
-    assert_eq!(keyset.head(), Some(HEAD_KEY));
-    assert_eq!(
-        keyset.members.len(),
-        1,
-        "the joining machine is ROSTER-ONLY — that is the whole point of the tier"
     );
 
     // The roster was EXTENDED, not replaced: m3 (put there by `armed_tree`) survives.

@@ -66,17 +66,15 @@ pub struct VendorSpec {
     pub digest_docs: &'static [DocPin],
     /// `NAME=VALUE` entries the shims export; never taken from the index.
     pub shim_env: &'static [&'static str],
-    /// The vendor version current when this row was written: nothing older is installed,
-    /// so a frozen or replayed CDN cannot hand a new machine an old build. It is also at
-    /// or above the version of every legacy pin up to [`Self::legacy_ceiling`].
+    /// The oldest version installed: a frozen or replayed CDN cannot hand a new machine an
+    /// old build. It is the version the final legacy pin names, so it is at or above every
+    /// legacy pin up to [`Self::legacy_ceiling`].
     pub floor: Version,
-    /// The newest legacy ALab index build of the program published before this row was
-    /// written — build 2026092201 of both, pinned by indexes 43–44 (read from the index
-    /// cache, 2026-09-22), whose signed pkg manifests name claude 2.1.280 and codex
-    /// 0.156.0: the floors. So a legacy build at or below it whose version cannot be read
-    /// is replaced by any admissible head with no index and no downgrade. A legacy build
-    /// above it was pinned after this code and may carry a version above the floor: unread,
-    /// only a person asking replaces it.
+    /// The final legacy ALab index build of the program — the last one any index pinned
+    /// before the vendor lane was retired. A legacy build at or below it whose version
+    /// cannot be read is replaced by any admissible head with no index and no downgrade. A
+    /// build above it (a pin this code never saw) may carry a version above the floor, so
+    /// the lane keeps it until its version is read (`legacy_facts`) or a person asks.
     pub legacy_ceiling: u64,
 }
 
@@ -117,13 +115,16 @@ const fn floor(major: u32, minor: u32, patch: u32) -> Version {
     }
 }
 
-/// The newest legacy pin published when this was written ([`VendorSpec::legacy_ceiling`]):
-/// indexes 43–44 pin claude and codex at build 2026092201, the compiled floors. The vendor
-/// lane has pinned past it since (index 45: codex 2026092301; index 46: claude 2026092401),
-/// so the release carrying this code re-derives it, and the floors, from the live index once
-/// that lane is booted out (docs/RUNBOOK-atpkg-republish.md, cutover steps 1–2);
-/// `spec_coherence` refuses a committed legacy pin above it.
-const LEGACY_CEILING: u64 = 2_026_092_201;
+/// The final legacy pins ([`VendorSpec::legacy_ceiling`]), read from the live index 46 on
+/// 2026-09-24 after the vendor lane was retired: claude 2026092401 (2.1.281) and codex
+/// 2026092301 (0.156.1), whose versions are the floors. No lane pins either program again
+/// (an index pin for one is a floor), and `spec_coherence` refuses a committed legacy pin
+/// above the ceiling. A legacy build above it all the same — a pin this code never saw — has
+/// its version read once from its signed manifest and kept in the stamp
+/// (`lane::legacy_facts`), then is decided like any read build; only while that read fails
+/// is it kept (`LegacyUnread`), and the next pass reads again. Raising the ceiling means
+/// raising the floors with it — never one without the other.
+const LEGACY_CEILING: u64 = 2_026_092_401;
 
 /// The vendor-direct programs, in [`crate::stub::AGENT_PROGRAMS`] order.
 pub const VENDORS: &[VendorSpec] = &[
@@ -143,7 +144,7 @@ pub const VENDORS: &[VendorSpec] = &[
         }],
         // Claude's own updater writes a copy under `~/.local` that this name never runs.
         shim_env: &["DISABLE_AUTOUPDATER=1"],
-        floor: floor(2, 1, 280),
+        floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
     },
     VendorSpec {
@@ -176,7 +177,7 @@ pub const VENDORS: &[VendorSpec] = &[
             },
         ],
         shim_env: &[],
-        floor: floor(0, 156, 0),
+        floor: floor(0, 156, 1),
         legacy_ceiling: LEGACY_CEILING,
     },
 ];
@@ -225,7 +226,7 @@ mod tests {
         );
         assert_eq!(claude.exposes, &["claude"]);
         assert_eq!(claude.shim_env, &["DISABLE_AUTOUPDATER=1"]);
-        assert_eq!(claude.floor.to_string(), "2.1.280");
+        assert_eq!(claude.floor.to_string(), "2.1.281");
         let codex = spec("codex").unwrap();
         assert_eq!(
             (codex.vendor, codex.anchor, codex.apple_team),
@@ -233,29 +234,12 @@ mod tests {
         );
         assert_eq!(codex.exposes, &["codex"]);
         assert!(codex.shim_env.is_empty());
-        assert_eq!(codex.floor.to_string(), "0.156.0");
-        // Build 2026092201 of both, the newest legacy pins (indexes 43–44), at the floors.
+        assert_eq!(codex.floor.to_string(), "0.156.1");
+        // The final legacy pins (index 46): claude 2026092401, codex 2026092301.
         for s in VENDORS {
-            assert_eq!(s.legacy_ceiling, 2_026_092_201, "{}", s.program);
+            assert_eq!(s.legacy_ceiling, 2_026_092_401, "{}", s.program);
             assert!(!super::super::is_vendor_build(s.legacy_ceiling));
         }
-    }
-
-    /// The floors are the versions of the committed fixtures, which were fetched from the
-    /// vendors the day this table was written.
-    #[test]
-    fn the_floors_are_the_fixture_releases() {
-        let manifest: aterm_json::Value =
-            aterm_json::from_str(include_str!("fixtures/claude-2.1.280-manifest.json")).unwrap();
-        let version = manifest["version"].as_str().unwrap();
-        assert_eq!(Version::parse(version), Some(spec("claude").unwrap().floor));
-        let build_date = manifest["buildDate"].as_str().unwrap();
-        assert!(super::super::version::BuildDate::parse(build_date).is_some());
-        let release: aterm_json::Value =
-            aterm_json::from_str(include_str!("fixtures/codex-channel-latest.json")).unwrap();
-        let tag = release["tag_name"].as_str().unwrap();
-        let codex_floor = spec("codex").unwrap().floor.to_string();
-        assert_eq!(tag.strip_prefix("rust-v"), Some(codex_floor.as_str()));
     }
 
     #[test]

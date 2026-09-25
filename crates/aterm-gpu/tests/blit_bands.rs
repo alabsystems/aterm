@@ -119,7 +119,7 @@ fn window_seven_px_past_grid_fit_offsets_content_without_scaling() {
     // CPU/GPU AGREEMENT: the softbuffer twin over the same source must equal
     // the GPU blit byte-for-byte — both backends absorb the remainder the same.
     let mut cpu = vec![0u32; dw * dh];
-    place_frame_bands(&mut cpu, dw, dh, &source.pixels, fw, fh, false, bg, 0);
+    place_frame_bands(&mut cpu, dw, dh, &source.pixels, fw, fh, false, bg, 0..0);
     for (i, (&c, &g)) in cpu.iter().zip(blit.pixels.iter()).enumerate() {
         assert_eq!(
             c & 0x00ff_ffff,
@@ -272,6 +272,7 @@ fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
     gpu.set_pad(9);
     gpu.set_chrome_bleed(Some(aterm_render::ChromeBleed {
         rows: 2,
+        first: 0,
         color: BAND,
         seam: None,
         top_extends_cells: false,
@@ -291,8 +292,8 @@ fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
     let (fw, fh) = (source.width, source.height);
     let edge_rows = gpu.chrome_extent_px(fh);
     assert!(
-        edge_rows > 0 && edge_rows < fh,
-        "two chrome rows: {edge_rows} of {fh}"
+        edge_rows.start == 0 && edge_rows.end > 0 && edge_rows.end < fh,
+        "two chrome rows from the top: {edge_rows:?} of {fh}"
     );
     let (dw, dh) = (fw + 7, fh + 7);
     let blit = gpu.blit_to_sized_for_test(&mut win, false, dw as u32, dh as u32);
@@ -308,7 +309,7 @@ fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
             if in_rows && in_cols {
                 continue;
             }
-            if in_rows && (sy as usize) < edge_rows {
+            if in_rows && edge_rows.contains(&(sy as usize)) {
                 let row = sy as usize * fw;
                 let edge = if sx < 0 {
                     source.pixels[row]
@@ -330,6 +331,92 @@ fn chrome_rows_continue_their_edge_pixels_through_the_leftover_bands() {
     assert_eq!(
         saw, [true; 3],
         "the band tone, the fill and the track all reached the edge"
+    );
+    let mut cpu = vec![0u32; dw * dh];
+    place_frame_bands(
+        &mut cpu,
+        dw,
+        dh,
+        &source.pixels,
+        fw,
+        fh,
+        false,
+        bg,
+        edge_rows,
+    );
+    for (i, (&c, &g)) in cpu.iter().zip(blit.pixels.iter()).enumerate() {
+        assert_eq!(
+            c & 0x00ff_ffff,
+            g & 0x00ff_ffff,
+            "CPU placement and GPU blit diverge at pixel {i}"
+        );
+    }
+}
+
+/// `ChromeBleed::first` REACHES THE PRESENTERS (second audit, 2026-09-24). A
+/// band below a strip row with no surface of its own (macOS's in-grid strip)
+/// continues ITS edge pixels only: beside the strip row the leftover bands
+/// stay the theme background, as they did before the band existed, even where
+/// that row's own edge pixel is something else (here a red cell at pad 0; in
+/// the field, a wallpaper texel). The chrome extent used to be a prefix from
+/// row 0, so the strip row's edge column was stretched across the bands. GPU
+/// and CPU agree byte for byte, so the shader's `chrome_y0` bound and
+/// `place_frame_bands`' range are the same law.
+#[test]
+fn rows_above_the_chrome_start_keep_the_flat_leftover_band() {
+    let Some(mut gpu) = fresh_gpu() else { return };
+    const BAND: u32 = 0x0030_3135;
+    gpu.set_pad(0);
+    gpu.set_chrome_bleed(Some(aterm_render::ChromeBleed {
+        rows: 2,
+        first: 1,
+        color: BAND,
+        seam: None,
+        top_extends_cells: false,
+        row_edges: [None; aterm_render::CHROME_ROW_EDGES],
+    }));
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    // Row 0 — the strip — wears red cells at both edges, so continuing it
+    // would be visible; row 1 is the band.
+    term.process(format!("\x1b[41m \x1b[0m\x1b[1;{COLS}H\x1b[41m \x1b[0m\r\nband").as_bytes());
+    let input = term.cell_frame(ROWS, COLS);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let source = gpu.render_input(&mut win, &input, None);
+    let (fw, fh) = (source.width, source.height);
+    let edge_rows = gpu.chrome_extent_px(fh);
+    assert!(
+        edge_rows.start > 0 && edge_rows.end > edge_rows.start && edge_rows.end < fh,
+        "the band row alone: {edge_rows:?} of {fh}"
+    );
+    let bg = Theme::default().bg & 0x00ff_ffff;
+    let (dw, dh) = (fw + 7, fh + 7);
+    let blit = gpu.blit_to_sized_for_test(&mut win, false, dw as u32, dh as u32);
+    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
+    let mut strip_edge_differs = false;
+    for y in 0..dh {
+        for x in 0..dw {
+            let got = blit.pixels[y * dw + x] & 0x00ff_ffff;
+            let (sx, sy) = (x as i64 - ox, y as i64 - oy);
+            let in_rows = sy >= 0 && (sy as usize) < fh;
+            let in_cols = sx >= 0 && (sx as usize) < fw;
+            if in_rows && in_cols {
+                continue;
+            }
+            if in_rows && (sy as usize) < edge_rows.start {
+                let row = sy as usize * fw;
+                let edge = if sx < 0 {
+                    source.pixels[row]
+                } else {
+                    source.pixels[row + fw - 1]
+                } & 0x00ff_ffff;
+                strip_edge_differs |= edge != bg;
+                assert_eq!(got, bg, "beside the strip row ({x},{y}): the flat band");
+            }
+        }
+    }
+    assert!(
+        strip_edge_differs,
+        "non-vacuous: the strip row's own edge pixel is not the band colour"
     );
     let mut cpu = vec![0u32; dw * dh];
     place_frame_bands(

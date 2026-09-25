@@ -80,18 +80,6 @@ impl Staging {
         self.root.join("failed.toml")
     }
 
-    /// Where curl dumps the TOKEN-LANE release listing's RESPONSE HEADERS
-    /// (`list.headers`), so the `x-ratelimit-*` block can be read back and a rate-limited
-    /// check can hold until the server's own reset.
-    ///
-    /// A file, not `-D -`: the body is captured from curl's stdout with the status
-    /// trailer appended to it, so headers on the same stream would corrupt both. It is
-    /// overwritten by every request and read immediately; nothing durable lives here.
-    /// The web lane writes nothing here — its one HEAD carries its answer on stdout.
-    pub fn list_headers(&self) -> PathBuf {
-        self.root.join("list.headers")
-    }
-
     /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written beside
     /// the boot sentinel at apply time so a LATER crash-loop revert — which no longer
     /// holds the ready marker — can poison exactly the build that crash-looped, so it

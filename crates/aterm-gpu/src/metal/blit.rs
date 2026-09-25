@@ -13,7 +13,7 @@
 //!
 //! This module is the Metal half of that experiment, and
 //! [`super::tests::blit_matches_wgpu_byte_for_byte`] is the differential that
-//! judges it: the SAME source pixels and the SAME 96 uniform bytes are pushed
+//! judges it: the SAME source pixels and the SAME 112 uniform bytes are pushed
 //! through the shipped `wgpu` blit and through this one, and every byte of both
 //! outputs must agree. It is a strictly stronger gate than `blit_invert.rs` /
 //! `blit_bands.rs` on their own, because those two assert properties of one
@@ -50,7 +50,7 @@ use crate::pipeline_table::Pipeline;
 
 /// The first-party Metal twin of `renderer.rs::build_blit_resources` — the
 /// shader library, the pipeline state for one destination format, the NEAREST
-/// sampler and the 96-byte uniform buffer.
+/// sampler and the 112-byte uniform buffer.
 ///
 /// `build_blit_resources` returns a bind-group layout and a pipeline layout as
 /// well. Both are `wgpu` bookkeeping with no Metal counterpart: Metal binds
@@ -69,7 +69,7 @@ pub(crate) struct MetalBlit {
     /// shader declares it; `fs_blit` fetches with `read()`, so it is never
     /// actually sampled through (the same is true under `wgpu`).
     sampler: Obj,
-    /// The shared 96-byte `BlitUniform` buffer, written per present.
+    /// The shared 112-byte `BlitUniform` buffer, written per present.
     uniform: Obj,
     format: PixelFormat,
 }
@@ -79,7 +79,7 @@ impl MetalBlit {
     /// call site that fills it, so a field added to `BlitUniform` without a
     /// matching `Blit` member in `blit.metal` fails loudly instead of reading
     /// past the end of the buffer.
-    pub(crate) const UNIFORM_BYTES: usize = 96;
+    pub(crate) const UNIFORM_BYTES: usize = 112;
 
     /// The offscreen frame's format. Named, and its texel size taken from
     /// [`PixelFormat::bytes_per_texel`], so the upload stride below cannot drift
@@ -140,7 +140,7 @@ impl MetalBlit {
     /// back as tightly packed RGBA8.
     ///
     /// `src` is `src_w * src_h` RGBA8 texels — the offscreen frame the present
-    /// path blits. `uniform` is the 96 bytes of a `BlitUniform`, produced by
+    /// path blits. `uniform` is the 112 bytes of a `BlitUniform`, produced by
     /// the SAME `present_blit_uniform` the `wgpu` path uses, so this function
     /// makes no policy decision of its own.
     pub(crate) fn run(

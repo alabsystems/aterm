@@ -18,7 +18,7 @@
 //! Originally in `aterm-core-ffi/src/safety.rs`. Extracted to `aterm-types`
 //! so all FFI crates can share the same helpers (#4628, #4633).
 
-use crate::ffi_bounds::{MAX_FFI_ARRAY_ELEMENTS, MAX_FFI_INPUT_BYTES, is_valid_ffi_len};
+use crate::ffi_bounds::{MAX_FFI_INPUT_BYTES, is_valid_ffi_len};
 use crate::verification::FfiTracker;
 
 /// Convert a raw const pointer to a shared reference.
@@ -168,33 +168,6 @@ pub unsafe fn ffi_byte_slice_mut<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut
     unsafe { ffi_slice_mut(ptr, len, MAX_FFI_INPUT_BYTES) }
 }
 
-/// Convert a raw const pointer + length to a shared slice of typed elements.
-///
-/// Bounded by [`MAX_FFI_ARRAY_ELEMENTS`] (1M elements). Use for arrays of
-/// structs, indices, or other non-byte typed data at FFI boundaries.
-///
-/// # Safety
-///
-/// Same as [`ffi_slice`].
-#[inline]
-pub unsafe fn ffi_array_slice<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T]> {
-    // SAFETY: Caller upholds ffi_slice preconditions.
-    unsafe { ffi_slice(ptr, len, MAX_FFI_ARRAY_ELEMENTS) }
-}
-
-/// Convert a raw mutable pointer + length to a mutable slice of typed elements.
-///
-/// Bounded by [`MAX_FFI_ARRAY_ELEMENTS`] (1M elements).
-///
-/// # Safety
-///
-/// Same as [`ffi_slice_mut`].
-#[inline]
-pub unsafe fn ffi_array_slice_mut<'a, T>(ptr: *mut T, len: usize) -> Option<&'a mut [T]> {
-    // SAFETY: Caller upholds ffi_slice_mut preconditions.
-    unsafe { ffi_slice_mut(ptr, len, MAX_FFI_ARRAY_ELEMENTS) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,27 +242,6 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap(), &[10, 20, 30]);
     }
-
-    #[test]
-    fn ffi_array_slice_returns_some_on_valid() {
-        let data = [1u32, 2, 3, 4, 5];
-        let result = unsafe { ffi_array_slice(data.as_ptr(), 5) };
-        assert_eq!(result, Some(&data[..]));
-    }
-
-    #[test]
-    fn ffi_array_slice_returns_none_on_null() {
-        let result = unsafe { ffi_array_slice::<u32>(std::ptr::null(), 1) };
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn ffi_array_slice_mut_returns_some_on_valid() {
-        let mut data = [1u32, 2, 3];
-        let result = unsafe { ffi_array_slice_mut(data.as_mut_ptr(), 3) };
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), &[1, 2, 3]);
-    }
 }
 
 #[cfg(kani)]
@@ -346,25 +298,5 @@ mod kani_proofs {
         let ptr = 1usize as *mut u8; // non-null sentinel
         let result = unsafe { ffi_byte_slice_mut(ptr, len) };
         kani::assert(result.is_none(), "ffi_byte_slice_mut rejects overlength");
-    }
-
-    /// ffi_array_slice rejects any len exceeding MAX_FFI_ARRAY_ELEMENTS.
-    #[kani::proof]
-    fn ffi_array_slice_rejects_overlength() {
-        let len: usize = kani::any();
-        kani::assume(len > MAX_FFI_ARRAY_ELEMENTS);
-        let ptr = 1usize as *const u32; // non-null sentinel
-        let result = unsafe { ffi_array_slice(ptr, len) };
-        kani::assert(result.is_none(), "ffi_array_slice rejects overlength");
-    }
-
-    /// ffi_array_slice_mut rejects any len exceeding MAX_FFI_ARRAY_ELEMENTS.
-    #[kani::proof]
-    fn ffi_array_slice_mut_rejects_overlength() {
-        let len: usize = kani::any();
-        kani::assume(len > MAX_FFI_ARRAY_ELEMENTS);
-        let ptr = 1usize as *mut u32; // non-null sentinel
-        let result = unsafe { ffi_array_slice_mut(ptr, len) };
-        kani::assert(result.is_none(), "ffi_array_slice_mut rejects overlength");
     }
 }

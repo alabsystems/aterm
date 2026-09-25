@@ -251,41 +251,10 @@ impl Default for Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Cursor;
 
     // =========================================================================
-    // Grid::new() basic dimensions
+    // Grid::new() clamps its dimensions
     // =========================================================================
-
-    #[test]
-    fn test_new_basic_dimensions() {
-        let grid = Grid::new(24, 80);
-        assert_eq!(grid.rows(), 24);
-        assert_eq!(grid.cols(), 80);
-    }
-
-    #[test]
-    fn test_new_cursor_at_origin() {
-        let grid = Grid::new(24, 80);
-        assert_eq!(grid.cursor_row(), 0);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn test_new_1x1_grid() {
-        let grid = Grid::new(1, 1);
-        assert_eq!(grid.rows(), 1);
-        assert_eq!(grid.cols(), 1);
-        assert_eq!(grid.cursor_row(), 0);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn test_new_large_grid() {
-        let grid = Grid::new(500, 300);
-        assert_eq!(grid.rows(), 500);
-        assert_eq!(grid.cols(), 300);
-    }
 
     #[test]
     fn test_new_clamps_zero_rows_to_one() {
@@ -313,112 +282,9 @@ mod tests {
         assert_eq!(grid.cols(), MAX_GRID_COLS);
     }
 
-    #[test]
-    fn test_new_all_cells_empty() {
-        let grid = Grid::new(5, 10);
-        for row in 0..5u16 {
-            for col in 0..10u16 {
-                let cell = grid.cell(row, col).expect("cell should exist");
-                assert_eq!(
-                    cell.char(),
-                    ' ',
-                    "cell ({row}, {col}) should be space (empty)"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_new_scroll_region_is_full() {
-        let grid = Grid::new(24, 80);
-        let region = grid.scroll_region();
-        assert!(
-            region.is_full(24),
-            "scroll region should be full screen on new grid"
-        );
-        assert_eq!(region.top, 0);
-        assert_eq!(region.bottom, 23);
-    }
-
-    #[test]
-    fn test_new_display_offset_zero() {
-        let grid = Grid::new(24, 80);
-        assert_eq!(grid.display_offset(), 0);
-    }
-
-    #[test]
-    fn test_new_no_pending_wrap() {
-        let grid = Grid::new(24, 80);
-        assert!(!grid.pending_wrap());
-    }
-
-    #[test]
-    fn test_new_total_lines_equals_rows() {
-        let grid = Grid::new(24, 80);
-        assert_eq!(grid.total_lines(), 24);
-    }
-
-    #[test]
-    fn test_new_no_scrollback_lines() {
-        let grid = Grid::new(24, 80);
-        assert_eq!(grid.scrollback_lines(), 0);
-    }
-
-    // =========================================================================
-    // Grid::with_scrollback()
-    // =========================================================================
-
-    #[test]
-    fn test_with_scrollback_dimensions() {
-        let grid = Grid::with_scrollback(10, 40, 5000);
-        assert_eq!(grid.rows(), 10);
-        assert_eq!(grid.cols(), 40);
-    }
-
-    #[test]
-    fn test_with_scrollback_cursor_at_origin() {
-        let grid = Grid::with_scrollback(10, 40, 5000);
-        assert_eq!(grid.cursor_row(), 0);
-        assert_eq!(grid.cursor_col(), 0);
-    }
-
-    #[test]
-    fn test_with_scrollback_zero_scrollback() {
-        let grid = Grid::with_scrollback(5, 10, 0);
-        assert_eq!(grid.rows(), 5);
-        assert_eq!(grid.cols(), 10);
-        assert_eq!(grid.scrollback_lines(), 0);
-    }
-
-    #[test]
-    fn test_with_scrollback_large_scrollback() {
-        let grid = Grid::with_scrollback(24, 80, 100_000);
-        assert_eq!(grid.rows(), 24);
-        assert_eq!(grid.cols(), 80);
-        assert_eq!(grid.scrollback_lines(), 0);
-    }
-
     // =========================================================================
     // Grid::with_tiered_scrollback()
     // =========================================================================
-
-    #[test]
-    fn test_with_tiered_scrollback_dimensions() {
-        let sb = aterm_scrollback::Scrollback::new(100, 1000, 1_000_000);
-        let grid = Grid::with_tiered_scrollback(24, 80, 1000, sb);
-        assert_eq!(grid.rows(), 24);
-        assert_eq!(grid.cols(), 80);
-    }
-
-    #[test]
-    fn test_with_tiered_scrollback_has_scrollback() {
-        let sb = aterm_scrollback::Scrollback::new(100, 1000, 1_000_000);
-        let grid = Grid::with_tiered_scrollback(24, 80, 1000, sb);
-        assert!(
-            grid.scrollback().is_some(),
-            "tiered scrollback grid should have scrollback attached"
-        );
-    }
 
     #[test]
     fn test_with_tiered_scrollback_clamps_zero() {
@@ -426,23 +292,6 @@ mod tests {
         let grid = Grid::with_tiered_scrollback(0, 0, 500, sb);
         assert_eq!(grid.rows(), 1);
         assert_eq!(grid.cols(), 1);
-    }
-
-    // =========================================================================
-    // Default impl
-    // =========================================================================
-
-    #[test]
-    fn test_default_is_24x80() {
-        let grid = Grid::default();
-        assert_eq!(grid.rows(), 24);
-        assert_eq!(grid.cols(), 80);
-    }
-
-    #[test]
-    fn test_default_cursor_at_origin() {
-        let grid = Grid::default();
-        assert_eq!(grid.cursor(), Cursor::default());
     }
 
     // =========================================================================

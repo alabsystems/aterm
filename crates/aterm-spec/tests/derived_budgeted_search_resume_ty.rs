@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 and registry locks for the derived `BudgetedSearchResume` machine.
+//! Tier-0 and executable-twin walks for the derived `BudgetedSearchResume` machine.
 //!
 //! The machine is the owner-level lifecycle twin of
 //! `Terminal::search_budgeted`: a valid cursor preserves `search_id`; every fresh
 //! or restarted logical stream exposes `reset` and a new ID; scan completion can
 //! precede result-delta completion; and only the final drain retires the cursor.
+//!
+//! The action set and the registry enrolment are held elsewhere, not re-pinned
+//! here: `executable_model_walks_every_public_lifecycle_branch` fires every
+//! action, aterm-core's `budgeted_resume_refinement_actions_are_complete`
+//! requires one `#[refines]` anchor per action in both directions, and
+//! `non_vacuity_ratchet.rs` names this model, so dropping it from
+//! `xref::model_registry()` fails there.
 
 use aterm_spec::derive::budgeted_search_resume_model;
 use aterm_spec::{interp, verify};
@@ -16,44 +23,6 @@ fn budgeted_search_resume_proves_and_catches_stale_continuation() {
     verify::prove_and_catch_scalar(
         &budgeted_search_resume_model(),
         "derived BudgetedSearchResume spec (identity/reset/delta-drain lifecycle)",
-    );
-}
-
-#[test]
-fn budgeted_search_resume_is_registered_for_global_verification() {
-    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
-        .into_iter()
-        .map(|model| model.name)
-        .collect();
-    assert!(
-        registered.contains("BudgetedSearchResume"),
-        "BudgetedSearchResume must resolve through the global spec registry"
-    );
-}
-
-#[test]
-fn budgeted_search_resume_action_set_is_pinned() {
-    let model = budgeted_search_resume_model();
-    let mut names: Vec<_> = model.actions.iter().map(|action| action.name).collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "Cancel",
-            "ContentRestart",
-            "Drain",
-            "DrainComplete",
-            "FinishScan",
-            "ForgedRestart",
-            "QueryRestart",
-            "RestartComplete",
-            "Resume",
-            "Start",
-            "StartBacklog",
-            "StartComplete",
-            "Supersede",
-        ],
-        "BudgetedSearchResume action set drifted; update Tier-1 and this pin together"
     );
 }
 

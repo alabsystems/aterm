@@ -543,9 +543,7 @@ fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>>
 ///
 /// Scratch needs no claim guard: both views parse `store/<program>/<n>` and nothing else, so
 /// no link and no shim can name a `<build>.incoming-<pid>`, and the store-wide writer lock
-/// means the stager that owned any scratch here is gone. Gone is not quiet, though — the
-/// staging lane's extractor is a launchd job that outlives its submitter — so the sweep
-/// below stops those orphans first.
+/// means the stager that owned any scratch here is gone.
 ///
 /// One guard of its own: a `<build>.superseded-<pid>` whose `<build>` is absent is not
 /// debris but the only copy of that build on disk, a swap window
@@ -857,12 +855,6 @@ fn run_in(
         let _ = std::fs::remove_file(sidecar);
     }
     let mut swept_scratch: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // A dead stager's launchd-parented helper is still extracting into its scratch; stop it
-    // and wait for it before this loop deletes the directory under it. A scoped pass with
-    // no scratch of its programs to delete has no helper to stop.
-    if scope.is_none() || !debris.scratch.is_empty() {
-        crate::stage_helper::stop_orphaned_lane_jobs();
-    }
     for (program, name, path) in debris.scratch {
         // Reported only when the removal actually happened: the point of the line is to say
         // where the disk went, and a scratch dir we failed to unlink (a permissions problem,
@@ -1034,11 +1026,32 @@ pub(crate) fn process_table() -> Option<Vec<PathBuf>> {
     running_executables()
 }
 
-/// The executable path of every process alive now, from `proc_listallpids` +
+/// The executable path of every process alive now ([`running_processes`] without the
+/// pids). `None` when the process table cannot be read.
+fn running_executables() -> Option<Vec<PathBuf>> {
+    Some(
+        running_process_table()?
+            .into_iter()
+            .map(|(_, exe)| exe)
+            .collect(),
+    )
+}
+
+/// Every process alive now as `(pid, executable path)`, by the KERNEL's path for each
+/// (so a relative, symlinked or PATH launch is seen, unlike `ps`'s argv[0]). `None` when
+/// the process table cannot be read — never an empty list standing in for "unknown".
+/// The release cutter names the pids it finds running out of a staging bundle it is
+/// about to delete.
+#[must_use]
+pub fn running_processes() -> Option<Vec<(i32, PathBuf)>> {
+    running_process_table()
+}
+
+/// The pid and executable path of every process alive now, from `proc_listallpids` +
 /// `proc_pidpath`. A process that exits mid-walk, or whose executable has no path left,
 /// is skipped; any other failure is `None` (unknown).
 #[cfg(target_os = "macos")]
-fn running_executables() -> Option<Vec<PathBuf>> {
+fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     use std::os::unix::ffi::OsStrExt as _;
     unsafe extern "C" {
         fn proc_listallpids(buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
@@ -1081,7 +1094,7 @@ fn running_executables() -> Option<Vec<PathBuf>> {
         match usize::try_from(written) {
             Ok(n) if n > 0 => {
                 let path = buf.get(..n)?;
-                out.push(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+                out.push((pid, PathBuf::from(std::ffi::OsStr::from_bytes(path))));
             }
             _ => match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::ESRCH | libc::ENOENT) => {}
@@ -1092,11 +1105,11 @@ fn running_executables() -> Option<Vec<PathBuf>> {
     Some(out)
 }
 
-/// The executable path of every process alive now, from `/proc/<pid>/exe` (procfs's
-/// ` (deleted)` annotation removed). A process that exits mid-walk, a kernel thread and
-/// another user's process are skipped; any other failure is `None` (unknown).
+/// The pid and executable path of every process alive now, from `/proc/<pid>/exe`
+/// (procfs's ` (deleted)` annotation removed). A process that exits mid-walk, a kernel
+/// thread and another user's process are skipped; any other failure is `None` (unknown).
 #[cfg(target_os = "linux")]
-fn running_executables() -> Option<Vec<PathBuf>> {
+fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     use std::os::unix::ffi::OsStrExt as _;
     let mut out = Vec::new();
     for entry in std::fs::read_dir("/proc").ok()? {
@@ -1105,11 +1118,14 @@ fn running_executables() -> Option<Vec<PathBuf>> {
         if !name.as_bytes().iter().all(u8::is_ascii_digit) {
             continue;
         }
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            continue;
+        };
         match std::fs::read_link(entry.path().join("exe")) {
             Ok(exe) => {
                 let bytes = exe.as_os_str().as_bytes();
                 let bytes = bytes.strip_suffix(b" (deleted)").unwrap_or(bytes);
-                out.push(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+                out.push((pid, PathBuf::from(std::ffi::OsStr::from_bytes(bytes))));
             }
             Err(e)
                 if matches!(
@@ -1125,7 +1141,7 @@ fn running_executables() -> Option<Vec<PathBuf>> {
 /// No process table is read here, so whether a session runs from an agent build is
 /// unknown and every agent build is kept: disk is spent before a running tree is lost.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn running_executables() -> Option<Vec<PathBuf>> {
+fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     None
 }
 

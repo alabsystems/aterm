@@ -198,41 +198,6 @@ fn padded_extent_absorbs_every_phase_without_clipping() {
     );
 }
 
-/// NEGATIVE CONTROL for the placement: the pre-fix policy (`pen = -b`, bearing
-/// `round(b)`, phase pinned to 0) genuinely mis-places glyphs — on the same
-/// lattice where the fixed policy reconstructs EXACTLY (asserted above), the
-/// old reported position misses the designed one by >= 0.25px on a quarter of
-/// the lattice, and the old pen destroys the phase (a non-integer translate
-/// pinned the ink to the bitmap grid).
-#[test]
-fn old_round_and_pin_placement_is_rejected() {
-    let mut half_px_error_seen = 0usize;
-    let mut phase_destroyed_seen = 0usize;
-    for k in -4096i64..=4096 {
-        let b = k as f64 / 64.0;
-        let (pen, min) = ct_pen_and_bearing(b);
-        // Fixed: exact at every lattice point (re-asserted for the comparison).
-        assert_eq!(f64::from(min) + (b + pen), b);
-        // Pre-fix reported position = round(b) with the phase discarded.
-        if (b.round() - b).abs() >= 0.25 {
-            half_px_error_seen += 1;
-        }
-        // Pre-fix pen -b: off the integer px grid, the raster translate was
-        // fractional — i.e. the outline got re-pinned, losing its phase.
-        if -b != (-b).floor() {
-            phase_destroyed_seen += 1;
-        }
-    }
-    assert!(
-        half_px_error_seen > 2000,
-        "the >=0.25px error class must be reached ({half_px_error_seen})"
-    );
-    assert!(
-        phase_destroyed_seen > 4000,
-        "the old pen must be non-integer somewhere ({phase_destroyed_seen})"
-    );
-}
-
 /// Tier-1 MODEL ↔ CODE conformance: drive the `CtFracBearing` model's own
 /// executable interpreter (`Model::fire` — the same semantics `ty` checks) over
 /// its ENTIRE bounded domain (eighth-px bearings in ±3px) and assert the

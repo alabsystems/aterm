@@ -7,13 +7,20 @@
 //! its own width function; these functions only ever make strings shorter,
 //! so a grapheme-aware measure can only find them narrower than counted).
 
-use crate::PIECE_SEP;
+use crate::{GLASS_TITLE_CHARS, GLASS_TITLE_WORDS, PIECE_SEP};
 
 /// Strip control characters (terminal escape-sequence injection) and the
-/// invisible FORMAT characters a spoof rides on — the bidi overrides and
-/// isolates (U+202A–U+202E, U+2066–U+2069), the zero-width joiners, spaces
-/// and marks (U+200B–U+200F, U+FEFF) and the line and paragraph separators
-/// (U+2028, U+2029) — then cap length before a string reaches a cell. The
+/// invisible FORMAT characters a spoof rides on — the bidi overrides,
+/// isolates and marks (U+202A–U+202E, U+2066–U+2069, U+061C), the
+/// zero-width joiners, spaces and marks (U+200B–U+200F, U+FEFF), the word
+/// joiner and invisible operators (U+2060–U+2064), the deprecated format
+/// controls (U+206A–U+206F), the soft hyphen (U+00AD), the Mongolian vowel
+/// separator (U+180E), the interlinear annotation controls (U+FFF9–U+FFFB),
+/// the tag characters (U+E0001, U+E0020–U+E007F), every noncharacter
+/// (U+FDD0–U+FDEF and each plane's last two) and the line and paragraph
+/// separators (U+2028, U+2029) — then cap length before a string reaches a
+/// cell (design ruling 196: an invisible character inside `Build:` would
+/// get a clause past the glass title form). The
 /// cap is in characters, applied after the strip; an elided tail is marked
 /// with `…` — so an elided result is `cap + 1` chars long, the
 /// `atpkg::progress::sanitize_for_tty` shape (re-implemented here so the
@@ -39,13 +46,22 @@ fn is_stripped(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200b}'..='\u{200f}'
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
                 | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{fdd0}'..='\u{fdef}'
                 | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
                 | '\u{2028}'
                 | '\u{2029}'
         )
+        || u32::from(c) & 0xfffe == 0xfffe
 }
 
 /// `s` in at most `max` chars, the last one `…` when it was cut
@@ -424,9 +440,91 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The WORDS of a title: whitespace tokens carrying a letter, so a route's
+/// `▸`, a name's `&` and a bare number — the `2` of `in tab 2` — spend no
+/// word (review 2026-09-24; the strain row's `Typing slowed by yes in tab 2`,
+/// design ruling 207).
+#[must_use]
+pub fn title_words(title: &str) -> usize {
+    title
+        .split_whitespace()
+        .filter(|token| token.chars().any(char::is_alphabetic))
+        .count()
+}
+
+/// The clause seams a glass title may not carry.
+const TITLE_SEAMS: [&str; 3] = [" \u{2014} ", "; ", ": "];
+
+/// Why `title` may not be a glass title, or `None` (design ruling 179: ONE
+/// copy, read by the host's `attention` and by the wire's parser). The checks
+/// run in this order: at most [`GLASS_TITLE_WORDS`] words
+/// ([`title_words`]), at most [`GLASS_TITLE_CHARS`] characters, no clause
+/// seam (` — `, `; `, `: `), no trailing period.
+#[must_use]
+pub fn glass_title_fault(title: &str) -> Option<&'static str> {
+    if title_words(title) > GLASS_TITLE_WORDS {
+        Some("a glass title over six words")
+    } else if title.chars().count() > GLASS_TITLE_CHARS {
+        Some("a glass title over 48 characters")
+    } else if TITLE_SEAMS.iter().any(|seam| title.contains(seam)) {
+        Some("a clause in a glass title")
+    } else if title.ends_with('.') {
+        Some("a sentence for a glass title")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title form is `attention`'s rule, fault for fault and in its order
+    /// (design ruling 179): a pass, each of the four faults, a word count
+    /// that spends nothing on a lone symbol, and the words check winning over
+    /// the characters check when both fail.
+    #[test]
+    fn glass_title_fault_is_the_attention_rule() {
+        assert_eq!(glass_title_fault("Updating aterm"), None);
+        assert_eq!(glass_title_fault("Settings \u{25b8} Messages & more"), None);
+        assert_eq!(title_words("Settings \u{25b8} Messages & more"), 3);
+        assert_eq!(
+            title_words("Typing slowed by yes in tab 2"),
+            6,
+            "a number is no word"
+        );
+        assert_eq!(glass_title_fault("Typing slowed by yes in tab 2"), None);
+        assert_eq!(
+            glass_title_fault("one two three four five six seven"),
+            Some("a glass title over six words")
+        );
+        assert_eq!(
+            glass_title_fault(&"x".repeat(GLASS_TITLE_CHARS + 1)),
+            Some("a glass title over 48 characters")
+        );
+        assert_eq!(glass_title_fault(&"x".repeat(GLASS_TITLE_CHARS)), None);
+        for seam in ["a \u{2014} b", "a; b", "Build: failed"] {
+            assert_eq!(
+                glass_title_fault(seam),
+                Some("a clause in a glass title"),
+                "{seam}"
+            );
+        }
+        assert_eq!(
+            glass_title_fault("Build failed."),
+            Some("a sentence for a glass title")
+        );
+        assert_eq!(
+            glass_title_fault(&format!("{} a b c d e f", "y".repeat(60))),
+            Some("a glass title over six words"),
+            "words first"
+        );
+        assert_eq!(
+            glass_title_fault(""),
+            None,
+            "emptiness is the parser's to refuse"
+        );
+    }
 
     /// A SENTENCE RECEIVED FROM ELSEWHERE IS KEPT WHOLE (design ruling 64):
     /// every piece within the cap, none empty, and rejoined at the joints the

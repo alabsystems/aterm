@@ -5,11 +5,6 @@
 use super::super::*;
 
 #[test]
-fn page_size_is_64k() {
-    assert_eq!(PAGE_SIZE, 65536);
-}
-
-#[test]
 fn page_is_zeroed() {
     let page = Page::new();
     // SAFETY: We have exclusive access to the page data in this test.

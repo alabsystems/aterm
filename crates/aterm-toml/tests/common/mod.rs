@@ -52,6 +52,18 @@ fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
         || name == ".git"
         || name == "node_modules"
         || (parent == root && (name.starts_with("target-") || name == ".aterm-verify"))
+        || is_handoff_fixture_dir(parent, name)
+}
+
+/// `crates/aterm-gui/tests/fixtures/handoff/`: byte-exact RECORDINGS of what a
+/// shipped release's seamless-update producer wrote, kept so the current consumer
+/// is proven against them. The handoff manifest keeps the producer's own
+/// `seamless-<pid>-<nonce>.toml` name, but on the wire it is a nonce line
+/// followed by TOML — not a TOML document — and no file in there may ever be
+/// reformatted, because the recorded digests are over those exact bytes. They are
+/// wire captures, not config, so this gate does not claim them.
+fn is_handoff_fixture_dir(parent: &Path, name: &str) -> bool {
+    name == "handoff" && parent.ends_with(Path::new("tests").join("fixtures"))
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {

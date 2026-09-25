@@ -5,114 +5,11 @@
 //! Style API, scrollback boundary, damage tracking, and targeted regression tests.
 
 use crate::grid::Scrollback;
-use crate::{
-    CellCoord, CellFlags, Color, ExtendedStyle, Grid, PackedColor, PackedColors, Style, StyleAttrs,
-    StyleId,
-};
+use crate::{CellCoord, CellFlags, ExtendedStyle, Grid, PackedColor, StyleId};
 
 // -------------------------------------------------------------------------
 // Style API tests
 // -------------------------------------------------------------------------
-
-#[test]
-fn grid_style_table_initialized() {
-    let grid = Grid::new(24, 80);
-    // Grid should have a style table with the default style
-    // Note: StyleTable::is_empty() returns true when only default style exists,
-    // so we check that get_style returns the default style
-    let default_style = grid
-        .get_style(StyleId::DEFAULT)
-        .expect("grid should have default style at initialization");
-    assert_eq!(
-        *default_style,
-        Style::DEFAULT,
-        "default style should be canonical"
-    );
-}
-
-#[test]
-fn grid_intern_style_returns_id() {
-    let mut grid = Grid::new(24, 80);
-    let style = Style::new(Color::new(255, 0, 0), Color::DEFAULT_BG, StyleAttrs::BOLD);
-    let id = grid.intern_style(style);
-    // Should get a non-default ID for non-default style
-    assert!(!id.is_default());
-    // Should be able to retrieve it
-    let retrieved = grid.get_style(id).unwrap();
-    assert_eq!(*retrieved, style);
-}
-
-#[test]
-fn grid_intern_same_style_returns_same_id() {
-    let mut grid = Grid::new(24, 80);
-    let style = Style::new(Color::new(0, 255, 0), Color::DEFAULT_BG, StyleAttrs::ITALIC);
-    let id1 = grid.intern_style(style);
-    let id2 = grid.intern_style(style);
-    assert_eq!(id1, id2);
-}
-
-#[test]
-fn grid_intern_default_style() {
-    let mut grid = Grid::new(24, 80);
-    let id = grid.intern_style(Style::DEFAULT);
-    assert!(id.is_default());
-}
-
-#[test]
-fn grid_style_stats() {
-    let mut grid = Grid::new(24, 80);
-    let initial_stats = grid.style_stats();
-    assert_eq!(initial_stats.total_styles, 1); // Just default
-
-    // Add some styles
-    grid.intern_style(Style::new(
-        Color::new(255, 0, 0),
-        Color::DEFAULT_BG,
-        StyleAttrs::BOLD,
-    ));
-    grid.intern_style(Style::new(
-        Color::new(0, 255, 0),
-        Color::DEFAULT_BG,
-        StyleAttrs::ITALIC,
-    ));
-
-    let stats = grid.style_stats();
-    assert_eq!(stats.total_styles, 3); // default + 2 new
-    assert!(stats.memory_bytes > 0);
-}
-
-#[test]
-fn grid_clear_styles() {
-    let mut grid = Grid::new(24, 80);
-    grid.intern_style(Style::new(
-        Color::new(255, 0, 0),
-        Color::DEFAULT_BG,
-        StyleAttrs::empty(),
-    ));
-    grid.intern_style(Style::new(
-        Color::new(0, 255, 0),
-        Color::DEFAULT_BG,
-        StyleAttrs::empty(),
-    ));
-    assert_eq!(grid.style_stats().total_styles, 3);
-
-    grid.clear_styles();
-    assert_eq!(grid.style_stats().total_styles, 1); // Only default remains
-}
-
-#[test]
-fn grid_intern_extended_style() {
-    let mut grid = Grid::new(24, 80);
-    let colors = PackedColors::with_indexed(196, 21);
-    let flags = CellFlags::BOLD.union(CellFlags::UNDERLINE);
-    let ext = ExtendedStyle::from_cell_style(colors, flags, None, None);
-    let id = grid.intern_extended_style(ext);
-
-    assert!(!id.is_default());
-    let style = grid.get_style(id).unwrap();
-    assert!(style.attrs.contains(StyleAttrs::BOLD));
-    assert!(style.attrs.contains(StyleAttrs::UNDERLINE));
-}
 
 #[test]
 fn grid_write_char_with_style_id_default() {

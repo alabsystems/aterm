@@ -17,6 +17,8 @@
 //! * **No pass writes a marker**, and every pass SWEEPS `landing/` ([`sweep`], run where
 //!   the pass takes the store lock): that pass is the only one, so a marker there is an
 //!   older client's leftover, and a twin that still tests for it then runs its own `exec`.
+//!   The same sweep takes `optin/`, the extras opt-in markers an older client recorded
+//!   (design §5.3(c), retired 2026-09-24), which nothing reads any more.
 //! * **The hidden verb stays** ([`HIDDEN_VERB`], `cli::cmd_landing`): a twin laid by an
 //!   older client still hands over to it while such a marker stands. It `exec`s the
 //!   current `bin/<program>` at once with the arguments verbatim ([`HandOver`],
@@ -85,20 +87,21 @@ pub fn shim_command(layout: &Layout, tool: &ToolName, args: &[String]) -> std::p
     command
 }
 
-/// Remove `<prefix>/landing/` and everything in it — silent, best-effort. Run by every
-/// pass once it holds the store lock: no other pass is running, and no pass of this
-/// client writes a marker. A link or a file standing at `landing/` is unlinked, never
-/// followed (`remove_dir_all` does not follow links either).
+/// Remove `<prefix>/landing/` and `<prefix>/optin/` and everything in them — silent,
+/// best-effort. Run by every pass once it holds the store lock: no other pass is running,
+/// and no pass of this client writes either. A link or a file standing at either name is
+/// unlinked, never followed (`remove_dir_all` does not follow links either).
 pub fn sweep(layout: &Layout) {
-    let dir = layout.landing_dir();
-    match std::fs::symlink_metadata(&dir) {
-        Ok(md) if md.is_dir() => {
-            let _ = std::fs::remove_dir_all(&dir);
+    for dir in [layout.landing_dir(), layout.prefix.join("optin")] {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(md) if md.is_dir() => {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(&dir);
+            }
+            Err(_) => {}
         }
-        Ok(_) => {
-            let _ = std::fs::remove_file(&dir);
-        }
-        Err(_) => {}
     }
 }
 
@@ -194,8 +197,13 @@ mod tests {
         std::fs::write(dir.join("claude"), live).unwrap();
         std::fs::write(dir.join("codex"), b"junk\n").unwrap();
         std::fs::write(dir.join(".claude.tmp-4242"), b"").unwrap();
+        // An older client's extras opt-in markers (§5.3(c)) go with them.
+        let optin = l.prefix.join("optin");
+        std::fs::create_dir_all(&optin).unwrap();
+        std::fs::write(optin.join("vendorx"), b"# opted in\n").unwrap();
         sweep(&l);
         assert!(!dir.exists(), "landing/ is gone");
+        assert!(!optin.exists(), "optin/ is gone");
         sweep(&l);
         assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(&l.prefix);

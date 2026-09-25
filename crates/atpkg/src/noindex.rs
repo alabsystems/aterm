@@ -2260,7 +2260,7 @@ pub fn verify_scope(dir: &Path) -> Option<&Path> {
         // empty path is not a directory, and MEASURED 2026-09-02 on macOS 26.6.2, with an
         // indexed file present:
         //   mdfind -onlyin ''  'kMDItemFSName == "<token>"'  ->  '' , exit 0
-        //   mdfind -onlyin .   'kMDItemFSName == "<token>"'  ->  /Users//…/<token>
+        //   mdfind -onlyin .   'kMDItemFSName == "<token>"'  ->  /Users/…/<token>
         // Exit 0 with empty stdout is a CLEAN MISS to `spotlight_query`, so an empty scope
         // makes even the control unfindable: `aterm pkg noindex verify target` would burn
         // the whole timeout and answer `Unknown` on a perfectly idle machine, advising a
@@ -2299,7 +2299,7 @@ pub fn verify(dir: &Path, timing: &Timing) -> Verdict {
     // `plant` writes THROUGH `dir`, so with `repo/target -> /Volumes/fast/realtarget` the
     // probe's real, indexed path is under `/Volumes/fast`, while a scope taken from the
     // LINK's parent is `repo`. MEASURED 2026-09-02 on macOS 26.6.2 with exactly that shape:
-    //   mdfind (unscoped)          -> /Users//…/elsewhere/realtarget/<token>   (INDEXED)
+    //   mdfind (unscoped)          -> /Users/…/elsewhere/realtarget/<token>   (INDEXED)
     //   mdfind -onlyin …/repo      -> ''
     // while the control, a real path under `repo`, indexed in ~1.5 s. Control seen, both
     // candidate queries a clean miss, verdict `Excluded` — a MEASURED, confident false

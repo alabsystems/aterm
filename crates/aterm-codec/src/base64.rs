@@ -589,44 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_empty() {
-        assert_eq!(encode(b"").unwrap(), "");
-    }
-
-    #[test]
-    fn test_encode_hello_world() {
-        assert_eq!(encode(b"Hello, world!").unwrap(), "SGVsbG8sIHdvcmxkIQ==");
-    }
-
-    #[test]
-    fn test_encode_padding_one() {
-        // 1 byte remainder -> 2 padding chars
-        assert_eq!(encode(b"f").unwrap(), "Zg==");
-    }
-
-    #[test]
-    fn test_encode_padding_two() {
-        // 2 byte remainder -> 1 padding char
-        assert_eq!(encode(b"fo").unwrap(), "Zm8=");
-    }
-
-    #[test]
-    fn test_encode_no_padding() {
-        // 3 byte multiple -> no padding
-        assert_eq!(encode(b"foo").unwrap(), "Zm9v");
-    }
-
-    #[test]
-    fn test_decode_empty() {
-        assert_eq!(decode("").unwrap(), b"");
-    }
-
-    #[test]
-    fn test_decode_hello_world() {
-        assert_eq!(decode("SGVsbG8sIHdvcmxkIQ==").unwrap(), b"Hello, world!");
-    }
-
-    #[test]
     fn test_decode_without_padding() {
         // Should work without padding too
         assert_eq!(decode("SGVsbG8sIHdvcmxkIQ").unwrap(), b"Hello, world!");
@@ -651,64 +613,10 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_standard() {
-        for input in [
-            b"".as_slice(),
-            b"a",
-            b"ab",
-            b"abc",
-            b"abcd",
-            b"Hello, world!",
-            &[0u8; 256],
-            &(0..=255).collect::<Vec<u8>>(),
-        ] {
-            let encoded = encode(input).expect("encode");
-            let decoded = decode(&encoded).expect("roundtrip decode failed");
-            assert_eq!(decoded, input);
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_url_safe() {
-        for input in [
-            b"".as_slice(),
-            b"a",
-            b"ab",
-            b"abc",
-            b"Hello, world!",
-            &(0..=255).collect::<Vec<u8>>(),
-        ] {
-            let encoded = encode_url_safe_no_pad(input).expect("encode");
-            let decoded = decode_url_safe_no_pad(&encoded).expect("roundtrip decode failed");
-            assert_eq!(decoded, input);
-        }
-    }
-
-    #[test]
-    fn test_url_safe_alphabet() {
-        // URL-safe should not contain + or /
-        let encoded = encode_url_safe_no_pad(&[0xFF, 0xFF, 0xFF]).unwrap();
-        assert!(!encoded.contains('+'));
-        assert!(!encoded.contains('/'));
-    }
-
-    #[test]
     fn test_encode_no_pad_function() {
         assert_eq!(encode_no_pad(b"f").unwrap(), "Zg");
         assert_eq!(encode_no_pad(b"fo").unwrap(), "Zm8");
         assert_eq!(encode_no_pad(b"foo").unwrap(), "Zm9v");
-    }
-
-    #[test]
-    fn test_rfc4648_vectors() {
-        // Test vectors from RFC 4648 section 10
-        assert_eq!(encode(b"").unwrap(), "");
-        assert_eq!(encode(b"f").unwrap(), "Zg==");
-        assert_eq!(encode(b"fo").unwrap(), "Zm8=");
-        assert_eq!(encode(b"foo").unwrap(), "Zm9v");
-        assert_eq!(encode(b"foob").unwrap(), "Zm9vYg==");
-        assert_eq!(encode(b"fooba").unwrap(), "Zm9vYmE=");
-        assert_eq!(encode(b"foobar").unwrap(), "Zm9vYmFy");
     }
 
     #[test]

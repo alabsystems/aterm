@@ -60,7 +60,7 @@ pub(crate) fn say(msg: &str) {
     }
     // Around the terminal meter's line ([`crate::meter::around`]), and taken in its
     // order — the meter's screen, then stderr — so the two never wait on each other.
-    crate::meter::around(true, || {
+    crate::meter::around(|| {
         route(
             msg,
             TO_HOST_LOG.load(Ordering::Relaxed),

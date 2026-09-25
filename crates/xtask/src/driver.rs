@@ -214,9 +214,9 @@ pub(crate) fn resolve_cargo_driver(
 /// when `have_targo()` holds (an executable `targo` there, and the pin
 /// accepted), `None` otherwise.
 ///
-/// `crate::gate::trust_stage2_bin()` deliberately returns a REFUSED directory
-/// too — it is what the operator pointed at, and the "no trustc here" probes
-/// answer no about it by construction. That is the right shape for a probe and
+/// A discovered toolchain's `stage2_dir` is a REFUSED directory too — it is
+/// what the operator pointed at, and the "no trustc here" probes answer no
+/// about it by construction. That is the right shape for a probe and
 /// the wrong one for a driver: until 2026-09-18 the ladder joined `targo` onto
 /// that directory and adopted it on mere executability, so an impostor at
 /// `$TRUST_STAGE2_BIN` (measured that day on the owner's Mac: a shell script

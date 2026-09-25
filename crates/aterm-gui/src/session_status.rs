@@ -36,12 +36,34 @@
 
 use std::time::{Duration, Instant};
 
+use aterm_core::terminal::Terminal;
+
 #[path = "session_program.rs"]
 pub(crate) mod program;
 
 /// At most this often is one session's screen re-read for its agent verdict,
 /// whatever `tab_status`'s observation interval: 4 Hz per session.
 pub(crate) const AGENT_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The whole-screen fingerprint and only the final `tail_rows` rows, read in
+/// one pass under the status sweep's terminal `try_lock`. Hash every visible
+/// row plus its newline, exactly as [`crate::control::screen_text`] does, but
+/// retain no full-screen String and no rows outside the live zone. A parity
+/// test spans Unicode, resize and alternate-screen transitions.
+pub(crate) fn screen_agent_frame(t: &Terminal, tail_rows: usize) -> (u64, Vec<String>) {
+    let first = (t.rows() as usize).saturating_sub(tail_rows);
+    let mut rows = Vec::with_capacity((t.rows() as usize).min(tail_rows));
+    let mut hash = crate::turn_ledger::Fnv1a64::new();
+    for r in 0..t.rows() as usize {
+        let row = crate::control::visible_row(t, r);
+        hash.update(row.as_bytes());
+        hash.update(b"\n");
+        if r >= first {
+            rows.push(row);
+        }
+    }
+    (hash.finish(), rows)
+}
 
 /// How often a foreground group whose screen keeps moving is re-named. A
 /// group's program is resolved when the group CHANGES; this catches the one
@@ -2078,14 +2100,8 @@ impl crate::App {
                 .session_status
                 .agent_zone_wanted(id, generation, &program, now)
                 .then(|| {
-                    let text = crate::control::screen_text(&guard);
-                    let stamp = crate::session_timeline::AgentStamp {
-                        generation,
-                        fp: crate::turn_ledger::fnv1a_64(text.as_bytes()),
-                    };
-                    let rows: Vec<&str> = text.split_terminator('\n').collect();
-                    let from = rows.len().saturating_sub(crate::presence::CLASSIFY_ROWS);
-                    let zone: Vec<String> = rows[from..].iter().map(|r| (*r).to_string()).collect();
+                    let (fp, zone) = screen_agent_frame(&guard, crate::presence::CLASSIFY_ROWS);
+                    let stamp = crate::session_timeline::AgentStamp { generation, fp };
                     (zone, stamp)
                 });
             drop(guard);

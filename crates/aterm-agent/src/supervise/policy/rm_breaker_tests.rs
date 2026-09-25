@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-const CWD: &str = "/Users//_owner/aterm";
-const HOME: &str = "/Users//_owner";
+const CWD: &str = "/Users/_owner/aterm";
+const HOME: &str = "/Users/_owner";
 const TMP: &str = "/var/folders/ab/xyz/T";
 
 fn roots(cwd: &str) -> Vec<ScratchRoot> {
@@ -165,12 +165,12 @@ fn where_an_operand_may_point() {
     );
     approves("S=/tmp/w/a; rm -rf \"$S\"/*.o");
     assert_eq!(
-        approves("rm -rf /Users//_owner/aterm/target/debug/x"),
-        ["/Users//_owner/aterm/target/debug/x"]
+        approves("rm -rf /Users/_owner/aterm/target/debug/x"),
+        ["/Users/_owner/aterm/target/debug/x"]
     );
-    approves("rm -rf /Users//_owner/aterm/target.noindex/x");
-    assert!(escalates("rm -rf /Users//_owner/aterm/target").contains("not strictly inside"));
-    assert!(escalates("rm -rf /Users//_owner/aterm/src/x").contains("not strictly inside"));
+    approves("rm -rf /Users/_owner/aterm/target.noindex/x");
+    assert!(escalates("rm -rf /Users/_owner/aterm/target").contains("not strictly inside"));
+    assert!(escalates("rm -rf /Users/_owner/aterm/src/x").contains("not strictly inside"));
 }
 
 /// The Bash tool keeps a working directory of its own, which the worker
@@ -185,7 +185,7 @@ fn a_relative_operand_and_pwd_escalate() {
     assert!(escalates("rm -rf \"$PWD/target/x\"").contains("$PWD"));
     assert!(escalates("S=$PWD/target; rm -rf \"$S/x\"").contains("$S"));
     assert!(escalates("rm -rf .").contains("relative rm operand"));
-    approves("rm -rf /Users//_owner/aterm/target/x");
+    approves("rm -rf /Users/_owner/aterm/target/x");
 }
 
 /// The default macOS volume is case-insensitive: `Rm` runs `/bin/rm`, so

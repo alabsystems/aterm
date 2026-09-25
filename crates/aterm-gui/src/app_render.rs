@@ -3190,6 +3190,30 @@ pub(crate) const fn failed_present_route(use_gpu: bool, device_lost: bool) -> Fa
     }
 }
 
+/// Whether a CPU present must copy the whole frame into the retained surface
+/// instead of only its dirty rows. `forced` folds the reasons the caller owns
+/// (frontend chrome this frame or the last, stale chrome bands); `retained_ok`
+/// is a surface buffer that holds exactly the previous frame (age 1, the raw
+/// window size). A TRANSLATED (sub-row) frame moves every band row against
+/// the cache that `damage` describes — over unchanged cells it is a gate hit,
+/// and a dirty-row copy would leave the glass at the old offset — and the
+/// frame after one must put the surface back in cache space. A rescued scroll
+/// blit shifted the cache rows but not the surface, so it copies in full too.
+pub(crate) fn cpu_present_needs_full_copy(
+    forced: bool,
+    translated: bool,
+    translated_prev: bool,
+    damage: DamageOutcome,
+    retained_ok: bool,
+) -> bool {
+    forced
+        || translated
+        || translated_prev
+        || damage == DamageOutcome::Full
+        || matches!(damage, DamageOutcome::Scroll { .. })
+        || !retained_ok
+}
+
 #[inline]
 pub(crate) fn present_band_bg(default_bg: u32, theme_bg: u32) -> u32 {
     if default_bg == aterm_core::render::COLOR_UNSET {
@@ -4784,9 +4808,10 @@ fn cpu_surface_transaction<B, E>(
 #[cfg(test)]
 mod cpu_surface_transaction_tests {
     use super::{
-        FailedPresentRoute, cpu_surface_transaction, failed_present_route, opaque_cpu_client_frame,
-        present_band_bg,
+        FailedPresentRoute, cpu_present_needs_full_copy, cpu_surface_transaction,
+        failed_present_route, opaque_cpu_client_frame, present_band_bg,
     };
+    use aterm_render::DamageOutcome;
 
     #[derive(Debug)]
     struct FakeBuffer;
@@ -4826,6 +4851,49 @@ mod cpu_surface_transaction_tests {
             cpu_surface_transaction(Ok::<_, FakeSurfaceError>(FakeBuffer), |_| Ok(17)),
             Ok(17),
             "the causal work sample is returned only after a successful commit"
+        );
+    }
+
+    /// THE SUB-ROW PRESENT COPIES IN FULL (second audit, 2026-09-24). A
+    /// translated frame over unchanged cells is a gate hit — the damage the
+    /// cache describes is untranslated — so a dirty-row copy moves nothing and
+    /// the glass keeps the previous offset: the whole-row jump on the CPU
+    /// backend. The frame after a translated one must copy in full too, or
+    /// the settled surface keeps the shifted rows and the incoming strip.
+    #[test]
+    fn a_translated_cpu_frame_and_the_one_after_it_copy_in_full() {
+        let f = |translated, translated_prev| {
+            cpu_present_needs_full_copy(
+                false,
+                translated,
+                translated_prev,
+                DamageOutcome::GateHit,
+                true,
+            )
+        };
+        assert!(
+            !f(false, false),
+            "control: an untranslated gate hit on a retained surface copies nothing"
+        );
+        assert!(
+            f(true, false),
+            "a sub-row frame over unchanged cells still moves the band"
+        );
+        assert!(
+            f(false, true),
+            "the settle frame puts the surface back in cache space"
+        );
+        assert!(
+            cpu_present_needs_full_copy(false, false, false, DamageOutcome::Full, true),
+            "full damage"
+        );
+        assert!(
+            cpu_present_needs_full_copy(false, false, false, DamageOutcome::GateHit, false),
+            "a surface that does not hold the previous frame"
+        );
+        assert!(
+            cpu_present_needs_full_copy(true, false, false, DamageOutcome::GateHit, true),
+            "a caller-forced copy (chrome, stale bands)"
         );
     }
 
@@ -6965,7 +7033,6 @@ mod native_damage_tests {
             });
             window.badge_card = Some(host([0, 0, 255, 255], 2));
             window.bubble_card = Some(host([0, 255, 0, 255], 3));
-            window.level_up_card = Some(host([255, 0, 0, 255], 4));
         }
 
         assert!(app.compose_native_route_card(wid));
@@ -6975,16 +7042,8 @@ mod native_damage_tests {
                 .as_ref()
                 .expect("combined route card")
                 .rgba[4..8],
-            &[255, 0, 0, 255],
-            "level-up outranks the bubble and the badge over the retained native base"
-        );
-
-        app.windows.get_mut(&wid).unwrap().level_up_card = None;
-        assert!(app.compose_native_route_card(wid));
-        assert_eq!(
-            &app.windows[&wid].route_card.as_ref().unwrap().rgba[4..8],
             &[0, 255, 0, 255],
-            "the bubble is the next global-card priority"
+            "the bubble outranks the badge over the retained native base"
         );
         app.windows.get_mut(&wid).unwrap().bubble_card = None;
         assert!(app.compose_native_route_card(wid));
@@ -10976,8 +11035,8 @@ const DROP_WASH_ALPHA: u32 = 28; // ~11% — readable content underneath
 const DROP_BORDER_ALPHA: u32 = 235; // ~92% — a crisp but not harsh frame
 
 /// The parameters of ONE inset-accent-border overlay pass: the drag-and-drop drop
-/// target (fixed [`DROP_WASH_ALPHA`]/[`DROP_BORDER_ALPHA`]) OR the LEVEL-UP celebration
-/// glow (a breathing alpha off [`crate::level_up`]). Threading a single descriptor
+/// target (fixed [`DROP_WASH_ALPHA`]/[`DROP_BORDER_ALPHA`]) OR the upgrade rim
+/// (a pulsing alpha off [`crate::level_up`]). Threading a single descriptor
 /// through the CPU present ([`apply_overlay_at`]), the GPU blit ([`aterm_gpu::DropOverlay`]),
 /// and the SACRED `image`/`snapshot` compositor keeps the app-present destination
 /// equal to what an AI reads.
@@ -11096,7 +11155,7 @@ pub(crate) fn apply_drop_overlay_at(
 }
 
 /// The alpha-parametrized CORE of the inset-accent-border overlay (the drop target's
-/// fixed alphas OR the level-up glow's breathing alpha), band-aware exactly like
+/// fixed alphas OR the upgrade rim's pulsing alpha), band-aware exactly like
 /// the fixed-alpha test helper and pure + allocation-free. With the drop-overlay constants
 /// this is byte-identical to the historical fixed-alpha pass — that equivalence is
 /// pinned by `band_aware_overlay_twins_shift_without_touching_bands`.
@@ -19649,7 +19708,8 @@ mod composed_cursor_effect_advance_tests {
     // ---- THE CONTENT WITNESS ON A COMPOSED FRAME (2026-09-13) -------------
     //
     // Round A wired Rainbow Kitty's content witness (`ribbon_rows` →
-    // `observe_ribbon_row` → `Engine::witness_rows`) at LOCK A in
+    // `observe_ribbon_row`/`capture_ribbon_row` → `Engine::witness_rows`)
+    // at LOCK A in
     // `redraw_window` — the SINGLE-PANE path — and nowhere else. Every split
     // pane, every ZOOMED pane (a single zoomed leaf routes as composed too)
     // and every `aterm ctl image`/`video` capture therefore ran with the
@@ -19900,8 +19960,8 @@ mod composed_cursor_effect_advance_tests {
     /// ELSE'S glyph, and retires light the owner earned: worse than sampling
     /// nothing at all. Both splits (one offset each), a three-pane layout
     /// (both offsets at once) and a zoomed leaf, and the band deliberately
-    /// left on a row the caret has LEFT, which is the only row read through
-    /// `witness_row_buf` rather than through the caret's own probe. Then the
+    /// left on a row the caret has LEFT, which is the only row read into a
+    /// resident witness slot rather than through the caret's own probe. Then the
     /// 2026-09-16 shape law from this side: a lone glyph changed strictly
     /// inside the standing band is not evidence and the band stays whole; the
     /// same change at the band's last cell is a suffix and retires — which is
@@ -19927,8 +19987,8 @@ mod composed_cursor_effect_advance_tests {
 
             // Return: the caret LEAVES the band's row on a licensed move, so
             // the band stays where it was typed and row-scoped renewal no
-            // longer touches it. From here on row `win_row` is sampled through
-            // `witness_row_buf` — the pane-local read this test is about.
+            // longer touches it. From here on row `win_row` is sampled into
+            // its pane-local resident witness slot — the read this test is about.
             let t = t + Duration::from_millis(90);
             app.windows
                 .get_mut(&wid)
@@ -20001,8 +20061,9 @@ mod composed_cursor_effect_advance_tests {
     fn composed_witness_defers_rows_changed_after_cell_extraction() {
         for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
             let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
-            // Leave a live band on the preceding row, captured as this
-            // frame's upper neighbor.
+            // Leave a live band two rows above the caret. This is outside
+            // the exact caret-and-neighbor capture, so only a matching
+            // second-lock generation may fill its direct witness slot.
             let t = t + Duration::from_millis(90);
             app.windows
                 .get_mut(&wid)
@@ -20013,6 +20074,7 @@ mod composed_cursor_effect_advance_tests {
             assert!(
                 app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t))
             );
+            term_lock(&term).process(b"\x1b[8;1H");
             let plan = app.active_visible_leaf_plan(wid).unwrap();
             let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
             let sample = focused_composed_cursor_fx_sample(
@@ -24214,7 +24276,7 @@ mod motion_policy_tests {
 /// lock when Rainbow Kitty's content witness asks for either of them. A fresh
 /// read is needed only for a different ribbon row. The caller must feed rows
 /// from the same terminal generation as `above` and `below`.
-fn captured_witness_neighbor<'a>(
+pub(crate) fn captured_witness_neighbor<'a>(
     row: u16,
     caret_row: u16,
     above: Option<&'a [char]>,
@@ -24248,55 +24310,26 @@ fn needs_fresh_witness_read(
     })
 }
 
-pub(crate) fn witness_row_cols<'a>(
-    row: u16,
-    caret_row: u16,
-    above: Option<&'a [char]>,
-    below: Option<&'a [char]>,
-    scratch: &'a mut Vec<char>,
-    mut read: impl FnMut(u16, &mut Vec<char>),
-) -> &'a [char] {
-    if let Some(captured) = captured_witness_neighbor(row, caret_row, above, below) {
-        return captured;
-    }
-    read(row, scratch);
-    scratch
-}
-
 #[cfg(test)]
-mod witness_row_cols_tests {
-    use super::{needs_fresh_witness_read, witness_row_cols};
+mod witness_row_capture_tests {
+    use super::{captured_witness_neighbor, needs_fresh_witness_read};
 
     #[test]
     fn adjacent_ribbon_rows_reuse_captured_glyphs_without_a_second_grid_read() {
         let above = ['═', 'A'];
         let below = [' ', 'B'];
-        let mut scratch = vec!['!'];
-        let mut reads = Vec::new();
         for (row, want) in [(4, &above[..]), (6, &below[..])] {
-            let got = witness_row_cols(row, 5, Some(&above), Some(&below), &mut scratch, |r, _| {
-                reads.push(r);
-            });
-            assert_eq!(got, want, "the witness sees the exact captured glyphs");
+            assert_eq!(
+                captured_witness_neighbor(row, 5, Some(&above), Some(&below)),
+                Some(want),
+                "the witness reuses the exact captured glyphs"
+            );
         }
-        assert!(reads.is_empty(), "adjacent rows cost no second grid read");
-        assert_eq!(scratch, ['!'], "the unused read buffer stays untouched");
-
-        let got = witness_row_cols(8, 5, Some(&above), Some(&below), &mut scratch, |r, out| {
-            reads.push(r);
-            out.clear();
-            out.extend(['X', 'Y']);
-        });
-        assert_eq!(got, ['X', 'Y']);
-        assert_eq!(reads, [8], "a distinct ribbon row is read once");
-
-        let got = witness_row_cols(4, 5, None, Some(&below), &mut scratch, |r, out| {
-            reads.push(r);
-            out.clear();
-            out.push('Q');
-        });
-        assert_eq!(got, ['Q']);
-        assert_eq!(reads, [8, 4], "an uncaptured neighbor is read fresh");
+        assert_eq!(
+            captured_witness_neighbor(8, 5, Some(&above), Some(&below)),
+            None
+        );
+        assert_eq!(captured_witness_neighbor(4, 5, None, Some(&below)), None);
     }
 
     #[test]
@@ -28046,7 +28079,6 @@ impl App {
                         cursor_glow,
                         poof_row_above_buf,
                         poof_row_below_buf,
-                        witness_row_buf,
                         ..
                     } = window;
                     if let Some(captured) = captured_witness_neighbor(
@@ -28058,13 +28090,14 @@ impl App {
                         cursor_glow.observe_ribbon_row(r, captured);
                     } else if same_generation && local < grid_rows {
                         let terminal = terminal.as_ref().expect("far witness owns a lock");
-                        terminal.row_cols_into(local, witness_row_buf);
-                        if col > 0 {
-                            let len = witness_row_buf.len();
-                            witness_row_buf.resize(len.saturating_add(col), ' ');
-                            witness_row_buf.rotate_right(col);
-                        }
-                        cursor_glow.observe_ribbon_row(r, witness_row_buf);
+                        cursor_glow.capture_ribbon_row(r, |cols| {
+                            terminal.row_cols_into(local, cols);
+                            if col > 0 {
+                                let len = cols.len();
+                                cols.resize(len.saturating_add(col), ' ');
+                                cols.rotate_right(col);
+                            }
+                        });
                     }
                 }
             }
@@ -28330,7 +28363,6 @@ impl App {
         let Some(host) = window
             .conn_wire_card
             .as_ref()
-            .or(window.level_up_card.as_ref())
             .or(window.bubble_card.as_ref())
             .or(window.badge_card.as_ref())
         else {
@@ -29661,9 +29693,11 @@ impl App {
                 border_scale_q4: 0,
             })
         } else {
+            // THE UPGRADE RIM paints over an in-app overlay too: it is the one
+            // explanation of a frozen terminal, and a frozen terminal behind
+            // Settings is still frozen.
             self.level_up
                 .as_ref()
-                .filter(|l| !overlay_open || l.paints_over_overlay())
                 .map(|level| OverlayGlow {
                     accent: level.accent(self.theme.cursor, now),
                     wash_a: level.wash_alpha(now),
@@ -29840,12 +29874,18 @@ impl App {
         // acquisition and final-present waits remain in `redraw_total`.
         // THIS window's pending keystroke only: a present in another window (its
         // own streaming output) must not close a key typed here.
-        metrics::record_present(
+        let hardware_slice = metrics::record_present(
             present_latency_ns,
             render_ns,
             startup_timing,
             self.windows.get_mut(&id).map(|ws| &mut ws.pending_input),
         );
+        // STRAIN (design §10.14, ruling 211): a hardware key's closed,
+        // untainted input→present slice is one FELT sample — one ring write on
+        // a frame that is drawn anyway.
+        if let Some(slice_ns) = hardware_slice {
+            self.note_strain_key(id, slice_ns);
+        }
 
         // There is deliberately NO font-coverage warm here any more. The
         // `aterm-font-warm` thread this hook used to spawn read EVERY system
@@ -30180,7 +30220,6 @@ impl App {
         self.splice_find_bar(id);
         self.splice_build_badge(id);
         self.splice_robi_bubble(id);
-        self.splice_level_up(id);
         self.splice_conn_wire(id);
         if !self.compose_native_route_card(id) {
             return;
@@ -30245,7 +30284,6 @@ impl App {
         self.splice_find_bar(id);
         self.splice_build_badge(id);
         self.splice_robi_bubble(id);
-        self.splice_level_up(id);
         self.splice_conn_wire(id);
         if !self.compose_native_route_card(id) {
             return;
@@ -30581,8 +30619,8 @@ impl App {
         // active. The flash state machine decides "active"; `about_to_wait` wakes
         // the loop at its deadline so the normal frame returns.
         // ANY modal overlay (Settings, About, Palette, Update) suppresses the bell-flash
-        // invert, the drag-drop wash (below), and the level-up glow (at the OverlayGlow
-        // build) so the card and the terminal behind it stay stable and render IDENTICALLY
+        // invert and the drag-drop wash (below) — never the upgrade rim, which explains a
+        // freeze — so the card and the terminal behind it stay stable and render IDENTICALLY
         // on CPU + GPU. The GPU bakes the card into the offscreen, so a whole-frame invert
         // there would photo-negative the modal; the CPU composites the card last (pristine).
         // `overlay_open()` is the ONE gate — snapshot and the `image` verb consult
@@ -31045,7 +31083,8 @@ impl App {
                 // same text — and the caret row from the probe just taken.
                 // The engine reads them right after its tick and retires the
                 // cells whose glyph has changed or gone
-                // (`CursorGlow::observe_ribbon_row`). Nothing for the nine
+                // (`CursorGlow::observe_ribbon_row`/`capture_ribbon_row`).
+                // Nothing for the nine
                 // other styles: `ribbon_rows` answers 0 and the slot copy is
                 // refused, so they pay one bool.
                 ws.cursor_glow
@@ -31054,17 +31093,18 @@ impl App {
                 let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
                 for &r in &ribbon_rows[..n] {
                     if usize::from(r) < rows && r != cpos.row {
-                        let cols = witness_row_cols(
+                        if let Some(captured) = captured_witness_neighbor(
                             r,
                             cpos.row,
                             neighbor_above.then_some(ws.poof_row_above_buf.as_slice()),
                             neighbor_below.then_some(ws.poof_row_below_buf.as_slice()),
-                            &mut ws.witness_row_buf,
-                            |r, out| {
-                                term.row_cols_into(usize::from(r), out);
-                            },
-                        );
-                        ws.cursor_glow.observe_ribbon_row(r, cols);
+                        ) {
+                            ws.cursor_glow.observe_ribbon_row(r, captured);
+                        } else {
+                            ws.cursor_glow.capture_ribbon_row(r, |cols| {
+                                term.row_cols_into(usize::from(r), cols);
+                            });
+                        }
                     }
                 }
                 Some((cpos.row, cpos.col, probe_trust))
@@ -33065,19 +33105,15 @@ impl App {
                 .robi_bubble
                 .as_ref()
                 .map_or(0, |b| b.fingerprint(std::time::Instant::now()));
-            // LEVEL-UP celebration — quantized to its ~30fps step so the glow/arrow re-
-            // present every frame while up; `0` when idle (byte-identical no-celebration).
-            // `0` while an overlay covers the window too, and while a drag hovers
-            // it with no arrow on glass: the rim is not painted under an overlay
-            // and a drag paints the fixed drop glow instead (`host_visual_state`),
-            // so its ticking would only re-present an identical frame at 30 fps.
+            // The UPGRADE RIM — quantized to its ~30fps step so it re-presents
+            // every frame while up; `0` when idle (byte-identical no-rim). `0`
+            // while a drag hovers the window outside an overlay too: the drag
+            // paints the fixed drop glow instead (`host_visual_state`), so the
+            // rim's ticking would only re-present an identical frame at 30 fps.
             let level_up_fp = self
                 .level_up
                 .as_ref()
-                .filter(|l| {
-                    (!ws.overlay_open() || l.paints_over_overlay())
-                        && (!ws.drag_hover || l.arrow_alpha(frame_started) > 0.0)
-                })
+                .filter(|_| !(ws.drag_hover && !ws.overlay_open()))
                 .map_or(0, |l| l.fingerprint(frame_started));
             // The message band: 0 when no row is committed — the key stays
             // byte-identical to the no-band path (FL-1); the hover rides it so
@@ -33714,7 +33750,11 @@ impl App {
             ws.input_scratch.grid_bot_row = 0;
             // …and the incoming-row apron a prior single-pane extraction stamped:
             // a composed frame's row below the band is no one pane's row.
-            ws.input_scratch.apron_row.present = false;
+            // The memo goes with it (`RenderInput::apron_stamp`): kept, the next
+            // single-pane fill of the same idle terminal would hit it and leave
+            // the apron absent for a row the engine never cleared.
+            ws.input_scratch.apron_row.clear();
+            ws.input_scratch.apron_stamp = None;
         }
         // SPLICE the Cmd-F find bar over the bottom terminal row (a no-op when not
         // searching).
@@ -33755,12 +33795,8 @@ impl App {
         }
         // Robi's tip bubble — paint-only, its own slot, priority over the badge.
         self.splice_robi_bubble(id);
-        // LEVEL-UP rising up-arrow — paint-only, its own slot, priority over Robi's
-        // bubble (the burst momentarily supersedes it). The border glow rides the overlay
-        // pass below, not this card. A no-op when no celebration / the arrow has faded.
-        self.splice_level_up(id);
         // DRAG-TO-CONNECT wire (design §3.2) — paint-only, its own slot,
-        // priority over the level-up/bubble cards while a connection drag from
+        // priority over the bubble card while a connection drag from
         // THIS window is in flight. A no-op (card = None) otherwise.
         self.splice_conn_wire(id);
         // The multi-line-paste confirmation is a SECURITY question: it
@@ -33793,11 +33829,10 @@ impl App {
         // recording metrics and routes through the dropped-frame retry below.
         // The inset-border overlay pass paints, in the theme accent (`theme.cursor`):
         // the drop-target highlight while a file is dragged (fixed alpha, priority), ELSE
-        // the LEVEL-UP celebration's breathing border glow while it is up. `None` keeps
-        // the present path byte-identical to before either feature (the idle invariant).
-        // Both arms honor the modal-overlay suppression: `drag_hover` was gated at its
-        // read, and the level-up arm consults the same `overlay_open` — matching
-        // the snapshot/`image` capture paths at the app-render boundary.
+        // the upgrade rim while it is up. `None` keeps the present path byte-identical
+        // to before either feature (the idle invariant). `drag_hover` was gated on the
+        // modal overlay at its read; the rim paints over one (it explains a freeze) —
+        // matching the snapshot/`image` capture paths at the app-render boundary.
         let overlay = if drag_hover {
             Some(OverlayGlow {
                 accent: self.theme.cursor,
@@ -33808,7 +33843,6 @@ impl App {
         } else {
             self.level_up
                 .as_ref()
-                .filter(|l| !overlay_open || l.paints_over_overlay())
                 .map(|l| OverlayGlow {
                     accent: l.accent(self.theme.cursor, frame_started),
                     wash_a: l.wash_alpha(frame_started),
@@ -34539,16 +34573,14 @@ impl App {
             // Disjoint sub-borrow of `ws.settings_card` (separate field from `ws.present`,
             // taken mutably below). `None` ⇒ the GPU draws nothing (feature off / closed).
             // The gpu crate takes raw bytes, NOT the gui `SettingsCard` type.
-            // Modal card FIRST, else the level-up arrow burst, else Robi's tip bubble,
-            // else the paint-only build/version badge (all share the one tray-quad slot:
-            // a modal covers the rest; the burst supersedes the bubble; the bubble covers
-            // the static badge).
+            // Modal card FIRST, else the connection wire, else Robi's tip bubble, else
+            // the paint-only build/version badge (all share the one tray-quad slot: a
+            // modal covers the rest; the bubble covers the static badge).
             let tray_arg = ws
                 .route_card
                 .as_ref()
                 .or(ws.settings_card.as_ref())
                 .or(ws.conn_wire_card.as_ref())
-                .or(ws.level_up_card.as_ref())
                 .or(ws.bubble_card.as_ref())
                 .or(ws.badge_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y))
@@ -34559,7 +34591,7 @@ impl App {
                     quad
                 });
             // Map the glow → the GPU overlay params (the alphas are the caller's:
-            // fixed for the drop target, breathing for the level-up celebration; the
+            // fixed for the drop target, pulsing for the upgrade rim; the
             // GPU derives the border thickness from the framebuffer size to match CPU).
             let gpu_overlay = overlay.map(|g| aterm_gpu::DropOverlay {
                 accent: g.accent,
@@ -34714,7 +34746,6 @@ impl App {
                 || ws.route_card.is_some()
                 || ws.settings_card.is_some()
                 || ws.conn_wire_card.is_some()
-                || ws.level_up_card.is_some()
                 || ws.bubble_card.is_some()
                 || ws.badge_card.is_some();
             let chrome_prev = ws.cpu_cache.presented_chrome();
@@ -34734,7 +34765,16 @@ impl App {
             // only configured-top + base-bottom rows; this is a prefix crop on
             // CPU because the renderer already places the grid at `pad_top`.
             let fh = crate::visible_frame_height(raw_fh, ws.metrics.pad, ws.metrics.pad_top);
-            let pixels = ws.cpu_cache.frame_pixels();
+            // THE PIXELS THE RENDER HANDED BACK: on a sub-row frame the
+            // translated present scratch (the band shifted, the incoming row in
+            // its strip), never the untranslated damage cache — reading the
+            // cache here presented whole-row jumps (audit, 2026-09-24). This
+            // call needs a softbuffer surface, so no headless test reaches it:
+            // `aterm-render`'s `incoming_row_apron` pins the accessor, and
+            // `cpu_present_needs_full_copy` the copy decision beside it.
+            let pixels = ws.cpu_cache.presented_pixels();
+            let translated = ws.cpu_cache.last_translated();
+            let translated_prev = ws.cpu_cache.presented_translated();
             // W1 (kill the compositor stretch), mirroring the GPU blit: the
             // softbuffer surface is the RAW window size (`win_px`), the frame
             // lands at the centred band offset, and the `0..cell-1` remainder
@@ -34765,8 +34805,8 @@ impl App {
                         .enumerate()
                         .any(|(row, &dirty)| {
                             dirty
-                                && r.row_pixel_band(row, ws.input_scratch.rows, fh).0
-                                    < chrome_edge_rows
+                                && chrome_edge_rows
+                                    .contains(&r.row_pixel_band(row, ws.input_scratch.rows, fh).0)
                         }));
             if surface
                 .resize(
@@ -34802,13 +34842,13 @@ impl App {
                 // retained SURFACE (a separate softbuffer) was not shifted — a
                 // dirty-band copy would strand the moved rows. The cache already holds
                 // the correct full frame, so fall back to the always-safe full copy.
-                let full = chrome
-                    || chrome_prev
-                    || chrome_bands_stale
-                    || damage == DamageOutcome::Full
-                    || matches!(damage, DamageOutcome::Scroll { .. })
-                    || buf.age() != 1
-                    || buf.len() != dw * dh;
+                let full = cpu_present_needs_full_copy(
+                    chrome || chrome_prev || chrome_bands_stale,
+                    translated,
+                    translated_prev,
+                    damage,
+                    buf.age() == 1 && buf.len() == dw * dh,
+                );
                 let commit = if full {
                     // W1 full copy: content placed 1:1 at the centred band offset
                     // (never scaled) + the remainder bands painted the live
@@ -34822,7 +34862,7 @@ impl App {
                         fh,
                         false,
                         band_bg,
-                        chrome_edge_rows,
+                        chrome_edge_rows.clone(),
                     );
                     for px in buf.iter_mut().skip(n) {
                         *px = 0;
@@ -34843,7 +34883,6 @@ impl App {
                         .as_ref()
                         .or(ws.settings_card.as_ref())
                         .or(ws.conn_wire_card.as_ref())
-                        .or(ws.level_up_card.as_ref())
                         .or(ws.bubble_card.as_ref())
                         .or(ws.badge_card.as_ref())
                         .and_then(|card| tray_quad_below_y(card, tray_floor_y));
@@ -34946,6 +34985,7 @@ impl App {
                 // The extent the surface's bands now hold: a full copy placed
                 // them with it, and a partial copy ran only when it was unchanged.
                 ws.cpu_cache.set_presented_edge_rows(chrome_edge_rows);
+                ws.cpu_cache.set_presented_translated(translated);
                 if capture_client_requested && let Some(client) = captured_client {
                     ws.capture_present_client = Some(client);
                     ws.capture_client_requested = false;
@@ -38205,19 +38245,16 @@ impl App {
             .robi_bubble
             .as_ref()
             .map_or(0, |b| b.fingerprint(std::time::Instant::now()));
-        // (`0` under an open overlay or an arrow-less drag hover, as in the
-        // single-pane key: no rim is painted there.)
-        let (overlay_covers, drag_covers) = self
+        // (`0` under a drag hover outside an overlay, as in the single-pane key:
+        // the drop glow is painted there, not the rim.)
+        let drag_covers = self
             .windows
             .get(&wid)
-            .map_or((false, false), |ws| (ws.overlay_open(), ws.drag_hover));
+            .is_some_and(|ws| ws.drag_hover && !ws.overlay_open());
         let level_up_fp = self
             .level_up
             .as_ref()
-            .filter(|l| {
-                (!overlay_covers || l.paints_over_overlay())
-                    && (!drag_covers || l.arrow_alpha(now) > 0.0)
-            })
+            .filter(|_| !drag_covers)
             .map_or(0, |l| l.fingerprint(now));
         // The message band — same term as the single-pane key: it is WINDOW
         // chrome over the finished composite; 0 when no row is committed (FL-1).
@@ -38977,17 +39014,25 @@ impl App {
         let bleed = match strip_bleed {
             Some((color, seam)) => Some(aterm_render::ChromeBleed {
                 rows: strip + bars,
+                first: 0,
                 color,
                 seam,
                 top_extends_cells: extend_top,
                 row_edges: [None; aterm_render::CHROME_ROW_EDGES],
             }),
-            None if strip == 0 && bars > 0 => {
+            // No strip bleed: no strip at all, or one with no surface of its own
+            // (macOS's in-grid strip, `tab_strip_rows = 1`). The band rows below
+            // it still reach the window edges; the strip rows keep the padding
+            // (`ChromeBleed::first`). This arm was `strip == 0` only, so that
+            // macOS strip dropped the band's whole bleed and a 100 % meter
+            // stopped `pad` px short of both edges (audit, 2026-09-24).
+            None if bars > 0 => {
                 let c = chrome_band::band_colors(chrome_theme);
                 let pack =
                     |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
                 Some(aterm_render::ChromeBleed {
-                    rows: bars,
+                    rows: strip + bars,
+                    first: strip,
                     color: pack(c.bar_bg),
                     seam: Some(pack(c.label)),
                     top_extends_cells: false,
@@ -40467,120 +40512,6 @@ impl App {
         f32::from(self.chrome_rows(wid))
     }
 
-    /// Rasterize the LEVEL-UP rising up-arrow ([`self.level_up`]) into this window's
-    /// paint-only `level_up_card` (composited with priority OVER `bubble_card`, UNDER a
-    /// modal `settings_card`). No-op ⇒ `level_up_card = None` when no celebration is up OR
-    /// the arrow has already faded (its alpha reached 0) — the border glow keeps going via
-    /// the overlay pass and a bubble shows through beneath. Re-rasterizes
-    /// each animation step (the arrow moves + fades), through the SAME rasterizer +
-    /// composite path the bubble/badge use, so the app-render frame matches its
-    /// introspection artifact. Mirrors [`Self::splice_robi_bubble`].
-    pub(crate) fn splice_level_up(&mut self, wid: WindowId) {
-        if !self
-            .serious_mode_policy()
-            .allows(crate::motion::SeriousEffect::LevelUp)
-        {
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.level_up_card = None;
-            }
-            return;
-        }
-        let now = std::time::Instant::now();
-        // Only while the arrow is actually visible do we hold a card; once it fades the
-        // slot is released so Robi's bubble can composite through.
-        let Some(fp) = self
-            .level_up
-            .as_ref()
-            .filter(|l| l.arrow_alpha(now) > 0.0)
-            .map(|l| l.fingerprint(now))
-        else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.level_up_card = None;
-            }
-            return;
-        };
-        let (cols, rows) = self
-            .windows
-            .get(&wid)
-            .map_or((0, 0), |ws| (ws.cols as usize, ws.rows as usize));
-        if cols == 0 || rows == 0 {
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.level_up_card = None;
-            }
-            return;
-        }
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid) as u32;
-        let pad_top = self.win_pad_top(wid) as u32;
-        let head = self.win_head(wid) as u32;
-        let font_px = self.win_font_px(wid);
-        let Some(level_up) = self.level_up.as_ref() else {
-            return;
-        };
-        // Accent = the surge's own hue at this instant (the cursor colour, pulled
-        // toward the electric tint through the burst), so the arrow and the rim
-        // it rises within share one colour frame by frame.
-        let accent = crate::settings::u32_rgb(level_up.accent(self.theme.cursor, now));
-        let geom = crate::settings::SettingsGeom {
-            cw: cw as f32,
-            ch: ch as f32,
-            font_px,
-            cols,
-            panel_rows: rows, // the window height the arrow centres its rise within
-        };
-        let geom_key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            cw.hash(&mut h);
-            ch.hash(&mut h);
-            font_px.to_bits().hash(&mut h);
-            cols.hash(&mut h);
-            rows.hash(&mut h);
-            pad.hash(&mut h);
-            pad_top.hash(&mut h);
-            head.hash(&mut h); // the dy anchor moves with the chrome headroom
-            h.finish()
-        };
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
-        if ws
-            .level_up_card
-            .as_ref()
-            .is_none_or(|c| c.fp != fp || c.geom != geom_key)
-        {
-            let mut tray = crate::level_up::arrow_tray(level_up, &geom, accent, now);
-            let tray_w = (cols * cw) as f32;
-            let (card_x, card_y, card_w, card_h) = tray.card;
-            const PAINT_MARGIN: f32 = 4.0; // covers any glyph overhang
-            let x0 = (card_x - PAINT_MARGIN).max(0.0).floor();
-            let y0 = (card_y - PAINT_MARGIN).max(0.0).floor();
-            let x1 = (card_x + card_w + PAINT_MARGIN).min(tray_w).ceil();
-            let y1 = (card_y + card_h + PAINT_MARGIN).ceil();
-            if x1 <= x0 || y1 <= y0 {
-                ws.level_up_card = None;
-                return;
-            }
-            crate::widget::translate_prims(&mut tray.prims, -x0, -y0);
-            let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
-                &tray.prims,
-                (x1 - x0) as u32,
-                (y1 - y0) as u32,
-                1.0,
-                [0, 0, 0, 0],
-            );
-            ws.level_up_card = Some(crate::SettingsCard {
-                rgba,
-                pw,
-                ph,
-                dx: pad + x0 as u32,
-                dy: pad_top + head + y0 as u32,
-                fp,
-                geom: geom_key,
-            });
-        }
-    }
-
     /// Device-pixel floor below the top-row BANNER band — the multi-line-paste
     /// confirmation banner of THIS window, when it is up.
     ///
@@ -40970,6 +40901,29 @@ impl App {
                 }
             }
             ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
+        }
+        // THE ROWS NO LONGER HOLD THE CELLS THEIR GUTTER TONES CAME FROM.
+        // `splice_tab_strip_with` handed the renderer `ChromeBleed::row_edges`
+        // taken from the message band's painted edge cells, and this splice
+        // (the paste banner, on Linux) has just overwritten some of those rows.
+        // Left in place, a metered row's gutters wear the meter beside a band
+        // row of `bar_bg` — and, the banner row being static while the meter
+        // under it moves, freeze on whatever tone was current when the banner
+        // first painted, since a gutter tone that changes without its edge
+        // cell breaks the bleed's no-epoch contract (audit, 2026-09-24). The
+        // covered rows take the bleed's own tone, the band surface the banner
+        // paints.
+        let covered = start..start + panel_rows;
+        if let Some(mut bleed) = self.backend.chrome_bleed() {
+            let before = bleed.row_edges;
+            for slot in &mut bleed.row_edges {
+                if slot.is_some_and(|e| covered.contains(&e.row)) {
+                    *slot = None;
+                }
+            }
+            if bleed.row_edges != before {
+                self.backend.set_chrome_bleed(Some(bleed));
+            }
         }
     }
 
@@ -43255,6 +43209,93 @@ mod tab_strip_bleed_tests {
             (bleed.color, bleed.color),
             "an unmetered row keeps the band tone"
         );
+    }
+
+    /// A BAND SPLICED OVER A METERED ROW TAKES ITS GUTTERS WITH IT (audit,
+    /// 2026-09-24). The paste-confirmation banner overwrites the top rows in
+    /// place after the bleed was handed over; the metered row's per-row tones
+    /// then sat beside a row of `bar_bg` and froze on a stale meter tone. The
+    /// splice primitive drops the tones of every row it covers; the rows it
+    /// does not cover keep theirs.
+    #[test]
+    fn a_band_spliced_over_a_metered_row_drops_its_gutter_tones() {
+        use aterm_messages::{Hold, Message, Meter, Severity, tags};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 0;
+        let live = Hold::Live {
+            stale_after: aterm_messages::STALE_UPDATE,
+        };
+        for title in ["aterm update v0.99.0", "aterm update v0.99.1"] {
+            app.post_message(
+                Message::new(tags::UPDATE, Severity::Info, title)
+                    .meter(Meter {
+                        fill_permille: Some(1000),
+                        ..Meter::default()
+                    })
+                    .hold(live),
+            );
+        }
+        app.splice_tab_strip_with(wid, 0);
+        let bleed = app.backend.chrome_bleed().expect("band rows are chrome");
+        let metered: Vec<usize> = bleed.row_edges.iter().flatten().map(|e| e.row).collect();
+        assert!(
+            metered.len() >= 2,
+            "fixture: two metered rows carry tones ({metered:?})"
+        );
+        let (covered, kept) = (metered[0], metered[1]);
+        let cols = usize::from(app.windows[&wid].cols);
+        let cell_h = app.win_cell_size(wid).1;
+        let blank = crate::message_band::blank_band_row(cols, app.chrome_palette_theme());
+        app.splice_band_rows_at(wid, 0, vec![blank; covered + 1], cols, cell_h);
+        let after = app.backend.chrome_bleed().expect("still chrome");
+        assert_eq!(
+            after.gutter_tones(covered),
+            (after.color, after.color),
+            "the covered row's gutters take the band tone"
+        );
+        assert_eq!(
+            after.gutter_tones(kept),
+            bleed.gutter_tones(kept),
+            "an uncovered row keeps its own tones"
+        );
+    }
+
+    /// A STRIP WITH NO SURFACE STILL LETS THE BAND REACH THE EDGES (audit,
+    /// 2026-09-24). macOS's in-grid strip (`tab_strip_rows = 1`) has no band
+    /// tones of its own, and the band's bleed arm required `strip == 0`, so
+    /// the whole bleed was dropped and a 100 % meter stopped `pad` px short of
+    /// both edges. The band now bleeds from below the strip (`first`), and a
+    /// strip that HAS a surface keeps the whole-stack bleed.
+    #[test]
+    fn the_band_bleeds_below_a_strip_with_no_surface() {
+        use aterm_messages::{Hold, Message, Severity, tags};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.post_message(
+            Message::new(tags::UPDATE, Severity::Info, "a band row").hold(Hold::Live {
+                stale_after: aterm_messages::STALE_UPDATE,
+            }),
+        );
+        app.splice_tab_strip_with(wid, 1);
+        let bleed = app
+            .backend
+            .chrome_bleed()
+            .expect("the band rows are chrome");
+        let presence = usize::from(app.windows[&wid].presence.rows);
+        assert_eq!(
+            bleed.rows,
+            1 + presence + usize::from(app.message_band_rows)
+        );
+        if tab_bar::strip_bleed_tones(app.chrome_palette_theme()).is_none() {
+            assert_eq!(bleed.first, 1, "a strip with no surface keeps the padding");
+        } else {
+            assert_eq!(
+                bleed.first, 0,
+                "a strip with a surface bleeds with the band"
+            );
+        }
     }
 
     /// The row-edge map: band row `i` lands on chrome row `first + i`, only
@@ -47328,6 +47369,7 @@ mod message_band_visual_tests {
         let committed = usize::from(app.message_band_rows);
         cpu.set_chrome_bleed((committed > 0).then(|| aterm_render::ChromeBleed {
             rows: committed,
+            first: 0,
             color: pack(band.bar_bg),
             seam: Some(pack(band.label)),
             top_extends_cells: false,
@@ -47503,7 +47545,6 @@ mod message_band_visual_tests {
                 bytes_total: 900_000_000,
                 build: Some(5520),
                 bumped: false,
-                bumped_with: None,
                 error: None,
             },
         );
@@ -47638,8 +47679,8 @@ mod message_band_visual_tests {
             // spinner frames and `✓` do.
             app.windows.get_mut(&wid).unwrap().focused = true;
         }
-        // "Staged automatic" is a record since the attention rule (design
-        // §10.5 H2): the scene that showed it commits no row at all.
+        // "Staged automatic" is a record (design §10.5 H2; the owner's silent
+        // path, 2026-09-24): the scene that showed it commits no row at all.
         app.clear_messages_for_test();
         app.note_update_progress(&aterm_update::Progress::Staged {
             version: "0.91.0".into(),
@@ -47653,7 +47694,7 @@ mod message_band_visual_tests {
         // THE ROWS, one scene each, at the four widths — every row one a
         // reporter really posts, shot 2 s after its motion epoch.
         type Scene = (&'static str, fn(&mut App));
-        let scenes: [Scene; 24] = [
+        let scenes: [Scene; 21] = [
             ("01-first-run-announced", |app| {
                 app.announce_toolchain_pass(FIRST_RUN, true);
             }),
@@ -47679,23 +47720,13 @@ mod message_band_visual_tests {
                     version: "0.92.0".into(),
                 });
             }),
-            ("08-installs-within-a-minute", |app| {
-                app.post_message(update_words::staged(
-                    "0.92.0",
-                    1234,
-                    Some(ApplyPosture::Automatic),
-                ));
-            }),
-            ("08c-editor-holds", |app| {
-                app.post_update_row(
-                    update_words::staged("0.92.0", 1234, Some(ApplyPosture::Automatic)),
-                    "0.92.0",
-                    crate::messages_host::FlowPhase::Staged {
-                        build: 1234,
-                        flow: true,
-                    },
+            // The one row the automatic lane raises before the switch: unsaved
+            // editor work holding the install, which only the person can clear.
+            ("08c-editor-waits", |app| {
+                app.note_update_blockers(
+                    &[App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()],
+                    true,
                 );
-                app.restate_update_flow_holds(1234, update_words::Holds::Editor);
             }),
             ("09-staged-manual", |app| {
                 app.post_message(update_words::staged(
@@ -47723,7 +47754,7 @@ mod message_band_visual_tests {
                 record_the_answers(app);
             }),
             ("11-landed", |app| {
-                app.post_update_landed("0.92.0", 1234);
+                app.post_update_landed("0.92.0", 1234, 0);
             }),
             // A lane that stopped: a row the person acts on, main's words and
             // the `Install now` press (ruling 143; was U17's press-failed row).
@@ -47783,8 +47814,9 @@ mod message_band_visual_tests {
             }),
             // THE RETIRED TOAST'S ROWS (Phase 4, R14–R19): the Full Disk
             // Access question with both capsules, its route words after Open
-            // Settings, the admin step's decision, the install running as a
-            // live row, and a failed gesture's short row.
+            // Settings, and a failed gesture's short row (the admin step's
+            // decision and its live install row went with the OS-installer
+            // protocols, 2026-09-24).
             ("17-file-access", |app| {
                 app.post_message(crate::message_reporters::file_access_question());
             }),
@@ -47795,15 +47827,6 @@ mod message_band_visual_tests {
                     .act(id, ActionIndex(0), Instant::now())
                     .expect("Open Settings");
                 app.perform_intent(WindowId(0), id, intent);
-            }),
-            ("19-admin-step", |app| {
-                app.post_admin_step(vec!["clt".to_string(), "brew".to_string()]);
-            }),
-            ("20-admin-installing", |app| {
-                app.post_message(crate::message_reporters::admin_install_started(&[
-                    "clt".to_string(),
-                    "brew".to_string(),
-                ]));
             }),
             ("21-gesture-failure", |app| {
                 app.post_message(crate::message_reporters::new_tab_failed(

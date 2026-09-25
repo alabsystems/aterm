@@ -61,6 +61,14 @@ use std::process::Command;
 pub const BRIDGE_VERB_FD: RawFd = 3;
 pub const BRIDGE_PUSH_FD: RawFd = 4;
 
+// The two numbers are the protocol. A launcher and a bridge that disagreed
+// about them would produce a child that starts, blocks on an empty descriptor
+// and never speaks — the least diagnosable failure available here — so they
+// are pinned at compile time rather than commented. (The end-to-end test
+// `a_child_reads_fd_three_and_writes_fd_four` drives a child that reads fd 3
+// and writes fd 4.)
+const _: () = assert!(BRIDGE_VERB_FD == 3 && BRIDGE_PUSH_FD == 4);
+
 /// SPAWN `cmd` with `first` and `second` inherited at [`BRIDGE_VERB_FD`] and
 /// [`BRIDGE_PUSH_FD`].
 ///
@@ -174,16 +182,6 @@ const F_DUPFD: i32 = 0;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The two numbers are the protocol. A launcher and a bridge that disagreed
-    /// about them would produce a child that starts, blocks on an empty
-    /// descriptor and never speaks — the least diagnosable failure available
-    /// here — so they are pinned rather than commented.
-    #[test]
-    fn the_inherited_numbers_are_three_and_four() {
-        assert_eq!(BRIDGE_VERB_FD, 3);
-        assert_eq!(BRIDGE_PUSH_FD, 4);
-    }
 
     /// END TO END, through a real fork+exec: a child that reads fd 3 and writes
     /// fd 4 sees the parent's socketpair ends at those exact numbers. `/bin/sh`

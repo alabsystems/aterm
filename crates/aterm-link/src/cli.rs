@@ -1076,10 +1076,13 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
     }
     match astream_cap::mint(&key, grant) {
         Ok(cap) => {
-            // `<grant> <tag-hex>`, split at the LAST whitespace by every reader,
-            // so a grant whose filter holds a space still reads back.
-            let tag: String = cap.tag.iter().map(|b| format!("{b:02x}")).collect();
-            println!("{} {tag}", cap.filter);
+            // `<grant> <tag-hex>` in astream's one cap-file format, which every
+            // reader splits at the LAST whitespace, so a grant whose filter holds
+            // a space still reads back.
+            println!(
+                "{}",
+                astream_cap::capfile::format_line(&cap.filter, &cap.tag)
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {

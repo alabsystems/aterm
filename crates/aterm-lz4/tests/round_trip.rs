@@ -125,13 +125,10 @@ fn round_trip_overlapping_match() {
 // ---------------------------------------------------------------------------
 // Malformed-input soundness regressions.
 //
-// These run against whichever decode path is built (safe-decode by default,
-// the unsafe pointer-based decoder under `--no-default-features`). The unsafe
-// hot loop copies fixed-width chunks (16-byte literal, 18-byte match) driven
-// by attacker-influenced lengths; the per-copy bounds guards in
-// `src/block/decompress.rs` must reject overruns with a decode `Err` rather
-// than reading/writing out of bounds. Both paths must agree: malformed input
-// errors cleanly, never panics or corrupts memory.
+// These run against the bounds-checked decoder (`src/block/decompress_safe.rs`,
+// the only one carried). Literal and match lengths are attacker-influenced;
+// an overrun must come back as a decode `Err`, never a panic or an
+// out-of-bounds read or write.
 // ---------------------------------------------------------------------------
 
 #[test]

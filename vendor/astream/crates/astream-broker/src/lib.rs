@@ -11,7 +11,10 @@
 //! its accept path — presented as a proof of possession over a per-connection nonce
 //! (`Hello` → `Nonce` → `Attach` → `Mark`), so the capability's tag never crosses the
 //! wire, and held on a bounded per-connection keyring. The same Frame protocol rides
-//! every transport.
+//! every transport, and a caller that picks the transport at runtime reaches all of
+//! them through ONE function: [`connect`] takes a [`Transport`] and hands back a
+//! transport-erased [`AnyClient`] plus the [`Closer`] that ends it from another thread
+//! and bounds its reads and writes, with an optional connect timeout.
 //!
 //! - **PUBLISH** appends to a durable log with **exactly-once ingest** — a re-sent
 //!   `(producer_id, producer_seq)` is not re-appended and returns its original
@@ -30,7 +33,9 @@
 //!   end-to-end exactly-once processing.
 //! - **RETAINED STATE**: `Last{filter, after, max}` is the last record of every
 //!   matching subject, paged in subject order and closed by a `Mark{next, head}` a
-//!   `subscribe` on the same connection can tail on from.
+//!   `subscribe` on the same connection can tail on from. [`Client::last_walk`] and
+//!   [`Client::last_all`] page it to the end on the resume cursor and keep the FIRST
+//!   page's mark — the one splice point a paged answer has.
 //! - **BOUNDED READS**: `Fetch{from, filter, max}` reads at most `max` matching
 //!   records while scanning at most `FETCH_SCAN_MAX`, and — unlike every other
 //!   streaming verb — leaves the connection usable.
@@ -62,9 +67,10 @@ pub mod store;
 
 pub use brecord::{BrokerRecord, BREC_VERSION, MAX_RECORD_PAYLOAD};
 pub use broker::{Broker, BrokerHandle};
-#[cfg(unix)]
-pub use client::SubscriptionCloser;
-pub use client::{ack, drain, take, Client, Event, Page, Record, Subscription, ACK_SEQ_BASE};
+pub use client::{
+    ack, connect, drain, take, AnyClient, AnyStream, AnySubscription, Client, Closer, Event, Page,
+    Record, Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE, LAST_WALK_PAGES_MAX,
+};
 
 /// Static public-key identity types (Rung 8), re-exported so callers of
 /// [`Broker::serve_tcp_identity`] / [`Client::connect_tcp_identity`] can build an

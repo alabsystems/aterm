@@ -42,8 +42,8 @@ const MAX_CELLS: i64 = 4;
 const STRIDE: usize = 12;
 
 // VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`:
-// verification is always required — an absent Trust `ty` FAILS the test with a build
-// hint (`cargo build --release -p tla-cli` in $HOME/trust/first-party/ty).
+// verification is always required — an absent Trust `ty` FAILS the test with the
+// install hint (`aterm pkg install ty`).
 
 /// Abstract spec state `<<bgInst, encoded, sliced>>`.
 #[derive(Clone, Copy, PartialEq, Debug)]

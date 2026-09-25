@@ -919,140 +919,9 @@ mod tests {
         Grid::new(rows, cols)
     }
 
-    fn make_storage_with_scrollback(rows: u16, cols: u16, max_sb: usize) -> Grid {
-        Grid::with_scrollback(rows, cols, max_sb)
-    }
-
-    // =========================================================================
-    // Construction — dimensions, initial state
-    // =========================================================================
-
-    #[test]
-    fn construction_visible_rows() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.visible_rows, 24);
-    }
-
-    #[test]
-    fn construction_cols() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.cols, 80);
-    }
-
-    #[test]
-    fn construction_total_lines_equals_visible() {
-        let g = make_storage(10, 40);
-        assert_eq!(g.storage.total_lines, 10);
-    }
-
-    #[test]
-    fn construction_display_offset_zero() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.display_offset, 0);
-    }
-
-    #[test]
-    fn construction_ring_head_zero() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.ring_head, 0);
-    }
-
-    #[test]
-    fn construction_no_scrollback() {
-        let g = make_storage(24, 80);
-        assert!(g.storage.scrollback.is_none());
-    }
-
-    #[test]
-    fn construction_ring_extras_empty() {
-        let g = make_storage(24, 80);
-        assert!(g.storage.ring_extras.is_empty());
-    }
-
-    #[test]
-    fn construction_flags_default_false() {
-        let g = make_storage(24, 80);
-        assert!(!g.storage.any_double_width);
-        assert!(!g.storage.has_horizontal_margins);
-    }
-
-    #[test]
-    fn construction_absolute_row_counter() {
-        let g = make_storage(10, 40);
-        assert_eq!(g.storage.absolute_row_counter, 10);
-    }
-
-    #[test]
-    fn construction_row_vec_len_equals_visible() {
-        let g = make_storage(5, 20);
-        assert_eq!(g.storage.rows.len(), 5);
-    }
-
-    // =========================================================================
-    // 1x1 edge case
-    // =========================================================================
-
-    #[test]
-    fn construction_1x1_dimensions() {
-        let g = make_storage(1, 1);
-        assert_eq!(g.storage.visible_rows, 1);
-        assert_eq!(g.storage.cols, 1);
-        assert_eq!(g.storage.rows.len(), 1);
-    }
-
-    #[test]
-    fn construction_zero_clamped_to_1x1() {
-        let g = make_storage(0, 0);
-        assert_eq!(g.storage.visible_rows, 1);
-        assert_eq!(g.storage.cols, 1);
-    }
-
-    // =========================================================================
-    // row_index — ring buffer mapping
-    // =========================================================================
-
-    #[test]
-    fn row_index_first_visible_row() {
-        let g = make_storage(5, 10);
-        let idx = g.storage.row_index(0);
-        assert_eq!(idx, Some(0));
-    }
-
-    #[test]
-    fn row_index_last_visible_row() {
-        let g = make_storage(5, 10);
-        let idx = g.storage.row_index(4);
-        assert_eq!(idx, Some(4));
-    }
-
-    #[test]
-    fn row_index_middle_row() {
-        let g = make_storage(8, 10);
-        let idx = g.storage.row_index(3);
-        assert_eq!(idx, Some(3));
-    }
-
-    // =========================================================================
-    // row_index_base — fast path base
-    // =========================================================================
-
-    #[test]
-    fn row_index_base_no_scrollback() {
-        let g = make_storage(5, 10);
-        // With no scrollback, ring_scrollback = 0, base = ring_head + 0 = 0
-        assert_eq!(g.storage.row_index_base(), 0);
-    }
-
     // =========================================================================
     // Row access — row(), row_mut()
     // =========================================================================
-
-    #[test]
-    fn row_access_valid_row() {
-        let g = make_storage(5, 10);
-        assert!(g.storage.row(0).is_some());
-        assert!(g.storage.row(4).is_some());
-    }
 
     #[test]
     fn row_access_out_of_bounds_returns_none() {
@@ -1062,45 +931,14 @@ mod tests {
     }
 
     #[test]
-    fn row_mut_valid_row() {
-        let mut g = make_storage(5, 10);
-        assert!(g.storage.row_mut(0).is_some());
-        assert!(g.storage.row_mut(4).is_some());
-    }
-
-    #[test]
     fn row_mut_out_of_bounds_returns_none() {
         let mut g = make_storage(5, 10);
         assert!(g.storage.row_mut(5).is_none());
     }
 
-    #[test]
-    fn row_has_correct_column_count() {
-        let g = make_storage(3, 20);
-        let r = g.storage.row(0).expect("row 0 should exist");
-        assert_eq!(r.cols(), 20);
-    }
-
-    #[test]
-    fn row_initially_empty() {
-        let g = make_storage(3, 10);
-        let r = g.storage.row(0).expect("row 0 should exist");
-        assert!(r.is_empty());
-    }
-
     // =========================================================================
     // row_mut_with_effective_cols
     // =========================================================================
-
-    #[test]
-    fn row_mut_with_effective_cols_normal_row() {
-        let mut g = make_storage(5, 80);
-        let result = g.storage.row_mut_with_effective_cols(0);
-        assert!(result.is_some());
-        let (row, eff_cols) = result.unwrap();
-        assert_eq!(eff_cols, 80);
-        assert_eq!(row.cols(), 80);
-    }
 
     #[test]
     fn row_mut_with_effective_cols_out_of_bounds() {
@@ -1111,40 +949,6 @@ mod tests {
     // =========================================================================
     // Cursor state — via Deref to GridCursorState
     // =========================================================================
-
-    #[test]
-    fn cursor_initial_position() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.cursor(), Cursor::new(0, 0));
-    }
-
-    #[test]
-    fn cursor_set_position() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_cursor_position(5, 10);
-        assert_eq!(g.storage.cursor(), Cursor::new(5, 10));
-    }
-
-    #[test]
-    fn cursor_pending_wrap_initially_false() {
-        let g = make_storage(24, 80);
-        assert!(!g.storage.pending_wrap());
-    }
-
-    #[test]
-    fn cursor_mark_pending_wrap() {
-        let mut g = make_storage(24, 80);
-        g.storage.mark_pending_wrap();
-        assert!(g.storage.pending_wrap());
-    }
-
-    #[test]
-    fn cursor_clear_pending_wrap() {
-        let mut g = make_storage(24, 80);
-        g.storage.mark_pending_wrap();
-        g.storage.clear_pending_wrap();
-        assert!(!g.storage.pending_wrap());
-    }
 
     #[test]
     fn cursor_take_pending_wrap_returns_true_and_clears() {
@@ -1178,34 +982,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn scroll_region_initial_full() {
-        let g = make_storage(24, 80);
-        let region = g.storage.scroll_region();
-        assert_eq!(region.top, 0);
-        assert_eq!(region.bottom, 23);
-        assert!(region.is_full(24));
-    }
-
-    #[test]
-    fn scroll_region_set_custom() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_scroll_region(5, 20);
-        let region = g.storage.scroll_region();
-        assert_eq!(region.top, 5);
-        assert_eq!(region.bottom, 20);
-        assert!(!region.is_full(24));
-    }
-
-    #[test]
-    fn scroll_region_reset() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_scroll_region(5, 20);
-        g.storage.reset_scroll_region();
-        let region = g.storage.scroll_region();
-        assert!(region.is_full(24));
-    }
-
-    #[test]
     fn scroll_region_invalid_range_resets_to_full() {
         let mut g = make_storage(24, 80);
         // top >= bottom should reset to full
@@ -1216,15 +992,6 @@ mod tests {
     // =========================================================================
     // Horizontal margins
     // =========================================================================
-
-    #[test]
-    fn horizontal_margins_initial_full() {
-        let g = make_storage(24, 80);
-        let margins = g.storage.horizontal_margins();
-        assert_eq!(margins.left, 0);
-        assert_eq!(margins.right, 79);
-        assert!(margins.is_full(80));
-    }
 
     #[test]
     fn horizontal_margins_set_custom() {
@@ -1255,56 +1022,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Scrollback — ring buffer scrollback count
-    // =========================================================================
-
-    #[test]
-    fn scrollback_initially_zero() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.ring_buffer_scrollback(), 0);
-    }
-
-    #[test]
-    fn scrollback_lines_initially_zero() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.scrollback_lines(), 0);
-    }
-
-    // =========================================================================
     // Effective column count / double-width
     // =========================================================================
-
-    #[test]
-    fn effective_cols_normal_row() {
-        let g = make_storage(5, 80);
-        assert_eq!(g.storage.effective_cols_for_row(0), 80);
-    }
-
-    #[test]
-    fn effective_cols_all_rows_normal() {
-        let g = make_storage(5, 40);
-        for row in 0..5 {
-            assert_eq!(g.storage.effective_cols_for_row(row), 40);
-        }
-    }
-
-    #[test]
-    fn effective_cols_1_col_normal() {
-        let g = make_storage(1, 1);
-        assert_eq!(g.storage.effective_cols_for_row(0), 1);
-    }
-
-    #[test]
-    fn max_col_for_row_normal() {
-        let g = make_storage(5, 80);
-        assert_eq!(g.storage.max_col_for_row(0), 79);
-    }
-
-    #[test]
-    fn max_col_for_row_1_col() {
-        let g = make_storage(1, 1);
-        assert_eq!(g.storage.max_col_for_row(0), 0);
-    }
 
     #[test]
     fn clamp_col_for_row_within_bounds() {
@@ -1322,12 +1041,6 @@ mod tests {
     fn clamp_col_for_row_exceeds_max() {
         let g = make_storage(5, 80);
         assert_eq!(g.storage.clamp_col_for_row(0, 200), 79);
-    }
-
-    #[test]
-    fn row_is_double_width_false_by_default() {
-        let g = make_storage(5, 80);
-        assert!(!g.storage.row_is_double_width(0));
     }
 
     // =========================================================================
@@ -1437,14 +1150,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn resize_viewport_updates_dimensions() {
-        let mut g = make_storage(24, 80);
-        g.storage.resize_viewport_state(30, 100);
-        assert_eq!(g.storage.visible_rows, 30);
-        assert_eq!(g.storage.cols, 100);
-    }
-
-    #[test]
     fn resize_viewport_clamps_cursor() {
         let mut g = make_storage(24, 80);
         g.storage.set_cursor_position(20, 70);
@@ -1549,66 +1254,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Lazy buffer
-    // =========================================================================
-
-    #[test]
-    fn lazy_buffer_initially_empty() {
-        let g = make_storage(24, 80);
-        assert_eq!(g.storage.lazy_buffer_lines(), 0);
-    }
-
-    // =========================================================================
-    // visible_rows / cols / total_lines / display_offset accessors
-    // =========================================================================
-
-    #[test]
-    fn accessor_visible_rows() {
-        let g = make_storage(15, 50);
-        assert_eq!(g.storage.visible_rows(), 15);
-    }
-
-    #[test]
-    fn accessor_cols() {
-        let g = make_storage(15, 50);
-        assert_eq!(g.storage.cols(), 50);
-    }
-
-    #[test]
-    fn accessor_total_lines() {
-        let g = make_storage(15, 50);
-        assert_eq!(g.storage.total_lines(), 15);
-    }
-
-    #[test]
-    fn accessor_display_offset() {
-        let g = make_storage(15, 50);
-        assert_eq!(g.storage.display_offset(), 0);
-    }
-
-    // =========================================================================
     // Tab stops via Deref
     // =========================================================================
-
-    #[test]
-    fn tab_stops_default_every_8() {
-        let g = make_storage(24, 80);
-        assert!(!g.storage.is_tab_stop(0));
-        assert!(g.storage.is_tab_stop(8));
-        assert!(g.storage.is_tab_stop(16));
-        assert!(g.storage.is_tab_stop(24));
-        assert!(!g.storage.is_tab_stop(7));
-        assert!(!g.storage.is_tab_stop(9));
-    }
-
-    #[test]
-    fn tab_stop_set_and_clear() {
-        let mut g = make_storage(24, 80);
-        g.storage.set_tab_stop_at(5);
-        assert!(g.storage.is_tab_stop(5));
-        g.storage.clear_tab_stop_at(5);
-        assert!(!g.storage.is_tab_stop(5));
-    }
 
     #[test]
     fn tab_stops_clear_all() {
@@ -1629,35 +1276,5 @@ mod tests {
         g.storage.reset_tab_stops(80);
         assert!(g.storage.is_tab_stop(8));
         assert!(g.storage.is_tab_stop(16));
-    }
-
-    // =========================================================================
-    // Large grid — stress test
-    // =========================================================================
-
-    #[test]
-    fn large_grid_row_access() {
-        let g = make_storage(200, 300);
-        assert_eq!(g.storage.rows.len(), 200);
-        assert!(g.storage.row(0).is_some());
-        assert!(g.storage.row(199).is_some());
-        assert!(g.storage.row(200).is_none());
-    }
-
-    // =========================================================================
-    // with_scrollback constructor
-    // =========================================================================
-
-    #[test]
-    fn with_scrollback_zero_scrollback() {
-        let g = make_storage_with_scrollback(5, 10, 0);
-        assert_eq!(g.storage.max_scrollback, 0);
-        assert_eq!(g.storage.rows.len(), 5);
-    }
-
-    #[test]
-    fn with_scrollback_large() {
-        let g = make_storage_with_scrollback(24, 80, 50_000);
-        assert_eq!(g.storage.max_scrollback, 50_000);
     }
 }

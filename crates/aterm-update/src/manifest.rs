@@ -619,11 +619,12 @@ pub struct FailedMark {
 }
 
 /// The widening retry schedule for a candidate that failed to stage, in seconds:
-/// 15 min, 1 h, 4 h, then 24 h forever. The first entry is already longer than
-/// the authenticated check interval (75 s), so a failing build cannot cost more
-/// than one download per 15 minutes even at its most aggressive; the 24 h ceiling
-/// bounds a permanently-corrupt artifact at one download a day, against the
-/// unbounded "never retry" this replaced.
+/// 15 min, 1 h, 4 h, then 24 h forever. The first rung is shorter than the one
+/// 30-minute check interval (`cadence::INTERVAL_SECS`), so the background loop
+/// retries a failed build at its next check, while a check asked for by hand
+/// (`aterm update check`, Check for Updates) still cannot download it more than once
+/// per 15 minutes; the 24 h ceiling bounds a permanently-corrupt artifact at one
+/// download a day, against the unbounded "never retry" this replaced.
 pub const RETRY_BACKOFF_SECS: [u64; 4] = [15 * 60, 60 * 60, 4 * 60 * 60, 24 * 60 * 60];
 
 impl FailedMark {

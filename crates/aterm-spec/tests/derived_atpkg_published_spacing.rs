@@ -27,7 +27,7 @@ fn a_newer_index_escapes_spacing_but_same_failed_index_and_unknowns_wait() {
         }
         assert_eq!((state["gui"], state["queued"]), (2, 2));
     }
-    for blocker in ["StaleWitness", "LiveHolder", "RateHold"] {
+    for blocker in ["StaleWitness", "LiveHolder"] {
         let mut state = model.init_state();
         assert!(model.fire("EndOldOk", &mut state));
         assert!(model.fire(blocker, &mut state), "{blocker}");
@@ -59,10 +59,6 @@ fn a_newer_index_escapes_spacing_but_same_failed_index_and_unknowns_wait() {
         (
             &["EndOldOk", "LiveHolder", "Publish45", "DecideQueued"][..],
             "LiveHolderWaits",
-        ),
-        (
-            &["EndOldOk", "RateHold", "Publish45", "DecideGui"][..],
-            "MeteredHoldWaits",
         ),
         (
             &["EndOldOk", "StaleWitness", "Publish45", "DecideQueued"][..],

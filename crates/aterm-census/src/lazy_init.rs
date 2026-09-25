@@ -1333,18 +1333,6 @@ mod tests {
         (path.to_string(), body.to_string())
     }
 
-    /// The tree as it stands must be clean — this census is only worth having
-    /// if GREEN means something on the real sources.
-    #[test]
-    fn lazy_init_census_is_green_on_this_tree() {
-        let out = run_lazy_init_census(&repo_root());
-        assert!(
-            out.ok,
-            "lazy-init reentrancy census RED on the current tree:\n{}",
-            out.log
-        );
-    }
-
     /// GREEN must not be vacuous: the walk has to actually SEE the idiom on
     /// this tree, or OB-21 is the only thing standing between a renamed
     /// construct and a silently blind gate.

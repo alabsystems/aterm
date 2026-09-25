@@ -37,9 +37,9 @@
 //! `alert_keys.rs`, `app_introspect.rs` and `lib.rs`'s paste sheet. Every
 //! `sel!` site in them is walked and must have a row. `menu.rs`'s other
 //! selectors, and the rest of `crates/aterm-gui/src`, are EARLIER waves' work
-//! and are NOT covered — that is the remaining half of this crate's census debt
-//! and it is counted by [`the_scope_is_a_named_fraction_of_the_crate`] rather
-//! than left as an impression.
+//! and are NOT covered — that is the remaining half of this crate's census
+//! debt (283 uncensused selectors on 2026-09-24, when the change-detector that
+//! pinned that count was retired).
 //!
 //! # Non-vacuity — the four ways this could fail to be a test
 //!
@@ -564,32 +564,6 @@ fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Every distinct selector spelled by a `sel!` site under `dir`, comments
-/// stripped.
-fn selectors_under(dir: &Path) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-                continue;
-            }
-            if !p.extension().is_some_and(|x| x == "rs") {
-                continue;
-            }
-            if let Ok(src) = std::fs::read_to_string(&p) {
-                out.extend(selectors_in(&src));
-            }
-        }
-    }
-    out
-}
-
 /// Every distinct selector one source file spells, comments stripped.
 fn selectors_in(src: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
@@ -670,66 +644,5 @@ fn the_expected_shapes_are_not_all_the_same() {
         "only {} distinct shapes: a census whose rows all spell one encoding \
          cannot catch a row that spells the wrong one",
         shapes.len()
-    );
-}
-
-/// WHAT THIS CENSUS DOES NOT COVER, counted rather than described.
-///
-/// `crates/aterm-gui/src` sends far more selectors than [`SCOPE`] does. Those
-/// belong to earlier waves (W1–W12), which ported them with the same hand-read
-/// prototypes and left the same gap. The number is pinned here so the debt is a
-/// figure someone can watch fall, not an impression — and so this file cannot
-/// be mistaken for covering the crate.
-#[test]
-fn the_scope_is_a_named_fraction_of_the_crate() {
-    let repo = repo();
-    let crate_wide = selectors_under(&repo.join("crates/aterm-gui/src"));
-    let mut in_scope = std::collections::BTreeSet::new();
-    for rel in SCOPE {
-        let src = std::fs::read_to_string(repo.join(rel)).expect("a scope file is readable");
-        for line in src.lines() {
-            let code = line.split("//").next().unwrap_or("");
-            let mut rest = code;
-            while let Some(at) = rest.find("sel!(") {
-                rest = &rest[at + "sel!(".len()..];
-                let Some(end) = rest.find(')') else { break };
-                let name = rest[..end].trim().to_owned();
-                rest = &rest[end..];
-                if !name.is_empty() && !name.starts_with('$') {
-                    in_scope.insert(name);
-                }
-            }
-        }
-    }
-    assert_eq!(
-        in_scope.len(),
-        40,
-        "the scope's distinct selector count moved to {} — re-derive the table",
-        in_scope.len()
-    );
-    let uncovered = crate_wide.len() - in_scope.len();
-    // 282 -> 283 on 2026-09-19 (merge): main carried it to 282 while this branch
-    // carried it to 281 from the same 280, and the two moves are independent —
-    // main's rows plus this branch's one new selector is 283.
-    //
-    // This branch's move, 280 -> 281: the late park's Commit-time activation
-    // (`app_launch_successor::activate_running`) introduced exactly one selector
-    // the crate did not already send — `yieldActivationToApplication:`, the one
-    // that lets an about-to-exit parent hand the front to its successor. The
-    // other four it sends (`sharedApplication`, `respondsToSelector:`,
-    // `runningApplicationWithProcessIdentifier:`, `activateWithOptions:`) were
-    // already crate-wide, which is why this moved by one and not by five.
-    // 2026-09-24: the toolbar click drive briefly removed its only sends of
-    // `activateIgnoringOtherApps:` and `makeKeyAndOrderFront:` (283 -> 281).
-    // The quality-round-two merge restored both in `toolbar_drive.rs` so
-    // AppKit routes synthesized chip clicks on Darwin 27 (281 -> 283). They
-    // use that driver's typed `s_v_bool` / `s_v_id` casts; both selector
-    // encodings also have runtime rows in `winit_sent_prototypes.rs`. The
-    // drive remains outside this census's three-file W13 scope.
-    assert_eq!(
-        uncovered, 283,
-        "the UNCENSUSED remainder of `crates/aterm-gui/src` moved to {uncovered}. \
-         That is not a failure — it is the number this file exists to make \
-         visible. Update it in the commit that moves it, in either direction"
     );
 }

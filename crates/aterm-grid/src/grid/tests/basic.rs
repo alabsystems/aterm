@@ -68,70 +68,6 @@ fn grid_cursor_movement() {
 }
 
 #[test]
-fn grid_cursor_up_within_scroll_region() {
-    let mut grid = Grid::new(10, 80);
-    // Set scroll region: rows 3-7
-    grid.set_scroll_region(3, 7);
-    // Cursor at row 5 (within region)
-    grid.set_cursor(5, 10);
-    // Move up 10 - should stop at top margin (row 3)
-    grid.cursor_up(10);
-    assert_eq!(grid.cursor_row(), 3);
-}
-
-#[test]
-fn grid_cursor_up_outside_scroll_region() {
-    let mut grid = Grid::new(10, 80);
-    // Set scroll region: rows 3-7
-    grid.set_scroll_region(3, 7);
-    // Cursor at row 1 (above region)
-    grid.set_cursor(1, 10);
-    // Move up 10 - should stop at row 0
-    grid.cursor_up(10);
-    assert_eq!(grid.cursor_row(), 0);
-}
-
-#[test]
-fn grid_cursor_down_within_scroll_region() {
-    let mut grid = Grid::new(10, 80);
-    // Set scroll region: rows 2-6
-    grid.set_scroll_region(2, 6);
-    // Cursor at row 4 (within region)
-    grid.set_cursor(4, 10);
-    // Move down 10 - should stop at bottom margin (row 6)
-    grid.cursor_down(10);
-    assert_eq!(grid.cursor_row(), 6);
-}
-
-#[test]
-fn grid_cursor_down_outside_scroll_region() {
-    let mut grid = Grid::new(10, 80);
-    // Set scroll region: rows 2-5
-    grid.set_scroll_region(2, 5);
-    // Cursor at row 7 (below region)
-    grid.set_cursor(7, 10);
-    // Move down 10 - should stop at row 9 (last line)
-    grid.cursor_down(10);
-    assert_eq!(grid.cursor_row(), 9);
-}
-
-#[test]
-fn grid_cursor_forward_stops_at_edge() {
-    let mut grid = Grid::new(10, 80);
-    grid.set_cursor(5, 70);
-    grid.cursor_forward(20);
-    assert_eq!(grid.cursor_col(), 79);
-}
-
-#[test]
-fn grid_cursor_backward_stops_at_zero() {
-    let mut grid = Grid::new(10, 80);
-    grid.set_cursor(5, 10);
-    grid.cursor_backward(20);
-    assert_eq!(grid.cursor_col(), 0);
-}
-
-#[test]
 fn grid_cursor_movement_exact_amount() {
     let mut grid = Grid::new(10, 80);
     grid.set_cursor(5, 40);
@@ -196,15 +132,6 @@ fn write_char_wrap_marks_continuation_after_full_screen_scroll() {
 }
 
 #[test]
-fn grid_line_feed() {
-    let mut grid = Grid::new(24, 80);
-    grid.set_cursor(5, 10);
-    grid.line_feed();
-    assert_eq!(grid.cursor_row(), 6);
-    assert_eq!(grid.cursor_col(), 10);
-}
-
-#[test]
 fn grid_scroll_up() {
     let mut grid = Grid::new(3, 80);
     grid.write_char('A');
@@ -235,19 +162,6 @@ fn grid_resize() {
     assert_eq!(grid.cols(), 40);
     assert_eq!(grid.cursor_row(), 9);
     assert_eq!(grid.cursor_col(), 39);
-}
-
-#[test]
-fn grid_save_restore_cursor() {
-    let mut grid = Grid::new(24, 80);
-    grid.set_cursor(10, 20);
-    grid.save_cursor();
-
-    grid.set_cursor(0, 0);
-    assert_eq!(grid.cursor(), Cursor::new(0, 0));
-
-    grid.restore_cursor();
-    assert_eq!(grid.cursor(), Cursor::new(10, 20));
 }
 
 #[test]

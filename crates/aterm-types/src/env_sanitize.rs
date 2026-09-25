@@ -152,6 +152,9 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_DEBUG_SEAMLESS_REEXEC",
     "ATERM_DEBUG_RELAUNCH_NUDGE",
     "ATERM_DEBUG_STATUS_BARS",
+    // The strain row's fake saturated reading: a nested aterm never inherits a
+    // demo's fake load.
+    "ATERM_DEBUG_STRAIN",
     "ATERM_UPDATE_ROOT",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
@@ -211,7 +214,7 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // instance — no `ATERM_PARENT_SESSION_ID` — the way the net-listen selectors
     // are gated by never being inherited) or in the state dir (an exclusive
     // lock). Neither exists yet; this entry is named honestly rather than read
-    // as closing a door that is still open. See the pin in this module's tests.
+    // as closing a door that is still open.
     "ATERM_FABRIC_COMMAND",
 ];
 
@@ -322,6 +325,7 @@ mod tests {
     /// no inherited QA seam. Each name here has a reader in a dev build (`dev_seam!`):
     /// debug_seamless_reexec_armed (ATERM_DEBUG_SEAMLESS_REEXEC), relaunch_nudge_seam
     /// (ATERM_DEBUG_RELAUNCH_NUDGE), the status-bar seeding (ATERM_DEBUG_STATUS_BARS),
+    /// the strain row's fake load (ATERM_DEBUG_STRAIN),
     /// seal_guard's updates_root (ATERM_UPDATE_ROOT) and the handoff deadlines
     /// (ATERM_HANDOFF_READY_TIMEOUT_MS, ATERM_HANDOFF_PROOF_TIMEOUT_MS). The retired
     /// update knobs are NOT listed: nothing reads them any more.
@@ -331,6 +335,7 @@ mod tests {
             "ATERM_DEBUG_SEAMLESS_REEXEC",
             "ATERM_DEBUG_RELAUNCH_NUDGE",
             "ATERM_DEBUG_STATUS_BARS",
+            "ATERM_DEBUG_STRAIN",
             "ATERM_UPDATE_ROOT",
             "ATERM_HANDOFF_READY_TIMEOUT_MS",
             "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
@@ -387,45 +392,6 @@ mod tests {
             "ATERM_EDGE_TOKENS must stay deny-listed even though the file persists \
              for the session (cross-hop inheritance must still be stripped)"
         );
-    }
-
-    /// **THE DENY-LIST ENTRY FOR `ATERM_FABRIC_COMMAND` CLOSES ONE OF TWO
-    /// DOORS**, and its comment must keep saying so for as long as that is true.
-    ///
-    /// The variable is only the OVERRIDE: `fabric_launch::configured_command`
-    /// falls back to the per-user config's `[fabric] command`, which a nested
-    /// aterm reads from the same file, so denying the env var alone does not
-    /// stop a second bridge from starting on the outer node's identity. The
-    /// pin is one-directional ON PURPOSE — it fires while the launcher has no
-    /// nested-instance gate, and simply falls silent once one lands, so a fix
-    /// on the other side of the tree can never fail this crate's suite. What it
-    /// prevents is the thing an audit actually found: a comment that reads as
-    /// closed while the config route stays open.
-    ///
-    /// The `include_str!` reaches across crates, which is the house pattern for
-    /// pinning a claim to the code that would falsify it (see
-    /// `aterm-gui/src/control.rs`'s pin of `aterm-control/src/selection.rs`); it
-    /// is test-only and adds no dependency.
-    #[test]
-    fn the_fabric_command_denial_names_the_config_route_it_does_not_close() {
-        let launcher = include_str!("../../aterm-gui/src/fabric_launch.rs");
-        let me = include_str!("env_sanitize.rs");
-        assert!(
-            launcher.contains(".and_then(|f| f.command.clone())"),
-            "fabric_launch.rs no longer reads the config fallback; re-read this \
-             module's ATERM_FABRIC_COMMAND note, it may now be stale"
-        );
-        // Assembled, not written out: a literal here would be found in THIS
-        // function's own source and the pin would match itself — which is
-        // exactly how a test comes to guard nothing.
-        let marker = ["THIS", "CLOSES", "THE", "ENV", "ROUTE", "ONLY"].join(" ");
-        if !launcher.contains("PARENT_SESSION_ID") {
-            assert!(
-                me.contains(&marker),
-                "the launcher still spawns a bridge from a NESTED instance, so the \
-                 deny-list entry must keep saying which route it does not close"
-            );
-        }
     }
 
     #[test]

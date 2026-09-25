@@ -859,11 +859,13 @@ impl Model {
 // ---- The model catalog: the *_model() data constructors, split by family ----
 // (pure code motion). The `pub use` re-exports keep every existing
 // `crate::derive::*_model` path — and the xref registry — compiling unchanged.
+mod models_atpkg_contention_release;
 mod models_atpkg_full_pass;
 mod models_atpkg_index_probe;
+mod models_atpkg_index_publish;
+mod models_atpkg_pass_stamps;
 mod models_atpkg_pending_wait;
 mod models_atpkg_published_spacing;
-mod models_atpkg_tag_record;
 mod models_atpkg_vendor_pending;
 mod models_broadcast_checkpoint;
 mod models_broadcast_head;
@@ -887,6 +889,7 @@ mod models_paste_order;
 mod models_pet_observation_admission;
 mod models_rainbow_continuity;
 mod models_release;
+mod models_release_head;
 mod models_render;
 mod models_ribbon_release_restoration;
 mod models_ribbon_row_hold;
@@ -902,14 +905,16 @@ mod models_update_environment_repair;
 mod models_update_retired_intent;
 mod models_update_web_cache;
 
+pub use models_atpkg_contention_release::atpkg_contention_release_park_model;
 pub use models_atpkg_full_pass::atpkg_full_pass_rule_model;
 pub use models_atpkg_index_probe::{
     atpkg_index_pending_park_model, atpkg_index_probe_cooldown_model,
     atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
 };
+pub use models_atpkg_index_publish::atpkg_index_publish_walk_model;
+pub use models_atpkg_pass_stamps::atpkg_pass_stamps_model;
 pub use models_atpkg_pending_wait::atpkg_pending_wait_model;
 pub use models_atpkg_published_spacing::atpkg_published_spacing_model;
-pub use models_atpkg_tag_record::atpkg_tag_record_model;
 pub use models_atpkg_vendor_pending::atpkg_vendor_pending_check_model;
 pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
 pub use models_broadcast_head::broadcast_head_subscription_model;
@@ -933,6 +938,7 @@ pub use models_paste_order::*;
 pub use models_pet_observation_admission::*;
 pub use models_rainbow_continuity::*;
 pub use models_release::*;
+pub use models_release_head::release_channel_head_model;
 pub use models_render::*;
 pub use models_ribbon_release_restoration::*;
 pub use models_ribbon_row_hold::*;
@@ -1611,36 +1617,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_interpreter_holds_invariant_under_both_actions() {
-        let m = cursor_model();
-        let mut st = m.init_state();
-        // Interleave writer growth and reader delivery; the reader must never pass
-        // the writer, and `Deliver` must leave `seq` UNCHANGED, `Grow` leave `cursor`.
-        for _ in 0..3 {
-            let before_cursor = st[&"cursor"];
-            assert!(m.fire("Grow", &mut st));
-            assert_eq!(
-                st[&"cursor"], before_cursor,
-                "Grow must leave cursor UNCHANGED"
-            );
-            assert!(m.check_invariant("CursorBounded", &st));
-            let before_seq = st[&"seq"];
-            assert!(m.fire("Deliver", &mut st));
-            assert_eq!(st[&"seq"], before_seq, "Deliver must leave seq UNCHANGED");
-            assert_eq!(
-                st[&"cursor"], st[&"seq"],
-                "Deliver catches the reader up to the writer"
-            );
-            assert!(m.check_invariant("CursorBounded", &st));
-        }
-        // Deliver is guarded by seq > cursor; once caught up it cannot fire.
-        assert!(
-            !m.fire("Deliver", &mut st),
-            "Deliver guard (seq > cursor) blocks when caught up"
-        );
-    }
-
-    #[test]
     fn subscribe_emits_parenthesized_disjunction_guard_and_eq() {
         let tla = subscribe_model().to_tla();
         // The disjunctive guard MUST be parenthesized, else `/\` captures it.
@@ -1688,40 +1664,6 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_interpreter_enforces_no_silent_loss() {
-        let m = subscribe_model(); // committed Buggy = 0
-        let mut st = m.init_state();
-        // Writer races ahead, evicting past the idle reader (cursor stays 0).
-        for _ in 0..4 {
-            assert!(m.fire("Grow", &mut st));
-        }
-        assert_eq!(st[&"seq"], 4);
-        assert!(
-            st[&"lo"] > st[&"cursor"] + 1,
-            "reader has fallen behind the live window"
-        );
-        // A correct reader CANNOT silently deliver — the guard forbids it; it must
-        // gap. `lost` stays 0.
-        assert!(
-            !m.fire("PollDeliver", &mut st),
-            "a behind reader must not silently deliver (Buggy=0)"
-        );
-        assert!(
-            m.fire("PollGap", &mut st),
-            "a behind reader resyncs via gap"
-        );
-        assert_eq!(
-            st[&"cursor"], st[&"seq"],
-            "gap resyncs the cursor to the head"
-        );
-        assert!(m.check_invariant("NoSilentLoss", &st));
-        assert_eq!(st[&"lost"], 0);
-        // Caught up now: delivery is allowed and still loses nothing.
-        assert!(m.fire("PollDeliver", &mut st));
-        assert!(m.check_invariant("NoSilentLoss", &st));
-    }
-
-    #[test]
     fn transact_emits_conjunctive_guards() {
         let tla = transact_model().to_tla();
         assert!(
@@ -1736,38 +1678,6 @@ mod tests {
             "{tla}"
         );
         assert!(tla.contains("NoLostUpdate == lost = 0"), "{tla}");
-    }
-
-    #[test]
-    fn transact_interpreter_no_lost_update() {
-        let m = transact_model(); // committed Buggy = 0
-        let mut st = m.init_state();
-        assert!(m.fire("Begin", &mut st)); // txn reads base = 0
-        assert_eq!(st[&"tbase"], 0);
-        assert!(m.fire("Write", &mut st)); // a concurrent write advances the head
-        assert_eq!(st[&"seq"], 1);
-        // Conflict (seq > tbase): a correct txn must NOT commit, and the buggy
-        // commit is disabled at Buggy=0 — so no update can be lost.
-        assert!(
-            !m.fire("CommitClean", &mut st),
-            "must not commit-clean under a conflict"
-        );
-        assert!(
-            !m.fire("BuggyCommit", &mut st),
-            "buggy commit is disabled at Buggy=0"
-        );
-        assert!(
-            m.fire("Abort", &mut st),
-            "the correct path aborts the conflicted txn"
-        );
-        assert_eq!(st[&"active"], 0);
-        assert!(m.check_invariant("NoLostUpdate", &st));
-        assert_eq!(st[&"lost"], 0);
-        // A clean txn (no intervening write) commits K atomically.
-        assert!(m.fire("Begin", &mut st)); // base = seq = 1
-        assert!(m.fire("CommitClean", &mut st));
-        assert_eq!(st[&"seq"], 1 + 2, "clean commit advances by K");
-        assert!(m.check_invariant("NoLostUpdate", &st));
     }
 
     #[test]
@@ -1811,70 +1721,5 @@ mod tests {
             ),
             "quantified iff invariant: {tla}"
         );
-    }
-
-    #[test]
-    fn kernel_interpreter_keeps_seq_eq_count() {
-        let m = kernel_model();
-        let mut st = m.init_state();
-        for i in 1..=5 {
-            assert!(m.fire("Emit", &mut st));
-            assert_eq!(st[&"seq"], i, "gap-free: seq advances by exactly 1");
-            assert_eq!(st[&"count"], i);
-            assert!(m.check_invariant("SeqIsCount", &st));
-        }
-        assert!(!m.fire("Emit", &mut st), "guard bounds seq at MaxSeq");
-    }
-
-    #[test]
-    fn snapshot_interpreter_isolates_from_later_writes() {
-        let m = snapshot_model();
-        let mut st = m.init_state();
-        assert!(m.fire("Write", &mut st)); // pre-snapshot write
-        assert!(m.fire("Snap", &mut st));
-        assert_eq!(st[&"snapped"], 1);
-        assert!(m.fire("Write", &mut st)); // post-snapshot write must not leak (Buggy=0)
-        assert!(m.check_invariant("SnapshotIsolated", &st));
-        assert_eq!(
-            st[&"leaked"], 0,
-            "a later write did not leak into the snapshot"
-        );
-        assert!(
-            !m.fire("Snap", &mut st),
-            "only one snapshot (guard snapped = 0)"
-        );
-    }
-
-    #[test]
-    fn interpreter_matches_ring_semantics_and_holds_invariant() {
-        // The executable twin: drive the SAME model and check the ring discipline
-        // (seq monotone +1; lo advances exactly at the cap) and the invariant.
-        let m = ring_model();
-        let mut st = m.init_state();
-        assert_eq!(st[&"seq"], 0);
-        assert_eq!(st[&"lo"], 1);
-        let cap = 3;
-        let mut fired = 0;
-        while m.fire("Push", &mut st) {
-            fired += 1;
-            assert_eq!(st[&"seq"], fired, "seq must be monotone +1");
-            // lo stays 1 until the window exceeds Cap, then tracks the head.
-            let expected_lo = if fired - 1 + 1 > cap {
-                fired - cap + 1
-            } else {
-                1
-            };
-            assert_eq!(
-                st[&"lo"],
-                expected_lo.max(1),
-                "lo eviction discipline at seq={fired}"
-            );
-            assert!(
-                m.check_invariant("LenBounded", &st),
-                "LenBounded must hold at seq={fired}"
-            );
-        }
-        // Guard `seq <= MaxSeq-1` (MaxSeq=6) stops Push after seq reaches 6.
-        assert_eq!(st[&"seq"], 6, "guard must bound seq at MaxSeq");
     }
 }

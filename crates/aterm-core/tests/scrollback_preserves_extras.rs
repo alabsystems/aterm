@@ -395,66 +395,41 @@ fn assert_scrollback_parity_dims(rows: u16, cols: u16, input: &[u8], find: char)
 }
 
 #[test]
-fn scrollback_parity_vs16_widened_heart() {
-    // ❤️ = U+2764 U+FE0F: VS16 widens a text-presentation base to 2 cells + sets
-    // emoji_presentation; must not collapse to 1 column on scrollback.
-    assert_scrollback_parity("Q\u{2764}\u{FE0F}Z".as_bytes(), 'Q');
-}
-
-#[test]
-fn scrollback_parity_keycap() {
-    // 1️⃣ = '1' U+FE0F U+20E3: a keycap sequence is width 2 live; must not collapse.
-    assert_scrollback_parity("Q1\u{FE0F}\u{20E3}Z".as_bytes(), 'Q');
-}
-
-#[test]
-fn scrollback_parity_narrow_base_skin_splits() {
-    // ☝🏽 with NO VS16: U+261D is a NARROW modifier-base, so the live writer keeps
-    // the skin-tone as its own wide cell (2 cells). The segmenter must not over-fold.
-    assert_scrollback_parity("\u{261D}\u{1F3FD}Z".as_bytes(), '\u{261D}');
-}
-
-#[test]
-fn scrollback_parity_vs16_narrow_base_skin_folds() {
-    // ☝️🏽 = U+261D U+FE0F U+1F3FD: VS16 widens the narrow base, so the skin-tone folds.
-    assert_scrollback_parity("Q\u{261D}\u{FE0F}\u{1F3FD}Z".as_bytes(), 'Q');
-}
-
-#[test]
-fn scrollback_parity_vs15_narrowed_emoji() {
-    // 😀︎ = U+1F600 U+FE0E: VS15 (text presentation) NARROWS the wide emoji to 1
-    // cell live; materialize must narrow it too, not re-widen from the base char.
-    assert_scrollback_parity("Q\u{1F600}\u{FE0E}Z".as_bytes(), 'Q');
-}
-
-#[test]
-fn scrollback_parity_vs16_on_incapable_base_stays_narrow() {
-    // ①️ = U+2460 + VS16. U+2460 is NOT is_vs16_emoji_capable, so live does not
-    // widen it (VS16 rides as a combining mark, stays 1 col); materialize must match.
-    assert_scrollback_parity("Q\u{2460}\u{FE0F}Z".as_bytes(), 'Q');
-}
-
-#[test]
-fn scrollback_parity_last_column_vs16_base_not_dropped() {
-    // A VS16-capable base at the LAST column can't widen (no room for the
-    // continuation), so the live writer keeps it NARROW. Materialize must place it
-    // narrow too, not DROP the glyph: 3-col grid, "ab❤️" → ❤ lands at col2 (last).
-    assert_scrollback_parity_dims(4, 3, "ab\u{2764}\u{FE0F}".as_bytes(), 'a');
-}
-
-#[test]
-fn scrollback_parity_trailing_colored_blanks() {
-    // A truecolor-background bar whose LAST occupied cell is a coloured blank (a
-    // status bar). MaterializedRow::len clipped trailing coloured blanks that the
-    // live Row::len (write high-water mark) keeps, so the bar vanished on scrollback.
-    assert_scrollback_parity(b"Q\x1b[48;2;10;20;30m    \x1b[0m", 'Q');
-}
-
-#[test]
-fn scrollback_parity_plain_emoji_and_combining() {
-    // Regression guard: naturally-wide + combining stay at full parity under the
-    // stricter whole-RenderCell check.
-    assert_scrollback_parity("Q\u{1F600}e\u{0301}Z".as_bytes(), 'Q'); // 😀 é
+fn scrollback_parity_rows() {
+    // (rows, cols, input, first char of the row). Each row was its own test.
+    let rows: &[(u16, u16, &str, char)] = &[
+        // ❤️ = U+2764 U+FE0F: VS16 widens a text-presentation base to 2 cells and
+        // sets emoji_presentation; must not collapse to 1 column on scrollback.
+        (6, 80, "Q\u{2764}\u{FE0F}Z", 'Q'),
+        // 1️⃣ = '1' U+FE0F U+20E3: a keycap is width 2 live; must not collapse.
+        (6, 80, "Q1\u{FE0F}\u{20E3}Z", 'Q'),
+        // ☝🏽 with NO VS16: U+261D is a NARROW modifier-base, so the live writer
+        // keeps the skin tone as its own wide cell. The segmenter must not over-fold.
+        (6, 80, "\u{261D}\u{1F3FD}Z", '\u{261D}'),
+        // ☝️🏽 = U+261D U+FE0F U+1F3FD: VS16 widens the narrow base, so the skin
+        // tone folds.
+        (6, 80, "Q\u{261D}\u{FE0F}\u{1F3FD}Z", 'Q'),
+        // 😀︎ = U+1F600 U+FE0E: VS15 NARROWS the wide emoji to 1 cell live;
+        // materialize must narrow it too, not re-widen from the base char.
+        (6, 80, "Q\u{1F600}\u{FE0E}Z", 'Q'),
+        // ①️ = U+2460 + VS16. U+2460 is not VS16-emoji-capable, so live does not
+        // widen it (VS16 rides as a combining mark, 1 col); materialize must match.
+        (6, 80, "Q\u{2460}\u{FE0F}Z", 'Q'),
+        // A VS16-capable base at the LAST column cannot widen, so live keeps it
+        // narrow; materialize must place it narrow, not DROP it: in a 3-col grid
+        // "ab❤️" puts ❤ at col 2.
+        (4, 3, "ab\u{2764}\u{FE0F}", 'a'),
+        // A truecolor-background bar whose last occupied cell is a coloured blank
+        // (a status bar): MaterializedRow::len used to clip the trailing coloured
+        // blanks that the live Row::len keeps, so the bar vanished on scrollback.
+        (6, 80, "Q\x1b[48;2;10;20;30m    \x1b[0m", 'Q'),
+        // Regression guard: naturally-wide + combining (😀 é) stay at full parity
+        // under the whole-RenderCell check.
+        (6, 80, "Q\u{1F600}e\u{0301}Z", 'Q'),
+    ];
+    for &(rows, cols, input, find) in rows {
+        assert_scrollback_parity_dims(rows, cols, input.as_bytes(), find);
+    }
 }
 
 /// SGR 58 underline-colour parity: first assert the LIVE cell at `col` carries
@@ -496,32 +471,35 @@ fn assert_scrollback_parity_underline(input: &[u8], find: char, col: usize, expe
 }
 
 #[test]
-fn scrollback_parity_underline_color_rgb() {
-    // SGR 58:2 explicit RGB underline colour (packed 0x01) + SGR 4 underline must
-    // round-trip through scrollback — the storage-format extension this fix adds.
-    // 'U' sits at col 1 (after 'Q').
-    assert_scrollback_parity_underline(b"Q\x1b[4;58:2::255:0:0mU\x1b[0mZ", 'Q', 1, [255, 0, 0]);
-}
-
-#[test]
-fn scrollback_parity_underline_color_indexed() {
-    // SGR 58:5:1 (indexed, packed 0x02) resolves against the live palette; once
-    // scrolled back it must resolve to the SAME entry (the index is preserved).
+fn scrollback_parity_underline_colour_rows() {
+    // (input, first char, column of the underlined cell, its live colour). Each
+    // row was its own test; the helper pins the live colour first, so no row can
+    // pass with both sides None.
+    // SGR 58:5:1 resolves against the live palette; scrolled back it must
+    // resolve to the SAME entry (the index is preserved).
     let red = Terminal::new(6, 80).color_palette().get(1);
-    assert_scrollback_parity_underline(b"Q\x1b[4;58:5:1mU\x1b[0mZ", 'Q', 1, [red.r, red.g, red.b]);
-}
-
-#[test]
-fn scrollback_parity_underline_color_wide_char() {
-    // Underline colour on a WIDE char (中, U+4E2D, cols 1-2): the physical→cell
-    // column mapping and the wide-continuation cell must match live exactly. This
-    // probes that the sidecar restore aligns like hyperlinks do across wide cells.
-    assert_scrollback_parity_underline(
-        "Q\u{1b}[4;58:2::0:255:0m\u{4E2D}\u{1b}[0mZ".as_bytes(),
-        'Q',
-        1,
-        [0, 255, 0],
-    );
+    let rows: &[(&str, usize, [u8; 3])] = &[
+        // SGR 58:2 explicit RGB (packed 0x01) + SGR 4; 'U' sits at col 1.
+        ("Q\x1b[4;58:2::255:0:0mU\x1b[0mZ", 1, [255, 0, 0]),
+        // SGR 58:5:1, indexed (packed 0x02).
+        ("Q\x1b[4;58:5:1mU\x1b[0mZ", 1, [red.r, red.g, red.b]),
+        // A WIDE char (中, cols 1-2): the physical-to-cell mapping and the wide
+        // continuation must match live, as hyperlinks do across wide cells.
+        ("Q\u{1b}[4;58:2::0:255:0m\u{4E2D}\u{1b}[0mZ", 1, [0, 255, 0]),
+        // A VS16-widened emoji (❤️): the colour sidecar and the width replay
+        // together.
+        (
+            "Q\u{1b}[4;58:2::0:0:255m\u{2764}\u{FE0F}\u{1b}[0mZ",
+            1,
+            [0, 0, 255],
+        ),
+        // A contiguous run over several narrow cells coalesces to one span and
+        // restores each cell.
+        ("Q\x1b[4;58:2::200:100:50mABC\x1b[0mZ", 1, [200, 100, 50]),
+    ];
+    for &(input, col, colour) in rows {
+        assert_scrollback_parity_underline(input.as_bytes(), 'Q', col, colour);
+    }
 }
 
 #[test]
@@ -633,30 +611,6 @@ fn vs16_widened_spacer_carries_the_lead_underline_colour_live() {
         live.cells[0][2].underline_color,
         Some([0, 0, 255]),
         "a VS16-widened pair must answer the same colour for its right half as a naturally-wide one"
-    );
-}
-
-#[test]
-fn scrollback_parity_underline_color_emoji() {
-    // Underline colour on a VS16-widened emoji (❤️): full parity across the
-    // colour sidecar AND the width replay together.
-    assert_scrollback_parity_underline(
-        "Q\u{1b}[4;58:2::0:0:255m\u{2764}\u{FE0F}\u{1b}[0mZ".as_bytes(),
-        'Q',
-        1,
-        [0, 0, 255],
-    );
-}
-
-#[test]
-fn scrollback_parity_underline_color_multi_cell_run() {
-    // A contiguous underline-coloured run over several narrow cells must coalesce
-    // to one span and restore each cell — parity across the whole run.
-    assert_scrollback_parity_underline(
-        b"Q\x1b[4;58:2::200:100:50mABC\x1b[0mZ",
-        'Q',
-        1,
-        [200, 100, 50],
     );
 }
 

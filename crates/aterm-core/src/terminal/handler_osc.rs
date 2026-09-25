@@ -169,7 +169,16 @@ impl TerminalHandler<'_> {
     /// `DirectoryChanged` shell callback still fires unconditionally — the
     /// pre-existing contract is that consumers see every report, changed or
     /// not.
+    ///
+    /// A path [`reported_cwd_is_storable`] refuses — over-long, or containing
+    /// a NUL — is IGNORED here: the prior cwd stays, nothing is signalled and
+    /// no callback fires, exactly as the callers' own length caps behave. This
+    /// is the one place both OSC 7 and OSC 633 `P;Cwd=` store a cwd, so the
+    /// bound holds for every reporter (see that function for why NUL matters).
     pub(super) fn store_reported_cwd(&mut self, path: Option<&str>) {
+        if path.is_some_and(|path| !reported_cwd_is_storable(path)) {
+            return;
+        }
         if self.current_working_directory.as_deref() != path {
             self.title
                 .epoch
@@ -241,7 +250,10 @@ impl TerminalHandler<'_> {
             // path, so without this a single OSC 7 could pin megabytes of cwd.
             // 4 KiB (PATH_MAX) is generous for any real directory — a UNC host
             // counts toward the same bound, as it does in a real UNC path. (#7172)
-            if event_payload.len() > MAX_CWD_PATH_BYTES {
+            // A `%00` that decoded to a NUL is refused on the same terms (see
+            // `reported_cwd_is_storable`): not stored, and not queued either,
+            // so no host is told about a directory the engine will not hold.
+            if !reported_cwd_is_storable(&event_payload) {
                 return;
             }
             // Queue the REAL parsed cwd (host-preserving) for poll-based hosts.
@@ -762,6 +774,22 @@ impl TerminalHandler<'_> {
     }
 }
 
+/// Whether a shell-reported working directory may be stored and announced.
+///
+/// Two bounds, both "ignore the report" rather than "clear the cwd":
+/// - at most [`MAX_CWD_PATH_BYTES`] (PATH_MAX, 4 KiB), so a single report
+///   cannot pin megabytes in the count-capped cwd/event fields (#7172);
+/// - no NUL byte. No directory name can contain one, and a stored NUL was
+///   the trigger of a 2026-09-22/23 update wedge: OSC 7's percent-decode
+///   turns `%00` into a real `\0`, the seamless-update wire refuses any cwd
+///   holding one (`current_working_directory NUL bytes`), and so a single
+///   `printf '\e]7;file:///tmp/a%%00b\a'` — or a `tail -f` of a log carrying
+///   it — refused every in-session update on the machine for as long as
+///   that tab kept the cwd.
+fn reported_cwd_is_storable(path: &str) -> bool {
+    path.len() <= MAX_CWD_PATH_BYTES && !path.contains('\0')
+}
+
 /// Strip control characters from a title string (#7588, #7958).
 ///
 /// Removes:
@@ -864,14 +892,25 @@ mod tests {
     // ---- sanitize_title (#7588, #7958) --------------------------------------
 
     #[test]
-    fn sanitize_title_plain_ascii_unchanged() {
-        assert_eq!(sanitize_title("Hello World"), "Hello World");
-    }
-
-    #[test]
-    fn sanitize_title_tab_preserved() {
-        // Tab (0x09) is explicitly allowed.
-        assert_eq!(sanitize_title("Col1\tCol2"), "Col1\tCol2");
+    fn sanitize_title_passes_legitimate_text_through() {
+        // Each row was its own test (or assertion): input == output.
+        for text in [
+            "Hello World",
+            // Tab (0x09) is explicitly allowed.
+            "Col1\tCol2",
+            // CJK, Arabic and Hebrew: only the nine override codepoints go, and
+            // pure-RTL scripts without them are safe.
+            "\u{65E5}\u{672C}\u{8A9E}",
+            "\u{0627}\u{0644}\u{0639}",
+            "\u{05D0}\u{05D1}\u{05D2}",
+            // One below / above the U+202A..U+202E and U+2066..U+2069 ranges.
+            "a\u{2029}b",
+            "a\u{202F}b",
+            "a\u{2065}b",
+            "a\u{206A}b",
+        ] {
+            assert_eq!(sanitize_title(text), text, "{text:?}");
+        }
     }
 
     #[test]
@@ -913,33 +952,6 @@ mod tests {
         // Full Trojan Source payload — all 9 override codepoints in one string.
         let payload = "X\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}Y";
         assert_eq!(sanitize_title(payload), "XY");
-    }
-
-    #[test]
-    fn sanitize_title_preserves_legitimate_unicode() {
-        // CJK, Arabic, Hebrew, and other non-override Unicode must pass
-        // through — only the 9 explicit-override codepoints are stripped.
-        assert_eq!(
-            sanitize_title("\u{65E5}\u{672C}\u{8A9E}"),
-            "\u{65E5}\u{672C}\u{8A9E}"
-        );
-        let arabic = "\u{0627}\u{0644}\u{0639}"; // alef lam ain
-        assert_eq!(sanitize_title(arabic), arabic);
-        // Pure-RTL scripts (without override codepoints) are safe.
-        let hebrew = "\u{05D0}\u{05D1}\u{05D2}"; // aleph bet gimel
-        assert_eq!(sanitize_title(hebrew), hebrew);
-    }
-
-    #[test]
-    fn sanitize_title_boundary_codepoints_below_and_above_override_ranges() {
-        // U+2029 is one below U+202A — must pass through.
-        assert_eq!(sanitize_title("a\u{2029}b"), "a\u{2029}b");
-        // U+202F (NARROW NO-BREAK SPACE) is one above U+202E — must pass through.
-        assert_eq!(sanitize_title("a\u{202F}b"), "a\u{202F}b");
-        // U+2065 is one below U+2066 — must pass through.
-        assert_eq!(sanitize_title("a\u{2065}b"), "a\u{2065}b");
-        // U+206A is one above U+2069 — must pass through.
-        assert_eq!(sanitize_title("a\u{206A}b"), "a\u{206A}b");
     }
 
     // ---- OSC 0/1/2 end-to-end (Terminal::process) --------------------------
@@ -1223,6 +1235,77 @@ mod tests {
             Some("/home/user"),
             "oversized OSC 633 P Cwd must not overwrite the prior cwd"
         );
+    }
+
+    /// A percent-encoded NUL (`%00`) decodes to a real `\0`, which no
+    /// directory can contain and which the seamless-update wire refuses
+    /// (`current_working_directory NUL bytes`). Stored, it made one tab's
+    /// output — `printf '\e]7;file:///tmp/a%%00b\a'`, a `tail -f` of a log
+    /// holding that sequence — refuse every in-session update on the machine
+    /// until the shell reported another directory (2026-09-22/23 audit). The
+    /// engine now ignores such a report exactly like an over-long one: the
+    /// prior cwd stays, and nothing is queued. Fails before the fix.
+    #[test]
+    fn osc_7_cwd_with_a_nul_byte_is_ignored() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b]7;file:///home/user\x07");
+        assert_eq!(term.current_working_directory(), Some("/home/user"));
+        assert!(
+            term.take_osc_event().is_some(),
+            "the baseline report queues"
+        );
+        let epoch = term.title_epoch();
+
+        term.process(b"\x1b]7;file:///tmp/a%00b\x07");
+        assert_eq!(
+            term.current_working_directory(),
+            Some("/home/user"),
+            "a cwd containing NUL must not overwrite the prior cwd"
+        );
+        assert!(
+            term.take_osc_event().is_none(),
+            "a cwd the engine refuses to store is not announced either"
+        );
+        assert_eq!(
+            term.title_epoch(),
+            epoch,
+            "an ignored report is not a tab-label change"
+        );
+
+        // With no prior cwd, it stays unset rather than becoming "a\0b".
+        let mut fresh = Terminal::new(24, 80);
+        fresh.process(b"\x1b]7;file:///tmp/a%00b\x07");
+        assert_eq!(fresh.current_working_directory(), None);
+    }
+
+    /// `store_reported_cwd` is the one place OSC 7 and OSC 633 `P;Cwd=` store
+    /// a cwd, so the NUL refusal lives there and holds for any caller — not
+    /// only for the OSC 7 decode above. (OSC 633's raw value cannot carry a
+    /// NUL through the parser today, which drops C0 NUL inside an OSC string,
+    /// so the chokepoint is pinned directly rather than through a sequence.)
+    /// Fails before the fix.
+    #[test]
+    fn the_cwd_store_ignores_a_path_with_a_nul_byte() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b]633;P;Cwd=/home/user\x07");
+        assert_eq!(term.current_working_directory(), Some("/home/user"));
+        let epoch = term.title_epoch();
+        {
+            let (_parser, mut handler) = term.split_for_process();
+            handler.store_reported_cwd(Some("/tmp/a\0b"));
+        }
+        assert_eq!(
+            term.current_working_directory(),
+            Some("/home/user"),
+            "a cwd containing NUL must not overwrite the prior cwd"
+        );
+        assert_eq!(term.title_epoch(), epoch);
+        // Clearing (`None`) is still honoured — only an unstorable path is ignored.
+        {
+            let (_parser, mut handler) = term.split_for_process();
+            handler.store_reported_cwd(None);
+        }
+        assert_eq!(term.current_working_directory(), None);
     }
 
     #[test]

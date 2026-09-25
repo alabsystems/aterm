@@ -240,15 +240,6 @@ const SAY_CURSOR_CHECKPOINT_SHARDS: u64 = 256;
 /// incarnation that never got to say goodbye.
 const GHOST_AFTER: Duration = Duration::from_secs(300);
 
-/// The most pages one last-value walk may take before it is called a failure.
-///
-/// A liveness bound, not a size one: the resume cursor advances every page, so a
-/// walk that has not finished in this many has met something pathological, and
-/// the honest answer to a caller that must not read absence as evidence is an
-/// error rather than a short list. 256 rows a page puts the ceiling at a million
-/// rows.
-const LAST_PAGES_MAX: usize = 4096;
-
 /// How many of this node's own acked offsets the self-lane check remembers.
 const SELF_ACK_KEEP: usize = 4096;
 
@@ -305,16 +296,36 @@ const ANSWER_KINDS: [&str; 3] = ["answer", "report", "ack"];
 /// deadline FOR. The same two `post` turns `--wait` on by default for.
 const WAITING_KINDS: [&str; 2] = ["ask", "task"];
 
-/// How often the deadline table is swept. The broker holds no timers (R8), so
-/// the asker's OWN bridge is the only thing that can notice a deadline pass,
-/// and it notices on this clock — from the run loop, not the idle arm, for the
-/// reason every other periodic duty moved there: a busy bridge never idles.
-const DEADLINE_TICK: Duration = Duration::from_millis(250);
+/// Retry an already-due deadline after a broker read or publish failed. The
+/// first sweep is armed for the deadline itself; there is no quarter-second
+/// scan while an ask is still far from expiry.
+const DEADLINE_RETRY: Duration = Duration::from_millis(250);
+
+/// Arm the earliest pending ask, never beyond the roster's next backstop.
+/// That cap catches a wall-clock jump while the bridge is quiet and coalesces
+/// far deadlines with a wake it already owes. An overdue ask is armed now on
+/// insertion; after a failed sweep it takes [`DEADLINE_RETRY`] before trying
+/// the broker again, so a failed read cannot spin the loop.
+fn deadline_wake(
+    now: Instant,
+    now_ms: u64,
+    earliest_at: Option<u64>,
+    roster_due: Instant,
+    retry_overdue: bool,
+) -> Option<Instant> {
+    let until = Duration::from_millis(earliest_at?.saturating_sub(now_ms));
+    let until = if retry_overdue && until.is_zero() {
+        DEADLINE_RETRY
+    } else {
+        until
+    };
+    Some(now + until.min(roster_due.saturating_duration_since(now)))
+}
 
 /// Park only until the first duty that actually has work. An empty deadline
-/// table needs no quarter-second wake, while a pending ask still gets its
-/// quarter-second expiry check. The roster's two-second read is also the
-/// backstop for an outbox event lost from the push lane.
+/// table needs no deadline wake; a pending ask arms its earliest expiry via
+/// [`deadline_wake`]. The roster's two-second read also backs up a lost outbox
+/// push and a wall-clock change.
 fn idle_wait(
     now: Instant,
     roster_due: Instant,
@@ -362,6 +373,47 @@ const EXPIRED_KEEP: usize = 4096;
 
 /// The most bytes a `reason=` token may carry onto the bus.
 const REASON_TOKEN_MAX: usize = 32;
+
+/// Decode the bridge-only roster before changing any cached membership. A
+/// partial or duplicate reply must not look like departed sessions: pruning on
+/// an incomplete roster could forget holds and advertise a false fleet state.
+fn parse_bridge_roster<'a>(
+    rows: impl Iterator<Item = &'a str>,
+) -> io::Result<(BTreeMap<u64, String>, BTreeMap<String, String>)> {
+    let mut locals = BTreeMap::new();
+    let mut epochs = BTreeMap::new();
+    for row in rows {
+        let mut cols = row.split_whitespace();
+        let (Some(local), Some(sid), Some(nonce), None) =
+            (cols.next(), cols.next(), cols.next(), cols.next())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed bridge roster row",
+            ));
+        };
+        let local = local.parse::<u64>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid bridge roster local id")
+        })?;
+        let nonce = nonce.strip_prefix("nonce=").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing bridge roster nonce")
+        })?;
+        if sid == "-"
+            || nonce.len() != 32
+            || !nonce
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || locals.insert(local, sid.to_string()).is_some()
+            || epochs.insert(sid.to_string(), nonce.to_string()).is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid bridge roster identity",
+            ));
+        }
+    }
+    Ok((locals, epochs))
+}
 
 /// The most body bytes one `inbox get @<off>` answer carries: the endpoint's
 /// own `BODY_MAX` (256 KiB), the largest body it holds or returns. A record
@@ -679,48 +731,35 @@ pub struct Cap {
     pub tag: Vec<u8>,
 }
 
-/// Read a `--cap-file`: `<grant> <tag-hex>` lines, split at the LAST whitespace.
+/// Read a `--cap-file` through astream's ONE reader, [`astream_cap::capfile`]:
+/// `<grant> <tag-hex>` lines split at the LAST ASCII whitespace (a grant may hold
+/// a space), whole-line `#` comments and blank lines skipped, and a tag of exactly
+/// 64 hex digits.
 ///
-/// The last, not the first: the wire admits a SPACE inside a filter, so a grant
-/// may hold one, and the tag is the fixed-width whitespace-free tail. Splitting
-/// at the first whitespace turns `ro:/f/F/pub a/> <tag>` into a parse error that
-/// takes the whole keyring down with it — `asb` learned this the same way.
+/// This crate used to keep its own copy of that reader, and the two had drifted:
+/// it read a `#` comment as a malformed capability — so a ring file `asb`
+/// accepted made the bridge refuse ALL of it — and it took a tag of any even
+/// length. One parser for every face is the fix, and it lives with the mint.
 ///
 /// # Errors
 ///
-/// The file read, or a line that is not `<grant> <hex>`.
+/// The file read, or the first line that breaks a rule, named `path:line`.
 pub fn read_cap_file(path: &str) -> io::Result<Vec<Cap>> {
-    let text = std::fs::read_to_string(path)?;
-    let mut caps = Vec::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let Some((grant, tag_hex)) = line.rsplit_once(char::is_whitespace) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{path}: a cap line is `<grant> <tag-hex>`"),
-            ));
-        };
-        let tag = hex_to_bytes(tag_hex).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{path}: the tag is not hex"),
-            )
-        })?;
-        caps.push(Cap {
-            grant: grant.trim().to_string(),
-            tag,
-        });
-    }
-    Ok(caps)
-}
-
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if !s.len().is_multiple_of(2) || s.is_empty() {
-        return None;
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok())
-        .collect()
+    let lines = astream_cap::capfile::read_file(path).map_err(|e| match e {
+        astream_cap::capfile::ReadError::Io { error, .. } => {
+            io::Error::new(error.kind(), format!("{path}: {error}"))
+        }
+        malformed @ astream_cap::capfile::ReadError::Malformed(_) => {
+            io::Error::new(io::ErrorKind::InvalidData, malformed.to_string())
+        }
+    })?;
+    Ok(lines
+        .into_iter()
+        .map(|line| Cap {
+            grant: line.grant,
+            tag: line.tag.to_vec(),
+        })
+        .collect())
 }
 
 /// Everything `serve` was told.
@@ -862,7 +901,7 @@ pub struct Bridge {
     /// and that is the whole of "the broker is down" as far as this process is
     /// concerned: holds stay, posts stay queued, nothing is lifted.
     conn: Option<Conn>,
-    /// `local id -> sid`, refreshed from `sessions`. The events digest names the
+    /// `local id -> sid`, refreshed from `sessions bridge`. The events digest names the
     /// LOCAL id; every subject names the sid.
     locals: BTreeMap<u64, String>,
     /// `sid -> epoch` (the session's public launch nonce, verbatim).
@@ -994,7 +1033,7 @@ pub struct Bridge {
     /// `expired` for, newest [`EXPIRED_KEEP`], so a reply arriving afterwards
     /// ON THE ASKER'S LANE is delivered `late=1`.
     expired: BTreeMap<u64, String>,
-    /// When the deadline table is next swept. See [`DEADLINE_TICK`].
+    /// When the earliest pending ask is next checked. See [`deadline_wake`].
     deadline_due: Instant,
     /// The live subscriptions' closers. On a reconnect every one is closed
     /// FIRST: two group subscriptions on one cursor would deliver the same
@@ -1116,7 +1155,7 @@ impl Bridge {
             deadlines: state.deadlines().into_iter().map(|d| (d.off, d)).collect(),
             asked: state.asked().into_iter().map(|a| (a.off, a.to)).collect(),
             expired: BTreeMap::new(),
-            deadline_due: Instant::now() + DEADLINE_TICK,
+            deadline_due: Instant::now() + ROSTER_REFRESH,
             state,
             caps,
             attachment,
@@ -1557,7 +1596,7 @@ impl Bridge {
 
     /// Refresh `local -> sid` and `sid -> epoch` from aterm's own roster.
     fn refresh_sessions(&mut self) -> io::Result<Vec<String>> {
-        let reply = self.ctl_request("sessions")?;
+        let reply = self.ctl_request("sessions bridge")?;
         // A NON-`OK` REPLY IS NOT AN EMPTY ROSTER. `Ctl::read_reply` answers a
         // bare `Reply::Status` for any header that does not start with `OK`, and
         // `Reply::rows()` answers `&[]` for a `Status` — so an `ERR …` was
@@ -1573,45 +1612,26 @@ impl Bridge {
                 reply.header()
             )));
         }
+        // Parse every row before touching the prior roster. The specialized
+        // reply has only registry fields, with no program-controlled title
+        // before the nonce, and malformed rows are an error rather than an
+        // apparently empty instance.
+        let Reply::Lines { rows, .. } = &reply else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bridge roster reply was not Lines-framed",
+            ));
+        };
+        let (locals, epochs) = parse_bridge_roster(rows.iter().map(String::as_str))?;
+        self.locals = locals;
         let mut fresh = Vec::new();
-        self.locals.clear();
-        for row in reply.rows() {
-            let mut cols = row.split_whitespace();
-            let (Some(local), Some(sid)) = (cols.next(), cols.next()) else {
-                continue;
-            };
-            let Ok(local) = local.parse::<u64>() else {
-                continue;
-            };
-            self.locals.insert(local, sid.to_string());
-            // THE EPOCH comes off the roster row's `nonce=` — the session's
-            // public launch nonce, verbatim, which is what §7 makes `epoch=`.
-            // `whoami` carries it too but only for the connection's OWN session,
-            // and the bridge's connection is not a session's.
-            //
-            // SEARCHED AFTER THE FIXED COLUMNS, NOT ACROSS THE WHOLE ROW. The row is
-            // `<local> <sid> <parent> <state> <title> meta=.. nonce=.. ...`, and the
-            // title is the one field a PROGRAM controls: it is whatever the PTY last
-            // set with OSC 0/2. A whole-row `find_map` picked the first `nonce=` token
-            // in the line, which put an attacker-authored field UPSTREAM of the real
-            // one in scan order. It is not exploitable today — `pct_encode` escapes
-            // every non-graphic byte, so a title is exactly ONE token and can never
-            // introduce a second — but that is an invariant of a function three crates
-            // away, and this fence must not be one careless emitter away from letting
-            // screen content choose the epoch it is checked against. `parent` and
-            // `state` are ours; `cols` has already taken `local` and `sid`, so dropping
-            // three more lands past the title with no second pass over the row.
-            let nonce = cols
-                .skip(3)
-                .find_map(|t| t.strip_prefix("nonce="))
-                .unwrap_or("-")
-                .to_string();
-            if self.epochs.insert(sid.to_string(), nonce).is_none() {
-                fresh.push(sid.to_string());
+        for (sid, nonce) in epochs {
+            if self.epochs.insert(sid.clone(), nonce).is_none() {
+                fresh.push(sid.clone());
                 // AND IT IS REMEMBERED, not merely returned. Four of this
                 // function's five callers discard the return value; see
                 // [`Bridge::pending_admit`].
-                self.pending_admit.insert(sid.to_string());
+                self.pending_admit.insert(sid);
             }
         }
         // PRUNED TO THE ROSTER. A3 only ever ADDED to these maps:
@@ -2848,6 +2868,28 @@ impl Bridge {
     // deadlines (R8): the asker's own bridge records `expired`
     // -----------------------------------------------------------------------
 
+    /// Move the deadline arm toward the earliest ask. A new ask may be due
+    /// sooner than the old one, including now; a periodic roster round replaces
+    /// the arm so a wall-clock jump is noticed within that two-second backstop.
+    /// After a failed sweep an already-due ask gets a bounded retry delay.
+    fn arm_deadline_sweep(&mut self, replace: bool, retry_overdue: bool) {
+        let now = Instant::now();
+        let earliest = self.deadlines.values().map(|d| d.at).min();
+        if let Some(due) = deadline_wake(
+            now,
+            crate::now_ms(),
+            earliest,
+            self.roster_due,
+            retry_overdue,
+        ) {
+            self.deadline_due = if replace {
+                due
+            } else {
+                self.deadline_due.min(due)
+            };
+        }
+    }
+
     /// Remember that the ask at `off` expires `dl` ms from now, unless it is
     /// already remembered (a deduped re-post does not restart the clock), and
     /// whose reply settles it.
@@ -2855,6 +2897,7 @@ impl Bridge {
         if self.deadlines.contains_key(&off) {
             return;
         }
+        let was_empty = self.deadlines.is_empty();
         self.deadlines.insert(
             off,
             Deadline {
@@ -2868,6 +2911,7 @@ impl Bridge {
         while self.deadlines.len() > DEADLINES_KEEP {
             self.deadlines.pop_first();
         }
+        self.arm_deadline_sweep(was_empty, false);
         self.persist_deadlines();
     }
 
@@ -5170,6 +5214,10 @@ impl Bridge {
             spawn_event_reader(push, self.mailbox.clone());
         }
         let _ = self.refresh_sessions();
+        // Restored deadlines are already in the table: no `note_deadline`
+        // event will arm them, and one may be overdue before the first roster
+        // round. Reconstruct the arm before the loop starts.
+        self.arm_deadline_sweep(true, false);
         let mut backoff = RECONNECT_MIN;
         loop {
             if self.conn.is_none() {
@@ -5198,6 +5246,7 @@ impl Bridge {
             if Instant::now() >= self.roster_due {
                 self.roster_backstop();
                 self.roster_due = Instant::now() + ROSTER_REFRESH;
+                self.arm_deadline_sweep(true, false);
             }
             // AND THE GHOSTS — ONLY WHILE THERE IS ONE, which is what keeps
             // this from being a heartbeat.
@@ -5224,9 +5273,9 @@ impl Bridge {
             }
             // AND THE DEADLINES (R8). The broker holds no timers; this clock is
             // the only one that can say an ask went unanswered.
-            if Instant::now() >= self.deadline_due {
+            if !self.deadlines.is_empty() && Instant::now() >= self.deadline_due {
                 self.expire_deadlines();
-                self.deadline_due = Instant::now() + DEADLINE_TICK;
+                self.arm_deadline_sweep(true, true);
             }
             // EACH OF THE DUTIES ABOVE CARRIES ITS OWN DEADLINE, and none of
             // them lives on the idle branch, because a busy bridge never idles
@@ -5335,9 +5384,9 @@ enum Delivery {
 /// end of the answer. Only an empty `resume` is. Four readers in this crate
 /// paged on "the page came back empty" instead, which reads a scan bound as
 /// evidence of absence — and one of them ([`Bridge::read_fleet_halts`]) LIFTS A
-/// STANDING FLEET HALT on that evidence. `glance::read` already does it
-/// correctly and says why; this is that loop, in one place, for the readers that
-/// did not.
+/// STANDING FLEET HALT on that evidence. The loop is astream's
+/// `Client::last_all` — the one walk `asb`, `transport::walk_last` and every
+/// reader here now share — and this names the splice point it returns.
 ///
 /// `Err` is returned for a walk that could not be COMPLETED, page bound
 /// included, because a caller that cannot tell "no rows" from "I stopped
@@ -5350,21 +5399,7 @@ enum Delivery {
 /// that wants to go on watching the face it just snapshotted passes this to
 /// `subscribe`, and the two are gap-free and dup-free across the seam.
 fn last_all(conn: &mut Conn, filter: &str) -> io::Result<(Vec<BrokerRecord>, u64)> {
-    let mut rows = Vec::new();
-    let mut after = String::new();
-    let mut splice = None;
-    for _ in 0..LAST_PAGES_MAX {
-        let (page, (next, _), resume) = conn.last_page(filter, &after, 256)?;
-        splice.get_or_insert(next);
-        rows.extend(page);
-        if resume.is_empty() {
-            return Ok((rows, splice.unwrap_or(next)));
-        }
-        after = resume;
-    }
-    Err(io::Error::other(format!(
-        "the last-value walk of {filter} did not finish within {LAST_PAGES_MAX} pages"
-    )))
+    conn.last_all(filter).map(|(rows, (next, _))| (rows, next))
 }
 
 /// ONE `deliver` LINE'S FIELDS, as [`Bridge::deliver_record`] or
@@ -6072,6 +6107,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bridge_roster_accepts_only_complete_unique_identity_rows() {
+        let a = "0123456789abcdef0123456789abcdef";
+        let b = "fedcba9876543210fedcba9876543210";
+        let rows = [format!("9 s-nine nonce={a}"), format!("2 s-two nonce={b}")];
+        let (locals, epochs) = parse_bridge_roster(rows.iter().map(String::as_str)).unwrap();
+        assert_eq!(locals.get(&2).map(String::as_str), Some("s-two"));
+        assert_eq!(locals.get(&9).map(String::as_str), Some("s-nine"));
+        assert_eq!(epochs.get("s-two").map(String::as_str), Some(b));
+        assert_eq!(epochs.get("s-nine").map(String::as_str), Some(a));
+
+        for bad in [
+            "2 s-two",                                                // missing nonce
+            "2 s-two nonce=-",                                        // missing launch fence
+            "2 s-two nonce=FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",         // noncanonical
+            "2 s-two nonce=0123456789abcdef0123456789abcdef extra=1", // extra field
+            "not-a-local s-two nonce=0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(parse_bridge_roster(std::iter::once(bad)).is_err(), "{bad}");
+        }
+        for duplicate in [
+            [format!("2 s-two nonce={a}"), format!("2 s-new nonce={b}")],
+            [format!("2 s-two nonce={a}"), format!("3 s-two nonce={b}")],
+        ] {
+            assert!(
+                parse_bridge_roster(duplicate.iter().map(String::as_str)).is_err(),
+                "duplicate local id or sid cannot be admitted"
+            );
+        }
+    }
+
+    #[test]
     fn status_batch_keeps_each_session_and_incarnation_separate() {
         let locals = BTreeMap::from([
             (1, "s-one".to_string()),
@@ -6199,18 +6265,60 @@ mod tests {
     }
 
     #[test]
-    fn idle_bridge_waits_for_real_work_but_pending_asks_keep_the_expiry_bound() {
+    fn idle_bridge_arms_only_the_earliest_deadline_and_retries_failed_due_work() {
         let now = Instant::now();
         let roster = now + ROSTER_REFRESH;
+        // Tier-1 projection onto the existing derived earliest-arm model:
+        // far=2, near=1, and an empty deadline table is the unset sentinel.
+        let model = aterm_spec::derive::idle_deadline_model();
+        let mut arm = model.init_state();
+        let no_asks = deadline_wake(now, 1_000, None, roster, false);
+        assert_eq!(no_asks, None);
         assert_eq!(
-            idle_wait(now, roster, None, None),
+            idle_wait(now, roster, no_asks, None),
             ROSTER_REFRESH,
             "no ask or ghost needs the old 250 ms wake"
         );
+        let far = deadline_wake(now, 1_000, Some(3_601_000), roster, false).unwrap();
+        assert_eq!(far, roster, "a far ask shares the two-second roster wake");
+        assert!(model.fire("ArmFar", &mut arm));
+        assert_eq!(arm["armed"], 2);
+        let near = deadline_wake(now, 1_000, Some(1_010), roster, false).unwrap();
+        assert_eq!(near, now + Duration::from_millis(10));
+        assert!(model.fire("ArmNear", &mut arm));
+        assert_eq!(arm["armed"], 1);
+        assert!(model.check_invariant("EarliestArmed", &arm));
         assert_eq!(
-            idle_wait(now, roster, Some(now + DEADLINE_TICK), None),
-            DEADLINE_TICK,
-            "an outstanding ask keeps its quarter-second expiry check"
+            idle_wait(now, roster, Some(far.min(near)), None),
+            Duration::from_millis(10),
+            "a new earlier ask moves the arm forward immediately"
+        );
+        let mut keep_first = arm.clone();
+        keep_first.insert("armed", 2);
+        assert!(
+            !model.check_invariant("EarliestArmed", &keep_first),
+            "a stale far arm after a near ask is the caught negative control"
+        );
+        assert_eq!(
+            deadline_wake(now, 1_000, Some(1_000), roster, false),
+            Some(now),
+            "an already-due ask is checked on the next loop iteration"
+        );
+        assert_eq!(
+            deadline_wake(now, 1_000, Some(1_000), roster, true),
+            Some(now + DEADLINE_RETRY),
+            "a failed due check backs off instead of spinning"
+        );
+        assert_eq!(
+            deadline_wake(
+                roster,
+                3_601_000,
+                Some(3_601_000),
+                roster + ROSTER_REFRESH,
+                false
+            ),
+            Some(roster),
+            "the roster round notices a forward wall-clock jump"
         );
         assert_eq!(
             idle_wait(now, roster, None, Some(now + Duration::from_millis(100))),
@@ -6218,6 +6326,112 @@ mod tests {
             "a ghost sweep due sooner than the roster still wakes on time"
         );
         assert_eq!(idle_wait(now, now, None, None), Duration::ZERO);
+    }
+
+    /// Drive the real bridge writer and arm, including a deadline restored
+    /// from the state directory. The pure `deadline_wake` check above would not
+    /// catch a caller that forgot to re-arm after inserting a nearer ask.
+    #[cfg(unix)]
+    #[test]
+    fn bridge_deadlines_restore_then_move_the_shipping_arm_from_far_to_near() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let scratch = std::env::temp_dir().join(format!(
+            "al-dl-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let state_path = scratch.join("state");
+        let state = StateDir::open(&state_path).unwrap();
+        state
+            .set_deadlines(&[Deadline {
+                off: 1,
+                sid: "s-one".into(),
+                at: 0,
+                dl: 1_000,
+                to: None,
+            }])
+            .unwrap();
+
+        // Bridge::new probes `outbox` on its control lane; this small endpoint
+        // answers only that startup request. No broker or background loop runs.
+        let socket = scratch.join("ctl.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let responder = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "AUTH test\n");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "outbox\n");
+            stream.write_all(b"OK 0\n").unwrap();
+        });
+        let mut bridge = Bridge::new(Config {
+            fleet: "test".into(),
+            broker: String::new(),
+            transport: Transport::Unix,
+            cap_files: Vec::new(),
+            state_dir: state_path.to_string_lossy().into_owned(),
+            accept_from: Vec::new(),
+            sock: Some(socket.to_string_lossy().into_owned()),
+            token: Some("test".into()),
+            presence: Mode::Meta,
+            receipts: true,
+        })
+        .unwrap();
+        responder.join().unwrap();
+
+        assert!(
+            bridge.deadlines.contains_key(&1),
+            "the old ask was restored"
+        );
+        // Keep this test's synthetic roster horizon well beyond any ordinary
+        // scheduling pause; the pure helper test above pins the real 2 s cap.
+        bridge.roster_due = Instant::now() + Duration::from_secs(60);
+        bridge.arm_deadline_sweep(true, false);
+        assert!(
+            bridge.deadline_due <= Instant::now(),
+            "run's startup arm must check a restored overdue ask immediately"
+        );
+        let before_retry = Instant::now();
+        bridge.arm_deadline_sweep(true, true);
+        assert!(
+            bridge.deadline_due >= before_retry + DEADLINE_RETRY,
+            "a still-overdue ask does not busy-loop after a failed sweep"
+        );
+
+        bridge.deadlines.clear();
+        bridge.persist_deadlines();
+        bridge.roster_due = Instant::now() + Duration::from_secs(60);
+        bridge.note_deadline("s-one", 2, 3_600_000, None);
+        assert_eq!(
+            bridge.deadline_due, bridge.roster_due,
+            "the far ask shares the roster wake"
+        );
+        // Rebase the synthetic roster horizon after the durable write: even
+        // an extremely slow fsync cannot make the far arm stale before the
+        // next insertion is compared with it.
+        bridge.roster_due = Instant::now() + Duration::from_secs(60);
+        bridge.arm_deadline_sweep(true, false);
+        let far = bridge.deadline_due;
+        bridge.note_deadline("s-one", 3, 0, None);
+        assert!(
+            bridge.deadline_due < far,
+            "a nearer ask replaces the far arm"
+        );
+        // The pure helper test pins zero-delay immediacy; the shipping-path
+        // assertion is relative, so an unusually slow fsync cannot make it
+        // falsely red after a correct earlier re-arm.
+        drop(bridge);
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     /// **THE PRIME IS FNV'S OWN.** Pinned against the vectors FNV publishes,
@@ -6694,12 +6908,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atlink-cap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let path = dir.join("caps");
-        std::fs::write(&path, "ro:/f/F/pub a/> 0a0b\nrw,p=n-1:/f/F/in/> ffee\n").expect("write");
+        let (a, b) = ("0a".repeat(32), "ff".repeat(32));
+        // A `#` comment line, as `asb` writes and reads them, is skipped — the
+        // bridge used to refuse the whole ring over it.
+        std::fs::write(
+            &path,
+            format!("# this node's ring\nro:/f/F/pub a/> {a}\n\nrw,p=n-1:/f/F/in/> {b}\n"),
+        )
+        .expect("write");
         let caps = read_cap_file(path.to_str().expect("utf8")).expect("read");
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[0].grant, "ro:/f/F/pub a/>");
-        assert_eq!(caps[0].tag, vec![0x0a, 0x0b]);
+        assert_eq!(caps[0].tag, vec![0x0a; 32]);
         assert_eq!(caps[1].grant, "rw,p=n-1:/f/F/in/>");
+        // A tag that is not 32 bytes is refused, naming the line.
+        std::fs::write(&path, "ro:/f/F/pub/> 0a0b\n").expect("write");
+        let err = read_cap_file(path.to_str().expect("utf8")).expect_err("short tag");
+        assert!(err.to_string().contains(":1"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

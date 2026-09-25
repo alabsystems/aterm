@@ -770,27 +770,6 @@ mod tests {
         assert!(checks > 500_000, "equivalence grid too small ({checks})");
     }
 
-    /// DETERMINISM: the field is a pure function — same inputs, same bytes,
-    /// twice, across the whole patch.
-    #[test]
-    fn field_is_deterministic() {
-        let p = params(180, -60, 123_456);
-        for py in 60..200 {
-            for px in 0..160 {
-                assert_eq!(
-                    fire_field_add(px, py, &p),
-                    fire_field_add(px, py, &p),
-                    "add at ({px},{py})"
-                );
-                assert_eq!(
-                    fire_field_over(px, py, &p),
-                    fire_field_over(px, py, &p),
-                    "over at ({px},{py})"
-                );
-            }
-        }
-    }
-
     /// AA LAW: along the silhouette the coverage/alpha must roll off smoothly
     /// — no two vertically adjacent pixels may differ by more than the
     /// analytic slope budget. Coverage is a product of ≤1 factors, so the

@@ -80,7 +80,8 @@ pub enum StageId {
     Tippy,
     Formatting,
     GrepGuards,
-    InstallChannel,
+    /// The hermetic suites over the release scripts (`stages::RELEASE_SUITES`).
+    ReleaseTooling,
     AtpkgTooling,
     TrustGateVerdict,
     TrustContractProbe,
@@ -91,9 +92,12 @@ pub enum StageId {
     FreezeGate,
     ProofInventory,
     DriverBuilds,
-    /// The RELEASE `aterm` the paint, spin and untracked-staging suites judge,
-    /// built in its own lane at t0 so the test stage finds it warm.
+    /// The RELEASE `aterm` the paint and spin suites judge, built in its own
+    /// lane at t0 so the measuring stage finds it warm.
     ConformanceRelease,
+    /// The tests the parallel run skips because they MEASURE the machine
+    /// (`stages::MEASURING_TESTS`), run with nothing else in flight.
+    MeasuringTests,
     ControlSocketSmoke,
     GuiSmoke,
     RedrawConformance,
@@ -117,16 +121,17 @@ pub struct StageSpec {
     /// The `=== … ===` header, resolved against the scope where it varies.
     pub title: String,
     pub lane: Lane,
-    /// Runs with nothing else in flight. Only the two smokes, and only because
-    /// they measure frame rates and latencies: a stage whose verdict depends on
-    /// how busy the machine is must own the machine.
+    /// Runs with nothing else in flight. Only the measuring tests and the two
+    /// smokes, and only because they measure frame rates, latencies and
+    /// deadlines: a stage whose verdict depends on how busy the machine is must
+    /// own the machine.
     pub exclusive: bool,
     /// Lanes whose stages must all have FINISHED before this one starts —
     /// apart from stages behind an exclusive barrier declared after it, which
     /// cannot overlap it anyway (see `crate::sched`). Only the test run uses
-    /// it: it measures (paint, spin), and before 2026-09-13 the regex lane, the
-    /// xtask verbs and the driver builds were serialised behind it in
-    /// `target/`, so waiting for their new lanes keeps it at least as isolated.
+    /// it: before 2026-09-13 the regex lane, the xtask verbs and the driver
+    /// builds were serialised behind it in `target/`, so waiting for their new
+    /// lanes keeps it at least as isolated as it was.
     pub after_lanes: Vec<Lane>,
 }
 
@@ -172,27 +177,27 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
     }
 }
 
-/// Will this run's test stage run a suite that builds the conformance RELEASE
-/// artifact for itself?
+/// Will this run's measuring stage run a suite that builds the conformance
+/// RELEASE artifact for itself?
 ///
-/// Three do — `aterm-conformance`'s `paint` and `spin`, and `atpkg`'s
-/// `untracked_stage` — and all three reach it through the same `release_bin`
-/// helper, so the question is exactly "does the selection compile one of those
-/// two crates". Whole-tree always does. A narrowing that selects neither runs
+/// Two do — `aterm-conformance`'s `paint` and `spin` — and both reach it through
+/// the same `release_bin` helper, so the question is exactly "does the selection
+/// compile that crate" (atpkg's `untracked_stage`, the third, went with the
+/// untracked lanes on 2026-09-24). Whole-tree always does. A narrowing that selects neither runs
 /// no suite that would ever open the lane, and priming it would be a minutes-long
 /// build for nobody — the same reason the regex and sealed lanes are REMOVED
 /// rather than skipped under a scope that has nothing for them.
 #[must_use]
 fn primes_conformance_release(ctx: &Ctx) -> bool {
-    ctx.scope.includes_crate("aterm-conformance") || ctx.scope.includes_crate("atpkg")
+    ctx.scope.includes_crate("aterm-conformance")
 }
 
 /// Build the run's stage list.
 ///
 /// Two things can remove a stage entirely (as opposed to skipping it):
 ///  * `--scope` narrowing away from `aterm-search` drops the regex lane, away
-///    from `aterm-link` the sealed fabric lane, and away from BOTH
-///    `aterm-conformance` and `atpkg` the conformance-release prime
+///    from `aterm-link` the sealed fabric lane, and away from
+///    `aterm-conformance` the conformance-release prime
 ///    ([`primes_conformance_release`]), because there is nothing for any of them
 ///    to run — the script never printed the regex lane's header either;
 ///  * `--fast` drops the two `--full`-only stages.
@@ -211,27 +216,13 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         // fabric rung is one of the driver lane's stages, so it is waited for
         // through `DriverTarget`.
         //
-        // AND FOR TIPPY (2026-09-18). The test run MEASURES: the paint
-        // conformance takes run in its first minutes and carry a scheduling
-        // sampler beside the probe's driver. Tippy is a full-workspace
-        // `--all-targets` compile at t0 in its own lane, and on a cached build
-        // it is the only heavy work on the box when those takes run. Measured
-        // on m3, third v0.88.0 gate: `alt_screen_fake_claude_typing_paints_trail_ink`
-        // read `sched_late_max_us=49894` against the 25 ms floor
-        // (`sched_qos=user-interactive`, capture hole 18.6 ms — the cadence was
-        // fine, the DRIVER was descheduled) with tippy's rustc jobs running
-        // beside it; the same take had passed the two previous runs, where a
-        // longer build stage had let tippy get further first. A take its own
-        // sampler disowns is a red the tree did not earn, so the test run waits
-        // for the lint's compile the way it waits for the other side lanes,
-        // and the lint keeps starting at t0.
+        // NOT FOR TIPPY (2026-09-23). It waited for tippy's whole-workspace
+        // compile from 2026-09-18, because a paint take inside the test run was
+        // measured descheduled for 50 ms beside it. The tests that measure now
+        // run in their own exclusive stage (`StageId::MeasuringTests`), so the
+        // run no longer holds its start for the lint.
         StageSpec {
-            after_lanes: vec![
-                Lane::RegexTarget,
-                Lane::XtaskTarget,
-                Lane::DriverTarget,
-                Lane::TippyTarget,
-            ],
+            after_lanes: vec![Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget],
             ..spec(StageId::Test, format!("test ({label})"), Lane::MainTarget)
         },
         spec(
@@ -273,8 +264,8 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     ));
     v.push(spec(StageId::GrepGuards, "grep guards", Lane::Pure));
     v.push(spec(
-        StageId::InstallChannel,
-        "bootstrap update-channel arbitration/identity",
+        StageId::ReleaseTooling,
+        "release tooling (installer update channel, export policy, release preflight, after-cut; stubbed)",
         Lane::Pure,
     ));
     v.push(spec(
@@ -332,14 +323,14 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     //
     // `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin` builds
     // `--locked --release -p aterm` into `target/conformance-release` and hands
-    // the binary to the paint, spin and untracked-staging suites — which judge
-    // the RELEASE artifact and refuse to run without one. Cargo runs test
-    // binaries ONE AT A TIME, so whichever of the three sorts first pays for
+    // the binary to the paint and spin suites — which judge the RELEASE
+    // artifact and refuse to run without one. Cargo runs test binaries ONE AT A
+    // TIME, so whichever of the two sorts first pays for
     // that whole release build inside the test stage's own time, with nothing
     // else in the gate running. MEASURED on a `--fast` run of 2026-09-22
     // (`ATERM_VERIFY_TIMINGS`): `test (--workspace)` was 33 of the run's 36
-    // minutes, and its two slowest suites were `untracked_stage` (424 s) and
-    // `paint` (417 s) out of 581.
+    // minutes, and its two slowest suites were `untracked_stage` (424 s, deleted
+    // 2026-09-24) and `paint` (417 s) out of 581.
     //
     // This row runs THE SAME argv, in THE SAME directory, from THE SAME cwd —
     // `stages::conformance_release_cmd` is the one place that argv is written,
@@ -352,14 +343,13 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     //
     // NOT in `after_lanes` of anything, and nothing waits on this lane: the
     // point is to overlap the build stage, and a waiter would put the cost back
-    // on the critical path it was taken off. Nor is it MEASUREMENT risk of the
-    // kind that made the test run wait for tippy: the three suites that would
-    // otherwise build this artifact are precisely the ones that take THIS
-    // lane's cargo lock, so none of them can run while this row still holds it.
+    // on the critical path it was taken off. Nor is it a MEASUREMENT risk: the
+    // two suites that use this artifact are the measuring stage's, which is
+    // exclusive, so neither of them can start before this row has finished.
     if primes_conformance_release(ctx) {
         v.push(spec(
             StageId::ConformanceRelease,
-            "conformance release artifact (paint/spin/untracked_stage build it otherwise)",
+            "conformance release artifact (paint/spin build it otherwise)",
             Lane::ConformanceRelease,
         ));
     }
@@ -432,8 +422,19 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // `target-sealed/` made.
     v.push(spec(
         StageId::AtpkgTooling,
-        "atpkg publish tooling (author-vendor/index/publish rows + the vendor lane; stubbed)",
+        "atpkg publish tooling (index/publish/pack rows; stubbed)",
         Lane::DriverTarget,
+    ));
+    // THE MEASURING TESTS (2026-09-23), the first exclusive stage: the paint
+    // and spin matrices and aterm-update's launchd copy tests, which the test
+    // run skips (`stages::MEASURING_TESTS`). They
+    // judge frame timings and launchd deadlines, so like the smokes below they
+    // run with nothing else in flight: every stage above has finished first,
+    // the conformance-release prime they share included.
+    v.push(exclusive(
+        StageId::MeasuringTests,
+        format!("measuring tests ({label}; run alone)"),
+        Lane::MainTarget,
     ));
     v.push(exclusive(
         StageId::ControlSocketSmoke,
@@ -691,7 +692,7 @@ mod tests {
                 StageId::Tippy,
                 StageId::Formatting,
                 StageId::GrepGuards,
-                StageId::InstallChannel,
+                StageId::ReleaseTooling,
                 StageId::TrustGateVerdict,
                 StageId::TrustContractProbe,
                 StageId::StartCompare,
@@ -704,6 +705,7 @@ mod tests {
                 StageId::ConformanceRelease,
                 StageId::SealedLane,
                 StageId::AtpkgTooling,
+                StageId::MeasuringTests,
                 StageId::ControlSocketSmoke,
                 StageId::GuiSmoke,
                 StageId::RedrawConformance,
@@ -719,115 +721,13 @@ mod tests {
         );
     }
 
-    /// THE STAGE-SET PROOF, as ids. The 2026-09-13 speed round was allowed to
-    /// ADD one row (driver builds) and move stages between lanes; it was not
-    /// allowed to lose one. This is the 18f19eea6 ladder as a literal — its 28
-    /// `--fast` stages and the 3 `--full` tiers — and every one must still be
-    /// planned, in that order, in every mode and scope that planned it then.
-    /// The literal also carries the sealed fabric lane, which joined on
-    /// 2026-09-14 and moved behind the driver builds the same day (its row is
-    /// filtered by its crate, like the regex lane's). The atpkg publish tooling
-    /// moved on 2026-09-16, for the same reason and to the same place: it
-    /// drives an `atpkg` binary, and at t0 in `Lane::Pure` the only one it
-    /// could find was a previous run's. Its row is still here, still before the
-    /// smokes — what moved is where in this order it sits, and that is exactly
-    /// what a stage-set proof must let through and an order proof must not.
-    /// The conformance-release prime joined on 2026-09-22 and is the second
-    /// added row; like the two feature lanes it is filtered by the crates whose
-    /// suites use it, so it is counted through the same predicate.
-    #[test]
-    fn every_stage_of_the_18f19eea6_ladder_is_still_planned_in_order() {
-        const FAST_18F19EEA6: [StageId; 29] = [
-            StageId::Build,
-            StageId::Test,
-            StageId::Doctests,
-            StageId::RegexLane,
-            StageId::Tippy,
-            StageId::Formatting,
-            StageId::GrepGuards,
-            StageId::InstallChannel,
-            StageId::TrustGateVerdict,
-            StageId::TrustContractProbe,
-            StageId::StartCompare,
-            StageId::LicenseHeaders,
-            StageId::FeatureGates,
-            StageId::LibcOracle,
-            StageId::FreezeGate,
-            StageId::ProofInventory,
-            StageId::SealedLane,
-            StageId::AtpkgTooling,
-            StageId::ControlSocketSmoke,
-            StageId::GuiSmoke,
-            StageId::RedrawConformance,
-            StageId::ObjcClassAudit,
-            StageId::ObjcImeDrive,
-            StageId::ObjcToolbarDrive,
-            StageId::ObjcWindowDrive,
-            StageId::ObjcEventDrive,
-            StageId::ObjcAlertDrive,
-            StageId::ObjcSwizzleDrive,
-            StageId::ObjcBoundDrive,
-        ];
-        const FULL_18F19EEA6: [StageId; 3] = [
-            StageId::DifferentialOracle,
-            StageId::KaniFloor,
-            StageId::CrossCells,
-        ];
-        for mode in [Mode::Fast, Mode::Full] {
-            for scope in [
-                Scope::workspace(),
-                Scope::crate_only("aterm-grid"),
-                Scope::crate_only("aterm-search"),
-                Scope::changed("main", vec!["aterm-gui".into()], true),
-                Scope::changed("main", vec![], true),
-            ] {
-                let c = ctx(mode, scope.clone());
-                let mut old: Vec<StageId> = FAST_18F19EEA6
-                    .into_iter()
-                    .filter(|id| match id {
-                        StageId::RegexLane => c.scope.includes_regex_lane(),
-                        StageId::SealedLane => c.scope.includes_sealed_lane(),
-                        _ => true,
-                    })
-                    .collect();
-                if mode == Mode::Full {
-                    old.extend(FULL_18F19EEA6);
-                }
-                let new = ids(&c);
-                let mut rest = new.iter();
-                for id in &old {
-                    assert!(
-                        rest.any(|n| n == id),
-                        "{mode:?} / {}: {id:?} is missing or out of order in {new:?}",
-                        scope.label()
-                    );
-                }
-                let added = 1 + usize::from(primes_conformance_release(&c));
-                assert_eq!(
-                    new.len(),
-                    old.len() + added,
-                    "{mode:?} / {}: the only new rows are driver builds and the \
-                     conformance-release prime: {new:?}",
-                    scope.label()
-                );
-                assert!(new.contains(&StageId::DriverBuilds));
-                assert_eq!(
-                    new.contains(&StageId::ConformanceRelease),
-                    primes_conformance_release(&c),
-                    "{mode:?} / {}",
-                    scope.label()
-                );
-            }
-        }
-    }
-
-    /// The test run measures, and until 2026-09-13 the regex lane, the xtask
-    /// verbs and every driver build queued behind it in `target/`. Now they
-    /// have lanes of their own and start at t0, so the test run must wait for
-    /// all three — and, since 2026-09-18, for tippy's compile, which
-    /// descheduled a paint take's driver for 50 ms in the v0.88.0 gate — and
-    /// for every stage of theirs that is not behind an exclusive barrier
-    /// (those cannot overlap it by the barrier rule).
+    /// Until 2026-09-13 the regex lane, the xtask verbs and every driver build
+    /// queued behind the test run in `target/`. Now they have lanes of their
+    /// own and start at t0, so the test run waits for all three, and for every
+    /// stage of theirs that is not behind an exclusive barrier (those cannot
+    /// overlap it by the barrier rule). It does NOT wait for tippy any more
+    /// (2026-09-23): that wait existed for the paint takes, which now run in
+    /// the exclusive measuring stage.
     #[test]
     fn the_test_run_waits_for_every_new_side_lane() {
         for mode in [Mode::Fast, Mode::Full] {
@@ -835,19 +735,14 @@ mod tests {
             let test = p.iter().position(|s| s.id == StageId::Test).expect("test");
             assert_eq!(
                 p[test].after_lanes,
-                [
-                    Lane::RegexTarget,
-                    Lane::XtaskTarget,
-                    Lane::DriverTarget,
-                    Lane::TippyTarget
-                ]
+                [Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget]
             );
             let awaited: Vec<StageId> = crate::sched::awaited(&p, test).map(|j| p[j].id).collect();
+            assert!(!awaited.contains(&StageId::Tippy), "{awaited:?}");
             assert_eq!(
                 awaited,
                 [
                     StageId::RegexLane,
-                    StageId::Tippy,
                     StageId::Formatting,
                     StageId::FeatureGates,
                     StageId::ProofInventory,
@@ -1102,27 +997,49 @@ mod tests {
         assert!(titles.contains(&"license headers"));
     }
 
+    /// THE STAGE-SET PROOF across modes and scopes. Three rows follow their
+    /// own crates: the regex lane is aterm-search's, the sealed lane is
+    /// aterm-link's, and the conformance-release prime belongs to the crate
+    /// whose suites build that artifact (aterm-conformance).
+    /// Every mode and scope plans EXACTLY the whole-tree ladder of its mode
+    /// minus the lane rows its crates dropped — in the same order, nothing else
+    /// lost. With the literal fast ladder above and `--full`'s three appended
+    /// tiers, that pins every ladder the gate can print.
     #[test]
     fn a_scope_removes_exactly_the_lanes_whose_crates_it_dropped() {
-        // Three rows follow their own crates: the regex lane is aterm-search's,
-        // the sealed lane is aterm-link's, and the conformance-release prime
-        // belongs to the two crates whose suites build that artifact
-        // (aterm-conformance, atpkg). A scope that holds none of them drops
-        // exactly those three and nothing else.
+        for mode in [Mode::Fast, Mode::Full] {
+            let whole = ids(&ctx(mode, Scope::workspace()));
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-grid"),
+                Scope::crate_only("aterm-search"),
+                Scope::changed("main", vec!["aterm-gui".into()], true),
+                Scope::changed("main", vec![], true),
+            ] {
+                let c = ctx(mode, scope.clone());
+                let expected: Vec<StageId> = whole
+                    .iter()
+                    .filter(|id| match id {
+                        StageId::RegexLane => c.scope.includes_regex_lane(),
+                        StageId::SealedLane => c.scope.includes_sealed_lane(),
+                        StageId::ConformanceRelease => primes_conformance_release(&c),
+                        _ => true,
+                    })
+                    .copied()
+                    .collect();
+                assert_eq!(
+                    ids(&c),
+                    expected,
+                    "{mode:?} / {}: no other stage is dropped by a scope",
+                    scope.label()
+                );
+            }
+        }
+        // A scope holding none of the three crates drops all three.
         let scoped = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-grid")));
         assert!(!scoped.contains(&StageId::RegexLane));
         assert!(!scoped.contains(&StageId::SealedLane));
         assert!(!scoped.contains(&StageId::ConformanceRelease));
-        let full = ids(&ctx(Mode::Fast, Scope::workspace()));
-        let expected: Vec<StageId> = full
-            .into_iter()
-            .filter(|i| {
-                *i != StageId::RegexLane
-                    && *i != StageId::SealedLane
-                    && *i != StageId::ConformanceRelease
-            })
-            .collect();
-        assert_eq!(scoped, expected, "no other stage is dropped by a scope");
         assert!(
             ids(&ctx(Mode::Fast, Scope::crate_only("aterm-search"))).contains(&StageId::RegexLane)
         );
@@ -1134,10 +1051,10 @@ mod tests {
     /// THE PRIME FOLLOWS THE SUITES THAT WOULD OTHERWISE BUILD IT.
     ///
     /// `release_bin` is reached from `aterm-conformance`'s paint and spin suites
-    /// and from `atpkg`'s untracked-staging suite, and from nowhere else (grep
-    /// of the tree, 2026-09-22). So the row is planned whole-tree, planned
-    /// whenever a narrowing selects either crate, and REMOVED — not skipped —
-    /// when it selects neither, because a minutes-long release build for a test
+    /// and from nowhere else (grep of the tree, 2026-09-24; atpkg's
+    /// untracked-staging suite was the other caller until then). So the row is
+    /// planned whole-tree, planned whenever a narrowing selects that crate, and
+    /// REMOVED — not skipped — when it does not, because a minutes-long release build for a test
     /// stage that will never open the directory is the opposite of what this row
     /// is for.
     #[test]
@@ -1156,10 +1073,13 @@ mod tests {
         };
         assert!(has(Scope::workspace()), "--fast and --full both prime it");
         assert!(has(Scope::crate_only("aterm-conformance")));
-        assert!(has(Scope::crate_only("atpkg")));
+        assert!(
+            !has(Scope::crate_only("atpkg")),
+            "no atpkg suite opens the lane since its untracked-staging suite went"
+        );
         assert!(has(Scope::changed(
             "main",
-            vec!["aterm-grid".into(), "atpkg".into()],
+            vec!["aterm-grid".into(), "aterm-conformance".into()],
             true
         )));
         assert!(!has(Scope::crate_only("aterm-grid")));
@@ -1181,11 +1101,7 @@ mod tests {
     #[test]
     fn the_conformance_release_prime_overlaps_everything_and_blocks_nobody() {
         for mode in [Mode::Fast, Mode::Full] {
-            for scope in [
-                Scope::workspace(),
-                Scope::crate_only("aterm-conformance"),
-                Scope::crate_only("atpkg"),
-            ] {
+            for scope in [Scope::workspace(), Scope::crate_only("aterm-conformance")] {
                 let p = plan(&ctx(mode, scope.clone()));
                 let what = format!("{mode:?} / {}", scope.label());
                 let prime = p
@@ -1237,7 +1153,45 @@ mod tests {
     fn only_the_measuring_stages_are_exclusive() {
         let p = plan(&ctx(Mode::Full, Scope::workspace()));
         let ex: Vec<StageId> = p.iter().filter(|s| s.exclusive).map(|s| s.id).collect();
-        assert_eq!(ex, [StageId::ControlSocketSmoke, StageId::GuiSmoke]);
+        assert_eq!(
+            ex,
+            [
+                StageId::MeasuringTests,
+                StageId::ControlSocketSmoke,
+                StageId::GuiSmoke
+            ]
+        );
+    }
+
+    /// THE MEASURING TESTS RUN ALONE, IN EVERY TIER AND SCOPE (2026-09-23).
+    /// The test run skips them, so a plan without this stage would drop them
+    /// silently; and they judge timings, so the stage must be exclusive and
+    /// start only after everything declared before it — the test run and the
+    /// conformance-release prime they use included — has finished.
+    #[test]
+    fn the_measuring_tests_run_alone_after_the_test_run_in_every_tier_and_scope() {
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-grid"),
+                Scope::changed("main", vec!["aterm-conformance".into()], true),
+                Scope::changed("main", vec![], true),
+            ] {
+                let p = plan(&ctx(mode, scope.clone()));
+                let what = format!("{mode:?} / {}", scope.label());
+                let at = |id| p.iter().position(|s| s.id == id);
+                let measuring = at(StageId::MeasuringTests)
+                    .unwrap_or_else(|| panic!("{what}: the measuring tests are planned"));
+                assert!(p[measuring].exclusive, "{what}");
+                assert_eq!(p[measuring].lane, Lane::MainTarget, "{what}");
+                assert!(at(StageId::Test).is_some_and(|t| t < measuring), "{what}");
+                if let Some(prime) = at(StageId::ConformanceRelease) {
+                    assert!(prime < measuring, "{what}: the prime must finish first");
+                }
+                let barrier = p.iter().position(|s| s.exclusive).expect("exclusive");
+                assert_eq!(barrier, measuring, "{what}: it is the first barrier");
+            }
+        }
     }
 
     #[test]
@@ -1269,7 +1223,7 @@ mod tests {
                 | StageId::ObjcSwizzleDrive
                 | StageId::ObjcBoundDrive => Lane::DriverTarget,
                 StageId::GrepGuards
-                | StageId::InstallChannel
+                | StageId::ReleaseTooling
                 | StageId::TrustGateVerdict
                 | StageId::TrustContractProbe
                 | StageId::StartCompare
@@ -1361,6 +1315,7 @@ mod tests {
         // 33 since 2026-09-14: the sealed fabric lane — the one test covering the
         // vendored astream-aead is feature-gated and ran on no cadence before it.
         // 34 since 2026-09-22: the conformance-release prime.
-        assert_eq!(plan(&nothing_installed).len(), 34);
+        // 35 since 2026-09-23: the measuring tests, out of the test run.
+        assert_eq!(plan(&nothing_installed).len(), 35);
     }
 }

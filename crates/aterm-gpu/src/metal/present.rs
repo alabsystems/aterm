@@ -1013,7 +1013,7 @@ mod tests {
         unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
     }
 
-    /// The 96-byte blit uniform, restated `repr(C)` (the swapchain tests'
+    /// The 112-byte blit uniform, restated `repr(C)` (the swapchain tests'
     /// spelling — the production `BlitUniform` layout is pinned against
     /// `blit.metal` by `MetalBlit::UNIFORM_BYTES` and the differentials).
     #[repr(C)]
@@ -1036,6 +1036,8 @@ mod tests {
         visible_y: f32,
         visible_h: f32,
         premult: f32,
+        chrome_y0: f32,
+        chrome_pad: [f32; 3],
     }
 
     /// The 32-byte crown uniform (`HdrGlowUniform`'s layout).
@@ -1270,6 +1272,8 @@ mod tests {
             visible_y: 0.0,
             visible_h: CH as f32,
             premult: 0.0,
+            chrome_y0: 0.0,
+            chrome_pad: [0.0; 3],
         };
         let blit_ubuf = dev.new_buffer(size_of::<BlitU>()).expect("blit uniform");
         // SAFETY: repr(C) into an exactly-sized fresh shared buffer.

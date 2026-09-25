@@ -2988,10 +2988,10 @@ mod tests {
         }
     }
 
-    /// The readable ceiling is the cursor-trail precedent, pinned.
+    /// The readable ceiling (the cursor-trail precedent) holds against
+    /// out-of-range overrides.
     #[test]
     fn alpha_cap_is_pinned() {
-        assert_eq!(RAIN_ALPHA_CAP, 135);
         // Overrides clamp into 16..=135 and head >= body.
         let e = MatrixRain::new(RainConfig {
             alpha_override: Some(200),

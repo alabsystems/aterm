@@ -20,7 +20,7 @@
 //! `ty` and `clean` — and the managed `bin/` is deliberately APPENDED to `PATH` (a managed
 //! tool never overrides what the user already had), so typing `trust` may run someone
 //! else's copy. The PATH order stays. Instead every program that is ALab's OWN
-//! ([`Aliases::Alab`]: its index entry has no `system` key and is not an `extra`) gets an
+//! ([`Aliases::Alab`]: its index entry has no `system` key) gets an
 //! `alab-<tool>` shim beside every `<tool>` shim, forwarding to the SAME store executable.
 //! Aliases are pruned, tombstoned, rolled back and uninstalled exactly like their primary
 //! — they resolve into the same build, and every sweep in this crate keys on where a shim
@@ -64,17 +64,14 @@ pub enum Aliases {
 }
 
 impl Aliases {
-    /// The policy for an index entry: ALab's own ⇔ no `system` key, not an `extra`, and
-    /// not an AGENT PROGRAM (`claude`/`codex` are a vendor's whatever their row's flag
-    /// says — [`crate::stub::AGENT_PROGRAMS`] — so dropping `extra` from the spec never
-    /// grows an `alab-claude`). An UNLISTED program (`None`) is not ALab's: nothing
-    /// vouches for it.
+    /// The policy for an index entry: ALab's own ⇔ no `system` key and not an AGENT
+    /// PROGRAM (`claude`/`codex` are a vendor's, whatever their row says —
+    /// [`crate::stub::AGENT_PROGRAMS`] — so they never grow an `alab-claude`). An UNLISTED
+    /// program (`None`) is not ALab's: nothing vouches for it.
     #[must_use]
     pub fn for_program(name: &str, program: Option<&crate::manifest::Program>) -> Self {
         match program {
-            Some(p) if p.system.is_none() && !p.extra && !crate::stub::is_agent_program(name) => {
-                Self::Alab
-            }
+            Some(p) if p.system.is_none() && !crate::stub::is_agent_program(name) => Self::Alab,
             _ => Self::Off,
         }
     }
@@ -256,13 +253,10 @@ pub(crate) fn install_tools_env(
             Err(e) => eprintln!("{}", crate::compat::not_laid_line(layout, n, &e)),
         }
     }
-    // Rendered first, laid in ONE pass: every primary and — under [`Aliases::Alab`] —
-    // its `alab-<tool>` alias forwarding to the SAME executable, handed together to
-    // [`crate::lay::lay_executables`], which writes them in-process or, when this process
-    // is provenance-tracked, through one untracked launchd job (law m21: a tagged shim
-    // tracks the tool it execs). The alias is the primary's target under the alias's
-    // file name — the pair [`platform::shim_executable_env`] keeps apart by taking the
-    // target's [`ToolName`] and the shim path separately.
+    // Rendered first, then laid: every primary and — under [`Aliases::Alab`] — its
+    // `alab-<tool>` alias forwarding to the SAME executable. The alias is the primary's
+    // target under the alias's file name — the pair [`platform::shim_executable_env`] keeps
+    // apart by taking the target's [`ToolName`] and the shim path separately.
     let mut files = Vec::new();
     for tool in tools {
         files.push(platform::shim_executable_env(
@@ -282,7 +276,7 @@ pub(crate) fn install_tools_env(
             )?);
         }
     }
-    crate::lay::lay_executables(&files)?;
+    files.iter().try_for_each(crate::lay::write_in_process)?;
     prune_stale_shims(layout, build_dir, tools, aliases);
     // The front-of-PATH twin of an agent program's shim (owner decision 2026-09-10),
     // laid from the `bin/` shim just written so the two can never disagree.
@@ -310,12 +304,7 @@ pub(crate) fn install_tools_env(
 /// it walks [`crate::stub::AGENT_PROGRAMS`] and sweeps `agents/` whatever the caller was
 /// reconciling. It used to hang off the end of [`reconcile_aliases`], which the pass runs
 /// for EVERY active program, so a twelve-program machine paid twelve whole agents
-/// reconciles per six-hourly tick. On an untracked machine those were wasted reads; on a
-/// provenance-tracked one whose untracked launchd lane fails, [`crate::lay`] falls back to
-/// an in-process write that is tagged again under the default `TrackedPolicy::Allow` — so
-/// the `!carries_provenance` arm of the keep-predicate below saw a tagged twin on the next
-/// program's iteration and re-laid it, a launchd submission and its wait per twin per
-/// program, converging neither within a pass nor across passes (audit 2026-09-15).
+/// reconciles per six-hourly tick (audit 2026-09-15).
 ///
 /// BEST-EFFORT, like [`sweep_agents_dir`]: a twin that cannot be laid — `agents/`
 /// uncreatable, the link refused — is reported on stderr and the pass goes on, because
@@ -355,11 +344,7 @@ pub fn reconcile_agents(layout: &Layout) {
             crate::selfupdate::verbs_of(name),
         );
         // Left alone only when it resolves where the primary does, exports the same
-        // environment AND is untagged: a twin laid in-process by a lane that could not
-        // run carries `com.apple.provenance` and tracks every `claude` run from every
-        // shell, and this predicate used to keep it forever — `repair` re-lays each
-        // `bin/` shim unconditionally and then skipped the twin (audit 2026-09-14).
-        // And only when its BYTES are what the renderer lays now ([`twin_is_rendered`]):
+        // environment, and its BYTES are what the renderer lays now ([`twin_is_rendered`]):
         // a twin that forwards and exports right but renders differently — laid before
         // an exec root stood for its build, by a client whose shim text differed, or by
         // one that laid the landing prelude — would otherwise be kept forever by a
@@ -367,27 +352,18 @@ pub fn reconcile_agents(layout: &Layout) {
         if platform::resolve_shim(&twin).is_some_and(|t| t == target)
             && platform::shim_env_of(&twin) == env
             && twin_is_rendered(&twin, &target, &env, &prelude)
-            // A tagged twin is re-laid only when a re-lay from THIS process would come
-            // back clean (a tracked harness with no lane rewrote it forever, 2026-09-15),
-            // and once per file: a lane whose twin came back tagged is not asked again for
-            // the same bytes (`crate::lay::relay_worth_trying`).
-            && !crate::stub::identical_stub_needs_relay(
-                || crate::provenance::carries_provenance(&twin),
-                || crate::lay::relay_worth_trying(layout, &twin),
-            )
         {
             continue;
         }
         let laid = layout
             .ensure_dir(&layout.agents_dir())
             .and_then(|()| platform::install_twin_to_env(&twin, &target, &env, &prelude));
-        match laid {
-            Ok(()) => crate::lay::note_relayed(layout, std::slice::from_ref(&twin)),
-            Err(e) => eprintln!(
+        if let Err(e) = laid {
+            eprintln!(
                 "atpkg: {name}: the agents/ twin {} was not laid ({e}) — bin/{name} is in \
                  place; retried next pass",
                 twin.display()
-            ),
+            );
         }
     }
     sweep_agents_dir(layout);
@@ -488,7 +464,7 @@ pub fn sweep_agents_dir(layout: &Layout) {
 /// ALIASES ONLY: `agents/` is NOT reconciled here. This runs once per active program and
 /// [`reconcile_agents`] answers for none of them in particular, so the pass calls it once
 /// after its loop (`cli::reconcile_aliases`) — see that function's doc for what the
-/// per-program repeat cost a tracked machine.
+/// per-program repeat cost.
 pub(crate) fn reconcile_aliases(
     layout: &Layout,
     build_dir: &Path,
@@ -524,12 +500,6 @@ pub(crate) fn reconcile_aliases(
             if platform::resolve_shim(&shim).is_some_and(|t| t == wanted)
                 && platform::shim_env_of(&shim) == env
                 && shim_is_rendered(&shim, &wanted, &env)
-                // …and a tagged alias is re-laid when a re-lay would come back clean
-                // (audit 2026-09-14; the twin got this rule first), once per file.
-                && !crate::stub::identical_stub_needs_relay(
-                    || crate::provenance::carries_provenance(&shim),
-                    || crate::lay::relay_worth_trying(layout, &shim),
-                )
             {
                 continue;
             }
@@ -545,7 +515,6 @@ pub(crate) fn reconcile_aliases(
             }
             layout.ensure_dir(&layout.bin_dir())?;
             platform::install_shim_env(&target_bin, tool, &shim, &env)?;
-            crate::lay::note_relayed(layout, std::slice::from_ref(&shim));
         }
     }
     prune_stale_shims(layout, build_dir, tools, aliases);
@@ -613,9 +582,8 @@ pub(crate) fn shim_env_drift(
 ///
 /// The target is the primary's own, as spelled on disk — never a re-derived path, for the
 /// reason [`reconcile_aliases`] gives — and the render goes through the one shim renderer,
-/// so a routed trust shim stays routed. Every file is laid in ONE
-/// [`crate::lay::lay_executables`] call for the whole pass: on a provenance-tracked pass,
-/// one untracked job. Idempotent: a primary that already exports its build's declaration
+/// so a routed trust shim stays routed. Idempotent: a primary that already exports its
+/// build's declaration
 /// is never rewritten, so the six-hourly tick writes nothing once it is healed.
 /// Best-effort like every reconcile here: a lay that fails is said on stderr and retried
 /// next pass; one healed is said on stdout, once.
@@ -649,9 +617,8 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
         return;
     }
     let paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.path.clone()).collect();
-    match crate::lay::lay_executables(&files) {
+    match files.iter().try_for_each(crate::lay::write_in_process) {
         Ok(()) => {
-            crate::lay::note_relayed(layout, &paths);
             for (path, env) in paths.iter().zip(&said) {
                 println!(
                     "atpkg: {} re-laid — it exports {env} again, as its build declares",
@@ -1241,7 +1208,8 @@ mod tests {
             &crate::shim_env::ShimEnv::NONE,
             Some(&route),
         );
-        crate::lay::lay_executable(&shim, routed.as_bytes()).unwrap();
+        crate::lay::write_in_process(&crate::lay::Executable::new(&shim, routed.as_bytes()))
+            .unwrap();
         assert_eq!(read(), Some(want.clone()), "a routed stub");
 
         install_tombstone_shim(&layout, &tool("ty")).unwrap();
@@ -1736,18 +1704,15 @@ mod tests {
         }
         let stamp = |p: &Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
         let before = (stamp(&alias), stamp(&twin));
-        // A twin laid in-process by a provenance-TRACKED test runner carries the tag, and
-        // the twin predicate re-lays a tagged twin on every pass by design (audit
-        // 2026-09-14) — so its half of the no-write check holds only where it is untagged
-        // (measured 2026-09-15: a file this session's shell writes carries the tag).
-        let twin_tagged = crate::provenance::carries_provenance(&twin);
         std::thread::sleep(std::time::Duration::from_millis(20));
         reconcile_aliases(&layout, &c1, std::slice::from_ref(&claude), Aliases::Alab).unwrap();
         reconcile_agents(&layout);
         assert_eq!(stamp(&alias), before.0, "a second pass writes no alias");
-        if !twin_tagged {
-            assert_eq!(stamp(&twin), before.1, "a second pass writes no twin");
-        }
+        assert_eq!(
+            stamp(&twin),
+            before.1,
+            "a second pass writes no twin, tagged or not"
+        );
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
@@ -2235,12 +2200,9 @@ mod tests {
     /// THE AGENTS RECONCILE IS THE PASS'S, NOT EVERY PROGRAM'S (audit 2026-09-15).
     /// [`reconcile_aliases`] runs once per ACTIVE PROGRAM and [`reconcile_agents`] answers
     /// for none of them in particular, so hanging the second off the end of the first made
-    /// a P-program machine do the whole agents reconcile P times per pass — P sets of
-    /// resolves, env reads and `listxattr` on an untracked machine, and on a
-    /// provenance-tracked one whose untracked lane fails, a re-lay of BOTH twins per
-    /// program, because the in-process fallback write is tagged again and the
-    /// keep-predicate refuses a tagged twin. The alias reconcile now leaves `agents/`
-    /// alone; the pass calls [`reconcile_agents`] once after its loop.
+    /// a P-program machine do the whole agents reconcile P times per pass. The alias
+    /// reconcile now leaves `agents/` alone; the pass calls [`reconcile_agents`] once after
+    /// its loop.
     #[cfg(unix)]
     #[test]
     fn the_alias_reconcile_leaves_the_agents_twin_to_the_once_per_pass_reconcile() {
@@ -2333,37 +2295,30 @@ mod tests {
         );
     }
 
-    /// The alias policy is read off the SIGNED index entry: ALab's own (no `system`, not an
-    /// `extra`) aliases; a vendor tool, a system-satisfiable member and an unlisted name
-    /// do not.
+    /// The alias policy is read off the SIGNED index entry: ALab's own (no `system`)
+    /// aliases; an agent program, a system-satisfiable member and an unlisted name do not.
     #[test]
     fn the_alias_policy_follows_the_index_entry() {
-        let program = |extra: bool, system: Option<&str>| crate::manifest::Program {
+        let program = |system: Option<&str>| crate::manifest::Program {
             repo: "x".into(),
             policy: String::new(),
             coherence_group: None,
-            extra,
             system: system.map(str::to_string),
             unavailable_hint: None,
             requires: vec![],
         };
         assert_eq!(
-            Aliases::for_program("ay", Some(&program(false, None))),
+            Aliases::for_program("ay", Some(&program(None))),
             Aliases::Alab,
             "trust/ay/ty/clean: ALab's own"
         );
         assert_eq!(
-            Aliases::for_program("emacs", Some(&program(true, None))),
+            Aliases::for_program("claude", Some(&program(None))),
             Aliases::Off,
-            "a vendor extra"
+            "codex/claude: an agent program is a vendor's"
         );
         assert_eq!(
-            Aliases::for_program("claude", Some(&program(false, None))),
-            Aliases::Off,
-            "codex/claude: an agent program is a vendor's even with `extra` dropped"
-        );
-        assert_eq!(
-            Aliases::for_program("gh", Some(&program(false, Some("gh")))),
+            Aliases::for_program("gh", Some(&program(Some("gh")))),
             Aliases::Off,
             "gh/emacs: a system copy may satisfy it"
         );

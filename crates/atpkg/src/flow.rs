@@ -145,8 +145,8 @@ pub trait Fetcher {
     /// at anything larger writes those extra bytes into `staging/`, through the
     /// free-space floor the preflight had just defended, and refuses them afterwards
     /// (§9, "caps from the SIGNED manifest, not the API"). `0` means the row states no
-    /// size ([`crate::vendor::check_row`] requires one only for the `https`/`pkg`
-    /// protocols) and the fetcher falls back to its own ceiling.
+    /// size ([`crate::vendor::check_row`] requires one only for the `https` protocol) and
+    /// the fetcher falls back to its own ceiling.
     ///
     /// The DEFAULT drops it with `download`'s signature, which carries no cap: that is
     /// the `dir:` registry lane, which hardlinks or copies a file already on this disk —
@@ -251,65 +251,15 @@ pub trait Fetcher {
     fn source_id(&self) -> String {
         "fetcher:unspecified".to_string()
     }
-    /// A CHEAP fingerprint of each candidate [`Fetcher::index_candidates`] would return
-    /// THIS pass, in the SAME order — or `None` (the default) when this fetcher cannot
-    /// answer without doing the expensive work.
-    ///
-    /// # What this is for
-    ///
-    /// `index_candidates` is the most expensive thing a no-op update does. The production
-    /// fetcher spends one listing request plus FOUR asset downloads per candidate — with
-    /// `INDEX_CANDIDATE_CAP = 4`, sixteen sequential `curl` subprocesses each paying its
-    /// own DNS+TLS handshake — and the §14 cache beside it held those very bytes but was
-    /// consulted only when the fetch FAILED. Steady state therefore re-downloaded, every
-    /// pass and in every fresh process, bytes it could prove it already had.
-    ///
-    /// The saving is ROUND-TRIPS, not rate-limit budget, and the difference matters: the
-    /// sixteen asset reads already go to the unmetered release CDN, and the listing — one
-    /// `api.github.com` request PER PAGE on the listing lane — still happens there. (On the
-    /// pointer lane, `crate::net::GithubFetcher::index_pointer`, discovery is one
-    /// unmetered HEAD and there is no API request to save at all.) Claiming the anonymous
-    /// 60/hr budget back would be describing the code as it was before the zero-API asset
-    /// fetch landed.
-    ///
-    /// This method is the proof. The production impl derives it from the release LISTING
-    /// (which `index_candidates` must fetch anyway, and memoizes), so answering costs
-    /// nothing beyond the request that was always going to happen — and the listing
-    /// already carries each asset's identity, because a GitHub asset URL names an id that
-    /// changes if and only if the asset is re-uploaded.
-    ///
-    /// # Contract
-    ///
-    /// * SAME ORDER, SAME LENGTH as `index_candidates` would return this pass. The
-    ///   position is the pairing; [`crate::IndexCache::store`] drops the whole vector on
-    ///   a length disagreement rather than zipping a prefix.
-    /// * A fingerprint must change whenever ANY of the four assets behind that candidate
-    ///   changes. It need not be unforgeable — see the module doc of [`crate::cache`]:
-    ///   equality only decides whether to re-download bytes that face every trust gate
-    ///   either way.
-    /// * `None` or an empty vector means "no cheap answer", which is always safe: the
-    ///   caller then takes the historical download path. A fetcher that opts in is telling
-    ///   the resolver it may skip `index_candidates` entirely, so the default is `None`.
-    fn index_identities(&self) -> Option<Vec<String>> {
-        None
-    }
-
     /// Whether this fetcher's last FAILED [`Fetcher::index_candidates`] failed on the LINK
     /// — no host answered (DNS, a refused or timed-out connect, a TLS failure) — rather
-    /// than on a host that answered with a refusal (a rate limit, an auth answer, a 404, a
-    /// 5xx). Only the first is an offline machine ([`ResolveProvenance::answered`]): a
-    /// revoked token or a rate-limited address is a failure to surface, never a quiet
-    /// "offline" retried soon. DEFAULT `false` — offline is a claim that needs evidence.
+    /// than on a host that answered with something else (a rate limit, a 5xx, a captive
+    /// portal's page). Only the first is an offline machine
+    /// ([`ResolveProvenance::answered`]): a host that answered is a failure to surface,
+    /// never a quiet "offline" retried soon. DEFAULT `false` — offline is a claim that needs
+    /// evidence.
     fn index_link_down(&self) -> bool {
         false
-    }
-
-    /// The unix second a RATE-LIMITED metered listing said to come back at (`retry-after`,
-    /// or `x-ratelimit-reset` with the window spent), when this fetcher was refused one and
-    /// the answer named a time — what the full pass records as the machine's hold
-    /// ([`crate::status::MeteredHold`]). DEFAULT `None`: no fetcher claims a hold unasked.
-    fn metered_hold_until(&self) -> Option<i64> {
-        None
     }
 }
 
@@ -344,14 +294,6 @@ pub struct InstallReport {
     /// Required-dependency pull-in outcomes (flattened transitive closure), each
     /// installed-first, with yanked/unreachable/cyclic deps SKIPPED (never gate-bypassing).
     pub dependencies: Vec<DepOutcome>,
-    /// `Some` when the member was applied through an OS-installer protocol (`pkg`,
-    /// `softwareupdate`, `system-pm`) instead of the store: what that lane did — proven
-    /// present at a `provides` path, DEFERRED for want of elevation, or UNAVAILABLE here
-    /// (a `system-pm` row whose manager this machine lacks). Nothing was staged, shimmed or
-    /// activated for such a member (`shimmed` is empty, `tree_root` empty), and the
-    /// caller records the outcome's canonical state ([`ProtocolOutcome::state`]) rather
-    /// than `managed <build>`. `None` for every store-managed install.
-    pub protocol: Option<ProtocolOutcome>,
     /// `Some` when the program is vendor-direct: what the vendor lane did, in its own
     /// words. `index_build`/`roster_seq` are then `0` (no index was consulted).
     pub vendor: Option<VendorReport>,
@@ -366,82 +308,6 @@ pub struct VendorReport {
     pub vendor: String,
     /// The verdict line (`atpkg: claude 2.1.278 → 2.1.280 (Anthropic latest)`).
     pub line: String,
-}
-
-/// What an OS-installer lane did for a member — the three states such a member can be
-/// in after a pass, in the canonical words ([`crate::state`]). The `protocol` each
-/// carries is the spelling the state prints: `pkg`, `softwareupdate`, or — for a
-/// `system-pm` row — the MANAGER's name (`apt`, `brew`, `winget`, …), since that is
-/// what keeps the member current from then on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProtocolOutcome {
-    /// Present: a `provides` path exists — installed this pass, or found already there
-    /// (the row's `provides` IS the system copy; nothing is ever re-downloaded for it).
-    /// Recorded as `installed via <protocol>: <path>`.
-    Installed {
-        /// The protocol (or manager) that proved it (`pkg`, `softwareupdate`, `apt`, …).
-        protocol: &'static str,
-        /// The first `provides` path that exists.
-        path: PathBuf,
-    },
-    /// Not present, and this pass may not elevate ([`crate::elevate::Elevation::Deferred`]
-    /// — the unattended pass, or a door with no terminal). Recorded as `needs admin —
-    /// run: aterm pkg install <name>`; the explicit door is where it installs.
-    NeedsAdmin {
-        /// The protocol (or manager) that is waiting.
-        protocol: &'static str,
-    },
-    /// Not present, and not installable HERE: a `system-pm` row whose manager is not on
-    /// this machine's `PATH`. Recorded as `unavailable on <target>: <hint>` — a state,
-    /// never a fault; atpkg never installs a package manager, so nothing waits on the
-    /// door either ([`crate::system_pm::missing_manager_hint`] spells the hint).
-    Unavailable {
-        /// The manager that is missing.
-        protocol: &'static str,
-        /// The target triple the row was pinned for.
-        target: String,
-        /// The hint the state carries.
-        hint: String,
-    },
-}
-
-impl ProtocolOutcome {
-    /// The canonical state row for `program`.
-    #[must_use]
-    pub fn state(&self, program: &str) -> String {
-        match self {
-            ProtocolOutcome::Installed { protocol, path } => {
-                crate::state::installed_via(protocol, path)
-            }
-            ProtocolOutcome::NeedsAdmin { .. } => crate::state::needs_admin(program),
-            ProtocolOutcome::Unavailable { target, hint, .. } => {
-                crate::state::unavailable(target, hint)
-            }
-        }
-    }
-
-    /// The protocol's (or manager's) spelling.
-    #[must_use]
-    pub fn protocol(&self) -> &'static str {
-        match self {
-            ProtocolOutcome::Installed { protocol, .. }
-            | ProtocolOutcome::NeedsAdmin { protocol }
-            | ProtocolOutcome::Unavailable { protocol, .. } => protocol,
-        }
-    }
-
-    /// Whether the member is waiting on elevation.
-    #[must_use]
-    pub fn is_deferred(&self) -> bool {
-        matches!(self, ProtocolOutcome::NeedsAdmin { .. })
-    }
-
-    /// Whether the member cannot be obtained on this machine at all (its manager is
-    /// absent) — for an OS-installed parent, a requirement that fails, not one that waits.
-    #[must_use]
-    pub fn is_unavailable(&self) -> bool {
-        matches!(self, ProtocolOutcome::Unavailable { .. })
-    }
 }
 
 /// One resolved `requires` dependency and what happened to it.
@@ -472,10 +338,6 @@ pub enum DepResult {
     /// copy beside the user's own). Carries the path; the caller records the canonical
     /// `system: <path> — not managed by aterm` row if it changed.
     System(PathBuf),
-    /// Applied through an OS-installer protocol: present at a `provides` path, or
-    /// DEFERRED for want of elevation — in which case a parent that is itself an
-    /// OS-installed member defers too (its installer needs the dependency first).
-    Protocol(ProtocolOutcome),
     /// Skipped, with a reason (unreachable / tombstoned / not pinned / cycle / fetch error).
     Skipped(String),
 }
@@ -548,19 +410,14 @@ pub enum FlowError {
     /// An artifact row failed per-protocol admission ([`crate::vendor::check_row`]) BEFORE
     /// any byte moved: for `https`, a non-https or non-allow-listed `url`, an unknown
     /// `payload`, a raw-binary `entry` that is not an exposed shimmable name, a hostile
-    /// `links` target, or a missing signed digest; for `pkg`/`system-pm`, their own field
-    /// rules. The message names the field.
+    /// `links` target, or a missing signed digest; for any other protocol (the deleted
+    /// OS-installer ones included), the protocol itself. The message names the field.
     VendorRefused(String),
-    /// An OS-installer lane (`pkg`, `softwareupdate`, `system-pm`) refused or failed AFTER
-    /// admission and after the elevation decision: a package signed outside the pinned
-    /// team, an installer or manager that exited non-zero, a `softwareupdate -l` with no
-    /// label, or an install that left none of the `provides` paths behind. `protocol` is
-    /// the lane's spelling (the manager's name for `system-pm`); `why` names the reason.
-    Protocol { protocol: &'static str, why: String },
-    /// A `requires` entry of an OS-installed member could not be satisfied first (the
-    /// installer would only fail later, less legibly — Homebrew's `.pkg` refuses to
-    /// install without the Command Line Tools). Names the dependency and its outcome.
-    Requirement { dep: String, why: String },
+    /// The program's signed index row names the RETIRED `requires` relation
+    /// ([`crate::manifest::Program::names_requires`], design 2026-09-22 §5.3(b)): this
+    /// client keeps no install order, so the program is refused before any byte moves
+    /// rather than installed ahead of what it names. Carries the program.
+    RequiresRetired(String),
     /// The asset download failed.
     Download(String),
     /// Staging (sha256 / extract / tree_root) failed.
@@ -673,16 +530,12 @@ impl std::fmt::Display for FlowError {
                 f.write_str("artifact row refused: ")?;
                 f.write_str(why)
             }
-            FlowError::Protocol { protocol, why } => {
-                f.write_str(protocol)?;
-                f.write_str(": ")?;
-                f.write_str(why)
-            }
-            FlowError::Requirement { dep, why } => {
-                f.write_str("requires ")?;
-                f.write_str(dep)?;
-                f.write_str(", which could not be installed first: ")?;
-                f.write_str(why)
+            FlowError::RequiresRetired(p) => {
+                f.write_str(p)?;
+                f.write_str(
+                    "'s signed index row names `requires`, a relation this client no longer \
+                     honours — refused rather than installed out of order",
+                )
             }
             FlowError::Download(e) => {
                 f.write_str("download: ")?;
@@ -899,13 +752,16 @@ fn install_inner(
     }
     seen.insert(program.to_string(), None);
     // 1–2. Resolve + verify-select the index + freshness (§8 gate 2) — the shared
-    // [`resolve_verified_index`] prologue (cached-fallback, §14) — then reachability.
+    // [`resolve_verified_index`] prologue (cached-fallback, §14) — then reachability, and
+    // the retired `requires` refusal (§5.3(b)) before anything is decided or fetched.
     let index = resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
-    let repo = index
+    let row = index
         .program(program)
-        .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?
-        .repo
-        .clone();
+        .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?;
+    if row.names_requires() {
+        return Err(FlowError::RequiresRetired(program.to_string()));
+    }
+    let repo = row.repo.clone();
     // The channel AS SEEN FROM THIS HOST: a per-target pin overlay, if the index
     // carries one for `triple`, is resolved here and nowhere else.
     let ch = index
@@ -940,7 +796,6 @@ fn install_inner(
                 // `requires` are not resolved on a no-op install (documented gap).
                 tree_root: String::new(),
                 dependencies: vec![],
-                protocol: None,
                 vendor: None,
             });
         }
@@ -979,34 +834,23 @@ fn install_inner(
 
     // 4b. Runtime `requires` (§17): pull in each MISSING dep FIRST, through the SAME verified
     // pipeline (reachability + freshness + floor/yank gate). Best-effort — a dep failure never
-    // fails a STORE-MANAGED parent's install; a Tombstone/NotReachable is SKIPPED, never
-    // bypassed. `requires` is SIGNED metadata — the index's `[programs.<name>].requires`
-    // (Homebrew requires `clt`) unioned with the pkg manifest's own, both parsed from
-    // verified bytes — so a repo-write adversary can neither inject nor redirect an edge.
-    // (An OS-installed parent is stricter: see the requirement gate at step 5b.)
-    let mut requires: Vec<String> = index
-        .program(program)
-        .map(|p| p.requires.clone())
-        .unwrap_or_default();
-    for dep in &pkg.requires {
-        if !requires.contains(dep) {
-            requires.push(dep.clone());
-        }
-    }
+    // fails the parent's install; a Tombstone/NotReachable is SKIPPED, never bypassed.
+    // `requires` is the pkg manifest's own SIGNED metadata, parsed from verified bytes, so a
+    // repo-write adversary can neither inject nor redirect an edge.
+    let requires = &pkg.requires;
     let mut dependencies: Vec<DepOutcome> = Vec::new();
     // ONE `bin/` scan for the whole loop: any program this recursion installs is in
     // `seen` (inserted at entry) and screened by the check below BEFORE the map is
     // consulted, so a pre-loop snapshot decides identically.
     let active = crate::ops::active_builds(layout);
-    for dep in &requires {
+    for dep in requires {
         if let Some(earlier) = seen.get(dep) {
             match earlier {
                 // Resolved EARLIER in this call — a sibling's recursion pulled it in (a
-                // diamond: brew requires [mid, clt], mid requires clt). Its outcome stands
-                // for this edge too, so an OS-installed parent's requirement gate reads
-                // what really happened rather than a skip. Already in this report ⇒
-                // nothing to add; from another subtree ⇒ replayed, a fresh install as
-                // AlreadyPresent so the caller records it once.
+                // diamond: top requires [mid, low], mid requires low). Its outcome stands
+                // for this edge too. Already in this report ⇒ nothing to add; from another
+                // subtree ⇒ replayed, a fresh install as AlreadyPresent so the caller
+                // records it once.
                 Some(outcome) => {
                     if !dependencies.iter().any(|d| d.program == *dep) {
                         let result = match outcome {
@@ -1044,24 +888,13 @@ fn install_inner(
                 crate::vendor::system_binary_on_path(
                     &layout.prefix,
                     bin,
-                    crate::elevate::path_var().as_deref(),
+                    crate::vendor::path_var().as_deref(),
                 )
             });
         if let Some(path) = system {
             dependencies.push(DepOutcome {
                 program: dep.clone(),
                 result: DepResult::System(path),
-            });
-            continue;
-        }
-        // An EXTRA is never opted in on a dependent's behalf (design S9): without this
-        // machine's own opt-in marker it is SKIPPED with the consent spelling — a
-        // store-managed parent installs without it, an OS-installed parent is stopped by
-        // its requirement gate naming it — and no byte of it moves until the user says so.
-        if index.is_extra(dep) && !layout.optin_exists(dep) {
-            dependencies.push(DepOutcome {
-                program: dep.clone(),
-                result: DepResult::Skipped(crate::state::extra_not_installed(dep)),
             });
             continue;
         }
@@ -1082,12 +915,9 @@ fn install_inner(
             resolved_assets,
         ) {
             Ok(r) => (
-                match r.protocol {
-                    Some(outcome) => DepResult::Protocol(outcome),
-                    None => DepResult::Installed {
-                        build: r.build,
-                        tree_root: r.tree_root,
-                    },
+                DepResult::Installed {
+                    build: r.build,
+                    tree_root: r.tree_root,
                 },
                 r.dependencies,
             ),
@@ -1108,9 +938,8 @@ fn install_inner(
     // The pass's verified answer for this program, recorded BEFORE the download so a
     // transfer that fails midway still reaches the caller's collector — the pass-end
     // `gc::run_keeping_pinned_partials` spares exactly these programs' `<asset>.part`
-    // resume files, and the failed download is the one the sparing exists for. (A pkg
-    // row may name no `asset`; its local staging name is derived, see `pkg_local_name`.)
-    resolved_assets.insert(program.to_string(), local_asset_name(program, artifact));
+    // resume files, and the failed download is the one the sparing exists for.
+    resolved_assets.insert(program.to_string(), artifact.asset.clone());
     // Per-member dispatch (§16.4/§17) on BOTH halves of the row: the tool path installs
     // plain `binary`/`cargo-src` (Shim — over `github-release` or `https`; only the
     // download lane differs, and `fetch_artifact` picks it from the PROTOCOL), a vendor
@@ -1122,16 +951,14 @@ fn install_inner(
     // toolchain is neither reported SUCCESS nor left live reading as 'already current'.
     // `app-bundle` over `github-release` (the aterm self-update, applied in-session by the
     // app's own updater) is refused here, always, and is NEVER the vendor-app lane.
-    // The OS-INSTALLER lanes — `pkg` ([`apply_pkg`]), `softwareupdate`
-    // ([`apply_softwareupdate`]) and `system-pm`
-    // ([`apply_system_pm`]) — return HERE with a [`ProtocolOutcome`] and never reach the
-    // store path below: nothing is staged, activated or shimmed for them. Unknown pairs
-    // remain refused CLOSED. (audit: sysroot-bundle silent-broken-install;
-    // sysroot-bundle resolve-failure left-active wedge.)
+    // Unknown pairs — the deleted OS-installer protocols' among them (§5.3(b)) — remain
+    // refused CLOSED. (audit: sysroot-bundle silent-broken-install; sysroot-bundle
+    // resolve-failure left-active wedge.)
     //
     // Every row is admitted HERE, before the disk preflight and before any byte moves
-    // (`vendor::check_row`, protocol-aware: the release lane has nothing to check, the
-    // https lane keeps every refusal it always had, the OS-installer rows get their own).
+    // (`vendor::check_row`, protocol-aware: the release lane has only its asset name to
+    // check, the https lane keeps every refusal it always had, any other protocol is
+    // refused by name).
     crate::vendor::check_row(artifact, &pkg.exposes)?;
     let strategy = crate::dispatch::strategy_for(&artifact.kind, &artifact.protocol);
     match strategy {
@@ -1141,71 +968,6 @@ fn install_inner(
         crate::dispatch::ApplyStrategy::AppBundle => {
             // The app updates itself; atpkg never swaps it ([`FlowError::AppBundleRefused`]).
             return Err(FlowError::AppBundleRefused(program.to_string()));
-        }
-        crate::dispatch::ApplyStrategy::Pkg
-        | crate::dispatch::ApplyStrategy::SoftwareUpdate
-        | crate::dispatch::ApplyStrategy::SystemPm => {
-            // 5b. The requirement gate for an OS-installed member: every `requires` must
-            // be present FIRST. A dependency that DEFERRED (needs admin) defers this
-            // member too — the explicit door installs both, in order — and one that
-            // failed, or is UNAVAILABLE here (its manager absent), stops it here, with
-            // the reason, rather than inside Apple's installer or the manager.
-            for d in &dependencies {
-                match &d.result {
-                    DepResult::Protocol(o) if o.is_deferred() => {
-                        let protocol = lane_name(strategy, artifact);
-                        return Ok(protocol_report(
-                            program,
-                            pinned,
-                            &index,
-                            dependencies,
-                            ProtocolOutcome::NeedsAdmin { protocol },
-                        ));
-                    }
-                    DepResult::Protocol(o) if o.is_unavailable() => {
-                        let why = o.state(&d.program);
-                        return Err(FlowError::Requirement {
-                            dep: d.program.clone(),
-                            why,
-                        });
-                    }
-                    // A dev-linked dependency is managed from its checkout, so it is met —
-                    // exactly as `requires::unmet_requirement` counts it — though the
-                    // recursion reports it as a `Linked` skip.
-                    DepResult::Skipped(_) if crate::linkmode::is_linked(layout, &d.program) => {}
-                    DepResult::Skipped(why) => {
-                        return Err(FlowError::Requirement {
-                            dep: d.program.clone(),
-                            why: why.clone(),
-                        });
-                    }
-                    DepResult::Installed { .. }
-                    | DepResult::AlreadyPresent(_)
-                    | DepResult::System(_)
-                    | DepResult::Protocol(_) => {}
-                }
-            }
-            let outcome = match strategy {
-                crate::dispatch::ApplyStrategy::Pkg => {
-                    apply_pkg(fetcher, layout, program, artifact)?
-                }
-                crate::dispatch::ApplyStrategy::SoftwareUpdate => {
-                    apply_softwareupdate(layout, program, artifact)?
-                }
-                _ => {
-                    let program_hint = index
-                        .program(program)
-                        .and_then(|p| p.unavailable_hint.as_deref());
-                    apply_system_pm(layout, program, artifact, triple, program_hint)?
-                }
-            };
-            return Ok(protocol_report(
-                program,
-                pinned,
-                &index,
-                dependencies,
-                outcome,
-            ));
         }
         crate::dispatch::ApplyStrategy::Unknown => {
             return Err(FlowError::UnsupportedKind(artifact.kind.clone()));
@@ -1242,7 +1004,6 @@ fn install_inner(
         refused_shims: landed.refused,
         tree_root: artifact.tree_root.clone(),
         dependencies,
-        protocol: None,
         vendor: None,
     })
 }
@@ -1325,7 +1086,7 @@ pub(crate) fn door_vendor_policy(
     {
         return latch.policy;
     }
-    let fresh = resolve_candidates_live(fetcher, layout)
+    let fresh = resolve_candidates_live(fetcher)
         .and_then(|candidates| verify_select_fresh(layout, anchor, candidates, floor, now_unix));
     Policy::current(layout, fresh.as_ref().ok().map(|index| &**index))
 }
@@ -1559,266 +1320,15 @@ pub(crate) fn land_artifact(
     })
 }
 
-/// The report an OS-installer lane returns: the pinned build (the index's word for
-/// "which row"), no shims, no root, and the lane's [`ProtocolOutcome`].
-fn protocol_report(
-    program: &str,
-    pinned: u64,
-    index: &TrustedIndex,
-    dependencies: Vec<DepOutcome>,
-    outcome: ProtocolOutcome,
-) -> InstallReport {
-    InstallReport {
-        program: program.to_string(),
-        build: pinned,
-        index_build: index.index_build,
-        roster_seq: index.roster_seq(),
-        already_current: false,
-        shimmed: vec![],
-        refused_shims: vec![],
-        tree_root: String::new(),
-        dependencies,
-        protocol: Some(outcome),
-        vendor: None,
-    }
-}
-
-/// The spelling an OS-installer lane's state prints for `artifact`: the protocol for
-/// `pkg` and `softwareupdate`, the MANAGER's name for a `system-pm` row (`apt`, …; the
-/// protocol's own name only for a manager the table does not carry, which admission
-/// refuses before this is ever read).
-fn lane_name(
-    strategy: crate::dispatch::ApplyStrategy,
-    artifact: &crate::manifest::Artifact,
-) -> &'static str {
-    match strategy {
-        crate::dispatch::ApplyStrategy::SoftwareUpdate => crate::softwareupdate::PROTOCOL,
-        crate::dispatch::ApplyStrategy::SystemPm => {
-            crate::vendor::manager(&artifact.manager).map_or(crate::system_pm::PROTOCOL, |m| m.name)
-        }
-        _ => crate::installer_pkg::PROTOCOL,
-    }
-}
-
-/// The `pkg` lane's flow half: PROBE first (a `provides` path that exists is the whole
-/// answer — nothing is ever re-downloaded for a member that is present), DEFER when this
-/// thread may not elevate (the unattended pass, a door with no terminal — no byte moves
-/// for a member that cannot be applied), else DOWNLOAD through the https lane under the
-/// signed `size` cap and `sha256`, hand the file to [`crate::installer_pkg::install`]
-/// (signature team, elevated installer, provides), and RECLAIM the file on every path.
-fn apply_pkg(
-    fetcher: &dyn Fetcher,
-    layout: &Layout,
-    program: &str,
-    artifact: &crate::manifest::Artifact,
-) -> Result<ProtocolOutcome, FlowError> {
-    let protocol = crate::installer_pkg::PROTOCOL;
-    let path_var = crate::elevate::path_var();
-    if let Some(path) =
-        crate::elevate::first_provided(&layout.prefix, &artifact.provides, path_var.as_deref())
-    {
-        return Ok(ProtocolOutcome::Installed { protocol, path });
-    }
-    let elevation = crate::elevate::elevation();
-    if elevation == crate::elevate::Elevation::Deferred {
-        return Ok(ProtocolOutcome::NeedsAdmin { protocol });
-    }
-    let dl = download_pkg(fetcher, layout, program, artifact)?;
-    let applied = crate::elevate::with_current_runner(|runner| {
-        crate::installer_pkg::install(
-            runner,
-            elevation,
-            artifact,
-            &dl,
-            &layout.prefix,
-            path_var.as_deref(),
-        )
-    });
-    // The package is spent either way: installed, or refused/failed and re-downloaded
-    // on the next explicit attempt (its `.part` was promoted on success, so nothing
-    // resumable is left behind either).
-    let _ = std::fs::remove_file(&dl);
-    let path = applied.map_err(|why| FlowError::Protocol { protocol, why })?;
-    Ok(ProtocolOutcome::Installed { protocol, path })
-}
-
-/// The `softwareupdate` lane's flow half: probe, defer, else run
-/// [`crate::softwareupdate::install`] with the real placeholder. No bytes of ours move.
-fn apply_softwareupdate(
-    layout: &Layout,
-    program: &str,
-    artifact: &crate::manifest::Artifact,
-) -> Result<ProtocolOutcome, FlowError> {
-    let protocol = crate::softwareupdate::PROTOCOL;
-    let path_var = crate::elevate::path_var();
-    if let Some(path) =
-        crate::elevate::first_provided(&layout.prefix, &artifact.provides, path_var.as_deref())
-    {
-        return Ok(ProtocolOutcome::Installed { protocol, path });
-    }
-    let elevation = crate::elevate::elevation();
-    if elevation == crate::elevate::Elevation::Deferred {
-        return Ok(ProtocolOutcome::NeedsAdmin { protocol });
-    }
-    crate::progress::note_phase(program, crate::progress::Phase::Link);
-    let path = crate::elevate::with_current_runner(|runner| {
-        crate::softwareupdate::install(
-            runner,
-            elevation,
-            artifact,
-            Path::new(crate::softwareupdate::PLACEHOLDER),
-            &layout.prefix,
-            path_var.as_deref(),
-        )
-    })
-    .map_err(|why| FlowError::Protocol { protocol, why })?;
-    Ok(ProtocolOutcome::Installed { protocol, path })
-}
-
-/// The `system-pm` lane's flow half ([`crate::system_pm`]): PROBE `provides` first (one
-/// exists ⇒ `installed via <manager>: <path>`, nothing runs, whatever the policy); the
-/// MANAGER next — absent from `PATH` ⇒ [`ProtocolOutcome::Unavailable`] (`unavailable
-/// on <target>: <hint>`; atpkg never installs a manager, so nothing is deferred to the
-/// door either); DEFER when the row declares `elevated = true` and this thread may not
-/// elevate (`needs admin`; a user-scoped row runs unattended — it needs no one's
-/// password); else RUN the manager through [`crate::system_pm::install`] under the
-/// current runner and prove the install. `program_hint` is the index's
-/// `[programs.<name>].unavailable_hint`, folded into the missing-manager hint.
-fn apply_system_pm(
-    layout: &Layout,
-    program: &str,
-    artifact: &crate::manifest::Artifact,
-    triple: &str,
-    program_hint: Option<&str>,
-) -> Result<ProtocolOutcome, FlowError> {
-    let Some(mgr) = crate::vendor::manager(&artifact.manager) else {
-        // Unreachable past `check_row`, which refuses an unknown manager by name; kept
-        // as a refusal rather than a panic so a future admission slip fails closed.
-        let mut why = String::from("manager is not in the table: ");
-        why.push_str(&artifact.manager);
-        return Err(FlowError::Protocol {
-            protocol: crate::system_pm::PROTOCOL,
-            why,
-        });
-    };
-    let protocol = mgr.name;
-    let path_var = crate::elevate::path_var();
-    if let Some(path) =
-        crate::elevate::first_provided(&layout.prefix, &artifact.provides, path_var.as_deref())
-    {
-        return Ok(ProtocolOutcome::Installed { protocol, path });
-    }
-    let Some(manager_bin) =
-        crate::system_pm::manager_on_path(&layout.prefix, mgr, path_var.as_deref())
-    else {
-        return Ok(ProtocolOutcome::Unavailable {
-            protocol,
-            target: triple.to_string(),
-            hint: crate::system_pm::missing_manager_hint(mgr, &artifact.package, program_hint),
-        });
-    };
-    let elevation = crate::elevate::elevation();
-    if artifact.elevated && elevation == crate::elevate::Elevation::Deferred {
-        return Ok(ProtocolOutcome::NeedsAdmin { protocol });
-    }
-    crate::progress::note_phase(program, crate::progress::Phase::Link);
-    let path = crate::elevate::with_current_runner(|runner| {
-        crate::system_pm::install(
-            runner,
-            elevation,
-            mgr,
-            artifact,
-            &manager_bin,
-            &layout.prefix,
-            path_var.as_deref(),
-        )
-    })
-    .map_err(|why| FlowError::Protocol { protocol, why })?;
-    Ok(ProtocolOutcome::Installed { protocol, path })
-}
-
-/// Download a `pkg` row's package into `staging/<program>/<local name>` through the
-/// https lane (signed `url`, signed `size` as the cap) and gate it on the signed
-/// `sha256` — the same integrity gate every store member passes, applied to a file the
-/// store never keeps. Same partial-resume discipline as the store path.
-fn download_pkg(
-    fetcher: &dyn Fetcher,
-    layout: &Layout,
-    program: &str,
-    artifact: &crate::manifest::Artifact,
-) -> Result<PathBuf, FlowError> {
-    let dl = layout
-        .staging_dir(program)
-        .join(local_asset_name(program, artifact));
-    disk_gate(
-        artifact.size.saturating_add(artifact.cost.disk_installed),
-        crate::freespace::available_bytes(&dl),
-    )?;
-    if let Some(parent) = dl.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| FlowError::Download(e.to_string()))?;
-    }
-    let _ = std::fs::remove_file(&dl);
-    sweep_foreign_partials(&dl);
-    let download_watch = crate::progress::watch_download(program, &dl, artifact.size);
-    if let Err(e) = fetch_artifact(fetcher, program, "", artifact, &dl) {
-        let _ = std::fs::remove_file(&dl);
-        note_fetch_fault();
-        return Err(FlowError::Download(e));
-    }
-    drop(download_watch);
-    crate::progress::note_phase(program, crate::progress::Phase::Verify);
-    let got = match crate::tree::file_sha256(&dl) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = std::fs::remove_file(&dl);
-            return Err(FlowError::Stage(StageError::Io(e)));
-        }
-    };
-    if !got.eq_ignore_ascii_case(&artifact.sha256) {
-        let _ = std::fs::remove_file(&dl);
-        discard_sibling_partial(&dl);
-        return Err(FlowError::Stage(StageError::Sha256Mismatch {
-            expected: artifact.sha256.clone(),
-            got,
-        }));
-    }
-    Ok(dl)
-}
-
-/// The local staging file name for a row: its `asset` (every store-bound row carries
-/// one), or for a `pkg` row that omits it the URL's last path component when that is a
-/// bare name, else `<program>.pkg`. Only ever joined onto `staging/<program>/`.
-fn local_asset_name(program: &str, artifact: &crate::manifest::Artifact) -> String {
-    if !artifact.asset.is_empty() || artifact.protocol != "pkg" {
-        return artifact.asset.clone();
-    }
-    let tail = artifact
-        .url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-    if !tail.is_empty() && tail != "." && tail != ".." && !tail.contains('\\') {
-        return tail.to_string();
-    }
-    let mut n = String::from(program);
-    n.push_str(".pkg");
-    n
-}
-
 /// The ONE place the download lanes fork — on the row's PROTOCOL, never its kind or its
 /// apply strategy. A `github-release` member goes through [`Fetcher::download_for`] (the
 /// program's `repo` under the account slug, the `[packages.links]` override, the GitHub
 /// token) — with the SIGNED `size` as its byte cap, the same number the disk preflight
 /// bounded the free-space check with, so no lane may write more than the preflight
-/// admitted. An `https` member — and a `pkg` member, whose package is a vendor download
-/// like any other — goes through [`Fetcher::download_url`] with the SIGNED row's `url`
-/// and the SIGNED `size` as the exact byte cap — and NEVER through `download_for`: the
-/// vendor host is not a release repo, and nothing about the account slug may reach it.
-/// `system-pm` and `softwareupdate` move no bytes of ours (their tools fetch their own);
-/// anything else is refused by name. The row was admitted by
+/// admitted. An `https` member goes through [`Fetcher::download_url`] with the SIGNED
+/// row's `url` and the SIGNED `size` as the exact byte cap — and NEVER through
+/// `download_for`: the vendor host is not a release repo, and nothing about the account
+/// slug may reach it. Anything else is refused by name. The row was admitted by
 /// [`crate::vendor::check_row`] before this is called.
 fn fetch_artifact(
     fetcher: &dyn Fetcher,
@@ -1829,7 +1339,7 @@ fn fetch_artifact(
 ) -> Result<(), String> {
     match artifact.protocol.as_str() {
         "github-release" => fetcher.download_for(program, repo, &artifact.asset, dl, artifact.size),
-        "https" | "pkg" => fetcher.download_url(&artifact.url, dl, artifact.size),
+        "https" => fetcher.download_url(&artifact.url, dl, artifact.size),
         other => {
             let mut m = String::from("protocol ");
             m.push_str(other);
@@ -2282,9 +1792,7 @@ fn apply_group(
     // store witness for it. A shim that is simply GONE is a different machine state (an
     // interrupted uninstall, a hand-removed file, a lane that only ever laid some names),
     // and reviving it here would make the update lane reinstall a program nobody asked it
-    // to: `the_update_pass_holds_an_installed_dependent_whose_dependency_was_uninstalled`
-    // pins that contract — a missing dependency is never installed by this lane, and the
-    // dependent stays HELD rather than being quietly unblocked by a resurrection.
+    // to.
     //
     // It is also NOT the round-13 widening that was reverted, which is what makes the
     // recovery honest: that one widened `installed` ITSELF, the map handed to `decide`, and
@@ -2483,8 +1991,8 @@ pub fn group_missing_triple(
 }
 
 /// The transaction body shared by [`apply_group`] (update: installed groups only) and
-/// [`bootstrap_group`] (§11 fresh install): decide-first, the requirement gate
-/// ([`TxnOutcome::Blocked`], §17.10), the local-pin hold, one walk over the Install
+/// [`bootstrap_group`] (§11 fresh install): decide-first, the retired-`requires` refusal
+/// ([`FlowError::RequiresRetired`], §5.3(b)), the local-pin hold, one walk over the Install
 /// members' manifests feeding the missing-triple hold ([`TxnOutcome::Unpublished`], for a
 /// tuple with something installed) and the group-aggregated disk preflight, then
 /// stage-all → flip-all → rollback via [`transact`], with the abort discard,
@@ -2542,27 +2050,31 @@ fn apply_group_txn(
         .iter()
         .all(|m| crate::gate::current_build_ok(ch, m, installed.get(m).copied()));
 
-    // THE REQUIREMENT GATE (§17.10) — strictly AFTER decide(), suppression-only,
-    // coherence-preserving, and the ONE rule ([`crate::requires::unmet_requirement`])
-    // the set-completion pass and the OS-installed reconcile apply before a member
-    // starts: the group is held on its current builds while one of its `requires` (a
-    // tuple's: the union of its members', minus the tuple) is not installed, dev-linked,
-    // system-satisfied or installed through its protocol. Running here, in the body the
-    // update lane shares with the bootstrap lane, is what makes `apply_channel` and
-    // `apply_program` honour it too: an already-installed dependent whose dependency
-    // was uninstalled is NOT moved to a newer pin, and nothing is resolved or downloaded
-    // for it — `Blocked` names the dependency and quotes its row, the caller records
-    // `blocked by <dep>: <dep state>` with the build and attestation kept, and the next
-    // pass retries. Never over a Tombstone (transact tombstones the group — a revoked
+    // THE RETIRED `requires` (§5.3(b), 2026-09-24) — strictly AFTER decide() and in the
+    // body the update lane shares with the bootstrap lane, so `apply_channel` and
+    // `apply_program` refuse it exactly as `install` does: a group with something to
+    // install, one of whose members' signed row names the relation this client no longer
+    // honours, aborts before anything is resolved or downloaded, the tuple staying on its
+    // current builds. Never over a Tombstone (transact tombstones the group — a revoked
     // build never keeps running) and never over a force-upgrade off a revoked current
-    // build, exactly like the pin below. The plan is dependency-first, so a requirement
-    // this pass could satisfy has already had its turn.
-    if !any_tombstone && all_current_valid {
-        let requires = crate::apply::group_requires(index, group);
-        if let Some((dep, dep_state)) = crate::requires::unmet_requirement(layout, index, &requires)
-        {
-            return (TxnOutcome::Blocked { dep, dep_state }, BTreeMap::new());
-        }
+    // build, exactly like the pin below.
+    if !any_tombstone
+        && all_current_valid
+        && decisions.iter().any(|(_, d)| *d == ApplyDecision::Install)
+        && let Some(member) = group.members.iter().find(|m| {
+            index
+                .program(m)
+                .is_some_and(crate::manifest::Program::names_requires)
+        })
+    {
+        return (
+            TxnOutcome::Aborted {
+                failed: member.clone(),
+                during_flip: false,
+                why: FlowError::RequiresRetired(member.clone()).to_string(),
+            },
+            BTreeMap::new(),
+        );
     }
 
     // LOCAL PIN GATE — strictly AFTER decide(), suppression-only, coherence-preserving.
@@ -3195,13 +2707,17 @@ pub fn resolve_verified_index(
 ) -> Result<TrustedIndex, FlowError> {
     let candidates = resolve_candidates(fetcher, layout)?;
     let live = last_resolve().is_some_and(|r| r.reached);
-    verify_select_fresh_from(layout, anchor, candidates, floor, now_unix, live)
+    let index = verify_select_fresh_from(layout, anchor, candidates, floor, now_unix, live)?;
+    if live {
+        LIVE_VERIFICATIONS.with(|n| n.set(n.get().saturating_add(1)));
+    }
+    Ok(index)
 }
 
 /// The verify-select + freshness half of [`resolve_verified_index`], over caller-supplied
 /// `candidates` — shared with the single-program paths ([`rollback`], [`apply_program`],
-/// [`plan_update`]), which resolve theirs through `resolve_candidates_live`: the cheap
-/// identity hit path, and no §14 cached FALLBACK when the fetch fails.
+/// [`plan_update`]), which resolve theirs through `resolve_candidates_live`: no §14
+/// cached FALLBACK when the fetch fails.
 /// Freshness (§8 gate 2): refuse a selected index whose window has lapsed; a
 /// `valid_until` we cannot parse is treated as lapsed (fail closed).
 ///
@@ -3308,50 +2824,14 @@ pub(crate) fn index_is_fresh(index: &Index, now_unix: i64) -> bool {
 fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Candidate>, FlowError> {
     let cache = crate::cache::IndexCache::for_layout(layout);
     let src = fetcher.source_id();
-    // THE HIT PATH (see `Fetcher::index_identities`). Ask the cheap question first: is
-    // the source still publishing the very assets the cached bytes came from? On the
-    // production fetcher that question is answered by the release LISTING, which
-    // `index_candidates` fetches and memoizes anyway — so this costs zero extra requests
-    // whether it hits or misses, and when it hits it removes the sixteen asset downloads
-    // that were the entire cost of a no-op update pass.
-    //
-    // WHAT THIS DOES NOT CHANGE, and the reason it is not a trust decision: the bytes
-    // returned here are the same raw candidate bytes `load` has always been allowed to
-    // return on a failed fetch. They go straight into `select_index` → `admit_roster` →
-    // `authorize_index` → the durable `index_build` floor → the `roster_seq` ratchet →
-    // the `valid_until` freshness window, every one of them unchanged. A stale or
-    // tampered cache installs nothing the live path would not, exactly as §14 already
-    // states — the identity match only decides whether re-fetching provably-identical
-    // bytes is worth sixteen round-trips.
-    //
-    // A host that wants to hold a client on an old index does not need this seam: it can
-    // simply keep serving the old assets, which is the suppression the freshness window
-    // bounds. And a LOCAL attacker who can write `<prefix>/index-cache.toml` (0700,
-    // owner-only) already owns the store the shims point into.
-    //
-    // `unwrap_or_default()` collapses "no cheap answer" to an empty vector, which
-    // `load_if_identical` refuses outright — so every non-participating fetcher (a `dir:`
-    // `DirFetcher`, every test double) takes the historical path below, byte for byte.
-    let live = fetcher.index_identities().unwrap_or_default();
-    if let Some(hit) = cache.load_if_identical(&src, &live) {
-        // The identities came off the LIVE listing: the source was reached, and the
-        // cache is proven current — the one cache read that is not a fallback.
-        note_resolve(true, None, true);
-        return Ok(hit);
-    }
     match fetcher.index_candidates() {
         Ok(c) if !c.is_empty() => {
-            // Stamped with the identities probed ABOVE — the same listing that produced
-            // these bytes, so the pairing cannot straddle a publish. A fetcher that gave
-            // no identities stores none (`&[]`), and the entry stays the failure-time
-            // fallback it has always been.
-            cache.store(&src, &c, &live);
+            cache.store(&src, &c);
             note_resolve(true, None, true);
             Ok(c)
         }
         // Reached the source, and it genuinely carried no index — a repo with no
-        // index release, or a tag pushed off the listing. A trust-shaped answer is
-        // the right one here.
+        // index release. A trust-shaped answer is the right one here.
         Ok(_) => {
             note_resolve(true, None, true);
             cache.load(&src).ok_or(FlowError::NoIndex)
@@ -3366,62 +2846,31 @@ fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Cand
     }
 }
 
-/// The identity HIT PATH alone, for the lanes a TYPED single-program verb takes
-/// ([`rollback`], [`apply_program`], [`plan_update`]): serve the §14 cache when the source
-/// is provably still publishing the very assets those bytes came from, and otherwise fetch
-/// live — with NO cached fallback if that fetch fails.
-///
-/// # Why this is not the §14 fallback these lanes deliberately refuse
-///
-/// Their rule is about FAILURE: a transient index-fetch failure must surface as
-/// [`FlowError::NoIndex`], never as an install decided from a cache the network could not
-/// corroborate this pass. That rule is untouched, in both directions. A listing that cannot
-/// be reached answers no identities ([`Fetcher::index_identities`] is `None`, hence empty),
-/// `load_if_identical` refuses an empty `live` outright, and the fetch below then fails into
-/// `NoIndex` exactly as before. The hit fires only when the listing WAS reached and reported
-/// the same assets, position for position — which is why it is a proof of currency and not a
-/// fallback at all.
-///
-/// # What it buys
-///
-/// The sixteen downloads. Without it a typed `aterm pkg update <program>` (or `rollback`)
-/// re-fetched the whole candidate set in every fresh process — on the production fetcher four
-/// assets for each of `INDEX_CANDIDATE_CAP` releases, sequential `curl` subprocesses each
-/// paying its own DNS+TLS handshake — to obtain bytes the 6-hourly pass had already stamped as
-/// identical in `<prefix>/index-cache.toml`. The listing that answers the identity probe is the
-/// one `index_candidates` would have fetched anyway, so the probe cannot ADD a round-trip.
-///
-/// Deliberately NOT here: the cache WRITE and the `note_resolve` provenance stamp. These lanes
-/// have never refreshed the cache nor recorded what the resolve learned about the network (only
-/// the pass lanes stamp `status.toml` from [`last_resolve`]), and a hit path is not the place to
-/// hand them either.
-fn resolve_candidates_live(
-    fetcher: &dyn Fetcher,
-    layout: &Layout,
-) -> Result<Vec<Candidate>, FlowError> {
-    let cache = crate::cache::IndexCache::for_layout(layout);
-    let live = fetcher.index_identities().unwrap_or_default();
-    if let Some(hit) = cache.load_if_identical(&fetcher.source_id(), &live) {
-        return Ok(hit);
-    }
+/// The candidates for the lanes a TYPED single-program verb takes ([`rollback`],
+/// [`apply_program`], [`plan_update`]): fetched live, with NO §14 cached fallback — a
+/// transient index-fetch failure surfaces as [`FlowError::NoIndex`], never as an install
+/// decided from a cache the network could not corroborate this pass. Nor does it refresh
+/// the cache or record what the resolve learned about the network: only the pass lanes
+/// stamp `status.toml` from [`last_resolve`].
+fn resolve_candidates_live(fetcher: &dyn Fetcher) -> Result<Vec<Candidate>, FlowError> {
     fetcher.index_candidates().map_err(|_| FlowError::NoIndex)
 }
 
 /// What the last index resolve in this process learned about the NETWORK: whether the
-/// source's listing was reached, and if not why — so a pass that ran on the §14 cache
-/// can SAY so instead of recording a green "up to date". Until 2026-09-15 a rate-limited
-/// or unreachable listing served the cache silently and every surface stayed green
-/// while the managed `claude` could freeze at an old pin (audit 2026-09-14); the pass
-/// end reads this ([`last_resolve`]) and stamps `status.toml`'s freshness fields, which
-/// `aterm pkg doctor` turns into "the listing has not been reached for N days".
+/// source was reached, and if not why — so a pass that ran on the §14 cache can SAY so
+/// instead of recording a green "up to date". Until 2026-09-15 a rate-limited or
+/// unreachable source served the cache silently and every surface stayed green while the
+/// managed `claude` could freeze at an old pin (audit 2026-09-14); the pass end reads this
+/// ([`last_resolve`]) into its outcome, and a pass whose resolve did not reach the source
+/// stamps a failure, never a success (`cli::record_pass_end`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveProvenance {
-    /// The source's release listing answered over the network this resolve.
+    /// The source served the candidates over the network this resolve (not the §14 cache).
     pub reached: bool,
     /// Why it did not, when it did not — the transport's own sentence.
     pub why: Option<String>,
-    /// Whether a host ANSWERED at all — the listing, or a refusal with a status (a rate
-    /// limit, an auth answer, a 404, a 5xx). `false` only when the link itself failed
+    /// Whether a host ANSWERED at all — the source, or a refusal with a status (a rate
+    /// limit, a 5xx, a portal's page). `false` only when the link itself failed
     /// ([`Fetcher::index_link_down`]): the one resolve an offline pass is made of.
     pub answered: bool,
 }
@@ -3441,6 +2890,21 @@ fn note_resolve(reached: bool, why: Option<String>, answered: bool) {
             answered: reached || answered,
         });
     });
+}
+
+// PER THREAD, like the resolve's provenance: how many indexes this thread's resolves
+// VERIFIED from what the channel served — not the §14 cache's bytes.
+thread_local! {
+    static LIVE_VERIFICATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's count of [`resolve_verified_index`] successes whose candidates the channel
+/// served this resolve. A pass that reads it before and after itself knows whether it
+/// REACHED the signed index — the one fact its success stamp may record
+/// (`cli::finish_update_pass`, the derived model `AtpkgPassStamps`).
+#[must_use]
+pub(crate) fn live_verifications() -> u32 {
+    LIVE_VERIFICATIONS.with(std::cell::Cell::get)
 }
 
 // PER THREAD, like the resolve's provenance: the members this pass lost AT A FETCH.
@@ -3501,8 +2965,8 @@ pub fn rollback(
             ))
         })?;
     // 2. Resolve + verify-select the SIGNED index so the floor/yank gate is authoritative
-    //    (hit path only — the single-program paths take no §14 cached fallback on failure).
-    let candidates = resolve_candidates_live(fetcher, layout)?;
+    //    (live — the single-program paths take no §14 cached fallback on failure).
+    let candidates = resolve_candidates_live(fetcher)?;
     let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     // 3. Reachability — capture the coherence group for the report/warn.
     let coherence_group = index
@@ -3576,8 +3040,8 @@ pub fn rollback(
 
 /// The transactional `update <grouped-member>` path (§11 tuple-split fix): verify-select the
 /// index + freshness like [`apply_channel`], but through `resolve_candidates_live` — the
-/// single-program paths take the §14 cache's identity HIT path and none of its failure-time
-/// fallback, so a transient index-fetch failure is `NoIndex` rather than a cached index.
+/// single-program paths take none of the §14 cache's failure-time fallback, so a transient
+/// index-fetch failure is `NoIndex` rather than a cached index.
 /// Then find the ONE coherence group containing
 /// `program`, and apply THAT WHOLE group atomically via [`apply_group`]. A grouped member
 /// therefore stages-all → flips-all → rolls-back atomically and can NEVER move
@@ -3601,7 +3065,7 @@ pub fn apply_program(
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
     refuse_vendor_program(program)?;
-    let candidates = resolve_candidates_live(fetcher, layout)?;
+    let candidates = resolve_candidates_live(fetcher)?;
     let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     // The channel as THIS target sees it (`pin_by_target` laid over `pin`): every decide,
     // plan and fetch below reads this view, never the raw platform-agnostic pin.
@@ -3690,7 +3154,7 @@ pub fn plan_update(
     now_unix: i64,
 ) -> Result<UpdatePlan, FlowError> {
     refuse_vendor_program(program)?;
-    let candidates = resolve_candidates_live(fetcher, layout)?;
+    let candidates = resolve_candidates_live(fetcher)?;
     let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     // Decide against the pin THIS target installs (`pin_by_target` overlay), or a build
     // `install` placed from the overlay reads as out of date against another target's pin.
@@ -3866,8 +3330,8 @@ pub fn signed_root_for_installed(
 /// a full disk and a tar-slip refusal all produced byte-identical output.
 ///
 /// The cause IS known at the exits that throw it away: the fetcher hands back its own
-/// words, and [`StageError`] renders sha256/tree_root mismatches, extract failures and the
-/// tracked-installer refusal — the very strings the SINGLETON lane already shows the user
+/// words, and [`StageError`] renders sha256/tree_root mismatches and extract failures — the
+/// very strings the SINGLETON lane already shows the user
 /// through [`FlowError::Download`] and [`FlowError::Stage`]. The group lane was the only
 /// one that dropped them. Printed to stderr so it lands immediately above the abort line in
 /// the same log, and deliberately NOT a failure of its own: reporting can never change what
@@ -3931,18 +3395,13 @@ fn stage_member(
         return None;
     }
     // Shim, vendor-app and sysroot-bundle members stage on this path; the aterm
-    // app-bundle, the OS-installer protocols (nothing of theirs is staged, and a
-    // coherence group is a STORE transaction), the not-yet-built `system-pm` and unknown
-    // pairs fail closed (return None → the group aborts), exactly like `install`.
+    // app-bundle and unknown pairs (the deleted OS-installer protocols' among them) fail
+    // closed (return None → the group aborts), exactly like `install`.
     let strategy = crate::dispatch::strategy_for(&artifact.kind, &artifact.protocol);
     let reloc = match strategy {
         crate::dispatch::ApplyStrategy::Shim | crate::dispatch::ApplyStrategy::VendorApp => None,
         crate::dispatch::ApplyStrategy::SysrootBundle => Some(artifact.reloc.clone()),
-        crate::dispatch::ApplyStrategy::AppBundle
-        | crate::dispatch::ApplyStrategy::Pkg
-        | crate::dispatch::ApplyStrategy::SoftwareUpdate
-        | crate::dispatch::ApplyStrategy::SystemPm
-        | crate::dispatch::ApplyStrategy::Unknown => {
+        crate::dispatch::ApplyStrategy::AppBundle | crate::dispatch::ApplyStrategy::Unknown => {
             // A kind/protocol pair this lane cannot stage is a PUBLISHING fact, not a
             // machine fault, and it aborts a whole tuple — so name it rather than leaving
             // the operator to guess at "ABORTED at <program> during stage".
@@ -4080,8 +3539,8 @@ fn stage_member(
         reclaim_after_failed_stage(&dl, &e);
         // SAY WHY (2026-09-13; see `stage_failure_note`). `StageError`'s Display is the
         // same text the singleton lane already shows through `FlowError::Stage` — a
-        // sha256 or tree_root mismatch with both digests, a tar-slip/size-cap refusal,
-        // the tracked-installer remedy — and it is the ONE sentence that separates "the
+        // sha256 or tree_root mismatch with both digests, a tar-slip/size-cap refusal —
+        // and it is the ONE sentence that separates "the
         // publisher shipped a bad asset" from "this machine could not unpack it".
         eprintln!("{}", stage_failure_note(program, pinned, &e.to_string()));
         *why = format!("staging {} failed: {e}", artifact.asset);
@@ -4540,7 +3999,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::rc::Rc;
 
     use crate::sig::testkit;
 
@@ -6093,785 +5551,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `pkg` and `system-pm` rows are ADMITTED (the schema and `check_row` accept them)
-    /// and DISPATCHED to their own strategies: a `system-pm` row reaches its lane, which
-    /// — with the manager absent from the (injected, empty) `PATH` — answers the
-    /// canonical `unavailable on <target>` outcome, moves no byte, stages nothing and
-    /// runs nothing; a `pkg` row reaches its lane, which DEFERS under this test's
-    /// (default) elevation. A row that fails its own field checks is still
-    /// `VendorRefused` first.
+    /// The OS-installer protocols are DELETED (design 2026-09-22 §5.3(b)): a signed row
+    /// naming `pkg`, `system-pm` or `softwareupdate` is refused by name at admission —
+    /// before the disk preflight, before any byte moves — and nothing is staged or shimmed.
     #[test]
-    fn pkg_and_system_pm_rows_are_admitted_and_dispatched_to_their_lanes() {
+    fn a_deleted_os_installer_row_is_refused_before_any_byte_moves() {
         let req = InstallRequest {
             channel: "stable",
             program: "ay",
             triple: TRIPLE,
             installed: None,
         };
-        let pdir = scratch("proto-pkg");
-        let pkg = fixture_vendor(
-            &pdir,
-            "kind = \"installer-pkg\"\nprotocol = \"pkg\"\n\
-             url = \"https://github.com/Homebrew/brew/releases/download/4.5.0/Homebrew-4.5.0.pkg\"\n\
-             signer_team = \"927JGANW46\"\nelevated = true\nprovides = [\"/opt/homebrew/bin/brew\"]\n\
-             vendor = \"Homebrew\"\n",
-        );
-        // `fixture_vendor` writes a tree_root, which a pkg row may not carry: strip it by
-        // hand-checking the refusal names that field, then use the real shape.
-        let play = layout(&pdir);
-        let err = install(&pkg, &play, &anchor(), &req, fl(0), 0).unwrap_err();
-        assert!(
-            matches!(&err, FlowError::VendorRefused(m) if m.contains("nothing lands in the store")),
-            "{err:?}"
-        );
-        assert!(!play.staging_dir("ay").exists());
-        let _ = std::fs::remove_dir_all(&pdir);
-
-        let sdir = scratch("proto-system-pm");
-        // A system-pm row carries no digests at all, so build it without the fixture's
-        // sha256/tree_root/size: the index and pkg bodies by hand.
-        let index_body = format!(
-            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
-             [programs.ay]\nrepo = \"ay\"\n\
-             [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
-             pin = {{ ay = 18 }}\n",
-            attr = attribution()
-        );
-        let pkg_body = format!(
-            "schema = 2\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
-             exposes = [\"ay\"]\n\
-             [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"system-package\"\n\
-             protocol = \"system-pm\"\nmanager = \"brew\"\npackage = \"ay\"\n\
-             provides = [\"ay\"]\n"
-        );
-        let mut pkgs = HashMap::new();
-        pkgs.insert(
-            ("ay".to_string(), 18u64),
-            (
-                pkg_body.clone().into_bytes(),
-                sign(&RELEASE_SEED, pkg_body.as_bytes()),
-            ),
-        );
-        let fake = Fake {
-            index: index_body.clone().into_bytes(),
-            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
-            pkg: pkgs,
-            archives: HashMap::new(),
-        };
-        let slay = layout(&sdir);
-        let rec = Rc::new(crate::elevate::testkit::Recorder::new(vec![]));
-        let empty = std::ffi::OsString::new();
-        let report = crate::elevate::with_path_var(Some(&empty), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&fake, &slay, &anchor(), &req, fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Unavailable {
-                protocol: "brew",
-                target: TRIPLE.to_string(),
-                hint: crate::system_pm::missing_manager_hint(
-                    crate::vendor::manager("brew").unwrap(),
-                    "ay",
-                    None
-                ),
-            })
-        );
-        assert_eq!(
-            report.protocol.as_ref().unwrap().state("ay"),
-            "unavailable on aarch64-apple-darwin: brew is not on PATH (the pinned row \
-             installs ay through it, and atpkg never installs a package manager)"
-        );
-        assert!(rec.argvs().is_empty(), "no manager ran");
-        assert!(!slay.staging_dir("ay").exists(), "no byte moved");
-        assert!(crate::ops::which(&slay, "ay").is_none());
-        let _ = std::fs::remove_dir_all(&sdir);
-
-        // The pkg protocol, in its real shape (no tree_root), reaches its LANE — which,
-        // with nothing at the provides path and no elevation on this thread, answers
-        // Ok-with-deferred: the canonical `needs admin` state, no byte moved.
-        let qdir = scratch("proto-pkg-real");
-        let pkg_body = format!(
-            "schema = 2\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
-             exposes = []\n\
-             [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"installer-pkg\"\nprotocol = \"pkg\"\n\
-             url = \"https://github.com/Homebrew/brew/releases/download/4.5.0/Homebrew-4.5.0.pkg\"\n\
-             sha256 = \"{}\"\nsize = 144434507\nsigner_team = \"927JGANW46\"\nelevated = true\n\
-             provides = [\"/nope/opt/homebrew/bin/brew\"]\n",
-            "7b09f01c".repeat(8)
-        );
-        let mut pkgs = HashMap::new();
-        pkgs.insert(
-            ("ay".to_string(), 18u64),
-            (
-                pkg_body.clone().into_bytes(),
-                sign(&RELEASE_SEED, pkg_body.as_bytes()),
-            ),
-        );
-        let fake = Fake {
-            index: index_body.clone().into_bytes(),
-            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
-            pkg: pkgs,
-            archives: HashMap::new(),
-        };
-        let qlay = layout(&qdir);
-        assert_eq!(
-            crate::elevate::elevation(),
-            crate::elevate::Elevation::Deferred
-        );
-        let report = install(&fake, &qlay, &anchor(), &req, fl(0), 0).unwrap();
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "pkg" })
-        );
-        assert_eq!(
-            report.protocol.as_ref().unwrap().state("ay"),
-            crate::state::needs_admin("ay")
-        );
-        assert!(report.shimmed.is_empty() && report.tree_root.is_empty());
-        assert!(!qlay.staging_dir("ay").exists(), "no byte moved");
-        let _ = std::fs::remove_dir_all(&qdir);
-    }
-
-    // ---- the OS-installer lanes through the real flow ----
-
-    /// A fetcher for the `pkg` lane: the signed index + manifests of `inner`, the
-    /// package bytes served on `download_url` ONLY (the slug lane panics), every vendor
-    /// request recorded.
-    struct PkgFake {
-        inner: Fake,
-        served: PathBuf,
-        seen: RefCell<Vec<(String, u64)>>,
-    }
-    impl Fetcher for PkgFake {
-        fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
-            self.inner.index_candidates()
-        }
-        fn pkg_manifest(&self, r: &str, p: &str, b: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
-            self.inner.pkg_manifest(r, p, b)
-        }
-        fn download(&self, _: &str, asset: &str, _: &Path) -> Result<(), String> {
-            panic!("a pkg row must never reach the slug lane (asked for {asset})");
-        }
-        fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
-            self.seen.borrow_mut().push((url.to_string(), cap));
-            std::fs::copy(&self.served, dest)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        }
-    }
-
-    const BREW_URL: &str = "https://github.com/Homebrew/brew/releases/download/6.0.20/Homebrew.pkg";
-
-    /// The signed release for the `pkg` lane: `brew` pinned at 18 with a `pkg` row over
-    /// the bytes at `<dir>/Homebrew.pkg` (signed sha256 = `signed_sha`, or the real one),
-    /// `provides` as given; and, when `clt_row` is `Some`, a `clt` program at build 7
-    /// carrying that `[[artifact]]` body, which `brew` REQUIRES through the index.
-    fn fixture_pkg(
-        dir: &Path,
-        provides: &[String],
-        signed_sha: Option<&str>,
-        clt_row: Option<&str>,
-    ) -> PkgFake {
-        let served = dir.join("Homebrew.pkg");
-        std::fs::write(&served, b"xar! not really a package, but signed bytes").unwrap();
-        let real_sha = crate::tree::file_sha256(&served).unwrap();
-        let sha = signed_sha.unwrap_or(&real_sha);
-        let size = std::fs::metadata(&served).unwrap().len();
-        let provides_toml: Vec<String> = provides.iter().map(|p| format!("{p:?}")).collect();
-        let (requires, clt_prog, clt_pin) = if clt_row.is_some() {
-            (
-                "requires = [\"clt\"]\n",
-                "[programs.clt]\nrepo = \"clt\"\n",
-                ", clt = 7",
-            )
-        } else {
-            ("", "", "")
-        };
-        let index_body = format!(
-            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
-             [programs.brew]\nrepo = \"brew\"\n{requires}{clt_prog}\
-             [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
-             pin = {{ brew = 18{clt_pin} }}\n",
-            attr = attribution()
-        );
-        let brew_body = format!(
-            "schema = 2\nprogram = \"brew\"\nversion = \"6.0.20\"\nbuild_number = 18\n\
-             exposes = []\n\
-             [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"installer-pkg\"\nprotocol = \"pkg\"\n\
-             url = \"{BREW_URL}\"\nsha256 = \"{sha}\"\nsize = {size}\n\
-             signer_team = \"927JGANW46\"\nelevated = true\n\
-             provides = [{}]\nvendor = \"Homebrew\"\n",
-            provides_toml.join(", ")
-        );
-        let mut pkg = HashMap::new();
-        pkg.insert(
-            ("brew".to_string(), 18u64),
-            (
-                brew_body.clone().into_bytes(),
-                sign(&RELEASE_SEED, brew_body.as_bytes()),
-            ),
-        );
-        if let Some(row) = clt_row {
-            let clt_body = format!(
-                "schema = 2\nprogram = \"clt\"\nversion = \"16.4\"\nbuild_number = 7\n\
-                 exposes = []\n[[artifact]]\ntarget = \"{TRIPLE}\"\n{row}"
+        for (kind, protocol) in [
+            ("installer-pkg", "pkg"),
+            ("system-package", "system-pm"),
+            ("system-package", "softwareupdate"),
+        ] {
+            let dir = scratch(&format!("deleted-{protocol}"));
+            let fake = fixture_vendor(
+                &dir,
+                &format!("kind = \"{kind}\"\nprotocol = \"{protocol}\"\nelevated = true\n"),
             );
-            pkg.insert(
-                ("clt".to_string(), 7u64),
-                (
-                    clt_body.clone().into_bytes(),
-                    sign(&RELEASE_SEED, clt_body.as_bytes()),
-                ),
+            let lay = layout(&dir);
+            let err = install(&fake, &lay, &anchor(), &req, fl(0), 0).unwrap_err();
+            assert!(
+                matches!(&err, FlowError::VendorRefused(m)
+                    if m.contains("protocol must be github-release | https")
+                        && m.ends_with(protocol)),
+                "{protocol}: {err:?}"
             );
+            assert!(!lay.staging_dir("ay").exists(), "{protocol}: no byte moved");
+            assert!(crate::ops::which(&lay, "ay").is_none());
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        PkgFake {
-            inner: Fake {
-                index: index_body.clone().into_bytes(),
-                index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
-                pkg,
-                archives: HashMap::new(),
-            },
-            served,
-            seen: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// The Command Line Tools row, with `provides` as given.
-    fn clt_row(provides: &str) -> String {
-        format!(
-            "kind = \"system-package\"\nprotocol = \"softwareupdate\"\n\
-             label_prefix = \"Command Line Tools for Xcode\"\nelevated = true\n\
-             provides = [{provides:?}]\nvendor = \"Apple\"\n"
-        )
-    }
-
-    fn brew_req() -> InstallRequest<'static> {
-        InstallRequest {
-            channel: "stable",
-            program: "brew",
-            triple: TRIPLE,
-            installed: None,
-        }
-    }
-
-    /// Restore the thread's policy on every exit path of a test that raises it.
-    struct Deferred;
-    impl Drop for Deferred {
-        fn drop(&mut self) {
-            crate::elevate::set_elevation(crate::elevate::Elevation::Deferred);
-        }
-    }
-
-    /// A `pkg` member whose `provides` path already exists is `installed via pkg:
-    /// <path>` — no download, no installer, whatever the elevation; and one whose path
-    /// is absent, under a Deferred policy, is `needs admin` with no byte moved and no
-    /// tool run.
-    #[test]
-    fn a_pkg_member_is_proven_by_its_provides_path_and_defers_without_elevation() {
-        let dir = scratch("pkg-provides");
-        let present = dir.join("opt-homebrew-bin-brew");
-        std::fs::write(&present, "brew").unwrap();
-        let fake = fixture_pkg(
-            &dir,
-            &[
-                String::from("/nope/brew"),
-                present.to_string_lossy().into_owned(),
-            ],
-            None,
-            None,
-        );
-        let lay = layout(&dir);
-        // Even with sudo allowed, a present member runs nothing: the recorder would
-        // answer garbage to any call, and the download lane would record one.
-        let _restore = Deferred;
-        crate::elevate::set_elevation(crate::elevate::Elevation::Sudo);
-        let rec = Rc::new(crate::elevate::testkit::Recorder::new(vec![]));
-        let report = crate::elevate::with_runner(rec.clone(), || {
-            install(&fake, &lay, &anchor(), &brew_req(), fl(0), 0).unwrap()
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "pkg",
-                path: present.clone()
-            })
-        );
-        assert_eq!(
-            report.protocol.as_ref().unwrap().state("brew"),
-            crate::state::installed_via("pkg", &present)
-        );
-        assert!(rec.argvs().is_empty(), "nothing ran");
-        assert!(fake.seen.borrow().is_empty(), "nothing downloaded");
-        assert!(!lay.staging_dir("brew").exists());
-        assert!(
-            crate::ops::which(&lay, "brew").is_none(),
-            "no shim: the provides path IS the copy"
-        );
-        // Absent + Deferred: needs admin, nothing moved, nothing run.
-        crate::elevate::set_elevation(crate::elevate::Elevation::Deferred);
-        std::fs::remove_file(&present).unwrap();
-        let report = crate::elevate::with_runner(rec.clone(), || {
-            install(&fake, &lay, &anchor(), &brew_req(), fl(0), 0).unwrap()
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "pkg" })
-        );
-        assert!(rec.argvs().is_empty());
-        assert!(
-            fake.seen.borrow().is_empty(),
-            "a deferred member downloads nothing"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// THE pkg LANE, end to end under the terminal door: the package is downloaded
-    /// through `download_url` ONLY (signed url, signed size as the cap) into
-    /// `staging/brew/Homebrew.pkg`, gated on the signed sha256, checked with `pkgutil`
-    /// (captured), applied by EXACTLY `sudo /usr/sbin/installer -pkg <file> -target /`
-    /// (inherited), proven by the provides path the installer left, and the package is
-    /// deleted afterwards. A wrong signer team never reaches the installer; a sha256
-    /// mismatch never reaches pkgutil; both leave nothing behind.
-    #[test]
-    fn a_pkg_member_installs_through_the_signed_download_the_team_check_and_the_elevated_installer()
-    {
-        use crate::elevate::testkit::{Recorder, ok};
-        use crate::installer_pkg::fixtures::{GOOD, WRONG_TEAM};
-        let _restore = Deferred;
-        let dir = scratch("pkg-lane");
-        let brew = dir.join("opt-homebrew-bin-brew");
-        let fake = fixture_pkg(&dir, &[brew.to_string_lossy().into_owned()], None, None);
-        let lay = layout(&dir);
-        let staged = lay.staging_dir("brew").join("Homebrew.pkg");
-        crate::elevate::set_elevation(crate::elevate::Elevation::Sudo);
-        let mut rec = Recorder::new(vec![ok(GOOD), ok("")]);
-        let (created, expect_staged) = (brew.clone(), staged.clone());
-        rec.on_run = Some(Box::new(move |argv: &[String]| {
-            if argv.iter().any(|a| a == "/usr/sbin/installer") {
-                assert!(
-                    expect_staged.is_file(),
-                    "the package is on disk while installer runs"
-                );
-                std::fs::write(&created, "brew").unwrap();
-            }
-        }));
-        let rec = Rc::new(rec);
-        let report = crate::elevate::with_runner(rec.clone(), || {
-            install(&fake, &lay, &anchor(), &brew_req(), fl(0), 0).unwrap()
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "pkg",
-                path: brew.clone()
-            })
-        );
-        assert_eq!(report.build, 18);
-        assert!(report.shimmed.is_empty());
-        let seen = fake.seen.borrow();
-        assert_eq!(seen.len(), 1, "exactly one vendor download");
-        assert_eq!(seen[0].0, BREW_URL, "the SIGNED url, verbatim");
-        assert_eq!(
-            seen[0].1,
-            std::fs::metadata(&fake.served).unwrap().len(),
-            "the cap is the signed size, exactly"
-        );
-        let calls = rec.calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[0],
-            (
-                crate::installer_pkg::check_signature_argv(&staged),
-                crate::elevate::Io::Capture
-            )
-        );
-        assert_eq!(
-            calls[1],
-            (
-                vec![
-                    "/usr/bin/sudo".to_string(),
-                    "/usr/sbin/installer".to_string(),
-                    "-pkg".to_string(),
-                    staged.to_string_lossy().into_owned(),
-                    "-target".to_string(),
-                    "/".to_string(),
-                ],
-                crate::elevate::Io::Inherit
-            )
-        );
-        assert!(!staged.exists(), "the package is deleted after the install");
-        drop(calls);
-        drop(seen);
-
-        // Wrong team: refused by name, installer never run, package reclaimed.
-        let wdir = scratch("pkg-wrong-team");
-        let wfake = fixture_pkg(&wdir, &[String::from("/nope/brew")], None, None);
-        let wlay = layout(&wdir);
-        let wrec = Rc::new(Recorder::new(vec![ok(WRONG_TEAM), ok("")]));
-        let err = crate::elevate::with_runner(wrec.clone(), || {
-            install(&wfake, &wlay, &anchor(), &brew_req(), fl(0), 0).unwrap_err()
-        });
-        match &err {
-            FlowError::Protocol {
-                protocol: "pkg",
-                why,
-            } => {
-                assert!(
-                    why.contains("not the pinned signer_team 927JGANW46"),
-                    "{why}"
-                );
-            }
-            other => panic!("expected a pkg refusal, got {other:?}"),
-        }
-        assert!(
-            err.to_string().starts_with("pkg: refusing to install"),
-            "{err}"
-        );
-        assert_eq!(wrec.argvs().len(), 1, "pkgutil only");
-        assert!(!wlay.staging_dir("brew").join("Homebrew.pkg").exists());
-
-        // sha256 mismatch: the signed digest disagrees with the served bytes — refused
-        // before pkgutil, nothing left in staging.
-        let sdir = scratch("pkg-sha");
-        let sfake = fixture_pkg(
-            &sdir,
-            &[String::from("/nope/brew")],
-            Some(&"7b09f01c".repeat(8)),
-            None,
-        );
-        let slay = layout(&sdir);
-        let srec = Rc::new(Recorder::new(vec![ok(GOOD), ok("")]));
-        let err = crate::elevate::with_runner(srec.clone(), || {
-            install(&sfake, &slay, &anchor(), &brew_req(), fl(0), 0).unwrap_err()
-        });
-        assert!(
-            matches!(err, FlowError::Stage(StageError::Sha256Mismatch { .. })),
-            "{err:?}"
-        );
-        assert!(srec.argvs().is_empty(), "nothing ran on a bad download");
-        assert!(!slay.staging_dir("brew").join("Homebrew.pkg").exists());
-        for d in [dir, wdir, sdir] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    /// `requires` for an OS-installed member (Homebrew requires the Command Line Tools,
-    /// through the INDEX's `[programs.brew].requires`): the dependency is resolved FIRST
-    /// through the same flow; its deferral defers brew (both wait for the door); its
-    /// presence lets brew proceed; its refusal stops brew with the reason.
-    #[test]
-    fn an_os_installed_member_waits_for_its_required_clt() {
-        // clt absent + Deferred ⇒ clt defers ⇒ brew defers, without touching its own lane.
-        let dir = scratch("pkg-requires-deferred");
-        let fake = fixture_pkg(
-            &dir,
-            &[String::from("/nope/brew")],
-            None,
-            Some(&clt_row("/nope/CommandLineTools/usr/bin/git")),
-        );
-        let lay = layout(&dir);
-        let report = install(&fake, &lay, &anchor(), &brew_req(), fl(0), 0).unwrap();
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "pkg" })
-        );
-        assert_eq!(report.dependencies.len(), 1);
-        assert_eq!(report.dependencies[0].program, "clt");
-        assert_eq!(
-            report.dependencies[0].result,
-            DepResult::Protocol(ProtocolOutcome::NeedsAdmin {
-                protocol: "softwareupdate"
-            })
-        );
-        assert!(
-            fake.seen.borrow().is_empty(),
-            "brew's own lane never started"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-
-        // clt present ⇒ recorded `installed via softwareupdate` beside brew's own answer.
-        let pdir = scratch("pkg-requires-present");
-        let git = pdir.join("CommandLineTools-usr-bin-git");
-        std::fs::write(&git, "git").unwrap();
-        let pfake = fixture_pkg(
-            &pdir,
-            &[String::from("/nope/brew")],
-            None,
-            Some(&clt_row(&git.to_string_lossy())),
-        );
-        let play = layout(&pdir);
-        let report = install(&pfake, &play, &anchor(), &brew_req(), fl(0), 0).unwrap();
-        assert_eq!(
-            report.dependencies[0].result,
-            DepResult::Protocol(ProtocolOutcome::Installed {
-                protocol: "softwareupdate",
-                path: git.clone()
-            })
-        );
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "pkg" }),
-            "brew itself still waits for the door on this pass"
-        );
-        let _ = std::fs::remove_dir_all(&pdir);
-
-        // clt refused (its row fails admission) ⇒ brew stops with the requirement named.
-        let rdir = scratch("pkg-requires-refused");
-        let rfake = fixture_pkg(
-            &rdir,
-            &[String::from("/nope/brew")],
-            None,
-            Some(
-                "kind = \"system-package\"\nprotocol = \"softwareupdate\"\nelevated = true\n\
-                 provides = [\"/nope/git\"]\n",
-            ),
-        );
-        let rlay = layout(&rdir);
-        let err = install(&rfake, &rlay, &anchor(), &brew_req(), fl(0), 0).unwrap_err();
-        match &err {
-            FlowError::Requirement { dep, why } => {
-                assert_eq!(dep, "clt");
-                assert!(why.contains("label_prefix must be"), "{why}");
-            }
-            other => panic!("expected Requirement, got {other:?}"),
-        }
-        assert!(
-            err.to_string()
-                .starts_with("requires clt, which could not be installed first: "),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(&rdir);
-    }
-
-    /// An OS-installed member's requirement gate counts a dependency that is MET, however
-    /// this call reached it. A DIAMOND — brew requires [mid, clt], mid requires clt — has
-    /// clt resolved inside mid's recursion before brew's own clt edge is walked; that edge
-    /// carries clt's real outcome, so brew proceeds (it used to stop with `requires clt,
-    /// which could not be installed first: already resolved or cycle`). The same holds
-    /// across subtrees (top requires [mid, brew]), and a DEV-LINKED dependency is met
-    /// exactly as `requires::unmet_requirement` counts it.
-    #[test]
-    fn an_os_installed_member_counts_a_requirement_met_earlier_or_dev_linked() {
-        let dir = scratch("pkg-requires-diamond");
-        let git = dir.join("CommandLineTools-usr-bin-git");
-        let mid_bin = dir.join("mid-bin");
-        let top_bin = dir.join("top-bin");
-        for p in [&git, &mid_bin, &top_bin] {
-            std::fs::write(p, "present").unwrap();
-        }
-        let base = fixture_pkg(
-            &dir,
-            &[String::from("/nope/brew")],
-            None,
-            Some(&clt_row(&git.to_string_lossy())),
-        );
-        let index_body = String::from_utf8(base.inner.index.clone())
-            .unwrap()
-            .replace(
-                "[programs.brew]\nrepo = \"brew\"\nrequires = [\"clt\"]\n",
-                "[programs.brew]\nrepo = \"brew\"\nrequires = [\"mid\", \"clt\"]\n\
-                 [programs.mid]\nrepo = \"mid\"\nrequires = [\"clt\"]\n\
-                 [programs.top]\nrepo = \"top\"\nrequires = [\"mid\", \"brew\"]\n",
-            )
-            .replace(", clt = 7", ", clt = 7, mid = 3, top = 5");
-        assert!(index_body.contains("top = 5"), "{index_body}");
-        let mut pkg = base.inner.pkg;
-        for (name, build, bin) in [("mid", 3u64, &mid_bin), ("top", 5, &top_bin)] {
-            let body = format!(
-                "schema = 2\nprogram = \"{name}\"\nversion = \"1.0\"\nbuild_number = {build}\n\
-                 exposes = []\n[[artifact]]\ntarget = \"{TRIPLE}\"\n{}",
-                clt_row(&bin.to_string_lossy())
-            );
-            pkg.insert(
-                (name.to_string(), build),
-                (
-                    body.clone().into_bytes(),
-                    sign(&RELEASE_SEED, body.as_bytes()),
-                ),
-            );
-        }
-        let fake = PkgFake {
-            inner: Fake {
-                index: index_body.clone().into_bytes(),
-                index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
-                pkg,
-                archives: HashMap::new(),
-            },
-            served: base.served,
-            seen: RefCell::new(Vec::new()),
-        };
-        let lay = layout(&dir);
-
-        // The diamond: brew passes its gate and waits for the door; clt is named ONCE.
-        let report = install(&fake, &lay, &anchor(), &brew_req(), fl(0), 0).unwrap();
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "pkg" })
-        );
-        assert_eq!(
-            report.dependencies,
-            vec![
-                DepOutcome {
-                    program: "mid".into(),
-                    result: DepResult::Protocol(ProtocolOutcome::Installed {
-                        protocol: "softwareupdate",
-                        path: mid_bin.clone(),
-                    }),
-                },
-                DepOutcome {
-                    program: "clt".into(),
-                    result: DepResult::Protocol(ProtocolOutcome::Installed {
-                        protocol: "softwareupdate",
-                        path: git.clone(),
-                    }),
-                },
-            ]
-        );
-
-        // Across subtrees: brew (reached through top) still sees clt as met, so top
-        // defers on brew's deferral instead of failing on a skipped brew.
-        let top = InstallRequest {
-            program: "top",
-            ..brew_req()
-        };
-        let report = install(&fake, &lay, &anchor(), &top, fl(0), 0).unwrap();
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin {
-                protocol: "softwareupdate"
-            })
-        );
-        assert!(
-            report.dependencies.iter().any(|d| d.program == "brew"
-                && d.result
-                    == DepResult::Protocol(ProtocolOutcome::NeedsAdmin { protocol: "pkg" })),
-            "{:?}",
-            report.dependencies
-        );
-        assert!(
-            report
-                .dependencies
-                .iter()
-                .all(|d| !matches!(d.result, DepResult::Skipped(_))),
-            "{:?}",
-            report.dependencies
-        );
-        assert!(fake.seen.borrow().is_empty(), "no vendor download started");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        // A dev-linked clt (absent from its provides path) is met: brew proceeds.
-        let ldir = scratch("pkg-requires-linked");
-        let lfake = fixture_pkg(
-            &ldir,
-            &[String::from("/nope/brew")],
-            None,
-            Some(&clt_row("/nope/CommandLineTools/usr/bin/git")),
-        );
-        let llay = layout(&ldir);
-        mark_linked(&llay, "clt");
-        let report = install(&lfake, &llay, &anchor(), &brew_req(), fl(0), 0).unwrap();
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "pkg" })
-        );
-        assert!(
-            matches!(&report.dependencies[..], [d] if d.program == "clt"
-                && matches!(&d.result, DepResult::Skipped(why) if why.contains("dev-linked"))),
-            "{:?}",
-            report.dependencies
-        );
-        let _ = std::fs::remove_dir_all(&ldir);
-    }
-
-    /// THE EXPLICIT DOOR'S ORDER (§17.10): `aterm pkg install brew` under the terminal
-    /// door (Sudo on this thread) installs the Command Line Tools FIRST — `softwareupdate
-    /// -l`, then `sudo softwareupdate -i <label>` — and only then runs brew's own lane
-    /// (`pkgutil --check-signature`, `sudo installer …`); one thread, one elevation
-    /// policy, one sudo session. Every tool runs through the injected runner, which
-    /// leaves each lane's `provides` path behind exactly as the real tools would.
-    #[test]
-    fn the_explicit_door_installs_a_required_clt_before_brew_in_one_session() {
-        use crate::elevate::testkit::{Recorder, ok};
-        use crate::installer_pkg::fixtures::GOOD;
-        let _restore = Deferred;
-        let dir = scratch("door-order");
-        let git = dir.join("CommandLineTools-usr-bin-git");
-        let brew_bin = dir.join("opt-homebrew-bin-brew");
-        let fake = fixture_pkg(
-            &dir,
-            &[brew_bin.to_string_lossy().into_owned()],
-            None,
-            Some(&clt_row(&git.to_string_lossy())),
-        );
-        let lay = layout(&dir);
-        crate::elevate::set_elevation(crate::elevate::Elevation::Sudo);
-        let mut rec = Recorder::new(vec![
-            ok(
-                "Software Update found the following new or updated software:\n\
-                * Label: Command Line Tools for Xcode-16.4\n",
-            ),
-            ok(""),
-            ok(GOOD),
-            ok(""),
-        ]);
-        let (git_c, brew_c) = (git.clone(), brew_bin.clone());
-        rec.on_run = Some(Box::new(move |argv: &[String]| {
-            // Each ELEVATED install leaves its proof behind; the listing and the
-            // signature check leave nothing.
-            if argv.first().map(String::as_str) == Some("/usr/bin/sudo") {
-                if argv.iter().any(|a| a == "/usr/sbin/softwareupdate") {
-                    std::fs::write(&git_c, "git").unwrap();
-                } else {
-                    std::fs::write(&brew_c, "brew").unwrap();
-                }
-            }
-        }));
-        let rec = Rc::new(rec);
-        let report = crate::elevate::with_runner(rec.clone(), || {
-            install(&fake, &lay, &anchor(), &brew_req(), fl(0), 0).unwrap()
-        });
-        // brew installed, clt installed first, both proven.
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "pkg",
-                path: brew_bin.clone()
-            })
-        );
-        assert_eq!(report.dependencies.len(), 1);
-        assert_eq!(
-            report.dependencies[0],
-            DepOutcome {
-                program: "clt".into(),
-                result: DepResult::Protocol(ProtocolOutcome::Installed {
-                    protocol: "softwareupdate",
-                    path: git.clone()
-                })
-            }
-        );
-        // THE ORDER, tool by tool: clt's two calls strictly before brew's two.
-        let argvs = rec.argvs();
-        assert_eq!(argvs.len(), 4, "{argvs:?}");
-        assert_eq!(argvs[0], vec!["/usr/sbin/softwareupdate", "-l"]);
-        assert_eq!(
-            argvs[1],
-            vec![
-                "/usr/bin/sudo",
-                "/usr/sbin/softwareupdate",
-                "-i",
-                "Command Line Tools for Xcode-16.4"
-            ]
-        );
-        assert_eq!(argvs[2][0], "/usr/sbin/pkgutil");
-        assert_eq!(argvs[3][0], "/usr/bin/sudo");
-        assert_eq!(argvs[3][1], "/usr/sbin/installer");
-        assert!(
-            !Path::new(crate::softwareupdate::PLACEHOLDER).exists(),
-            "the on-demand placeholder is removed on every path"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Rule 2 on the `requires` path: a dependency the user's OWN copy satisfies
@@ -6883,7 +5595,7 @@ mod tests {
     fn a_system_satisfied_dependency_is_never_pulled_in_as_a_managed_copy() {
         let dir = scratch("requires-system");
         let sys = dir.join("usr-local-bin");
-        let gh = lay_pm_exe(&sys, "gh");
+        let gh = lay_exe(&sys, "gh");
         let path = std::env::join_paths([sys.clone()]).unwrap();
         // `ay` requires `gh`; gh declares `system = "gh"` and is pinned, but its pkg
         // manifest is deliberately ABSENT: fetching it would fail loudly.
@@ -6909,7 +5621,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = crate::elevate::with_path_var(Some(&path), || {
+        let report = crate::vendor::with_path_var(Some(&path), || {
             install(&fake, &lay, &anchor(), &req, fl(0), 0).unwrap()
         });
         assert_eq!(report.build, 18);
@@ -6927,428 +5639,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- the system-pm lane through the real flow ----
-
-    /// The signed release for the `system-pm` lane: `emacs` pinned at 18 with the
-    /// `[[artifact]]` body `row` for this triple (no `system = "emacs"` — the lane is
-    /// under test, not the satisfaction reconcile), and
-    /// `[programs.emacs].unavailable_hint` when `hint` is given.
-    fn fixture_pm(dir: &Path, row: &str, hint: Option<&str>) -> Fake {
-        let _ = dir;
-        let hint_line = hint.map_or_else(String::new, |h| format!("unavailable_hint = {h:?}\n"));
-        let index_body = format!(
-            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
-             [programs.emacs]\nrepo = \"emacs\"\n{hint_line}\
-             [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
-             pin = {{ emacs = 18 }}\n",
-            attr = attribution()
-        );
-        let pkg_body = format!(
-            "schema = 2\nprogram = \"emacs\"\nversion = \"31.1\"\nbuild_number = 18\n\
-             exposes = []\n[[artifact]]\ntarget = \"{TRIPLE}\"\n{row}"
-        );
-        let mut pkgs = HashMap::new();
-        pkgs.insert(
-            ("emacs".to_string(), 18u64),
-            (
-                pkg_body.clone().into_bytes(),
-                sign(&RELEASE_SEED, pkg_body.as_bytes()),
-            ),
-        );
-        Fake {
-            index: index_body.clone().into_bytes(),
-            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
-            pkg: pkgs,
-            archives: HashMap::new(),
-        }
-    }
-
-    /// A `system-pm` row over `manager`, `provides` as given, `elevated` as given.
-    fn pm_row(manager: &str, package: &str, provides: &[&str], elevated: bool) -> String {
-        let p: Vec<String> = provides.iter().map(|x| format!("{x:?}")).collect();
-        format!(
-            "kind = \"system-package\"\nprotocol = \"system-pm\"\nmanager = {manager:?}\n\
-             package = {package:?}\nelevated = {elevated}\nprovides = [{}]\n",
-            p.join(", ")
-        )
-    }
-
-    fn emacs_req() -> InstallRequest<'static> {
-        InstallRequest {
-            channel: "stable",
-            program: "emacs",
-            triple: TRIPLE,
-            installed: None,
-        }
-    }
-
     #[cfg(unix)]
-    fn lay_pm_exe(dir: &Path, name: &str) -> PathBuf {
+    fn lay_exe(dir: &Path, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let p = dir.join(name);
         std::fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
-    }
-
-    /// A `system-pm` member whose `provides` already resolves — a bare name on PATH, or
-    /// an absolute path — is `installed via <manager>: <path>`: no manager is looked up,
-    /// nothing runs, whatever the policy. The manager's NAME is the state's protocol.
-    #[cfg(unix)]
-    #[test]
-    fn a_system_pm_member_is_proven_by_its_provides_before_any_manager_runs() {
-        use crate::elevate::testkit::Recorder;
-        let dir = scratch("syspm-provides");
-        let sys = dir.join("usr-bin");
-        let emacs = lay_pm_exe(&sys, "emacs");
-        let path = std::env::join_paths([sys.clone()]).unwrap();
-        let fake = fixture_pm(&dir, &pm_row("apt", "emacs", &["emacs"], true), None);
-        let lay = layout(&dir);
-        let rec = Rc::new(Recorder::new(vec![]));
-        let report = crate::elevate::with_path_var(Some(&path), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&fake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "apt",
-                path: emacs.clone()
-            })
-        );
-        assert_eq!(
-            report.protocol.as_ref().unwrap().state("emacs"),
-            crate::state::installed_via("apt", &emacs)
-        );
-        assert!(rec.argvs().is_empty(), "nothing ran");
-        assert!(report.shimmed.is_empty() && report.tree_root.is_empty());
-        // An absolute proof, with no PATH at all.
-        let abs = dir.join("opt-emacs");
-        std::fs::write(&abs, "emacs").unwrap();
-        let afake = fixture_pm(
-            &dir,
-            &pm_row(
-                "apt",
-                "emacs",
-                &["/nope/emacs", &abs.to_string_lossy()],
-                true,
-            ),
-            None,
-        );
-        let report = crate::elevate::with_path_var(None, || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&afake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "apt",
-                path: abs
-            })
-        );
-        assert!(rec.argvs().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A `system-pm` member whose manager is not on PATH is `unavailable on <target>:
-    /// <hint>` — the index author's hint first, then which manager is missing; not
-    /// deferred (nothing waits on the door for a manager atpkg never installs), nothing
-    /// run. An unset PATH is the same answer.
-    #[test]
-    fn a_system_pm_member_without_its_manager_is_unavailable_here() {
-        use crate::elevate::testkit::Recorder;
-        let dir = scratch("syspm-no-manager");
-        let empty = std::ffi::OsString::new();
-        let fake = fixture_pm(
-            &dir,
-            &pm_row("apt", "emacs", &["emacs"], true),
-            Some("Emacs is a macOS/Linux member"),
-        );
-        let lay = layout(&dir);
-        let rec = Rc::new(Recorder::new(vec![]));
-        for path in [Some(empty.as_os_str()), None] {
-            let report = crate::elevate::with_path_var(path, || {
-                crate::elevate::with_runner(rec.clone(), || {
-                    install(&fake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-                })
-            });
-            let outcome = report.protocol.clone().unwrap();
-            assert!(outcome.is_unavailable() && !outcome.is_deferred());
-            assert_eq!(outcome.protocol(), "apt");
-            assert_eq!(
-                outcome.state("emacs"),
-                "unavailable on aarch64-apple-darwin: Emacs is a macOS/Linux member; apt is \
-                 not on PATH (the pinned row installs emacs through it, and atpkg never \
-                 installs a package manager)"
-            );
-            assert!(rec.argvs().is_empty(), "nothing ran");
-        }
-        // Without an index hint, the fact alone.
-        let plain = fixture_pm(&dir, &pm_row("apt", "emacs", &["emacs"], true), None);
-        let report = crate::elevate::with_path_var(Some(&empty), || {
-            install(&plain, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-        });
-        assert!(
-            report
-                .protocol
-                .unwrap()
-                .state("emacs")
-                .starts_with("unavailable on aarch64-apple-darwin: apt is not on PATH ("),
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A SYSTEM-WIDE manager on PATH: the unattended pass DEFERS (`needs admin`, nothing
-    /// runs); the terminal door runs EXACTLY `sudo <apt-get> install -y emacs`
-    /// (inherited) and proves the install by the bare name apt laid on PATH; a manager
-    /// that fails is a `Protocol` error naming the manager and the exit.
-    #[cfg(unix)]
-    #[test]
-    fn a_system_wide_manager_defers_unattended_and_installs_under_sudo_at_the_door() {
-        use crate::elevate::testkit::{Recorder, failed, ok};
-        let _restore = Deferred;
-        let dir = scratch("syspm-apt");
-        let sys = dir.join("usr-bin");
-        let apt_get = lay_pm_exe(&sys, "apt-get");
-        let path = std::env::join_paths([sys.clone()]).unwrap();
-        let fake = fixture_pm(&dir, &pm_row("apt", "emacs", &["emacs"], true), None);
-        let lay = layout(&dir);
-        // Deferred: needs admin, nothing runs.
-        let rec = Rc::new(Recorder::new(vec![ok("")]));
-        let report = crate::elevate::with_path_var(Some(&path), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&fake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "apt" })
-        );
-        assert_eq!(
-            report.protocol.as_ref().unwrap().state("emacs"),
-            crate::state::needs_admin("emacs")
-        );
-        assert!(
-            rec.argvs().is_empty(),
-            "the unattended pass runs no manager"
-        );
-        // The door: sudo, exact argv, proven.
-        crate::elevate::set_elevation(crate::elevate::Elevation::Sudo);
-        let mut rec = Recorder::new(vec![ok("")]);
-        let created = sys.clone();
-        rec.on_run = Some(Box::new(move |argv: &[String]| {
-            assert_eq!(argv[0], "/usr/bin/sudo");
-            lay_pm_exe(&created, "emacs");
-        }));
-        let rec = Rc::new(rec);
-        let report = crate::elevate::with_path_var(Some(&path), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&fake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "apt",
-                path: sys.join("emacs")
-            })
-        );
-        assert_eq!(
-            rec.calls.borrow()[..],
-            [(
-                vec![
-                    "/usr/bin/sudo".to_string(),
-                    apt_get.to_string_lossy().into_owned(),
-                    "install".to_string(),
-                    "-y".to_string(),
-                    "emacs".to_string(),
-                ],
-                crate::elevate::Io::Inherit
-            )]
-        );
-        assert!(!lay.staging_dir("emacs").exists(), "no byte of ours moved");
-        // The manager failing.
-        let _ = std::fs::remove_file(sys.join("emacs"));
-        let rec = Rc::new(Recorder::new(vec![failed(
-            100,
-            "E: Unable to locate package",
-        )]));
-        let err = crate::elevate::with_path_var(Some(&path), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&fake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap_err()
-            })
-        });
-        match &err {
-            FlowError::Protocol {
-                protocol: "apt",
-                why,
-            } => assert!(
-                why.starts_with("apt install emacs failed (exit 100)"),
-                "{why}"
-            ),
-            other => panic!("expected an apt failure, got {other:?}"),
-        }
-        assert!(
-            err.to_string().starts_with("apt: apt install emacs failed"),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A USER-SCOPED manager (brew) runs UNATTENDED and UNWRAPPED: a row that declares
-    /// no elevation needs no one's password, so the default (Deferred) policy runs it as
-    /// the user; a winget row that declares `elevated = true` (a machine-scoped
-    /// installer) defers unattended and, at the door, runs unwrapped with
-    /// `--scope machine`.
-    #[cfg(unix)]
-    #[test]
-    fn a_user_scoped_manager_runs_unattended_and_unwrapped() {
-        use crate::elevate::testkit::{Recorder, ok};
-        let _restore = Deferred;
-        let dir = scratch("syspm-brew");
-        let bin = dir.join("opt-homebrew-bin");
-        let brew = lay_pm_exe(&bin, "brew");
-        let path = std::env::join_paths([bin.clone()]).unwrap();
-        let fake = fixture_pm(&dir, &pm_row("brew", "emacs", &["emacs"], false), None);
-        let lay = layout(&dir);
-        let mut rec = Recorder::new(vec![ok("")]);
-        let created = bin.clone();
-        rec.on_run = Some(Box::new(move |_argv: &[String]| {
-            lay_pm_exe(&created, "emacs");
-        }));
-        let rec = Rc::new(rec);
-        assert_eq!(
-            crate::elevate::elevation(),
-            crate::elevate::Elevation::Deferred
-        );
-        let report = crate::elevate::with_path_var(Some(&path), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&fake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "brew",
-                path: bin.join("emacs")
-            })
-        );
-        assert_eq!(
-            rec.argvs(),
-            vec![vec![
-                brew.to_string_lossy().into_owned(),
-                "install".to_string(),
-                "emacs".to_string()
-            ]],
-            "brew runs as the user, unattended, never under sudo"
-        );
-        // winget, elevated: deferred unattended; at the door, unwrapped, machine scope.
-        let _ = std::fs::remove_file(bin.join("emacs"));
-        let winget = lay_pm_exe(&bin, "winget");
-        let wfake = fixture_pm(&dir, &pm_row("winget", "GNU.Emacs", &["emacs"], true), None);
-        let rec = Rc::new(Recorder::new(vec![ok("")]));
-        let report = crate::elevate::with_path_var(Some(&path), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&wfake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::NeedsAdmin { protocol: "winget" })
-        );
-        assert!(rec.argvs().is_empty());
-        crate::elevate::set_elevation(crate::elevate::Elevation::Sudo);
-        let mut rec = Recorder::new(vec![ok("")]);
-        let created = bin.clone();
-        rec.on_run = Some(Box::new(move |_argv: &[String]| {
-            lay_pm_exe(&created, "emacs");
-        }));
-        let rec = Rc::new(rec);
-        let report = crate::elevate::with_path_var(Some(&path), || {
-            crate::elevate::with_runner(rec.clone(), || {
-                install(&wfake, &lay, &anchor(), &emacs_req(), fl(0), 0).unwrap()
-            })
-        });
-        assert_eq!(
-            report.protocol,
-            Some(ProtocolOutcome::Installed {
-                protocol: "winget",
-                path: bin.join("emacs")
-            })
-        );
-        let argvs = rec.argvs();
-        assert_eq!(argvs.len(), 1);
-        assert_eq!(argvs[0][0], winget.to_string_lossy(), "unwrapped: no sudo");
-        assert_eq!(
-            &argvs[0][1..],
-            &[
-                "install",
-                "--exact",
-                "--id",
-                "GNU.Emacs",
-                "--accept-package-agreements",
-                "--accept-source-agreements",
-                "--scope",
-                "machine"
-            ]
-            .map(String::from)[..]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A requirement that is UNAVAILABLE here (a `system-pm` dependency whose manager is
-    /// absent) stops an OS-installed parent with the reason — it neither waits on the
-    /// door (nothing there would install the manager) nor reaches the parent's lane.
-    #[test]
-    fn an_unavailable_requirement_stops_an_os_installed_parent() {
-        let dir = scratch("pkg-requires-unavailable");
-        let fake = fixture_pkg(
-            &dir,
-            &[String::from("/nope/brew")],
-            None,
-            Some(&pm_row("apt", "clt-tools", &["/nope/git"], true)),
-        );
-        let lay = layout(&dir);
-        let empty = std::ffi::OsString::new();
-        let err = crate::elevate::with_path_var(Some(&empty), || {
-            install(&fake, &lay, &anchor(), &brew_req(), fl(0), 0).unwrap_err()
-        });
-        match &err {
-            FlowError::Requirement { dep, why } => {
-                assert_eq!(dep, "clt");
-                assert!(
-                    why.starts_with("unavailable on aarch64-apple-darwin: apt is not on PATH"),
-                    "{why}"
-                );
-            }
-            other => panic!("expected Requirement, got {other:?}"),
-        }
-        assert!(
-            fake.seen.borrow().is_empty(),
-            "brew's own lane never started"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A `pkg` row's local staging name: its `asset` when it names one, else the URL's
-    /// last path component, else `<program>.pkg` — never a path.
-    #[test]
-    fn a_pkg_row_gets_a_local_staging_name() {
-        let mut a = crate::vendor::testkit::pkg_row();
-        a.asset = String::new();
-        a.url = BREW_URL.into();
-        assert_eq!(local_asset_name("brew", &a), "Homebrew.pkg");
-        a.url =
-            "https://github.com/Homebrew/brew/releases/download/6.0.20/Homebrew.pkg?x=1#f".into();
-        assert_eq!(local_asset_name("brew", &a), "Homebrew.pkg");
-        a.url = "https://github.com/".into();
-        assert_eq!(local_asset_name("brew", &a), "brew.pkg");
-        a.asset = "Homebrew-6.0.20.pkg".into();
-        assert_eq!(local_asset_name("brew", &a), "Homebrew-6.0.20.pkg");
-        let https = crate::vendor::testkit::row();
-        assert_eq!(local_asset_name("claude", &https), https.asset);
     }
 
     #[test]
@@ -9429,17 +7726,6 @@ mod tests {
         ay_requires: &[&str],
         ny_requires: &[&str],
     ) -> Fake {
-        requires_fixture_with(dir, yanked, ay_requires, ny_requires, false)
-    }
-
-    /// [`requires_fixture`] with `ny` optionally an EXTRA (`extra = true` in the index).
-    fn requires_fixture_with(
-        dir: &Path,
-        yanked: &[&str],
-        ay_requires: &[&str],
-        ny_requires: &[&str],
-        ny_extra: bool,
-    ) -> Fake {
         fn req_line(reqs: &[&str]) -> String {
             if reqs.is_empty() {
                 String::new()
@@ -9483,11 +7769,10 @@ mod tests {
         };
         let index_body = format!(
             "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
-                          [programs.ay]\nrepo = \"ay\"\n[programs.ny]\nrepo = \"ny\"\n{extra}\
+                          [programs.ay]\nrepo = \"ay\"\n[programs.ny]\nrepo = \"ny\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
              {yanked_toml}pin = {{ ay = 18, ny = 9 }}\n",
-            attr = attribution(),
-            extra = if ny_extra { "extra = true\n" } else { "" }
+            attr = attribution()
         );
         Fake {
             index: index_body.clone().into_bytes(),
@@ -9497,19 +7782,14 @@ mod tests {
         }
     }
 
-    /// THE UPDATE LANE IS GATED TOO (§17.10): `ay` requires `ny`; ay is installed at an
-    /// old build and ny is not installed at all (uninstalled, or never there). The pass
-    /// holds ay on its current build — `TxnOutcome::Blocked` naming ny and quoting its
-    /// state — and resolves nothing for it: no artifact selected, no byte staged. Once ny
-    /// is live, the same pass shape moves ay to its pin. The update lane never installs a
-    /// MISSING dependency itself (that is the set-completion pass's job), so ny's own
-    /// group is simply not an update.
+    /// THE RETIRED `requires` (§5.3(b)) is refused on BOTH lanes: `ay`'s signed index row
+    /// names it, so `install` refuses ay before any manifest is fetched, and the update
+    /// lane aborts ay's group with the same sentence — held on its current build, nothing
+    /// resolved or staged — even though what it names (`ny`) is live. `ny`, which names
+    /// nothing, installs as ever; and an up-to-date group has nothing to refuse.
     #[test]
-    fn apply_channel_holds_an_installed_dependent_whose_requirement_is_unmet() {
-        let dir = scratch("update-gate");
-        // The edge rides the INDEX (`[programs.ay].requires`) — the relation the plan
-        // and the gate read, known before any manifest is fetched — not the pkg
-        // manifest's own `requires`, which `install` unions in at install time.
+    fn a_program_naming_the_retired_requires_is_refused_on_both_lanes() {
+        let dir = scratch("requires-retired");
         let fake = requires_fixture(&dir, &[], &[], &[]);
         let index_body = String::from_utf8(fake.index.clone()).unwrap().replace(
             "[programs.ay]\nrepo = \"ay\"\n",
@@ -9523,39 +7803,56 @@ mod tests {
             archives: fake.archives,
         };
         let layout = layout(&dir);
-        seed_build(&layout, "ay", 17, true);
-        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
-        let report = apply_channel(
-            &fake,
-            &layout,
-            &anchor(),
-            "stable",
-            TRIPLE,
-            &installed,
-            &[],
-            fl(0),
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            report.groups.len(),
-            1,
-            "ny is not installed, so it is not an update: {:?}",
-            report.groups
+        let req = |program| InstallRequest {
+            channel: "stable",
+            program,
+            triple: TRIPLE,
+            installed: None,
+        };
+        let err = install(&fake, &layout, &anchor(), &req("ay"), fl(0), 0).unwrap_err();
+        assert!(
+            matches!(&err, FlowError::RequiresRetired(p) if p == "ay"),
+            "{err:?}"
         );
-        let (group, outcome) = &report.groups[0];
-        assert_eq!(group.members, vec!["ay".to_string()]);
+        assert!(err.to_string().contains("names `requires`"), "{err}");
+        assert!(
+            !layout.staging_dir("ay").exists(),
+            "refused before any byte moved"
+        );
+        install(&fake, &layout, &anchor(), &req("ny"), fl(0), 0).expect("ny names nothing");
+        // The update lane: ay installed at 17, ny live.
+        seed_build(&layout, "ay", 17, true);
+        let run = |installed: &BTreeMap<String, u64>| {
+            apply_channel(
+                &fake,
+                &layout,
+                &anchor(),
+                "stable",
+                TRIPLE,
+                installed,
+                &[],
+                fl(0),
+                0,
+            )
+            .unwrap()
+        };
+        let report = run(&crate::ops::active_builds(&layout));
+        let ay = report
+            .groups
+            .iter()
+            .find(|(g, _)| g.members == vec!["ay".to_string()])
+            .expect("ay's group");
         assert_eq!(
-            *outcome,
-            TxnOutcome::Blocked {
-                dep: "ny".into(),
-                dep_state: "not installed".into()
+            ay.1,
+            TxnOutcome::Aborted {
+                failed: "ay".into(),
+                during_flip: false,
+                why: FlowError::RequiresRetired("ay".into()).to_string(),
             }
         );
-        assert!(report.applied.is_empty(), "nothing flipped");
         assert!(
             !report.resolved_assets.contains_key("ay"),
-            "nothing resolved for a held group"
+            "nothing resolved for a refused group"
         );
         assert!(!layout.build_dir("ay", 18).exists(), "nothing staged");
         assert_eq!(
@@ -9563,30 +7860,16 @@ mod tests {
             Some(17),
             "held on its current build"
         );
-        // The requirement met: the dependent moves.
-        seed_build(&layout, "ny", 9, true);
-        let installed = crate::ops::active_builds(&layout);
-        let report = apply_channel(
-            &fake,
-            &layout,
-            &anchor(),
-            "stable",
-            TRIPLE,
-            &installed,
-            &[],
-            fl(0),
-            0,
-        )
-        .unwrap();
-        let ay = report
-            .groups
-            .iter()
-            .find(|(g, _)| g.members == vec!["ay".to_string()])
-            .expect("ay's group");
-        assert_eq!(ay.1, TxnOutcome::Applied(vec!["ay".into()]));
-        assert_eq!(
-            crate::ops::active_builds(&layout).get("ay").copied(),
-            Some(18)
+        // At its pin already: nothing to install out of order, nothing refused.
+        seed_build(&layout, "ay", 18, true);
+        let report = run(&crate::ops::active_builds(&layout));
+        assert!(
+            report
+                .groups
+                .iter()
+                .all(|(_, o)| !matches!(o, TxnOutcome::Aborted { .. })),
+            "{:?}",
+            report.groups
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9618,76 +7901,15 @@ mod tests {
             crate::ops::which(&layout, "ny").is_some(),
             "the dep is live too"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A dependency that is an EXTRA is never opted in on the dependent's behalf: without
-    /// this machine's opt-in marker it is Skipped with the consent spelling and no byte
-    /// of it moves; with the marker it is pulled in like any dependency.
-    #[test]
-    fn requires_never_opts_in_to_an_extra_on_the_dependents_behalf() {
-        let dir = scratch("req-extra");
-        let fake = requires_fixture_with(&dir, &[], &["ny"], &[], true);
-        let layout = layout(&dir);
-        let req = InstallRequest {
-            channel: "stable",
-            program: "ay",
-            triple: TRIPLE,
-            installed: None,
-        };
-        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
-        assert!(
-            crate::ops::which(&layout, "ay").is_some(),
-            "ay still installs"
-        );
-        let ny = report
-            .dependencies
-            .iter()
-            .find(|d| d.program == "ny")
-            .expect("ny is named");
-        assert!(
-            matches!(&ny.result, DepResult::Skipped(why) if why == &crate::state::extra_not_installed("ny")),
-            "{:?}",
-            ny.result
-        );
-        assert!(crate::ops::which(&layout, "ny").is_none());
-        assert!(
-            !layout.staging_dir("ny").exists() && !layout.build_dir("ny", 9).exists(),
-            "no byte of the extra moved"
-        );
-        assert!(!layout.optin_exists("ny"), "nothing opted in for the user");
-        // Opted in by the user: an ordinary dependency.
-        layout.record_optin("ny").unwrap();
-        let again = InstallRequest {
-            channel: "stable",
-            program: "ay",
-            triple: TRIPLE,
-            installed: None,
-        };
-        let report = install(&fake, &layout, &anchor(), &again, fl(0), 0).unwrap();
-        assert!(
-            report
-                .dependencies
-                .iter()
-                .any(|d| d.program == "ny"
-                    && matches!(d.result, DepResult::Installed { build: 9, .. })),
-            "{:?}",
-            report.dependencies
-        );
-        assert!(crate::ops::which(&layout, "ny").is_some());
-        // The alias policy through the REAL pipeline (§17.11): ay is ALab's own (no
-        // `system`, not an extra) and gets `alab-ay` beside `ay`; ny is a vendor EXTRA
-        // and never gets one — even though it is installed through the same lane.
-        assert!(
-            crate::ops::which(&layout, "alab-ay")
-                .is_some_and(|t| t.starts_with(layout.build_dir("ay", 18))),
-            "an ALab program's alias is laid by the install"
-        );
-        assert!(
-            std::fs::symlink_metadata(layout.shim(&tool("alab-ny"))).is_err(),
-            "no alias for a vendor extra"
-        );
-        assert_eq!(Aliases::laid_for(&layout, "ny"), Aliases::Off);
+        // The alias policy through the REAL pipeline (§17.11): ALab's own programs (no
+        // `system`) get `alab-<tool>` beside `<tool>`, a pulled-in dependency included.
+        for program in ["ay", "ny"] {
+            let alias = format!("alab-{program}");
+            assert!(
+                crate::ops::which(&layout, &alias).is_some(),
+                "{alias} is laid by the install"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10019,7 +8241,7 @@ mod tests {
     }
 
     /// A RATE-LIMITED listing is a transport failure like any other: the same-source
-    /// identity cache stands in for it, and without a cache the verdict is
+    /// cache stands in for it, and without a cache the verdict is
     /// `Unreachable` naming the rate limit — never `NoIndex`, never a signature failure.
     /// This is the outcome a drained IP at GUI launch reaches, and the cache is what
     /// keeps the toolchain usable through it.
@@ -10092,232 +8314,6 @@ mod tests {
         assert!(matches!(err, FlowError::NoIndex), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
-    }
-
-    /// A [`Fake`] that COUNTS index fetches and answers the cheap identity probe from a
-    /// cell, so a test can move one asset's fingerprint and watch the resolve react.
-    struct IdentityFake {
-        inner: Fake,
-        fetches: std::cell::Cell<u32>,
-        identity: std::cell::RefCell<Vec<String>>,
-    }
-    impl IdentityFake {
-        fn new(inner: Fake, identity: &[&str]) -> Self {
-            Self {
-                inner,
-                fetches: std::cell::Cell::new(0),
-                identity: std::cell::RefCell::new(
-                    identity.iter().map(|s| (*s).to_string()).collect(),
-                ),
-            }
-        }
-    }
-    impl Fetcher for IdentityFake {
-        fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
-            self.fetches.set(self.fetches.get().saturating_add(1));
-            self.inner.index_candidates()
-        }
-        fn pkg_manifest(
-            &self,
-            repo: &str,
-            program: &str,
-            build: u64,
-        ) -> Result<(Vec<u8>, Vec<u8>), String> {
-            self.inner.pkg_manifest(repo, program, build)
-        }
-        fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
-            self.inner.download(repo, asset, dest)
-        }
-        fn source_id(&self) -> String {
-            "src:identity".to_string()
-        }
-        fn index_identities(&self) -> Option<Vec<String>> {
-            Some(self.identity.borrow().clone())
-        }
-    }
-
-    /// THE HIT PATH, end to end and two-sided. A resolve whose cheap identity probe
-    /// matches the §14 cache must do NO index fetch at all and must hand selection
-    /// byte-identical candidates; the moment an identity moves — a re-uploaded asset, a
-    /// new carrying release — the fetch comes straight back.
-    ///
-    /// The counter is the instrument. Without it this optimization is unfalsifiable: a
-    /// resolve that quietly re-downloaded everything would still pass every functional
-    /// assertion, which is exactly how a "cache" ends up never being a hit path (the
-    /// state this crate was in — `resolve_candidates` consulted the cache only when the
-    /// fetch had already failed).
-    #[test]
-    fn a_matching_identity_serves_the_cache_with_no_index_fetch() {
-        let dir = scratch("identity-hit");
-        let layout = layout(&dir);
-        let f = IdentityFake::new(fixture(&dir), &["id-v0"]);
-        let req = InstallRequest {
-            channel: "stable",
-            program: "ay",
-            triple: TRIPLE,
-            installed: None,
-        };
-        // 1. COLD. The install fetches for real and caches the candidates WITH their
-        //    identity.
-        install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
-        let cold = f.fetches.get();
-        assert!(cold >= 1, "the cold pass must actually fetch — got {cold}");
-
-        // 2. WARM, same identity: zero fetches, and the SAME bytes reach selection.
-        let got = resolve_candidates(&f, &layout).expect("the warm cache resolves");
-        assert_eq!(
-            f.fetches.get(),
-            cold,
-            "a matching identity must skip index_candidates entirely"
-        );
-        let fresh = f.inner.index_candidates().expect("fixture candidates");
-        assert_eq!(got.len(), fresh.len(), "same candidate set");
-        assert_eq!(got[0].label, fresh[0].label);
-        assert_eq!(
-            got[0].index_bytes, fresh[0].index_bytes,
-            "the cache serves the very bytes the source publishes"
-        );
-        assert_eq!(got[0].sig, fresh[0].sig);
-        assert_eq!(
-            got[0].roster_bytes, fresh[0].roster_bytes,
-            "the roster rides with its index through the hit path too"
-        );
-        assert_eq!(got[0].roster_sig, fresh[0].roster_sig);
-
-        // 3. THE OTHER SIDE. Move the identity (an asset re-uploaded, a release cut) and
-        //    the resolve must go back to the network — otherwise this seam would be a
-        //    permanent downgrade oracle rather than a cache.
-        f.identity.borrow_mut()[0] = "id-v1".to_string();
-        let after_move = f.fetches.get();
-        resolve_candidates(&f, &layout).expect("a moved identity re-fetches");
-        assert_eq!(
-            f.fetches.get(),
-            after_move + 1,
-            "a changed identity must re-download"
-        );
-
-        // 4. And a COUNT change (a newly published carrying release) refuses too.
-        f.identity.borrow_mut().push("id-extra".to_string());
-        let before_grow = f.fetches.get();
-        resolve_candidates(&f, &layout).expect("a grown candidate set re-fetches");
-        assert_eq!(
-            f.fetches.get(),
-            before_grow + 1,
-            "a different candidate COUNT must re-download"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A fetcher that answers the identity probe still has NOTHING to serve without a
-    /// same-source cache: the probe is a permission to reuse, never a source of bytes.
-    #[test]
-    fn an_identity_without_a_cache_still_fetches() {
-        let dir = scratch("identity-cold");
-        let layout = layout(&dir);
-        let f = IdentityFake::new(fixture(&dir), &["id-v0"]);
-        let got = resolve_candidates(&f, &layout).expect("cold resolve");
-        assert_eq!(f.fetches.get(), 1, "no cache ⇒ the fetch must happen");
-        assert_eq!(got.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// THE SAME HIT PATH, on the lanes a TYPED single-program verb takes. `plan_update`,
-    /// `apply_program` and `rollback` resolve their candidates without the §14 failure-time
-    /// fallback — deliberately — but that rule is about FAILURES, and it also cost them the
-    /// identity hit for as long as the hit path existed: every `aterm pkg update <program>`
-    /// in a fresh process re-downloaded the whole candidate set (sixteen assets on the
-    /// production fetcher) to obtain bytes the last pass had already stamped as identical.
-    ///
-    /// The counter is again the instrument, and the test is two-sided: a matching identity
-    /// must cost NO index fetch on any of the three, and a moved identity must bring the
-    /// fetch straight back — a lane that went on serving a cache the source had moved past
-    /// would be the defect in the other direction.
-    #[test]
-    fn the_typed_single_program_lanes_take_the_hit_path_too() {
-        let dir = scratch("identity-lanes");
-        let layout = layout(&dir);
-        let f = IdentityFake::new(fixture(&dir), &["id-v0"]);
-        let req = InstallRequest {
-            channel: "stable",
-            program: "ay",
-            triple: TRIPLE,
-            installed: None,
-        };
-        // COLD: the install fetches for real and stamps the cache with its identity.
-        install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
-        let installed = crate::ops::active_builds(&layout);
-        assert_eq!(installed.get("ay").copied(), Some(18), "ay@18 is active");
-        let warm = f.fetches.get();
-
-        // 1. `plan_update` — the first thing a typed `aterm pkg update <program>` calls.
-        let plan = plan_update(
-            &f,
-            &layout,
-            &anchor(),
-            "stable",
-            TRIPLE,
-            "ay",
-            Some(18),
-            fl(0),
-            0,
-        )
-        .expect("the warm cache plans");
-        assert_eq!(plan.decision, ApplyDecision::UpToDate);
-        assert_eq!(
-            f.fetches.get(),
-            warm,
-            "plan_update must serve a matching identity from the cache"
-        );
-
-        // 2. `apply_program` — the transactional lane, on the same fetcher.
-        apply_program(
-            &f,
-            &layout,
-            &anchor(),
-            "stable",
-            TRIPLE,
-            "ay",
-            &installed,
-            &[],
-            fl(0),
-            0,
-        )
-        .expect("the warm cache applies");
-        assert_eq!(
-            f.fetches.get(),
-            warm,
-            "apply_program must serve a matching identity from the cache"
-        );
-
-        // 3. `rollback` — it errors (nothing retained below 18), but only AFTER the resolve
-        //    this test is about.
-        let err = rollback(&f, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap_err();
-        assert!(matches!(err, FlowError::Rollback(_)), "got {err:?}");
-        assert_eq!(
-            f.fetches.get(),
-            warm,
-            "rollback must serve a matching identity from the cache"
-        );
-
-        // THE OTHER SIDE: move the identity and every lane goes back to the source.
-        f.identity.borrow_mut()[0] = "id-v1".to_string();
-        let moved = f.fetches.get();
-        plan_update(
-            &f,
-            &layout,
-            &anchor(),
-            "stable",
-            TRIPLE,
-            "ay",
-            Some(18),
-            fl(0),
-            0,
-        )
-        .expect("a moved identity re-fetches");
-        assert_eq!(f.fetches.get(), moved + 1, "plan_update re-downloads");
-        let _ = rollback(&f, &layout, &anchor(), "stable", "ay", fl(0), 0);
-        assert_eq!(f.fetches.get(), moved + 2, "rollback re-downloads");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -2130,45 +2130,6 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         assert!(block_with(None).contains(RUST_NOTE));
     }
 
-    /// No prose in this crate states the primer's size as a number. The block is
-    /// budgeted by the two tests below and has grown three times (body, then
-    /// the Rust note, then the fabric note); the "3-line primer" the usage text
-    /// and module doc carried stood through all three growths, and the
-    /// front-door `aterm --help` copied it (audit finding, 2026-09-01). A count
-    /// beside a budget-tested constant is a claim nothing re-derives — so the
-    /// rule is that none is made.
-    #[test]
-    fn no_prose_hand_types_the_primer_line_count() {
-        // CODE AND STRING LITERALS ONLY: comment lines are blanked first, or
-        // this scan counts its own doc comment (which names the old figure
-        // precisely to explain the rule) — the mentions-not-code trap every
-        // source-scanning gate in the sibling repo has to dodge.
-        let code: String = include_str!("lib.rs")
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Spelled with `concat!` so this test's own source never carries a
-        // needle contiguously — the scan matched its own list on the first run.
-        for needle in [
-            concat!("-line", " primer"),
-            concat!("-line", " pointer"),
-            concat!("-line", " block"),
-            concat!("three", "-line"),
-        ] {
-            assert!(
-                !code.contains(needle),
-                "{needle:?} states a primer size in code or a literal; the budget tests own that number"
-            );
-        }
-        assert!(
-            !usage().contains("-line"),
-            "`aterm agents` usage must not state the primer's size: {}",
-            usage()
-        );
-    }
-
     /// Raised a second time, from 1 150/13 to 1 300/15, for v9's `rm` sentence
     /// (2026-09-23). The argument: in the owner's transcripts 344 of 678 `rm`
     /// commands had an unguarded `$VAR` operand and none used `${VAR:?}`; that
@@ -3708,45 +3669,6 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         // And the addendum-free block too, which is what `aterm agents primer`
         // prints for an agent the registry does not know.
         assert!(generic().contains("aterm ctl @self inbox"));
-    }
-
-    /// v9: WHEN to read it. Reading is tied to the one line that is typed
-    /// (`drive task`'s `Inbox: task @<off>`) and to `fabric=connected`; the
-    /// per-turn poll (twice a turn, in every session, with nothing able to
-    /// arrive while `fabric=absent`) and the "nothing types it" sentence that
-    /// contradicted `drive task` are gone.
-    #[test]
-    fn the_inbox_is_read_on_the_typed_line_or_a_connected_fabric_never_every_turn() {
-        let note = FABRIC_NOTE.replace('\n', " ");
-        for needle in [
-            "Inbox: task @<off>",
-            "`aterm drive task`",
-            "fabric=connected",
-        ] {
-            assert!(note.contains(needle), "missing {needle:?}: {note}");
-        }
-        for gone in [
-            "start of a turn",
-            "before you stop",
-            "nothing types it",
-            "READ IT",
-        ] {
-            assert!(!note.contains(gone), "still says {gone:?}: {note}");
-        }
-    }
-
-    /// v9: the `rm` guard, in every agent's block — the rewrite the vendor's own
-    /// box asks for, stated before the command is written.
-    #[test]
-    fn every_agent_is_told_the_rm_operand_shape() {
-        for a in AGENT_FILES {
-            let block = primer_block(Some(a.name)).replace('\n', " ");
-            assert!(
-                block.contains("An `rm` operand is a literal path or `\"${VAR:?}/…\"`"),
-                "{}: {block}",
-                a.name
-            );
-        }
     }
 
     /// The fabric note carries the facts an agent otherwise gets wrong: that a

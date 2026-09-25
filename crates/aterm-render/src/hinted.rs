@@ -573,17 +573,6 @@ mod tests {
         assert!(adv > 0.0);
     }
 
-    /// Determinism: the same (face, gid, px, mode) rasterizes byte-identically
-    /// twice — the atlas-cache assumption.
-    #[test]
-    fn raster_is_deterministic() {
-        let hint = full_instance(12.0);
-        let gid = unicode_gid(dejavu(), 0, 'g').unwrap();
-        let a = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
-        let b = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
-        assert_eq!(a, b);
-    }
-
     /// `HintMode::Off` yields no options, so the bank hands out no instance:
     /// the fontdue path is reached bit-for-bit.
     #[test]

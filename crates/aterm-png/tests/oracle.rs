@@ -279,39 +279,6 @@ fn corpus_under(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// The walk stays out of the gate's sibling build dirs (`target-regex/`,
-/// `target-xtask/`, `target-drivers/`, `target-gate/`) and its `.aterm-verify/`
-/// state dir at the repository root — gigabytes of build output — while a
-/// `target-*` name deeper in the tree is still walked.
-#[test]
-fn the_corpus_walk_skips_root_lane_dirs_and_verify_state() {
-    let root = std::env::temp_dir().join(format!("aterm-png-corpus-skip-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    for rel in [
-        "target-regex/debug/build/x/out/golden.png",
-        "target-xtask/frame.png",
-        ".aterm-verify/trash/shot.png",
-        "target/debug/y.png",
-        "assets/a.png",
-        "assets/target-input/c.png",
-    ] {
-        let path = root.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"not decoded by this test").unwrap();
-    }
-    let found: Vec<String> = corpus_under(&root)
-        .iter()
-        .map(|p| {
-            p.strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
-    std::fs::remove_dir_all(&root).unwrap();
-    assert_eq!(found, ["assets/a.png", "assets/target-input/c.png"]);
-}
-
 /// Every `.png` this checkout holds, under BOTH transform settings.
 ///
 /// The corpus is the strongest available evidence about real inputs: golden

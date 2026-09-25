@@ -14,7 +14,7 @@
 //!   log on restart), and the 4097th key evicts the oldest.
 //! * A `dl=` deadline that passes with no answer produces EXACTLY ONE `expired`
 //!   row on the asker's lane, and NONE when an answer arrived first — the
-//!   asker's own bridge does it, on its tick, because the broker holds no
+//!   asker's own bridge does it at the armed deadline, because the broker holds no
 //!   timers (R8).
 //!
 //! Every wait is `until <observable state>`, bounded by the harness deadline —
@@ -305,8 +305,9 @@ fn a_deadline_that_passes_records_one_expired_and_an_answered_one_records_none()
     assert!(ans.ok(), "answer: {}", ans.header());
 
     // The asker's bridge records `expired re=<ask_off>` on the asker's own lane.
-    // A bridge tick (DEADLINE_TICK 250 ms) plus the machine, so the periodic
-    // budget rather than the event-driven one.
+    // The bridge arms this ask's due time, then checks the bus before recording
+    // expiry. The bound includes that check and the machine, not a free-running
+    // quarter-second timer.
     let expired = until_within(
         PERIODIC_DEADLINE,
         "the asker's bridge to record expired",

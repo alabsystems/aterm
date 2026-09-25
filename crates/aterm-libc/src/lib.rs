@@ -76,11 +76,13 @@
 //! * **`vm_statistics64` is upstream's Mach rev1, not the SDK's rev3.** 24
 //!   fields and 152 bytes here against the SDK's 36 and 248. The divergence is
 //!   INHERITED -- this crate matches the `libc` it replaces byte-for-byte -- and
-//!   it is kept on purpose: nothing in aterm's graph calls `host_statistics64`,
-//!   so nothing can observe it, and for a drop-in replacement differing from the
-//!   crate replaced is the worse property. The reasoning, the evidence and what
-//!   to do if a caller ever appears are on the struct itself in the Darwin cell
-//!   modules (and in `libc-oracle/gen/emit.py`, which is what puts them there).
+//!   it is kept on purpose: the one caller (`aterm-sysprobe`, 2026-09-24) passes
+//!   upstream's `HOST_VM_INFO64_COUNT` — this layout's 38 words — so the kernel
+//!   writes the rev1 prefix only, and for a drop-in replacement differing from
+//!   the crate replaced is the worse property. The reasoning, the evidence and
+//!   what to do if a caller needs a rev2/rev3 counter are on the struct itself in
+//!   the Darwin cell modules (and in `libc-oracle/gen/emit.py`, which is what
+//!   puts them there).
 //! * The feature table is upstream's, and `std`, `align`, `const-extern-fn`,
 //!   `use_std` and `rustc-dep-of-std` are accepted and ignored: nothing in
 //!   aterm's graph varies on them (`cargo tree -e features -i libc` resolves to
@@ -132,8 +134,8 @@ pub use crate::linux_gnu_aarch64::*;
 // to be said once per architecture, and for one release it was said only for
 // `x86_64`. `aarch64-pc-windows-msvc` is one of the six triples
 // `atpkg::manifest::TARGETS` publishes rows for, one of the six arms of
-// `atpkg`'s `current_triple`, one of the six the vendor lane maps
-// (tools/atpkg-auto-vendor.sh) — and `apps/aterm-win/build.ps1` detects ARM64
+// `atpkg`'s `current_triple`, one of the six the vendor authoring ceremony mapped
+// (deleted 2026-09-24) — and `apps/aterm-win/build.ps1` detects ARM64
 // Windows and picks the `aarch64-pc-windows-` prefix by itself. Every one of
 // those lanes pointed at a triple that stopped HERE, at
 // `error: aterm-libc has no generated ABI cell for this target`, before a line

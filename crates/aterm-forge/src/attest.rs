@@ -48,9 +48,10 @@
 //!   redistributed fork), a row on [`crate::provenance::FIRST_PARTY_VENDORED`]
 //!   (aterm's own code vendored so a clean clone builds, held to being REACHED
 //!   by a member's `path = …` since no patch entry could ever name it), or the
-//!   explicitly reviewed astream direct-path bundle (tracked inventory,
-//!   reviewed byte hashes, supplied license text and actual Cargo metadata
-//!   source paths). The FORK arm is cross-checked against
+//!   astream git SUBMODULE (`.gitmodules` entry, a lone gitlink in the index,
+//!   a clean checkout at exactly the gitlink commit, and Cargo metadata
+//!   resolving its crates from there as non-member path packages — see
+//!   `direct_vendor`). The FORK arm is cross-checked against
 //!   [`aterm_census::scan_set::REVIEWED_VENDORED_CRATES`] in both directions,
 //!   and a review row inside a first-party vendored root is itself a failure —
 //!   plus the partition: every patch path is under `vendor/` or `crates/`, and
@@ -74,18 +75,20 @@
 //!   exist.
 //! * `[OB-9]`  every license arm is on `deny.toml`'s `[licenses] allow` list.
 //! * `[OB-10]` nothing under `vendor/` is swallowed by `.gitignore`, checked
-//!   with the read-only `git check-ignore -v --no-index`.
+//!   with the read-only `git check-ignore -v --no-index`. A submodule's
+//!   working tree is another repository and is not descended into.
 //!
 //! # What this module does NOT do
 //!
 //! `[OB-7]` byte-diffs Apache-only forks against an available pristine copy and
 //! checks modification notices. Without that copy it reports UNVERIFIED. The
-//! astream direct bundle has a separate reviewed inventory, not a crates.io
-//! pristine copy; its pinned hashes establish review consistency, not an
-//! authenticated upstream signature. Nor are they what makes those crates
-//! aterm's own: [`crate::provenance::FIRST_PARTY_VENDORED`] is the reviewed
-//! claim that does that, and it is what keeps the astream crates out of forge's
-//! third-party counts.
+//! astream submodule has no crates.io pristine copy and needs none: its pin is
+//! the gitlink commit, and `[OB-1]` proves the checkout IS that commit, offline
+//! — not that the commit is one astream's `main` reached, which is reviewed in
+//! astream. Nor is the pin what makes those crates aterm's own:
+//! [`crate::provenance::FIRST_PARTY_VENDORED`] is the reviewed claim that does
+//! that, and it is what keeps the astream crates out of forge's third-party
+//! counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -646,17 +649,43 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
     Some(out)
 }
 
-/// Every path under `vendor/`, repo-relative, files and directories alike.
-fn vendor_paths(root: &Path, dir: &Path, out: &mut Vec<String>) {
+/// The gitlinks (mode 160000 entries) the index records under `vendor/`,
+/// repo-relative: the submodules. `None` when git cannot answer.
+fn vendor_gitlinks(root: &Path) -> Option<BTreeSet<String>> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "-s", "-z", "--", "vendor"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(
+        text.split('\0')
+            .filter_map(|entry| {
+                let (meta, path) = entry.split_once('\t')?;
+                meta.starts_with("160000 ").then(|| path.to_string())
+            })
+            .collect(),
+    )
+}
+
+/// Every path under `vendor/`, repo-relative, files and directories alike —
+/// except BENEATH a submodule in `skip`, whose working tree is another
+/// repository's. The submodule's own path is still listed.
+fn vendor_paths(root: &Path, dir: &Path, skip: &BTreeSet<String>, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
-        out.push(rel_display(root, &path));
-        if path.is_dir() && !path.is_symlink() {
-            vendor_paths(root, &path, out);
+        let rel = rel_display(root, &path);
+        let descend = path.is_dir() && !path.is_symlink() && !skip.contains(&rel);
+        out.push(rel);
+        if descend {
+            vendor_paths(root, &path, skip, out);
         }
     }
 }
@@ -751,8 +780,9 @@ pub fn report(root: &Path) -> (bool, String) {
 /// sources. Every vendor directory is claimed by one of THREE shapes — such a
 /// patch, a row on [`crate::provenance::FIRST_PARTY_VENDORED`] that a member
 /// really reaches by `path = …` (on the root that roster describes), or the
-/// separately verified direct-bundle record. Patch forks are cross-checked
-/// against the census registry when this root IS the workspace it describes.
+/// separately verified astream submodule (`direct_vendor`). Patch forks are
+/// cross-checked against the census registry when this root IS the workspace
+/// it describes.
 ///
 /// FIRST-PARTY patch targets are checked here too, against the only two things
 /// that can be wrong about them — the directory must exist and must have
@@ -770,25 +800,34 @@ fn ob1_patch_vendor_agreement(
     log: &mut String,
 ) -> usize {
     let mut fails = 0;
-    let direct_bundle = match crate::direct_vendor::review(root) {
-        Ok(true) => {
+    let submodule = match crate::direct_vendor::review(root) {
+        Ok(Some(pin)) => {
             let _ = writeln!(
                 log,
-                "    [OB-1] vendor/astream is the REVIEWED DIRECT-PATH bundle: tracked inventory \
-                 and byte hashes, supplied Apache-2.0 text, package manifests and Cargo metadata \
-                 source/dependency paths agree. Its inventory pins a reviewed upstream copy, \
-                 not an upstream signature. It does NOT decide provenance: what takes these \
-                 crates out of forge's third-party totals is the reviewed roster \
-                 aterm_forge::provenance::FIRST_PARTY_VENDORED, and this notary infers no \
-                 crates.io patch and no general vendor-directory exemption."
+                "    [OB-1] vendor/astream is the astream SUBMODULE, pinned by this tree's gitlink \
+                 at {} ({}): .gitmodules declares it, the index tracks that one gitlink and \
+                 nothing beneath it, the checkout is initialised at exactly that commit with no \
+                 tracked modification, and cargo resolves astream-aead, astream-broker, \
+                 astream-cap and astream-wire from vendor/astream/crates/<name> as Apache-2.0 \
+                 path packages outside this workspace (the root manifest excludes \
+                 vendor/astream), with aterm-link's broker and cap edges pointing there. The \
+                 gitlink IS the pin: forge compiles in no astream revision and no file digest, \
+                 and a bump is reviewed in astream as the range it moves over. It does NOT \
+                 decide provenance: what takes these crates out of forge's third-party totals \
+                 is the reviewed roster aterm_forge::provenance::FIRST_PARTY_VENDORED, and this \
+                 notary infers no crates.io patch and no general vendor-directory exemption.",
+                pin.commit, pin.url
             );
-            true
+            Some(pin)
         }
-        Ok(false) => false,
+        Ok(None) => None,
         Err(why) => {
-            let _ = writeln!(log, "  ✗ FAIL [OB-1] reviewed direct-path bundle: {why}");
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-1] astream submodule (vendor/astream): {why}"
+            );
             fails += 1;
-            false
+            None
         }
     };
     for fp in first_party {
@@ -865,6 +904,7 @@ fn ob1_patch_vendor_agreement(
     // fixtures build miniature workspaces in a temp directory, and the
     // staleness sweep reported `vendor/astream` MISSING in every one of them.
     let roster_applies = crate::provenance::applies_to(root);
+    let gitlinks = vendor_gitlinks(root).unwrap_or_default();
     if !roster_applies {
         let _ = writeln!(
             log,
@@ -927,40 +967,53 @@ fn ob1_patch_vendor_agreement(
                 fails += 1;
                 continue;
             }
+            // The pin is read from the tree, never from the roster: the row
+            // names the repository, the gitlink names the commit.
+            let pin = submodule
+                .as_ref()
+                .filter(|_| dir == crate::direct_vendor::DIRECTORY)
+                .map(|p| format!(" at {}", p.commit))
+                .unwrap_or_default();
+            let ob10 = if gitlinks.contains(&rel) {
+                "[OB-10] does not descend into it: it is a git submodule, another repository's \
+                 working tree, so nothing beneath it can be tracked here or lost to an ignore \
+                 rule here — the submodule check above holds it to its pinned commit instead."
+            } else {
+                "[OB-10] DOES: unlike a patch target under crates/, this directory is under \
+                 vendor/, and the ignore sweep walks every path there — a rule that swallows \
+                 first-party source loses it just as silently."
+            };
             let _ = writeln!(
                 log,
-                "    [OB-1] `{rel}` is a FIRST-PARTY VENDORED PATH DEPENDENCY (upstream {}), \
+                "    [OB-1] `{rel}` is a FIRST-PARTY VENDORED PATH DEPENDENCY (upstream {}{pin}), \
                  reached by path from: {}. It is not a redistribution, so [OB-3]..[OB-9] — \
                  the [workspace] stub, .cargo_vcs_info.json/Cargo.toml.orig, a retained \
                  upstream LICENSE, a NOTICE row, the Apache §4(b) pristine diff, the \
                  fork-marker census and the SPDX allowlist — do NOT apply to it, for the same \
-                 reason they do not apply to crates/. [OB-10] DOES: unlike a patch target \
-                 under crates/, this directory is under vendor/, and the ignore sweep walks \
-                 every path there — a rule that swallows first-party source loses it just as \
-                 silently. {}",
+                 reason they do not apply to crates/. {ob10} {}",
                 row.upstream,
                 dependants.join(", "),
                 row.why
             );
             continue;
         }
-        // THE REVIEWED DIRECT-PATH BUNDLE is the classification that survives
-        // on a root the roster does NOT describe — attest's own fixtures build
-        // miniature workspaces in a temp directory, where `roster_applies` is
-        // false by construction. On THIS workspace the roster branch above
-        // already took `vendor/astream`; the notary still ran, and its byte
-        // inventory is reported there.
-        if direct_bundle && dir == crate::direct_vendor::DIRECTORY {
+        // THE ASTREAM SUBMODULE is the classification that survives on a root
+        // the roster does NOT describe — attest's own fixtures build miniature
+        // workspaces in a temp directory, where `roster_applies` is false by
+        // construction. On THIS workspace the roster branch above already took
+        // `vendor/astream`; the submodule check still ran, and its pin is
+        // reported there.
+        if submodule.is_some() && dir == crate::direct_vendor::DIRECTORY {
             continue;
         }
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-1] `{rel}` is not named by any [patch.crates-io] entry, is not \
-             on aterm_forge::provenance::FIRST_PARTY_VENDORED, and did not pass the reviewed \
-             direct-path bundle notary — it has no reviewed source classification and is dead \
-             weight that ships in the source distribution. Add the patch entry (a redistributed \
+             on aterm_forge::provenance::FIRST_PARTY_VENDORED, and did not pass the astream \
+             submodule check — it has no reviewed source classification and is dead weight \
+             that ships in the source distribution. Add the patch entry (a redistributed \
              fork), add the roster row (aterm's own code, vendored so a clean clone builds), or \
-             delete the directory. A direct-path bundle must not be given a fictitious \
+             delete the directory. A direct path dependency must not be given a fictitious \
              crates.io patch."
         );
         fails += 1;
@@ -1706,9 +1759,19 @@ fn ob9_spdx_allowlist(root: &Path, forks: &[VendoredFork], log: &mut String) -> 
 }
 
 /// `[OB-10]` Nothing under `vendor/` is swallowed by `.gitignore`.
+///
+/// A SUBMODULE IS NOT SWEPT. Its working tree belongs to another repository:
+/// nothing beneath it can be `git add`ed here, so no ignore rule here can lose
+/// it, and git never applies this repository's rules there in real use (the
+/// submodule reads its own). Only a `check-ignore --no-index` probe from here
+/// does, and it fails on the submodule's own build output — the root `target`
+/// rule matches `vendor/astream/target/` — which is not source this
+/// repository could ever track. `[OB-1]` owns the submodule: its gitlink, and
+/// a checkout at exactly that commit with no tracked modification.
 fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
+    let submodules = vendor_gitlinks(root).unwrap_or_default();
     let mut existing = Vec::new();
-    vendor_paths(root, &root.join("vendor"), &mut existing);
+    vendor_paths(root, &root.join("vendor"), &submodules, &mut existing);
     // Probe the paths a re-vendor WOULD create, too: a rule that swallows a
     // file nobody has written yet is exactly how a fork loses its provenance.
     // Only the artifacts `[OB-4]` REQUIRES are probed — a rule that ignores a
@@ -1771,6 +1834,14 @@ fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usiz
                 future.join(" / ")
             );
         }
+    }
+    for submodule in &submodules {
+        let _ = writeln!(
+            log,
+            "    [OB-10] `{submodule}` is a git submodule (a gitlink in the index): the sweep \
+             probes its path but does not descend into another repository's working tree — \
+             [OB-1] holds that checkout to its pinned commit."
+        );
     }
     if fails == 0 {
         let _ = writeln!(
@@ -2147,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreviewed_vendor_directory_still_fails_the_direct_bundle_notary() {
+    fn an_unreviewed_vendor_directory_still_fails_the_astream_submodule_check() {
         let fixture = good_fixture("unreviewed-bundle");
         std::fs::create_dir_all(fixture.0.join("vendor/another-bus/src")).unwrap();
         let (ok, log) = report(&fixture.0);
@@ -2156,13 +2227,96 @@ mod tests {
             log.contains("vendor/another-bus") && log.contains("no reviewed source classification"),
             "{log}"
         );
-        // Naming a directory astream is insufficient: it needs the pinned
-        // inventory and genuine metadata paths, rather than a name exemption.
+        // Naming a directory astream is insufficient: it must be the declared,
+        // pinned submodule that cargo really resolves, not a name exemption.
+        git(&fixture.0, &["init", "-q"]);
         std::fs::create_dir_all(fixture.0.join("vendor/astream/src")).unwrap();
         let (ok, log) = report(&fixture.0);
         assert!(!ok);
         assert!(
-            log.contains("reviewed direct-path bundle") && log.contains("UPSTREAM.toml"),
+            log.contains("astream submodule (vendor/astream)")
+                && log.contains("`.gitmodules` declares no submodule"),
+            "{log}"
+        );
+    }
+
+    /// Run git in a fixture with a fixed identity, so a commit needs no
+    /// configuration from the machine running the tests, and with no
+    /// inherited repository variables, so it can only touch the fixture.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args([
+                "-c",
+                "user.name=aterm-forge test",
+                "-c",
+                "user.email=forge@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A submodule is another repository: its build output under the root
+    /// `target` rule is not this repository's source, and must not fail
+    /// [OB-10]. The same output in an ordinary vendor directory still does.
+    #[test]
+    fn the_ignore_sweep_does_not_descend_into_a_submodule_working_tree() {
+        let fixture = good_fixture("ob10-submodule");
+        let root = &fixture.0;
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "target\n").unwrap();
+        let sub = root.join("vendor/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q"]);
+        std::fs::write(
+            sub.join("lib.rs"),
+            "// SPDX-License-Identifier: Apache-2.0\n",
+        )
+        .unwrap();
+        git(&sub, &["add", "lib.rs"]);
+        git(&sub, &["commit", "-q", "-m", "one"]);
+        let head = git(&sub, &["rev-parse", "HEAD"]);
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},vendor/sub"),
+            ],
+        );
+        assert_eq!(
+            vendor_gitlinks(root),
+            Some(BTreeSet::from(["vendor/sub".to_string()]))
+        );
+        std::fs::create_dir_all(sub.join("target/debug")).unwrap();
+        std::fs::write(sub.join("target/debug/out"), "").unwrap();
+        let mut log = String::new();
+        assert_eq!(ob10_gitignore(root, &[], &mut log), 0, "{log}");
+        assert!(
+            log.contains("`vendor/sub` is a git submodule") && !log.contains("vendor/sub/"),
+            "{log}"
+        );
+        // Non-vacuity: the sweep is live, and an ordinary vendor directory's
+        // copy of the same output IS reported.
+        std::fs::create_dir_all(root.join("vendor/goodfork/target")).unwrap();
+        std::fs::write(root.join("vendor/goodfork/target/out"), "").unwrap();
+        let mut log = String::new();
+        assert_eq!(ob10_gitignore(root, &[], &mut log), 1, "{log}");
+        assert!(
+            log.contains("vendor/goodfork/target") && !log.contains("vendor/sub/"),
             "{log}"
         );
     }

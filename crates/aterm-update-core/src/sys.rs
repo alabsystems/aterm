@@ -16,8 +16,24 @@ use std::path::Path;
 /// An advisory exclusive lock held for the lifetime of the value. Dropping it (or
 /// the process exiting / `exec`ing) releases the lock — `flock` is associated with
 /// the open file description, so the kernel always cleans up.
+///
+/// Dropping releases it by `LOCK_UN`, not by the close alone (2026-09-24): a child
+/// another thread is mid-spawning holds a copy of every descriptor until it
+/// `exec`s (`FD_CLOEXEC` closes at exec, never at fork — up to ~523 ms under load),
+/// and a lock released only by the close stayed held that long. `LOCK_UN` strips
+/// it from the description, every inherited copy included. An `exec` with the
+/// guard alive still releases it atomically with the image replacement (the file
+/// is close-on-exec), and a failed exec keeps it held for rollback.
 pub struct FileLock {
     _file: File,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Windows' stand-in is an exclusive open, released by the close.
+        #[cfg(unix)]
+        let _ = self._file.unlock();
+    }
 }
 
 /// How often [`FileLock::acquire_within`] re-tests a held lock. Matches the
@@ -65,6 +81,15 @@ impl FileLock {
         // the same blocking semantics, released on close/drop exactly as a direct
         // `libc::flock` call, and failures map to the same `io::Error`. Using the
         // safe std wrapper keeps this crate free of direct FFI here.
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
+
+    /// Take `LOCK_EX` on a file the caller opened its own way (blocking) — the
+    /// roster's read-only claim, which must never create its rendezvous.
+    pub fn lock_open(file: File) -> io::Result<Self> {
+        // Ascription load-bearing — census File evidence, as in `acquire`.
+        let file: std::fs::File = file;
         file.lock()?;
         Ok(Self { _file: file })
     }
@@ -283,6 +308,37 @@ mod tests {
         // Re-acquiring after the previous guard dropped must succeed (no deadlock).
         let l2 = FileLock::acquire(&p).expect("re-acquire after release");
         drop(l2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A DROPPED LOCK IS FREE AT ONCE, even while a copy of its descriptor lives —
+    /// the copy a child another thread is mid-spawning holds until it `exec`s
+    /// (`try_clone` is `dup`, the same open file description). Released by the close
+    /// alone, it stayed held for that window, which `aterm-update`'s dedup-wait test
+    /// had to poll out for up to five seconds.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let p = std::env::temp_dir().join(format!("aterm-lock-dup-{}", std::process::id()));
+        let held = FileLock::acquire(&p).expect("acquire");
+        let childs_copy = held._file.try_clone().expect("dup the lock's descriptor");
+        drop(held);
+        FileLock::acquire_within(&p, std::time::Duration::ZERO)
+            .expect("free the moment its guard drops, whatever else holds the descriptor");
+        drop(childs_copy);
+        // The same for a lock taken on a file the caller opened itself.
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .expect("open")
+        };
+        let held = FileLock::lock_open(open()).expect("lock an open file");
+        let childs_copy = held._file.try_clone().expect("dup");
+        drop(held);
+        FileLock::acquire_within(&p, std::time::Duration::ZERO).expect("free");
+        drop(childs_copy);
         let _ = std::fs::remove_file(&p);
     }
 

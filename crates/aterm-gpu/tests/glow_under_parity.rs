@@ -24,7 +24,8 @@
 //   * char_fg FOLLOWS INTO LINE DECORATIONS on both backends: a charred
 //     underline / undercurl / strike / overline is byte-identical to the same
 //     text recoloured via SGR truecolor fg, WITHIN each backend;
-//   * an emptied pair (`clear_overlays`) restores the bare GPU frame.
+//   * an emptied pair (`clear_overlays`) restores the bare GPU frame (the
+//     glow_under + char_fg row of `tests/empty_channels_gpu.rs`).
 //
 // Gated: no GPU or no font -> the tests no-op (return), like the other parity
 // gates. Byte-exact additive gates additionally skip on downlevel
@@ -425,62 +426,6 @@ fn char_fg_follows_into_line_decorations_on_both_backends() {
     assert!(
         delta <= 8,
         "charred decorated frame CPU/GPU diverge: delta {delta} > 8"
-    );
-}
-
-/// An emptied pair is byte-identical on the GPU: a populated
-/// `glow_under`+`char_fg` frame must paint, and `clear_overlays` must restore
-/// the bare frame — the introspection-capture (`image plain`) contract, GPU
-/// side (also pins that a glow_under-free frame opens NO extra passes: the
-/// fused base pass reproduces the bare bytes).
-#[test]
-fn glow_under_disabled_bytes_identical_on_gpu() {
-    let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (6usize, 20usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l$ embers off");
-    let (cw, ch) = cpu.cell_size();
-
-    let base_input = term.cell_frame(rows, cols);
-    assert!(base_input.glow_under.is_empty() && base_input.char_fg.is_empty());
-    let base = gpu.render_input(&mut win, &base_input, None).pixels;
-
-    let mut cleared = term.cell_frame(rows, cols);
-    cleared.glow_under.push(GlowQuad {
-        row: 0,
-        x: 0,
-        y: 0,
-        w: (10 * cw) as u16,
-        h: ch as u16,
-        color: 0x0060_3010,
-        // ADDITIVE light (see `GlowQuad::alpha`).
-        alpha: 0,
-        color2: 0x0060_3010,
-        alpha2: 0,
-    });
-    cleared.char_fg.push(CharFg {
-        row: 0,
-        col: 2,
-        fg: 0x0010_0804,
-    });
-    let painted = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_ne!(
-        base, painted,
-        "a live glow_under+char_fg frame must paint on the GPU"
-    );
-    cleared.clear_overlays();
-    assert!(
-        cleared.glow_under.is_empty() && cleared.char_fg.is_empty(),
-        "clear_overlays must strip both streams"
-    );
-    let stripped = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_eq!(
-        base, stripped,
-        "clear_overlays must restore the bare GPU frame (both streams ARE bling)"
     );
 }
 

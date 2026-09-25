@@ -9,7 +9,6 @@
 //! translation. This module provides:
 //!
 //! - [`FfiErrorCode`] — trait that unifies error enum sentinel constructors
-//! - `check_null_outputs!` — variadic macro for output pointer validation
 //!
 //! Higher-order combinator functions (`terminal_read_ffi`, `terminal_write_ffi`)
 //! live in `aterm-core::ffi::combinator` since they depend on `AtermTerminal`.
@@ -76,81 +75,6 @@ pub trait FfiErrorCode: Copy {
     fn from_terminal_lock_error(_err: AtermTerminalError) -> Self {
         Self::internal()
     }
-}
-
-/// Validates that all provided output pointers are non-null.
-///
-/// Returns the specified error if any pointer is null. This replaces the
-/// repetitive `if ptr.is_null() { return Err; }` chains found in ~200+
-/// FFI functions.
-///
-/// # Example
-///
-/// ```no_run
-/// use aterm_ffi_types::AtermTerminalError;
-///
-/// unsafe extern "C" fn example(out_x: *mut i32, out_y: *mut i32, out_z: *mut i32) -> AtermTerminalError {
-///     aterm_ffi_types::check_null_outputs!(AtermTerminalError::ErrNullOutput, out_x, out_y, out_z);
-///     AtermTerminalError::Ok
-/// }
-/// ```
-#[macro_export]
-macro_rules! check_null_outputs {
-    ($err:expr_2021, $($ptr:expr_2021),+ $(,)?) => {
-        $(if $ptr.is_null() { return $err; })+
-    };
-}
-
-/// Validates terminal pointer and output pointers with correct null-check ordering.
-///
-/// This macro enforces the invariant that `ErrNullTerminal` takes precedence
-/// over `ErrNullOutput` when both the terminal and output pointers are null.
-/// It also provides defense-in-depth zeroing of output pointers before any
-/// early return.
-///
-/// Sequence:
-/// 1. Zero all non-null output pointers to `Default::default()` (defense-in-depth)
-/// 2. If `term` is null, return `$err_term`
-/// 3. If any output pointer is null, return `$err_output`
-///
-/// # Safety
-///
-/// Output pointers that are non-null must be valid for writes. The caller is
-/// responsible for ensuring this (standard FFI contract).
-///
-/// # Example
-///
-/// ```no_run
-/// use aterm_ffi_types::AtermTerminalError;
-///
-/// unsafe extern "C" fn example(
-///     term: *const (),
-///     out_x: *mut i32,
-///     out_y: *mut i32,
-/// ) -> AtermTerminalError {
-///     aterm_ffi_types::check_null_term_and_outputs!(
-///         AtermTerminalError::ErrNullTerminal,
-///         AtermTerminalError::ErrNullOutput,
-///         term,
-///         out_x, out_y
-///     );
-///     AtermTerminalError::Ok
-/// }
-/// ```
-///
-/// Part of #4770.
-#[macro_export]
-macro_rules! check_null_term_and_outputs {
-    ($err_term:expr_2021, $err_output:expr_2021, $term:expr_2021, $($out:expr_2021),+ $(,)?) => {
-        // Defense-in-depth: zero outputs before any early return, if non-null.
-        // SAFETY: Caller guarantees non-null output pointers are valid for writes
-        // and properly aligned. The is_null() guard skips null pointers.
-        $( if !$out.is_null() { unsafe { *$out = Default::default(); } } )+
-        if $term.is_null() {
-            return $err_term;
-        }
-        $crate::check_null_outputs!($err_output, $($out),+);
-    };
 }
 
 // =============================================================================

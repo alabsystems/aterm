@@ -1103,72 +1103,54 @@ allowed = ["read_file"]
     // --- Percent-decode tests ---
 
     #[test]
-    fn percent_decode_basic() {
-        assert_eq!(percent_decode("localhost"), "localhost");
-        assert_eq!(percent_decode("%6c%6f%63%61%6c%68%6f%73%74"), "localhost");
-        assert_eq!(percent_decode("exam%70le.com"), "example.com");
-    }
-
-    #[test]
-    fn percent_decode_uppercase_hex() {
-        assert_eq!(percent_decode("%4A%4B"), "JK");
-        assert_eq!(percent_decode("%4a%4b"), "JK");
-    }
-
-    #[test]
-    fn percent_decode_passthrough_invalid() {
-        assert_eq!(percent_decode("foo%2"), "foo%2");
-        assert_eq!(percent_decode("foo%zz"), "foo%zz");
-        assert_eq!(percent_decode("foo%"), "foo%");
+    fn percent_decode_cases() {
+        for (input, decoded) in [
+            ("localhost", "localhost"),
+            ("%6c%6f%63%61%6c%68%6f%73%74", "localhost"),
+            ("exam%70le.com", "example.com"),
+            // Upper- and lower-case hex digits both decode.
+            ("%4A%4B", "JK"),
+            ("%4a%4b", "JK"),
+            // A malformed escape passes through untouched.
+            ("foo%2", "foo%2"),
+            ("foo%zz", "foo%zz"),
+            ("foo%", "foo%"),
+        ] {
+            assert_eq!(percent_decode(input), decoded, "{input:?}");
+        }
     }
 
     // --- IP normalization tests ---
 
     #[test]
-    fn normalize_ip_hex_ipv4() {
-        assert_eq!(normalize_ip("0x7f000001"), "127.0.0.1");
-        assert_eq!(normalize_ip("0X7F000001"), "127.0.0.1");
-        assert_eq!(normalize_ip("0x00000000"), "0.0.0.0");
-        assert_eq!(normalize_ip("0xffffffff"), "255.255.255.255");
-    }
-
-    #[test]
-    fn normalize_ip_octal_dotted() {
-        assert_eq!(normalize_ip("0177.0.0.01"), "127.0.0.1");
-        assert_eq!(normalize_ip("0300.0250.0.01"), "192.168.0.1");
-    }
-
-    #[test]
-    fn normalize_ip_hex_dotted() {
-        assert_eq!(normalize_ip("0x7f.0.0.0x01"), "127.0.0.1");
-    }
-
-    #[test]
-    fn normalize_ip_standard_ipv4_passthrough() {
-        assert_eq!(normalize_ip("127.0.0.1"), "127.0.0.1");
-        assert_eq!(normalize_ip("192.168.1.1"), "192.168.1.1");
-    }
-
-    #[test]
-    fn normalize_ip_ipv4_mapped_ipv6() {
-        assert_eq!(normalize_ip("::ffff:127.0.0.1"), "127.0.0.1");
-        assert_eq!(normalize_ip("::ffff:192.168.1.1"), "192.168.1.1");
-        assert_eq!(normalize_ip("::ffff:7f00:1"), "127.0.0.1");
-    }
-
-    #[test]
-    fn normalize_ip_standard_ipv6() {
-        assert_eq!(normalize_ip("::1"), "::1");
-        assert_eq!(
-            normalize_ip("0000:0000:0000:0000:0000:0000:0000:0001"),
-            "::1"
-        );
-    }
-
-    #[test]
-    fn normalize_ip_non_ip_passthrough() {
-        assert_eq!(normalize_ip("localhost"), "localhost");
-        assert_eq!(normalize_ip("example.com"), "example.com");
+    fn normalize_ip_cases() {
+        for (input, normalized) in [
+            // Hex IPv4.
+            ("0x7f000001", "127.0.0.1"),
+            ("0X7F000001", "127.0.0.1"),
+            ("0x00000000", "0.0.0.0"),
+            ("0xffffffff", "255.255.255.255"),
+            // Octal dotted.
+            ("0177.0.0.01", "127.0.0.1"),
+            ("0300.0250.0.01", "192.168.0.1"),
+            // Hex dotted.
+            ("0x7f.0.0.0x01", "127.0.0.1"),
+            // Standard IPv4 passes through.
+            ("127.0.0.1", "127.0.0.1"),
+            ("192.168.1.1", "192.168.1.1"),
+            // IPv4-mapped IPv6 unwraps to IPv4.
+            ("::ffff:127.0.0.1", "127.0.0.1"),
+            ("::ffff:192.168.1.1", "192.168.1.1"),
+            ("::ffff:7f00:1", "127.0.0.1"),
+            // Standard IPv6 compresses.
+            ("::1", "::1"),
+            ("0000:0000:0000:0000:0000:0000:0000:0001", "::1"),
+            // A name is not an IP.
+            ("localhost", "localhost"),
+            ("example.com", "example.com"),
+        ] {
+            assert_eq!(normalize_ip(input), normalized, "{input:?}");
+        }
     }
 
     // --- Unix path normalization tests ---
@@ -1203,82 +1185,41 @@ allowed = ["read_file"]
 
     // --- Network matching bypass vector tests ---
 
+    /// Every spelling of an allowed endpoint must match the rule — in both
+    /// directions — so an alternative encoding can neither slip past a rule nor
+    /// be written as one. (The denials that must survive normalization are
+    /// `network_bypass_nonmatch_still_denied`.)
     #[test]
-    fn network_bypass_octal_ip() {
-        assert!(network_matches("127.0.0.1:8080", "0177.0.0.01:8080"));
-        assert!(network_matches("127.0.0.1:*", "0177.0.0.01:8080"));
-        assert!(network_matches("0177.0.0.01:8080", "127.0.0.1:8080"));
-    }
-
-    #[test]
-    fn network_bypass_hex_ip() {
-        assert!(network_matches("127.0.0.1:8080", "0x7f000001:8080"));
-        assert!(network_matches("127.0.0.1:*", "0x7f000001:443"));
-        assert!(network_matches("0x7f000001:8080", "127.0.0.1:8080"));
-    }
-
-    #[test]
-    fn network_bypass_hex_dotted_ip() {
-        assert!(network_matches("127.0.0.1:8080", "0x7f.0.0.0x01:8080"));
-    }
-
-    #[test]
-    fn network_bypass_percent_encoded_host() {
-        assert!(network_matches(
-            "localhost:8080",
-            "%6c%6f%63%61%6c%68%6f%73%74:8080"
-        ));
-        assert!(network_matches(
-            "localhost:*",
-            "%6c%6f%63%61%6c%68%6f%73%74:9090"
-        ));
-    }
-
-    #[test]
-    fn network_bypass_percent_encoded_in_url() {
-        assert!(network_matches(
-            "example.com:443",
-            "https://exam%70le.com/path"
-        ));
-    }
-
-    #[test]
-    fn network_bypass_ipv4_mapped_ipv6() {
-        assert!(network_matches("127.0.0.1:8080", "[::ffff:127.0.0.1]:8080"));
-        assert!(network_matches("127.0.0.1:*", "[::ffff:127.0.0.1]:9090"));
-        assert!(network_matches("[::ffff:127.0.0.1]:8080", "127.0.0.1:8080"));
-    }
-
-    #[test]
-    fn network_bypass_ipv6_expanded_vs_compressed() {
-        assert!(network_matches(
-            "::1:8080",
-            "[0000:0000:0000:0000:0000:0000:0000:0001]:8080"
-        ));
-    }
-
-    #[test]
-    fn network_bypass_unix_double_slash() {
-        assert!(network_matches(
-            "unix:/tmp/aterm.sock",
-            "unix:/tmp//aterm.sock"
-        ));
-        assert!(network_matches(
-            "unix:/tmp//aterm.sock",
-            "unix:/tmp/aterm.sock"
-        ));
-    }
-
-    #[test]
-    fn network_bypass_unix_dot_segment() {
-        assert!(network_matches(
-            "unix:/tmp/aterm.sock",
-            "unix:/tmp/./aterm.sock"
-        ));
-        assert!(network_matches(
-            "unix:/tmp/./aterm.sock",
-            "unix:/tmp/aterm.sock"
-        ));
+    fn network_bypass_spellings_match() {
+        for (rule, target) in [
+            // Octal IP.
+            ("127.0.0.1:8080", "0177.0.0.01:8080"),
+            ("127.0.0.1:*", "0177.0.0.01:8080"),
+            ("0177.0.0.01:8080", "127.0.0.1:8080"),
+            // Hex IP.
+            ("127.0.0.1:8080", "0x7f000001:8080"),
+            ("127.0.0.1:*", "0x7f000001:443"),
+            ("0x7f000001:8080", "127.0.0.1:8080"),
+            // Hex dotted IP.
+            ("127.0.0.1:8080", "0x7f.0.0.0x01:8080"),
+            // Percent-encoded host, bare and inside a URL.
+            ("localhost:8080", "%6c%6f%63%61%6c%68%6f%73%74:8080"),
+            ("localhost:*", "%6c%6f%63%61%6c%68%6f%73%74:9090"),
+            ("example.com:443", "https://exam%70le.com/path"),
+            // IPv4-mapped IPv6.
+            ("127.0.0.1:8080", "[::ffff:127.0.0.1]:8080"),
+            ("127.0.0.1:*", "[::ffff:127.0.0.1]:9090"),
+            ("[::ffff:127.0.0.1]:8080", "127.0.0.1:8080"),
+            // Expanded vs compressed IPv6.
+            ("::1:8080", "[0000:0000:0000:0000:0000:0000:0000:0001]:8080"),
+            // Unix socket paths with doubled slashes and dot segments.
+            ("unix:/tmp/aterm.sock", "unix:/tmp//aterm.sock"),
+            ("unix:/tmp//aterm.sock", "unix:/tmp/aterm.sock"),
+            ("unix:/tmp/aterm.sock", "unix:/tmp/./aterm.sock"),
+            ("unix:/tmp/./aterm.sock", "unix:/tmp/aterm.sock"),
+        ] {
+            assert!(network_matches(rule, target), "{rule} must match {target}");
+        }
     }
 
     #[test]

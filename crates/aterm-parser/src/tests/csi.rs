@@ -130,80 +130,34 @@ fn parse_csi_kakoune_sgr() {
 // ============== CSI Fast Path Tests ==============
 
 #[test]
-fn csi_fast_path_simple_sgr() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
+fn csi_fast_path_single_sequences() {
+    // One sequence through `advance_fast` -> exactly one CSI dispatch of
+    // (params, intermediates, final). Each row was its own test.
+    let rows: &[(&str, &[u8], &[u16], &[u8], u8)] = &[
+        ("simple SGR", b"\x1b[31m", &[31], &[], b'm'),
+        ("256-color fg", b"\x1b[38;5;196m", &[38, 5, 196], &[], b'm'),
+        (
+            "RGB fg",
+            b"\x1b[38;2;255;128;64m",
+            &[38, 2, 255, 128, 64],
+            &[],
+            b'm',
+        ),
+        ("private mode set", b"\x1b[?1049h", &[1049], b"?", b'h'),
+        ("cursor position", b"\x1b[10;20H", &[10, 20], &[], b'H'),
+        ("cursor home, no params", b"\x1b[H", &[], &[], b'H'),
+    ];
+    for &(label, input, params, intermediates, final_byte) in rows {
+        let mut parser = Parser::new();
+        let mut sink = RecordingSink::default();
+        parser.advance_fast(input, &mut sink);
 
-    // Use advance_fast to test the CSI fast path
-    parser.advance_fast(b"\x1b[31m", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0], (vec![31], vec![], b'm'));
-}
-
-#[test]
-fn csi_fast_path_256_color() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // 256-color foreground: ESC[38;5;196m
-    parser.advance_fast(b"\x1b[38;5;196m", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0], (vec![38, 5, 196], vec![], b'm'));
-}
-
-#[test]
-fn csi_fast_path_true_color() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // RGB foreground: ESC[38;2;255;128;64m
-    parser.advance_fast(b"\x1b[38;2;255;128;64m", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(
-        sink.csi_dispatches[0],
-        (vec![38, 2, 255, 128, 64], vec![], b'm')
-    );
-}
-
-#[test]
-fn csi_fast_path_private_marker() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Private mode set: ESC[?1049h
-    parser.advance_fast(b"\x1b[?1049h", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0].0, vec![1049]);
-    assert_eq!(sink.csi_dispatches[0].1, vec![b'?']);
-    assert_eq!(sink.csi_dispatches[0].2, b'h');
-}
-
-#[test]
-fn csi_fast_path_cursor_position() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Cursor position: ESC[10;20H
-    parser.advance_fast(b"\x1b[10;20H", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0], (vec![10, 20], vec![], b'H'));
-}
-
-#[test]
-fn csi_fast_path_no_params() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Cursor home: ESC[H
-    parser.advance_fast(b"\x1b[H", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0], (vec![], vec![], b'H'));
+        assert_eq!(
+            sink.csi_dispatches,
+            vec![(params.to_vec(), intermediates.to_vec(), final_byte)],
+            "{label}"
+        );
+    }
 }
 
 #[test]

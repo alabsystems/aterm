@@ -18,8 +18,34 @@ use std::time::Duration;
 pub type Record = (u64, String, Vec<u8>);
 
 /// The answer to a bounded, NON-TERMINAL read ([`Client::last`], [`Client::fetch`]):
-/// the page of records, then the `(next, head)` its closing `Mark` carried.
+/// the page of records, then the `(next, head)` its closing `Mark` carried. Also the
+/// shape of [`Client::last_all`]'s whole-face answer, whose mark is its FIRST page's.
 pub type Page = (Vec<Record>, (u64, u64));
+
+/// The most `Last` requests one [`Client::last_walk`] may make before the walk is
+/// called a FAILURE rather than an answer.
+///
+/// A liveness bound, not a size one. Every page moves the resume cursor strictly
+/// forward (it is the last subject the broker VISITED, after the one it was sent), so
+/// against a conforming broker a walk ends; one that has not ended in this many
+/// requests has met something pathological — a peer whose cursor never runs out, an
+/// index grown faster than it is walked — and the honest answer to a caller that must
+/// not read absence as evidence is an error, not a short list. At the broker's
+/// `LAST_PAGE_MAX` rows a page the ceiling is 4096 × 4096 = 16 777 216 rows; pages the
+/// index-scan bound cuts short reach it sooner.
+pub const LAST_WALK_PAGES_MAX: usize = 4096;
+
+/// What a [`Client::last_walk`] callback answers after each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk {
+    /// Deliver the next row, paging on as the answer needs.
+    Continue,
+    /// That row was the last one wanted: the walk returns at once — the rest of the
+    /// page already read is dropped and no further page is asked for — reporting the
+    /// row's subject as the cursor that continues it (or no cursor at all, when that
+    /// row was the last of an answer the broker said was complete).
+    Stop,
+}
 
 /// A connection to a broker over a byte stream. Three transports:
 ///
@@ -33,7 +59,9 @@ pub type Page = (Vec<Record>, (u64, u64));
 ///
 /// `S` is the byte stream; any `Read + Write` works (see
 /// [`from_stream`](Client::from_stream)), and the Frame protocol is identical on
-/// every transport.
+/// every transport. A caller that picks the transport at RUNTIME uses the free
+/// function [`connect`] instead: one [`AnyClient`] for every wire, plus the
+/// [`Closer`] that ends it and bounds its I/O.
 #[cfg(unix)]
 pub struct Client<S = UnixStream> {
     stream: S,
@@ -64,10 +92,109 @@ impl Client<TcpStream> {
     /// untrusted network use `connect_tcp_sealed` (the `aead` feature), which
     /// carries the same protocol inside an authenticated-encryption record layer.
     pub fn connect_tcp(addr: impl ToSocketAddrs) -> io::Result<Client<TcpStream>> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        Ok(Client { stream })
+        Ok(Client {
+            stream: dial_tcp(addr, None)?,
+        })
     }
+
+    /// [`connect_tcp`](Self::connect_tcp) with a bound on the CONNECT: each address
+    /// `addr` resolves to is tried in turn with `TcpStream::connect_timeout`, so a
+    /// black-holed address fails `TimedOut` after `timeout` instead of after the OS's
+    /// SYN-retry schedule (minutes). The bound is per address, so the worst case is
+    /// `timeout` × addresses; the error is the LAST address's. Name resolution itself
+    /// is not bounded (std's resolver has no timeout) — an IP-literal `addr` makes
+    /// this a hard bound. The stream comes back blocking: this bounds the connect,
+    /// not the requests (see [`Closer`] for those).
+    ///
+    /// # Errors
+    /// Every address failed (the last one's error), `addr` resolved to nothing
+    /// (`InvalidInput`), or a zero `timeout` (`InvalidInput`, std's own refusal).
+    pub fn connect_tcp_timeout(
+        addr: impl ToSocketAddrs,
+        timeout: Duration,
+    ) -> io::Result<Client<TcpStream>> {
+        Ok(Client {
+            stream: dial_tcp(addr, Some(timeout))?,
+        })
+    }
+}
+
+/// Dial TCP with `TCP_NODELAY` — every request is one small frame that waits for its
+/// answer, so Nagle only adds latency. `None` is `TcpStream::connect` exactly (each
+/// resolved address under the OS's own connect timeout); `Some(t)` tries each
+/// resolved address with `TcpStream::connect_timeout(addr, t)` and answers the first
+/// that connects, else the last error.
+fn dial_tcp(addr: impl ToSocketAddrs, timeout: Option<Duration>) -> io::Result<TcpStream> {
+    let stream = match timeout {
+        None => TcpStream::connect(addr)?,
+        Some(t) => {
+            let mut last = None;
+            let mut connected = None;
+            for a in addr.to_socket_addrs()? {
+                match TcpStream::connect_timeout(&a, t) {
+                    Ok(s) => {
+                        connected = Some(s);
+                        break;
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            match (connected, last) {
+                (Some(s), _) => s,
+                (None, Some(e)) => return Err(e),
+                (None, None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "could not resolve to any addresses",
+                    ))
+                }
+            }
+        }
+    };
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+/// How long the broker may take to complete the SEALED handshake when the caller gave
+/// no connect timeout; lifted after it.
+#[cfg(feature = "aead")]
+const SEALED_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run the client half of the sealed handshake over an already-dialed socket, each
+/// read bounded by `deadline` so an unresponsive peer cannot hang the connect; the
+/// socket is blocking again afterwards.
+#[cfg(feature = "aead")]
+fn seal_tcp(
+    stream: TcpStream,
+    key: [u8; astream_aead::KEY_LEN],
+    deadline: Duration,
+) -> io::Result<astream_aead::SealedStream<TcpStream>> {
+    stream.set_read_timeout(Some(deadline))?;
+    let stream = astream_aead::SealedStream::handshake_client(stream, key)?;
+    stream.get_ref().set_read_timeout(None)?;
+    Ok(stream)
+}
+
+/// How long the Rung-7 key agreement may take when the caller gave no connect
+/// timeout; lifted after it.
+#[cfg(feature = "handshake")]
+const KEY_AGREEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run the client half of the Rung-7 forward-secret handshake over an already-dialed
+/// socket. Its reads AND writes are bounded by `deadline`, so a broken or hostile
+/// server cannot hang the client on the key-agreement I/O; reset to blocking after.
+#[cfg(feature = "handshake")]
+fn agree_tcp(
+    stream: TcpStream,
+    psk: &[u8; astream_aead::KEY_LEN],
+    deadline: Duration,
+) -> io::Result<astream_aead::SealedStream<TcpStream>> {
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
+    let sealed = astream_aead::client_handshake(stream, psk)?;
+    sealed.get_ref().set_read_timeout(None)?;
+    sealed.get_ref().set_write_timeout(None)?;
+    Ok(sealed)
 }
 
 #[cfg(feature = "aead")]
@@ -86,13 +213,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         addr: impl ToSocketAddrs,
         key: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<Client<astream_aead::SealedStream<TcpStream>>> {
-        // How long the broker may take to complete the handshake; lifted after it.
-        const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        let stream = astream_aead::SealedStream::handshake_client(stream, key)?;
-        stream.get_ref().set_read_timeout(None)?;
+        let stream = seal_tcp(dial_tcp(addr, None)?, key, SEALED_HANDSHAKE_TIMEOUT)?;
         Ok(Client { stream })
     }
 }
@@ -109,16 +230,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         addr: impl ToSocketAddrs,
         psk: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<Client<astream_aead::SealedStream<TcpStream>>> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        // Bound the handshake I/O so a broken or hostile server cannot hang the
-        // client forever on the key-agreement read; reset to blocking afterward.
-        let hs_timeout = std::time::Duration::from_secs(10);
-        stream.set_read_timeout(Some(hs_timeout))?;
-        stream.set_write_timeout(Some(hs_timeout))?;
-        let sealed = astream_aead::client_handshake(stream, &psk)?;
-        sealed.get_ref().set_read_timeout(None)?;
-        sealed.get_ref().set_write_timeout(None)?;
+        let sealed = agree_tcp(dial_tcp(addr, None)?, &psk, KEY_AGREEMENT_TIMEOUT)?;
         Ok(Client { stream: sealed })
     }
 }
@@ -436,9 +548,13 @@ impl<S: Read + Write> Client<S> {
     /// superseded a value an earlier page already reported.
     ///
     /// The broker CLAMPS `max` and bounds its scan of the subject index, so a short
-    /// page does not mean the answer ended. Use
-    /// [`last_page`](Self::last_page) whenever the whole answer matters: it returns the
-    /// cursor that says whether there is more.
+    /// page — an EMPTY one included — does not mean the answer ended, and this method
+    /// has already thrown away the cursor that says whether it did. It is ONE page, and
+    /// nothing that must see the whole face should read it as more. Walk instead:
+    /// [`last_walk`](Self::last_walk) (streaming, row-bounded, stoppable) or
+    /// [`last_all`](Self::last_all) (collected) follow the cursor to the end, keep the
+    /// FIRST page's mark, and turn a walk that does not end into an error.
+    /// [`last_page`](Self::last_page) is the one-request primitive under them.
     ///
     /// Non-terminal: the connection is fully usable afterwards (this is the one read
     /// verb that does NOT consume the client).
@@ -453,7 +569,7 @@ impl<S: Read + Write> Client<S> {
     /// scan reached the end of the filter's range and this was the last page. Page
     /// until it is empty — a page shorter than `max` is NOT the end, because the
     /// broker bounds how many index entries one request may visit (matched or not) as
-    /// well as how many rows it may return.
+    /// well as how many rows it may return. [`last_walk`](Self::last_walk) is that loop.
     pub fn last_page(
         &mut self,
         filter: &str,
@@ -469,6 +585,143 @@ impl<S: Read + Write> Client<S> {
             }),
         )?;
         self.read_page_resumable()
+    }
+
+    /// WALK A LAST-VALUE FACE: [`last_page`](Self::last_page) repeated on its resume
+    /// cursor until the broker says the filter's range is exhausted, each row handed to
+    /// `on_row` in ascending subject order. This is the one loop that knows how a
+    /// `Last` answer ENDS, so a reader that must see every subject — a roster, a halt
+    /// list, an escalation view — calls it rather than restating it.
+    ///
+    /// THE END IS AN EMPTY `resume`, AND NOTHING ELSE. The broker clamps each request
+    /// to `LAST_PAGE_MAX` rows and cuts its index scan after `LAST_SCAN_MAX` entries
+    /// VISITED, matched or not, so a page shorter than asked — an EMPTY one included —
+    /// is not the end of the answer. The walk pages on the cursor, never on the row
+    /// count and never on the last row's subject, which an empty page does not have.
+    ///
+    /// THE MARK IS THE FIRST PAGE'S. Each request pins its own, later head, so the
+    /// answer is a UNION of per-page snapshots, not one snapshot. The `(next, head)`
+    /// returned is the first request's — the lowest pin, and so the only offset a
+    /// `subscribe(next, filter)` can splice on at with no gap: from a later page's
+    /// `next`, a record that superseded a value an earlier page already delivered would
+    /// never arrive. The reader pays for the splice: a row from page 2..n may carry an
+    /// offset AT OR ABOVE the returned `head`, and the tail may supersede a delivered
+    /// row, so a reader that tails folds newest-wins and dedups on offset. Rows never
+    /// repeat within one walk; the cursor is a strictly increasing subject.
+    ///
+    /// AND THE ROWS ALONE ARE NOT THE WHOLE FACE. A subject whose newest record lands
+    /// at or above a request's pinned head before that request reaches it is OMITTED
+    /// from its page rather than answered stale (see [`Request::Last`]); the record
+    /// that displaced it arrives on the tail from `next`. The whole face is the rows
+    /// PLUS that tail.
+    ///
+    /// `after` starts the walk strictly after that subject (`""` for the whole face).
+    /// `max` bounds the ROWS the whole walk delivers, not one page's, and each request
+    /// asks the broker for exactly the rows still owed, so it never works for rows the
+    /// caller will not take; `u32::MAX` is the whole face. `max = 0` is the head query:
+    /// one request, no rows, the mark.
+    ///
+    /// `on_row` runs once its row's page has been read to the closing `Mark`, so the
+    /// connection is at a frame boundary whenever it runs and stays usable however the
+    /// walk ends — [`Walk::Stop`], the row bound, an `on_row` error. Memory is one page,
+    /// not the face.
+    ///
+    /// Returns the first page's `(next, head)` and the CONTINUATION:
+    ///
+    /// - `None` — the walk delivered the whole answer: the broker's cursor came back
+    ///   empty and every row it sent reached `on_row` (a `Stop` on the very last row
+    ///   included).
+    /// - `Some(after)` — the walk ended early, on [`Walk::Stop`] or on `max`. Pass it
+    ///   back as `after` to continue; it is the subject of the last row delivered (or
+    ///   this walk's own `after`, if it delivered none), and continuing from it may
+    ///   find nothing more. It is an `Option` where `last_page` has an
+    ///   empty-means-done `String` because a walk that stopped before its first row
+    ///   must be able to say "continue from the start", and that cursor IS `""`.
+    ///
+    /// # Errors
+    ///
+    /// A broker or transport failure, including the broker refusing a request; the
+    /// first error `on_row` returns, which ends the walk and is returned as is; or a
+    /// walk that has not ended within [`LAST_WALK_PAGES_MAX`] requests — because a
+    /// caller that cannot tell "no rows" from "I stopped looking" reports an empty
+    /// fleet while a node is escalating. Rows delivered before an error WERE
+    /// delivered; the error says the answer is incomplete, not that nothing was seen.
+    pub fn last_walk(
+        &mut self,
+        filter: &str,
+        after: &str,
+        max: u32,
+        mut on_row: impl FnMut(Record) -> io::Result<Walk>,
+    ) -> io::Result<((u64, u64), Option<String>)> {
+        let mut cursor = after.to_string();
+        // The continuation if the walk ends early: the last subject DELIVERED, which
+        // starts as the walk's own `after` so a walk that delivered nothing hands that
+        // back. `clone_from` reuses the buffer, so tracking it costs no allocation per
+        // row once it has grown to the longest subject.
+        let mut last = cursor.clone();
+        let mut remaining = max;
+        // The FIRST request's mark; every later page's is dropped (see above).
+        let mut first: Option<(u64, u64)> = None;
+        for _ in 0..LAST_WALK_PAGES_MAX {
+            let ask = remaining;
+            let (page, page_mark, resume) = self.last_page(filter, &cursor, ask)?;
+            let mark = *first.get_or_insert(page_mark);
+            let rows = page.len();
+            let mut taken = 0usize;
+            let mut stopped = false;
+            for row in page {
+                if remaining == 0 {
+                    // More rows than were asked for: `max` is the CALLER's promise, and
+                    // a peer that over-delivers does not get to break it.
+                    break;
+                }
+                remaining -= 1;
+                taken += 1;
+                last.clone_from(&row.1);
+                if on_row(row)? == Walk::Stop {
+                    stopped = true;
+                    break;
+                }
+            }
+            // `ask > 0`: a head query's empty cursor means "no page", not "complete".
+            if resume.is_empty() && taken == rows && ask > 0 {
+                return Ok((mark, None));
+            }
+            if stopped || remaining == 0 {
+                return Ok((mark, Some(last)));
+            }
+            cursor = resume;
+        }
+        Err(io::Error::other(format!(
+            "the last-value walk of {filter} did not end within {LAST_WALK_PAGES_MAX} pages"
+        )))
+    }
+
+    /// The WHOLE last-value face of `filter`, collected: [`last_walk`](Self::last_walk)
+    /// from the first subject with no row bound. Returns every row, in ascending subject
+    /// order, and the FIRST page's `(next, head)` — the gap-free splice point for a
+    /// `subscribe(next, filter)` that goes on watching the face (fold newest-wins across
+    /// the seam; `last_walk` says why).
+    ///
+    /// `Ok` only for an answer the broker said was complete; a walk past
+    /// [`LAST_WALK_PAGES_MAX`] pages is an error, never a short list. Memory is the
+    /// whole face; a reader that can act row by row walks instead.
+    pub fn last_all(&mut self, filter: &str) -> io::Result<Page> {
+        let mut rows = Vec::new();
+        let (mark, rest) = self.last_walk(filter, "", u32::MAX, |row| {
+            rows.push(row);
+            Ok(Walk::Continue)
+        })?;
+        match rest {
+            None => Ok((rows, mark)),
+            // Unreachable against a broker that honours its own page clamp (the page
+            // bound ends the walk long before u32::MAX rows), and still not a reason
+            // to hand back a list that is short without saying so.
+            Some(_) => Err(io::Error::other(format!(
+                "the last-value face of {filter} did not end within {} rows",
+                u32::MAX
+            ))),
+        }
     }
 
     /// BOUNDED READ: at most `max` records matching `filter` with offset >= `from`,
@@ -675,9 +928,10 @@ impl<S: Read + Write> Client<S> {
 /// transports whose socket is reachable — `Subscription<UnixStream>` (Unix builds),
 /// `Subscription<TcpStream>` and (feature `aead`) the sealed
 /// `Subscription<SealedStream<TcpStream>>`, which the `handshake` and `identity`
-/// transports also produce. On any OTHER stream type there is no idle window: bound
-/// the socket yourself before subscribing (reach it with
-/// [`Subscription::get_ref`]), or this parks in the read until the broker sends
+/// transports also produce. An erased [`AnySubscription`] sets it through the
+/// [`Closer`] that [`connect`] returned with its client. On any OTHER stream type
+/// there is no idle window: bound the socket yourself before subscribing (reach it
+/// with [`Subscription::get_ref`]), or this parks in the read until the broker sends
 /// something.
 ///
 /// The idle stop is frame-atomic: a timeout that lands part-way through a record
@@ -822,29 +1076,19 @@ impl Subscription<UnixStream> {
     /// in a socket read with no timeout, so an owner that wants to stop a tailing
     /// thread (and release the broker-side connection) shuts the socket down through
     /// this closer, which makes the blocked `recv` return `Ok(None)`.
+    ///
+    /// The TCP and sealed subscriptions have the same method, returning the same
+    /// [`Closer`]; an erased [`AnySubscription`] has no socket left to reach, so its
+    /// closer is the one [`connect`] handed back.
     pub fn closer(&self) -> io::Result<SubscriptionCloser> {
-        Ok(SubscriptionCloser {
-            stream: self.stream.try_clone()?,
-        })
+        Closer::unix(&self.stream)
     }
 }
 
-/// Ends a Unix-socket [`Subscription`] from outside its reading thread (see
-/// [`Subscription::closer`]). Dropping the closer does nothing; `close` is explicit.
-#[cfg(unix)]
-pub struct SubscriptionCloser {
-    stream: UnixStream,
-}
-
-#[cfg(unix)]
-impl SubscriptionCloser {
-    /// Shut the subscription's socket down in both directions: the reader's
-    /// blocked `recv` returns `Ok(None)` and the broker sees the peer go away.
-    /// Idempotent; an already-closed socket is not an error.
-    pub fn close(&self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
-    }
-}
+/// The name [`Closer`] had when only a Unix-socket [`Subscription`] could make one.
+/// Kept so code written against it compiles unchanged: it IS [`Closer`], so it also
+/// comes from a TCP or sealed subscription and from [`connect`].
+pub type SubscriptionCloser = Closer;
 
 /// What a subscription can carry: a record, or the `Mark` that closes a bounded
 /// read. [`Subscription::recv`] keeps its signature and SKIPS marks; a caller that
@@ -909,10 +1153,12 @@ impl<S: Read + Write> Subscription<S> {
     /// The underlying byte stream, for transport-level control — a timeout, a
     /// shutdown — that does not touch the record bytes. This is the escape hatch for
     /// a stream type that has no [`set_read_timeout`](Self::set_read_timeout) of its
-    /// own (a boxed `dyn` stream, say): reach the socket through it and bound the
-    /// read there. Do NOT read or write the stream itself — a subscription that has
-    /// timed out mid-frame holds the rest of that frame, and bytes taken from
-    /// underneath it are gone from the stream this resumes.
+    /// own: reach the socket through it and bound the read there. (A boxed
+    /// [`AnyStream`] cannot be reached this way — erasing it hid the socket — which
+    /// is why [`connect`] returns a [`Closer`] alongside it.) Do NOT read or write
+    /// the stream itself — a subscription that has timed out mid-frame holds the
+    /// rest of that frame, and bytes taken from underneath it are gone from the
+    /// stream this resumes.
     pub fn get_ref(&self) -> &S {
         &self.stream
     }
@@ -1009,6 +1255,12 @@ impl Subscription<TcpStream> {
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(d)
     }
+
+    /// The TCP twin of [`Subscription::closer`]: a [`Closer`] on a duplicate of this
+    /// subscription's socket, so another thread can end a `recv` parked on it.
+    pub fn closer(&self) -> io::Result<Closer> {
+        Closer::tcp(&self.stream)
+    }
 }
 
 #[cfg(feature = "aead")]
@@ -1027,4 +1279,313 @@ impl Subscription<astream_aead::SealedStream<TcpStream>> {
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.stream.get_ref().set_read_timeout(d)
     }
+
+    /// The SEALED twin of [`Subscription::closer`]. The duplicate is of the TCP
+    /// socket UNDER the record layer — never a second `SealedStream`, which would be a
+    /// second record sequence over one socket — because shutting that socket down is
+    /// what unparks the reader, and it is all the closer needs.
+    pub fn closer(&self) -> io::Result<Closer> {
+        Closer::tcp(self.stream.get_ref())
+    }
+}
+
+/// Any byte stream a broker connection can ride, so a caller that picks its transport
+/// at RUNTIME — a flag, a config file — has ONE code path per verb rather than one per
+/// wire. Blanket-implemented for every `Read + Write + Send` type. `Send` is a
+/// supertrait because a subscription is typically pumped by a thread of its own, and
+/// every transport this crate builds is `Send`.
+pub trait AnyStream: Read + Write + Send {}
+impl<T: Read + Write + Send> AnyStream for T {}
+
+/// A [`Client`] whose transport has been erased — what [`connect`] returns.
+pub type AnyClient = Client<Box<dyn AnyStream>>;
+
+/// A [`Subscription`] whose transport has been erased — what an [`AnyClient`]'s
+/// `subscribe` / `subscribe_group` / `fork_subscribe` return. Its idle window and its
+/// shutdown live on the [`Closer`] that came with the client.
+pub type AnySubscription = Subscription<Box<dyn AnyStream>>;
+
+/// How a client reaches the broker: the runtime choice [`connect`] dispatches on.
+///
+/// EVERY VARIANT EXISTS IN EVERY BUILD. The sealed and handshake wires need the `aead`
+/// and `handshake` features, but their variants are not cfg-gated: Cargo unifies
+/// features ADDITIVELY across a build graph, so a variant that appeared only when some
+/// other crate in the graph switched `aead` on would break every exhaustive `match`
+/// written against the default build. [`connect`] refuses a transport this build cannot
+/// speak with `ErrorKind::Unsupported` naming the missing feature instead — so a config
+/// that says "sealed" still parses and still redacts its key, and fails loudly at the
+/// one place it matters, never by quietly speaking plaintext.
+///
+/// Deliberately NOT `#[non_exhaustive]`, for the opposite reason: a caller's exhaustive
+/// match over transports (what to serve, what to name) is where a NEW wire should break
+/// the build and be decided on, not fall through a wildcard arm into some other wire's
+/// behaviour. Static-identity connections (`connect_tcp_identity`) are not a variant:
+/// they carry a keypair and a pinned host key rather than a pre-shared key, and no
+/// runtime-chosen caller of this enum serves them yet.
+///
+/// `Debug` NEVER prints a key: it names the variant and says the key is redacted, so a
+/// config logged on a bad day does not put the fleet's pre-shared key in a file.
+#[derive(Clone)]
+pub enum Transport {
+    /// A Unix-domain socket at a filesystem path: same machine, unsealed (the socket
+    /// path's permissions scope who can reach it). Unix hosts only — elsewhere
+    /// [`connect`] refuses it.
+    Unix,
+    /// PLAINTEXT TCP to `host:port` — a trusted network only (as
+    /// [`Client::connect_tcp`]).
+    Tcp,
+    /// TCP inside the XChaCha20-Poly1305 sealed record layer under this 32-byte
+    /// pre-shared key (as `Client::connect_tcp_sealed`; feature `aead`). Boxed so
+    /// moving or cloning the config does not copy the key around the stack.
+    Sealed(Box<[u8; 32]>),
+    /// The sealed wire behind the Rung-7 forward-secret handshake: an ephemeral X25519
+    /// key agreement authenticated by this 32-byte pre-shared key (as
+    /// `Client::connect_tcp_handshake`; feature `handshake`).
+    Handshake(Box<[u8; 32]>),
+}
+
+impl std::fmt::Debug for Transport {
+    /// The variant, and never the key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Transport::Unix => "Unix",
+            Transport::Tcp => "Tcp",
+            Transport::Sealed(_) => "Sealed(<key redacted>)",
+            Transport::Handshake(_) => "Handshake(<key redacted>)",
+        })
+    }
+}
+
+/// Ends a connection from outside the thread using it, and bounds how long that
+/// thread's I/O may park — the one handle on the SOCKET under a client or subscription
+/// whose stream has been erased ([`connect`]) or wrapped (a sealed record layer).
+///
+/// It holds a DUPLICATE descriptor of the socket. For a sealed or handshake connection
+/// that is the TCP socket UNDER the record layer — never a second `SealedStream`, which
+/// would be a second record sequence over one socket. Shutdown and the socket timeouts
+/// are properties of the socket rather than of a descriptor, so everything done through
+/// the closer applies to the connection it came from, and keeps applying after
+/// `subscribe` consumes the client. Dropping a closer does nothing to the connection;
+/// [`close`](Self::close) is explicit. `Send + Sync`: one closer can be shared (an
+/// `Arc`) with a watchdog.
+#[derive(Debug)]
+pub struct Closer {
+    socket: Socket,
+}
+
+/// The socket a [`Closer`] duplicated.
+#[derive(Debug)]
+enum Socket {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Closer {
+    #[cfg(unix)]
+    fn unix(s: &UnixStream) -> io::Result<Closer> {
+        Ok(Closer {
+            socket: Socket::Unix(s.try_clone()?),
+        })
+    }
+
+    fn tcp(s: &TcpStream) -> io::Result<Closer> {
+        Ok(Closer {
+            socket: Socket::Tcp(s.try_clone()?),
+        })
+    }
+
+    /// Shut the socket down in BOTH directions: a `recv` (or a request's read) parked
+    /// on it returns — `Ok(None)` at a frame boundary, an error part-way through one —
+    /// and the broker sees the peer go away, which releases its side of the connection
+    /// (and fires a registered last will). Idempotent: closing an already-closed socket
+    /// is not an error, and nothing is reported.
+    pub fn close(&self) {
+        let _ = match &self.socket {
+            #[cfg(unix)]
+            Socket::Unix(s) => s.shutdown(std::net::Shutdown::Both),
+            Socket::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
+        };
+    }
+
+    /// Bound how long a read on this connection parks with nothing arriving:
+    /// `SO_RCVTIMEO` on the socket, so it applies to every read the client or
+    /// subscription makes from now on (`None` clears it). Past it the read fails
+    /// `WouldBlock`/`TimedOut`.
+    ///
+    /// On a SUBSCRIPTION that is an idle window, and a resumable one: the partial frame
+    /// stays on the subscription ([`Subscription::recv_event`]) and the record layer
+    /// keeps its partial record, so [`take`] / [`drain`] can stop and come back. On a
+    /// request/reply CLIENT it is a deadline and nothing more: a request that timed out
+    /// may still be answered late, so the connection is no longer in step with its
+    /// replies — drop it and reconnect; do not retry on it. That is what turns a broker
+    /// that accepts and never answers from a caller parked forever into an error.
+    ///
+    /// # Errors
+    /// The `setsockopt`; a zero duration is `InvalidInput` (std's own refusal).
+    pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        match &self.socket {
+            #[cfg(unix)]
+            Socket::Unix(s) => s.set_read_timeout(d),
+            Socket::Tcp(s) => s.set_read_timeout(d),
+        }
+    }
+
+    /// Bound how long a write on this connection parks on a full send buffer (a broker
+    /// that stopped reading): `SO_SNDTIMEO` on the socket, `None` clears it. A write
+    /// that times out may have sent PART of a frame, so the connection is no longer
+    /// framed: drop it, do not retry on it.
+    ///
+    /// # Errors
+    /// The `setsockopt`; a zero duration is `InvalidInput` (std's own refusal).
+    pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        match &self.socket {
+            #[cfg(unix)]
+            Socket::Unix(s) => s.set_write_timeout(d),
+            Socket::Tcp(s) => s.set_write_timeout(d),
+        }
+    }
+}
+
+/// Open ONE connection to `endpoint` over `transport` — a socket path for
+/// [`Transport::Unix`], `host:port` for the rest — and return it with its transport
+/// erased, together with the [`Closer`] that ends it and bounds its I/O.
+///
+/// The closer is made HERE, at connect time, from a duplicate of the socket under
+/// whatever wrapper the transport adds, because once the stream is boxed nothing can
+/// reach that socket again — and it outlives the `subscribe` that consumes the client,
+/// which is when a caller needs it most (to end a `recv` parked on another thread, or
+/// to give a group subscription its idle window).
+///
+/// `connect_timeout` bounds ESTABLISHING the connection, and nothing after it:
+///
+/// - **TCP** (all three TCP transports): each address the endpoint resolves to is tried
+///   in turn with `TcpStream::connect_timeout` (see
+///   [`Client::connect_tcp_timeout`]), so a black-holed address fails `TimedOut` after
+///   the bound instead of after the OS's SYN-retry schedule. The bound is per address,
+///   and name resolution is not bounded (std's resolver has no timeout): an IP-literal
+///   endpoint makes it a hard bound.
+/// - **Sealed / handshake**: the bound also REPLACES the built-in deadline on the
+///   transport's handshake I/O (5 s sealed, 10 s key agreement), so a peer that accepts
+///   and never answers the hello costs `connect_timeout`, not the default.
+/// - **Unix**: not applied. std has no bounded Unix-socket connect; a local connect
+///   fails at once when nothing listens, and can park only while a LIVE listener's
+///   accept backlog is full.
+///
+/// `None` is exactly each transport's own constructor — [`Client::connect`],
+/// [`Client::connect_tcp`], `Client::connect_tcp_sealed`,
+/// `Client::connect_tcp_handshake` — including their built-in handshake deadlines.
+/// Either way every stream comes back BLOCKING: bound requests and deliveries with
+/// [`Closer::set_read_timeout`] / [`Closer::set_write_timeout`]. Every TCP transport
+/// gets `TCP_NODELAY`, as every TCP constructor here does.
+///
+/// # Errors
+/// `Unsupported`, naming what is missing, for a transport this build cannot speak
+/// ([`Transport::Sealed`] without the `aead` feature, [`Transport::Handshake`] without
+/// `handshake`, [`Transport::Unix`] off a unix host); `InvalidInput` for a zero
+/// `connect_timeout`; otherwise the connect, the handshake (a broker without the key is
+/// refused HERE, not at the first verb), or the descriptor duplication the closer needs.
+pub fn connect(
+    transport: &Transport,
+    endpoint: &str,
+    connect_timeout: Option<Duration>,
+) -> io::Result<(AnyClient, Closer)> {
+    if connect_timeout == Some(Duration::ZERO) {
+        // Refused up front so every transport says the same thing: std refuses a zero
+        // TCP connect timeout itself, but a Unix connect would silently ignore it.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a zero connect timeout bounds nothing: pass None for the OS default, or a positive duration",
+        ));
+    }
+    match transport {
+        Transport::Unix => connect_unix(endpoint),
+        Transport::Tcp => {
+            let s = dial_tcp(endpoint, connect_timeout)?;
+            let closer = Closer::tcp(&s)?;
+            Ok(erase(s, closer))
+        }
+        Transport::Sealed(key) => connect_sealed(endpoint, key, connect_timeout),
+        Transport::Handshake(key) => connect_handshake(endpoint, key, connect_timeout),
+    }
+}
+
+/// Box a connected stream behind [`AnyStream`], beside its closer.
+fn erase<S: AnyStream + 'static>(stream: S, closer: Closer) -> (AnyClient, Closer) {
+    (Client::from_stream(Box::new(stream)), closer)
+}
+
+#[cfg(unix)]
+fn connect_unix(endpoint: &str) -> io::Result<(AnyClient, Closer)> {
+    let s = UnixStream::connect(endpoint)?;
+    let closer = Closer::unix(&s)?;
+    Ok(erase(s, closer))
+}
+
+#[cfg(not(unix))]
+fn connect_unix(_endpoint: &str) -> io::Result<(AnyClient, Closer)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Transport::Unix needs a unix host (std has no Unix-domain sockets here); use Transport::Tcp",
+    ))
+}
+
+#[cfg(feature = "aead")]
+fn connect_sealed(
+    endpoint: &str,
+    key: &[u8; 32],
+    connect_timeout: Option<Duration>,
+) -> io::Result<(AnyClient, Closer)> {
+    let stream = dial_tcp(endpoint, connect_timeout)?;
+    let sealed = seal_tcp(
+        stream,
+        *key,
+        connect_timeout.unwrap_or(SEALED_HANDSHAKE_TIMEOUT),
+    )?;
+    let closer = Closer::tcp(sealed.get_ref())?;
+    Ok(erase(sealed, closer))
+}
+
+/// Without `aead` there is no record layer to seal with, and a sealed transport must
+/// never quietly become a plaintext one.
+#[cfg(not(feature = "aead"))]
+fn connect_sealed(
+    _endpoint: &str,
+    _key: &[u8; 32],
+    _connect_timeout: Option<Duration>,
+) -> io::Result<(AnyClient, Closer)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Transport::Sealed needs astream-broker built with the `aead` feature",
+    ))
+}
+
+#[cfg(feature = "handshake")]
+fn connect_handshake(
+    endpoint: &str,
+    psk: &[u8; 32],
+    connect_timeout: Option<Duration>,
+) -> io::Result<(AnyClient, Closer)> {
+    let stream = dial_tcp(endpoint, connect_timeout)?;
+    let sealed = agree_tcp(
+        stream,
+        psk,
+        connect_timeout.unwrap_or(KEY_AGREEMENT_TIMEOUT),
+    )?;
+    let closer = Closer::tcp(sealed.get_ref())?;
+    Ok(erase(sealed, closer))
+}
+
+/// Without `handshake` there is no key agreement, and falling back to the plain
+/// sealed wire would silently drop the forward secrecy the caller asked for.
+#[cfg(not(feature = "handshake"))]
+fn connect_handshake(
+    _endpoint: &str,
+    _psk: &[u8; 32],
+    _connect_timeout: Option<Duration>,
+) -> io::Result<(AnyClient, Closer)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Transport::Handshake needs astream-broker built with the `handshake` feature",
+    ))
 }

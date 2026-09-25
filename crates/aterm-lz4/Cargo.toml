@@ -27,6 +27,9 @@ path = "src/lib.rs"
 default = ["std", "safe-encode", "safe-decode", "checked-decode"]
 std = []
 safe-encode = []
+# Required: the bounds-checked decoder is the only one carried (the upstream
+# raw-pointer decoder was never compiled here and was deleted); turning this
+# off is a compile_error in src/block/mod.rs.
 safe-decode = []
 # Extra runtime sanity checks on decode (bounds, etc). Matches upstream.
 checked-decode = []

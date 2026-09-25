@@ -366,10 +366,6 @@ mod tests {
     /// argue for in review, in the entry.
     const UNDECLARED_WORKERS: &[(&str, &str)] = &[
         (
-            "aterm-admin-step-dismiss",
-            "unclassified: posts an admin-step notice dismissal",
-        ),
-        (
             "aterm-agent-prime",
             "unclassified: primes the agent roster when due",
         ),

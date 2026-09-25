@@ -95,11 +95,8 @@ fn discovered_ty_finds_a_counterexample_under_its_own_reductions() {
          `--no-auto-por` (enforced by `ty_drivers_are_armed`), so no verdict here rests\n\
          on the broken reduction. But a checker that answers \"proved\" about spaces it\n\
          never entered should not be the one this machine discovers.\n\n\
-         REMEDY:  cargo build --release -p tla-cli      (in $HOME/trust/first-party/ty)\n\
-         A correct build already exists on this disk:\n\
-         $HOME/trust/build/<triple>/stage2/bin/ty   (measured: POR 0/127 reduced, 128 states)\n\
-         `find_trust_bin` probes the first-party path first, so rebuilding there is what\n\
-         changes which binary is selected.\n\
+         REMEDY:  aterm pkg install ty   (discovery takes the store's ty first; a build\n\
+         of your own is reached by `aterm pkg link ty <checkout>`)\n\
          =====================================================================\n\n{combined}",
         verify::ty_evidence_header(&ty).trim_end(),
         m.name,

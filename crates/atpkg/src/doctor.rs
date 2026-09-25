@@ -85,9 +85,9 @@ fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> 
 /// The programs this machine WANTS but does not have, split by whether the removed
 /// ledger explains the absence: `(unexplained, on_purpose)`, each alphabetical.
 ///
-/// "Wants" is [`crate::cli::wanted_programs`] — the signed default set narrowed by
-/// `[packages].include`/`exclude` plus opted-in extras — so this asks the same question
-/// the install lanes ask, and cannot drift from them into a second opinion.
+/// "Wants" is [`crate::cli::wanted_programs`] — the signed set narrowed by
+/// `[packages].exclude` — so this asks the same question the install lanes ask, and
+/// cannot drift from them into a second opinion.
 ///
 /// The split is the whole point. A program on the removed ledger is a decision, and
 /// reporting it as a problem would be the manager arguing with the user. A program
@@ -107,7 +107,7 @@ fn missing_against_index(
         return (Vec::new(), Vec::new(), Vec::new());
     };
     split_missing(
-        &crate::cli::wanted_programs(layout, &index, crate::config::cached()),
+        &crate::cli::wanted_programs(&index, crate::config::cached()),
         installed,
         &layout.removed_programs(),
         dev_linked,
@@ -236,15 +236,18 @@ pub struct WorkspacePolicyProbe {
 }
 
 /// rustup's `trust` channel resolving OUTSIDE the atpkg store: a locally built or
-/// sealed toolchain. Not wrong in itself — a publisher machine builds Trust — but
-/// anything committed against a feature only that toolchain has will not build on an
-/// atpkg-managed machine until the seal is PUBLISHED. Naming it is what lets the
-/// operator see, on the machine that seals, that the seal is still local only.
+/// sealed toolchain. Newer than the store's, it is a publisher's seal: anything committed
+/// against a feature only it has will not build on an atpkg-managed machine until the seal
+/// is PUBLISHED. Older (m7, 2026-09-24: a 2026-07-17 stage2 against the store's
+/// 2026-09-17) or gone, it is stale, and `repair` re-points it at the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSealProbe {
     pub link_target: PathBuf,
     /// `trustc -Vv`'s commit hash (first 10 characters), or "unknown".
     pub trustc: String,
+    /// Set when it is gone or older than the store's build
+    /// ([`crate::seam::stale_against_store`]).
+    pub stale: Option<crate::seam::Stale>,
 }
 
 /// The environment-dependent probes `run` takes and `run_with` only reports, so the
@@ -440,10 +443,7 @@ fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealPro
         return None;
     }
     let trustc = target.join("bin").join("trustc");
-    let commit = std::process::Command::new(&trustc)
-        .arg("-Vv")
-        .output()
-        .ok()
+    let commit = output_bounded(std::process::Command::new(&trustc).arg("-Vv"))
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .and_then(|s| {
             s.lines().find_map(|l| {
@@ -453,6 +453,7 @@ fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealPro
         })
         .unwrap_or_else(|| "unknown".to_string());
     Some(LocalSealProbe {
+        stale: crate::seam::stale_against_store(layout, &target),
         link_target: target,
         trustc: commit,
     })
@@ -471,16 +472,13 @@ pub enum Detail {
 
 /// Run the health surface, printing the report ([`present`]). Returns `true` iff there
 /// were NO structural problems (`main` maps `false` → exit 1). Reads the real environment:
-/// home, PATH, the clock, the `[packages]` config's account, automatic-update switches and
-/// exclusions, and the token chain's SOURCE label — never the token.
+/// home, PATH, the clock, and the `[packages]` config's account, automatic-update switches
+/// and exclusions.
 #[must_use]
 pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
-    // Which source supplies a GitHub token (§5.1 private-repo aid): aterm-update-core's
-    // chain, consulted only for a repointed destination. Only the LABEL is surfaced.
-    let (_token, token_source) = crate::cli::resolve_pkg_token(layout);
     let cfg = crate::config::cached();
     let probes = Probes {
         workspace: std::env::current_dir()
@@ -504,7 +502,6 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         path.as_deref(),
         crate::flow::now_unix(),
         cfg_account.as_deref(),
-        token_source.as_deref(),
         prefix,
         &probes,
         &mut report,
@@ -773,10 +770,9 @@ fn next_step(text: &str) -> Option<String> {
     (step.chars().count() <= 110 && !step.is_empty()).then_some(step)
 }
 
-/// The testable core: `home`, the `PATH` value, `now`, the `[packages].account`
-/// config override, and the resolved token-source LABEL are injected so the surface
-/// can be exercised against a synthetic environment without mutating the process env
-/// (or spawning the keychain/`gh` probes).
+/// The testable core: `home`, the `PATH` value, `now` and the `[packages].account`
+/// config override are injected so the surface can be exercised against a synthetic
+/// environment without mutating the process env.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // the injected environment, plus the speaker and its streams
 pub fn run_with(
@@ -785,7 +781,6 @@ pub fn run_with(
     path_var: Option<&OsStr>,
     now: i64,
     cfg_account: Option<&str>,
-    token_source: Option<&str>,
     prefix: &str,
     probes: &Probes,
     out: &mut dyn std::io::Write,
@@ -820,7 +815,7 @@ pub fn run_with(
     );
     report_aterm_posture(layout, p, out);
 
-    // (1) TRUST ROOT + INDEX SOURCE + TOKEN SOURCE.
+    // (1) TRUST ROOT + INDEX SOURCE.
     let _ = writeln!(
         out,
         "{p}: index source github.com/{}",
@@ -842,26 +837,6 @@ pub fn run_with(
             "{p}: warn — disabled/inert (no paper master compiled in: \
              pins::PAPER_MASTER_PUBKEYS is empty) — this build installs nothing"
         );
-    }
-    // Loud token provenance (never the token itself): which rung of aterm-update-core's
-    // chain (keychain → 0600 file → `gh auth token`; no environment rung) supplied a
-    // credential.
-    match token_source {
-        Some(src) => {
-            let _ = writeln!(
-                out,
-                "{p}: ok — GitHub token from {src} (used for index/pkg fetches; never printed)"
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "{p}: ok — no GitHub token in use (anonymous API: fine for the public index, \
-             rate-limited; only a development build's repointed account or private \
-             `[packages.links]` override consults the app updater's chain — keychain, \
-             0600 file, `gh auth token`)"
-            );
-        }
     }
     // The table's own spelling: a retired key to rename or remove. Notes, never failures —
     // every one of them is still honoured or harmlessly ignored.
@@ -1051,26 +1026,7 @@ pub fn run_with(
     }
     let _ = writeln!(out, "{p}: ok — {} program(s) active", active.len());
 
-    // (5a) THE INSTALLER ITSELF, when it is a browser download. A quarantined app is
-    // provenance-tracked in EVERY invocation, so every file it lays would carry the tag
-    // were the installs not staged and cleared the way they are. A note, not a warning:
-    // nothing is wrong, and the line says why installs from it still come out clean
-    // (2026-09-14: every surface said "a probe file it wrote came back tagged" and none
-    // said why).
-    if let Some(carrier) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| std::fs::canonicalize(exe).ok())
-        .and_then(|exe| crate::provenance::quarantined_carrier(&exe))
-    {
-        let _ = writeln!(
-            out,
-            "{p}: note — {} is a browser download (com.apple.quarantine); what it installs \
-             is still cleared of the macOS tag",
-            carrier.display()
-        );
-    }
-
-    // (5b) INSTALLED FILES THAT STILL CARRY `com.apple.provenance` (macOS).
+    // (5a) INSTALLED FILES THAT STILL CARRY `com.apple.provenance` (macOS).
     //
     // A file a provenance-tracked process writes carries the tag, and a tagged executable,
     // shim or dylib tags what it writes in turn — every object file and proof snapshot a
@@ -1335,19 +1291,42 @@ pub fn run_with(
         }
     }
 
-    // (5e) A LOCAL SEAL BEHIND rustup's `trust` CHANNEL. Correct on a publisher
-    // machine; the warning exists so that machine can see the seal is still local
-    // only — the other half of (5d), seen from the side that causes it.
+    // (5e) A LOCAL TOOLCHAIN BEHIND rustup's `trust` CHANNEL. Newer than the store's, it
+    // is correct on a publisher machine, and the warning lets that machine see the seal is
+    // still local only — the other half of (5d), seen from the side that causes it. Older,
+    // or gone, it is stale, and `repair` re-points the channel at the store.
     if let Some(seal) = &probes.local_seal {
-        let _ = writeln!(
-            out,
-            "{p}: warn — rustup's trust channel resolves to a LOCAL toolchain, not the \
-             atpkg store: {} (trustc {}). Commits made against features only it has \
-             will not build on atpkg-managed machines until that seal is published \
-             ({PUBLISH_RUSTC_GROUP})",
-            seal.link_target.display(),
-            seal.trustc
-        );
+        let _ = match &seal.stale {
+            Some(crate::seam::Stale::Dangling) => writeln!(
+                out,
+                "{p}: warn — rustup's trust channel names {}, which no longer exists, so \
+                 `cargo +trust` and every repo pinning `channel = \"trust\"` fail with \
+                 `'rustc' is not installed for the custom toolchain 'trust'`; fix: `aterm pkg \
+                 repair` re-points it at the store",
+                seal.link_target.display()
+            ),
+            Some(crate::seam::Stale::Older { its, store }) => writeln!(
+                out,
+                "{p}: warn — rustup's trust channel resolves to a LOCAL toolchain OLDER than \
+                 the atpkg store's: {} (trustc {}, {}; the store's is {}), so `cargo +trust` \
+                 and every repo pinning `channel = \"trust\"` compile with a stale Trust; fix: \
+                 `aterm pkg repair` re-points it at the store (the old toolchain is left \
+                 where it is)",
+                seal.link_target.display(),
+                seal.trustc,
+                its,
+                store
+            ),
+            None => writeln!(
+                out,
+                "{p}: warn — rustup's trust channel resolves to a LOCAL toolchain, not the \
+                 atpkg store: {} (trustc {}). Commits made against features only it has \
+                 will not build on atpkg-managed machines until that seal is published \
+                 ({PUBLISH_RUSTC_GROUP})",
+                seal.link_target.display(),
+                seal.trustc
+            ),
+        };
     }
 
     let live = crate::gc::live_builds(layout);
@@ -1743,47 +1722,26 @@ pub fn run_with(
                     let _ = writeln!(out, "{p}: warn — could not parse the last-success time");
                 }
             }
-            // THE TWO QUESTIONS THAT CLOCK COULD NOT ANSWER (2026-09-15): has the signed
-            // index LISTING been reached lately (a pass served from the §14 cache is a
-            // completed pass that learned nothing), and has the index itself MOVED
-            // (the publisher's pulse). Both read the freshness fields the pass end
-            // stamps from what the resolve measured; a record from before they existed
-            // is silent here rather than accused.
-            let reached_days = (!status.last_index_reached_at.is_empty())
-                .then(|| index_age_days(&status.last_index_reached_at, now))
-                .flatten();
-            // A RECORD WITH NO FRESHNESS STAMP AT ALL is not "from before the fields
-            // existed" once a pass has completed since they did: it is one of two
-            // things the record alone cannot tell apart, and both mute the two checks
-            // below while every other row reads green. Measured 2026-09-22: a second,
-            // OLDER aterm build ran its own 6 h pass on the same store and rewrote
-            // status.toml through a Status without the fields, so "publishing looks
-            // frozen" could never fire while the index sat at one build for three
-            // days. Said once, as a warn — the remedy is a pass by THIS build.
-            if status.last_index_reached_at.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — no completed pass has recorded reaching the signed index \
-                     listing (last completed pass {}) — either every pass ran on the cached \
-                     index, or the record was last written by an OLDER atpkg that does not \
-                     stamp index freshness (a second aterm build running its own update pass \
-                     on this store: `aterm pkg status` prints which atpkg answers, the app log \
-                     names each pass's); until a pass by this build reaches the listing, the \
-                     'listing not reached' and 'frozen publishing' checks cannot run — \
-                     run: aterm pkg update",
-                    status.last_success_at
-                );
-            }
+            // HAS THE INDEX BEEN REACHED LATELY: the last success is the last pass that reached
+            // the signed index, and a pass that recorded itself failed or offline after it
+            // (`last_pass` / `last_pass_at`) says every pass since ran on the cached index —
+            // read by the schedulers' own reader (`Stamps::last_failed`), so doctor and the
+            // failure ladder can never disagree about which pass failed (2026-09-23; before,
+            // a separate reach stamp answered what the success stamp did not, and a record an
+            // older atpkg wrote without it muted this check).
+            let reached_days = index_age_days(&status.last_success_at, now);
+            let unreached =
+                aterm_update_core::pkg_check::Stamps::parse(&status.to_toml().unwrap_or_default())
+                    .last_failed();
             match reached_days {
-                Some(days) if days > INDEX_UNREACHED_WARN_DAYS => {
+                Some(days) if unreached && days > INDEX_UNREACHED_WARN_DAYS => {
                     let _ = writeln!(
                         out,
-                        "{p}: warn — the signed index listing has not been reached for {days} \
-                         day(s) (last: {}) — every pass since ran on the cached index and \
-                         cannot see a newer pin: offline, rate-limited (the anonymous GitHub \
-                         API shares ~60 requests/hour per address) or a proxy in the way; \
-                         `aterm pkg update` prints the transport's reason",
-                        status.last_index_reached_at
+                        "{p}: warn — the signed index has not been reached for {days} day(s) \
+                         (last: {}; the last pass, {}, ran on the cached index) — no pass since \
+                         can see a newer pin: offline, a proxy in the way, or the download host \
+                         refusing; `aterm pkg update` prints the reason",
+                        status.last_success_at, status.last_pass_at
                     );
                 }
                 _ => {}
@@ -1796,9 +1754,8 @@ pub fn run_with(
                 let _ = writeln!(
                     out,
                     "{p}: warn — index build {} has not changed in {days} day(s) while the \
-                     listing was reachable — publishing looks frozen: the vendor lane's launchd \
-                     job, its lock or its token upstream (a pinned claude stays at its version \
-                     until the index moves)",
+                     index was reachable — publishing looks frozen upstream (a pin stays at its \
+                     build until the index moves)",
                     status.last_index_build
                 );
             }
@@ -1830,8 +1787,8 @@ pub fn run_with(
     // beside the floor. This reads that answer back, offline, and says it.
     if probes.index_head {
         let last_pass = LastPass {
-            read_listing_at: crate::status::read(layout)
-                .and_then(|s| crate::flow::rfc3339_to_unix(&s.last_index_reached_at)),
+            reached_index_at: crate::status::read(layout)
+                .and_then(|s| crate::flow::rfc3339_to_unix(&s.last_success_at)),
             held: crate::index_probe::held_index_builds(layout),
         };
         index_head_line(
@@ -1879,8 +1836,16 @@ pub fn run_with(
             PROBE_TIMEOUT.as_secs()
         );
     }
-    if let Some(rustup_home) =
-        crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)
+    // A link (5e) named stale has its line and its fix (`repair`) there: neither the
+    // re-point below nor the unlinked-channel line — a link to nothing does not resolve
+    // either — says it a second time with another fix.
+    let stale_said = probes
+        .local_seal
+        .as_ref()
+        .is_some_and(|s| s.stale.is_some());
+    if !stale_said
+        && let Some(rustup_home) =
+            crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)
         && layout.program_current("trust").join("bin").is_dir()
         && let Some(line) = seam_line(
             &crate::seam::status(layout, &rustup_home, crate::seam::DEFAULT_SEAM),
@@ -1895,7 +1860,8 @@ pub fn run_with(
         // the one command; it re-points nothing — an entry under `~/.rustup` that
         // aterm did not lay is the user's, by the seam module's own rule.
         let _ = writeln!(out, "{p}: {line}");
-    } else if rustup_answers
+    } else if !stale_said
+        && rustup_answers
         && layout.program_current("trust").join("bin").is_dir()
         && !rustup_trust_channel_resolves(rustup.as_deref().unwrap_or(Path::new("rustup")))
     {
@@ -1970,58 +1936,6 @@ pub fn run_with(
                     out,
                     "{p}: warn — {program}: recorded as `{}`, but that copy is gone — system \
                      copy gone: the next `aterm pkg update` reinstalls the managed copy",
-                    row.state
-                );
-            }
-        }
-        // (10b) MEMBERS WAITING ON ELEVATION (`needs admin — run: aterm pkg install
-        // <name>`): not a fault — the unattended pass cannot elevate — but the one line
-        // that tells the user which act is theirs.
-        for (program, row) in &s.programs {
-            if row.state.starts_with(crate::state::NEEDS_ADMIN_PREFIX) {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — {program}: {} (in a terminal; sudo asks there)",
-                    row.state
-                );
-            }
-        }
-        // (10c) MEMBERS OBTAINED THROUGH ANOTHER PROTOCOL (`installed via <protocol>:
-        // <path>` — Homebrew's pkg, Apple's Command Line Tools): proven by the recorded
-        // `provides` path, re-checked here the way a system copy is. Gone ⇒ the next
-        // pass records `needs admin` and the explicit door reinstalls it.
-        for (program, row) in &s.programs {
-            let Some((protocol, path)) = crate::state::installed_via_path(&row.state) else {
-                continue;
-            };
-            if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — {program}: {} (kept current by {protocol}, not by aterm)",
-                    row.state
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — {program}: recorded as `{}`, but that path is gone — the \
-                     next pass records it as needing admin; reinstall: aterm pkg install \
-                     {program}",
-                    row.state
-                );
-            }
-        }
-    }
-    // (10e) MEMBERS BLOCKED BY A REQUIREMENT (`blocked by <dep>: <dep state>`, §17.10):
-    // a DEFERRED state, never a fault — the pass retries every six hours, and the
-    // dependency's own row (quoted in the state) says whose act unblocks it. The
-    // explicit door resolves both, in order.
-    if let Some(s) = status.as_ref() {
-        for (program, row) in &s.programs {
-            if let Some((dep, _)) = crate::state::blocked_by(&row.state) {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — {program}: {} (installs once {dep} is; `aterm pkg install \
-                     {program}` does both, in order)",
                     row.state
                 );
             }
@@ -2613,18 +2527,20 @@ fn build_list(builds: &[u64]) -> String {
 }
 
 /// How recent a "nothing newer" answer must be for (8) to say `ok`: the window re-asks
-/// the next two tags every minute and the two after them every five, so an answer older
-/// than this means nothing is asking any more (no window running), and its age is the
-/// honest thing to print.
+/// the next two tags every thirty seconds ([`crate::index_probe`]), so an answer older than
+/// this means nothing is asking any more (no window running), and its age is the honest
+/// thing to print.
 const INDEX_HEAD_FRESH_SECS: i64 = 15 * 60;
 
-/// What the last signed update pass left on disk that bears on the channel head: when it
-/// last read the index listing (`status.toml`'s `last_index_reached_at`), and the index
-/// builds of the signed candidates it downloaded ([`crate::index_probe::held_index_builds`]).
-/// `None` in either field when that record is absent or unreadable.
+/// What the last signed update pass left on disk that bears on the channel head: when a
+/// pass last REACHED the signed index (`status.toml`'s `last_success_at` — stamped only by
+/// a pass that verified an index the channel served, never by one on the §14 cache), and
+/// the index builds of the signed candidates it downloaded
+/// ([`crate::index_probe::held_index_builds`]). `None` in either field when that record is
+/// absent or unreadable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LastPass {
-    read_listing_at: Option<i64>,
+    reached_index_at: Option<i64>,
     held: Option<Vec<u64>>,
 }
 
@@ -2639,11 +2555,11 @@ struct LastPass {
 /// "run: aterm pkg update" is right when no signed pass has looked since the newer index
 /// appeared. It is wrong — and loops, update saying "already current" and doctor saying
 /// "not the newest" — when a pass already downloaded the newer index and refused it, or
-/// read the listing and found no complete newer release there. The last pass's downloaded
-/// candidates (the §14 cache, written before select) tell those apart offline, so each gets
-/// its own sentence. And the notes never promise that `aterm pkg update` refreshes the
-/// probe's answer — it does not write the probe's stamps; what it does move, the time the
-/// listing was last read, is printed beside them.
+/// walked the channel's tags and found no complete newer release there. The last pass's
+/// downloaded candidates (the §14 cache, written before select) tell those apart offline,
+/// so each gets its own sentence. And the notes never promise that `aterm pkg update`
+/// refreshes the probe's answer — it does not write the probe's stamps; what it does move,
+/// the time a pass last reached the index, is printed beside them.
 fn index_head_line(
     cached: &crate::index_probe::CachedProbe,
     last: &LastPass,
@@ -2659,15 +2575,15 @@ fn index_head_line(
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         now.saturating_sub(at).max(0)
     };
-    let pass = match last.read_listing_at {
+    let pass = match last.reached_index_at {
         Some(at) => format!(
-            "the last signed update pass read the index listing {} ago",
+            "the last signed update pass reached the index {} ago",
             ago(now.saturating_sub(at).max(0))
         ),
-        None => "no update pass has recorded reading the signed index listing".to_string(),
+        None => "no update pass has recorded reaching the signed index".to_string(),
     };
     // A NEWER INDEX ALREADY DOWNLOADED AND NOT LANDED. The cache is written from the
-    // listing before verify-then-select, so this is independent of the probe: the pass
+    // channel before verify-then-select, so this is independent of the probe: the pass
     // held it, and the floor did not move.
     if let Some(held) = last
         .held
@@ -2685,86 +2601,67 @@ fn index_head_line(
         );
         return;
     }
-    let ranges = [cached.near, cached.lookahead, cached.listing];
-    let newest = |want: RangeAnswer| {
-        ranges
-            .iter()
-            .flatten()
-            .filter(|(answer, _)| *answer == want)
-            .map(|(_, written)| age(*written))
-            .min()
-    };
-    if let Some(seen) = newest(RangeAnswer::Published) {
-        if last.read_listing_at.is_some() && last.held.is_some() {
-            // The last pass reached the listing and held nothing above the floor: at that
-            // moment the listing had no COMPLETE signed release newer than it.
+    match cached.near {
+        Some((RangeAnswer::Published, seen)) => {
+            if last.reached_index_at.is_some() && last.held.is_some() {
+                // The last pass reached the channel and held nothing above the floor: at
+                // that moment it had no COMPLETE signed release newer than it.
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — index {floor} is not the newest: the index probe found a \
+                     newer ALab index (seen {} ago; an unverified hint), but {pass} and \
+                     found no complete signed release newer than {floor} there — if the new \
+                     one was up by then, its signed files are not all uploaded and no update \
+                     can land it yet; otherwise run: aterm pkg update",
+                    ago(age(seen))
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — index {floor} is not the newest: the index probe found a \
+                     newer ALab index (seen {} ago; an unverified hint — no signed pass has \
+                     landed it on this machine) — run: aterm pkg update",
+                    ago(age(seen))
+                );
+            }
+        }
+        Some((RangeAnswer::Missing, checked)) => {
+            // Said as what was CHECKED — the next two tags — because the probe's own rule
+            // is that absence is never authority.
+            let checked = age(checked);
+            if checked <= INDEX_HEAD_FRESH_SECS {
+                let _ = writeln!(
+                    out,
+                    "{p}: ok — the release host shows no index newer than {floor} at the next \
+                     two tags (checked {} ago)",
+                    ago(checked)
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{p}: note — the release host showed no index newer than {floor} when last \
+                     asked, {} ago (the aterm window asks every thirty seconds while it runs); \
+                     {pass}",
+                    ago(checked)
+                );
+            }
+        }
+        Some((RangeAnswer::Failed, when)) => {
             let _ = writeln!(
                 out,
-                "{p}: warn — index {floor} is not the newest: the index probe found a \
-                 newer ALab index (seen {} ago; an unverified hint), but {pass} and found no \
-                 complete signed release newer than {floor} there — if the new one was up by \
-                 then, its signed files are not all uploaded and no update can land it yet; \
-                 otherwise run: aterm pkg update",
-                ago(seen)
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "{p}: warn — index {floor} is not the newest: the index probe found a \
-                 newer ALab index (seen {} ago; an unverified hint — no signed pass has \
-                 landed it on this machine) — run: aterm pkg update",
-                ago(seen)
+                "{p}: note — the last check for an index newer than {floor} got no usable \
+                 answer ({} ago), so whether one is published is unknown here; {pass}",
+                ago(age(when))
             );
         }
-        return;
-    }
-    if let (
-        Some((RangeAnswer::Missing, near)),
-        Some((RangeAnswer::Missing, deep)),
-        Some((RangeAnswer::Missing, listing)),
-    ) = (cached.near, cached.lookahead, cached.listing)
-    {
-        // The claim rests on all three ranges, so it is as old as the oldest. It is
-        // said as what was CHECKED — four tags and one listing page — because the probe's
-        // own rule is that absence is never authority.
-        let checked = age(near).max(age(deep)).max(age(listing));
-        if checked <= INDEX_HEAD_FRESH_SECS {
+        None => {
             let _ = writeln!(
                 out,
-                "{p}: ok — the release host shows no index newer than {floor} at the next \
-                 four tags or on its first releases page (checked {} ago)",
-                ago(checked)
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "{p}: note — the release host showed no index newer than {floor} when last \
-                 asked, {} ago (the aterm window asks every minute while it runs); {pass}",
-                ago(checked)
+                "{p}: note — no check for an index newer than {floor} is recorded on this \
+                 machine (the aterm window asks every thirty seconds while it runs); {pass}"
             );
         }
-        return;
     }
-    let failed = [
-        (RangeAnswer::RateLimited, "was rate-limited"),
-        (RangeAnswer::Failed, "got no usable answer"),
-    ]
-    .into_iter()
-    .find_map(|(want, said)| newest(want).map(|a| (said, a)));
-    if let Some((said, when)) = failed {
-        let _ = writeln!(
-            out,
-            "{p}: note — the last check for an index newer than {floor} {said} ({} ago), so \
-             whether one is published is unknown here; {pass}",
-            ago(when)
-        );
-        return;
-    }
-    let _ = writeln!(
-        out,
-        "{p}: note — no check for an index newer than {floor} is recorded on this machine (the \
-         aterm window asks every minute while it runs); {pass}"
-    );
 }
 
 /// A non-negative age in seconds, said in the unit a person reads it in.
@@ -2780,11 +2677,11 @@ fn ago(secs: i64) -> String {
     }
 }
 
-/// How long the signed index listing may go unreached before `doctor` says so: past
-/// this, every pass has been a cached one — the vendor lane publishes daily-ish, so
-/// three days of cache is three days a newer claude pin could have been missed.
+/// How long the signed index may go unreached before `doctor` says so: past this, every
+/// pass has been a cached one — three days of cache is three days a newer pin or yank could
+/// have been missed.
 const INDEX_UNREACHED_WARN_DAYS: i64 = 3;
-/// How long an unchanged `index_build` — with the listing reachable — reads as a frozen
+/// How long an unchanged `index_build` — with the index reachable — reads as a frozen
 /// publisher rather than a quiet week: the ALab pins move on releases, the vendor rows
 /// on every Claude Code and Codex release, and thirty days without either is neither.
 const INDEX_FROZEN_WARN_DAYS: i64 = 30;
@@ -3564,7 +3461,6 @@ mod tests {
                 Some(&path),
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut out,
@@ -3599,7 +3495,6 @@ mod tests {
                 Some(&path),
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -3630,7 +3525,6 @@ mod tests {
             Some(&path),
             0,
             None,
-            None,
             "doctor",
             &Probes::default(),
             &mut out,
@@ -3655,7 +3549,6 @@ mod tests {
             Some(&home),
             Some(&path),
             0,
-            None,
             None,
             "doctor",
             &Probes::default(),
@@ -3729,7 +3622,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 0,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -3822,7 +3714,6 @@ mod tests {
                 Some(&path),
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -3889,7 +3780,6 @@ mod tests {
                 Some(&path),
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -3911,7 +3801,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 0,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -4037,7 +3926,6 @@ mod tests {
                 Some(&path),
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -4088,7 +3976,6 @@ mod tests {
                 Some(&path),
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -4116,7 +4003,6 @@ mod tests {
                 Some(&home),
                 None,
                 0,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -4162,7 +4048,6 @@ mod tests {
             Some(&home),
             None,
             0,
-            None,
             None,
             "doctor",
             &Probes::default(),
@@ -4212,7 +4097,6 @@ mod tests {
             None,
             0,
             None,
-            None,
             "doctor",
             &Probes::default(),
             &mut out,
@@ -4256,7 +4140,6 @@ mod tests {
                 None,
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -4282,7 +4165,6 @@ mod tests {
                 Some(&home),
                 None,
                 0,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -4315,7 +4197,6 @@ mod tests {
                 Some(home),
                 None,
                 0,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -4465,7 +4346,6 @@ mod tests {
                 None,
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut out,
@@ -4545,7 +4425,6 @@ mod tests {
                 None,
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -4575,7 +4454,6 @@ mod tests {
                 None,
                 0,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut std::io::sink(),
@@ -4600,7 +4478,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 0,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -4641,14 +4518,13 @@ mod tests {
                 outcome: "up to date".into(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
-                last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
                 last_pass: String::new(),
                 last_pass_at: String::new(),
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
-                metered_hold_until: String::new(),
+                pass_seq: 0,
                 programs,
                 extra: Default::default(),
             },
@@ -4665,7 +4541,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 now,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -4696,192 +4571,6 @@ mod tests {
             "{out}"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// An `installed via <protocol>: <path>` row (Homebrew's pkg, the Command Line
-    /// Tools) is an OK line while its `provides` path is there — the words the pass
-    /// wrote — and a WARN naming the door once it is gone; `needs admin` is a WARN with
-    /// the door's spelling. Neither is ever a recorded fault.
-    #[test]
-    fn an_os_installed_member_is_reported_by_its_provides_path_and_never_a_fault() {
-        let l = layout("installed-via");
-        install(&l, "ay", 19);
-        let brew = l.prefix.join("fake-opt-homebrew-bin-brew");
-        std::fs::write(&brew, b"#!/bin/sh\nexit 0\n").unwrap();
-        let existing = crate::status::read(&l).unwrap_or_default();
-        let mut programs = existing.programs.clone();
-        programs.insert(
-            "brew".into(),
-            crate::ProgramStatus {
-                installed_build: None,
-                state: crate::state::installed_via("pkg", &brew),
-                tree_root: String::new(),
-            },
-        );
-        programs.insert(
-            "clt".into(),
-            crate::ProgramStatus {
-                installed_build: None,
-                state: crate::state::needs_admin("clt"),
-                tree_root: String::new(),
-            },
-        );
-        crate::status::write(
-            &l,
-            &crate::Status {
-                schema: 1,
-                updated_at: "2026-08-27T00:00:00Z".into(),
-                enabled: true,
-                index_source: "alabsystems/aterm".into(),
-                outcome: "up to date".into(),
-                seams: Vec::new(),
-                last_success_at: String::new(),
-                last_index_reached_at: String::new(),
-                last_index_build: 0,
-                index_build_changed_at: String::new(),
-                last_pass: String::new(),
-                last_pass_at: String::new(),
-                last_pass_attempted_index_build: 0,
-                last_pass_attempted_at: String::new(),
-                metered_hold_until: String::new(),
-                programs,
-                extra: Default::default(),
-            },
-        )
-        .unwrap();
-        let home = synthetic_home("installed-via");
-        let path = std::env::join_paths([l.bin_dir()]).unwrap();
-        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
-        let run = |l: &Layout| {
-            let mut out: Vec<u8> = Vec::new();
-            let mut err: Vec<u8> = Vec::new();
-            let ok = run_with(
-                l,
-                Some(&home),
-                Some(&path),
-                now,
-                None,
-                None,
-                "doctor",
-                &Probes::default(),
-                &mut out,
-                &mut err,
-            );
-            (ok, String::from_utf8_lossy(&out).into_owned())
-        };
-        let (ok, out) = run(&l);
-        assert!(ok, "an OS-installed member is not a problem:\n{out}");
-        assert!(
-            out.contains(&format!(
-                "doctor: ok — brew: installed via pkg: {} (kept current by pkg, not by aterm)",
-                brew.display()
-            )),
-            "{out}"
-        );
-        assert!(
-            out.contains(
-                "doctor: warn — clt: needs admin — run: aterm pkg install clt (in a terminal; \
-                 sudo asks there)"
-            ),
-            "{out}"
-        );
-        assert!(recorded_problems(crate::status::read(&l).as_ref()).is_empty());
-        // The provides path goes away: a warning naming the door, still not a problem.
-        std::fs::remove_file(&brew).unwrap();
-        let (ok, out) = run(&l);
-        assert!(ok, "{out}");
-        assert!(
-            out.contains("doctor: warn — brew: recorded as `installed via pkg: ")
-                && out.contains("reinstall: aterm pkg install brew"),
-            "{out}"
-        );
-        let _ = std::fs::remove_dir_all(&l.prefix);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// SHADOWED (design S5): a foreign copy of a managed tool AHEAD of the managed bin/ on
-    /// PATH is a WARN line in the canonical words — never a fault, never touched — and a
-    /// copy BEHIND the managed bin/ is not mentioned at all.
-    #[cfg(unix)]
-    /// A member BLOCKED by a requirement (§17.10) is reported in its own words as a
-    /// `warn` naming the dependency and the door that installs both — and never counted
-    /// as a fault: `doctor` stays healthy over it.
-    #[test]
-    fn a_blocked_member_is_a_warning_naming_its_dependency_never_a_fault() {
-        let layout = layout("doctor-blocked");
-        install(&layout, "ay", 18);
-        let mut programs = std::collections::BTreeMap::new();
-        programs.insert(
-            "ay".to_string(),
-            crate::ProgramStatus {
-                installed_build: Some(18),
-                state: crate::state::managed(18, 41),
-                tree_root: String::new(),
-            },
-        );
-        let blocked = crate::state::blocked("clt", &crate::state::needs_admin("clt"));
-        programs.insert(
-            "brew".to_string(),
-            crate::ProgramStatus {
-                installed_build: None,
-                state: blocked.clone(),
-                tree_root: String::new(),
-            },
-        );
-        let status = crate::Status {
-            schema: 1,
-            updated_at: "2026-08-27T00:00:00Z".into(),
-            enabled: true,
-            index_source: "x/y".into(),
-            outcome: "up to date".into(),
-            seams: Vec::new(),
-            last_success_at: String::new(),
-            last_index_reached_at: String::new(),
-            last_index_build: 0,
-            index_build_changed_at: String::new(),
-            last_pass: String::new(),
-            last_pass_at: String::new(),
-            last_pass_attempted_index_build: 0,
-            last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
-            programs,
-            extra: Default::default(),
-        };
-        crate::status::write(&layout, &status).unwrap();
-        assert!(
-            recorded_problems(Some(&status)).is_empty(),
-            "a blocked row is deferred, not a fault"
-        );
-        let home = synthetic_home("doctor-blocked");
-        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
-        let path = std::env::join_paths([layout.bin_dir()]).unwrap();
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        let ok = run_with(
-            &layout,
-            Some(&home),
-            Some(&path),
-            now,
-            None,
-            None,
-            "doctor",
-            &Probes::default(),
-            &mut out,
-            &mut err,
-        );
-        let text = String::from_utf8_lossy(&out).into_owned();
-        assert!(
-            ok,
-            "a blocked row is a warning, not a structural fault:
-{text}"
-        );
-        assert!(
-            text.contains(&format!("warn — brew: {blocked} (installs once clt is;")),
-            "{text}"
-        );
-        assert!(text.contains("aterm pkg install brew"), "{text}");
-        let _ = std::fs::remove_dir_all(&layout.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -4936,7 +4625,6 @@ mod tests {
             Some(&path),
             now,
             None,
-            None,
             "doctor",
             &Probes::default(),
             &mut out,
@@ -4984,7 +4672,6 @@ mod tests {
             None,
             0,
             None,
-            None,
             "doctor",
             &Probes::default(),
             &mut out,
@@ -5012,6 +4699,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// SHADOWED (design S5): a foreign copy of a managed tool AHEAD of the managed bin/ on
+    /// PATH is a WARN line in the canonical words — never a fault, never touched — and a
+    /// copy BEHIND the managed bin/ is not mentioned at all.
     #[cfg(unix)]
     #[test]
     fn a_shadowed_managed_member_is_a_warning_never_a_fault() {
@@ -5038,7 +4728,6 @@ mod tests {
                 Some(&home),
                 Some(path),
                 now,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -5080,6 +4769,9 @@ mod tests {
     /// "open a new tab" (owner, 2026-09-16), never `exec $SHELL` (it drops the tab's shell
     /// integration; measured 2026-09-16), never "remove or reorder that copy". A warn,
     /// never a fault; the plain SHADOWED wording returns only when the twin itself is gone.
+    /// All of it IN AN ATERM SHELL, where the remedy works (since 03513b5d7 the managed
+    /// copy leads inside aterm only; outside aterm the same PATH is a note, pinned by
+    /// `outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed`).
     #[cfg(unix)]
     #[test]
     fn an_agent_program_shadowed_in_this_shell_names_the_hook_source_never_a_new_tab() {
@@ -5113,9 +4805,11 @@ mod tests {
                 Some(path),
                 now,
                 None,
-                None,
                 "doctor",
-                &Probes::default(),
+                &Probes {
+                    stub_env: crate::reroute::StubEnv { in_aterm: true },
+                    ..Probes::default()
+                },
                 &mut out,
                 &mut err,
             );
@@ -5222,7 +4916,6 @@ mod tests {
                 Some(path),
                 now,
                 None,
-                None,
                 "doctor",
                 &Probes {
                     stub_env,
@@ -5301,6 +4994,142 @@ mod tests {
         assert!(
             out.contains("doctor: warn — reroute stub claude missing"),
             "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&foreign);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// OUTSIDE ATERM WITH THE STUB LAID, THE USER'S OWN COPY IS THE DESIGN — ON ANY PATH
+    /// (2026-09-24). An iTerm shell has no reroute directory on its PATH at all, so no stub
+    /// answers first there, and this report fell back to `SHADOWED in this shell` with the
+    /// rc-hook remedy — a remedy whose own false arm demotes `agents/` outside aterm, i.e.
+    /// advice that does nothing (owner law, 03513b5d7: the managed copy leads inside aterm
+    /// only). Three cases, one per answer: outside aterm with the stub laid (no reroute dir
+    /// on PATH, or one behind the foreign copy) — a note naming this shell's own copy, no
+    /// SHADOWED, no remedy; inside aterm with the stub first — routed, an `ok`; the stub
+    /// absent — outside aterm the same note (review, 2026-09-24: laid or not, no stub
+    /// answers in such a shell), inside aterm SHADOWED with the remedy.
+    #[cfg(unix)]
+    #[test]
+    fn outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed() {
+        let l = layout("agent-outside");
+        install(&l, "ay", 19);
+        let v280 = crate::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v280);
+        crate::reroute::lay(&l).unwrap();
+        let stub = crate::reroute::stub_path(&l, "claude");
+        assert!(
+            crate::reroute::is_reroute_stub(&stub),
+            "the twin earns a stub"
+        );
+        let foreign = l.prefix.parent().unwrap().join(format!(
+            "atpkg-doctor-agent-outside-foreign-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&foreign);
+        std::fs::create_dir_all(&foreign).unwrap();
+        let exe = foreign.join("claude");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = synthetic_home("agent-outside");
+        let now = crate::flow::rfc3339_to_unix("2026-09-24T00:00:00Z").unwrap();
+        let run = |path: &std::ffi::OsStr, stub_env: crate::reroute::StubEnv| {
+            let mut out: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(path),
+                now,
+                None,
+                "doctor",
+                &Probes {
+                    stub_env,
+                    ..Probes::default()
+                },
+                &mut out,
+                &mut std::io::sink(),
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        let outside = crate::reroute::StubEnv::default();
+        let inside = crate::reroute::StubEnv { in_aterm: true };
+        let remedy = crate::cli::shell_remedy_command(&l);
+        let claude_rows = |out: &str| -> Vec<String> {
+            out.lines()
+                .filter(|line| line.contains("— claude: "))
+                .map(str::to_owned)
+                .collect()
+        };
+        // 1. Outside aterm, the stub laid: an iTerm PATH (no reroute dir), and one whose
+        //    reroute dir stands behind the foreign copy.
+        let iterm = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
+        let behind =
+            std::env::join_paths([foreign.clone(), crate::reroute::dir(&l), l.bin_dir()]).unwrap();
+        for (label, path) in [("no reroute dir", &iterm), ("reroute behind", &behind)] {
+            let (ok, out) = run(path, outside);
+            assert!(ok, "{label}: {out}");
+            assert_eq!(
+                claude_rows(&out),
+                vec![format!(
+                    "doctor: note — claude: {}",
+                    crate::state::agent_own_copy_outside_aterm(v280, &exe)
+                )],
+                "{label}: {out}"
+            );
+            assert!(
+                !out.contains("SHADOWED") && !out.contains(&remedy),
+                "{label}: no shadow, no remedy outside aterm: {out}"
+            );
+        }
+        // 2. Inside aterm, the stub first: routed at exec time, an ok.
+        let stale =
+            std::env::join_paths([crate::reroute::dir(&l), foreign.clone(), l.bin_dir()]).unwrap();
+        let (ok, out) = run(&stale, inside);
+        assert!(ok, "{out}");
+        assert_eq!(
+            claude_rows(&out),
+            vec![format!(
+                "doctor: ok — claude: {}",
+                crate::state::agent_routed_in_shell(v280, &stub, &exe)
+            )],
+            "{out}"
+        );
+        // 3. The stub absent (reroute declined, or no pass has laid it yet). Outside aterm
+        //    it is STILL the note (review, 2026-09-24): in a shell with no reroute dir on
+        //    PATH whether a stub is laid decides nothing, and the rc hook's false arm
+        //    demotes `agents/` there, so its remedy does nothing — and the no-hook
+        //    fallback, `export PATH="<agents>:$PATH"`, would put the managed copy first
+        //    outside aterm, the takeover 03513b5d7 removed. Inside aterm: SHADOWED with
+        //    the remedy, which works there.
+        std::fs::remove_file(&stub).unwrap();
+        let (ok, out) = run(&iterm, outside);
+        assert!(ok, "{out}");
+        assert_eq!(
+            claude_rows(&out),
+            vec![format!(
+                "doctor: note — claude: {}",
+                crate::state::agent_own_copy_outside_aterm(v280, &exe)
+            )],
+            "no stub, outside aterm: {out}"
+        );
+        assert!(
+            !out.contains("SHADOWED")
+                && !out.contains(&remedy)
+                && !out.contains(&format!("{}:", l.agents_dir().display())),
+            "no stub, outside aterm: no shadow, no remedy, agents/ put first nowhere: {out}"
+        );
+        let (ok, out) = run(&iterm, inside);
+        assert!(ok, "{out}");
+        assert_eq!(
+            claude_rows(&out),
+            vec![format!(
+                "doctor: warn — claude: {}",
+                crate::state::agent_shadowed_in_shell(v280, &exe, &l.agents_dir(), false, &remedy)
+            )],
+            "no stub, inside aterm: {out}"
         );
         let _ = std::fs::remove_dir_all(&foreign);
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -5388,7 +5217,8 @@ mod tests {
     /// policy's `shim_env` gets ONE `ok` line — the canonical row (the recorded one when
     /// it is managed, else derived) and the trailing "own updater is off here" sentence —
     /// never a fault, never inside the state; a plain shim gets no such line, and a
-    /// shadowed one keeps (10d)'s warn alone (the env never reaches the system copy). A
+    /// shadowed one keeps (10d)'s row alone — a warn inside aterm, a note outside it (the
+    /// env never reaches the system copy). A
     /// vendor program (design §1.7) reads by version and source — never an index pin, never
     /// "updates arrive with the ALab index".
     #[cfg(unix)]
@@ -5430,14 +5260,13 @@ mod tests {
                 outcome: "up to date".into(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
-                last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
                 last_pass: String::new(),
                 last_pass_at: String::new(),
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
-                metered_hold_until: String::new(),
+                pass_seq: 0,
                 programs,
                 extra: Default::default(),
             },
@@ -5445,7 +5274,7 @@ mod tests {
         .unwrap();
         let home = synthetic_home("shim-env");
         let now = crate::flow::rfc3339_to_unix("2026-08-28T00:00:00Z").unwrap();
-        let run = |path: &std::ffi::OsStr| {
+        let run_in = |path: &std::ffi::OsStr, stub_env: crate::reroute::StubEnv| {
             let mut out: Vec<u8> = Vec::new();
             let mut err: Vec<u8> = Vec::new();
             let ok = run_with(
@@ -5454,14 +5283,17 @@ mod tests {
                 Some(path),
                 now,
                 None,
-                None,
                 "doctor",
-                &Probes::default(),
+                &Probes {
+                    stub_env,
+                    ..Probes::default()
+                },
                 &mut out,
                 &mut err,
             );
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
+        let run = |path: &std::ffi::OsStr| run_in(path, crate::reroute::StubEnv::default());
         let managed_only = std::env::join_paths([l.bin_dir()]).unwrap();
         let (ok, out) = run(&managed_only);
         assert!(ok, "{out}");
@@ -5492,7 +5324,7 @@ mod tests {
                 )
             );
         }
-        // Shadowed: the warn alone — the foreign copy runs, and runs without the env.
+        // Shadowed: (10d)'s row alone — the foreign copy runs, and runs without the env.
         let foreign = l
             .prefix
             .parent()
@@ -5503,13 +5335,20 @@ mod tests {
         let exe = foreign.join("claude");
         std::fs::write(&exe, b"#!/bin/sh\necho vendor\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // (Inside aterm a warn; outside it, since 2026-09-24, a note — this shell's own
+        // copy is the design there. Neither carries the sentence.)
         let ahead = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
-        let (ok, out) = run(&ahead);
-        assert!(ok, "{out}");
-        assert!(out.contains("warn — claude:"), "{out}");
-        assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
-        for line in out.lines().filter(|l| l.contains("claude")) {
-            assert_eq!(crate::vendor_direct::retired_wording(line), None, "{line}");
+        for (stub_env, row) in [
+            (crate::reroute::StubEnv { in_aterm: true }, "warn — claude:"),
+            (crate::reroute::StubEnv::default(), "note — claude:"),
+        ] {
+            let (ok, out) = run_in(&ahead, stub_env);
+            assert!(ok, "{out}");
+            assert!(out.contains(row), "{stub_env:?}: {out}");
+            assert!(!member_has_self_update_notice(&out, "claude"), "{out}");
+            for line in out.lines().filter(|l| l.contains("claude")) {
+                assert_eq!(crate::vendor_direct::retired_wording(line), None, "{line}");
+            }
         }
         // A plain shim: no line about it at all.
         crate::activate::install_tools(&l, &dir, &[tool("claude")], crate::activate::Aliases::Off)
@@ -5597,7 +5436,6 @@ mod tests {
             Some(&ahead),
             now,
             None,
-            None,
             "doctor",
             &Probes::default(),
             &mut out,
@@ -5646,7 +5484,6 @@ mod tests {
                 Some(&path),
                 0,
                 None,
-                None,
                 invoked,
                 &Probes::default(),
                 &mut out,
@@ -5684,7 +5521,6 @@ mod tests {
             Some(&home),
             Some(&path),
             0,
-            None,
             None,
             "doctor",
             &Probes::default(),
@@ -5932,7 +5768,6 @@ mod tests {
                 Some(&path),
                 now,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut out,
@@ -6054,7 +5889,6 @@ mod tests {
                 Some(&path),
                 now,
                 None,
-                None,
                 "doctor",
                 &Probes::default(),
                 &mut out,
@@ -6149,7 +5983,6 @@ mod tests {
             Some(&path),
             now,
             None,
-            None,
             "doctor",
             &Probes::default(),
             &mut out,
@@ -6193,7 +6026,6 @@ mod tests {
             Some(&path),
             0,
             None,
-            None,
             "doctor",
             &probes,
             &mut out,
@@ -6231,6 +6063,7 @@ mod tests {
             local_seal: Some(LocalSealProbe {
                 link_target: PathBuf::from("/Users//me/toolchains/trust-d3866677"),
                 trustc: "d3866677".into(),
+                stale: None,
             }),
             ..Probes::default()
         };
@@ -6241,7 +6074,6 @@ mod tests {
             Some(&home),
             Some(&path),
             0,
-            None,
             None,
             "doctor",
             &probes,
@@ -6259,6 +6091,105 @@ mod tests {
         );
         assert!(out.contains("trust-d3866677"), "{out}");
         assert!(out.contains("healthy"), "{out}");
+    }
+
+    /// A LOCAL TOOLCHAIN OLDER THAN THE STORE'S — or one that is gone — is not a publisher's
+    /// unpublished seal: the line says it is stale and names `repair`, never "features only
+    /// it has".
+    #[test]
+    fn an_older_local_toolchain_is_named_stale_with_repair_as_its_fix() {
+        let l = layout("stale-seal");
+        install(&l, "trust", 9192);
+        let home = synthetic_home("stale-seal");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let probes = Probes {
+            local_seal: Some(LocalSealProbe {
+                link_target: PathBuf::from("/Users//me/trust/build/host/stage2"),
+                trustc: "1a2b3c4d5e".into(),
+                stale: Some(crate::seam::Stale::Older {
+                    its: "2026-07-17".into(),
+                    store: "2026-09-17".into(),
+                }),
+            }),
+            ..Probes::default()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            "doctor",
+            &probes,
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(
+                "warn — rustup's trust channel resolves to a LOCAL toolchain OLDER than the \
+                 atpkg store's: /Users//me/trust/build/host/stage2 (trustc 1a2b3c4d5e, \
+                 2026-07-17; the store's is 2026-09-17)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("fix: `aterm pkg repair` re-points it"),
+            "{out}"
+        );
+        assert!(!out.contains("features only it has"), "{out}");
+        // A link to a tree that is gone: every `cargo +trust` fails, and repair relinks —
+        // said ONCE, with that one fix: not again by (9) as a foreign link to re-point by
+        // hand, nor as a channel rustup lacks (a link to nothing does not resolve either).
+        #[cfg(unix)]
+        {
+            let toolchains = home.join(".rustup").join("toolchains");
+            std::fs::create_dir_all(&toolchains).unwrap();
+            std::os::unix::fs::symlink(
+                "/Users//me/trust/build/host/stage2",
+                toolchains.join("trust"),
+            )
+            .unwrap();
+        }
+        let probes = Probes {
+            local_seal: Some(LocalSealProbe {
+                link_target: PathBuf::from("/Users//me/trust/build/host/stage2"),
+                trustc: "unknown".into(),
+                stale: Some(crate::seam::Stale::Dangling),
+            }),
+            ..Probes::default()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            "doctor",
+            &probes,
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(
+                "warn — rustup's trust channel names /Users//me/trust/build/host/stage2, which \
+                 no longer exists"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("fix: `aterm pkg repair` re-points it"),
+            "{out}"
+        );
+        assert!(!out.contains("is NOT the managed store"), "{out}");
+        assert!(!out.contains("rustup has NO `trust` channel"), "{out}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -6295,7 +6226,6 @@ mod tests {
             Some(home),
             Some(path),
             0,
-            None,
             None,
             "doctor",
             &Probes::default(),
@@ -7196,8 +7126,8 @@ mod tests {
     /// Installed files that still carry the tag — anywhere the heal reaches: a bundle's
     /// `bin/`, a nested directory of it, a shim, the rustup view — are ONE warning line,
     /// exit 0, at most 160 characters, naming the count, what it breaks and `aterm pkg
-    /// repair`. A clean store says nothing about the tag at all, and a record beside a
-    /// build is not what doctor reads. Minted with a synthetic `user.*` attribute:
+    /// repair`. A clean store says nothing about the tag at all. Minted with a synthetic
+    /// `user.*` attribute:
     /// `com.apple.provenance` cannot be set by hand, and a test process may itself be
     /// tracked, so the negative half uses an attribute nothing set rather than the real one.
     #[cfg(target_os = "macos")]
@@ -7220,8 +7150,6 @@ mod tests {
             trust_exe.is_file() && shim.is_file(),
             "fixture laid the tool and its shim"
         );
-        // A record beside a CLEAN build: not doctor's to read.
-        crate::store::record_tracked_install(&l.build_dir("ay", 8256), "an old record").unwrap();
         let home = synthetic_home("provenance");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         let now = crate::flow::rfc3339_to_unix("2026-09-12T00:00:00Z").unwrap();
@@ -7237,7 +7165,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 now,
-                None,
                 None,
                 "doctor",
                 &probes,
@@ -7258,7 +7185,6 @@ mod tests {
             !out.contains("com.apple.provenance") && !out.contains("macOS tag"),
             "{out}"
         );
-        assert!(!out.contains("tracked-install"), "{out}");
 
         for tagged in [&trust_exe, &shim, &nested, &view] {
             crate::provenance::set_xattr_for_test(tagged, "user.aterm.probe", b"1").unwrap();
@@ -7312,7 +7238,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 crate::flow::now_unix(),
-                None,
                 None,
                 "doctor",
                 probes,
@@ -7380,7 +7305,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 now,
-                None,
                 None,
                 "doctor",
                 probes,
@@ -7475,13 +7399,13 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    /// The freshness warnings (2026-09-15 and 2026-09-22), separately: a listing unreached for
-    /// days is named as such — every pass since ran on the cache — and an index build
-    /// unchanged for a month WHILE the listing was reachable reads as a frozen
-    /// publisher. A completed pass with no freshness stamp names that blind spot;
-    /// an unreachable listing is never called a frozen publisher.
+    /// The freshness warnings, separately: an index unreached for days — the last pass
+    /// failed, and the last success is that old — is named as such, and an index build
+    /// unchanged for a month WHILE the index was reached reads as a frozen publisher. An
+    /// unreachable index is never called a frozen publisher, and a record whose last pass
+    /// reached the index names neither (the control).
     #[test]
-    fn doctor_names_an_unreached_listing_and_a_frozen_index_separately() {
+    fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
         let l = layout("freshness");
         install(&l, "ay", 8256);
         let home = synthetic_home("freshness");
@@ -7495,7 +7419,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 now,
-                None,
                 None,
                 "doctor",
                 &Probes::default(),
@@ -7512,63 +7435,53 @@ mod tests {
             outcome: "up to date".into(),
             seams: Vec::new(),
             last_success_at: "2026-10-19T00:00:00Z".into(),
-            last_index_reached_at: String::new(),
-            last_index_build: 0,
-            index_build_changed_at: String::new(),
-            last_pass: String::new(),
-            last_pass_at: String::new(),
+            last_index_build: 32,
+            index_build_changed_at: "2026-10-01T00:00:00Z".into(),
+            last_pass: "ok".into(),
+            last_pass_at: "2026-10-19T00:00:00Z".into(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 0,
             programs: Default::default(),
             extra: Default::default(),
         };
         let out = run(base.clone());
         assert!(!out.contains("has not been reached"), "{out}");
         assert!(!out.contains("publishing looks frozen"), "{out}");
-        // A completed pass with NO freshness stamp is named, never silent
-        // (2026-09-22): the two checks above cannot run over such a record, and a
-        // reader must be told why rather than shown a green report.
-        assert!(
-            out.contains(
-                "warn — no completed pass has recorded reaching the signed index listing \
-                 (last completed pass 2026-10-19T00:00:00Z)"
-            ),
-            "a record without a freshness stamp is named:\n{out}"
-        );
-        assert!(
-            out.contains("OLDER atpkg that does not stamp index freshness")
-                && out.contains("run: aterm pkg update"),
-            "the warn names the second cause and the remedy:\n{out}"
-        );
         let out = run(crate::Status {
-            last_index_reached_at: "2026-10-10T00:00:00Z".into(),
-            last_index_build: 32,
-            index_build_changed_at: "2026-10-01T00:00:00Z".into(),
-            last_pass: String::new(),
-            last_pass_at: String::new(),
-            metered_hold_until: String::new(),
+            last_success_at: "2026-10-10T00:00:00Z".into(),
+            last_pass: "failed".into(),
+            last_pass_at: "2026-10-19T00:00:00Z".into(),
             ..base.clone()
         });
         assert!(
-            !out.contains("no completed pass has recorded reaching"),
-            "a stamped record is not accused of lacking a stamp:\n{out}"
-        );
-        assert!(
-            out.contains("has not been reached for 10 day(s)"),
-            "an unreached listing is named:\n{out}"
+            out.contains("the signed index has not been reached for 10 day(s)"),
+            "an unreached index is named:\n{out}"
         );
         assert!(
             !out.contains("publishing looks frozen"),
             "unreachable is not frozen:\n{out}"
         );
+        // A failure OLDER than the success (a success stamped after the failed pass ended)
+        // is no failure.
         let out = run(crate::Status {
-            last_index_reached_at: "2026-10-19T00:00:00Z".into(),
-            last_index_build: 32,
+            last_success_at: "2026-10-10T00:00:00Z".into(),
+            last_pass: "failed".into(),
+            last_pass_at: "2026-10-09T00:00:00Z".into(),
+            ..base.clone()
+        });
+        assert!(!out.contains("has not been reached"), "{out}");
+        // A pass that ended ok with nothing to check reached nothing, but failed nothing
+        // either: an old success after it is not "unreached".
+        let out = run(crate::Status {
+            last_success_at: "2026-10-10T00:00:00Z".into(),
+            last_pass: "ok".into(),
+            last_pass_at: "2026-10-19T00:00:00Z".into(),
+            ..base.clone()
+        });
+        assert!(!out.contains("has not been reached"), "{out}");
+        let out = run(crate::Status {
             index_build_changed_at: "2026-09-10T00:00:00Z".into(),
-            last_pass: String::new(),
-            last_pass_at: String::new(),
-            metered_hold_until: String::new(),
             ..base
         });
         assert!(
@@ -7769,7 +7682,7 @@ mod tests {
         );
     }
 
-    /// THE OWNER'S 2026-09-22 REPORT, REPLAYED. A pass completed minutes ago, the listing
+    /// THE OWNER'S 2026-09-22 REPORT, REPLAYED. A pass completed minutes ago, the index
     /// was reached, the floor is index 42 — and the release host already answers for index
     /// 43. The report used to say "ok — 0 day(s) since the last completed update pass",
     /// "last-trusted index_build 42" and "healthy", every line true and none the answer.
@@ -7778,7 +7691,7 @@ mod tests {
     /// reader; nothing on this path touches the network.
     #[test]
     fn doctor_says_when_the_channel_head_is_past_the_local_index() {
-        use crate::index_probe::{LISTING_LOCK, LOOKAHEAD_LOCK, NEAR_LOCK};
+        use crate::index_probe::NEAR_LOCK;
         use aterm_update_core::{HeadAnswer, HttpError};
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let l = layout("channel-head");
@@ -7798,14 +7711,13 @@ mod tests {
                 outcome: "up to date".into(),
                 seams: Vec::new(),
                 last_success_at: "2026-09-22T17:58:00Z".into(),
-                last_index_reached_at: "2026-09-22T17:58:00Z".into(),
                 last_index_build: 42,
                 index_build_changed_at: "2026-09-21T09:00:00Z".into(),
                 last_pass: String::new(),
                 last_pass_at: String::new(),
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
-                metered_hold_until: String::new(),
+                pass_seq: 0,
                 programs: Default::default(),
                 extra: Default::default(),
             },
@@ -7826,30 +7738,24 @@ mod tests {
                         .then(|| "https://release-assets.githubusercontent.com/object".into()),
                 })
             };
-            let mut list = |_: &str| -> Result<Vec<u8>, HttpError> { Ok(b"[]".to_vec()) };
             crate::index_probe::successor_with(
                 &l,
                 "alabsystems",
                 "aterm",
                 SystemTime::now(),
                 &mut head,
-                &mut list,
             )
         };
         let age_stamps = |secs_ago: u64| {
-            for lock in [NEAR_LOCK, LOOKAHEAD_LOCK, LISTING_LOCK] {
-                if let Ok(file) = std::fs::File::options()
-                    .write(true)
-                    .open(l.prefix.join(lock))
-                {
-                    file.set_modified(at(secs_ago)).unwrap();
-                }
+            if let Ok(file) = std::fs::File::options()
+                .write(true)
+                .open(l.prefix.join(NEAR_LOCK))
+            {
+                file.set_modified(at(secs_ago)).unwrap();
             }
         };
         let clear = || {
-            for lock in [NEAR_LOCK, LOOKAHEAD_LOCK, LISTING_LOCK] {
-                let _ = std::fs::remove_file(l.prefix.join(lock));
-            }
+            let _ = std::fs::remove_file(l.prefix.join(NEAR_LOCK));
         };
         let run = |index_head: bool| -> (bool, String) {
             let path = std::env::join_paths([l.bin_dir()]).unwrap();
@@ -7859,7 +7765,6 @@ mod tests {
                 Some(&home),
                 Some(&path),
                 now,
-                None,
                 None,
                 "doctor",
                 &Probes {
@@ -7878,7 +7783,7 @@ mod tests {
                 .collect()
         };
 
-        // The §14 cache the pass writes from the listing before it selects — by its REAL
+        // The §14 cache the pass writes from the channel before it selects — by its REAL
         // writer, under the source key the real fetcher uses.
         let cache_holds = |builds: &[u64]| {
             let candidates: Vec<crate::select::Candidate> = builds
@@ -7891,11 +7796,8 @@ mod tests {
                     roster_sig: b"rs".to_vec(),
                 })
                 .collect();
-            crate::cache::IndexCache::for_layout(&l).store(
-                &crate::net::github_source_id("alabsystems"),
-                &candidates,
-                &[],
-            );
+            crate::cache::IndexCache::for_layout(&l)
+                .store(&crate::net::github_source_id("alabsystems"), &candidates);
         };
         let drop_cache = || {
             let _ = std::fs::remove_file(l.prefix.join("index-cache.toml"));
@@ -7920,47 +7822,6 @@ mod tests {
                               pass has landed it on this machine) — run: aterm pkg update";
         assert_eq!(head_lines(&out), [published_line], "{out}");
 
-        // A complete first-page Releases listing is an actionable hint even if all four
-        // release-asset HEADs miss. The doctor reads that third stamp and names the
-        // probe, without claiming a successful asset HEAD it did not observe.
-        clear();
-        let mut head = |_: &str| -> Result<HeadAnswer, HttpError> {
-            Ok(HeadAnswer {
-                code: 404,
-                location: None,
-            })
-        };
-        let mut list = |_: &str| -> Result<Vec<u8>, HttpError> {
-            Ok(br#"[{"tag_name":"atpkg-index-43","assets":[{"name":"index.toml","url":"i"},{"name":"index.toml.sig","url":"is"},{"name":"aterm-machines.toml","url":"m"},{"name":"aterm-machines.toml.sig","url":"ms"}]}]"#.to_vec())
-        };
-        assert_eq!(
-            crate::index_probe::successor_with(
-                &l,
-                "alabsystems",
-                "aterm",
-                SystemTime::now(),
-                &mut head,
-                &mut list,
-            ),
-            crate::index_probe::Probe::Published(43)
-        );
-        age_stamps(120);
-        let cached = crate::index_probe::cached_answer(&l);
-        assert_eq!(
-            cached.near.unwrap().0,
-            crate::index_probe::RangeAnswer::Missing
-        );
-        assert_eq!(
-            cached.lookahead.unwrap().0,
-            crate::index_probe::RangeAnswer::Missing
-        );
-        assert_eq!(
-            cached.listing.unwrap().0,
-            crate::index_probe::RangeAnswer::Published
-        );
-        let (_, out) = run(true);
-        assert_eq!(head_lines(&out), [published_line], "{out}");
-
         clear();
         assert_eq!(
             probe(Some(43), false),
@@ -7968,8 +7829,8 @@ mod tests {
         );
         age_stamps(120);
 
-        // (a2) The same hint, but the last pass that read the listing held only 42 and
-        // older: the listing had no COMPLETE newer release then. "run: aterm pkg update"
+        // (a2) The same hint, but the last pass that reached the index held only 42 and
+        // older: the channel had no COMPLETE newer release then. "run: aterm pkg update"
         // alone would loop ("already current" / "not the newest"); the line says why.
         cache_holds(&[42, 41, 40, 39]);
         let (_, out) = run(true);
@@ -7978,7 +7839,7 @@ mod tests {
             [
                 "doctor: warn — index 42 is not the newest: the index probe found a \
               newer ALab index (seen 2 min ago; an unverified hint), but the last signed \
-              update pass read the index listing 2 min ago and found no complete signed \
+              update pass reached the index 2 min ago and found no complete signed \
               release newer than 42 there — if the new one was up by then, its signed files \
               are not all uploaded and no update can land it yet; otherwise run: aterm pkg \
               update"
@@ -7999,7 +7860,7 @@ mod tests {
         assert!(ok, "{out}");
         assert_eq!(head_lines(&out), [refused], "{out}");
 
-        // (b) Nothing newer, asked just now by both ranges: ok, said as what was checked.
+        // (b) Nothing newer, asked just now: ok, said as what was checked.
         clear();
         drop_cache();
         assert_eq!(probe(None, false), crate::index_probe::Probe::Missing);
@@ -8008,8 +7869,8 @@ mod tests {
         assert_eq!(
             head_lines(&out),
             [
-                "doctor: ok — the release host shows no index newer than 42 at the next four \
-              tags or on its first releases page (checked 30 s ago)"
+                "doctor: ok — the release host shows no index newer than 42 at the next two \
+              tags (checked 30 s ago)"
             ],
             "{out}"
         );
@@ -8021,15 +7882,15 @@ mod tests {
         drop_cache();
 
         // (d) The same answer three hours old — no window asking: its age, not an ok, and
-        // the time the listing was last read (what `aterm pkg update` does move).
+        // the time a pass last reached the index (what `aterm pkg update` does move).
         age_stamps(3 * 3600);
         let (_, out) = run(true);
         assert_eq!(
             head_lines(&out),
             [
                 "doctor: note — the release host showed no index newer than 42 when last \
-              asked, 3 h ago (the aterm window asks every minute while it runs); the last \
-              signed update pass read the index listing 2 min ago"
+              asked, 3 h ago (the aterm window asks every thirty seconds while it runs); the \
+              last signed update pass reached the index 2 min ago"
             ],
             "{out}"
         );
@@ -8044,7 +7905,7 @@ mod tests {
             [
                 "doctor: note — the last check for an index newer than 42 got no usable \
               answer (60 s ago), so whether one is published is unknown here; the last \
-              signed update pass read the index listing 2 min ago"
+              signed update pass reached the index 2 min ago"
             ],
             "{out}"
         );
@@ -8063,8 +7924,8 @@ mod tests {
         assert!(
             out.contains(
                 "doctor: note — no check for an index newer than 43 is recorded on this \
-                 machine (the aterm window asks every minute while it runs); the last signed \
-                 update pass read the index listing 2 min ago"
+                 machine (the aterm window asks every thirty seconds while it runs); the last \
+                 signed update pass reached the index 2 min ago"
             ),
             "{out}"
         );
@@ -8076,18 +7937,18 @@ mod tests {
         assert!(head_lines(&out).is_empty(), "{out}");
         assert!(!out.contains("release host"), "{out}");
 
-        // No pass has recorded reading the listing: the note says that, not a time.
+        // No pass has recorded reaching the index: the note says that, not a time.
         clear();
         let mut status = crate::status::read(&l).unwrap();
-        status.last_index_reached_at.clear();
+        status.last_success_at.clear();
         crate::status::write(&l, &status).unwrap();
         let (_, out) = run(true);
         assert_eq!(
             head_lines(&out),
             [
                 "doctor: note — no check for an index newer than 42 is recorded on this \
-              machine (the aterm window asks every minute while it runs); no update pass has \
-              recorded reading the signed index listing"
+              machine (the aterm window asks every thirty seconds while it runs); no update \
+              pass has recorded reaching the signed index"
             ],
             "{out}"
         );

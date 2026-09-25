@@ -69,6 +69,7 @@ pub mod glass;
 pub mod log;
 pub mod model;
 pub mod progress;
+pub mod strain;
 pub mod text;
 pub mod wire;
 pub mod words;
@@ -80,12 +81,16 @@ pub use animate::{Anim, BandMotion, FineTone, Look, Pace, ROW, RowMotion, Stop, 
 pub use carry::{CarriedMessage, Carry};
 pub use center::{Echo, EchoKind, Live, MessageCenter, Outcome, PostOutcome, Posted, Settled};
 pub use glass::{CapsuleLayout, CapsuleRole, Hit, Links, Presentation, RowKind, RowLayout};
-pub use log::{CodecError, LogLine, LogRecord, LogState, MessageLog, Retired};
+pub use log::{CodecError, LogLine, LogRecord, LogState, MessageLog, Retired, Shelf};
 pub use model::{
     ActionIndex, Amount, Decision, Glyph, Hold, Intent, Load, Message, MessageId, Meter, Origin,
     Restatement, Severity, Tag, TagError, Unit, WallStamp, tags,
 };
 pub use progress::{Eta, ProgressTrack};
+pub use wire::{
+    Applied, DoneHow, DoneRequest, NoticeRequest, Paint, Press, ProgressRequest, WireGate,
+    WireIndicator,
+};
 
 // ---------------------------------------------------------------------------
 // Constants (D8: constants, not knobs).
@@ -138,10 +143,9 @@ pub const HOLD_INFO: Duration = Duration::from_secs(30);
 pub const HOLD_WARN: Duration = Duration::from_secs(45);
 /// An Error row's default hold — an error earns a longer read than a warning.
 pub const HOLD_ERROR: Duration = Duration::from_secs(60);
-// `HOLD_STAGED_AUTOMATIC` (10 min) RETIRED 2026-09-23 (design ruling 57,
-// kept by ruling 143): the automatic staged row is `Hold::Live` and BUSY
-// under the host's `update_words::STAGED_AUTOMATIC_STALE`, which must track
-// the apply ladder's `LANDS_WITHIN` — a host constant the engine cannot see.
+// `HOLD_STAGED_AUTOMATIC` (10 min) RETIRED 2026-09-23 (design ruling 57);
+// since 2026-09-24 the automatic lane's staged build takes no row at all (a
+// record, the owner's silent path).
 /// A staged update that applies only on a press (`status_bars.rs:96`).
 pub const HOLD_STAGED_MANUAL: Duration = Duration::from_secs(60);
 /// A decision row (the retired toast's `ADMIN_STEP_TTL`, notice.rs:146).
@@ -278,6 +282,139 @@ pub const FAILED_WORD: &str = "failed";
 /// check mark still name the work (`✓ Downloading aterm v0.91.0 … 100%
 /// done`, review round 3, 2026-09-24).
 pub const DONE_WORD: &str = "done";
+// ---- The wire's `notice` verb (design rulings 163–198) ------------------
+
+/// A wire progress row's staleness cap: an abandoned row fades (`Stale`, a
+/// Vanish echo) this long after its last line; a live script re-sends its line
+/// (an identical line costs nothing painted and re-arms the cap).
+pub const STALE_WIRE: Duration = Duration::from_secs(120);
+/// The most wire rows live at once: the glass's [`MAX_ROWS`], the overflow
+/// row included, so everything one script has in flight is ON the glass —
+/// never its ETA row under `… 2 more messages` (design ruling 197). A
+/// restate or a same-key supersede never counts against it.
+pub const WIRE_LIVE_CAP: usize = MAX_ROWS as usize;
+/// New wire messages — rows and records, each a log line — per trailing
+/// [`WIRE_MINT_WINDOW`].
+pub const WIRE_MINTS_PER_WINDOW: usize = 60;
+/// The title and detail bytes those mints may carry per window: each is
+/// written to `messages.log` twice (its Posted and its Retired line), so a
+/// flood of full-detail records cannot rotate aterm's own lines out of the
+/// file within minutes (design ruling 194).
+pub const WIRE_BYTES_PER_WINDOW: usize = 16 * 1024;
+/// `notice act` presses per [`WIRE_MINT_WINDOW`]: each repaints, may open
+/// a window and logs a line, so a loop cannot (design ruling 195).
+pub const WIRE_PRESSES_PER_WINDOW: usize = 10;
+/// The most wire-owned records the log ring keeps once it is full: past it a
+/// new record evicts the oldest retired WIRE record, so a script can never
+/// push aterm's own history out of the ring (design ruling 194).
+pub const WIRE_LOG_SHARE: usize = 128;
+/// That window.
+pub const WIRE_MINT_WINDOW: Duration = Duration::from_secs(60);
+/// The least gap between two paints a wire line causes: one motion frame.
+pub const WIRE_PAINT_GAP: Duration = ANIM_FRAME;
+/// The wire's key namespace: `notice` can only ever NAME a key under it, so
+/// it can never restate, end, supersede or record over a host row.
+pub const WIRE_KEY_PREFIX: &str = "wire.";
+/// A wire key's longest spelling after [`WIRE_KEY_PREFIX`].
+pub const WIRE_KEY_MAX: usize = 40;
+/// A glass title is at most this many words ([`text::title_words`])…
+pub const GLASS_TITLE_WORDS: usize = 6;
+/// …and this many characters: short enough to survive beside two capsules.
+pub const GLASS_TITLE_CHARS: usize = 48;
+const _: () =
+    assert!(WIRE_KEY_PREFIX.len() + WIRE_KEY_MAX <= KEY_CAP && GLASS_TITLE_CHARS < TITLE_CAP);
+
+// ---- Strain: explaining very heavy system use (design rulings 206–212) ----
+//
+// The strain engine ([`strain`]) puts ONE row on the glass — `Typing slowed by
+// <cause>` — only while aterm MEASURED slow typing (FELT), a resource is past
+// its enter line (HEAVY), the cause is named from what was measured (NAMED)
+// and it is not the person's own command or an aterm job that already has a
+// row (NOT OWN). Everything else is a record. Nothing is sampled until FELT is
+// suspected, so a calm machine arms nothing.
+
+/// The strain row's supersede key; its records share it.
+pub const STRAIN_KEY: &str = "system.strain";
+/// A hardware key whose arrival-to-present took at least this long is SLOW:
+/// 2.6× this m1's measured p95 of 23.1 ms.
+pub const SLOW_KEY_MS: u32 = 60;
+/// A key this slow is a HITCH as well as slow — the lag a person feels as a
+/// stall, not a drag.
+pub const HITCH_MS: u32 = 250;
+/// A main-loop turn at least this long, ending within the host's typing
+/// tail, is a hitch (the host decides the tail and calls
+/// [`strain::StrainTracker::note_freeze`]).
+pub const FREEZE_MS: u32 = 400;
+/// The trailing window [`strain::StrainTracker::felt`] reads.
+pub const FEEL_WINDOW: Duration = Duration::from_secs(6);
+/// FELT needs at least this many keys in the window, half of them slow…
+pub const FEEL_MIN_KEYS: usize = 6;
+/// …or this many hitches.
+pub const FEEL_MIN_HITCHES: usize = 2;
+/// The typing samples kept: O(1) per note, bounded forever.
+pub const FEEL_RING: usize = 32;
+/// The probe's cadence while the engine is Suspect or Open.
+pub const STRAIN_SAMPLE_EVERY: Duration = Duration::from_secs(2);
+/// A process sweep rides every this-many readings (the first reading of an
+/// episode is a sweep: the baseline the next one takes deltas against).
+pub const STRAIN_SCAN_EVERY: u32 = 2;
+/// Consecutive readings past a kind's enter line before it is HEAVY.
+pub const STRAIN_ENTER_READINGS: u8 = 2;
+/// Consecutive readings past a kind's clear line before it clears.
+pub const STRAIN_CLEAR_READINGS: u8 = 3;
+/// FELT must have held this long before a row: the heavy-load words' own
+/// onset ([`LOAD_AFTER`]).
+pub const STRAIN_ONSET: Duration = LOAD_AFTER;
+/// Suspect falls back to calm after FELT has been false this long…
+pub const STRAIN_UNFELT_CALM: Duration = Duration::from_secs(8);
+/// …or after no hardware key for this long.
+pub const STRAIN_NO_KEY_CALM: Duration = Duration::from_secs(15);
+/// A Suspect that lasted this long leaves one record when it ends.
+pub const STRAIN_RECORD_AFTER: Duration = Duration::from_secs(5);
+/// An open row folds after no hardware key for this long…
+pub const STRAIN_IDLE: Duration = Duration::from_secs(30);
+/// …or after FELT has been false this long across at least
+/// [`FEEL_MIN_KEYS`] keys…
+pub const STRAIN_UNFELT_FOLD: Duration = Duration::from_secs(20);
+/// …or after this long on the glass, whatever the machine does.
+pub const STRAIN_GLASS_MAX: Duration = Duration::from_mins(2);
+/// Nothing folds the row sooner than this after it appeared.
+pub const STRAIN_MIN_GLASS: Duration = Duration::from_secs(6);
+/// The strain row's staleness cap: a host that stops sampling lets it fade.
+pub const STALE_STRAIN: Duration = Duration::from_secs(30);
+/// An unchanged open row is restated this often, so its staleness cap never
+/// fades a row the engine still holds (an identical restatement repaints
+/// nothing).
+pub const STRAIN_KEEPALIVE: Duration = Duration::from_secs(10);
+/// The gauge moves the row only by at least this much (ruling 170).
+pub const STRAIN_RESTATE_PERMILLE: u16 = 20;
+/// The same cause (kind and culprit) stays off the glass this long after
+/// its fold…
+pub const STRAIN_QUIET_SAME: Duration = Duration::from_mins(15);
+/// …and any strain row this long; only an escalation breaks either.
+pub const STRAIN_QUIET_ANY: Duration = Duration::from_mins(3);
+/// Strain records per trailing [`STRAIN_RECORD_WINDOW`]; past it the next
+/// record's title ends ` (+N more)`.
+pub const STRAIN_RECORDS_PER_WINDOW: usize = 6;
+/// That window.
+pub const STRAIN_RECORD_WINDOW: Duration = Duration::from_secs(3600);
+/// At most one `Memory pressure critical` record (while calm) per this.
+pub const STRAIN_CRITICAL_EVERY: Duration = Duration::from_mins(10);
+/// A culprit is NAMED only past this many milli-cores…
+pub const STRAIN_NAMED_MILLICORES: u32 = 1000;
+/// …and this share (percent) of the machine's busy core-time.
+pub const STRAIN_NAMED_SHARE_PCT: u32 = 40;
+/// A memory culprit is named only past this share (percent) of the RAM.
+pub const STRAIN_NAMED_MEMORY_PCT: u32 = 20;
+const _: () = assert!(
+    STRAIN_MIN_GLASS.as_secs() < STALE_STRAIN.as_secs()
+        && STRAIN_KEEPALIVE.as_secs() < STALE_STRAIN.as_secs()
+        && STRAIN_KEY.len() <= KEY_CAP
+        && HITCH_MS > SLOW_KEY_MS
+        && FEEL_MIN_KEYS <= FEEL_RING
+);
+const _: () = assert!(WIRE_LOG_SHARE < LOG_CAP && WIRE_LIVE_CAP < WIRE_LOG_SHARE);
+
 const _: () = assert!(
     STALLED_WORD.len() <= ETA_SHORT_W
         && ETA_SHORT_W < ETA_W
@@ -304,6 +441,7 @@ mod tests {
         ("carry.rs", include_str!("carry.rs")),
         ("progress.rs", include_str!("progress.rs")),
         ("animate.rs", include_str!("animate.rs")),
+        ("strain.rs", include_str!("strain.rs")),
     ];
 
     /// Invariant 1: the engine never samples a clock. Family C's C3 walks only
@@ -340,7 +478,7 @@ mod tests {
             .lines()
             .filter_map(|l| l.strip_prefix("pub mod ")?.strip_suffix(';'))
             .collect();
-        assert_eq!(modules.len(), 10, "{modules:?}");
+        assert_eq!(modules.len(), 11, "{modules:?}");
         for m in &modules {
             let file = format!("{m}.rs");
             assert!(

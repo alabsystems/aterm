@@ -5,7 +5,8 @@
 // `rain_atlas` + `rain_add`). The contract under test:
 //   * empty rain channels (never touched AND explicitly emptied — and quads
 //     empty WITH an atlas set) are byte-identical to the pre-rain path, also
-//     after `clear_overlays` (the `image plain` contract);
+//     after `clear_overlays` (the `image plain` contract) — the `rain_*` row
+//     of `tests/empty_channels.rs`;
 //   * the rain stamp shares the cat regime: NEAREST 1:1, `mul8` tint/alpha,
 //     `flip_x` mirroring, and every painted pixel stays inside the quad's
 //     one-row cell band;
@@ -130,66 +131,6 @@ fn mul8(c: u32, f: u32) -> u32 {
 fn sat_add(dst: u32, premul: u32) -> u32 {
     let ch = |sh: u32| (((dst >> sh) & 0xff) + ((premul >> sh) & 0xff)).min(255);
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
-}
-
-/// Empty rain channels — untouched, explicitly emptied, or atlas-only — must be
-/// byte-identical to the pre-rain path; `clear_overlays` restores the bare
-/// frame (the `image plain` capture contract).
-#[test]
-fn rain_disabled_bytes_identical() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lrainy planet");
-
-    // Pre-feature frame: the snapshot as built, rain never mentioned.
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    // The SAME frame with every rain channel set to its explicit empty state.
-    let mut input = term.cell_frame(3, 12);
-    input.rain_quads = Vec::new();
-    input.rain_atlas = None;
-    input.rain_add = Vec::new();
-    let explicit = rend.render_input(&input).pixels.clone();
-    assert_eq!(
-        base, explicit,
-        "explicit empty rain channels must not change any pixel"
-    );
-
-    // Empty quads WITH an atlas set: the atlas alone draws nothing.
-    input.rain_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-    let atlas_only = rend.render_input(&input).pixels.clone();
-    assert_eq!(
-        base, atlas_only,
-        "a rain atlas with no quads must draw nothing"
-    );
-
-    // `clear_overlays` strips rain like every other bling layer: both quad
-    // Vecs cleared AND the atlas Arc nulled.
-    let mut with_rain = term.cell_frame(3, 12);
-    with_rain.rain_atlas = Some(Arc::new(patterned_atlas(32, 32, 1)));
-    with_rain.rain_quads = vec![band_quad(1, 0, cw as u16, ch.min(32) as u16, 0, 0)];
-    with_rain.rain_add = vec![halo(1, 0, ch as u16, cw as u16, 2, 0x0020_4020)];
-    let painted = rend.render_input(&with_rain).pixels.clone();
-    assert_ne!(base, painted, "non-empty rain must paint something");
-    with_rain.clear_overlays();
-    assert!(
-        with_rain.rain_quads.is_empty(),
-        "clear_overlays must strip rain quads"
-    );
-    assert!(
-        with_rain.rain_atlas.is_none(),
-        "clear_overlays must null the rain atlas Arc"
-    );
-    assert!(
-        with_rain.rain_add.is_empty(),
-        "clear_overlays must strip rain halos"
-    );
-    let stripped = rend.render_input(&with_rain).pixels.clone();
-    assert_eq!(base, stripped, "clear_overlays must restore the bare frame");
 }
 
 /// Stamp correctness: tint and alpha flow through the shared `mul8` math

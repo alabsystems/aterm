@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use aterm_messages::{
-    ANIM_FRAME, Amount, ELAPSED_AFTER, Hold, Look, Message, Meter, Pace, SHRINK_QUIET,
+    ANIM_FRAME, Amount, ELAPSED_AFTER, Hold, Look, Message, Meter, Pace, Restatement, SHRINK_QUIET,
     STALE_UPDATE, Severity, Unit, tags,
 };
 
@@ -205,6 +205,127 @@ fn a_hidden_window_schedules_no_animation_frames() {
             pair[1] - pair[0]
         );
     }
+}
+
+/// A determinate bar's next glint/glide frame searches future cell surfaces.
+/// The event sweep and the park may ask again dozens of times in the SAME
+/// frame during PTY traffic; those reads must share one search, yet a new
+/// reading, width, visual look or visibility edge must keep the first real
+/// transition reachable.
+#[test]
+fn repeated_event_and_park_queries_share_the_next_visible_transition() {
+    let mut app = on_screen_app();
+    let id = app.post_message(download(10_000_000));
+    let t0 = Instant::now();
+    app.prepare_band_motion(WID, t0);
+    let ws = &app.windows[&WID];
+    let expected = app.messages.motion_deadline(
+        &ws.band_layout.as_ref().expect("prepared layout").2,
+        ws.band_motion.as_ref().expect("prepared frame").at,
+        Look::MOVING,
+    );
+    assert!(expected.is_some(), "the live bar has a future transition");
+    assert_eq!(app.band_motion_deadline(t0), expected);
+    let first_scan = app.windows[&WID].band_motion_deadline_computations.get();
+    assert_eq!(first_scan, 1);
+    for event in 0..64 {
+        if event % 4 == 0 {
+            // Terminal output or a typed key may cause an additional present
+            // in this same band frame. It must not force another look-ahead
+            // scan merely because terminal content changed.
+            app.prepare_band_motion(WID, t0);
+        }
+        assert_eq!(app.band_motion_deadline(t0), expected);
+        assert!(app.band_motion_due(t0).is_empty());
+    }
+    assert_eq!(
+        app.windows[&WID].band_motion_deadline_computations.get(),
+        first_scan,
+        "same-frame event and park queries reuse the cell-surface scan"
+    );
+    let due = expected.unwrap();
+    assert_eq!(app.band_motion_due(due), vec![WID]);
+    app.prepare_band_motion(WID, due);
+    assert!(app.band_motion_deadline(due).is_some_and(|next| next > due));
+    let after_frame = app.windows[&WID].band_motion_deadline_computations.get();
+    assert_eq!(
+        after_frame,
+        first_scan + 1,
+        "a presented frame gets a new answer"
+    );
+
+    let next_meter = download(20_000_000).meter;
+    assert!(app.messages.restate(
+        id,
+        Restatement {
+            meter: Some(next_meter),
+            ..Restatement::default()
+        },
+        due,
+    ));
+    let _ = app.band_motion_deadline(due);
+    let after_progress = app.windows[&WID].band_motion_deadline_computations.get();
+    assert_eq!(
+        after_progress,
+        after_frame + 1,
+        "new progress retires the memo"
+    );
+
+    // A visually identical restatement is allowed to re-anchor future ETA
+    // timing while leaving the Settings/glass revision alone.
+    let revision = app.messages.revision();
+    let epoch = app.messages.motion_input_epoch();
+    assert!(app.messages.restate(
+        id,
+        Restatement {
+            title: Some("Downloading aterm v0.92.0".into()),
+            ..Restatement::default()
+        },
+        due,
+    ));
+    assert_eq!(app.messages.revision(), revision);
+    assert_ne!(app.messages.motion_input_epoch(), epoch);
+    let _ = app.band_motion_deadline(due);
+    let after_heartbeat = app.windows[&WID].band_motion_deadline_computations.get();
+    assert_eq!(after_heartbeat, after_progress + 1);
+
+    app.windows.get_mut(&WID).unwrap().cols += 1;
+    let width_probe = due + Duration::from_millis(7);
+    let _ = app.band_motion_deadline(width_probe);
+    let after_width = app.windows[&WID].band_motion_deadline_computations.get();
+    assert_eq!(
+        after_width,
+        after_heartbeat + 1,
+        "width changes the surface cells"
+    );
+    assert_eq!(
+        app.windows[&WID].band_motion_deadline_last_from.get(),
+        Some(width_probe),
+        "a layout mismatch starts from now, not the old frame"
+    );
+    app.windows.get_mut(&WID).unwrap().cols -= 1;
+    app.prepare_band_motion(WID, due);
+    app.windows.get_mut(&WID).unwrap().occluded = true;
+    assert_eq!(app.band_motion_deadline(width_probe), None);
+    assert!(app.band_motion_due(width_probe).is_empty());
+    assert_eq!(
+        app.windows[&WID].band_motion_deadline_computations.get(),
+        after_width
+    );
+    app.windows.get_mut(&WID).unwrap().occluded = false;
+    app.windows.get_mut(&WID).unwrap().focused = false;
+    let focus_probe = due + Duration::from_millis(11);
+    let _ = app.band_motion_deadline(focus_probe);
+    assert_eq!(
+        app.windows[&WID].band_motion_deadline_computations.get(),
+        after_width + 1,
+        "unfocus recomputes the next text-only transition"
+    );
+    assert_eq!(
+        app.windows[&WID].band_motion_deadline_last_from.get(),
+        Some(focus_probe),
+        "a look mismatch starts from now, not the old frame"
+    );
 }
 
 // ---- (3) THE CADENCE AND THE COST OF ONE FRAME -----------------------------
@@ -453,6 +574,32 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
         shoot(&mut app, now + Duration::from_secs(4)),
         a,
         "the still form does not move with time"
+    );
+    // …but its WORDS are the capture's instant's (design ruling 202): a
+    // capture after another reads its own elapsed clock, never the last
+    // painted one (the live run's `1:59` at 120 s was the request time, not
+    // the capture's; re-measured 2026-09-24: every capture read its instant).
+    let text = |cells: &[aterm_core::terminal::RenderCell]| -> String {
+        cells.iter().map(|c| c.ch).collect()
+    };
+    let clock = |row: &str| -> u64 {
+        let word = row
+            .split_whitespace()
+            .find(|w| w.len() == 4 && w.as_bytes()[1] == b':')
+            .unwrap_or_else(|| panic!("an elapsed clock in {row:?}"));
+        word[2..].parse().unwrap()
+    };
+    // Half a second off the second boundary: the motion's 33 ms frame floor
+    // (anchored to the center's birth, and 1 s is not a whole number of
+    // frames) and the post-to-`now` gap can never carry a word across one.
+    let at20 = text(&shoot(&mut app, now + Duration::from_millis(20_500)));
+    let at21 = text(&shoot(&mut app, now + Duration::from_millis(21_500)));
+    assert_eq!(clock(&at20), 20, "{at20:?}");
+    assert_eq!(clock(&at21), 21, "{at21:?}");
+    assert_eq!(
+        text(&shoot(&mut app, now + Duration::from_millis(20_500))),
+        at20,
+        "back to an earlier instant, its words again"
     );
 }
 

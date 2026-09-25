@@ -244,6 +244,12 @@ aterm-predict = { workspace = true }
 # cells), so the native GUI paints the layouts it emits and appends the lines
 # it drains, and the engine stays unit-testable without a window or a clock.
 aterm-messages = { workspace = true }
+# The strain row's samplers (design §10.14, ruling 210): one reading of the
+# machine and one bounded process sweep, taken on the strain host's probe
+# thread only while the engine suspects felt lag. Every platform `cfg` of the
+# feature lives in that crate, so the host glue adds none. Linked here ahead of
+# `strain_host.rs` so the census and forge baselines move once, with the crate.
+aterm-sysprobe = { workspace = true }
 # The inline-suggestion (ghost text) engine: a bounded LRU corpus of
 # shell-integration command blocks plus a pure, clock-injected ranker. Lives in
 # its own crate for the same reason `aterm-predict` does — the state machine is

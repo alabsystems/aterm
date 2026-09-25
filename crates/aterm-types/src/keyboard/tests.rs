@@ -7,42 +7,74 @@
 use super::*;
 
 // =========================================================================
+// Table rows
+// =========================================================================
+
+/// One labelled encoder case: `(what, key, mods, mode, via, want)`.
+///
+/// `via` is the entry point the case drives: [`KEY`] calls [`encode_key`];
+/// [`PRESS`] / [`REPEAT`] / [`RELEASE`] call [`encode_key_with_event`] with that
+/// event. Each row therefore makes exactly the call the one-case test it
+/// replaced made, and keeps that test's expected bytes.
+type Case = (
+    &'static str,
+    Key,
+    Modifiers,
+    KeyboardMode,
+    Option<KeyEventType>,
+    &'static [u8],
+);
+
+const KEY: Option<KeyEventType> = None;
+const PRESS: Option<KeyEventType> = Some(KeyEventType::Press);
+const REPEAT: Option<KeyEventType> = Some(KeyEventType::Repeat);
+const RELEASE: Option<KeyEventType> = Some(KeyEventType::Release);
+
+/// No modifiers / no mode flags, spelled short so a row fits on one line.
+const NO_MODS: Modifiers = Modifiers::empty();
+const LEGACY: KeyboardMode = KeyboardMode::empty();
+
+fn ch(c: char) -> Key {
+    Key::Character(c)
+}
+
+fn named(key: NamedKey) -> Key {
+    Key::Named(key)
+}
+
+fn assert_cases(cases: &[Case]) {
+    for (what, key, mods, mode, via, want) in cases {
+        let got = match via {
+            None => encode_key(key, *mods, *mode),
+            Some(event) => encode_key_with_event(key, *mods, *mode, *event),
+        };
+        assert_eq!(got, *want, "{what}: {key:?} {mods:?} {mode:?} {via:?}");
+    }
+}
+
+// =========================================================================
 // KeyboardMode helpers
 // =========================================================================
 
 #[test]
-fn mode_xterm_modify_other_keys_level_default() {
-    assert_eq!(KeyboardMode::empty().xterm_modify_other_keys_level(), 0);
-}
-
-#[test]
-fn mode_xterm_modify_other_keys_level1() {
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
-    assert_eq!(mode.xterm_modify_other_keys_level(), 1);
-}
-
-#[test]
-fn mode_xterm_modify_other_keys_level2() {
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    assert_eq!(mode.xterm_modify_other_keys_level(), 2);
-}
-
-#[test]
-fn mode_xterm_modify_other_keys_both_levels_returns_2() {
-    // Level 2 takes precedence when both flags are set.
-    let mode =
-        KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1 | KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    assert_eq!(mode.xterm_modify_other_keys_level(), 2);
-}
-
-#[test]
-fn mode_xterm_format_other_keys_false_by_default() {
-    assert!(!KeyboardMode::empty().xterm_format_other_keys());
-}
-
-#[test]
-fn mode_xterm_format_other_keys_true() {
-    assert!(KeyboardMode::XTERM_FORMAT_OTHER_KEYS.xterm_format_other_keys());
+fn keyboard_mode_xterm_accessors() {
+    let level1 = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
+    let level2 = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
+    for (what, mode, level) in [
+        ("default", LEGACY, 0),
+        ("level 1", level1, 1),
+        ("level 2", level2, 2),
+        // Level 2 takes precedence when both flags are set.
+        ("both levels", level1 | level2, 2),
+    ] {
+        assert_eq!(mode.xterm_modify_other_keys_level(), level, "{what}");
+    }
+    for (mode, format) in [
+        (LEGACY, false),
+        (KeyboardMode::XTERM_FORMAT_OTHER_KEYS, true),
+    ] {
+        assert_eq!(mode.xterm_format_other_keys(), format, "{mode:?}");
+    }
 }
 
 // =========================================================================
@@ -140,70 +172,32 @@ fn term_mode_to_keyboard_mode_ignores_non_keyboard_flags() {
 // =========================================================================
 
 #[test]
-fn modifiers_kitty_encoded_no_mods() {
-    assert_eq!(Modifiers::empty().kitty_encoded(), 1);
-}
-
-#[test]
-fn modifiers_kitty_encoded_shift() {
-    assert_eq!(Modifiers::SHIFT.kitty_encoded(), 2);
-}
-
-#[test]
-fn modifiers_kitty_encoded_ctrl_alt() {
-    assert_eq!((Modifiers::CTRL | Modifiers::ALT).kitty_encoded(), 7);
-}
-
-#[test]
-fn modifiers_kitty_encoded_caps_lock() {
-    // WIRE-MODIFIERS: Caps Lock (bit 64) reports as kitty value 65, and combines
-    // with chord modifiers (Shift+CapsLock -> 1 + 64 + shift(1) = 66).
-    assert_eq!(Modifiers::CAPS_LOCK.kitty_encoded(), 65);
-    assert_eq!(
-        (Modifiers::SHIFT | Modifiers::CAPS_LOCK).kitty_encoded(),
-        66
-    );
-}
-
-#[test]
-fn modifiers_kitty_encoded_num_lock() {
-    // Num Lock (bit 128) reports as kitty value 129.
-    assert_eq!(Modifiers::NUM_LOCK.kitty_encoded(), 129);
-}
-
-#[test]
-fn modifiers_xterm_ignores_locks() {
-    // Legacy xterm modifier encoding does NOT report Caps/Num Lock.
-    assert_eq!(Modifiers::CAPS_LOCK.xterm_encoded(), 1);
-    assert_eq!(Modifiers::NUM_LOCK.xterm_encoded(), 1);
-}
-
-#[test]
-fn modifiers_xterm_encoded_no_mods() {
-    assert_eq!(Modifiers::empty().xterm_encoded(), 1);
-}
-
-#[test]
-fn modifiers_xterm_encoded_shift() {
-    assert_eq!(Modifiers::SHIFT.xterm_encoded(), 2);
-}
-
-#[test]
-fn modifiers_xterm_encoded_alt() {
-    assert_eq!(Modifiers::ALT.xterm_encoded(), 3);
-}
-
-#[test]
-fn modifiers_xterm_encoded_ctrl() {
-    assert_eq!(Modifiers::CTRL.xterm_encoded(), 5);
-}
-
-#[test]
-fn modifiers_xterm_encoded_shift_alt_ctrl() {
-    assert_eq!(
-        (Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL).xterm_encoded(),
-        8
-    );
+fn modifier_wire_values() {
+    for (mods, kitty) in [
+        (NO_MODS, 1),
+        (Modifiers::SHIFT, 2),
+        (Modifiers::CTRL | Modifiers::ALT, 7),
+        // WIRE-MODIFIERS: Caps Lock (bit 64) reports as kitty value 65, and
+        // combines with chord modifiers (Shift+CapsLock -> 1 + 64 + shift(1) = 66).
+        (Modifiers::CAPS_LOCK, 65),
+        (Modifiers::SHIFT | Modifiers::CAPS_LOCK, 66),
+        // Num Lock (bit 128) reports as kitty value 129.
+        (Modifiers::NUM_LOCK, 129),
+    ] {
+        assert_eq!(mods.kitty_encoded(), kitty, "kitty {mods:?}");
+    }
+    for (mods, xterm) in [
+        // Legacy xterm modifier encoding does NOT report Caps/Num Lock.
+        (Modifiers::CAPS_LOCK, 1),
+        (Modifiers::NUM_LOCK, 1),
+        (NO_MODS, 1),
+        (Modifiers::SHIFT, 2),
+        (Modifiers::ALT, 3),
+        (Modifiers::CTRL, 5),
+        (Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL, 8),
+    ] {
+        assert_eq!(mods.xterm_encoded(), xterm, "xterm {mods:?}");
+    }
 }
 
 // =========================================================================
@@ -232,116 +226,42 @@ mod tests_legacy;
 // =========================================================================
 
 #[test]
-fn kitty_encode_character_no_mods() {
+#[rustfmt::skip]
+fn kitty_disambiguate_encodings() {
     let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Character('a'), Modifiers::empty(), mode);
-    // Disambiguate must NOT over-escape a plain printable key: it stays text.
-    assert_eq!(result, b"a");
-}
-
-#[test]
-fn kitty_encode_character_with_shift_stays_text() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Character('a'), Modifiers::SHIFT, mode);
-    // Shift+key is NOT in the spec's disambiguation list ("the Esc, alt+key,
-    // ctrl+key, ctrl+alt+key, shift+alt+key keys") — it composes text, and
-    // kitty sends the shifted glyph in every text-preserving mode.
-    assert_eq!(result, b"A");
-}
-
-#[test]
-fn kitty_encode_shifted_symbol_stays_text() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Character('2'), Modifiers::SHIFT, mode);
-    assert_eq!(result, b"@");
-}
-
-#[test]
-fn kitty_encode_character_with_ctrl() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Character('c'), Modifiers::CTRL, mode);
-    // CSI 99;5 u (ctrl = mod value 5)
-    assert_eq!(result, b"\x1b[99;5u");
-}
-
-#[test]
-fn kitty_encode_named_enter() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::Enter), Modifiers::empty(), mode);
-    // Enter has a legacy text byte and keeps it under disambiguate (#audit).
-    assert_eq!(result, b"\r");
-}
-
-#[test]
-fn kitty_encode_named_escape() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::Escape), Modifiers::empty(), mode);
-    // Escape kitty code = 27
-    assert_eq!(result, b"\x1b[27u");
-}
-
-#[test]
-fn kitty_encode_named_arrow_up() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::ArrowUp), Modifiers::empty(), mode);
-    // ArrowUp retains legacy CSI format under Kitty protocol (#7474)
-    assert_eq!(result, b"\x1b[A");
-}
-
-#[test]
-fn kitty_encode_f1() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::F1), Modifiers::empty(), mode);
-    // F1 retains legacy CSI format under Kitty protocol (#7474)
-    assert_eq!(result, b"\x1b[P");
-}
-
-#[test]
-fn kitty_encode_f25() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::F25), Modifiers::empty(), mode);
-    assert_eq!(result, b"\x1b[57388u");
-}
-
-#[test]
-fn kitty_encode_scroll_lock_silent_without_report_all() {
-    // Modifier/lock keys are reported ONLY under REPORT_ALL_KEYS_AS_ESC
-    // (kitty's is_modifier_key gate covers ScrollLock/CapsLock/NumLock too).
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::ScrollLock), Modifiers::empty(), mode);
-    assert!(result.is_empty());
-}
-
-#[test]
-fn kitty_encode_scroll_lock_reported_under_report_all() {
-    let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC;
-    let result = encode_key(&Key::Named(NamedKey::ScrollLock), Modifiers::empty(), mode);
-    assert_eq!(result, b"\x1b[57359u");
-}
-
-#[test]
-fn kitty_encode_media_play() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::MediaPlay), Modifiers::empty(), mode);
-    assert_eq!(result, b"\x1b[57428u");
-}
-
-#[test]
-fn kitty_encode_numpad_equal() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(&Key::Named(NamedKey::NumpadEqual), Modifiers::empty(), mode);
-    assert_eq!(result, b"\x1b[57415u");
-}
-
-#[test]
-fn kitty_encode_numpad_arrow_up() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key(
-        &Key::Named(NamedKey::NumpadArrowUp),
-        Modifiers::empty(),
-        mode,
-    );
-    assert_eq!(result, b"\x1b[57419u");
+    assert_cases(&[
+        // Disambiguate must NOT over-escape a plain printable key: it stays text.
+        ("plain char", ch('a'), NO_MODS, mode, KEY, b"a"),
+        // Shift+key is NOT in the spec's disambiguation list ("the Esc, alt+key,
+        // ctrl+key, ctrl+alt+key, shift+alt+key keys") — it composes text, and
+        // kitty sends the shifted glyph in every text-preserving mode.
+        ("shift char", ch('a'), Modifiers::SHIFT, mode, KEY, b"A"),
+        ("shifted symbol", ch('2'), Modifiers::SHIFT, mode, KEY, b"@"),
+        // CSI 99;5 u (ctrl = mod value 5)
+        ("ctrl char", ch('c'), Modifiers::CTRL, mode, KEY, b"\x1b[99;5u"),
+        // Enter has a legacy text byte and keeps it under disambiguate (#audit).
+        ("enter", named(NamedKey::Enter), NO_MODS, mode, KEY, b"\r"),
+        // Escape kitty code = 27
+        ("escape", named(NamedKey::Escape), NO_MODS, mode, KEY, b"\x1b[27u"),
+        // ArrowUp and F1 retain legacy CSI format under Kitty protocol (#7474)
+        ("arrow up", named(NamedKey::ArrowUp), NO_MODS, mode, KEY, b"\x1b[A"),
+        ("f1", named(NamedKey::F1), NO_MODS, mode, KEY, b"\x1b[P"),
+        ("f25", named(NamedKey::F25), NO_MODS, mode, KEY, b"\x1b[57388u"),
+        // Modifier/lock keys are reported ONLY under REPORT_ALL_KEYS_AS_ESC
+        // (kitty's is_modifier_key gate covers ScrollLock/CapsLock/NumLock too).
+        ("scroll lock", named(NamedKey::ScrollLock), NO_MODS, mode, KEY, b""),
+        (
+            "scroll lock, report-all",
+            named(NamedKey::ScrollLock),
+            NO_MODS,
+            KeyboardMode::REPORT_ALL_KEYS_AS_ESC,
+            KEY,
+            b"\x1b[57359u",
+        ),
+        ("media play", named(NamedKey::MediaPlay), NO_MODS, mode, KEY, b"\x1b[57428u"),
+        ("numpad equal", named(NamedKey::NumpadEqual), NO_MODS, mode, KEY, b"\x1b[57415u"),
+        ("numpad up", named(NamedKey::NumpadArrowUp), NO_MODS, mode, KEY, b"\x1b[57419u"),
+    ]);
 }
 
 // =========================================================================
@@ -349,239 +269,87 @@ fn kitty_encode_numpad_arrow_up() {
 // =========================================================================
 
 #[test]
-fn kitty_encode_repeat_event_with_report_flag_stays_text() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::empty(),
-        mode,
-        KeyEventType::Repeat,
-    );
-    // Text-producing presses AND repeats stay plain UTF-8 under 0b11 — the
-    // event-type subfield only decorates events that already need an escape
-    // form (kitty sends 'a' here; its plain-text release stays silent).
-    assert_eq!(result, b"a");
-}
-
-#[test]
-fn kitty_encode_ctrl_chord_repeat_with_report_flag_carries_event_type() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::CTRL,
-        mode,
-        KeyEventType::Repeat,
-    );
-    // A chord that disambiguates gets the full CSI-u with `:2` (repeat).
-    assert_eq!(result, b"\x1b[97;5:2u");
-}
-
-#[test]
-fn kitty_text_release_with_report_flag_stays_silent_without_report_all() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::empty(),
-        mode,
-        KeyEventType::Release,
-    );
-    // Text-producing events have no release representation unless the app
-    // also requests REPORT_ALL_KEYS_AS_ESC.
-    assert!(result.is_empty());
-}
-
-#[test]
-fn kitty_encode_press_event_with_report_flag_stays_text() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::empty(),
-        mode,
-        KeyEventType::Press,
-    );
-    // Spec: event-type reporting adds repeat/release reports WITHOUT changing
-    // press encoding — a plain printable press is still text under 0b11.
-    assert_eq!(result, b"a");
-}
-
-#[test]
-fn kitty_encode_release_without_report_flag_is_empty() {
-    // Kitty spec: releases are reported ONLY under REPORT_EVENT_TYPES. Under
-    // disambiguate-only a release must encode to
-    // NOTHING — the CSI-u encoder would omit the `:3` subfield in this mode,
-    // making the release byte-identical to a press and doubling every key.
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::empty(),
-        mode,
-        KeyEventType::Release,
-    );
-    assert!(result.is_empty());
-}
-
-#[test]
-fn kitty_encode_named_release_event_with_report_flag_only() {
-    let result = encode_key_with_event(
-        &Key::Named(NamedKey::ArrowUp),
-        Modifiers::empty(),
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Release,
-    );
-    // ArrowUp release retains legacy CSI format with event type (#7474)
-    assert_eq!(result, b"\x1b[1;1:3A");
-}
-
-#[test]
-fn kitty_encode_named_repeat_event_with_report_flag_only() {
-    let result = encode_key_with_event(
-        &Key::Named(NamedKey::Escape),
-        Modifiers::empty(),
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Repeat,
-    );
-    assert_eq!(result, b"\x1b[27;1:2u");
-}
-
-#[test]
-fn kitty_encode_character_release_with_report_flag_only_is_empty() {
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::empty(),
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Release,
-    );
-    // REPORT_EVENT_TYPES cannot add an event type to plain UTF-8 text. The
-    // release exists only once REPORT_ALL_KEYS_AS_ESC makes the key a report.
-    assert!(result.is_empty());
-}
-
-#[test]
-fn kitty_encode_ctrl_character_release_event_with_report_flag_only() {
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::CTRL,
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Release,
-    );
-    assert_eq!(result, b"\x1b[97;5:3u");
-}
-
-#[test]
-fn kitty_encode_modified_character_repeat_event_with_report_flag_only() {
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::CTRL | Modifiers::SHIFT,
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Repeat,
-    );
-    assert_eq!(result, b"\x1b[97;6:2u");
-}
-
-#[test]
-fn kitty_encode_modified_character_release_event_with_report_flag_only() {
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::CTRL | Modifiers::SHIFT,
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Release,
-    );
-    assert_eq!(result, b"\x1b[97;6:3u");
-}
-
-#[test]
-fn kitty_encode_shift_tab_repeat_event_with_report_flag_only() {
-    let result = encode_key_with_event(
-        &Key::Named(NamedKey::Tab),
-        Modifiers::SHIFT,
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Repeat,
-    );
-    assert_eq!(result, b"\x1b[9;2:2u");
-}
-
-#[test]
-fn kitty_encode_shift_tab_release_with_report_flag_only_is_empty() {
-    let result = encode_key_with_event(
-        &Key::Named(NamedKey::Tab),
-        Modifiers::SHIFT,
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Release,
-    );
-    assert!(result.is_empty());
-}
-
-#[test]
-fn kitty_encode_enter_release_event_with_report_flag_only_is_empty() {
-    let result = encode_key_with_event(
-        &Key::Named(NamedKey::Enter),
-        Modifiers::empty(),
-        KeyboardMode::REPORT_EVENT_TYPES,
-        KeyEventType::Release,
-    );
-    assert!(result.is_empty());
-}
-
-#[test]
-fn legacy_press_remains_legacy_with_report_flag_only() {
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowUp),
-        Modifiers::empty(),
-        KeyboardMode::REPORT_EVENT_TYPES,
-    );
-    assert_eq!(result, b"\x1b[A");
-}
-
-#[test]
-fn kitty_encode_modifier_plus_release() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::CTRL,
-        mode,
-        KeyEventType::Release,
-    );
-    // CSI 97;5:3 u (ctrl=5, release=3)
-    assert_eq!(result, b"\x1b[97;5:3u");
-}
-
-#[test]
-fn kitty_encode_shift_left_silent_without_report_all() {
-    // Modifier keys are reported ONLY under REPORT_ALL_KEYS_AS_ESC; under
-    // 0b11 both press and release must be silent.
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
-    for (mods, event) in [
-        (Modifiers::empty(), KeyEventType::Press),
-        (Modifiers::SHIFT, KeyEventType::Release),
-    ] {
-        let result = encode_key_with_event(&Key::Named(NamedKey::ShiftLeft), mods, mode, event);
-        assert!(result.is_empty(), "bare Shift {event:?} must be silent");
-    }
-}
-
-#[test]
-fn kitty_encode_shift_left_press_updates_modifiers_under_report_all() {
-    let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC;
-    let result = encode_key_with_event(
-        &Key::Named(NamedKey::ShiftLeft),
-        Modifiers::empty(),
-        mode,
-        KeyEventType::Press,
-    );
-    // The bit reflects the state INCLUDING the current event: set on press.
-    assert_eq!(result, b"\x1b[57441;2u");
-}
-
-#[test]
-fn kitty_encode_shift_left_release_updates_modifiers_under_report_all() {
-    let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_EVENT_TYPES;
-    let result = encode_key_with_event(
-        &Key::Named(NamedKey::ShiftLeft),
-        Modifiers::SHIFT,
-        mode,
-        KeyEventType::Release,
-    );
-    assert_eq!(result, b"\x1b[57441;1:3u");
+#[rustfmt::skip]
+fn kitty_event_type_encodings() {
+    let both = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_EVENT_TYPES;
+    let events = KeyboardMode::REPORT_EVENT_TYPES;
+    let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+    assert_cases(&[
+        // Text-producing presses AND repeats stay plain UTF-8 under 0b11 — the
+        // event-type subfield only decorates events that already need an escape
+        // form (kitty sends 'a' here; its plain-text release stays silent).
+        ("0b11 text repeat", ch('a'), NO_MODS, both, REPEAT, b"a"),
+        // A chord that disambiguates gets the full CSI-u with `:2` (repeat).
+        ("0b11 ctrl repeat", ch('a'), Modifiers::CTRL, both, REPEAT, b"\x1b[97;5:2u"),
+        // Text-producing events have no release representation unless the app
+        // also requests REPORT_ALL_KEYS_AS_ESC.
+        ("0b11 text release", ch('a'), NO_MODS, both, RELEASE, b""),
+        // Spec: event-type reporting adds repeat/release reports WITHOUT changing
+        // press encoding — a plain printable press is still text under 0b11.
+        ("0b11 text press", ch('a'), NO_MODS, both, PRESS, b"a"),
+        // Kitty spec: releases are reported ONLY under REPORT_EVENT_TYPES. Under
+        // disambiguate-only a release must encode to NOTHING — the CSI-u encoder
+        // would omit the `:3` subfield in this mode, making the release
+        // byte-identical to a press and doubling every key.
+        (
+            "disambiguate-only release",
+            ch('a'),
+            NO_MODS,
+            KeyboardMode::DISAMBIGUATE_ESC_CODES,
+            RELEASE,
+            b"",
+        ),
+        // ArrowUp release retains legacy CSI format with event type (#7474)
+        ("0b10 up release", named(NamedKey::ArrowUp), NO_MODS, events, RELEASE, b"\x1b[1;1:3A"),
+        ("0b10 esc repeat", named(NamedKey::Escape), NO_MODS, events, REPEAT, b"\x1b[27;1:2u"),
+        // REPORT_EVENT_TYPES cannot add an event type to plain UTF-8 text. The
+        // release exists only once REPORT_ALL_KEYS_AS_ESC makes the key a report.
+        ("0b10 text release", ch('a'), NO_MODS, events, RELEASE, b""),
+        ("0b10 ctrl release", ch('a'), Modifiers::CTRL, events, RELEASE, b"\x1b[97;5:3u"),
+        ("0b10 ctrl+shift repeat", ch('a'), ctrl_shift, events, REPEAT, b"\x1b[97;6:2u"),
+        ("0b10 ctrl+shift release", ch('a'), ctrl_shift, events, RELEASE, b"\x1b[97;6:3u"),
+        (
+            "0b10 shift+tab repeat",
+            named(NamedKey::Tab),
+            Modifiers::SHIFT,
+            events,
+            REPEAT,
+            b"\x1b[9;2:2u",
+        ),
+        ("0b10 shift+tab release", named(NamedKey::Tab), Modifiers::SHIFT, events, RELEASE, b""),
+        ("0b10 enter release", named(NamedKey::Enter), NO_MODS, events, RELEASE, b""),
+        ("0b10 press stays legacy", named(NamedKey::ArrowUp), NO_MODS, events, KEY, b"\x1b[A"),
+        // CSI 97;5:3 u (ctrl=5, release=3)
+        ("0b11 ctrl release", ch('a'), Modifiers::CTRL, both, RELEASE, b"\x1b[97;5:3u"),
+        // Modifier keys are reported ONLY under REPORT_ALL_KEYS_AS_ESC; under
+        // 0b11 both press and release must be silent.
+        ("0b11 bare shift press", named(NamedKey::ShiftLeft), NO_MODS, both, PRESS, b""),
+        (
+            "0b11 bare shift release",
+            named(NamedKey::ShiftLeft),
+            Modifiers::SHIFT,
+            both,
+            RELEASE,
+            b"",
+        ),
+        // The bit reflects the state INCLUDING the current event: set on press.
+        (
+            "report-all shift press",
+            named(NamedKey::ShiftLeft),
+            NO_MODS,
+            KeyboardMode::REPORT_ALL_KEYS_AS_ESC,
+            PRESS,
+            b"\x1b[57441;2u",
+        ),
+        (
+            "report-all shift release",
+            named(NamedKey::ShiftLeft),
+            Modifiers::SHIFT,
+            KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_EVENT_TYPES,
+            RELEASE,
+            b"\x1b[57441;1:3u",
+        ),
+    ]);
 }
 
 // =========================================================================
@@ -589,21 +357,42 @@ fn kitty_encode_shift_left_release_updates_modifiers_under_report_all() {
 // =========================================================================
 
 #[test]
-fn xterm_modify_other_keys_level1_alt_char() {
-    // Level 1: only Alt triggers modifyOtherKeys encoding
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
-    let result = encode_key(&Key::Character('a'), Modifiers::ALT, mode);
-    // Default format: CSI 27;3;97 ~ (mod=3=alt, code=97='a')
-    assert_eq!(result, b"\x1b[27;3;97~");
-}
-
-#[test]
-fn xterm_modify_other_keys_level1_ctrl_char_falls_through() {
-    // Level 1 with only Ctrl: does NOT use modifyOtherKeys, falls to legacy
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
-    let result = encode_key(&Key::Character('c'), Modifiers::CTRL, mode);
-    // Legacy Ctrl+C = 0x03
-    assert_eq!(result, vec![0x03]);
+#[rustfmt::skip]
+fn xterm_modify_other_keys_encodings() {
+    let level1 = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
+    let level2 = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
+    assert_cases(&[
+        // Level 1: only Alt triggers modifyOtherKeys encoding.
+        // Default format: CSI 27;3;97 ~ (mod=3=alt, code=97='a')
+        ("L1 alt char", ch('a'), Modifiers::ALT, level1, KEY, b"\x1b[27;3;97~"),
+        // Level 1 with only Ctrl: does NOT use modifyOtherKeys, falls to legacy
+        // Ctrl+C = 0x03.
+        ("L1 ctrl char", ch('c'), Modifiers::CTRL, level1, KEY, &[0x03]),
+        // Level 2: any modifier triggers modifyOtherKeys encoding.
+        // Default format: CSI 27;5;99 ~ (mod=5=ctrl, code=99='c')
+        ("L2 ctrl char", ch('c'), Modifiers::CTRL, level2, KEY, b"\x1b[27;5;99~"),
+        // Default format: CSI 27;2;97 ~ (mod=2=shift, code=97='a')
+        ("L2 shift char", ch('a'), Modifiers::SHIFT, level2, KEY, b"\x1b[27;2;97~"),
+        // formatOtherKeys=1: CSI code ; modifier u (code=97='a', mod=5=ctrl)
+        (
+            "L2 formatOtherKeys",
+            ch('a'),
+            Modifiers::CTRL,
+            level2 | KeyboardMode::XTERM_FORMAT_OTHER_KEYS,
+            KEY,
+            b"\x1b[97;5u",
+        ),
+        // modifyOtherKeys applies to specific named keys too (Enter → code 13):
+        // CSI 27;3;13 ~
+        ("L1 alt enter", named(NamedKey::Enter), Modifiers::ALT, level1, KEY, b"\x1b[27;3;13~"),
+        // CSI 27;2;9 ~
+        ("L2 shift tab", named(NamedKey::Tab), Modifiers::SHIFT, level2, KEY, b"\x1b[27;2;9~"),
+        // Arrow keys are NOT in the modifyOtherKeys subset — falls through to
+        // legacy Ctrl+Up: CSI 1;5 A
+        ("L2 ctrl up", named(NamedKey::ArrowUp), Modifiers::CTRL, level2, KEY, b"\x1b[1;5A"),
+        // No modifiers → modifyOtherKeys doesn't apply.
+        ("L2 no mods", ch('a'), NO_MODS, level2, KEY, b"a"),
+    ]);
 }
 
 #[test]
@@ -640,23 +429,6 @@ fn xterm_modify_other_keys_level1_reports_only_ambiguous_ctrl_shift_chars() {
 }
 
 #[test]
-fn xterm_modify_other_keys_level2_ctrl_char() {
-    // Level 2: any modifier triggers modifyOtherKeys encoding
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    let result = encode_key(&Key::Character('c'), Modifiers::CTRL, mode);
-    // Default format: CSI 27;5;99 ~ (mod=5=ctrl, code=99='c')
-    assert_eq!(result, b"\x1b[27;5;99~");
-}
-
-#[test]
-fn xterm_modify_other_keys_level2_shift_char() {
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    let result = encode_key(&Key::Character('a'), Modifiers::SHIFT, mode);
-    // Default format: CSI 27;2;97 ~ (mod=2=shift, code=97='a')
-    assert_eq!(result, b"\x1b[27;2;97~");
-}
-
-#[test]
 fn xterm_modify_other_keys_level2_preserves_unambiguous_shifted_text() {
     let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
     assert_eq!(
@@ -690,49 +462,6 @@ fn xterm_modify_other_keys_level2_ctrl_backspace_uses_legacy_toggle() {
         encode_key(&Key::Named(NamedKey::Backspace), Modifiers::SHIFT, mode),
         b"\x1b[27;2;127~"
     );
-}
-
-#[test]
-fn xterm_modify_other_keys_format_other_keys() {
-    // formatOtherKeys=1: CSI code ; modifier u
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2 | KeyboardMode::XTERM_FORMAT_OTHER_KEYS;
-    let result = encode_key(&Key::Character('a'), Modifiers::CTRL, mode);
-    // CSI 97;5 u (code=97='a', mod=5=ctrl)
-    assert_eq!(result, b"\x1b[97;5u");
-}
-
-#[test]
-fn xterm_modify_other_keys_named_enter_with_alt() {
-    // modifyOtherKeys applies to specific named keys too (Enter → code 13)
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
-    let result = encode_key(&Key::Named(NamedKey::Enter), Modifiers::ALT, mode);
-    // CSI 27;3;13 ~
-    assert_eq!(result, b"\x1b[27;3;13~");
-}
-
-#[test]
-fn xterm_modify_other_keys_tab_level2_shift() {
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    let result = encode_key(&Key::Named(NamedKey::Tab), Modifiers::SHIFT, mode);
-    // CSI 27;2;9 ~
-    assert_eq!(result, b"\x1b[27;2;9~");
-}
-
-#[test]
-fn xterm_modify_other_keys_no_effect_on_arrows() {
-    // Arrow keys are NOT in the modifyOtherKeys subset — falls through to legacy
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    let result = encode_key(&Key::Named(NamedKey::ArrowUp), Modifiers::CTRL, mode);
-    // Legacy Ctrl+Up: CSI 1;5 A
-    assert_eq!(result, b"\x1b[1;5A");
-}
-
-#[test]
-fn xterm_modify_other_keys_no_mods_falls_through() {
-    // No modifiers → modifyOtherKeys doesn't apply
-    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    let result = encode_key(&Key::Character('a'), Modifiers::empty(), mode);
-    assert_eq!(result, b"a");
 }
 
 #[test]

@@ -989,6 +989,7 @@ pub(crate) fn snapshot_words(
             // No known fraction yet (a pass before its plan lands, a program
             // whose phase has no bytes): busy, and the engine moves it.
             busy: fill.is_none(),
+            level: false,
         })
         .hold(Hold::Live {
             stale_after: STALE_TAILED,
@@ -1143,7 +1144,6 @@ mod tests {
                         bytes_total: 900_000_000,
                         build: Some(5520),
                         bumped: false,
-                        bumped_with: None,
                         error: None,
                     },
                 ),
@@ -1155,7 +1155,6 @@ mod tests {
                         bytes_total: 0,
                         build: None,
                         bumped: false,
-                        bumped_with: None,
                         error: None,
                     },
                 ),
@@ -1451,7 +1450,7 @@ mod tests {
     #[test]
     fn a_lock_wait_timeout_is_a_deferred_record_not_a_failure() {
         let m = deferred(
-            "waiting for an earlier package update to finish \u{2014} trying again in 30 s",
+            "waiting for an earlier package update to finish \u{2014} trying again when it finishes or in 30 s",
         );
         assert_eq!(m.title, "Package update postponed");
         assert_eq!(m.severity, Severity::Info);
@@ -1459,7 +1458,7 @@ mod tests {
         assert_eq!(m.hold, Hold::LogOnly);
         assert_eq!(m.key, None, "unkeyed");
         assert!(!m.detail[0].contains("failed"), "{}", m.detail[0]);
-        assert!(m.detail[0].contains("trying again in 30 s"));
+        assert!(m.detail[0].contains("trying again when it finishes or in 30 s"));
     }
 
     /// A pass that LEFT NO ALAB TOOLS and saw no failure (`seed-nothing:`,
@@ -1789,7 +1788,6 @@ mod tests {
         let mut f = file(Some(7), "net");
         for row in f.programs.values_mut() {
             row.bumped = true;
-            row.bumped_with = Some("claude".into());
         }
         let (m, _) = live_of(snapshot_words(
             Some(&crate::PkgProgressSnapshot {
@@ -1833,7 +1831,6 @@ mod tests {
                 bytes_total: 2,
                 build: None,
                 bumped: false,
-                bumped_with: None,
                 error: None,
             },
         );
@@ -2146,7 +2143,6 @@ mod tests {
             bytes_total: 0,
             build: None,
             bumped: false,
-            bumped_with: None,
             error: None,
         };
         let with = |phases: &[Phase]| {

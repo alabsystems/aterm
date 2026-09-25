@@ -28,6 +28,7 @@ pub type fsfilcnt_t = c_uint;
 pub type gid_t = u32;
 pub type host_flavor_t = integer_t;
 pub type host_info64_t = *mut integer_t;
+pub type host_info_t = *mut integer_t;
 pub type host_t = c_uint;
 pub type id_t = c_uint;
 pub type idtype_t = c_uint;
@@ -38,6 +39,7 @@ pub type integer_t = c_int;
 pub type intptr_t = isize;
 pub type kern_return_t = c_int;
 pub type mach_msg_type_number_t = natural_t;
+pub type mach_port_t = c_uint;
 pub type mode_t = u16;
 pub type natural_t = u32;
 pub type nfds_t = c_uint;
@@ -46,6 +48,7 @@ pub type off_t = i64;
 pub type pid_t = i32;
 pub type pthread_t = uintptr_t;
 pub type rlim_t = u64;
+pub type rusage_info_t = *mut c_void;
 pub type sa_family_t = u8;
 pub type sighandler_t = size_t;
 pub type sigset_t = u32;
@@ -132,6 +135,13 @@ pub struct fstore_t {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct host_cpu_load_info {
+    pub cpu_ticks: [natural_t; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
 pub struct if_nameindex {
     pub if_index: c_uint,
     pub if_name: *mut c_char,
@@ -206,6 +216,14 @@ pub struct kevent {
 pub struct linger {
     pub l_onoff: c_int,
     pub l_linger: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct mach_timebase_info {
+    pub numer: u32,
+    pub denom: u32,
 }
 
 #[repr(C)]
@@ -299,6 +317,48 @@ pub struct radvisory {
 pub struct rlimit {
     pub rlim_cur: rlim_t,
     pub rlim_max: rlim_t,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct rusage_info_v4 {
+    pub ri_uuid: [u8; 16],
+    pub ri_user_time: u64,
+    pub ri_system_time: u64,
+    pub ri_pkg_idle_wkups: u64,
+    pub ri_interrupt_wkups: u64,
+    pub ri_pageins: u64,
+    pub ri_wired_size: u64,
+    pub ri_resident_size: u64,
+    pub ri_phys_footprint: u64,
+    pub ri_proc_start_abstime: u64,
+    pub ri_proc_exit_abstime: u64,
+    pub ri_child_user_time: u64,
+    pub ri_child_system_time: u64,
+    pub ri_child_pkg_idle_wkups: u64,
+    pub ri_child_interrupt_wkups: u64,
+    pub ri_child_pageins: u64,
+    pub ri_child_elapsed_abstime: u64,
+    pub ri_diskio_bytesread: u64,
+    pub ri_diskio_byteswritten: u64,
+    pub ri_cpu_time_qos_default: u64,
+    pub ri_cpu_time_qos_maintenance: u64,
+    pub ri_cpu_time_qos_background: u64,
+    pub ri_cpu_time_qos_utility: u64,
+    pub ri_cpu_time_qos_legacy: u64,
+    pub ri_cpu_time_qos_user_initiated: u64,
+    pub ri_cpu_time_qos_user_interactive: u64,
+    pub ri_billed_system_time: u64,
+    pub ri_serviced_system_time: u64,
+    pub ri_logical_writes: u64,
+    pub ri_lifetime_max_phys_footprint: u64,
+    pub ri_instructions: u64,
+    pub ri_cycles: u64,
+    pub ri_billed_energy: u64,
+    pub ri_serviced_energy: u64,
+    pub ri_interval_max_phys_footprint: u64,
+    pub ri_runnable_time: u64,
 }
 
 #[repr(C)]
@@ -515,21 +575,21 @@ pub struct timeval {
 /// This crate reproduces UPSTREAM byte-for-byte, so the oracle is green on it and
 /// the crates.io `libc` it replaces would behave identically.
 ///
-/// That parity is the decision, not an oversight. Nothing in aterm's graph calls
-/// `host_statistics64`: the only reference to it anywhere in the build is rustix's
-/// `pub(super) use host_statistics64 as host_statistics, vm_statistics64_t as
-/// vm_statistics_t` in `src/backend/libc/c.rs` -- present in both 0.38.44 and
-/// 1.1.4, called by neither, and a `use` of a name that must therefore exist,
-/// which is the whole reason this struct is declared at all. Measured by grepping
-/// every one of the 587 packages in `Cargo.lock`. No caller can observe the
-/// difference, and for a drop-in replacement, differing from the crate it replaces
-/// is the worse property.
+/// That parity is the decision, not an oversight. It was declared because rustix
+/// names it: `pub(super) use host_statistics64 as host_statistics, vm_statistics64_t
+/// as vm_statistics_t` in `src/backend/libc/c.rs` (0.38.44 and 1.1.4, called by
+/// neither). Since 2026-09-24 ONE caller exists: `aterm-sysprobe` reads `swapins`
+/// and `swapouts` for the strain probe, and it passes upstream's own
+/// `HOST_VM_INFO64_COUNT` -- THIS layout's size in words, 38 -- so the kernel
+/// writes the rev1 prefix and nothing past it. Both fields it reads are rev1
+/// fields. For a drop-in replacement, differing from the crate it replaces is
+/// still the worse property.
 ///
-/// If a caller ever does appear, this layout is NOT the one to hand
-/// `host_statistics64` alongside an SDK-derived `HOST_VM_INFO64_COUNT` (62 words):
-/// the kernel would write 248 bytes into 152. At that point the SDK is right and
-/// upstream is the bug -- widen it here deliberately, and state the divergence
-/// where the oracle can see it rather than leaving it silent.
+/// This layout is NOT the one to hand `host_statistics64` alongside an SDK-derived
+/// `HOST_VM_INFO64_COUNT` (62 words): the kernel would write 248 bytes into 152.
+/// A caller that needs a rev2 or rev3 counter widens it here deliberately, and
+/// states the divergence where the oracle can see it rather than leaving it
+/// silent.
 #[repr(C, packed(8))]
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
@@ -624,6 +684,11 @@ pub const CLOCK_MONOTONIC: clockid_t = 6;
 pub const CLOCK_PROCESS_CPUTIME_ID: clockid_t = 12;
 pub const CLOCK_REALTIME: clockid_t = 0;
 pub const CLOCK_THREAD_CPUTIME_ID: clockid_t = 16;
+pub const CPU_STATE_IDLE: c_int = 2;
+pub const CPU_STATE_MAX: c_int = 4;
+pub const CPU_STATE_NICE: c_int = 3;
+pub const CPU_STATE_SYSTEM: c_int = 1;
+pub const CPU_STATE_USER: c_int = 0;
 pub const CREAD: tcflag_t = 0x00000800;
 pub const CRTSCTS: tcflag_t = 0x00030000;
 pub const CS5: tcflag_t = 0x00000000;
@@ -807,6 +872,10 @@ pub const F_SETLK: c_int = 8;
 pub const F_SETLKW: c_int = 9;
 pub const F_UNLCK: c_short = 2;
 pub const F_WRLCK: c_short = 3;
+pub const HOST_CPU_LOAD_INFO: i32 = 3;
+pub const HOST_CPU_LOAD_INFO_COUNT: u32 = 4;
+pub const HOST_VM_INFO64: i32 = 4;
+pub const HOST_VM_INFO64_COUNT: mach_msg_type_number_t = 38;
 pub const HUPCL: tcflag_t = 0x00004000;
 pub const ICANON: tcflag_t = 0x00000100;
 pub const ICRNL: tcflag_t = 0x00000100;
@@ -984,6 +1053,7 @@ pub const POLLWRNORM: c_short = 0x004;
 pub const PRIO_PGRP: c_int = 1;
 pub const PRIO_PROCESS: c_int = 0;
 pub const PRIO_USER: c_int = 2;
+pub const PROC_PIDPATHINFO_MAXSIZE: c_int = 4096;
 pub const PROC_PIDTBSDINFO: c_int = 3;
 pub const PROT_EXEC: c_int = 4;
 pub const PROT_NONE: c_int = 0;
@@ -1005,6 +1075,7 @@ pub const RLIMIT_NPROC: c_int = 7;
 pub const RLIMIT_STACK: c_int = 3;
 pub const RLIM_INFINITY: rlim_t = 0x7fff_ffff_ffff_ffff;
 pub const RTLD_DEFAULT: *mut c_void = 0xfffffffffffffffe as *mut c_void;
+pub const RUSAGE_INFO_V4: c_int = 4;
 pub const R_OK: c_int = 4;
 pub const SA_NOCLDSTOP: c_int = 0x0008;
 pub const SA_ONSTACK: c_int = 0x0001;
@@ -1334,6 +1405,12 @@ unsafe extern "C" {
         flags: c_int,
     ) -> ssize_t;
     pub fn grantpt(fd: c_int) -> c_int;
+    pub fn host_statistics(
+        host_priv: host_t,
+        flavor: host_flavor_t,
+        host_info_out: host_info_t,
+        host_info_outCnt: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
     pub fn host_statistics64(
         host_priv: host_t,
         flavor: host_flavor_t,
@@ -1373,6 +1450,8 @@ unsafe extern "C" {
     pub fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t;
     pub fn lstat(path: *const c_char, buf: *mut stat) -> c_int;
     pub fn lutimes(file: *const c_char, times: *const timeval) -> c_int;
+    pub fn mach_host_self() -> mach_port_t;
+    pub fn mach_timebase_info(info: *mut mach_timebase_info) -> c_int;
     pub fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int;
     pub fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
     pub fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: mode_t) -> c_int;
@@ -1412,6 +1491,8 @@ unsafe extern "C" {
     pub fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int;
     pub fn posix_openpt(flags: c_int) -> c_int;
     pub fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -> ssize_t;
+    pub fn proc_listallpids(buffer: *mut c_void, buffersize: c_int) -> c_int;
+    pub fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut rusage_info_t) -> c_int;
     pub fn proc_pidinfo(
         pid: c_int,
         flavor: c_int,
@@ -1419,6 +1500,7 @@ unsafe extern "C" {
         buffer: *mut c_void,
         buffersize: c_int,
     ) -> c_int;
+    pub fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
     pub fn pthread_cond_destroy(cond: *mut pthread_cond_t) -> c_int;
     pub fn pthread_cond_init(cond: *mut pthread_cond_t, attr: *const pthread_condattr_t) -> c_int;
     pub fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int;

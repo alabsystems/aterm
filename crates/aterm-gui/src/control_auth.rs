@@ -5887,8 +5887,22 @@ mod tests {
             .unwrap();
         notify_artifact_cleanup_worker(scheduler);
 
+        // The wait ends on the sweep's final step, not its first visible one.
+        // The worker renames the namespace away in the middle of a batch, then
+        // finishes the cursor, fsyncs the root and releases its descriptors
+        // before it drops the coalescing entry at EOF. A poll that stops when
+        // the directory vanishes can land inside that gap, and a loaded
+        // machine widens it. The entry was inserted above, so it leaves the
+        // registry only through a sweep that ran (or a failure path, which
+        // leaves the namespace in place).
+        let namespace_pending = || {
+            pending_dead_namespace_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&root)
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while namespace.exists() && std::time::Instant::now() < deadline {
+        while namespace_pending() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
@@ -5896,10 +5910,7 @@ mod tests {
             "panic recovery must requeue the pending root on a fresh cursor"
         );
         assert!(
-            !pending_dead_namespace_sweeps()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&root),
+            !namespace_pending(),
             "the recovered sweep must reconcile its coalescing registry"
         );
 
@@ -5929,8 +5940,17 @@ mod tests {
             .unwrap();
         notify_artifact_cleanup_worker(scheduler);
 
+        // The same ordering holds for video: the tombstone is removed inside
+        // the batch and the registry entry only after the cursor reaches EOF.
+        let video_pending = || {
+            pending_video_tombstone_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|entry| entry.root == video_root && entry.expected_root == expected_root)
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while tombstone.exists() && std::time::Instant::now() < deadline {
+        while video_pending() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
@@ -5938,11 +5958,7 @@ mod tests {
             "video panic recovery must requeue the tombstone cursor"
         );
         assert!(
-            !pending_video_tombstone_sweeps()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .any(|entry| { entry.root == video_root && entry.expected_root == expected_root }),
+            !video_pending(),
             "the recovered video sweep must reconcile its coalescing registry"
         );
     }

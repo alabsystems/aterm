@@ -4,17 +4,13 @@
 
 //! Callback types and infrastructure for terminal events.
 //!
-//! Callback type aliases and registry metadata live in `aterm-types` crate.
+//! Callback type aliases live in the `aterm-types` crate.
 //! This module re-exports them, normalizes protocol events for callback
 //! consumers, and keeps crate-internal sink adapters (Part of #5663 Phase 2).
 
 pub use aterm_types::ColorChangeOp;
 use aterm_types::Rgb;
 pub use aterm_types::callback_events::{SshConductorCallbackEvent, TmuxCallbackEvent};
-pub use aterm_types::{
-    CALLBACK_REGISTRY, CallbackCategory, CallbackInfo, callback_by_name, callback_count,
-    callback_info,
-};
 
 // ----------------------------------------------------------------------------
 // Re-export callback type aliases from aterm-types (Part of #5663 Phase 2)

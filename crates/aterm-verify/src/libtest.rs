@@ -422,6 +422,105 @@ pub fn note(log: &str) -> Option<String> {
     Some(s)
 }
 
+/// The words a test prints when the MACHINE refused it, not the tree: a
+/// previous run's daemons still alive (aterm-link's world harness), or a paint
+/// take its own instrument disowns as starved (the probe's exit 3). A red row
+/// under this sentinel says nothing about the code, so the gate records it as
+/// COULD NOT RUN — the same severity as a full disk — and the receipt says
+/// `verdict COULD-NOT-RUN`, never `FAIL`.
+///
+/// Producers print it VERBATIM in their panic message, and
+/// `every_producer_prints_the_sentinel_verbatim` below holds each of them to
+/// it, so a reworded producer cannot quietly turn its refusals back into
+/// findings.
+pub const COULD_NOT_RUN_SENTINEL: &str = "aterm-gate: COULD NOT RUN";
+
+/// The failed tests in a failed `targo test` child's log, when EVERY failure
+/// carries [`COULD_NOT_RUN_SENTINEL`]; `None` when any failure does not, or
+/// when the log cannot account for every failure.
+///
+/// Conservative in the one direction that matters — a finding must never
+/// read as the machine's fault — so all of this must hold:
+///
+/// * at least one `---- <name> stdout ----` block, and every one of them
+///   carries the sentinel;
+/// * the names libtest LISTS under its closing `failures:` are exactly the
+///   names that had a block, counted with multiplicity, so no failure went
+///   unread;
+/// * every binary cargo reported failed (`error: test failed, to rerun pass`)
+///   printed a `test result: FAILED.` line — a binary that died of a signal
+///   prints no result, and a crash is a finding.
+///
+/// EVERY BLOCK IS ITS OWN FAILURE (2026-09-23). One `--no-fail-fast` log holds
+/// many binaries, and two of them can fail a test of the same bare name — a
+/// refusal in one, a real assertion in the other. Keyed by name, the second
+/// block inherited the first one's sentinel and the finding read as the
+/// machine's; so a block is a position in the log, never a name.
+#[must_use]
+pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
+    if log.contains('\x1b') {
+        return environment_refusals(&strip_ansi(log));
+    }
+    // (name, refused) for each block, in log order.
+    let mut blocks: Vec<(&str, bool)> = Vec::new();
+    let mut listed: Vec<&str> = Vec::new();
+    let mut current: Option<usize> = None;
+    let mut in_list = false;
+    let (mut results, mut binaries) = (0usize, 0usize);
+    for line in log.lines() {
+        if let Some(name) = line
+            .strip_prefix("---- ")
+            .and_then(|r| r.strip_suffix(" stdout ----"))
+        {
+            current = Some(blocks.len());
+            in_list = false;
+            blocks.push((name, false));
+            continue;
+        }
+        if line == "failures:" {
+            current = None;
+            in_list = true;
+            continue;
+        }
+        if in_list {
+            if let Some(name) = line.strip_prefix("    ") {
+                listed.push(name.trim_end());
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            in_list = false;
+        }
+        if line.starts_with("test result: FAILED.") {
+            results += 1;
+            current = None;
+        }
+        if line.starts_with("error: test failed, to rerun pass")
+            || line.starts_with("error: doctest failed, to rerun pass")
+        {
+            binaries += 1;
+        }
+        if let Some(at) = current
+            && line.contains(COULD_NOT_RUN_SENTINEL)
+        {
+            blocks[at].1 = true;
+        }
+    }
+    let mut named: Vec<&str> = blocks.iter().map(|(name, _)| *name).collect();
+    named.sort_unstable();
+    listed.sort_unstable();
+    (!blocks.is_empty()
+        && blocks.iter().all(|(_, refused)| *refused)
+        && listed == named
+        && binaries > 0
+        && results == binaries)
+        .then(|| {
+            named.dedup();
+            named.into_iter().map(str::to_string).collect()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +876,169 @@ mod tests {
         assert_eq!(u.declared, Some(4874), "{u:?}");
         assert_eq!(u.verdicts, 4873, "{u:?}");
         assert!(!u.finished, "{u:?}");
+    }
+
+    /// One failing test binary as cargo and libtest print it under
+    /// `--no-fail-fast`: each `(name, output)` fails with that captured output.
+    fn failed_binary(target: &str, failures: &[(&str, &str)]) -> String {
+        let mut s =
+            format!("     Running {target} (target/debug/deps/{target}-abc)\n\nrunning 3 tests\n");
+        for (name, _) in failures {
+            s.push_str(&format!("test {name} ... FAILED\n"));
+        }
+        s.push_str("test passes ... ok\n\nfailures:\n\n");
+        for (name, out) in failures {
+            s.push_str(&format!("---- {name} stdout ----\n{out}\n\n"));
+        }
+        s.push_str("failures:\n");
+        for (name, _) in failures {
+            s.push_str(&format!("    {name}\n"));
+        }
+        s.push_str(&format!(
+            "\ntest result: FAILED. 1 passed; {} failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 3.83s\n\nerror: test failed, to rerun pass `-p x --test {target}`\n",
+            failures.len()
+        ));
+        s
+    }
+
+    fn refused(why: &str) -> String {
+        format!(
+            "\nthread 't' panicked at crates/x/tests/harness/mod.rs:177:5:\n\
+             {COULD_NOT_RUN_SENTINEL} — {why}\nnote: run with `RUST_BACKTRACE=1`"
+        )
+    }
+
+    /// THE MACHINE, NOT THE TREE. Every failure in the log carries the
+    /// sentinel, across two binaries, so the child is an environment refusal
+    /// and the names are the ones that refused.
+    #[test]
+    fn a_log_whose_every_failure_carries_the_sentinel_is_the_machines() {
+        let log = format!(
+            "   Compiling x v0.1.0\n{}{}     Running tests/ok.rs (target/debug/deps/ok-1)\n\n\
+             running 1 test\ntest fine ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; \
+             0 measured; 0 filtered out; finished in 0.01s\n\nerror: 2 targets failed:\n    \
+             `-p x --test bridge_e2e`\n    `-p x --test paint`\n",
+            failed_binary("bridge_e2e", &[("boots_a_world", &refused("strays alive"))]),
+            failed_binary(
+                "paint",
+                &[
+                    ("measuring::row_one", &refused("take unproved")),
+                    ("measuring::row_two", &refused("take unproved")),
+                ]
+            ),
+        );
+        assert_eq!(
+            environment_refusals(&log),
+            Some(vec![
+                "boots_a_world".to_string(),
+                "measuring::row_one".to_string(),
+                "measuring::row_two".to_string(),
+            ])
+        );
+    }
+
+    /// THE NEGATIVE CONTROL: one real finding among the refusals, and the
+    /// whole child is a finding. A refusal may never launder a failure.
+    #[test]
+    fn one_failure_without_the_sentinel_makes_the_whole_child_a_finding() {
+        let log = failed_binary(
+            "paint",
+            &[
+                ("measuring::row_one", &refused("take unproved")),
+                (
+                    "measuring::row_two",
+                    "thread 't' panicked at x.rs:1:1:\nPAINT CONFORMANCE FAILED [prompt]",
+                ),
+            ],
+        );
+        assert_eq!(environment_refusals(&log), None);
+        // …and with only the finding, likewise.
+        let log = failed_binary("x", &[("t", "thread 't' panicked at x.rs:1:1:\nassert")]);
+        assert_eq!(environment_refusals(&log), None);
+    }
+
+    /// ONE NAME, TWO BINARIES, TWO FAILURES. `boots_a_world` refused in one
+    /// binary and failed a real assertion in a later one: the finding must not
+    /// inherit the refusal's sentinel through the shared name. Keyed by name,
+    /// this log read as the machine's (measured on the pre-fix function). The
+    /// control is the same log with both blocks refused, which is the
+    /// machine's, and names the test once.
+    #[test]
+    fn a_finding_that_shares_a_refusals_name_in_another_binary_is_still_a_finding() {
+        let finding = "thread 't' panicked at x.rs:1:1:\nassertion failed: world.ready()";
+        let log = format!(
+            "{}{}",
+            failed_binary("bridge_e2e", &[("boots_a_world", &refused("strays alive"))]),
+            failed_binary("fabric_on", &[("boots_a_world", finding)]),
+        );
+        assert_eq!(environment_refusals(&log), None, "{log}");
+        // …in either order.
+        let log = format!(
+            "{}{}",
+            failed_binary("fabric_on", &[("boots_a_world", finding)]),
+            failed_binary("bridge_e2e", &[("boots_a_world", &refused("strays alive"))]),
+        );
+        assert_eq!(environment_refusals(&log), None, "{log}");
+
+        let log = format!(
+            "{}{}",
+            failed_binary("bridge_e2e", &[("boots_a_world", &refused("strays alive"))]),
+            failed_binary("fabric_on", &[("boots_a_world", &refused("strays alive"))]),
+        );
+        assert_eq!(
+            environment_refusals(&log),
+            Some(vec!["boots_a_world".to_string()])
+        );
+    }
+
+    /// A binary that DIED — a signal, an abort — prints no `test result:`, and
+    /// a crash is a finding however politely its siblings refused.
+    #[test]
+    fn a_binary_that_died_without_a_result_is_a_finding() {
+        let log = format!(
+            "{}     Running tests/crash.rs (target/debug/deps/crash-1)\n\nrunning 1 test\n\
+             error: test failed, to rerun pass `-p x --test crash`\n\nCaused by:\n  process \
+             didn't exit successfully: `crash-1` (signal: 11, SIGSEGV: invalid memory \
+             reference)\n",
+            failed_binary("bridge_e2e", &[("boots_a_world", &refused("strays alive"))]),
+        );
+        assert_eq!(environment_refusals(&log), None);
+    }
+
+    /// A failure libtest LISTED but printed no block for is a failure nobody
+    /// read, and the sentinel cannot be vouched for.
+    #[test]
+    fn a_listed_failure_with_no_block_is_not_accounted_for() {
+        let mut log = failed_binary("bridge_e2e", &[("boots_a_world", &refused("strays"))]);
+        log = log.replace(
+            "failures:\n    boots_a_world\n",
+            "failures:\n    boots_a_world\n    silent_one\n",
+        );
+        assert_eq!(environment_refusals(&log), None);
+        // …and a log with no failure in it at all is nobody's refusal.
+        assert_eq!(environment_refusals("running 0 tests\n"), None);
+        assert_eq!(environment_refusals(""), None);
+    }
+
+    /// THE PRODUCERS, HELD TO THE WORDS. The gate recognises a refusal only by
+    /// [`COULD_NOT_RUN_SENTINEL`], so a producer that rewords its panic turns
+    /// every refusal back into a finding without a line of the gate changing.
+    /// Each file must still carry the sentinel verbatim, once per refusal arm.
+    #[test]
+    fn every_producer_prints_the_sentinel_verbatim() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (file, arms) in [
+            ("crates/aterm-link/tests/harness/mod.rs", 1),
+            ("crates/aterm-conformance/tests/paint/measuring.rs", 1),
+        ] {
+            let text =
+                std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(
+                text.matches(COULD_NOT_RUN_SENTINEL).count(),
+                arms,
+                "{file} must print `{COULD_NOT_RUN_SENTINEL}` in each of its {arms} refusal arm(s)"
+            );
+        }
     }
 }

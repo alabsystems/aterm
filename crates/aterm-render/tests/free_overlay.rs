@@ -4,10 +4,10 @@
 // Free-floating overlay layer, Phase 0 (FREE_OVERLAY_LAYER_DESIGN.md §3.1/§3.3):
 // the `RenderInput.free_sprites` + `free_atlas` contract plumbing, consumed by
 // NO renderer yet. The contract under test:
-//   * the empty free layer (sprites empty / atlas absent) is byte-identical to
-//     the pre-layer path, also after `clear_overlays` (the `image plain`
-//     contract), and `RenderInput::eq` compares sprites by full value (incl.
-//     the `z`/`sampler` enums) and the atlas by VERSION only;
+//   * `RenderInput::eq` compares sprites by full value (incl. the
+//     `z`/`sampler` enums) and the atlas by VERSION only (the empty free layer
+//     being byte-identical to the pre-layer path, also after `clear_overlays`,
+//     is the `free_sprites` row of `tests/empty_channels.rs`);
 //   * dirty-ROW gate (row-union over the true pixel Y-extent, prev∪cur):
 //     settled sprites gate-hit with zero rows marked; a moved rect marks
 //     exactly the prev∪cur bands its `[y, y+h)` extent overlaps; a same-rect
@@ -21,16 +21,12 @@ use std::sync::Arc;
 
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, SceneAtlas};
 use aterm_core::terminal::Terminal;
-use aterm_render::{DirtyDecision, Renderer, Theme, compute_dirty_rows};
+use aterm_render::{DirtyDecision, compute_dirty_rows};
 
 /// The cell height every direct `compute_dirty_rows` drive below uses: the
 /// row→pixel mapping constant for the row-union assertions (row `r` spans
 /// grid-interior `[r·16, (r+1)·16)`).
 const CELL_H: usize = 16;
-
-fn renderer() -> Option<Renderer> {
-    Renderer::from_system(18.0, Theme::default())
-}
 
 /// A deterministic, fully-opaque patterned RGBA atlas (same shape as the cat
 /// suite's) so a future consuming phase can reuse these fixtures unchanged.
@@ -80,52 +76,6 @@ fn marked(dirty: &[bool]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(r, &b)| b.then_some(r))
         .collect()
-}
-
-#[test]
-fn empty_free_fields_are_byte_identical_also_after_clear_overlays() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lfree layer");
-
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    // Empty sprites + NO atlas (the common off state).
-    let mut input = term.cell_frame(3, 12);
-    assert!(input.free_sprites.is_empty() && input.free_atlas.is_none());
-    let again = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, again, "empty free fields must not change any pixel");
-
-    // Empty sprites WITH an atlas set: the atlas alone draws nothing.
-    input.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-    let atlas_only = rend.render_input(&input).pixels.clone();
-    assert_eq!(
-        base, atlas_only,
-        "a free atlas with no sprites must draw nothing"
-    );
-
-    // `clear_overlays` (the `image plain` capture) strips the free layer like
-    // every other bling layer: sprites cleared AND the atlas Arc nulled.
-    let mut with_free = term.cell_frame(3, 12);
-    with_free.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-    with_free.free_sprites = vec![free(2, 5, 16, 16)];
-    with_free.clear_overlays();
-    assert!(
-        with_free.free_sprites.is_empty(),
-        "clear_overlays must strip free sprites"
-    );
-    assert!(
-        with_free.free_atlas.is_none(),
-        "clear_overlays must null the free atlas Arc"
-    );
-    let cleared = rend.render_input(&with_free).pixels.clone();
-    assert_eq!(
-        base, cleared,
-        "a cleared free layer must render the bare screen"
-    );
 }
 
 #[test]

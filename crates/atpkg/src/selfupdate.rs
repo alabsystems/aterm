@@ -111,9 +111,8 @@
 //!
 //! Every function here is PURE — no process, no I/O, no exit-code value of its own (the
 //! exit-code registry scan in [`crate::lock`] reads `cli.rs`, where the relay is literal
-//! arms) and no usage-line literal (the help-surfaces gate discovers files by that word;
-//! the verb's usage line lives in `cli.rs` beside `cmd_landing`'s) — so every line and
-//! every verdict is pinned on every platform.
+//! arms; the verb's usage line lives there too, beside `cmd_landing`'s) — so every line
+//! and every verdict is pinned on every platform.
 
 use std::ffi::OsStr;
 use std::io;
@@ -1294,13 +1293,11 @@ mod tests {
 
     /// THIS MODULE IS PURE, by its source: no exit-code value (the exit-code registry scan
     /// in `lock.rs` reads `cli.rs`, where every relay is a literal arm or a named
-    /// constant), no usage-line literal and no `USAGE`/`HELP`-named item (the help-surfaces
-    /// gate would otherwise discover this file and demand a roster row; the usage line
-    /// lives in `cli.rs` like `cmd_landing`'s), and no `#[cfg(test)]` item ahead of this
-    /// test module (the shape the registry scan's split rule requires of every file it
-    /// might one day read).
+    /// constant), no process exit, and no `#[cfg(test)]` item ahead of this test module
+    /// (the shape the registry scan's split rule requires of every file it might one day
+    /// read).
     #[test]
-    fn the_module_builds_no_exit_code_and_carries_no_help_surface() {
+    fn the_module_builds_no_exit_code() {
         let src = include_str!("selfupdate.rs");
         let gate = "#[cfg(test)]";
         let (production, tests) = src.split_once(gate).expect("the test module's gate");
@@ -1311,16 +1308,6 @@ mod tests {
         assert!(!production.contains("mod tests {"));
         let exit_code = ["Exit", "Code"].concat();
         assert!(!production.contains(&exit_code), "no {exit_code} here");
-        let usage = ["usage", ":"].concat();
-        assert!(!production.contains(&usage), "no {usage} literal here");
-        for named in ["USAGE", "HELP"] {
-            assert!(
-                !production
-                    .lines()
-                    .any(|l| (l.contains("const ") || l.contains("static ")) && l.contains(named)),
-                "no {named}-named item"
-            );
-        }
         assert!(
             !production.contains("std::process::exit"),
             "the verb relays the child's code; this module decides nothing about exits"

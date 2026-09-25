@@ -24,9 +24,8 @@ use std::time::Duration;
 use crate::checker_skip_at;
 use crate::paths::Staging;
 
-/// The web lane's base, which a freshly spawned process (lane still `Unknown`) is
-/// deduped against (`crate::dedup_window_base`).
-const WEB_BASE: Duration = Duration::from_secs(crate::cadence::WEB_INTERVAL_SECS);
+/// The check's one base interval.
+const BASE: Duration = Duration::from_secs(crate::cadence::INTERVAL_SECS);
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -76,7 +75,7 @@ fn check_channel_audit_an_apply_lane_status_write_is_not_a_completed_check() {
     ] {
         crate::status::record(&s, 1789276245, outcome);
         assert_eq!(
-            checker_skip_at(&s, WEB_BASE, now),
+            checker_skip_at(&s, BASE, now),
             None,
             "{outcome:?}: the apply lane completed no check, so its stamp must not make \
              a sibling skip this interval's check"
@@ -95,24 +94,20 @@ fn check_channel_audit_an_apply_lane_status_write_is_not_a_completed_check() {
     )
     .expect("write ledger");
     assert!(
-        checker_skip_at(&s, WEB_BASE, now).is_some(),
+        checker_skip_at(&s, BASE, now).is_some(),
         "a check completed a minute ago still dedups the siblings"
     );
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// THE WIDENED WINDOW BELONGS TO GITHUB'S BACKOFF, NOT THE APPLY LANE'S. The gate
-/// doubles the freshness window when the ledger's `outcome` contains "deferred",
-/// which is how a machine that was just told to slow down keeps every sibling off
-/// GitHub. But `install.rs` writes `deferred: install location not writable` /
-/// `deferred: staged bundle failed re-verification (discarded)` / `deferred: staged
-/// bundle build-number rebind mismatch (discarded)` for APPLY deferrals that never
-/// touched the network, and the gate cannot tell them apart: an admin-owned
-/// `/Applications` costs every launch a 42-minute check holiday and logs "holding
-/// off GitHub for the rest of the backoff" about a backoff that never happened.
-/// Every check-lane deferral sentence starts with `update check deferred` (pinned by
-/// `every_new_outcome_sentence_keeps_or_avoids_the_deferred_substring_as_intended`);
-/// the widening must key on THAT, or on the check-owned `delivery = "deferred"` note.
+/// THE WIDENED WINDOW BELONGS TO THE HOST'S BACKOFF, NOT THE APPLY LANE'S. The gate
+/// doubles the freshness window when the check receipt records a deferral, which is
+/// how a machine that was just told to slow down keeps every sibling off the host.
+/// But `install.rs` writes `deferred: install location not writable` / `deferred:
+/// staged bundle failed re-verification (discarded)` / `deferred: staged bundle
+/// build-number rebind mismatch (discarded)` for APPLY deferrals that never touched
+/// the network: an admin-owned `/Applications` cost every launch a 42-minute check
+/// holiday. The widening keys on the check receipt's own `outcome = "deferred"`.
 #[test]
 fn check_channel_audit_an_apply_lane_deferral_does_not_widen_the_check_window() {
     let s = Staging::scratch("audit-apply-deferral");
@@ -124,32 +119,25 @@ fn check_channel_audit_an_apply_lane_deferral_does_not_widen_the_check_window() 
     ] {
         // 80 % of an interval: past the base window (70 %), inside the widened one
         // (70 % of two intervals).
-        write_stamped(&s, now - WEB_BASE.as_secs() * 8 / 10, outcome);
+        write_stamped(&s, now - BASE.as_secs() * 8 / 10, outcome);
         assert_eq!(
-            checker_skip_at(&s, WEB_BASE, now),
+            checker_skip_at(&s, BASE, now),
             None,
             "{outcome:?}: an apply-lane deferral is not a GitHub backoff and must not \
              hold the machine off its channel for a second interval"
         );
     }
     // The check lane's own deferral still widens, exactly as before.
-    write_stamped(
-        &s,
-        now - WEB_BASE.as_secs() * 8 / 10,
-        "update check deferred: the release host answered HTTP 429 to HEAD x; transient — \
-         backing off, will retry on the next check",
-    );
+    write_stamped(&s, now - BASE.as_secs() * 8 / 10, "deferred");
     assert!(
-        checker_skip_at(&s, WEB_BASE, now).is_some_and(|(reason, _)| reason.contains("deferred")),
-        "a recorded GitHub deferral keeps the machine-wide retreat"
+        checker_skip_at(&s, BASE, now).is_some_and(|(reason, _)| reason.contains("deferred")),
+        "a recorded host deferral keeps the machine-wide retreat"
     );
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// A STAMP FROM THE FUTURE HOLDS EVERY CHECKER UNTIL THE CLOCK CATCHES UP. The hold
-/// path bounds `held_until` against `min(updated_at, now)` precisely so a record
-/// stamped by a fast clock cannot carry its own horizon with it (2026-09-04 audit);
-/// the plain freshness window has no such bound. `rfc3339_older_than` answers
+/// A STAMP FROM THE FUTURE HOLDS EVERY CHECKER UNTIL THE CLOCK CATCHES UP.
+/// `rfc3339_older_than` answers
 /// "not older" for any stamp ahead of now, so after a clock step backwards (a wrong
 /// clock corrected by NTP, a VM restored from a snapshot) every background loop on
 /// the machine skips — logging "another aterm process completed this interval's
@@ -162,12 +150,12 @@ fn check_channel_audit_a_ledger_stamped_in_the_future_does_not_hold_every_checke
     let now = now_secs();
     write_stamped(&s, now + 2 * 3600, "up to date (channel head v0.85.0)");
     assert_eq!(
-        checker_skip_at(&s, WEB_BASE, now),
+        checker_skip_at(&s, BASE, now),
         None,
         "a stamp two hours ahead of now is not a check that completed inside the window"
     );
     // Sanity: a stamp a minute in the past is the ordinary fresh skip.
     write_stamped(&s, now - 60, "up to date (channel head v0.85.0)");
-    assert!(checker_skip_at(&s, WEB_BASE, now).is_some());
+    assert!(checker_skip_at(&s, BASE, now).is_some());
     let _ = std::fs::remove_dir_all(&s.root);
 }

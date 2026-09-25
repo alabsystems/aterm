@@ -33,13 +33,18 @@
 #     --locked --release -p aterm` into `<root>/target/conformance-release`,
 #     6 jobs. It is not a new build: it is the build
 #     `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin` already
-#     ran INSIDE the test stage, for the paint, spin and untracked-staging
-#     suites that judge the RELEASE binary, moved to t0 in a lane of its own.
+#     ran INSIDE the test stage, for the paint and spin suites that judge the
+#     RELEASE binary, moved to t0 in a lane of its own.
+#   * exception 7 (2026-09-23): the test run's `--tests` child hands libtest
+#     `--skip measuring:: --skip launchd_copy_tests::`, and the exclusive
+#     measuring stage runs the same selection with those two as the filter —
+#     one selection split in two, the tests that measure the machine run alone.
 # `<inherited>` means the child got the test process's own value.
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --workspace
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --doc --workspace --no-fail-fast
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --workspace --no-fail-fast --no-run
-targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --workspace --no-fail-fast --tests
+targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --workspace --no-fail-fast --tests -- --skip measuring:: --skip launchd_copy_tests::
+targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --workspace --no-fail-fast --tests -- measuring:: launchd_copy_tests::
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-gui --example objc_alert_drive
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-gui --example objc_event_drive
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-gui --example objc_ime_drive

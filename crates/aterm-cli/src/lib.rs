@@ -1382,10 +1382,10 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
 /// a clause that had been dead since versions moved to `MAJOR.MINOR.0` and the
 /// number left the identity line. Omitted (no line) when the launcher has not
 /// published one ([`set_running_build`]) — a `0` would be a claim. And last,
-/// WHAT THIS BUILD TRUSTS: `trusts: master=<sha256> channel=<sha256>`, the
-/// fingerprints of the paper master and the channel key compiled in, so a
-/// client stranded by a key or master rotation can be told from a healthy one
-/// by its own output (`empty` names an unarmed tier).
+/// WHAT THIS BUILD TRUSTS: `trusts: master=<sha256>`, the fingerprint of the
+/// paper master compiled in — the one anchor that authorizes a release — so a
+/// client stranded by a master rotation can be told from a healthy one by its
+/// own output (`empty` names an unarmed tier).
 #[must_use]
 pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
     // Identity line first (install.sh greps `^aterm `), then the origin line —
@@ -1430,8 +1430,7 @@ fn running_build() -> Option<u64> {
 /// The `trusts:` line of [`version_text`].
 fn trust_anchors_line() -> String {
     format!(
-        "trusts: master={} channel={}\n",
-        aterm_update::compiled_master_pin_sha256(),
+        "trusts: master={}\n",
         aterm_update::compiled_update_pin_sha256()
     )
 }
@@ -4015,7 +4014,7 @@ mod tests {
         assert!(identity.contains("by Andrew Yates") && identity.contains("alab.systems"));
         let anchors = super::trust_anchors_line();
         assert!(
-            anchors.starts_with("trusts: master=") && anchors.contains(" channel="),
+            anchors.starts_with("trusts: master=") && !anchors.contains("channel="),
             "{anchors}"
         );
         // The build line follows the identity once the launcher publishes it

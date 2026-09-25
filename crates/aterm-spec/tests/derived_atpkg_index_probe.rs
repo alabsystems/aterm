@@ -53,10 +53,10 @@ fn cross_process_probe_cooldown_proves_and_catches_duplicate_ranges() {
     assert!(buggy.fire("ProbeError", &mut short_error));
     assert!(!buggy.check_invariant("StampMatchesOutcome", &short_error));
 
-    let mut short_rate_limit = buggy.init_state();
-    assert!(buggy.fire("Acquire", &mut short_rate_limit));
-    assert!(buggy.fire("ProbeRateLimited", &mut short_rate_limit));
-    assert!(!buggy.check_invariant("StampMatchesOutcome", &short_rate_limit));
+    let mut short_published = buggy.init_state();
+    assert!(buggy.fire("Acquire", &mut short_published));
+    assert!(buggy.fire("ProbePublished", &mut short_published));
+    assert!(!buggy.check_invariant("StampMatchesOutcome", &short_published));
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn independent_hints_prove_highest_and_no_false_missing() {
     let mut healthy = model.init_state();
     let buggy = interp::with_buggy(&model, 1);
     let mut first_hit = buggy.init_state();
-    for action in ["ObserveLow", "ObserveHigh", "ObserveDeferred", "Choose"] {
+    for action in ["ObserveLow", "ObserveHigh", "Choose"] {
         assert!(model.fire(action, &mut healthy));
         assert!(buggy.fire(action, &mut first_hit));
     }
@@ -81,12 +81,7 @@ fn independent_hints_prove_highest_and_no_false_missing() {
     assert!(!buggy.check_invariant("BestAvailableHint", &first_hit));
 
     let mut partial = buggy.init_state();
-    for action in [
-        "ObserveMissing",
-        "ObserveDeferred",
-        "ObserveMissing",
-        "Choose",
-    ] {
+    for action in ["ObserveMissing", "ObserveDeferred", "Choose"] {
         assert!(buggy.fire(action, &mut partial));
     }
     assert_eq!(partial["chosen"], 1);

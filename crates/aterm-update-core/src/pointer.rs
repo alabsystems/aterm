@@ -39,8 +39,8 @@
 //! for a whole night, and every client 404'd on `…/v0.80.0/aterm-appcast.toml`). So a
 //! pointer that resolves is not a release that can be installed from; the check lane
 //! treats a 404 on the head's appcast as the distinct "channel head has no app
-//! manifest" state and elects the newest release that does carry one
-//! (`aterm-update`'s `web_head_fallback`) — never as a broken download pipeline.
+//! manifest yet" state — a healthy, recorded end to the check, never a broken download
+//! pipeline. The publisher owns `latest`; nothing here lists the catalog to look past it.
 
 use crate::cdn::path_segment_safe;
 use crate::http::{HeadAnswer, HttpError};
@@ -86,10 +86,9 @@ pub enum PointerError {
     /// The pointer names a release of THIS repository, carrying THIS asset name
     /// under a safe tag — everything checks out except that the tag is not one
     /// this client installs from (an `atpkg-index-<n>` cut published as a
-    /// normal release captures `/releases/latest` away from the app releases;
-    /// `tools/atpkg-index.sh`'s own fallback text warns of exactly this). Not
-    /// a refusal to interpret: the channel is intact and the newest APP
-    /// release below it is elected from the listing (2026-09-14). Nothing at
+    /// normal release captures `/releases/latest` away from the app releases).
+    /// Not a refusal to interpret: the channel is intact and its head is simply
+    /// not an app release; the caller records that and ends the check. Nothing at
     /// the location was fetched.
     OtherTag { tag: String },
     /// The host asked us to slow down (429) or is having a bad moment (5xx). Weather:
@@ -131,7 +130,7 @@ impl std::fmt::Display for PointerError {
             Self::OtherTag { tag } => write!(
                 f,
                 "the evergreen release pointer names {tag}, a release of this channel that is \
-                 not an app release; the newest app release is elected from the listing"
+                 not an app release"
             ),
             Self::Refused { why } => write!(
                 f,
@@ -379,9 +378,9 @@ mod tests {
         refused("https://github.com/alabsystems/aterm/releases/download//aterm-appcast.toml");
         // Tags outside the grammar ON THIS REPOSITORY, for THIS asset — legacy
         // two-component, non-canonical spelling, prerelease suffix, atpkg's tags —
-        // are the one benign case (2026-09-14): `OtherTag`, so the caller elects
-        // the newest APP release from the listing instead of filing a network
-        // failure that never escalates. Invariant (d) holds exactly as before:
+        // are the one benign case (2026-09-14): `OtherTag`, so the caller records a
+        // head that is not an app release instead of filing a network failure that
+        // never escalates. Invariant (d) holds exactly as before:
         // nothing at the location is fetched, and the tag is named, never
         // interpreted as a release to install from.
         for tag in [

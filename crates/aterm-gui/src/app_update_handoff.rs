@@ -81,6 +81,11 @@ struct HandoffCapture {
     manifest: crate::session_store::SessionHandoff,
     fds: crate::session_store::HandoffFds,
     screens: Vec<(u64, aterm_core::terminal::TerminalCheckpoint)>,
+    /// The sessions the capture carried below its exact rungs — a clamped or a
+    /// blank screen (`seamless::CarryRung::needs_repaint`) — which the writer
+    /// marks `ScreenCarry::repaint` so the successor makes the program redraw
+    /// (the 2026-09-22/23 update audit, plan P0-1e).
+    repaint: Vec<u64>,
     /// Each session's CONTROL CARRY capture from the freeze — the archive's
     /// fence, counters and differ state, and the engine and ledger to export
     /// the rest from on this worker (`crate::handoff_carry`).
@@ -1568,13 +1573,24 @@ fn emergency_kill_and_reap_handoff_child(pid: u32) -> HandoffRollbackWarrant {
     wait_for_handoff_candidate_to_terminate(candidate)
 }
 
-/// PRE-PARK admission peek only: any readable byte OR error/hangup counts.
-/// Automatic mode refuses to even BEGIN an overlap while output is actively
-/// flowing (the quiet-epoch policy). Once an attempt is in flight this
-/// function must NOT be used — mid-flight, queued output is tolerated and
-/// only session death revokes; use [`handoff_masters_closed`] there.
+/// PRE-PARK admission peek only: a readable byte on a LIVE master — output its
+/// reader has not taken yet. Automatic mode refuses to even BEGIN an overlap
+/// while output is actively flowing (the quiet-epoch policy). Once an attempt
+/// is in flight this function must NOT be used — mid-flight, queued output is
+/// tolerated and only session death revokes; use [`handoff_masters_closed`]
+/// there.
+///
+/// POLLIN ONLY, AND NEVER FROM A HUNG-UP MASTER (the 2026-09-22/23 update
+/// audit, plan P1-3). This used to count `POLLHUP`/`POLLERR`/`POLLNVAL` as
+/// "output waiting" too. A dead master reports them forever — and macOS reports
+/// a dead slave as `POLLIN|POLLHUP`, so even the `POLLIN` bit lies for it — so a
+/// pane kept open after its command exited (`--hold`) answered "a session has
+/// output waiting" at every park gate for as long as it stayed open: every
+/// automatic attempt held its successor 120 s and stood down, every ~15 min,
+/// forever. A dead session is not output; it is death, which
+/// [`handoff_masters_closed`] and the post-park re-check already own.
 #[cfg(unix)]
-fn handoff_masters_have_activity(live: &[(u64, i32, i32)]) -> bool {
+pub(crate) fn handoff_masters_have_activity(live: &[(u64, i32, i32)]) -> bool {
     let mut fds = live
         .iter()
         .map(|(_, fd, _)| libc::pollfd {
@@ -1588,8 +1604,11 @@ fn handoff_masters_have_activity(live: &[(u64, i32, i32)]) -> bool {
     }
     // SAFETY: initialized stable pollfd slice; timeout 0 is a non-consuming peek.
     let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
-    let activity = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    polled > 0 && fds.iter().any(|fd| fd.revents & activity != 0)
+    let dead = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    polled > 0
+        && fds
+            .iter()
+            .any(|fd| fd.revents & libc::POLLIN != 0 && fd.revents & dead == 0)
 }
 
 /// MID-FLIGHT death peek: true only when a handed-off master reports
@@ -1604,7 +1623,7 @@ fn handoff_masters_have_activity(live: &[(u64, i32, i32)]) -> bool {
 /// by the paired unit test). The filter to HUP/ERR/NVAL in `revents` is what
 /// makes plain readable output invisible here.
 #[cfg(unix)]
-fn handoff_masters_closed(live: &[(u64, i32, i32)]) -> bool {
+pub(crate) fn handoff_masters_closed(live: &[(u64, i32, i32)]) -> bool {
     let mut fds = live
         .iter()
         .map(|(_, fd, _)| libc::pollfd {
@@ -2009,8 +2028,39 @@ fn handoff_preparation_cancelled(
     true
 }
 
-/// Every preparation failure is raised BEFORE `spawn`, including the one for a
-/// `spawn` that itself failed, so no candidate has ever held a master.
+/// THIS process could not prepare the handoff — a write, a descriptor, a
+/// `spawn`, an event loop or an attempt record gone, no private directory.
+/// Raised BEFORE any candidate held a master (so the warrant is
+/// `NoCandidate`), and filed `ProducerFailed` — Transient — because none of it
+/// is about the candidate's bytes (the 2026-09-22/23 update audit, plan P1-2).
+/// [`send_handoff_preparation_failure`] is kept for the one failure that is:
+/// the staged candidate's pre-park verification.
+#[cfg(unix)]
+fn send_handoff_producer_failure(
+    job: &HandoffWorkerJob,
+    proxy: &winit::event_loop::EventLoopProxy<Wake>,
+    nonce: Option<String>,
+    detail: impl Into<String>,
+) {
+    send_warranted_handoff_failure(
+        HandoffRollbackWarrant::NoCandidate,
+        &job.cleanup,
+        proxy,
+        job.current_build,
+        crate::UpdateHandoffCompletion::failure(
+            job.attempt_id,
+            nonce,
+            None,
+            crate::UpdateHandoffOutcome::ProducerFailed,
+            detail,
+        ),
+    );
+}
+
+/// The staged candidate failed its PRE-PARK VERIFICATION — the one preparation
+/// failure that is a verdict about the bytes, and so the only one still filed
+/// `PreparationFailed` (Structural). Raised BEFORE `spawn`, so no candidate
+/// has ever held a master.
 #[cfg(unix)]
 fn send_handoff_preparation_failure(
     job: &HandoffWorkerJob,
@@ -2288,7 +2338,9 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     let child = match job.command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            send_handoff_preparation_failure(
+            // The candidate passed its pre-park verification; a `spawn` that
+            // fails now is this process's (`EAGAIN`, `ENOMEM`, `EMFILE`).
+            send_handoff_producer_failure(
                 &job,
                 &proxy,
                 Some(nonce),
@@ -2351,8 +2403,13 @@ enum PreparationFailure {
     /// The main thread poked the cancel channel: structural activity revoked
     /// the attempt (typed `ActivityRevoked` for the retry budget).
     Cancelled,
-    /// A physical step refused; the detail is the status-bar row's sentence.
-    Failed(String),
+    /// A step of THIS process's own preparation refused — a write, a pipe, its
+    /// own carry disagreeing with itself; the detail is the status-bar row's
+    /// sentence, with the `std::io::ErrorKind` when the filesystem said one.
+    /// Nothing here is about the candidate, so it is filed `ProducerFailed`
+    /// (Transient), never `PreparationFailed` (the 2026-09-22/23 update audit,
+    /// plan P1-2: an `ENOSPC` here latched the artifact after two attempts).
+    Producer(String),
 }
 
 /// Every artifact one attempt publishes, in the order the successor consumes
@@ -2382,7 +2439,7 @@ fn prepare_outgoing_artifacts(
         .ok()
         .and_then(|wire| crate::restore::RestoreManifest::from_toml(&wire));
     if capture.layout.is_empty() || layout_roundtrip.as_ref() != Some(&capture.layout) {
-        return Err(PreparationFailure::Failed(
+        return Err(PreparationFailure::Producer(
             "could not persist the bounded handoff layout".to_string(),
         ));
     }
@@ -2403,18 +2460,20 @@ fn prepare_outgoing_artifacts(
     // late park launches the successor with the manifest's path before the
     // manifest exists, so the name must be derivable before the write, and the
     // echoed `outgoing.nonce` below is that very value.
-    let Some(outgoing) = crate::seamless::write_outgoing(
+    let outgoing = crate::seamless::write_outgoing(
         &capture.manifest,
         &capture.fds,
         &capture.screens,
+        &capture.repaint,
         capture.window.clone(),
         &controls,
         nonce,
-    ) else {
-        return Err(PreparationFailure::Failed(
-            "could not write the authenticated handoff manifest".to_string(),
-        ));
-    };
+    )
+    .map_err(|failure| {
+        PreparationFailure::Producer(format!(
+            "could not write the authenticated handoff manifest ({failure})"
+        ))
+    })?;
     let crate::seamless::OutgoingHandoff {
         manifest_path: path,
         nonce: echoed_nonce,
@@ -2436,7 +2495,7 @@ fn prepare_outgoing_artifacts(
     // here would surface later as an unexplained `AdoptionMismatch`. Catch it now
     // as an ordinary, explained preparation failure instead.
     if carried_screen_digest != capture.screen_digest {
-        return Err(PreparationFailure::Failed(
+        return Err(PreparationFailure::Producer(
             "handoff screen carry did not match the committed screen digest".to_string(),
         ));
     }
@@ -2444,10 +2503,10 @@ fn prepare_outgoing_artifacts(
         return Err(PreparationFailure::Cancelled);
     }
     let layout_path = std::path::Path::new(&path).with_extension("layout.toml");
-    if crate::restore::write_once_to(&layout_path, &capture.layout).is_err() {
-        return Err(PreparationFailure::Failed(
-            "could not write the attempt-bound handoff layout".to_string(),
-        ));
+    if let Err(error) = crate::restore::write_once_to(&layout_path, &capture.layout) {
+        return Err(PreparationFailure::Producer(format!(
+            "could not write the attempt-bound handoff layout ({error})"
+        )));
     }
     if job.cancel.try_recv().is_ok() {
         return Err(PreparationFailure::Cancelled);
@@ -2463,19 +2522,21 @@ fn prepare_outgoing_artifacts(
         // vector; on the out-of-band lane the middle field is the PTY device.
         &capture.proof_identities,
     ) else {
-        return Err(PreparationFailure::Failed(
+        return Err(PreparationFailure::Producer(
             "handoff identity set exceeds the proof format".to_string(),
         ));
     };
     let Some((proof_rd, proof_wr)) = make_cloexec_pipe() else {
-        return Err(PreparationFailure::Failed(
-            "could not create the adoption-proof channel".to_string(),
-        ));
+        let kind = std::io::Error::last_os_error().kind();
+        return Err(PreparationFailure::Producer(format!(
+            "could not create the adoption-proof channel ({kind})"
+        )));
     };
     let Some((commit_rd, commit_wr)) = make_cloexec_pipe() else {
-        return Err(PreparationFailure::Failed(
-            "could not create the handoff-commit channel".to_string(),
-        ));
+        let kind = std::io::Error::last_os_error().kind();
+        return Err(PreparationFailure::Producer(format!(
+            "could not create the handoff-commit channel ({kind})"
+        )));
     };
     if job.cancel.try_recv().is_ok() {
         return Err(PreparationFailure::Cancelled);
@@ -2494,8 +2555,9 @@ fn prepare_outgoing_artifacts(
 
 /// The fork lane's report of a [`PreparationFailure`]: no candidate exists, so
 /// the warrant is `NoCandidate` and the completion is exactly what each inline
-/// arm used to send — a cancel is `ActivityRevoked`, a refusal is
-/// `PreparationFailed`.
+/// arm used to send — a cancel is `ActivityRevoked` — except that this
+/// process's own refusal is `ProducerFailed` since the 2026-09-22/23 audit
+/// (plan P1-2), where it used to be `PreparationFailed`.
 #[cfg(unix)]
 fn report_preparation_failure(
     job: &HandoffWorkerJob,
@@ -2520,8 +2582,8 @@ fn report_preparation_failure(
                 "activity revoked handoff during physical preparation",
             ),
         ),
-        PreparationFailure::Failed(detail) => {
-            send_handoff_preparation_failure(job, proxy, Some(nonce), detail);
+        PreparationFailure::Producer(detail) => {
+            send_handoff_producer_failure(job, proxy, Some(nonce), detail);
         }
     }
 }
@@ -2939,12 +3001,7 @@ fn fork_after_park(
         })
         .is_err()
     {
-        send_handoff_preparation_failure(
-            job,
-            proxy,
-            Some(nonce),
-            "event loop closed before the park",
-        );
+        send_handoff_producer_failure(job, proxy, Some(nonce), "event loop closed before the park");
         return Prelaunched::Finished;
     }
     let hold_deadline = std::time::Instant::now() + hold_bound;
@@ -2957,7 +3014,7 @@ fn fork_after_park(
                 };
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                send_handoff_preparation_failure(
+                send_handoff_producer_failure(
                     job,
                     proxy,
                     Some(nonce),
@@ -3000,13 +3057,24 @@ fn fork_after_park(
             return Prelaunched::Finished;
         }
         if std::time::Instant::now() >= hold_deadline {
-            send_handoff_preparation_failure(
-                job,
+            // A HOLD THAT TIMED OUT IS TIMING, as the held lane's own hold
+            // deadline already says (`HoldOutcome::StandDown { TimedOut }`):
+            // it was `PreparationFailed` here, a verdict about bytes the fork
+            // had not even started (the 2026-09-22/23 audit, plan P1-2).
+            send_warranted_handoff_failure(
+                HandoffRollbackWarrant::NoCandidate,
+                &job.cleanup,
                 proxy,
-                Some(nonce),
-                format!(
-                    "the outgoing process did not park within {} s",
-                    hold_bound.as_secs()
+                job.current_build,
+                crate::UpdateHandoffCompletion::failure(
+                    job.attempt_id,
+                    Some(nonce),
+                    None,
+                    crate::UpdateHandoffOutcome::TimedOut,
+                    format!(
+                        "the outgoing process did not park within {} s",
+                        hold_bound.as_secs()
+                    ),
                 ),
             );
             return Prelaunched::Finished;
@@ -3094,7 +3162,7 @@ fn run_prelaunched_handoff(
     // names from the same nonce after the park (`prepare_outgoing_artifacts`
     // asserts the identity), and the successor reads them only after the grant.
     let Some(manifest_path) = crate::seamless::outgoing_manifest_path(&lane.nonce) else {
-        send_handoff_preparation_failure(
+        send_handoff_producer_failure(
             job,
             proxy,
             Some(lane.nonce.clone()),
@@ -3380,13 +3448,13 @@ fn run_prelaunched_handoff(
             );
             return Prelaunched::Finished;
         }
-        Err(PreparationFailure::Failed(detail)) => {
+        Err(PreparationFailure::Producer(detail)) => {
             retire_ungranted_successor(
                 job,
                 proxy,
                 &lane,
                 held,
-                crate::UpdateHandoffOutcome::PreparationFailed,
+                crate::UpdateHandoffOutcome::ProducerFailed,
                 detail,
             );
             return Prelaunched::Finished;
@@ -3839,6 +3907,88 @@ fn optional_carry_fits(
         .is_some_and(|total| total <= ceiling)
 }
 
+/// Why the park's capture (`App::capture_parked_screens`) could not produce a
+/// committed screen set — TYPED, because the capture is now total over screen
+/// content (the 2026-09-22/23 update audit, plan P0-1c) and what is left falls
+/// into kinds that deserve different answers: the first three are timing or
+/// this process's own memory, and retrying later is right; `Refused` is a
+/// deterministic fact that retrying the same desk cannot change, and filing it
+/// as "the machine is busy" is what looped v0.91 forever. Plan P0-3 gives it
+/// its own lane: [`classify_capture_failure`] is the one place a failure is
+/// sorted into a miss or a refusal, and [`std::fmt::Display`] keeps the
+/// sentences the ledger and the log have always carried.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CaptureFailure {
+    /// The capture outran the freeze budget.
+    Deadline { freeze_ms: u128 },
+    /// A session's engine stayed locked for the whole capture window.
+    EngineBusy,
+    /// This process could not reserve the capture's bounded storage.
+    Storage,
+    /// A session's parser was parked in the middle of an escape sequence
+    /// whose REST is still queued on its PTY — the reader stopped at a read
+    /// boundary inside a flood (a coloured build log, an inline redrawing UI,
+    /// a kitty-graphics or sixel transfer).
+    ///
+    /// TIMING, never a refusal, and never carried (the 2026-09-24 review of
+    /// the 2026-09-22/23 update audit fixes). The carry would abandon the
+    /// partial sequence as CAN does, and the successor's fresh Ground parser
+    /// would then read the queued tail as plain text: `6m` printed where a
+    /// colour was meant, a split `ESC [ 2` + `K` printing `K` and skipping the
+    /// erase, the rest of an image payload printed as screens of base64, a
+    /// split mode set lost in silence — on a session carried at the Full rung
+    /// with no repaint to cover it. The next park, 500 ms later on a wider
+    /// rung, almost always finds the reader on a sequence boundary; a stream
+    /// that never offers one is a busy machine, which is what a miss says.
+    /// A parser mid-sequence over a QUIET PTY (the stalled sequence the
+    /// abandoning carry exists for) is still carried.
+    MidSequence { local_id: u64, state: &'static str },
+    /// The build's own predicate refused the committed set: too many sessions,
+    /// a duplicate id, or (pinned unreachable) its own blank screen.
+    Refused {
+        local_id: Option<u64>,
+        cause: String,
+    },
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CaptureFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deadline { freeze_ms } => write!(
+                formatter,
+                "bounded visible-screen capture exceeded {freeze_ms} ms"
+            ),
+            Self::EngineBusy => formatter
+                .write_str("a terminal engine stayed busy for the whole handoff capture window"),
+            Self::Storage => {
+                formatter.write_str("visible checkpoint set could not reserve bounded storage")
+            }
+            Self::MidSequence { local_id, state } => write!(
+                formatter,
+                "session {local_id}'s parser was parked mid-sequence ({state}) with the rest of \
+                 that sequence still queued on its PTY; the park retries on a sequence boundary"
+            ),
+            Self::Refused { cause, .. } => formatter.write_str(cause),
+        }?;
+        formatter.write_str("; update handoff stayed in place")
+    }
+}
+
+/// The park's capture: every session's committed screen, the control carries
+/// that travel with them, the screen commitment `screen_digest` took over
+/// exactly those screens (the capture's self-check computes it, so no caller
+/// hashes the set twice under the freeze), and the sessions carried below the
+/// exact rungs, which the successor must make redraw (`ScreenCarry::repaint`).
+#[cfg(unix)]
+struct ParkedScreens {
+    screens: Vec<(u64, aterm_core::terminal::TerminalCheckpoint)>,
+    carries: Vec<crate::handoff_carry::CarrySource>,
+    screen_digest: [u8; 32],
+    repaint: Vec<u64>,
+}
+
 /// Why the in-session overlap handoff cannot run in THIS process. ONE predicate
 /// ([`App::seamless_handoff_unavailable`]) answers it for both readers — the
 /// apply gate in `start_unix_update_handoff` (`seamless_capable`) and the status
@@ -4022,9 +4172,9 @@ impl App {
         // new `main`. `exec` never returns on success. (Rung 1b: serialize the session
         // + pass the PTY master fds here so the new process re-adopts them.)
         // Hand the OLD build number to the post-update process via `ATERM_UPDATED_FROM`
-        // (inherited through `apply_staged_if_ready`'s own re-exec) so it shows the quiet
-        // cursor-themed "leveled-up" notice on startup. Read + cleared at startup so it
-        // never leaks into the user's shell children (`App::take_just_updated`).
+        // (inherited through `apply_staged_if_ready`'s own re-exec) so it records the
+        // landing on startup. Read + cleared at startup so it
+        // never leaks into the user's shell children (`JUST_UPDATED`).
         #[cfg(unix)]
         {
             // THE ROW IS RETIRED BY WHOEVER BROKE THE PROMISE. `start_unix_update_
@@ -4046,7 +4196,7 @@ impl App {
             );
             if let Err(error) = &started {
                 self.retire_update_installing();
-                self.record_update_switch_stopped(error.is_activity_deferred(), &error.to_string());
+                self.record_update_switch_stopped(error.stops_routinely(mode), &error.to_string());
             }
             return started;
         }
@@ -4180,8 +4330,9 @@ impl App {
     ) -> Result<(), crate::UpdateHandoffStartError> {
         use std::os::unix::process::CommandExt as _;
 
-        let live: Vec<(u64, i32, i32)> =
-            self.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
+        // Every session with a live process behind it; a pane kept open after
+        // its command exited is not handed (`handoff_live_sessions`).
+        let live: Vec<(u64, i32, i32)> = self.handoff_live_sessions();
         // THIS EPOCH GATES THE ENTRY, NOT THE FLIGHT — and the comment that
         // stood here said the opposite, four lines above the code that refutes
         // it. `automatic_activity_epoch` reaches exactly two places, both BEFORE
@@ -4250,6 +4401,20 @@ impl App {
                 why.cause(),
                 why.remedy()
             );
+        }
+        // NOTHING TO HAND OVER, SOMETHING TO LOSE. With every live session left
+        // out (`handoff_live_sessions`) the classifier below would read an exact
+        // zero-PTY desk and take the cold lane, whose `exec` closes every window —
+        // including the exited panes the user kept open (`--hold`) to read. That
+        // is not a desk with nothing on it, so it is a typed refusal instead:
+        // recorded, retried on the block cooldown, and gone the moment a pane is
+        // closed or a live tab opens (the 2026-09-24 review).
+        if live.is_empty() && !self.handoff_exited_session_ids().is_empty() {
+            return Err(crate::UpdateHandoffStartError::refused(
+                "every open terminal pane's command has exited (panes kept open by --hold); \
+                 the update applies once one is closed or a new tab opens, because replacing \
+                 the app now would close them",
+            ));
         }
         let overlap_available = handoff_unavailable.is_none();
         let facts = crate::native_update_admission::AdmissionFacts {
@@ -4360,8 +4525,9 @@ impl App {
         // worker's FIRST action (see `run_handoff_worker`), so the main thread
         // parks readers and returns without ever blocking on codesign. A failing
         // candidate is caught there and rolled back via the ordinary
-        // `PreparationFailed` completion (manual-only, like every other worker-
-        // stage preparation failure). The same-binary debug re-exec has no
+        // `PreparationFailed` completion (Structural — since the 2026-09-22/23
+        // audit the ONLY preparation failure filed that way; this process's own
+        // are `ProducerFailed`). The same-binary debug re-exec has no
         // staged bundle, so it carries `verify_staged_candidate: false`.
         //
         // …AND BETTER STILL, OUT OF THE PARKED WINDOW ENTIRELY: when this exact
@@ -4647,6 +4813,7 @@ impl App {
                 ));
             }
         };
+        let manifest = handed_sessions_only(manifest, &live);
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         let mut owned_masters = Vec::with_capacity(live.len());
         let mut adoption = Vec::with_capacity(live.len());
@@ -4684,7 +4851,6 @@ impl App {
                 // and paints carried content in them until Commit; the lines
                 // the freeze kept from the log ride along (design §3.8).
                 status_bar_rows: self.message_band_rows,
-                bars: Vec::new(),
                 messages: carried.messages,
                 next_message_id: carried.next_message_id,
                 // …and when this process finished downloading the build being
@@ -4713,6 +4879,16 @@ impl App {
                 "input or PTY output arrived before automatic reader park",
             ));
         }
+        // A HUNG-UP master is not output any more (plan P1-3), so the peek above
+        // no longer catches it; it is caught here, still before any reader
+        // stops, under a reason that says what it is — the post-park death check
+        // below would refuse it anyway, after freezing the terminal to learn it.
+        // Gated on the LANE, like that check, not on the activity epoch.
+        if mode.is_automatic() && handoff_masters_closed(&live) {
+            return Err(crate::UpdateHandoffStartError::activity(
+                "a session's command has exited but its pane is still open",
+            ));
+        }
         // How much of the capture window must remain before a session is willing to
         // serialize scrollback as well as its visible screen. Half the freeze budget: the
         // visible screen is mandatory and cheap, history is optional and priced per
@@ -4729,13 +4905,20 @@ impl App {
         // while `build` here is the RUNNING one — so the filter never matched,
         // every automatic retry got the first attempt's 20 ms, and the wider
         // rungs (5f77ff084) were dead on the lane they were written for.
-        let prior_physical_failures = self.prior_physical_failures_of(apply_attempt.as_ref());
+        // PLUS THIS LANE'S OWN PARK MISSES (plan P1-4): a fork-lane miss is no
+        // longer charged as a physical failure, so the rung it used to buy is
+        // counted here instead — see `App::fork_park_misses`.
+        let fork_park_misses = self.fork_park_misses_of(target_build);
+        let prior_physical_failures = self
+            .prior_physical_failures_of(apply_attempt.as_ref())
+            .saturating_add(fork_park_misses);
         let freeze_budget = handoff_freeze_budget(mode, prior_physical_failures);
         let freeze_ms = freeze_budget.as_millis();
         let handoff_history_comfort = freeze_budget / 2;
         aterm_log::info!(
             "update apply: freeze budget {freeze_ms} ms ({mode:?}, {prior_physical_failures} prior \
-             physical failure(s) of the target artifact; running build {build})"
+             physical failure(s) of the target artifact incl. {fork_park_misses} fork-lane park \
+             miss(es); running build {build})"
         );
         // THE INSTANT THE TERMINAL STOPS ECHOING — the start of the freeze the
         // user experiences, and the zero point of the two numbers reported at
@@ -4744,9 +4927,10 @@ impl App {
         let deadline = park_at + freeze_budget;
         if !self.park_all_readers(deadline) {
             self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(format!(
-                "a PTY reader missed the {freeze_ms} ms handoff park deadline"
-            )));
+            return Err(self.fork_park_missed(
+                target_build,
+                format!("a PTY reader missed the {freeze_ms} ms handoff park deadline"),
+            ));
         }
         // SEAMLESS: the post-park re-check tolerates activity that used to
         // revoke here. A final burst consumed by a reader during the bounded
@@ -4771,16 +4955,36 @@ impl App {
                 "a PTY session closed during automatic reader park",
             ));
         }
-        let (screens, carries) = match self.capture_parked_screens(
+        let ParkedScreens {
+            screens,
+            carries,
+            screen_digest,
+            repaint,
+        } = match self.capture_parked_screens(
             &live,
             deadline,
             freeze_ms,
             handoff_history_comfort,
+            crate::seamless::WireCaps::for_target(target_build),
         ) {
             Ok(captured) => captured,
-            Err(reason) => {
+            Err(failure) => {
                 self.rollback_overlap(None, &live);
-                return Err(crate::UpdateHandoffStartError::failed(reason));
+                // ONE FACT, ONE VERDICT, WHICHEVER LANE (plan P0-3(d), P1-4):
+                // the same classifier the launched lane's park reads. A miss
+                // rides the activity spacing; a refusal the refusal lane. Both
+                // used to be `failed` here — PHYSICAL, latching after nine.
+                return Err(match classify_capture_failure(&failure) {
+                    ParkAttempt::Refused(refusal) => {
+                        crate::UpdateHandoffStartError::capture_refused(refusal.to_string())
+                    }
+                    ParkAttempt::Missed(reason) => self.fork_park_missed(target_build, reason),
+                    // The classifier answers only the two above; anything else
+                    // it ever grows is timing until proven otherwise.
+                    ParkAttempt::Parked | ParkAttempt::NotYet(_) | ParkAttempt::Failed(_) => {
+                        self.fork_park_missed(target_build, failure.to_string())
+                    }
+                });
             }
         };
 
@@ -4811,27 +5015,23 @@ impl App {
 
         let Some(layout_digest) = crate::seamless::layout_digest(&layout) else {
             self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff layout could not be committed canonically",
+            return Err(crate::UpdateHandoffStartError::capture_refused(
+                CaptureRefusal {
+                    local_id: None,
+                    cause: "handoff layout could not be committed canonically".to_string(),
+                }
+                .to_string(),
             ));
         };
-        // The refusal REASON rides the message: this arm used to surface a dozen
-        // distinct causes as one opaque sentence, so a stuck update was invisible
-        // until someone read the source. It reaches the user through
-        // `aterm ctl update status`'s `apply_failure=`.
-        let screen_digest = match crate::seamless::screen_digest(&screens) {
-            Ok(digest) => digest,
-            Err(refusal) => {
-                self.rollback_overlap(None, &live);
-                return Err(crate::UpdateHandoffStartError::failed(format!(
-                    "visible checkpoint set could not be committed canonically: {refusal}"
-                )));
-            }
-        };
+        // The screen commitment was taken by the capture's own self-check
+        // (`seamless::settle_wire_carries`), over exactly `screens`; a refusal
+        // it could not lower is in the capture's `Err` above, named.
         if std::time::Instant::now() >= deadline {
             self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff proof capture exceeded the 20 ms deadline",
+            // It said "20 ms" whatever the rung was.
+            return Err(self.fork_park_missed(
+                target_build,
+                format!("handoff proof capture exceeded the {freeze_ms} ms deadline"),
             ));
         }
         let activity_epoch = self.update_handoff_activity_epoch;
@@ -4887,6 +5087,7 @@ impl App {
                 manifest,
                 fds,
                 screens,
+                repaint,
                 carries,
                 window,
                 layout,
@@ -4924,45 +5125,105 @@ impl App {
         Ok(())
     }
 
-    /// THE CAPTURE LADDER, under the park: every session's visible screen (and
-    /// as much scrollback as the remaining budget allows) plus the control
-    /// carry's head, priced against the freeze budget and the aggregate cell and
-    /// decode-authority ceilings. Shared by both lanes (2026-09-19): the fork
-    /// lane runs it inline before its spawn, the launched lane at the park it
-    /// takes once the successor has dialled. `Err` is the refusal's sentence;
-    /// the caller rolls the readers back.
+    /// THE SESSIONS AN OVERLAP HANDOFF HANDS OVER, as `(local_id, master, pid)`:
+    /// every pooled session except a pane kept open after its command EXITED
+    /// (`aterm --hold`, or any pane whose close did not follow its exit), which
+    /// the session registry marks `Exited` at the reader's EOF.
+    ///
+    /// Why they are left out (the 2026-09-24 review of the 2026-09-22/23 update
+    /// audit fixes, plan P1-3). Such a pane's master has hung up and stays hung
+    /// up until a person closes the pane, and both lanes treated a hung-up
+    /// master as a session that died under the attempt: the launched lane's
+    /// park gate waited on it with no bound, held every automatic successor
+    /// its full 120 s and stood it down as `ActivityRevoked` ("the terminal
+    /// never offered a moment to pause in"), every fifteen minutes, forever;
+    /// the fork lane deferred on it every 500 ms, recording nothing. The update
+    /// could not land while one exited pane was open. There is no live process
+    /// behind that pane to keep, so nothing is handed for it: the successor
+    /// rebuilds its layout leaf the way a relaunch does (a fresh shell in the
+    /// pane's last directory), and every live session goes across exactly.
+    ///
+    /// Read ONCE per decision and passed down, so the gate, the capture, the
+    /// descriptors and the manifest all describe the same set; the Commit
+    /// check compares against it with [`Self::handoff_exited_session_ids`].
     #[cfg(unix)]
-    #[allow(clippy::type_complexity)]
+    pub(crate) fn handoff_live_sessions(&self) -> Vec<(u64, i32, i32)> {
+        let exited = self.handoff_exited_session_ids();
+        self.pool
+            .iter()
+            .filter(|session| !exited.contains(&session.id))
+            .map(|session| (session.id, session.master, session.pid))
+            .collect()
+    }
+
+    /// The pooled sessions whose command has exited (registry state
+    /// `Exited`) — the panes [`Self::handoff_live_sessions`] leaves out. A
+    /// leaf read of the session registry, never a `Terminal` lock.
+    #[cfg(unix)]
+    pub(crate) fn handoff_exited_session_ids(&self) -> Vec<u64> {
+        let store = self
+            .store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.pool
+            .iter()
+            .map(|session| session.id)
+            .filter(|id| {
+                store.by_local(*id).is_some_and(|handle| {
+                    handle.state == crate::session_store::SessionState::Exited
+                })
+            })
+            .collect()
+    }
+
+    /// THE CAPTURE LADDER, under the park: every session's screen (and as much
+    /// scrollback as the remaining budget allows) plus the control carry's head,
+    /// priced against the freeze budget and the aggregate cell and
+    /// decode-authority ceilings, then committed by the build's own full
+    /// predicate. Shared by both lanes (2026-09-19): the fork lane runs it
+    /// inline before its spawn, the launched lane at the park it takes once the
+    /// successor has dialled. The caller rolls the readers back on `Err`.
+    ///
+    /// TOTAL OVER SCREEN CONTENT (the 2026-09-22/23 update audit, plan P0-1c/d).
+    /// Each session is carried by [`crate::seamless::carry_for_wire`] at the
+    /// most faithful rung the build's predicates admit at the successor's
+    /// `caps` — a parser mid-sequence, a screen over the per-grid cap, a grid
+    /// the wire cannot shape and a meta out of bounds each used to refuse the
+    /// whole update, every attempt, from the OLDER build where no release could
+    /// fix it; now each costs that one session a rung, at worst a blank tab that
+    /// redraws. The pool is then committed by
+    /// [`crate::seamless::settle_wire_carries`], which lowers whatever session
+    /// `screen_digest` still blames. So `Err` is only ever timing (the deadline,
+    /// or an engine lock it could not take), storage this process could not
+    /// reserve, or a refusal that is not about any one screen (too many
+    /// sessions, a duplicate id) — or this build refusing its own blank screen,
+    /// which a test pins unreachable.
+    #[cfg(unix)]
     fn capture_parked_screens(
         &mut self,
         live: &[(u64, i32, i32)],
         deadline: std::time::Instant,
         freeze_ms: u128,
         handoff_history_comfort: std::time::Duration,
-    ) -> Result<
-        (
-            Vec<(u64, aterm_core::terminal::TerminalCheckpoint)>,
-            Vec<crate::handoff_carry::CarrySource>,
-        ),
-        String,
-    > {
-        let mut screens = Vec::new();
+        caps: crate::seamless::WireCaps,
+    ) -> Result<ParkedScreens, CaptureFailure> {
+        use crate::seamless::{CarryRung, WireCarry};
+
+        let mut wire: Vec<WireCarry> = Vec::new();
         // The control carry's captures. Storage it cannot reserve carries
         // nothing (`carry_room` false) — never a failed capture.
         let mut carries = Vec::new();
         let carry_room = carries.try_reserve_exact(live.len()).is_ok();
-        if screens.try_reserve_exact(live.len()).is_err() {
-            return Err("visible checkpoint set could not reserve bounded storage".to_string());
+        if wire.try_reserve_exact(live.len()).is_err() {
+            return Err(CaptureFailure::Storage);
         }
         let mut capture_failed = None;
         let mut capture_budget = 0_u64;
         let mut capture_cells = 0_u64;
-        // Latched once the aggregate cell budget has refused a carried-history
-        // checkpoint: every later session goes straight to visible-only rather than
-        // paying a probe that this pool has already proven cannot pass. TWO causes
-        // arm it — the budget refusing the carry, and the produced blob refusing the
-        // wire's shape — which is why it is named for its EFFECT and not for either
-        // one of them.
+        // Latched once a session's carried history was refused — by the budget,
+        // or by the shape of the produced blob — so every later session goes
+        // straight to visible-only rather than paying a probe that this pool
+        // has already proven cannot pass. Named for its EFFECT, not either cause.
         let mut history_latched_off = false;
         // MANDATORY FIRST, OPTIONAL SECOND. Price the visible+alt grids of the WHOLE
         // POOL before charging any of it, in both budgets. Without this the budgets
@@ -4976,7 +5237,12 @@ impl App {
         // guess made here must never be the optimistic one.
         let mut cells_reserve = 0_u64;
         let mut bytes_reserve = 0_u64;
-        for session in self.pool.iter() {
+        // ONLY THE HANDED SESSIONS (the 2026-09-24 review): `live` leaves out a
+        // pane kept open after its command exited (`App::handoff_live_sessions`),
+        // and a screen carried for a session with no descriptor on the wire is
+        // one `write_outgoing` refuses as inconsistent.
+        let handed = |id: u64| live.iter().any(|(local_id, _, _)| *local_id == id);
+        for session in self.pool.iter().filter(|session| handed(session.id)) {
             let terminal = match try_lock_by(&session.term, deadline) {
                 Some(guard) => guard,
                 None => {
@@ -4992,23 +5258,32 @@ impl App {
                 .saturating_add(crate::seamless::mandatory_checkpoint_cells(rows, cols));
             bytes_reserve = bytes_reserve.saturating_add(mandatory_bytes);
         }
-        for session in self.pool.iter() {
+        for session in self.pool.iter().filter(|session| handed(session.id)) {
             if std::time::Instant::now() >= deadline {
-                capture_failed = Some(format!(
-                    "bounded visible-screen capture exceeded {freeze_ms} ms"
-                ));
+                capture_failed = Some(CaptureFailure::Deadline { freeze_ms });
                 break;
             }
             let Some(terminal) = try_lock_by(&session.term, deadline) else {
-                capture_failed = Some(format!(
-                    "a terminal engine stayed busy for the whole {freeze_ms} ms handoff \
-                     capture window"
-                ));
+                capture_failed = Some(CaptureFailure::EngineBusy);
                 break;
             };
-            if !terminal.parser_is_ground() {
-                capture_failed =
-                    Some("a terminal parser was mid-sequence during handoff capture".to_string());
+            // A PARSER PARKED MID-SEQUENCE OVER QUEUED OUTPUT IS A MISS, NOT A
+            // CARRY (the 2026-09-24 review). The carry would abandon the partial
+            // sequence as CAN does, and the successor's fresh parser would then
+            // print the rest of it — still waiting in the kernel — as text. Only
+            // when the PTY is quiet (a stalled sequence, which may never end) is
+            // abandoning the answer. One `poll` per mid-sequence session: the
+            // common desk is at Ground and pays nothing here.
+            if let Some(state) = terminal.partial_sequence_state()
+                && live
+                    .iter()
+                    .find(|(local_id, _, _)| *local_id == session.id)
+                    .is_some_and(|entry| handoff_masters_have_activity(std::slice::from_ref(entry)))
+            {
+                capture_failed = Some(CaptureFailure::MidSequence {
+                    local_id: session.id,
+                    state,
+                });
                 break;
             }
             // SCROLLBACK IS BEST-EFFORT AND MUST NEVER COST THE HANDOFF.
@@ -5050,7 +5325,7 @@ impl App {
                 bytes_reserve,
                 MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
             );
-            let mut history = if remaining >= handoff_history_comfort
+            let history = if remaining >= handoff_history_comfort
                 && !history_latched_off
                 && history_fits_cells
                 && history_fits_bytes
@@ -5059,158 +5334,50 @@ impl App {
             } else {
                 0
             };
-            // Reject decoded allocation dimensions BEFORE the checkpoint serializes
-            // anything. Conservatively reserve main+alt because querying the copied
-            // checkpoint to discover alt presence is exactly the potentially
-            // expensive work this admission must precede.
-            let mut per_grid = crate::seamless::admit_checkpoint_dimensions(
-                &mut capture_cells,
-                rows,
-                cols,
-                history,
-                true,
-            );
-            // DEGRADE ON BUDGET, exactly as the note above promises — this is the
-            // arm that was missing, and its absence is why an update could refuse
-            // to install forever.
-            //
-            // The ladder above reacts only to TIME. `admit_checkpoint_dimensions`
-            // also refuses on SPACE: the process-wide
-            // `MAX_HANDOFF_AGGREGATE_GRID_CELLS` is charged
-            // `cols * (2*rows + history)` per session across every tab and pane of
-            // every window, and carrying 256 history lines multiplies what a session
-            // costs. So a handful of ordinary sessions exhausts it — and a refusal
-            // there used to fall straight through to `capture_failed`, trading the
-            // whole update for the scrollback it was carrying. That is the precise
-            // failure this comment's own "MUST NEVER COST THE HANDOFF" forbids, and
-            // it is deterministic: same sessions, same geometry, same constants
-            // every attempt, so the automatic lane retried it indefinitely.
-            //
-            // A refusal costs nothing to recover from: the admission mutates the
-            // aggregate ONLY on success ("an over-budget checkpoint cannot leave
-            // partial authority"), so re-probing visible-only is exact, not
-            // approximate. The latch stops every later session paying the same
-            // doomed probe once the budget is known to be tight.
-            if per_grid.is_none() && history != 0 {
-                // SAY SO. Dropping a tab's history is invisible to the user until they
-                // scroll up and find it gone, on a machine configured for 100,000
-                // lines. The decision is deliberate and stays deliberate — but it is
-                // recorded where every other handoff decision is (2026-08-19, raised
-                // by an external reviewer of the product's public claim).
-                aterm_log::info!(
-                    "update apply: carrying no scrollback for this session — the \
-                     handoff's aggregate cell budget cannot fit {history} history \
-                     line(s) beside the visible {rows}x{cols} screen. Processes, the \
-                     visible screen and queued output still survive the update."
-                );
-                history = 0;
-                history_latched_off = true;
-                per_grid = crate::seamless::admit_checkpoint_dimensions(
-                    &mut capture_cells,
-                    rows,
-                    cols,
-                    0,
-                    true,
-                );
-            }
-            // Only now is a refusal real: the VISIBLE screen is what adoption
-            // requires, so a checkpoint that cannot be admitted even without history
-            // is a genuine blocker rather than a carried bonus. Name the cap that
-            // actually bound — the aggregate is in grid CELLS, and reporting every
-            // refusal as the byte cap sent this exact investigation looking for a
-            // 256 MiB allocation that was never involved.
-            if per_grid.is_none() {
-                capture_failed = Some(
-                    "visible-screen capture exceeded the aggregate grid-cell budget".to_string(),
-                );
-                break;
-            }
-            capture_budget = per_grid
-                .and_then(|bytes| bytes.checked_mul(2))
+            // THE DECODE-AUTHORITY BUDGET is the producer's own ceiling — no
+            // consumer checks it — so it may choose a rung but never refuse the
+            // update (plan P0-1c). A session whose visible screen alone would
+            // take the pool past it is carried blank; the history it might have
+            // carried was already priced above by `history_fits_bytes`.
+            let visible_authority = crate::seamless::checkpoint_capture_budget_bytes(rows, cols, 0)
                 .and_then(|bytes| capture_budget.checked_add(bytes))
-                .unwrap_or(u64::MAX);
-            // Same ladder, one budget over. This charge is not degradable here —
-            // the history that would have been dropped was already refused above by
-            // `history_fits`, which prices this ceiling too — so reaching it means
-            // the pool's MANDATORY visible screens alone do not fit, which is a
-            // genuine blocker rather than a carried bonus. Name the authority, not
-            // "memory": nothing here allocates these bytes, they are the decode
-            // ceiling the successor would be granted.
-            if capture_budget > MAX_HANDOFF_CAPTURE_BUDGET_BYTES {
-                capture_failed = Some(
-                    "visible-screen capture exceeded the aggregate decode-authority budget"
-                        .to_string(),
-                );
-                break;
-            }
-            let Some(mut checkpoint) = terminal.checkpoint_carry(history as usize) else {
-                capture_failed =
-                    Some("a terminal parser left Ground during handoff capture".to_string());
-                break;
+                .filter(|total| *total <= MAX_HANDOFF_CAPTURE_BUDGET_BYTES);
+            let (checkpoint, rung, _cause) = if visible_authority.is_some() {
+                crate::seamless::carry_for_wire(
+                    &terminal,
+                    session.id,
+                    history,
+                    &mut capture_cells,
+                    caps,
+                )
+            } else {
+                crate::seamless::repaint_carry_for_wire(
+                    &terminal,
+                    session.id,
+                    &mut capture_cells,
+                    caps,
+                    format!(
+                        "{rows}x{cols} would take the pool past the \
+                         {MAX_HANDOFF_CAPTURE_BUDGET_BYTES}-byte decode-authority budget"
+                    ),
+                )
             };
-            // DEGRADE ON SHAPE — the sibling of the budget arm above, and the arm
-            // whose absence stranded a machine on an update it had already
-            // downloaded and verified.
-            //
-            // The budget ladder prices TIME and SPACE. It cannot see the third way
-            // a carry can be wrong: the produced blob not matching the shape the
-            // wire allows. That is what `checkpoint_shape_refusal` asks, and until
-            // now nobody asked it here — the checkpoint went straight into
-            // `screens` and the first shape check ran in `screen_digest`, past the
-            // point where the carry could still be lowered, with nothing left to do
-            // but refuse the whole update. It refused every ~10 minutes for four
-            // days.
-            //
-            // Lowering the carry is the cure for this whole CLASS, not one bug: the
-            // inactive grid's blob is the only one whose record count the wire
-            // cannot describe, and at `history == 0` it is exactly `rows` records by
-            // construction, whatever the producer believed about the slot.
-            //
-            // Re-probing is exact rather than approximate, for the same reason the
-            // budget arm gives: nothing here has been published yet. The aggregates
-            // are function locals, `screen_digest`'s own aggregate is fresh per
-            // call, and this session's cells were already admitted at the HIGHER
-            // carry — so a re-carry at 0 leaves the pool charged for history it no
-            // longer holds. That over-charge is deliberate: it is conservative, it
-            // only ever makes a LATER session degrade sooner, and refunding a
-            // transactional admission would be the kind of partial-authority
-            // bookkeeping `admit_checkpoint_dimensions` exists to avoid.
-            if let Some(refusal) =
-                crate::seamless::checkpoint_shape_refusal(session.id, &checkpoint)
-            {
-                if history == 0 {
-                    // Nothing left to lower. A visible-only capture that still will
-                    // not take the wire's shape is a genuine blocker, and now it
-                    // says which check refused instead of dying anonymously.
-                    capture_failed = Some(format!(
-                        "a visible checkpoint could not be shaped for the wire even without carried scrollback ({refusal})"
-                    ));
-                    break;
-                }
-                aterm_log::warn!(
-                    "update apply: carrying no scrollback for the rest of this handoff — the carried shape was refused ({refusal}). Processes, the visible screen and queued output still survive the update."
-                );
-                // Only the LATCH carries this decision forward. Unlike the budget
-                // arm — which lowers `history` before the carry that reads it —
-                // this one runs after, and re-carries explicitly below; assigning
-                // `history` here would be writing to a value nothing reads again.
+            // A carry whose history a predicate refused lowers every later
+            // session's too — the budget or the shape that refused it is the
+            // pool's, not this session's alone. Only the VisibleOnly rung says
+            // that and nothing else: a Sanitized carry may still hold its
+            // history, and a Repaint is about this one screen (its geometry
+            // over a cap, a line past the record cap, a meta with no clamp),
+            // which says nothing about what the next session's history costs.
+            if history != 0 && rung == CarryRung::VisibleOnly {
                 history_latched_off = true;
-                let Some(visible_only) = terminal.checkpoint_carry(0) else {
-                    capture_failed =
-                        Some("a terminal parser left Ground during handoff capture".to_string());
-                    break;
-                };
-                if let Some(refusal) =
-                    crate::seamless::checkpoint_shape_refusal(session.id, &visible_only)
-                {
-                    capture_failed = Some(format!(
-                        "a visible checkpoint could not be shaped for the wire even without carried scrollback ({refusal})"
-                    ));
-                    break;
-                }
-                checkpoint = visible_only;
             }
-            screens.push((session.id, checkpoint));
+            capture_budget = crate::seamless::checkpoint_capture_budget_bytes(
+                checkpoint.rows,
+                checkpoint.cols,
+                checkpoint.history_lines,
+            )
+            .map_or(u64::MAX, |bytes| capture_budget.saturating_add(bytes));
             // THE CONTROL CARRY'S SHARE OF THE FREEZE (round 10), and all of it:
             // the archive's fence and counters, plus the differ's screen-sized
             // state — under this same lock, so it describes exactly the screen
@@ -5219,11 +5386,13 @@ impl App {
             // half the budget it leaves even the differ's state out — the worker
             // takes it then, while the fence's fingerprint of it holds (nothing
             // committed since), so the adopting engine still goes on exactly:
-            // the carry is never worth the deadline.
+            // the carry is never worth the deadline. A session carried below
+            // VisibleOnly goes without: its differ state describes a screen that
+            // was not carried (plan P0-1e).
             let differ = deadline.saturating_duration_since(std::time::Instant::now())
                 >= handoff_history_comfort;
             // Reserved for every live session above, so this never allocates.
-            if carry_room {
+            if carry_room && rung.keeps_control_carry() {
                 carries.push(crate::handoff_carry::capture_head(
                     session.id,
                     &terminal,
@@ -5232,22 +5401,59 @@ impl App {
                     differ,
                 ));
             }
+            wire.push(WireCarry {
+                local_id: session.id,
+                checkpoint,
+                rung,
+            });
             if std::time::Instant::now() >= deadline {
-                capture_failed = Some(format!(
-                    "bounded visible-screen capture exceeded {freeze_ms} ms"
-                ));
+                capture_failed = Some(CaptureFailure::Deadline { freeze_ms });
                 break;
             }
         }
         if capture_failed.is_none() && std::time::Instant::now() >= deadline {
-            capture_failed = Some(format!(
-                "bounded visible-screen capture exceeded {freeze_ms} ms"
-            ));
+            capture_failed = Some(CaptureFailure::Deadline { freeze_ms });
         }
-        if let Some(reason) = capture_failed {
-            return Err(format!("{reason}; update handoff stayed in place"));
+        if let Some(failure) = capture_failed {
+            return Err(failure);
         }
-        Ok((screens, carries))
+        // THE SELF-CHECK (plan P0-1d): commit the pool with `screen_digest`, and
+        // lower whatever session it still blames instead of refusing the update.
+        let screen_digest =
+            crate::seamless::settle_wire_carries(&mut wire, caps).map_err(|refusal| {
+                CaptureFailure::Refused {
+                    local_id: refusal.local_id(),
+                    cause: format!(
+                        "visible checkpoint set could not be committed canonically: {refusal}"
+                    ),
+                }
+            })?;
+        // A session the self-check lowered below VisibleOnly loses its control
+        // carry too.
+        carries.retain(|source: &crate::handoff_carry::CarrySource| {
+            wire.iter().any(|carry| {
+                carry.local_id == source.local_id() && carry.rung.keeps_control_carry()
+            })
+        });
+        let mut screens = Vec::new();
+        let mut repaint = Vec::new();
+        if screens.try_reserve_exact(wire.len()).is_err()
+            || repaint.try_reserve_exact(wire.len()).is_err()
+        {
+            return Err(CaptureFailure::Storage);
+        }
+        for carry in wire {
+            if carry.rung.needs_repaint() {
+                repaint.push(carry.local_id);
+            }
+            screens.push((carry.local_id, carry.checkpoint));
+        }
+        Ok(ParkedScreens {
+            screens,
+            carries,
+            screen_digest,
+            repaint,
+        })
     }
 
     /// The launched lane's first half (2026-09-19, the late park): record the
@@ -5303,6 +5509,8 @@ impl App {
             dialled: None,
             park_retry_at: None,
             park_misses: 0,
+            land_waits: 0,
+            last_wait: None,
             stood_down: false,
             teardown: crate::DeferredHandoffTeardown::None,
             revoked_by_activity: false,
@@ -5424,6 +5632,21 @@ impl App {
                     prelaunch.park_retry_at = Some(now + PRELAUNCH_PARK_RETRY);
                     aterm_log::debug!("update apply: not parking yet — {reason}");
                 }
+            }
+            // A REFUSED CAPTURE IS NOT A MISSED PARK (2026-09-22/23 update
+            // audit, plan P0-3). The readers are back and nothing was granted,
+            // exactly as for a miss — but a wider rung cannot change what the
+            // capture refused, so re-parking would spend the user's freeze on
+            // an answer already known, and standing down as `ActivityRevoked`
+            // would tell the lane (and the bar) that the machine was busy.
+            // The successor stands down typed `CaptureRefused` instead: the
+            // refusal lane records it and retries once the desk changes.
+            ParkAttempt::Refused(refusal) => {
+                aterm_log::warn!(
+                    "update apply: {refusal}; a wider freeze rung cannot change that, so the \
+                     held successor stands down and the lane retries once the desk changes"
+                );
+                self.stand_down_prelaunched_successor(capture_refusal_stand_down(&refusal));
             }
             // A PARK THAT MISSED ITS BUDGET IS NOT A FAILED UPDATE (2026-09-19).
             // The readers are back (nothing was granted, so the rollback is
@@ -5584,10 +5807,14 @@ impl App {
         let dialer_pid = dialled.and_then(|dialled| dialled.pid);
         let dialled_at = dialled.map_or(now, |dialled| dialled.at);
         let park_misses = prelaunch.park_misses;
+        let land_waits = prelaunch.land_waits;
         let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
 
-        let live: Vec<(u64, i32, i32)> =
-            self.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
+        // Every session with a live process behind it: a pane kept open after
+        // its command exited is left out HERE, before the gate reads the
+        // masters, so its hung-up master can neither hold the park nor fail it
+        // (`handoff_live_sessions`).
+        let live: Vec<(u64, i32, i32)> = self.handoff_live_sessions();
         if live.is_empty() {
             return ParkAttempt::Failed(HandoffStandDown {
                 outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
@@ -5603,25 +5830,56 @@ impl App {
             phase: self.automatic_phase_for(mode, now),
             activity: self.automatic_activity_facts(mode, now),
             masters_quiet: !handoff_masters_have_activity(&live),
+            masters_alive: !handoff_masters_closed(&live),
+            land_waits,
             held_for: now.saturating_duration_since(dialled_at),
         };
-        match prelaunch_park_admitted(gate_facts, prelaunch_hold_cap(mode)) {
+        let gate = prelaunch_park_admitted(gate_facts, prelaunch_hold_cap(mode));
+        // CONSECUTIVE `Land` waits, counted here where the gate is read (plan
+        // P1-3): any other answer, or any other phase, starts the count over.
+        let last_wait = self
+            .update_handoff_prelaunch
+            .as_ref()
+            .and_then(|prelaunch| prelaunch.last_wait);
+        if let Some(prelaunch) = self.update_handoff_prelaunch.as_mut() {
+            prelaunch.land_waits = match gate {
+                ParkGate::Wait(_)
+                    if gate_facts.phase == crate::native_update_auto_intent::ApplyPhase::Land =>
+                {
+                    land_waits.saturating_add(1)
+                }
+                _ => 0,
+            };
+            if let ParkGate::Wait(reason) = gate {
+                prelaunch.last_wait = Some(reason);
+            }
+        }
+        if !gate_facts.masters_quiet && gate == ParkGate::Park && mode.is_automatic() {
+            aterm_log::info!(
+                "update apply: parking at the bound over output still queued on a master \
+                 after {land_waits} consecutive waits; the successor replays it after Commit"
+            );
+        }
+        match gate {
             ParkGate::Park => {}
             ParkGate::Wait(reason) => return ParkAttempt::NotYet(reason),
             ParkGate::StandDown(reason) => {
                 return ParkAttempt::Failed(HandoffStandDown {
                     outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
-                    detail: format!(
-                        "{reason} ({} s after the successor dialled)",
-                        gate_facts.held_for.as_secs()
-                    ),
+                    detail: hold_cap_stand_down_detail(reason, gate_facts.held_for, last_wait),
                 });
             }
         }
+        // THIS PROCESS'S OWN LIMITS ARE NOT A VERDICT ABOUT THE CANDIDATE
+        // (2026-09-22/23 update audit, plan P1-2): each stand-down below the
+        // gate that is not the park or the capture is `ProducerFailed` —
+        // Transient — where it used to be `PreparationFailed`, which files a
+        // user opening a 63rd tab during the hold, or an `EMFILE`, as the
+        // staged bytes failing and latches after two.
         #[cfg(target_os = "macos")]
         if live.len() > crate::handoff_rendezvous::MAX_RENDEZVOUS_SESSIONS {
             return ParkAttempt::Failed(HandoffStandDown {
-                outcome: crate::UpdateHandoffOutcome::PreparationFailed,
+                outcome: crate::UpdateHandoffOutcome::ProducerFailed,
                 detail: "more sessions opened than one descriptor message carries".to_string(),
             });
         }
@@ -5639,6 +5897,7 @@ impl App {
                 return ParkAttempt::NotYet("the session registry is busy");
             }
         };
+        let manifest = handed_sessions_only(manifest, &live);
         let mut owned_masters = Vec::with_capacity(live.len());
         let mut adoption = Vec::with_capacity(live.len());
         for (local_id, master, pid) in &live {
@@ -5647,9 +5906,10 @@ impl App {
             // changing the open-file-description inherited by the child.
             let duplicate = unsafe { libc::fcntl(*master, libc::F_DUPFD_CLOEXEC, 3) };
             if duplicate < 0 {
+                let kind = std::io::Error::last_os_error().kind();
                 return ParkAttempt::Failed(HandoffStandDown {
-                    outcome: crate::UpdateHandoffOutcome::PreparationFailed,
-                    detail: "could not reserve child-only PTY descriptors".to_string(),
+                    outcome: crate::UpdateHandoffOutcome::ProducerFailed,
+                    detail: format!("could not reserve child-only PTY descriptors ({kind})"),
                 });
             }
             // SAFETY: F_DUPFD_CLOEXEC returned a fresh descriptor owned here.
@@ -5676,7 +5936,6 @@ impl App {
                 // and paints carried content in them until Commit; the lines
                 // the freeze kept from the log ride along (design §3.8).
                 status_bar_rows: self.message_band_rows,
-                bars: Vec::new(),
                 messages: carried.messages,
                 next_message_id: carried.next_message_id,
                 // …and when this process finished downloading the build being
@@ -5698,7 +5957,7 @@ impl App {
             crate::handoff_rendezvous::proof_identities_in_device_terms(&adoption)
         else {
             return ParkAttempt::Failed(HandoffStandDown {
-                outcome: crate::UpdateHandoffOutcome::PreparationFailed,
+                outcome: crate::UpdateHandoffOutcome::ProducerFailed,
                 detail: "a handed-off PTY would not answer fstat, so the out-of-band proof \
                          term cannot be computed"
                     .to_string(),
@@ -5708,7 +5967,7 @@ impl App {
         let proof_identities = adoption.clone();
         if self.update_handoff_activity_epoch == u64::MAX {
             return ParkAttempt::Failed(HandoffStandDown {
-                outcome: crate::UpdateHandoffOutcome::PreparationFailed,
+                outcome: crate::UpdateHandoffOutcome::ProducerFailed,
                 detail: "handoff activity identity space is exhausted".to_string(),
             });
         }
@@ -5748,16 +6007,24 @@ impl App {
                 detail: "a PTY session closed during automatic reader park".to_string(),
             });
         }
-        let (screens, carries) = match self.capture_parked_screens(
+        let ParkedScreens {
+            screens,
+            carries,
+            screen_digest,
+            repaint,
+        } = match self.capture_parked_screens(
             &live,
             deadline,
             freeze_ms,
             handoff_history_comfort,
+            crate::seamless::WireCaps::for_target(target_build),
         ) {
             Ok(captured) => captured,
-            Err(reason) => {
+            Err(failure) => {
                 self.rollback_overlap(None, &live);
-                return ParkAttempt::Missed(reason);
+                // A MISS OR A REFUSAL, decided by the failure's TYPE (plan
+                // P0-3): only timing and storage re-park on the next rung.
+                return classify_capture_failure(&failure);
             }
         };
         // POST-PARK, AND DELIBERATELY SO — see the fork lane for why a pre-park
@@ -5765,18 +6032,11 @@ impl App {
         let layout = self.capture_restore_manifest();
         let Some(layout_digest) = crate::seamless::layout_digest(&layout) else {
             self.rollback_overlap(None, &live);
-            return ParkAttempt::Missed(
-                "handoff layout could not be committed canonically".to_string(),
-            );
-        };
-        let screen_digest = match crate::seamless::screen_digest(&screens) {
-            Ok(digest) => digest,
-            Err(refusal) => {
-                self.rollback_overlap(None, &live);
-                return ParkAttempt::Missed(format!(
-                    "visible checkpoint set could not be committed canonically: {refusal}"
-                ));
-            }
+            // Deterministic: the same layout refuses on every rung.
+            return ParkAttempt::Refused(CaptureRefusal {
+                local_id: None,
+                cause: "handoff layout could not be committed canonically".to_string(),
+            });
         };
         if std::time::Instant::now() >= deadline {
             self.rollback_overlap(None, &live);
@@ -5825,6 +6085,7 @@ impl App {
                 manifest,
                 fds,
                 screens,
+                repaint,
                 carries,
                 window,
                 layout,
@@ -5999,8 +6260,19 @@ impl App {
             crate::DeferredHandoffTeardown::None | crate::DeferredHandoffTeardown::CleanQuitReady
         );
         let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch;
-        let mut current_live: Vec<(u64, i32, i32)> =
-            self.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
+        // The live set as the park drew it: an exited pane the park left out
+        // stays out, but a HANDED session that exited during the overlap stays
+        // IN, so its death reaches `sessions_alive` (a genuine rejection) rather
+        // than reading as the set changing (an activity-shaped one).
+        let exited = self.handoff_exited_session_ids();
+        let mut current_live: Vec<(u64, i32, i32)> = self
+            .pool
+            .iter()
+            .filter(|s| {
+                !exited.contains(&s.id) || pending_live.iter().any(|(id, _, _)| *id == s.id)
+            })
+            .map(|s| (s.id, s.master, s.pid))
+            .collect();
         current_live.sort_unstable();
         let mut expected_live = pending_live.clone();
         expected_live.sort_unstable();
@@ -6471,6 +6743,37 @@ impl App {
             .map_or(0, |retry| retry.cycles)
     }
 
+    /// How many times the FORK lane's park has missed its freeze budget for
+    /// `target_build` — the rungs it climbs across attempts, since it cannot
+    /// climb them inside one (see `App::fork_park_misses`).
+    #[must_use]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn fork_park_misses_of(&self, target_build: u64) -> u8 {
+        self.fork_park_misses
+            .filter(|(build, _)| *build == target_build)
+            .map_or(0, |(_, misses)| misses)
+    }
+
+    /// A fork-lane park MISS: count the rung it buys the next attempt and
+    /// return the typed start error that routes it to the activity-revoked
+    /// spacing rather than the physical budget (the 2026-09-22/23 update audit,
+    /// plan P1-4 — the fork lane charged a 20 ms stopwatch as a physical
+    /// failure and latched manual-only after nine of them).
+    #[cfg(unix)]
+    fn fork_park_missed(
+        &mut self,
+        target_build: u64,
+        reason: String,
+    ) -> crate::UpdateHandoffStartError {
+        let misses = self.fork_park_misses_of(target_build).saturating_add(1);
+        self.fork_park_misses = Some((target_build, misses));
+        aterm_log::warn!(
+            "update apply: the fork lane's park missed its budget ({reason}); the next attempt \
+             widens to the next rung (miss {misses}) and is retried on the activity spacing"
+        );
+        crate::UpdateHandoffStartError::park_missed(reason)
+    }
+
     /// The cached verdict's reason keyed by the ARTIFACT alone — for the
     /// submission-time failure arm, which has no ticket in hand (the attempt
     /// failed before any candidate was spawned) but knows the intent's build
@@ -6744,6 +7047,27 @@ impl App {
     }
 }
 
+/// The session registry's projection narrowed to the sessions this attempt
+/// hands over — the ones in `live` ([`App::handoff_live_sessions`]).
+///
+/// The manifest, the descriptors and the screens must name the same sessions
+/// (`seamless::write_outgoing` refuses the set otherwise), and the registry
+/// still holds a pane kept open after its command exited, which the attempt
+/// leaves out (the 2026-09-24 review). The connection rows are kept whole:
+/// the successor re-mints only rows whose two endpoints it adopted and drops
+/// the rest, audited, as it always has.
+#[cfg(unix)]
+fn handed_sessions_only(
+    mut manifest: crate::session_store::SessionHandoff,
+    live: &[(u64, i32, i32)],
+) -> crate::session_store::SessionHandoff {
+    manifest.sessions.retain(|record| {
+        live.iter()
+            .any(|(local_id, _, _)| *local_id == record.local_id)
+    });
+    manifest
+}
+
 /// Keep the actionable handoff cause in the returned refusal, which the updater
 /// records in its durable status. A separate warning cannot answer a later
 /// `update status`, and an unrelated admission failure must keep its own reason.
@@ -6977,9 +7301,27 @@ pub(crate) struct ParkGateFacts {
     /// `App::automatic_activity_facts`: the terminal's quiet / keys / output /
     /// focus facts, sampled at this instant.
     pub(crate) activity: crate::native_update_auto_intent::ActivityFacts,
-    /// `!handoff_masters_have_activity`: no master has bytes waiting that a
-    /// reader has not consumed.
+    /// `!handoff_masters_have_activity`: no live master has bytes waiting that
+    /// a reader has not consumed.
     pub(crate) masters_quiet: bool,
+    /// `!handoff_masters_closed`: no handed master has hung up. A dead one is
+    /// not output (plan P1-3) — it is a session the adoption proof would commit
+    /// to after it died, which the post-park re-check refuses anyway — so the
+    /// gate waits rather than freezing the terminal to find that out.
+    ///
+    /// BOUNDED BY CONSTRUCTION since the 2026-09-24 review: a pane kept open
+    /// after its command exited is not a HANDED master at all
+    /// (`App::handoff_live_sessions` leaves it out, re-read at every gate run),
+    /// so this is false only for the instant between a command's exit and the
+    /// registry marking it — one 20 ms re-run. It used to be false for as long
+    /// as an `aterm --hold` pane stayed open, which held every automatic
+    /// attempt to its cap, forever.
+    pub(crate) masters_alive: bool,
+    /// How many times in a row this attempt's gate has answered `Wait` in the
+    /// `Land` phase — which, the ladder admitting everything there, can only be
+    /// the masters holding it. Past [`PRELAUNCH_LAND_MAX_WAITS`] the park
+    /// proceeds over queued output anyway (plan P1-3); never over a dead one.
+    pub(crate) land_waits: u8,
     /// How long the successor has been holding its claim.
     pub(crate) held_for: std::time::Duration,
 }
@@ -7020,11 +7362,27 @@ pub(crate) enum ParkGate {
 ///   successor launched under `Automatic` and held into a later phase parks by
 ///   that later phase's rule; the mode only says which entry admitted it.
 ///
-/// Plus one fact the ladder never relaxes: bytes waiting on a master that its
-/// reader has not taken. Parking on top of them commits a screen digest the
-/// successor cannot reproduce, so that is a correctness gate, not a comfort,
-/// and it holds in every phase (the reader takes bytes within microseconds, so
-/// the 20 ms re-run finds a clean instant).
+/// Plus one fact the ladder relaxes only at its bound: bytes waiting on a live
+/// master that its reader has not taken. The park prefers a clean instant —
+/// the reader takes bytes within microseconds, so the 20 ms re-run usually
+/// finds one — but it is a PREFERENCE, not a correctness gate, and at `Land`
+/// it gives way after [`PRELAUNCH_LAND_MAX_WAITS`] consecutive waits (the
+/// 2026-09-22/23 update audit, plan P1-3). A producer faster than the parser
+/// (`yes`, a build log, reader backpressure) keeps `POLLIN` set indefinitely,
+/// and the gate that "never relaxed" held every automatic attempt its full
+/// 120 s and stood it down, for as long as the job ran. Parking over those
+/// bytes loses nothing AT A SEQUENCE BOUNDARY: the screen carry is captured
+/// post-park from what the engine already has, the parent consumes no byte
+/// after the park, and the successor's fresh parser replays everything still
+/// queued in the kernel after Commit (`HandoffCommitFacts`' admission
+/// contract). A reader parked INSIDE a sequence is the exception, and this
+/// gate cannot see it: the successor's Ground parser would print the queued
+/// rest of that sequence as text. So the capture checks each session's parser
+/// under the park and answers a mid-sequence parser over queued output with a
+/// timing miss (`CaptureFailure::MidSequence`), re-parked on the next rung —
+/// it abandons a partial sequence only over a quiet PTY, the stalled case
+/// (the 2026-09-24 review; this sentence used to say "loses nothing" with no
+/// such check behind it).
 ///
 /// MONOTONE IN `held_for`: past the cap every automatic mode stands down, and
 /// nothing can make a stood-down gate admit again. That is what bounds the hold
@@ -7050,11 +7408,61 @@ pub(crate) fn prelaunch_park_admitted(
     {
         return ParkGate::Wait(reason);
     }
-    if !facts.masters_quiet {
+    if !facts.masters_alive {
+        return ParkGate::Wait("a session's command has exited but its pane is still open");
+    }
+    if !facts.masters_quiet
+        && !(facts.phase == crate::native_update_auto_intent::ApplyPhase::Land
+            && facts.land_waits >= PRELAUNCH_LAND_MAX_WAITS)
+    {
         return ParkGate::Wait("a session has output waiting that its reader has not taken");
     }
     ParkGate::Park
 }
+
+/// The detail a hold-cap stand-down carries into the completion and the
+/// ledger: the cap's reason, how long the successor was held, and — the part
+/// that says what to do about it — the last thing the gate was waiting FOR.
+///
+/// Without that last clause every expired hold read "the terminal never
+/// offered a moment to pause in", which files a pane kept open after its
+/// command exited, or a flooded master, as the user being busy; the real
+/// reason reached only a debug log (the 2026-09-24 review of the 2026-09-22/23
+/// update audit fixes).
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn hold_cap_stand_down_detail(
+    reason: &str,
+    held_for: std::time::Duration,
+    last_wait: Option<&str>,
+) -> String {
+    let held = held_for.as_secs();
+    match last_wait {
+        Some(waiting_for) => format!(
+            "{reason} ({held} s after the successor dialled; the park was last held back \
+             because {waiting_for})"
+        ),
+        None => format!("{reason} ({held} s after the successor dialled)"),
+    }
+}
+
+/// How many consecutive `Wait` answers the gate gives in the `Land` phase before
+/// it parks over output still queued on a master (the 2026-09-22/23 update
+/// audit, plan P1-3). At the 20 ms re-run that is one second: long enough for
+/// any reader that is merely behind to catch up — it takes bytes within
+/// microseconds — and short enough that a master a producer keeps permanently
+/// readable costs the landing one second rather than the whole 120 s hold and a
+/// stand-down every fifteen minutes.
+#[cfg(unix)]
+pub(crate) const PRELAUNCH_LAND_MAX_WAITS: u8 = 50;
+
+#[cfg(unix)]
+const _: () = assert!(
+    PRELAUNCH_PARK_RETRY.as_millis() * (PRELAUNCH_LAND_MAX_WAITS as u128)
+        < PRELAUNCH_HOLD_MAX.as_millis(),
+    "the Land relaxation must come due well inside the hold it is spending, or a \
+     flooded master still stands the successor down"
+);
 
 /// The hold cap for `mode`: the automatic lanes are bounded, the explicit ones
 /// park at once and so can never reach a cap.
@@ -7068,7 +7476,8 @@ pub(crate) fn prelaunch_hold_cap(
 
 /// One run of the park gate for a prelaunched attempt.
 #[cfg(unix)]
-enum ParkAttempt {
+#[derive(Debug)]
+pub(crate) enum ParkAttempt {
     /// Parked, captured, and the capture is on its way to the worker.
     Parked,
     /// Not now — re-run the gate after [`PRELAUNCH_PARK_RETRY`].
@@ -7076,10 +7485,122 @@ enum ParkAttempt {
     /// The park itself missed: the readers were parked and rolled back, nothing
     /// was granted, and the successor is still holding. Re-park once, after
     /// [`PRELAUNCH_REPARK_DELAY`] and on the ladder's NEXT freeze-budget rung.
+    ///
+    /// TIMING ONLY (the 2026-09-22/23 update audit, plan P0-3): a reader that
+    /// missed the park deadline, a capture that outran it, an engine lock the
+    /// capture could not take, storage this process could not reserve, a
+    /// reader that parked in the middle of an escape sequence whose rest is
+    /// still queued (`CaptureFailure::MidSequence`). Every
+    /// one of those can come out differently 500 ms later, which is the whole
+    /// premise of re-parking — and exactly why a deterministic refusal must
+    /// never be one of them.
     Missed(String),
+    /// The capture REFUSED the desk: a fact about the screens, the session set
+    /// or the layout that the next rung cannot change. Not re-parked (the
+    /// freeze ladder buys time, and time is not what refused), never filed as
+    /// the machine being busy: the successor stands down as
+    /// [`crate::UpdateHandoffOutcome::CaptureRefused`], which the refusal lane
+    /// records and retries when the desk changes.
+    Refused(CaptureRefusal),
     /// Stand the held successor down with this outcome; readers (if they were
     /// parked) have already been rolled back.
     Failed(HandoffStandDown),
+}
+
+/// A deterministic refusal of the park's capture, with the session it names
+/// when it names one — so the stand-down, the ledger and `update status` can
+/// say WHICH session held the update back (2026-09-22/23 audit, plan P0-3).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptureRefusal {
+    /// The refusing session's local id, when the refusal is about one.
+    pub(crate) local_id: Option<u64>,
+    /// The build's own sentence for the refusal (the session, the field, the
+    /// bound).
+    pub(crate) cause: String,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CaptureRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.local_id {
+            Some(local_id) => write!(
+                formatter,
+                "the park's capture refused session {local_id}: {}",
+                self.cause
+            ),
+            None => write!(formatter, "the park's capture refused: {}", self.cause),
+        }
+    }
+}
+
+/// WHICH LANE A CAPTURE FAILURE BELONGS TO — the one decision the 2026-09-22/23
+/// update audit found made wrongly on every hop since 0.87 (plan P0-3).
+///
+/// Timing (`Deadline`, `EngineBusy`, and `MidSequence` — a reader parked inside
+/// a flood, whose next park lands on a sequence boundary) and this process's
+/// own storage (`Storage`) are a MISS: the same desk can capture 500 ms later
+/// on a wider rung. A
+/// `Refused` is a fact about the desk that no rung changes, and it is its own
+/// attempt: the park never climbs the freeze ladder for it and never stands
+/// down as `ActivityRevoked` ("the machine is busy, the candidate is not in
+/// question") for it. v0.91 mapped EVERY capture `Err` to `Missed` at its one
+/// call site, so a NUL in one tab's reported cwd relaunched a successor every
+/// fifteen minutes, forever, with `failing_applies=0`. Typed on the variant,
+/// never on the message.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn classify_capture_failure(failure: &CaptureFailure) -> ParkAttempt {
+    match failure {
+        CaptureFailure::Deadline { .. }
+        | CaptureFailure::EngineBusy
+        | CaptureFailure::Storage
+        | CaptureFailure::MidSequence { .. } => ParkAttempt::Missed(failure.to_string()),
+        CaptureFailure::Refused { local_id, .. } => ParkAttempt::Refused(CaptureRefusal {
+            local_id: *local_id,
+            cause: failure.to_string(),
+        }),
+    }
+}
+
+/// THE TIER-1 SEAM for the capture's lane decision (the 2026-09-22/23 update
+/// audit, plan P0-3): run the shipping park capture over the whole pool, with
+/// a deadline generous enough that a loaded test machine cannot turn the answer
+/// into timing, and answer what the park would do with the result — the repainted
+/// session ids of a parked capture, or the [`ParkAttempt`] a failure classifies
+/// into. `native_updater_conformance` drives real refused desks through it.
+#[cfg(all(test, unix))]
+impl App {
+    pub(crate) fn capture_park_outcome_for_conformance(
+        &mut self,
+        caps: crate::seamless::WireCaps,
+    ) -> Result<Vec<u64>, ParkAttempt> {
+        // The set the shipping lanes hand over, exited panes left out.
+        let live: Vec<(u64, i32, i32)> = self.handoff_live_sessions();
+        let window = std::time::Duration::from_secs(30);
+        self.capture_parked_screens(
+            &live,
+            std::time::Instant::now() + window,
+            window.as_millis(),
+            window / 2,
+            caps,
+        )
+        .map(|parked| parked.repaint)
+        .map_err(|failure| classify_capture_failure(&failure))
+    }
+}
+
+/// The stand-down a [`ParkAttempt::Refused`] park sends the held successor:
+/// typed `CaptureRefused`, with a detail that names the session, so the
+/// completion reaches the refusal lane and the ledger says what held the update
+/// back.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn capture_refusal_stand_down(refusal: &CaptureRefusal) -> HandoffStandDown {
+    HandoffStandDown {
+        outcome: crate::UpdateHandoffOutcome::CaptureRefused,
+        detail: format!("{refusal}; the lane retries once the desk changes"),
+    }
 }
 
 /// How often the event loop re-runs the park gate while a prelaunched attempt
@@ -7138,6 +7659,13 @@ pub(crate) enum ParkMissDisposition {
 /// law (docs/DESIGN-auto-apply-ladder-2026-09-21.md, law 2) reserves the latch
 /// for a successor that died or a proof that did not match; a stopwatch the
 /// parent missed is neither.
+///
+/// ONLY A MISS COMES HERE (the 2026-09-22/23 update audit, plan P0-3). Until
+/// then every capture `Err` did — a NUL in a reported cwd, a grid over the
+/// per-grid cap — so "the machine is busy" was said, re-parked and retried
+/// every fifteen minutes about facts no amount of waiting changes. A refusal is
+/// now [`ParkAttempt::Refused`] and never reaches this function, which is what
+/// makes the sentence below true.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn park_miss_disposition(misses: u8, reason: String) -> ParkMissDisposition {
@@ -7675,6 +8203,8 @@ mod late_park_record_tests {
                 dialled: None,
                 park_retry_at: None,
                 park_misses: 0,
+                land_waits: 0,
+                last_wait: None,
                 stood_down: false,
                 teardown: crate::DeferredHandoffTeardown::None,
                 revoked_by_activity: false,
@@ -7952,10 +8482,13 @@ mod late_park_record_tests {
 
     /// The headless fixture's session has no real master: the park half's
     /// descriptor duplicate fails, the readers it parked are rolled back, and
-    /// the held successor is stood down as a PHYSICAL preparation failure —
-    /// never left holding a claim for a park that cannot complete.
+    /// the held successor is stood down as THIS PROCESS's failure
+    /// (`ProducerFailed`, Transient) — never left holding a claim for a park
+    /// that cannot complete, and never filed as the candidate's bytes failing
+    /// (`PreparationFailed`, Structural, which it was until the 2026-09-22/23
+    /// update audit, plan P1-2: an `EMFILE` latched the artifact after two).
     #[test]
-    fn a_park_half_failure_stands_the_held_successor_down_as_a_preparation_failure() {
+    fn a_park_half_failure_stands_the_held_successor_down_as_a_producer_failure() {
         let mut app = App::headless_for_test();
         let (record, _cancelled, stood_down, transferred) =
             prelaunch_record(12, ApplyMode::Immediate);
@@ -7968,7 +8501,14 @@ mod late_park_record_tests {
         let received = stood_down.try_recv().expect("typed stand-down");
         assert_eq!(
             received.outcome,
-            crate::UpdateHandoffOutcome::PreparationFailed
+            crate::UpdateHandoffOutcome::ProducerFailed
+        );
+        assert!(
+            received
+                .detail
+                .starts_with("could not reserve child-only PTY descriptors ("),
+            "the descriptor failure carries its io::ErrorKind: {}",
+            received.detail
         );
     }
 
@@ -8092,6 +8632,8 @@ mod park_gate_tests {
                 consent_warmup: false,
             },
             masters_quiet: true,
+            masters_alive: true,
+            land_waits: 0,
             held_for: std::time::Duration::ZERO,
         }
     }
@@ -8108,6 +8650,8 @@ mod park_gate_tests {
                 consent_warmup: bits & 32 != 0,
             },
             masters_quiet: bits & 16 != 0,
+            masters_alive: true,
+            land_waits: 0,
             held_for: std::time::Duration::ZERO,
         }
     }
@@ -8411,27 +8955,370 @@ mod park_gate_tests {
         );
     }
 
-    /// Bytes waiting on a master that its reader has not taken hold every
-    /// automatic lane IN EVERY PHASE, `Land` included: parking on top of them
-    /// is how an attempt commits a screen digest the successor cannot
-    /// reproduce. A correctness gate, not a comfort, so the ladder never
-    /// relaxes it.
+    /// A HUNG-UP master is not output, and it is not parked over either (plan
+    /// P1-3): the gate waits — in every automatic phase, whatever it has
+    /// waited — with a reason that says so, instead of "output waiting" (the
+    /// old reason) or freezing the terminal only for the post-park death check
+    /// to refuse. A person's apply still parks at once.
+    ///
+    /// The wait is unbounded HERE on purpose, and bounded one level up: a pane
+    /// kept open after its command exited (`--hold`) is not among the masters
+    /// this gate is shown (`App::handoff_live_sessions`, pinned by
+    /// `an_exited_held_pane_is_not_handed_and_does_not_hold_the_park`), so a
+    /// dead master reaches it only for the moment before the registry marks
+    /// the exit (the 2026-09-24 review).
     #[test]
-    fn unconsumed_master_output_holds_every_automatic_phase() {
+    fn a_dead_master_holds_every_automatic_phase_with_its_own_reason() {
         for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
             for phase in PHASES {
-                assert!(
-                    matches!(
+                for land_waits in [0, super::PRELAUNCH_LAND_MAX_WAITS, u8::MAX] {
+                    assert_eq!(
                         gate(ParkGateFacts {
-                            masters_quiet: false,
+                            masters_alive: false,
+                            land_waits,
                             ..calm(mode, phase)
                         }),
-                        ParkGate::Wait(_)
-                    ),
-                    "{mode:?} {phase:?}"
-                );
+                        ParkGate::Wait("a session's command has exited but its pane is still open"),
+                        "{mode:?} {phase:?} after {land_waits} waits"
+                    );
+                }
             }
         }
+        for mode in [ApplyMode::Immediate, ApplyMode::CleanQuit] {
+            assert_eq!(
+                gate(ParkGateFacts {
+                    masters_alive: false,
+                    ..calm(mode, ApplyPhase::PreferIdle)
+                }),
+                ParkGate::Park,
+                "{mode:?}: the person asked; Commit's own liveness check answers them"
+            );
+        }
+    }
+
+    /// Bytes waiting on a master that its reader has not taken hold every
+    /// automatic lane in every phase — and at `Land` only until
+    /// `PRELAUNCH_LAND_MAX_WAITS` consecutive waits, after which the park
+    /// proceeds (the 2026-09-22/23 update audit, plan P1-3). The gate used to
+    /// hold at `Land` forever: a producer faster than the parser (`yes`, a
+    /// build log) kept `POLLIN` set, every automatic attempt held its successor
+    /// the full 120 s and stood down, every ~15 min, for as long as the job
+    /// ran. The successor replays kernel-queued bytes after Commit, so parking
+    /// over them loses nothing; the earlier phases still prefer a clean
+    /// instant, and the count never relaxes them.
+    #[test]
+    fn unconsumed_master_output_holds_until_the_bound_has_waited_long_enough() {
+        for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+            for phase in PHASES {
+                for land_waits in [0, super::PRELAUNCH_LAND_MAX_WAITS - 1] {
+                    assert!(
+                        matches!(
+                            gate(ParkGateFacts {
+                                masters_quiet: false,
+                                land_waits,
+                                ..calm(mode, phase)
+                            }),
+                            ParkGate::Wait(_)
+                        ),
+                        "{mode:?} {phase:?} after {land_waits} waits"
+                    );
+                }
+                let waited = gate(ParkGateFacts {
+                    masters_quiet: false,
+                    land_waits: super::PRELAUNCH_LAND_MAX_WAITS,
+                    ..calm(mode, phase)
+                });
+                if phase == ApplyPhase::Land {
+                    assert_eq!(
+                        waited,
+                        ParkGate::Park,
+                        "{mode:?}: the bound parks over a master that never goes quiet"
+                    );
+                } else {
+                    assert!(
+                        matches!(waited, ParkGate::Wait(_)),
+                        "{mode:?} {phase:?}: the count relaxes Land only"
+                    );
+                }
+            }
+        }
+        // The hold cap still wins over everything: a successor held past it
+        // stands down, however many waits it has banked.
+        assert!(matches!(
+            gate(ParkGateFacts {
+                masters_quiet: false,
+                land_waits: super::PRELAUNCH_LAND_MAX_WAITS,
+                held_for: PRELAUNCH_HOLD_MAX,
+                ..calm(ApplyMode::AutomaticPastGrace, ApplyPhase::Land)
+            }),
+            ParkGate::StandDown(_)
+        ));
+    }
+}
+
+/// The 2026-09-24 review of the 2026-09-22/23 update audit fixes, driven
+/// through the shipping capture and gate with REAL PTY masters: a parser the
+/// park catches mid-sequence over queued output is a timing miss, never a
+/// carry whose successor prints the queued tail as text; and a pane kept open
+/// after its command exited is not handed, so its hung-up master can neither
+/// hold the park to its cap nor fail it.
+#[cfg(all(test, unix))]
+mod handed_set_and_mid_sequence_tests {
+    use super::{
+        CaptureFailure, ParkAttempt, ParkGate, ParkGateFacts, classify_capture_failure,
+        handed_sessions_only, handoff_masters_closed, handoff_masters_have_activity,
+        hold_cap_stand_down_detail, prelaunch_hold_cap, prelaunch_park_admitted,
+    };
+    use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase};
+    use crate::native_updater_service::ApplyMode;
+
+    fn openpty() -> (i32, i32) {
+        let (mut master, mut slave) = (-1i32, -1i32);
+        // SAFETY: openpty(3) into two valid out-slots; no termios/winsize.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        (master, slave)
+    }
+
+    fn write_all(fd: i32, bytes: &[u8]) {
+        // SAFETY: a bounded write of a live slice to a test-owned descriptor.
+        let wrote = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(usize::try_from(wrote).ok(), Some(bytes.len()), "write");
+    }
+
+    /// Take every byte queued on `master` — the reader catching up — so the PTY
+    /// is quiet again.
+    fn drain(master: i32) {
+        let entry = [(0u64, master, 0i32)];
+        let mut buffer = [0u8; 4096];
+        while handoff_masters_have_activity(&entry) {
+            // SAFETY: a bounded read into a stack buffer from a readable master.
+            let read = unsafe { libc::read(master, buffer.as_mut_ptr().cast(), buffer.len()) };
+            assert!(read > 0, "a readable master reads");
+        }
+    }
+
+    /// The shipping park capture over the shipping handed set, with a window
+    /// wide enough that a loaded test machine cannot turn the answer into a
+    /// deadline: the ids it carried, or its typed failure.
+    fn capture(app: &mut crate::App) -> Result<Vec<u64>, CaptureFailure> {
+        let live = app.handoff_live_sessions();
+        let window = std::time::Duration::from_secs(30);
+        app.capture_parked_screens(
+            &live,
+            std::time::Instant::now() + window,
+            window.as_millis(),
+            window / 2,
+            crate::seamless::WireCaps::current(),
+        )
+        .map(|parked| parked.screens.iter().map(|(id, _)| *id).collect())
+    }
+
+    fn set_master(app: &mut crate::App, id: u64, master: i32) {
+        app.pool
+            .sessions
+            .get_mut(&id)
+            .expect("the session is pooled")
+            .session
+            .master = master;
+    }
+
+    /// A reader that parks inside `ESC [ 38;5;19` with `6m` still queued is the
+    /// flood case the Land relaxation now parks into. Carrying it would abandon
+    /// the sequence and the successor would print `6m` and keep the old pen;
+    /// the capture must MISS instead (timing, re-parked on the next rung). The
+    /// same parser over a quiet PTY is the stalled case and is carried; the same
+    /// queued output at a sequence boundary is carried.
+    ///
+    /// RED on the code before the fix: the first capture came back `Ok([0])`.
+    #[test]
+    fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
+        let mut app = crate::App::headless_for_test();
+        let (master, slave) = openpty();
+        set_master(&mut app, 0, master);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        crate::term_lock(&term).process(b"$ make\r\n\x1b[38;5;19");
+        write_all(slave, b"6mcompiling\r\n");
+
+        let failure = capture(&mut app).expect_err("mid-sequence over queued output");
+        assert_eq!(
+            failure,
+            CaptureFailure::MidSequence {
+                local_id: 0,
+                state: "CsiParam"
+            }
+        );
+        assert!(
+            matches!(classify_capture_failure(&failure), ParkAttempt::Missed(_)),
+            "timing: re-parked on the next rung, never a refusal"
+        );
+
+        // The reader caught up and the program went quiet mid-sequence: the
+        // stalled case, carried by abandoning the partial sequence.
+        drain(master);
+        assert_eq!(
+            capture(&mut app),
+            Ok(vec![0]),
+            "a stalled sequence is carried"
+        );
+
+        // Output queued again, but the parser is at a boundary: nothing to
+        // abandon, so queued output is no reason to miss.
+        crate::term_lock(&term).process(b"6m");
+        write_all(slave, b"more output\r\n");
+        assert_eq!(
+            capture(&mut app),
+            Ok(vec![0]),
+            "a boundary over a busy PTY is carried"
+        );
+
+        set_master(&mut app, 0, -1);
+        drop(app);
+        aterm_pty::close_fd(slave);
+        aterm_pty::close_fd(master);
+    }
+
+    fn calm_land(live: &[(u64, i32, i32)]) -> ParkGateFacts {
+        ParkGateFacts {
+            mode: ApplyMode::AutomaticPastGrace,
+            phase: ApplyPhase::Land,
+            activity: ActivityFacts {
+                quiet: true,
+                hands_off_keys: true,
+                output_quiet: true,
+                focused: true,
+                consent_warmup: false,
+            },
+            masters_quiet: !handoff_masters_have_activity(live),
+            masters_alive: !handoff_masters_closed(live),
+            land_waits: u8::MAX,
+            held_for: std::time::Duration::ZERO,
+        }
+    }
+
+    /// `aterm --hold`, one pane's command exited: its master hangs up and stays
+    /// hung up until a person closes the pane. Both lanes used to hand the
+    /// WHOLE pool, so the launched lane's gate waited on that master in every
+    /// phase with no bound (held the successor 120 s, stood down as
+    /// `ActivityRevoked`, every ~15 min, forever) and the fork lane deferred on
+    /// it every 500 ms. The pane is now left out of the handed set: the gate
+    /// parks, the capture carries exactly the live sessions, and the manifest
+    /// names exactly them.
+    ///
+    /// The CONTROL below is the old behaviour, reproduced: the whole pool, fed
+    /// to the same gate, still waits.
+    #[test]
+    fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
+        let mut app = crate::App::headless_for_test();
+        app.hold = true;
+        let (exited_master, exited_slave) = openpty();
+        write_all(exited_slave, b"build finished\r\n");
+        aterm_pty::close_fd(exited_slave);
+        let probe = [(1u64, exited_master, 0i32)];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !handoff_masters_closed(&probe) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exited slave hung up"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let held = crate::stub_session(1);
+        // Never signal a pid this test does not own on teardown.
+        held.child_reaped
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut held = held;
+        held.master = exited_master;
+        let _ = app.insert_logical_window(held, 24, 80);
+        // What the reader's EOF does under `--hold`: the registry marks the
+        // session exited and the pane stays.
+        app.store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_state(1, crate::session_store::SessionState::Exited);
+
+        let whole: Vec<(u64, i32, i32)> = app
+            .pool
+            .iter()
+            .map(|session| (session.id, session.master, session.pid))
+            .collect();
+        assert!(
+            matches!(
+                prelaunch_park_admitted(
+                    calm_land(&whole),
+                    prelaunch_hold_cap(ApplyMode::AutomaticPastGrace)
+                ),
+                ParkGate::Wait(_)
+            ),
+            "CONTROL: the whole pool, as both lanes handed it, holds the park even at Land \
+             past every bound"
+        );
+
+        let live = app.handoff_live_sessions();
+        assert_eq!(
+            live.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![0],
+            "the exited pane is not handed"
+        );
+        assert_eq!(
+            prelaunch_park_admitted(
+                calm_land(&live),
+                prelaunch_hold_cap(ApplyMode::AutomaticPastGrace)
+            ),
+            ParkGate::Park,
+            "and the handed set parks"
+        );
+        assert_eq!(
+            capture(&mut app),
+            Ok(vec![0]),
+            "the capture carries the live set"
+        );
+        let manifest = handed_sessions_only(
+            crate::session_store::SessionHandoff::from_store(
+                &app.store
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            &live,
+        );
+        assert!(
+            manifest.sessions.iter().all(|record| record.local_id != 1),
+            "the manifest names only handed sessions"
+        );
+
+        set_master(&mut app, 1, -1);
+        drop(app);
+        aterm_pty::close_fd(exited_master);
+    }
+
+    /// A hold-cap stand-down says what held the park — the ledger used to read
+    /// "the terminal never offered a moment to pause in" for an exited pane's
+    /// master, blaming the user.
+    #[test]
+    fn a_hold_cap_stand_down_names_what_held_the_park() {
+        let held_for = std::time::Duration::from_secs(120);
+        assert_eq!(
+            hold_cap_stand_down_detail(
+                "the terminal never offered a moment to pause in within the hold cap",
+                held_for,
+                Some("a session has output waiting that its reader has not taken"),
+            ),
+            "the terminal never offered a moment to pause in within the hold cap (120 s after \
+             the successor dialled; the park was last held back because a session has output \
+             waiting that its reader has not taken)"
+        );
+        assert_eq!(
+            hold_cap_stand_down_detail("capped", held_for, None),
+            "capped (120 s after the successor dialled)"
+        );
     }
 }
 
@@ -8535,7 +9422,7 @@ mod capture_budget_reservation_tests {
                 MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
             );
             let history = if cells_fit && bytes_fit { carry } else { 0 };
-            let Some(per_grid) =
+            let Ok(per_grid) =
                 admit_checkpoint_dimensions(&mut used_cells, rows, cols, history, true)
             else {
                 return Err(index);
@@ -8603,6 +9490,79 @@ mod capture_budget_reservation_tests {
             "one pane past the visible-only ceiling must be refused, and refused as the \
              LAST session — never an earlier one that lost its budget to somebody \
              else's scrollback"
+        );
+    }
+
+    /// REGRESSION (the 2026-09-22/23 update audit, plan P0-4a): the per-grid cell
+    /// cap was 32 Ki cells (256x128), and one aterm window in native full screen
+    /// on a 5K display at the default font is 99x338 = 33,462 cells — so every
+    /// automatic and manual update refused on that desk, every attempt, and named
+    /// the wrong cap ("aggregate") while doing it. The cap is a sanity bound on an
+    /// absurd geometry, so it must admit EVERY window the GUI can produce.
+    ///
+    /// The geometry comes from the GUI's own law ([`crate::App::grid_dims_for`])
+    /// on a headless App carrying the owner's measured chrome (pad 24, pad_top 4,
+    /// head 80 at scale 2), for four real Mac displays, full screen and maximized
+    /// (a 37 pt notched menu bar plus a 70 pt Dock at 2x), at every font size
+    /// from `FONT_PX_MIN` to 48 px. A pool is that window split into 1..=8 side
+    /// by side panes — the whole display's area, which is what a desk of panes
+    /// costs — admitted exactly as the capture admits a visible carry
+    /// (`history = 0`, the alt grid reserved).
+    #[test]
+    fn every_full_screen_display_geometry_is_admitted_for_a_pool_of_panes() {
+        use winit::dpi::PhysicalSize;
+
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        {
+            let ws = app.windows.get_mut(&wid).expect("the headless window");
+            ws.metrics.pad = 24;
+            ws.metrics.pad_top = 4;
+            ws.metrics.head = 80;
+        }
+        let mut over_the_old_cap = Vec::new();
+        for (width, height) in [
+            (3024_u32, 1964_u32),
+            (3456, 2234),
+            (5120, 2880),
+            (6016, 3384),
+        ] {
+            for (shape, size) in [
+                ("full screen", PhysicalSize::new(width, height)),
+                ("maximized", PhysicalSize::new(width, height - 74 - 140)),
+            ] {
+                // FONT_PX_MIN is a whole number of pixels (6).
+                let smallest = crate::FONT_PX_MIN as u32;
+                for font_px in smallest..=48 {
+                    app.windows
+                        .get_mut(&wid)
+                        .expect("the headless window")
+                        .metrics
+                        .font_px = font_px as f32;
+                    let (rows, cols) = app.grid_dims_for(wid, size);
+                    let cells = u64::from(rows) * u64::from(cols);
+                    if cells > 32 * 1024 {
+                        over_the_old_cap.push((width, height, shape, font_px, rows, cols));
+                    }
+                    for panes in 1..=8_u16 {
+                        let pane_cols = (cols / panes).max(1);
+                        let mut used = 0_u64;
+                        for pane in 0..panes {
+                            assert!(
+                                admit_checkpoint_dimensions(&mut used, rows, pane_cols, 0, true)
+                                    .is_ok(),
+                                "{width}x{height} {shape} at font {font_px} px ({rows}x{cols}): \
+                                 pane {pane} of {panes} ({rows}x{pane_cols}) was refused"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            !over_the_old_cap.is_empty(),
+            "PRECONDITION: the table must reach past the old 32 Ki per-grid cap, or it \
+             could not have caught the incident"
         );
     }
 }
@@ -9881,6 +10841,73 @@ mod handoff_process_group_tests {
         aterm_pty::close_fd(master);
     }
 
+    /// A HUNG-UP MASTER IS NOT OUTPUT WAITING (the 2026-09-22/23 update audit,
+    /// plan P1-3). A pane kept open after its command exited (`--hold`) holds a
+    /// master whose slave is gone: macOS reports it `POLLIN|POLLHUP` forever.
+    /// The park gate's peek used to count that as "a session has output waiting
+    /// that its reader has not taken", so every automatic attempt held its
+    /// successor 120 s and stood down, every ~15 min, for as long as the pane
+    /// stayed open. Death is `handoff_masters_closed`'s question; the activity
+    /// peek answers only for live masters — including when the dead one still
+    /// has bytes queued, and beside a live quiet one.
+    #[test]
+    fn a_hung_up_master_is_never_output_waiting() {
+        let open = || {
+            let (mut master, mut slave) = (-1i32, -1i32);
+            // SAFETY: openpty(3) into two valid out-slots; no termios/winsize.
+            let opened = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(opened, 0, "openpty");
+            (master, slave)
+        };
+        let (exited, exited_slave) = open();
+        let (alive, alive_slave) = open();
+        // The exited command's last words, still queued when it died.
+        // SAFETY: bounded write of a stack byte to the test-owned slave.
+        assert_eq!(
+            unsafe { libc::write(exited_slave, [0x62u8].as_ptr().cast(), 1) },
+            1
+        );
+        aterm_pty::close_fd(exited_slave);
+        let dead = [(1u64, exited, 4242i32)];
+        // PROMPT-EVENTUAL, as in the sibling test above: the HUP edge can
+        // surface a scheduler quantum after close(2).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !handoff_masters_closed(&dead) {
+            assert!(std::time::Instant::now() < deadline, "the slave hung up");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !handoff_masters_have_activity(&dead),
+            "an exited pane is not output waiting"
+        );
+        let desk = [(1u64, exited, 4242i32), (2u64, alive, 4243i32)];
+        assert!(
+            !handoff_masters_have_activity(&desk),
+            "a dead pane beside a quiet live one leaves the desk quiet"
+        );
+        // …and a LIVE master with bytes waiting still holds the gate.
+        // SAFETY: bounded write of a stack byte to the test-owned slave.
+        assert_eq!(
+            unsafe { libc::write(alive_slave, [0x62u8].as_ptr().cast(), 1) },
+            1
+        );
+        assert!(
+            handoff_masters_have_activity(&desk),
+            "a live session's unread output is still output"
+        );
+        aterm_pty::close_fd(alive_slave);
+        aterm_pty::close_fd(alive);
+        aterm_pty::close_fd(exited);
+    }
+
     /// Seamless seam 2, worker level: the ready wait completes to `ProofReady`
     /// while a handed-off master has queued readable output, and a cancel poke
     /// is typed `ActivityRevoked` (the retry-budget classification), never a
@@ -11012,6 +12039,228 @@ mod returned_handoff_completion_lane_tests {
         );
     }
 
+    /// A CAPTURE REFUSAL IS ITS OWN LANE (the 2026-09-22/23 update audit, plan
+    /// P0-3), driven through the production reducer: RECORDED as an apply failure
+    /// (so `failing_applies` moves and `update status` names it — v0.91 kept it at
+    /// zero for a day of refused attempts), retried only once the desk changes or
+    /// the hour's backstop passes, never on the activity spacing, never charged to
+    /// the physical budget, and NEVER LATCHED — twice, since two refusals were the
+    /// pair that latched 0.87-0.90.
+    ///
+    /// Fails on the code before this change: `CaptureRefused` did not exist, and
+    /// the park stood the successor down as `ActivityRevoked` for this very fact,
+    /// which leaves `auto_overlap_retry` spent and records nothing.
+    #[test]
+    fn a_capture_refusal_is_recorded_waits_for_the_desk_and_never_latches() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let dmg = [0xab_u8; 32];
+        let armed_at = std::time::Instant::now() - std::time::Duration::from_secs(400);
+        app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+            build,
+            armed_at,
+            announced: crate::native_update_auto_intent::ApplyPhase::KeysOnly,
+        });
+        // The per-process scratch ledger is shared with sibling tests (all of
+        // them under the lock held above), so the count is compared step to
+        // step rather than from zero.
+        let mut failing = None;
+        for refusal in 1..=2_u32 {
+            let before = std::time::Instant::now();
+            reduce_one_returned_failure(
+                &mut app,
+                ApplyMode::AutomaticPastGrace,
+                build,
+                &"ab".repeat(32),
+                crate::UpdateHandoffOutcome::CaptureRefused,
+                crate::ChildDeathEvidence::Unobserved,
+            );
+            assert!(
+                app.auto_apply_manual_only.is_none(),
+                "refusal {refusal}: a capture refusal never latches the lane"
+            );
+            assert!(
+                app.auto_apply_physical_retry.is_none(),
+                "refusal {refusal}: it is not the candidate's bytes"
+            );
+            assert!(
+                app.auto_overlap_retry.is_none(),
+                "refusal {refusal}: it is not the machine being busy"
+            );
+            let intent = app.auto_apply_intent.expect("the lane keeps a live intent");
+            assert_eq!((intent.build, intent.dmg_sha256), (build, dmg));
+            assert!(
+                intent.retry_at >= before + crate::app_native::CAPTURE_REFUSAL_PROBE,
+                "refusal {refusal}: re-probed on the refusal lane's cadence"
+            );
+            assert!(app.auto_apply_capture_refusal.is_some());
+            assert_eq!(
+                app.auto_apply_ladder.map(|ladder| ladder.armed_at),
+                Some(armed_at),
+                "refusal {refusal}: the ladder's anchor is untouched"
+            );
+            let snapshot = app.native_updater_service.snapshot();
+            assert_eq!(
+                snapshot.failing_applies,
+                failing.map_or(snapshot.failing_applies.max(1), |prior: u32| prior + 1),
+                "refusal {refusal}: recorded as an apply failure, which is what moves \
+                 `failing_applies` toward the persistent-failure notice"
+            );
+            failing = Some(snapshot.failing_applies);
+            assert!(
+                snapshot.apply_failure.contains("CaptureRefused"),
+                "`update status` names the refusal: {:?}",
+                snapshot.apply_failure
+            );
+        }
+
+        // THE DESK UNCHANGED HOLDS the next attempt: no successor is launched into
+        // the same refusal…
+        let now = std::time::Instant::now();
+        assert!(app.capture_refusal_holds(build, dmg, false, now));
+        assert!(app.capture_refusal_holds(build, dmg, false, now));
+        // …a DIFFERENT artifact is not held by it…
+        assert!(!app.capture_refusal_holds(build + 1, dmg, false, now));
+        // …and the desk moving releases it (a resize is one of the facts every
+        // refusal the capture can make is about).
+        for session in app.pool.iter() {
+            crate::term_lock(&session.term).resize(30, 100);
+        }
+        assert!(!app.capture_refusal_holds(build, dmg, false, now));
+        assert!(
+            app.auto_apply_capture_refusal.is_none(),
+            "a released refusal is cleared, so the attempt that follows is ordinary"
+        );
+
+        // THE BACKSTOP: an hour with the desk unchanged tries once more anyway.
+        app.auto_apply_capture_refusal = Some(crate::AutoApplyCaptureRefusal {
+            build,
+            dmg_sha256: dmg,
+            activation: false,
+            desk: app.capture_desk_fingerprint(),
+            refused_at: now,
+        });
+        assert!(app.capture_refusal_holds(build, dmg, false, now));
+        assert!(!app.capture_refusal_holds(
+            build,
+            dmg,
+            false,
+            now + crate::app_native::CAPTURE_REFUSAL_BACKSTOP
+        ));
+    }
+
+    /// THIS PROCESS'S OWN FAILURES ARE NOT THE CANDIDATE'S (the 2026-09-22/23
+    /// update audit, plan P1-2), driven through the production reducer: two
+    /// `ProducerFailed` completions — a full disk at the manifest write, an
+    /// `EMFILE` at the descriptor duplicate — leave the lane on the TRANSIENT
+    /// schedule with a deadline to lapse at, where the same two filed as
+    /// `PreparationFailed` (the control, and what they were until this change)
+    /// converge to the deadline-less latch after two.
+    #[test]
+    fn a_producer_failure_retries_where_a_preparation_failure_converges() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        for (outcome, converges) in [
+            (crate::UpdateHandoffOutcome::ProducerFailed, false),
+            (crate::UpdateHandoffOutcome::PreparationFailed, true),
+        ] {
+            let mut app = App::headless_for_test();
+            let build = stage_one_build(&mut app);
+            for _ in 0..crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS {
+                reduce_one_returned_failure(
+                    &mut app,
+                    ApplyMode::AutomaticPastGrace,
+                    build,
+                    &"ab".repeat(32),
+                    outcome,
+                    crate::ChildDeathEvidence::Unobserved,
+                );
+            }
+            let latch = app
+                .auto_apply_manual_only
+                .expect("a physical failure latches for its schedule's spacing");
+            assert_eq!(
+                latch.retry_at.is_none(),
+                converges,
+                "{outcome:?}: converged={converges} after {} failures",
+                crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS
+            );
+        }
+    }
+
+    /// THE FORK LANE CLIMBS THE FREEZE LADDER ACROSS ATTEMPTS (plan P1-4): a
+    /// miss is no longer a physical failure — it rides the activity spacing — so
+    /// the rung it used to buy through the physical count is counted per target
+    /// build instead: 20 ms, then 80 ms, then a quarter second, and a different
+    /// build starts over.
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_lane_park_miss_is_timing_and_buys_the_next_rung() {
+        let mut app = App::headless_for_test();
+        let target = 4_242_u64;
+        assert_eq!(
+            super::handoff_freeze_budget(ApplyMode::Automatic, app.fork_park_misses_of(target)),
+            std::time::Duration::from_millis(20)
+        );
+        for (misses, rung_ms) in [(1_u8, 80_u64), (2, 250), (3, 250)] {
+            let error = app.fork_park_missed(target, "a PTY reader missed".to_string());
+            assert!(
+                error.is_park_missed(),
+                "a fork-lane miss is typed as timing, never `Failed` (physical)"
+            );
+            assert_eq!(app.fork_park_misses_of(target), misses);
+            assert_eq!(
+                super::handoff_freeze_budget(ApplyMode::Automatic, app.fork_park_misses_of(target)),
+                std::time::Duration::from_millis(rung_ms)
+            );
+        }
+        assert_eq!(app.fork_park_misses_of(target + 1), 0);
+    }
+
+    /// ONE FACT, ONE RECORD: the fork lane's automatic park miss is the
+    /// launched lane's activity stand-down (`HandoffFailureLane::ActivityRevoked`,
+    /// recorded routine), so main's switch record files it as "Waiting to
+    /// install", never "was not installed" — and a person's apply, which the
+    /// launched lane classifies `Manual`, stays a stop worth a warning, as
+    /// `fork_park_miss_outcome` tells that person it failed.
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_lane_park_miss_is_recorded_as_the_routine_wait_it_is() {
+        let mut app = App::headless_for_test();
+        let miss = app.fork_park_missed(7, "a PTY reader missed".to_string());
+        for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+            assert!(miss.stops_routinely(mode), "{mode:?}: a timing miss");
+        }
+        for mode in [ApplyMode::Immediate, ApplyMode::CleanQuit] {
+            assert!(!miss.stops_routinely(mode), "{mode:?}: a person asked");
+        }
+        let activity = crate::UpdateHandoffStartError::activity("typing");
+        assert!(activity.stops_routinely(ApplyMode::Immediate));
+        for other in [
+            crate::UpdateHandoffStartError::failed("masters closed"),
+            crate::UpdateHandoffStartError::refused("unowned socket"),
+            crate::UpdateHandoffStartError::capture_refused("session 3"),
+        ] {
+            assert!(!other.stops_routinely(ApplyMode::Automatic), "{other}");
+        }
+        app.update_switch_on_record = Some(Some("0.93.0".to_string()));
+        app.record_update_switch_stopped(
+            miss.stops_routinely(ApplyMode::Automatic),
+            &miss.to_string(),
+        );
+        let record = app
+            .messages
+            .log()
+            .records()
+            .last()
+            .expect("the stop is on record");
+        assert!(
+            record.title.starts_with("Waiting to install aterm"),
+            "a routine wait, not a failed install: {}",
+            record.title
+        );
+    }
+
     /// The classification itself, stated as a table so a future outcome variant
     /// has to be placed deliberately rather than falling into whichever arm the
     /// compiler allows. Three axes now, and every one of them used to be lossy:
@@ -11030,10 +12279,17 @@ mod returned_handoff_completion_lane_tests {
 
         for (outcome, expected) in [
             (Outcome::AdoptionMismatch, Lane::Physical(Shape::Structural)),
+            // Only the candidate failing its pre-park verification now.
             (
                 Outcome::PreparationFailed,
                 Lane::Physical(Shape::Structural),
             ),
+            // THIS process's own write/descriptor failures: about the moment
+            // and the machine, never the bytes (plan P1-2).
+            (Outcome::ProducerFailed, Lane::Physical(Shape::Transient)),
+            // A deterministic capture refusal: its own lane, never a physical
+            // shape and never activity (plan P0-3).
+            (Outcome::CaptureRefused, Lane::Refused),
             // NOT `Structural` any more, and not `Transient` either: with nothing
             // observed, proof EOF is a failure whose KIND is unknown.
             (Outcome::ChildDied, Lane::Physical(Shape::Unexplained)),
@@ -11065,7 +12321,10 @@ mod returned_handoff_completion_lane_tests {
             );
             // The main thread's own activity-shaped rejection is the other half of
             // the activity observation and dominates the physical shape: a lossless
-            // rollback the terminal caused is not evidence about the artifact.
+            // rollback the terminal caused is not evidence about the artifact. It
+            // does NOT dominate a capture refusal: that stand-down was the park's
+            // own typed verdict about the desk, and re-filing it as activity is the
+            // v0.91 loop (plan P0-3, `RefusalNeverRetriesAsActivity`).
             assert_eq!(
                 Lane::classify(
                     ApplyMode::AutomaticPastGrace,
@@ -11073,7 +12332,11 @@ mod returned_handoff_completion_lane_tests {
                     Death::Unobserved,
                     true
                 ),
-                Lane::ActivityRevoked,
+                if outcome == Outcome::CaptureRefused {
+                    Lane::Refused
+                } else {
+                    Lane::ActivityRevoked
+                },
                 "{outcome:?} with a main-thread activity revocation"
             );
         }
@@ -11141,8 +12404,12 @@ mod returned_handoff_completion_lane_tests {
         );
 
         // BOUNDED ALL THE SAME. Spend the rest of the transient lifetime and the
-        // answer becomes the deadline-less latch: nine failures across three
-        // independent epochs is evidence about the artifact however each one died.
+        // SCHEDULE ends: no more in-epoch rungs, and the lane says so once. What
+        // follows is a quiet re-sample one epoch cooldown out — never a latch that
+        // never lapses (the 2026-09-22/23 update audit, plan P1-1(d)): a starved
+        // child is a fact about the machine's day, and `None` here kept a healthy
+        // build off the machine until someone relaunched. At most one attempt per
+        // six hours is the bound a lane that "retries forever" would not have.
         for _ in STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS..PHYSICAL_FAILURE_LIFETIME_ATTEMPTS {
             reduce_one_returned_failure(
                 &mut app,
@@ -11153,11 +12420,14 @@ mod returned_handoff_completion_lane_tests {
                 starved,
             );
         }
-        assert_eq!(
-            deadline(&app),
-            None,
-            "a lane that retries a starved child forever is the opposite defect; \
-             the transient budget still ends"
+        let resample = deadline(&app)
+            .expect("a spent transient budget re-samples after the cooldown")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            resample > std::time::Duration::from_secs(5 * 60 * 60 + 59 * 60)
+                && resample <= std::time::Duration::from_secs(6 * 60 * 60),
+            "the transient budget still ends: past it the lane waits a whole epoch \
+             cooldown (6 h) per attempt, got {resample:?}"
         );
     }
 
@@ -11235,7 +12505,7 @@ mod returned_handoff_completion_lane_tests {
     /// needed — the retry that finally worked came HOURS later, not at the 600 s
     /// and 1800 s rungs that re-ran the same pathological hour.
     #[test]
-    fn an_unexplained_child_died_gets_a_second_epoch_and_then_stops() {
+    fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
         use crate::app_native::{
             PHYSICAL_FAILURE_LIFETIME_ATTEMPTS, PHYSICAL_FAILURES_PER_EPOCH,
             UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS,
@@ -11275,14 +12545,22 @@ mod returned_handoff_completion_lane_tests {
             &mut app,
             UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS - PHYSICAL_FAILURES_PER_EPOCH,
         );
-        assert_eq!(
-            deadline(&app),
-            None,
-            "two independent samples of the machine is where 'the machine was \
-             having a bad hour' stops being a credible explanation — and \
-             {UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS} attempts is strictly under \
-             the {PHYSICAL_FAILURE_LIFETIME_ATTEMPTS} a named transient failure \
-             gets, which the compile-time assert beside the constants pins"
+        // Two independent samples of the machine is where 'the machine was having
+        // a bad hour' stops being a credible explanation for SPENDING THE
+        // SCHEDULE — {UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS} attempts, strictly
+        // under the {PHYSICAL_FAILURE_LIFETIME_ATTEMPTS} a named transient failure
+        // gets, which the compile-time assert beside the constants pins. It is not
+        // where the lane may stop for good (the 2026-09-22/23 update audit, plan
+        // P1-1(d)): the verdict is still unexplained, so what remains is a quiet
+        // re-sample one epoch cooldown out, not the old `None`.
+        let resample = deadline(&app)
+            .expect("a spent unexplained budget re-samples after the cooldown")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            resample > std::time::Duration::from_secs(5 * 60 * 60 + 59 * 60)
+                && resample <= std::time::Duration::from_secs(6 * 60 * 60),
+            "one epoch cooldown out: got {resample:?} after \
+             {UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS} of {PHYSICAL_FAILURE_LIFETIME_ATTEMPTS}"
         );
     }
 

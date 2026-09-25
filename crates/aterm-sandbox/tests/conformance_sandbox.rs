@@ -51,8 +51,8 @@ use aterm_spec::verify::ty_escalation;
 const K: usize = 4;
 
 // VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`:
-// verification is always required — an absent Trust `ty` FAILS the test with a build
-// hint (`cargo build --release -p tla-cli` in $HOME/trust/first-party/ty).
+// verification is always required — an absent Trust `ty` FAILS the test with the
+// install hint (`aterm pkg install ty`).
 
 /// Encode a `[bool; K]` as `ty`'s function-value JSON (`[1..K -> BOOLEAN]`).
 fn func_json(bits: &[bool]) -> String {

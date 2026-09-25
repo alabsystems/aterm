@@ -3762,6 +3762,7 @@ fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
     cpu.set_pad(P);
     let bleed = aterm_render::ChromeBleed {
         rows: 2,
+        first: 0,
         color: BAND,
         seam: Some(SEAM),
         top_extends_cells: false,

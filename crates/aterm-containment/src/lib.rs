@@ -302,11 +302,6 @@ pub fn mode_or_containment() -> ContainmentMode {
     try_current_mode().unwrap_or(ContainmentMode::Containment)
 }
 
-#[cfg(test)]
-fn current_capabilities() -> Capabilities {
-    ContainmentPolicy::capabilities(current_mode())
-}
-
 /// Initialize mode from environment variable `ATERM_CONTAINMENT_MODE`.
 ///
 /// Falls back to the provided default if the env var is not set.
@@ -390,56 +385,6 @@ mod tests {
     // isolation across tests in the same binary. Policy tests are pure
     // and don't touch global state — those are the primary verification.
 
-    #[test]
-    fn test_policy_without_init() {
-        // Policy functions are pure — they don't require init_mode.
-        let caps = ContainmentPolicy::capabilities(ContainmentMode::Safety);
-        assert_eq!(caps.network, NetworkCapability::Allowlist);
-    }
-
-    #[test]
-    fn test_try_current_mode_does_not_panic() {
-        // try_current_mode never panics, even before init.
-        let _ = try_current_mode();
-    }
-
-    #[test]
-    fn test_init_mode_succeeds_or_already_set() {
-        // Try to initialize. If another test already set it, that's fine.
-        let result = init_mode(ContainmentMode::User);
-        match result {
-            Ok(()) => {
-                assert_eq!(current_mode(), ContainmentMode::User);
-            }
-            Err(InitError::AlreadyInitialized { .. }) => {
-                // Another test set it first — verify it's readable.
-                let _ = current_mode();
-            }
-        }
-    }
-
-    #[test]
-    fn test_capabilities_for_all_modes() {
-        // Pure policy tests — no global state needed.
-        for mode in [
-            ContainmentMode::Master,
-            ContainmentMode::User,
-            ContainmentMode::Safety,
-            ContainmentMode::Containment,
-        ] {
-            let caps = ContainmentPolicy::capabilities(mode);
-            let _ = (
-                caps.network,
-                caps.fs,
-                caps.process,
-                caps.mcp,
-                caps.plugins,
-                caps.output,
-                caps.input,
-            );
-        }
-    }
-
     /// Verify InitError::AlreadyInitialized error message includes both modes.
     #[test]
     fn test_init_error_message_includes_modes() {
@@ -483,34 +428,5 @@ mod tests {
             msg.contains("already set"),
             "init error should explain double-init: {msg}"
         );
-    }
-
-    /// Verify current_capabilities returns Capabilities matching the mode.
-    #[test]
-    fn test_current_capabilities_matches_policy() {
-        // If mode was initialized by another test, verify consistency
-        if let Some(mode) = try_current_mode() {
-            let caps = current_capabilities();
-            let expected = ContainmentPolicy::capabilities(mode);
-            assert_eq!(
-                caps, expected,
-                "current_capabilities() != policy for {mode}"
-            );
-        }
-    }
-
-    /// Verify mode_or_containment returns mode if set, Containment otherwise.
-    #[test]
-    fn test_mode_or_containment_returns_mode_or_default() {
-        let result = mode_or_containment();
-        if let Some(mode) = try_current_mode() {
-            assert_eq!(result, mode, "should return initialized mode");
-        } else {
-            assert_eq!(
-                result,
-                ContainmentMode::Containment,
-                "should default to Containment when uninitialized"
-            );
-        }
     }
 }

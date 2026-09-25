@@ -1498,65 +1498,6 @@ fn terminal_search_option_navigation_is_ordered_and_case_insensitive() {
     assert_eq!((exact.line, exact.start_col), (0, 12));
 }
 
-/// Manual release-mode timing companion for the deterministic scaling tests.
-///
-/// Run with:
-/// `cargo test --release -p aterm-search measure_case_insensitive_100k_ascii -- --ignored --nocapture`
-///
-/// There is deliberately no wall-clock assertion: CI load makes those brittle.
-#[test]
-#[ignore = "manual release-mode performance measurement"]
-fn measure_case_insensitive_100k_ascii() {
-    use std::time::Instant;
-
-    let mut index = SearchIndex::with_capacity(100_000);
-    for line in 0..100_000 {
-        index.index_line(line, "needle A");
-    }
-
-    for query in ["a", "z"] {
-        let started = Instant::now();
-        let matches = index
-            .search_with_positions_opts(query, false, false)
-            .unwrap();
-        eprintln!(
-            "100k ASCII case-insensitive query {query:?}: {:?}, {} matches",
-            started.elapsed(),
-            matches.len()
-        );
-    }
-
-    let search = TerminalSearch {
-        index,
-        indexed_scrollback_lines: 0,
-        generation: 0,
-    };
-    for (case_sensitive, label) in [(true, "case-sensitive"), (false, "case-insensitive")] {
-        let iterations = 10_000;
-        let started = Instant::now();
-        for _ in 0..iterations {
-            let found = search
-                .find_direction_opts(
-                    "needle",
-                    case_sensitive,
-                    false,
-                    DirectedFind {
-                        anchor: (99_998, 0),
-                        direction: SearchDirection::Forward,
-                        inclusive: false,
-                        wrap: false,
-                    },
-                )
-                .unwrap();
-            std::hint::black_box(found);
-        }
-        eprintln!(
-            "100k ASCII {label} adjacent point navigation: {:?}/op",
-            started.elapsed() / iterations
-        );
-    }
-}
-
 /// Regex pattern exceeding `MAX_REGEX_PATTERN_LEN` is rejected before compilation.
 ///
 /// Prevents ReDoS via compilation by bounding pattern length at the index

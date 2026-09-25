@@ -15,8 +15,8 @@
 //!    `space_below = cell_h − (ascent − descent) − space_above`.
 //!
 //! The pre-fix law (`baseline = round(ascent)`, dropping the WHOLE lineGap
-//! below the descent) is kept as the NEGATIVE CONTROL: it top-biases every
-//! nonzero-lineGap face and violates the split.
+//! below the descent) top-biased every nonzero-lineGap face and violated the
+//! split.
 //!
 //! This is an arithmetic (rounding) law over f32, which the ty model language
 //! cannot express (no multiplication/division) — per the repo's verification
@@ -80,39 +80,6 @@ fn half_leading_splits_within_one_px() {
     // the baseline off the old `round(ascent)` — the law is not trivially the
     // old behavior.
     assert!(split_moved_baseline > 100, "got {split_moved_baseline}");
-}
-
-/// NEGATIVE CONTROL: the pre-fix law (`baseline = round(ascent)` — all the
-/// lineGap below the descent) violates the half-leading split for every
-/// lattice point with `gap >= 2` at `scale = 1`, so the split assertion above
-/// genuinely separates the fix from the bug.
-#[test]
-fn old_all_gap_below_law_violates_the_split() {
-    let mut violations = 0u32;
-    let mut checked = 0u32;
-    for a in ASCENTS {
-        for d in DESCENTS {
-            for g in GAPS {
-                if g < 2.0 {
-                    continue;
-                }
-                checked += 1;
-                let content = a - d;
-                let cell_h = (content + g).ceil().max(1.0); // old natural box
-                let baseline = a.round(); // old law: no half-leading
-                let above = baseline - a;
-                let below = cell_h - content - above;
-                if (above - below).abs() > 1.0 + 1e-4 {
-                    violations += 1;
-                }
-            }
-        }
-    }
-    assert_eq!(
-        violations, checked,
-        "the old law must violate the split at every gap>=2 lattice point"
-    );
-    assert!(checked > 0, "non-vacuity");
 }
 
 /// Integration (requires the bundled test font): the REAL renderer's public

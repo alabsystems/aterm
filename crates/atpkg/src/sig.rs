@@ -172,16 +172,6 @@ pub enum Reject {
     /// [`Reject::Malformed`], but it carries the split's spelling so the authoring machine's
     /// own `atpkg install` names the fix instead of a bare "malformed".
     RetiredKind(&'static str),
-    /// An `index.toml` whose `[programs.<name>].requires` relation is not one a client can
-    /// honour: a name the index does not carry, a program requiring itself, or a cycle —
-    /// over programs, or over the coherence groups the plan installs atomically
-    /// ([`crate::manifest::validate_requires`]). Post-verify, like [`Reject::Malformed`];
-    /// it carries the offending edge (a cycle is spelled out, `a → b → a`) so the
-    /// publisher's own `atpkg verify-index` names the row to fix. The dependency relation
-    /// is SIGNED metadata, so this can only ever be an authoring mistake, never an
-    /// adversary's — and a client refuses the whole index rather than plan an order it
-    /// could not satisfy. (`String`, so the enum is no longer `Copy`; nothing copied it.)
-    Requires(String),
     /// A `pkg-*.toml` whose `shim_env` list breaks the rule a shim can honour
     /// ([`crate::shim_env::ShimEnv::admit`]: too many entries, not `NAME=VALUE`, a name
     /// outside `[A-Z0-9_]+` or one the shim never sets, an empty or un-embeddable

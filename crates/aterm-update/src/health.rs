@@ -66,13 +66,10 @@ use std::path::Path;
 /// (Re-exported from the crate root so cross-platform status consumers share the
 /// one threshold.)
 ///
-/// This 3 was chosen against a 6h check interval, where it meant "≈18h — long
-/// enough to skip a flaky day". **That interval is retired.** The cadence is now
-/// 75s (`cadence::TOKEN_INTERVAL_SECS`, `spawn_background_check`), so 3 consecutive
-/// failures is ≈4 minutes: the threshold now means "three checks in a row", and it
-/// escalates far sooner than the original rationale intended. It has not been
-/// re-tuned for the new cadence — revisit it against 75s rather than trusting the
-/// old "skip a flaky day" reading.
+/// The threshold means "three checks in a row". At the one 30-minute cadence
+/// (`cadence::INTERVAL_SECS`, `spawn_background_check`) — doubling while checks fail —
+/// that is two to three hours of one failure class, long enough that a flaky network
+/// blip never escalates and short enough that a broken pipeline is named the same day.
 pub use crate::PERSISTENT_AFTER;
 
 /// The durable health record. All fields default so an absent/corrupt file reads as
@@ -233,6 +230,25 @@ pub struct Health {
     /// running.
     #[serde(default)]
     pub last_apply_refusal_build: u64,
+    /// The newer build this machine has been WAITING ON — staged in `Updates/`,
+    /// or already installed under a running image that is older — and
+    /// [`Self::pending_since`], when it was first seen waiting. `0` when
+    /// nothing newer is waiting. Written by [`Self::note_pending_update`].
+    ///
+    /// THE CLOCK THE UPDATER NEVER HAD (the 2026-09-22/23 update audit, plan
+    /// P1-1(b)). `ready.toml`'s `staged_at` is rewritten by every re-stage (the
+    /// incident's marker said 00:46:48Z for a build first staged at 00:10:45Z)
+    /// and nothing read it anyway, so a machine could run an old build beside a
+    /// verified newer one for 20–25 hours — 0.90 and 0.91 both did — while the
+    /// only trace was the check lane's "the apply lane has failed it 2×" line,
+    /// fifty times over. This one survives re-stages and is read: past
+    /// [`crate::PENDING_UPDATE_OVERDUE_SECS`] the loud notice fires.
+    #[serde(default)]
+    pub pending_build: u64,
+    /// RFC3339 UTC at which [`Self::pending_build`] was first seen waiting
+    /// (empty when nothing is).
+    #[serde(default)]
+    pub pending_since: String,
 }
 
 impl Health {
@@ -744,6 +760,45 @@ impl Health {
             }
         }
         h.write(path);
+        h
+    }
+
+    /// Note which newer build is waiting for this machine, as `current_build`
+    /// observes it (`observed`: the newest of the staged marker and an installed
+    /// bundle newer than the running image; `None` when this observation found
+    /// neither), and return the ledger with [`Self::pending_build`] /
+    /// [`Self::pending_since`] brought up to date (plan P1-1(b), the
+    /// 2026-09-22/23 update audit).
+    ///
+    /// THE FIRST SIGHTING WINS, which is the whole point: re-observing the same
+    /// build — every check cycle, every re-stage of the same release — never
+    /// moves the clock. A DIFFERENT newer build starts its own. The record is
+    /// dropped only once it is PROVEN moot — the running build has caught up
+    /// with it — never on an observation that merely found nothing: the stage
+    /// is retired for a moment during the very swap that strands a machine
+    /// (the candidate boot-applies it), and absence of evidence resetting the
+    /// clock is how a stranded machine would stay forever "just staged".
+    pub fn note_pending_update(path: &Path, current_build: u64, observed: Option<u64>) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        let observed = observed.filter(|build| *build > current_build);
+        let changed = match observed {
+            Some(build) if build != h.pending_build || h.pending_since.is_empty() => {
+                h.pending_build = build;
+                h.pending_since = crate::install::now_rfc3339();
+                true
+            }
+            Some(_) => false,
+            None if h.pending_build != 0 && h.pending_build <= current_build => {
+                h.pending_build = 0;
+                h.pending_since = String::new();
+                true
+            }
+            None => false,
+        };
+        if changed {
+            h.write(path);
+        }
         h
     }
 
@@ -1432,6 +1487,59 @@ mod tests {
             h.last_error.contains("ditto"),
             "a named standing class must carry its reason, not an empty string: {:?}",
             h.last_error
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// THE PENDING CLOCK SURVIVES RE-STAGES (the 2026-09-22/23 update audit, plan
+    /// P1-1(b)). `ready.toml`'s `staged_at` is rewritten by every re-stage — the
+    /// incident's marker said 00:46:48Z for a 0.91 first staged at 00:10:45Z — so
+    /// "how long has this machine been behind?" had no answer. The first sighting
+    /// of a build wins; a different newer build starts its own clock; an
+    /// observation that merely found nothing (the stage retired for the very swap
+    /// that strands a machine) keeps it; only a running build that caught up
+    /// drops it.
+    #[test]
+    fn the_pending_clock_is_the_first_sighting_and_survives_a_restage() {
+        let p = tmp("pending-clock");
+        let first = Health::note_pending_update(&p, 10, Some(11));
+        assert_eq!(first.pending_build, 11);
+        assert!(
+            !first.pending_since.is_empty(),
+            "the first sighting is stamped"
+        );
+        // Back-date the stamp so a rewrite would be visible.
+        let mut aged = Health::read(&p);
+        aged.pending_since = "2026-09-22T00:10:45Z".to_string();
+        aged.write(&p);
+        // The same build observed again (a re-stage, the next check cycle).
+        let again = Health::note_pending_update(&p, 10, Some(11));
+        assert_eq!(
+            again.pending_since, "2026-09-22T00:10:45Z",
+            "re-observing the same build must never move its clock"
+        );
+        // The stage vanished for a moment (the candidate's own swap retired it):
+        // no evidence the machine moved, so the clock stands.
+        let gone = Health::note_pending_update(&p, 10, None);
+        assert_eq!(
+            (gone.pending_build, gone.pending_since.as_str()),
+            (11, "2026-09-22T00:10:45Z")
+        );
+        // An observation no newer than the running build is not a pending one.
+        let stale = Health::note_pending_update(&p, 10, Some(10));
+        assert_eq!(
+            stale.pending_build, 11,
+            "a non-newer observation changes nothing"
+        );
+        // A different, newer build is a new wait with its own clock.
+        let newer = Health::note_pending_update(&p, 10, Some(12));
+        assert_eq!(newer.pending_build, 12);
+        assert_ne!(newer.pending_since, "2026-09-22T00:10:45Z");
+        // The running build caught up: the record is moot and is dropped.
+        let landed = Health::note_pending_update(&p, 12, None);
+        assert_eq!(
+            (landed.pending_build, landed.pending_since.as_str()),
+            (0, "")
         );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }

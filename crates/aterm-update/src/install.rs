@@ -58,7 +58,7 @@ const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from
 // SUCCESSOR bundle — so a tracked aterm hands the tag to the app that replaces it, and
 // to every app after that, forever: measured on m16, the 0.85.0 laid down by a tracked
 // 0.84.0 carried the tag on `Contents/MacOS/aterm` and `Info.plist`, which is exactly
-// what makes atpkg's untracked lane take its copy plan for the life of the install.
+// what made atpkg's untracked lanes (deleted 2026-09-24) take their copy plan.
 //
 // The one thing that escapes is a job LAUNCHD spawns from an untagged executable:
 // launchd is the job's parent, not us, and `/usr/bin/ditto` is a base-OS binary
@@ -90,8 +90,8 @@ const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from
 // property the lane actually has is narrower: it does not ADD the tag to output that
 // would otherwise have been clean. Everything upstream of it must already be clean,
 // which is exactly why the placement moves were worth fixing, and which is the
-// condition atpkg records as "the untracked lane ran, but the first file it laid still
-// carried com.apple.provenance".
+// condition atpkg's since-deleted lanes recorded as "the untracked lane ran, but the first
+// file it laid still carried com.apple.provenance".
 // ---------------------------------------------------------------------------
 
 /// Whether THIS process is provenance-tracked — MEASURED, by writing a probe file into

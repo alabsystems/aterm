@@ -2802,71 +2802,7 @@ impl SettingsApp {
                 );
                 EventResult::Handled
             }
-            _ => {
-                // The per-row Install controls. Each is admitted ONLY against the live
-                // projection — a stale or forged action id for a name that is not an
-                // extra awaiting consent, or not waiting on an administrator, is
-                // answered in user voice and never becomes an argv.
-                if let Some(name) = action.strip_prefix("packages/extras/install/") {
-                    let packages = self.packages.projection();
-                    if let Some(row) = packages
-                        .programs
-                        .iter()
-                        .find(|row| row.name == name && row.offers_extra_install())
-                    {
-                        // The consent line names the VENDOR (S9: "Install codex (OpenAI
-                        // Codex CLI, Apache-2.0, ~90 MB)?") — the same facts the row
-                        // carries, said again at the moment of the press.
-                        let feedback = match row.facts.as_ref() {
-                            Some(facts) => format!("Installing {name} ({})…", facts.line()),
-                            None => format!("Installing {name}…"),
-                        };
-                        self.reduce_packages_verb(
-                            view,
-                            cx,
-                            PackagesRequest::InstallExtra {
-                                name: name.to_string(),
-                            },
-                            &feedback,
-                        );
-                    } else {
-                        view.feedback =
-                            Some(format!("{name} is not an extra waiting for consent."));
-                        cx.repaint(crate::native_app::DamageRegion::All);
-                    }
-                    return EventResult::Handled;
-                }
-                if let Some(name) = action.strip_prefix("packages/admin/install/") {
-                    let packages = self.packages.projection();
-                    let Some(end) = packages.needs_admin.iter().position(|n| n == name) else {
-                        view.feedback = Some(format!("{name} is not waiting on an administrator."));
-                        cx.repaint(crate::native_app::DamageRegion::All);
-                        return EventResult::Handled;
-                    };
-                    if !packages.admin_door {
-                        view.feedback = Some(format!(
-                            "Run `aterm pkg install {name}` in a terminal — the administrator dialog is macOS-only."
-                        ));
-                        cx.repaint(crate::native_app::DamageRegion::All);
-                        return EventResult::Handled;
-                    }
-                    // The door installs this program AND every admin-waiting program
-                    // before it in door order (`clt` before `brew`), one dialog each.
-                    let names = packages.needs_admin[..=end].to_vec();
-                    let feedback = format!(
-                        "Installing {} — macOS will ask for your password…",
-                        names.join(", then ")
-                    );
-                    self.reduce_packages_verb(
-                        view,
-                        cx,
-                        PackagesRequest::InstallElevated { names },
-                        &feedback,
-                    );
-                    return EventResult::Handled;
-                }
-                EventResult::Bubble
-            }
+            _ => EventResult::Bubble,
         }
     }
 
@@ -2946,7 +2882,7 @@ impl SettingsApp {
                     PendingAction::Config(patch) => config_application_projection(
                         view,
                         patch,
-                        SettingsAvailability::for_state(view, crate::backend_gpu_or_undecided()),
+                        SettingsAvailability::for_state(view),
                     ),
                     _ => ConfigApplicationProjection {
                         has_live_edit: true,
@@ -3102,6 +3038,9 @@ impl SettingsApp {
                 format!("Before it can apply: {}", reasons.join(" · "))
             }
             UpdateOutcome::Failed { message } => format!("Update failed: {message}"),
+            UpdateOutcome::CaptureRefused { message } => {
+                format!("A tab could not be carried; retries when it changes · {message}")
+            }
         });
     }
 
@@ -4612,6 +4551,7 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "confirm_multiline_paste" => config.confirm_multiline_paste,
         "option_as_meta" => config.option_as_meta,
         "focus_boost" => config.focus_boost,
+        "explain_heavy_load" => config.explain_heavy_load,
         "allow_osc52_query" => config.allow_osc52_query,
         "allow_window_ops" => config.allow_window_ops,
         "allow_notifications" => config.allow_notifications,
@@ -7327,7 +7267,7 @@ fn page(
             SettingsRoute::SoftwareUpdate => update_page(
                 state,
                 update,
-                SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
+                SettingsAvailability::for_state(state),
                 width,
                 cx.viewport.width,
                 cx.viewport.height,
@@ -10713,7 +10653,7 @@ fn manual_override_disclosure(
         state,
         None,
         &authored.key,
-        SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
+        SettingsAvailability::for_state(state),
         state.presented_motion.get(),
     );
     parts.extend(effect.notes.into_iter().map(|note| note.semantic));
@@ -12267,13 +12207,11 @@ impl PackageAdmission {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SettingsAvailability {
-    /// CAN this run use a GPU — never "is a device live at this instant". Every
-    /// caller must source it from [`crate::backend_gpu_or_undecided`] rather
-    /// than [`crate::metrics::backend_gpu`]: a headless launch holding an
-    /// unredeemed GPU intent is running the CPU renderer right now and would
-    /// otherwise be told, in words, that its GPU-backed keys are unavailable —
-    /// a denial the identical launch never made before the deferral existed,
-    /// and one the first `image` would immediately contradict.
+    /// CAN this run use a GPU — never "is a device live at this instant": the host's
+    /// `ViewMotionCx::backend_gpu` (`App::gpu_capable`). A headless launch holding an
+    /// unredeemed GPU intent runs the CPU renderer until its first pixel demand, and
+    /// telling it in words that its GPU-backed keys are unavailable would be a denial
+    /// the first `image` immediately contradicts.
     backend_gpu: bool,
     macos: bool,
     windows: bool,
@@ -12294,10 +12232,14 @@ impl SettingsAvailability {
         }
     }
 
-    fn for_state(state: &SettingsViewState, backend_gpu: bool) -> Self {
+    /// The availability the view last PRESENTED: the host's GPU capability and the
+    /// package admission recorded with that presentation
+    /// ([`SettingsViewState::record_runtime_presentation`]), so a row and the save
+    /// feedback after it read one fact, and no view reads a process global.
+    fn for_state(state: &SettingsViewState) -> Self {
         Self {
             packages: state.presented_package_admission.get(),
-            ..Self::runtime(backend_gpu)
+            ..Self::runtime(state.presented_motion.get().backend_gpu)
         }
     }
 }
@@ -15503,7 +15445,7 @@ fn setting_row(
         state,
         None,
         field.key,
-        SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
+        SettingsAvailability::for_state(state),
         state.presented_motion.get(),
     );
     let value = if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
@@ -17644,15 +17586,7 @@ fn compact_update_summary(update: &UpdateProjection, available_width: f32) -> (U
     let headline_height = 42.0_f32.max(30.0 * scale);
     let current_height = 22.0_f32.max(18.0 * scale);
     let detail_height = 24.0_f32.max(20.0 * scale);
-    let full_detail = update.detail.clone().unwrap_or_else(|| {
-        if update.checking {
-            "Contacting the update service…".to_string()
-        } else if update.enabled {
-            update_checked_sentence(update)
-        } else {
-            "Update checks are unavailable.".to_string()
-        }
-    });
+    let full_detail = update_status_detail(update, SettingsWidth::Compact);
     let large_type = scale > 1.25;
     // This summary shares a short landscape row with the side pager. Derive
     // the exact two text-column widths from that row instead of relying on the
@@ -18302,21 +18236,29 @@ fn update_status_card(
     )
 }
 
+/// The status card's detail sentence: the projection's own detail where it has one;
+/// otherwise the checker's state — when the last check ran, on a healthy page — and
+/// then, where the automatic-checks switch is not simply on, what it means for this
+/// process (`UpdateProjection::automatic_checks_note`). The last check comes FIRST: it
+/// is short, so no rung of the card's line budget can cut it (2026-09-24: the switch's
+/// sentence used to take the slot, and "Checked …" left the page until next launch).
 fn update_status_detail(update: &UpdateProjection, width: SettingsWidth) -> String {
-    update.detail.clone().unwrap_or_else(|| {
-        if update.checking {
-            "Contacting the update service\u{2026}".to_string()
-        } else if update.enabled {
-            update_checked_sentence(update)
-        } else {
-            if width == SettingsWidth::Compact {
-                "Update checks are unavailable."
-            } else {
-                "Update checks are unavailable for this installation."
-            }
-            .to_string()
-        }
-    })
+    if let Some(detail) = &update.detail {
+        return detail.clone();
+    }
+    let status = if update.checking {
+        "Contacting the update service\u{2026}".to_string()
+    } else if update.enabled {
+        update_checked_sentence(update)
+    } else if width == SettingsWidth::Compact {
+        "Update checks are unavailable.".to_string()
+    } else {
+        "Update checks are unavailable for this installation.".to_string()
+    };
+    match &update.automatic_checks_note {
+        Some(note) => format!("{status} {note}"),
+        None => status,
+    }
 }
 
 /// A healthy page's status line: when the last check completed, relative and local
@@ -19146,9 +19088,8 @@ fn packages_sections(_packages: &PackagesProjection) -> usize {
     4
 }
 
-/// Bounded PROGRAM rows across the three groups (headings are not counted). 16 holds
-/// the whole shipped index — the ALab set, `gh`/`emacs`, the two extras and the two
-/// admin rows — so the Extras and Needs-admin groups are never the part elided.
+/// Bounded PROGRAM rows. 16 holds the whole shipped index (twelve programs at index 46)
+/// with room to grow; past it, the overflow line says how many are elided.
 const MAX_PACKAGE_PROGRAM_ROWS: usize = 16;
 
 /// The budget one program-row line gets before it wraps, per layout, in the wrap's
@@ -19171,15 +19112,12 @@ fn packages_reason_wrap_chars(width: SettingsWidth) -> usize {
     }
 }
 
-/// One line of the Packages program list: a group heading, a program row (its
-/// canonical state verbatim), or the overflow/empty/loading line — plus, on a row
-/// that offers one, the Install control the line carries beside its text.
+/// One line of the Packages program list: a program row (its canonical state verbatim),
+/// one of its wrapped reason/facts/detail lines, or the overflow/empty/loading line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProgramLine {
     key: String,
     text: String,
-    heading: bool,
-    install: Option<ProgramInstall>,
     /// A wrapped continuation of the row above it: one line of a long reason
     /// (`packages_screen::reason_lines`). Text only, full width; the compact page
     /// gives it neither a label nor a control.
@@ -19194,35 +19132,16 @@ struct ProgramLine {
     state: Option<String>,
 }
 
-/// The Install control on a program row: the action id the reducer admits and the
-/// busy label whose worker makes the control paint busy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProgramInstall {
-    action: String,
-    busy: PackagesBusy,
-}
-
-fn packages_group_slug(group: crate::packages_screen::RowGroup) -> &'static str {
-    match group {
-        crate::packages_screen::RowGroup::Default => "default-set",
-        crate::packages_screen::RowGroup::Extras => "extras",
-        crate::packages_screen::RowGroup::NeedsAdmin => "needs-admin",
-    }
-}
-
-/// The grouped program list — Default set, Extras (vendor · license · size, an Install
-/// control per extra awaiting consent), Needs admin (who installs it; an Install control
-/// that runs the osascript door on macOS, the terminal command elsewhere). Pure: the
+/// The program list (an agent program's row with its vendor · license · size). Pure: the
 /// wide page, the compact page and the row counts all read this one derivation. `width`
-/// sets the character budget a long reason wraps to (`packages_reason_wrap_chars`);
-/// a state that fits rides inline, exactly as before.
+/// sets the character budget a long reason wraps to (`packages_reason_wrap_chars`); a
+/// state that fits rides inline, exactly as before. (The Extras and Needs-admin groups,
+/// with their Install controls, went with the extras and the OS-installer protocols,
+/// design 2026-09-22 §5.3(b)/(c), 2026-09-24.)
 fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -> Vec<ProgramLine> {
-    use crate::packages_screen::RowGroup;
     let plain = |key: &str, text: String| ProgramLine {
         key: key.to_string(),
         text,
-        heading: false,
-        install: None,
         continuation: false,
         quiet: false,
         state: None,
@@ -19241,222 +19160,160 @@ fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -
     }
     let mut lines = Vec::new();
     let mut shown = 0usize;
-    let groups = [RowGroup::Default, RowGroup::Extras, RowGroup::NeedsAdmin];
-    // A list with ONE group needs no group heading: a store holding only the
-    // default set reads exactly as it did before the groups existed, and the
-    // card keeps its height (the wide page paginates the moment a card grows).
-    let grouped = groups
-        .iter()
-        .filter(|group| packages.programs.iter().any(|row| row.group == **group))
-        .count()
-        > 1;
-    for group in groups {
-        let rows: Vec<&crate::packages_screen::PackagesProgramRow> = packages
-            .programs
-            .iter()
-            .filter(|row| row.group == group)
-            .collect();
-        if rows.is_empty() || shown >= MAX_PACKAGE_PROGRAM_ROWS {
-            continue;
+    for row in &packages.programs {
+        if shown >= MAX_PACKAGE_PROGRAM_ROWS {
+            break;
         }
-        if grouped {
-            lines.push(ProgramLine {
-                key: format!("packages/programs/group/{}", packages_group_slug(group)),
-                text: group.heading().to_string(),
-                heading: true,
-                install: None,
-                continuation: false,
-                quiet: false,
-                state: None,
-            });
-        }
-        for row in rows {
-            if shown >= MAX_PACKAGE_PROGRAM_ROWS {
-                break;
-            }
-            shown += 1;
-            let wrap = packages_reason_wrap_chars(width);
-            let mut text = package_program_display_name(&row.name);
-            // AN INSTALLED PROGRAM IS NAMED BY ITS FACTS (Phase 4) IN PLAIN WORDS
-            // (2026-09-23 audit, SB-18): its version (a vendor build's, never its store id;
-            // an index build's number) and what its state says — `up to date`, `latest
-            // from Anthropic`, `you pinned it` — with when it was updated and any newer
-            // build known on the detail. A row with no installed build (an extra, a system
-            // binary, one waiting on an administrator) says its state in words too. A
-            // state with no plain words — a FAULT, anything this page does not parse —
-            // still rides the row verbatim, its own words whole (below). Either way the
-            // canonical line is the row's accessible value.
-            let plain = crate::packages_screen::plain_state(&row.kind, &row.state);
-            let show_state = match row.words.as_ref() {
-                Some(words) => {
-                    text.push_str("  ·  ");
-                    text.push_str(&words.summary);
-                    plain.is_none()
-                }
-                None => {
-                    if let Some(build) = row.installed_build {
-                        text.push_str("  ·  ");
-                        text.push_str(&atpkg::vendor_direct::build_words(build));
-                    }
-                    if let Some(plain) = plain.as_deref() {
-                        text.push_str("  ·  ");
-                        text.push_str(plain);
-                    }
-                    plain.is_none()
-                }
-            };
-            // What follows the row's own words: the product facts, who installs an
-            // admin row, a dev-link annotation (and, below, a terminal hint).
-            let mut tail = String::new();
-            if let Some(facts) = row.facts.as_ref() {
-                tail.push_str("  ·  ");
-                tail.push_str(&facts.line());
-            }
-            if group == RowGroup::NeedsAdmin {
-                tail.push_str("  ·  ");
-                tail.push_str(&crate::packages_screen::admin_vendor_line(&row.name));
-            }
-            if let Some(annotation) = row.annotation.as_deref() {
-                tail.push_str("  ·  ");
-                tail.push_str(annotation);
-            }
-            let install = if row.offers_extra_install() {
-                Some(ProgramInstall {
-                    action: format!("packages/extras/install/{}", row.name),
-                    busy: PackagesBusy::InstallExtra,
-                })
-            } else if group == RowGroup::NeedsAdmin {
-                if packages.admin_door {
-                    Some(ProgramInstall {
-                        action: format!("packages/admin/install/{}", row.name),
-                        busy: PackagesBusy::InstallAdmin,
-                    })
-                } else {
-                    tail.push_str("  ·  run in a terminal: aterm pkg install ");
-                    tail.push_str(&row.name);
-                    None
-                }
-            } else {
-                None
-            };
-            // A state that fits the row — with everything else the row says — rides
-            // inline, VERBATIM: the canonical spellings, byte-for-byte. One that does not
-            // (the 2026-09-14 ~700-character refusal; since Phase 4 also a short state
-            // beside a row's facts) moves BELOW its row as continuation lines, fix first,
-            // so nothing of it meets the painter's ellipsis.
-            let state_lines = if show_state && !row.state.is_empty() {
-                crate::packages_screen::reason_lines(&row.state, wrap)
-            } else {
-                Vec::new()
-            };
-            let inline_state = state_lines.len() == 1
-                && crate::packages_screen::fits_one_line(
-                    &format!("{text}  ·  {}{tail}", row.state),
-                    wrap,
-                );
-            if inline_state {
+        shown += 1;
+        let wrap = packages_reason_wrap_chars(width);
+        let mut text = package_program_display_name(&row.name);
+        // AN INSTALLED PROGRAM IS NAMED BY ITS FACTS (Phase 4) IN PLAIN WORDS
+        // (2026-09-23 audit, SB-18): its version (a vendor build's, never its store id;
+        // an index build's number) and what its state says — `up to date`, `latest
+        // from Anthropic`, `you pinned it` — with when it was updated and any newer
+        // build known on the detail. A row with no installed build (an agent program on
+        // its way, a system binary) says its state in words too. A
+        // state with no plain words — a FAULT, anything this page does not parse —
+        // still rides the row verbatim, its own words whole (below). Either way the
+        // canonical line is the row's accessible value.
+        let plain = crate::packages_screen::plain_state(&row.kind, &row.state);
+        let show_state = match row.words.as_ref() {
+            Some(words) => {
                 text.push_str("  ·  ");
-                text.push_str(&row.state);
+                text.push_str(&words.summary);
+                plain.is_none()
             }
-            let below = if inline_state {
-                Vec::new()
-            } else {
-                state_lines
-            };
-            // The detail — why a kept row is not current, when it was updated, the latest
-            // build known — rides inline, right after the row's own words, when the whole
-            // line fits and nothing else goes below; else under the row, QUIET (the row's
-            // own words stay the line a person scans), wrapped between its parts.
-            let detail = row.words.as_ref().and_then(|w| w.detail.clone());
-            let detail_lines = match detail {
-                Some(detail)
-                    if install.is_none()
-                        && below.is_empty()
-                        && crate::packages_screen::fits_one_line(
-                            &format!("{text}  ·  {detail}{tail}"),
-                            wrap,
-                        ) =>
-                {
+            None => {
+                if let Some(build) = row.installed_build {
                     text.push_str("  ·  ");
-                    text.push_str(&detail);
-                    Vec::new()
+                    text.push_str(&atpkg::vendor_direct::build_words(build));
                 }
-                Some(detail) => packages_detail_lines(&detail, wrap),
-                None => Vec::new(),
-            };
-            // The facts that follow ride the row when they fit; else they move under it
-            // (after a state that went below — the fix comes first), wrapped between their
-            // parts, so the row's own words are never the part the painter's ellipsis eats.
-            let tail_lines = if tail.is_empty()
-                || crate::packages_screen::fits_one_line(&format!("{text}{tail}"), wrap)
-            {
-                text.push_str(&tail);
-                Vec::new()
-            } else {
-                packages_detail_lines(tail.trim_start_matches("  ·  "), wrap)
-            };
-            lines.push(ProgramLine {
-                key: format!("packages/programs/{}", row.name),
-                text,
-                heading: false,
-                install,
-                continuation: false,
-                quiet: false,
-                state: (!show_state && !row.state.is_empty()).then(|| row.state.clone()),
-            });
-            lines.extend(
-                below
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, text)| ProgramLine {
-                        key: format!("packages/programs/{}/reason/{}", row.name, index + 1),
-                        text,
-                        heading: false,
-                        install: None,
-                        continuation: true,
-                        quiet: false,
-                        state: None,
-                    }),
-            );
-            let facts = tail_lines.len() > 1;
-            lines.extend(
-                tail_lines
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, text)| ProgramLine {
-                        key: if facts {
-                            format!("packages/programs/{}/facts/{}", row.name, index + 1)
-                        } else {
-                            format!("packages/programs/{}/facts", row.name)
-                        },
-                        text,
-                        heading: false,
-                        install: None,
-                        continuation: true,
-                        quiet: false,
-                        state: None,
-                    }),
-            );
-            let many = detail_lines.len() > 1;
-            lines.extend(
-                detail_lines
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, text)| ProgramLine {
-                        key: if many {
-                            format!("packages/programs/{}/detail/{}", row.name, index + 1)
-                        } else {
-                            format!("packages/programs/{}/detail", row.name)
-                        },
-                        text,
-                        heading: false,
-                        install: None,
-                        continuation: true,
-                        quiet: true,
-                        state: None,
-                    }),
-            );
+                if let Some(plain) = plain.as_deref() {
+                    text.push_str("  ·  ");
+                    text.push_str(plain);
+                }
+                plain.is_none()
+            }
+        };
+        // What follows the row's own words: the product facts and a dev-link
+        // annotation.
+        let mut tail = String::new();
+        if let Some(facts) = row.facts.as_ref() {
+            tail.push_str("  ·  ");
+            tail.push_str(&facts.line());
         }
+        if let Some(annotation) = row.annotation.as_deref() {
+            tail.push_str("  ·  ");
+            tail.push_str(annotation);
+        }
+        // A state that fits the row — with everything else the row says — rides
+        // inline, VERBATIM: the canonical spellings, byte-for-byte. One that does not
+        // (the 2026-09-14 ~700-character refusal; since Phase 4 also a short state
+        // beside a row's facts) moves BELOW its row as continuation lines, fix first,
+        // so nothing of it meets the painter's ellipsis.
+        let state_lines = if show_state && !row.state.is_empty() {
+            crate::packages_screen::reason_lines(&row.state, wrap)
+        } else {
+            Vec::new()
+        };
+        let inline_state = state_lines.len() == 1
+            && crate::packages_screen::fits_one_line(
+                &format!("{text}  ·  {}{tail}", row.state),
+                wrap,
+            );
+        if inline_state {
+            text.push_str("  ·  ");
+            text.push_str(&row.state);
+        }
+        let below = if inline_state {
+            Vec::new()
+        } else {
+            state_lines
+        };
+        // The detail — why a kept row is not current, when it was updated, the latest
+        // build known — rides inline, right after the row's own words, when the whole
+        // line fits and nothing else goes below; else under the row, QUIET (the row's
+        // own words stay the line a person scans), wrapped between its parts.
+        let detail = row.words.as_ref().and_then(|w| w.detail.clone());
+        let detail_lines = match detail {
+            Some(detail)
+                if below.is_empty()
+                    && crate::packages_screen::fits_one_line(
+                        &format!("{text}  ·  {detail}{tail}"),
+                        wrap,
+                    ) =>
+            {
+                text.push_str("  ·  ");
+                text.push_str(&detail);
+                Vec::new()
+            }
+            Some(detail) => packages_detail_lines(&detail, wrap),
+            None => Vec::new(),
+        };
+        // The facts that follow ride the row when they fit; else they move under it
+        // (after a state that went below — the fix comes first), wrapped between their
+        // parts, so the row's own words are never the part the painter's ellipsis eats.
+        let tail_lines = if tail.is_empty()
+            || crate::packages_screen::fits_one_line(&format!("{text}{tail}"), wrap)
+        {
+            text.push_str(&tail);
+            Vec::new()
+        } else {
+            packages_detail_lines(tail.trim_start_matches("  ·  "), wrap)
+        };
+        lines.push(ProgramLine {
+            key: format!("packages/programs/{}", row.name),
+            text,
+            continuation: false,
+            quiet: false,
+            state: (!show_state && !row.state.is_empty()).then(|| row.state.clone()),
+        });
+        lines.extend(
+            below
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| ProgramLine {
+                    key: format!("packages/programs/{}/reason/{}", row.name, index + 1),
+                    text,
+                    continuation: true,
+                    quiet: false,
+                    state: None,
+                }),
+        );
+        let facts = tail_lines.len() > 1;
+        lines.extend(
+            tail_lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| ProgramLine {
+                    key: if facts {
+                        format!("packages/programs/{}/facts/{}", row.name, index + 1)
+                    } else {
+                        format!("packages/programs/{}/facts", row.name)
+                    },
+                    text,
+                    continuation: true,
+                    quiet: false,
+                    state: None,
+                }),
+        );
+        let many = detail_lines.len() > 1;
+        lines.extend(
+            detail_lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| ProgramLine {
+                    key: if many {
+                        format!("packages/programs/{}/detail/{}", row.name, index + 1)
+                    } else {
+                        format!("packages/programs/{}/detail", row.name)
+                    },
+                    text,
+                    continuation: true,
+                    quiet: true,
+                    state: None,
+                }),
+        );
     }
     let total = packages.programs.len();
     if total > shown {
@@ -19471,25 +19328,8 @@ fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -
     lines
 }
 
-/// The node for one program line: a quiet heading, a status text, or — for a row that
-/// carries an Install control — a row group of the text beside the control (the text
-/// keeps the `packages/programs/<name>` key so the row's identity is stable).
-fn packages_program_line_node(
-    line: &ProgramLine,
-    packages: &PackagesProjection,
-    row_height: f32,
-) -> UiNode {
-    if line.heading {
-        return UiNode::new(
-            line.key.clone(),
-            UiContent::Text(TextSpec {
-                text: line.text.clone(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(row_height)));
-    }
+/// The node for one program line: its status text, keyed `packages/programs/<name>`.
+fn packages_program_line_node(line: &ProgramLine, row_height: f32) -> UiNode {
     let painted = UiContent::Text(TextSpec {
         text: line.text.clone(),
         role: SemanticRole::Status,
@@ -19503,23 +19343,7 @@ fn packages_program_line_node(
         Some(state) => program_state_node(line.key.clone(), painted, &line.text, state),
         None => UiNode::new(line.key.clone(), painted),
     };
-    let Some(install) = line.install.as_ref() else {
-        return text.layout(Layout::default().height(Length::Fixed(row_height)));
-    };
-    let name = line.key.rsplit('/').next().unwrap_or_default().to_string();
-    UiNode::new(
-        format!("packages/programs/row/{name}"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::row().height(Length::Fixed(row_height)).gap(6.0))
-    .children(vec![
-        text.layout(Layout::default().height(Length::Fill)),
-        packages_install_button(install, &name, packages).layout(
-            Layout::default()
-                .width(Length::Fixed(88.0 * settings_text_scale().min(1.5)))
-                .height(Length::Fill),
-        ),
-    ])
+    text.layout(Layout::default().height(Length::Fixed(row_height)))
 }
 
 /// A row whose words replace atpkg's state keeps that state as its accessible value: ONE
@@ -19541,33 +19365,6 @@ fn program_state_node(key: String, painted: UiContent, words: &str, state: &str)
     ])
 }
 
-/// The Install control itself — enabled exactly when the page's other actions are,
-/// busy while its own worker runs.
-fn packages_install_button(
-    install: &ProgramInstall,
-    name: &str,
-    packages: &PackagesProjection,
-) -> UiNode {
-    UiNode::new(
-        install.action.clone(),
-        UiContent::Button(
-            Control::new(
-                ButtonSpec::new(format!("Install {name}")).visual_label("Install"),
-                ActionId::new(install.action.clone()),
-            )
-            .state(ControlState {
-                enabled: packages.actions_enabled,
-                busy: packages.busy == Some(install.busy),
-                ..ControlState::default()
-            })
-            .style(StyleRef::Primary),
-        ),
-    )
-}
-
-/// The compact page's atomic item count for the program list: every line (headings
-/// and the overflow line included) plus one item per Install control, which the
-/// compact page stacks under its row.
 /// A row's detail as lines of at most `wrap` (the reason wrap's measure), broken only
 /// between its ` · ` parts, in order; a part longer than a line is a line of its own.
 fn packages_detail_lines(detail: &str, wrap: usize) -> Vec<String> {
@@ -19587,9 +19384,10 @@ fn packages_detail_lines(detail: &str, wrap: usize) -> Vec<String> {
     lines
 }
 
+/// The compact page's atomic item count for the program list: every line, the overflow
+/// line included.
 fn packages_program_row_count(packages: &PackagesProjection, width: SettingsWidth) -> usize {
-    let lines = packages_program_lines(packages, width);
-    lines.len() + lines.iter().filter(|line| line.install.is_some()).count()
+    packages_program_lines(packages, width).len()
 }
 
 /// A wrapped reason line on the atomic compact page: full width, no label column —
@@ -20952,6 +20750,7 @@ fn messages_page(
             )
         });
         let (report, report_h) = messages_report_buttons(true, section_width);
+        let switch = messages_explain_load_row(state, width);
         let unsaved = (!messages.saved).then(|| {
             wrapped_copy_node(
                 "settings/messages/not-saved",
@@ -20979,8 +20778,14 @@ fn messages_page(
         state.messages_page_facts.set(Some(facts));
         let (mut items, heads) = messages_compact_items(header, &visible, selected, facts);
         let entries_end = items.len();
-        // The reporting buttons: the list's last item (their doc).
+        // The reporting buttons: the list's last item (their doc) — then, on
+        // a compact page, the "Explain heavy load" switch, so the first
+        // section still opens on the newest message (the wide page seats it
+        // at the top).
         items.push(report_h);
+        if switch.is_some() {
+            items.push(width.row_height());
+        }
         let sections = messages_sections(&items, section_height);
         let pages = sections.len();
         state.record_result_page_limit(pages.saturating_sub(1));
@@ -21043,6 +20848,11 @@ fn messages_page(
         if range.contains(&entries_end) {
             children.push(report);
         }
+        if let Some(switch) = switch
+            && range.contains(&(entries_end + 1))
+        {
+            children.push(switch);
+        }
         let section_node = UiNode::new(
             format!("settings/messages/section/{section}"),
             UiContent::Group(GroupSpec::new("Messages")),
@@ -21075,6 +20885,12 @@ fn messages_page(
     let content_height =
         noncompact_page_content_height(state, width, viewport.width, viewport.height, maximum);
     let mut out = page_heading("Messages", messages_page_subtitle(width));
+    // The page's top switch: the strain row's (design §10.14, ruling 212).
+    let mut switch_h = 0.0;
+    if let Some(switch) = messages_explain_load_row(state, width) {
+        switch_h = width.row_height() + gap;
+        out.push(switch);
+    }
     let (chip_rows, chip_h) =
         messages_filter_chip_rows(messages, &state.messages_filter, content_width, false);
     let (chips, chips_h) = messages_filters_group(chip_rows, chip_h);
@@ -21130,8 +20946,13 @@ fn messages_page(
     // Heading, subtitle, chips, the status-and-buttons row (and the not-saved
     // note): the children and the gaps between them; the rows and the pager add
     // one gap each.
-    let fixed =
-        page_heading_height() + page_subtitle_height() + chips_h + header_h + unsaved_h + 3.0 * gap;
+    let fixed = page_heading_height()
+        + page_subtitle_height()
+        + switch_h
+        + chips_h
+        + header_h
+        + unsaved_h
+        + 3.0 * gap;
     if total == 0 {
         let (empty, _) = wrapped_copy_node(
             "settings/messages/empty",
@@ -21386,12 +21207,33 @@ fn packages_switch_row(
     key: &str,
     width: SettingsWidth,
 ) -> Option<UiNode> {
+    registry_switch_row(
+        state,
+        key,
+        width,
+        format!("packages/switch-row/{key}"),
+        "packages",
+    )
+}
+
+/// One registry-backed Switch row on a SPECIAL page, its row node keyed
+/// `row_key` and its compact wrappers under `prefix`: the Packages page's
+/// switches ([`packages_switch_row`]) and Settings ▸ Messages's "Explain heavy
+/// load" ([`messages_explain_load_row`]). The control is the ordinary
+/// `settings/control/<key>` / `settings/set/<key>` pair either way.
+fn registry_switch_row(
+    state: &SettingsViewState,
+    key: &str,
+    width: SettingsWidth,
+    row_key: String,
+    prefix: &str,
+) -> Option<UiNode> {
     let field = state.field_by_key(key)?;
     let effect = setting_effect_projection(
         state,
         None,
         key,
-        SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
+        SettingsAvailability::for_state(state),
         state.presented_motion.get(),
     );
     // The row shows the RESOLVED value its field was seeded with: for "Automatic updates"
@@ -21475,13 +21317,13 @@ fn packages_switch_row(
     );
     let (layout, children) = if width == SettingsWidth::Compact {
         let controls = UiNode::new(
-            format!("packages/controls/{key}"),
+            format!("{prefix}/controls/{key}"),
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
         .layout(Layout::row().height(Length::Fill).gap(6.0))
         .children(vec![
             UiNode::new(
-                format!("packages/control-spacer/{key}"),
+                format!("{prefix}/control-spacer/{key}"),
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
             .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
@@ -21503,12 +21345,27 @@ fn packages_switch_row(
         )
     };
     Some(
-        UiNode::new(
-            format!("packages/switch-row/{key}"),
-            UiContent::Group(GroupSpec::new(field.label)),
-        )
-        .layout(layout)
-        .children(children),
+        UiNode::new(row_key, UiContent::Group(GroupSpec::new(field.label)))
+            .layout(layout)
+            .children(children),
+    )
+}
+
+/// The deep link to Settings ▸ Messages's "Explain heavy load" switch — the
+/// row's own key.
+pub(crate) const MESSAGES_EXPLAIN_LOAD: &str = "settings/messages/explain-load";
+
+/// Settings ▸ Messages's top switch, "Explain heavy load"
+/// (`explain_heavy_load`, design §10.14, ruling 212): the strain row's
+/// switch, on the page that lists what that row records. `None` when the
+/// registry has no such field (never, in a shipped build).
+fn messages_explain_load_row(state: &SettingsViewState, width: SettingsWidth) -> Option<UiNode> {
+    registry_switch_row(
+        state,
+        prefs::EDIT_EXPLAIN_HEAVY_LOAD,
+        width,
+        MESSAGES_EXPLAIN_LOAD.to_string(),
+        "settings/messages",
     )
 }
 
@@ -22001,10 +21858,9 @@ fn packages_page(
     )
     .children(consent_children);
 
-    // The program list, GROUPED — Default set / Extras / Needs admin (§17.2's canonical
-    // states verbatim; S9's extras rows with vendor, license, size and an Install
-    // control; §17.8's admin rows with the door). Bounded rows keep the card height
-    // deterministic; the overflow line says exactly how much is elided.
+    // The program list (§17.2's canonical states verbatim; an agent program's row with
+    // its vendor, license and size). Bounded rows keep the card height deterministic;
+    // the overflow line says exactly how much is elided.
     let row_height = 24.0_f32.max(20.0 * text_scale);
     let programs_heading_height = 22.0_f32.max(16.0 * text_scale);
     let mut program_children = vec![
@@ -22023,7 +21879,7 @@ fn packages_page(
     program_children.extend(
         program_lines
             .iter()
-            .map(|line| packages_program_line_node(line, packages, row_height)),
+            .map(|line| packages_program_line_node(line, row_height)),
     );
     let programs_height = 40.0
         + programs_heading_height
@@ -22170,14 +22026,8 @@ fn packages_page(
                     items.push(compact_packages_reason_line(line.key, line.text));
                     continue;
                 }
-                let label = if line.heading {
-                    "Program group"
-                } else {
-                    "Program"
-                };
-                let name = line.key.rsplit('/').next().unwrap_or_default().to_string();
                 let (mut row, height) =
-                    compact_packages_status_row(line.key.clone(), label, line.text.clone());
+                    compact_packages_status_row(line.key.clone(), "Program", line.text.clone());
                 // Its value column carries atpkg's own state line too, as the wide row does.
                 if let Some(state) = line.state.as_deref()
                     && let Some(value) = row.children.get_mut(1)
@@ -22196,14 +22046,6 @@ fn packages_page(
                     .layout(layout);
                 }
                 items.push((row, height));
-                // The compact page stacks the row's Install control under its row as
-                // its own reachable item (counted in `packages_program_row_count`).
-                if let Some(install) = line.install.as_ref() {
-                    let mut button = packages_install_button(install, &name, packages);
-                    button.layout.width = Length::Fill;
-                    button.layout.height = Length::Fixed(action_control_height);
-                    items.push((button, action_control_height));
-                }
             }
             // The Activity: its heading row (with Open Log), this page's lines full width,
             // and its pager (counted in `packages_compact_sections`).
@@ -24521,10 +24363,8 @@ mod tests {
 
         let constrained = crate::native_app::ViewMotionCx {
             system_reduced: true,
-            focused: true,
             performance_reduced: true,
-            system_dark: false,
-            serious: false,
+            ..crate::native_app::ViewMotionCx::default()
         };
         focus(&mut state, "full");
         assert!(
@@ -24542,10 +24382,8 @@ mod tests {
         focus(&mut state, "auto");
         let load_only = crate::native_app::ViewMotionCx {
             system_reduced: false,
-            focused: true,
             performance_reduced: true,
-            system_dark: false,
-            serious: false,
+            ..crate::native_app::ViewMotionCx::default()
         };
         assert!(preview_reduced_motion(&state, load_only));
         state
@@ -29325,14 +29163,13 @@ mod tests {
             outcome: "up to date".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
-            last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
             last_pass: String::new(),
             last_pass_at: String::new(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -29392,14 +29229,13 @@ mod tests {
             outcome: "up to date".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
-            last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
             last_pass: String::new(),
             last_pass_at: String::new(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -29458,14 +29294,13 @@ mod tests {
                 outcome: "up to date".to_string(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
-                last_index_reached_at: String::new(),
                 last_index_build: 0,
                 index_build_changed_at: String::new(),
                 last_pass: String::new(),
                 last_pass_at: String::new(),
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
-                metered_hold_until: String::new(),
+                pass_seq: 0,
                 programs: std::collections::BTreeMap::new(),
                 extra: Default::default(),
             }),
@@ -29625,14 +29460,13 @@ mod tests {
             outcome: "up to date".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
-            last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
             last_pass: String::new(),
             last_pass_at: String::new(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -29949,14 +29783,13 @@ mod tests {
             outcome: "up to date (index build 44)".to_string(),
             seams: Vec::new(),
             last_success_at: aterm_types::rfc3339::format_rfc3339(u64::try_from(now - 60).unwrap()),
-            last_index_reached_at: String::new(),
             last_index_build: 44,
             index_build_changed_at: String::new(),
             last_pass: String::new(),
             last_pass_at: String::new(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -30890,19 +30723,25 @@ mod tests {
         let theme = aterm_render::Theme::default();
         let surface = crate::settings::Roles::from_theme(theme).surface;
         let restore = crate::native_appearance::current_preferences();
-        for (name, width, height, text_scale, checks, linux) in [
-            ("wide", 1_200.0_f32, 820.0_f32, 1.0_f32, true, false),
-            ("wide-off", 1_200.0, 820.0, 1.0, false, false),
-            ("medium", 849.0, 513.0, 1.0, true, false),
-            ("medium-off", 849.0, 513.0, 1.0, false, false),
-            ("compact", 568.0, 900.0, 1.0, true, false),
-            ("compact-short", 600.0, 560.0, 1.0, true, false),
-            ("landscape-2x", 568.0, 320.0, 2.0, true, false),
-            ("linux-wide-off", 1_200.0, 820.0, 1.0, false, true),
-            ("linux-medium", 849.0, 513.0, 1.0, true, true),
-            ("linux-medium-off", 849.0, 513.0, 1.0, false, true),
-            ("linux-compact", 568.0, 900.0, 1.0, true, true),
-            ("linux-compact-short-off", 600.0, 560.0, 1.0, false, true),
+        // `(running, saved)`: the automatic-checks switch as this process runs it and as
+        // saved; the `-stopping` / `-starting` rows are a saved flip awaiting next launch.
+        for (name, width, height, text_scale, (running, saved), linux) in [
+            ("wide", 1_200.0_f32, 820.0_f32, 1.0_f32, (true, true), false),
+            ("wide-off", 1_200.0, 820.0, 1.0, (false, false), false),
+            ("wide-stopping", 1_200.0, 820.0, 1.0, (true, false), false),
+            ("medium", 849.0, 513.0, 1.0, (true, true), false),
+            ("medium-off", 849.0, 513.0, 1.0, (false, false), false),
+            ("medium-starting", 849.0, 513.0, 1.0, (false, true), false),
+            ("compact", 568.0, 900.0, 1.0, (true, true), false),
+            ("compact-stopping", 568.0, 900.0, 1.0, (true, false), false),
+            ("compact-short", 600.0, 560.0, 1.0, (true, true), false),
+            ("short-starting", 600.0, 560.0, 1.0, (false, true), false),
+            ("landscape-2x", 568.0, 320.0, 2.0, (true, true), false),
+            ("linux-wide-off", 1_200.0, 820.0, 1.0, (false, false), true),
+            ("linux-medium", 849.0, 513.0, 1.0, (true, true), true),
+            ("linux-medium-off", 849.0, 513.0, 1.0, (false, false), true),
+            ("linux-compact", 568.0, 900.0, 1.0, (true, true), true),
+            ("linux-short-off", 600.0, 560.0, 1.0, (false, false), true),
         ] {
             crate::native_appearance::install_preferences(
                 crate::native_appearance::AppearancePreferences {
@@ -30914,6 +30753,7 @@ mod tests {
             let mut page = 0;
             while page < pages {
                 let mut status = update_status(false);
+                status.updated_at = "2026-01-01T00:00:00Z".to_string();
                 if linux {
                     status.linux = Some(aterm_update::LinuxUpdateStatus {
                         installed_build: 1,
@@ -30926,9 +30766,9 @@ mod tests {
                     });
                 }
                 let update = UpdateState::from_status(1, "0.1.0", Some(&status), false)
-                    .with_automatic_checks(checks, checks);
+                    .with_automatic_checks(running, saved);
                 let (mut runtime, instance, view) = setup_with_update(update);
-                if !checks {
+                if !saved {
                     replace_settings_source(
                         &mut runtime,
                         view,
@@ -32365,14 +32205,13 @@ mod tests {
             outcome: "install failed".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
-            last_index_reached_at: String::new(),
             last_index_build: 0,
             index_build_changed_at: String::new(),
             last_pass: String::new(),
             last_pass_at: String::new(),
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
-            metered_hold_until: String::new(),
+            pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -32442,7 +32281,7 @@ mod tests {
                 lines[0].text, "ay  \u{b7}  build 1971  \u{b7}  from ALab",
                 "{width:?}: a FAULT keeps its own words, whole, below the row's facts"
             );
-            assert!(!lines[0].continuation && lines[0].install.is_none());
+            assert!(!lines[0].continuation);
             let reason: Vec<String> = lines[1..].iter().map(|line| line.text.clone()).collect();
             assert_eq!(
                 reason,
@@ -32450,7 +32289,7 @@ mod tests {
                 "{width:?}"
             );
             for (index, line) in lines[1..].iter().enumerate() {
-                assert!(line.continuation && line.install.is_none() && !line.heading);
+                assert!(line.continuation);
                 assert_eq!(
                     line.key,
                     format!("packages/programs/ay/reason/{}", index + 1)
@@ -32530,109 +32369,75 @@ mod tests {
         }
     }
 
-    /// The grouped program list and its controls (§17.2 states verbatim; S9's extras
-    /// with vendor · license · size; §17.8's door): a store with a default member, an
-    /// extra awaiting consent and the two admin rows derives three group headings, an
-    /// Install control on the extra and on each admin row (macOS) — and the controls
-    /// dispatch the typed doors: the extra's `InstallExtra { vendorx }`, the admin control
-    /// on `brew` the door for `clt` THEN `brew`. A forged action id for a name that is
-    /// not waiting is refused in user voice without an effect.
+    /// The program list (§17.2 states verbatim): one flat list with no group headings and
+    /// no Install controls — the Extras and Needs-admin groups went with the extras and the
+    /// OS-installer protocols (design 2026-09-22 §5.3(b)/(c), 2026-09-24). A vendor row
+    /// names its version and source; a row an older atpkg wrote in a retired spelling
+    /// rides verbatim; and a retired row action id dispatches nothing.
     #[test]
-    fn packages_grouped_rows_offer_install_controls_that_dispatch_the_doors() {
-        fn grouped_state() -> PackagesState {
-            let mut programs = std::collections::BTreeMap::new();
-            let claude = atpkg::vendor_direct::Version::parse("2.1.280")
-                .unwrap()
-                .build_id();
-            for (name, state, build) in [
-                ("ay", atpkg::state::managed(1971, 41), Some(1971)),
-                (
-                    "claude",
-                    atpkg::state::vendor_managed("2.1.280", "Anthropic"),
-                    Some(claude),
-                ),
-                (
-                    "vendorx",
-                    atpkg::state::extra_not_installed("vendorx"),
-                    None,
-                ),
-                ("clt", atpkg::state::needs_admin("clt"), None),
-                (
-                    "brew",
-                    atpkg::state::blocked("clt", &atpkg::state::needs_admin("clt")),
-                    None,
-                ),
-            ] {
-                programs.insert(
-                    name.to_string(),
-                    atpkg::ProgramStatus {
-                        installed_build: build,
-                        state,
-                        tree_root: String::new(),
-                    },
-                );
-            }
-            let status = atpkg::Status {
-                schema: 1,
-                updated_at: "2026-08-27T00:00:00Z".to_string(),
-                enabled: true,
-                index_source: "alabsystems/aterm".to_string(),
-                outcome: "up to date".to_string(),
-                seams: Vec::new(),
-                last_success_at: String::new(),
-                last_index_reached_at: String::new(),
-                last_index_build: 0,
-                index_build_changed_at: String::new(),
-                last_pass: String::new(),
-                last_pass_at: String::new(),
-                last_pass_attempted_index_build: 0,
-                last_pass_attempted_at: String::new(),
-                metered_hold_until: String::new(),
-                programs,
-                extra: Default::default(),
-            };
-            let mut service = crate::packages_screen::PackagesService::new();
-            let sequence = service.begin(None).unwrap();
-            assert!(service.finish(
-                sequence,
-                crate::packages_screen::PackagesWorkerCompletion::refresh(
-                    crate::packages_screen::PackagesStatusReport::from_parts(
-                        true,
-                        true,
-                        "fp".to_string(),
-                        Some(&status),
-                        &[],
-                    ),
-                ),
-            ));
-            service.state(true, true, true)
+    fn packages_rows_are_one_list_with_no_install_controls() {
+        let mut programs = std::collections::BTreeMap::new();
+        let claude = atpkg::vendor_direct::Version::parse("2.1.280")
+            .unwrap()
+            .build_id();
+        for (name, state, build) in [
+            ("ay", atpkg::state::managed(1971, 41), Some(1971)),
+            (
+                "claude",
+                atpkg::state::vendor_managed("2.1.280", "Anthropic"),
+                Some(claude),
+            ),
+            (
+                "clt",
+                "needs admin — run: aterm pkg install clt".to_string(),
+                None,
+            ),
+        ] {
+            programs.insert(
+                name.to_string(),
+                atpkg::ProgramStatus {
+                    installed_build: build,
+                    state,
+                    tree_root: String::new(),
+                },
+            );
         }
-
-        // The derivation every rendering reads.
-        let projection = grouped_state().projection();
+        let status = atpkg::Status {
+            schema: 1,
+            programs,
+            ..Default::default()
+        };
+        let mut service = crate::packages_screen::PackagesService::new();
+        let sequence = service.begin(None).unwrap();
+        assert!(service.finish(
+            sequence,
+            crate::packages_screen::PackagesWorkerCompletion::refresh(
+                crate::packages_screen::PackagesStatusReport::from_parts(
+                    true,
+                    true,
+                    "fp".to_string(),
+                    Some(&status),
+                    &[],
+                ),
+            ),
+        ));
+        let state = service.state(true, true, true);
+        let projection = state.projection();
         let lines = packages_program_lines(&projection, SettingsWidth::Wide);
         let keys: Vec<&str> = lines.iter().map(|line| line.key.as_str()).collect();
         assert_eq!(
             keys,
             vec![
-                "packages/programs/group/default-set",
                 "packages/programs/ay",
                 "packages/programs/claude",
-                "packages/programs/group/extras",
-                "packages/programs/vendorx",
-                "packages/programs/group/needs-admin",
-                "packages/programs/brew",
                 "packages/programs/clt",
             ]
         );
         let line = |key: &str| lines.iter().find(|line| line.key == key).unwrap();
-        assert!(line("packages/programs/group/extras").heading);
-        assert_eq!(line("packages/programs/group/extras").text, "EXTRAS");
         assert_eq!(
             line("packages/programs/ay").text,
             "ay  ·  build 1971  ·  up to date"
         );
-        assert!(line("packages/programs/ay").install.is_none());
         // A vendor program's row names its version and source — never its store id.
         let claude = &line("packages/programs/claude").text;
         assert!(
@@ -32640,61 +32445,20 @@ mod tests {
             "{claude}"
         );
         assert!(!claude.contains("build "), "{claude}");
-        let vendorx = line("packages/programs/vendorx");
-        assert_eq!(vendorx.text, "vendorx  ·  not installed");
-        assert_eq!(
-            vendorx.state.as_deref(),
-            Some("extra — not installed (opt in: aterm pkg install vendorx)"),
-            "the canonical line is the row's accessible value"
+        assert!(
+            line("packages/programs/clt")
+                .text
+                .contains("needs admin — run: aterm pkg install clt"),
+            "a retired spelling rides verbatim"
         );
-        assert_eq!(
-            vendorx.install,
-            Some(ProgramInstall {
-                action: "packages/extras/install/vendorx".to_string(),
-                busy: PackagesBusy::InstallExtra,
-            })
-        );
-        let clt = line("packages/programs/clt");
-        assert!(clt.text.contains("needs an administrator to install"));
-        assert!(clt.text.contains("Apple Command Line Tools"));
-        let brew = line("packages/programs/brew");
-        assert!(brew.text.contains("waiting for clt"), "{}", brew.text);
-        assert!(brew.text.contains("Homebrew"));
-        if cfg!(target_os = "macos") {
-            for (row, name) in [(clt, "clt"), (brew, "brew")] {
-                assert_eq!(
-                    row.install,
-                    Some(ProgramInstall {
-                        action: format!("packages/admin/install/{name}"),
-                        busy: PackagesBusy::InstallAdmin,
-                    })
-                );
-            }
-        } else {
-            assert!(clt.install.is_none());
-            assert!(
-                clt.text
-                    .contains("run in a terminal: aterm pkg install clt")
-            );
-        }
         assert_eq!(
             packages_program_row_count(&projection, SettingsWidth::Wide),
-            lines.len() + if cfg!(target_os = "macos") { 3 } else { 1 },
-            "the compact page stacks one item per control"
-        );
-        // One group needs no heading — the single-member store reads as before.
-        let single = live_packages_state(None).projection();
-        assert_eq!(
-            packages_program_lines(&single, SettingsWidth::Wide)
-                .iter()
-                .map(|line| line.key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["packages/programs/ay"]
+            lines.len()
         );
 
-        // The controls dispatch the typed doors through the host executor.
+        // A retired row action id is no action at all.
         let (mut runtime, instance, view) = setup();
-        assert!(runtime.replace_settings_packages(grouped_state(), 2));
+        assert!(runtime.replace_settings_packages(state, 2));
         runtime
             .dispatch(
                 instance,
@@ -32705,7 +32469,10 @@ mod tests {
                 }),
             )
             .unwrap();
-        let press = |runtime: &mut NativeRuntime, id: &str| {
+        for id in [
+            "packages/extras/install/vendorx",
+            "packages/admin/install/clt",
+        ] {
             let out = runtime
                 .dispatch(
                     instance,
@@ -32716,55 +32483,12 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            out.effects.iter().find_map(|effect| match effect {
-                AppEffect::Packages { request, .. } => Some(request.clone()),
-                _ => None,
-            })
-        };
-        let feedback = |runtime: &NativeRuntime| -> String {
-            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-                unreachable!();
-            };
-            state.feedback.clone().unwrap_or_default()
-        };
-        assert_eq!(
-            press(&mut runtime, "packages/extras/install/vendorx"),
-            Some(crate::native_app::PackagesRequest::InstallExtra {
-                name: "vendorx".to_string()
-            })
-        );
-        assert_eq!(
-            feedback(&runtime),
-            "Installing vendorx…",
-            "an unauthored extra installs under its bare name"
-        );
-        assert_eq!(
-            press(&mut runtime, "packages/extras/install/ay"),
-            None,
-            "a default-set member is not an extra"
-        );
-        assert!(feedback(&runtime).contains("not an extra"));
-        assert_eq!(press(&mut runtime, "packages/admin/install/ay"), None);
-        assert!(feedback(&runtime).contains("not waiting on an administrator"));
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                press(&mut runtime, "packages/admin/install/brew"),
-                Some(crate::native_app::PackagesRequest::InstallElevated {
-                    names: vec!["clt".to_string(), "brew".to_string()]
-                }),
-                "the door installs the dependency first"
+            assert!(
+                !out.effects
+                    .iter()
+                    .any(|effect| matches!(effect, AppEffect::Packages { .. })),
+                "{id}"
             );
-            assert!(feedback(&runtime).contains("clt, then brew"));
-            assert!(feedback(&runtime).contains("password"));
-            assert_eq!(
-                press(&mut runtime, "packages/admin/install/clt"),
-                Some(crate::native_app::PackagesRequest::InstallElevated {
-                    names: vec!["clt".to_string()]
-                })
-            );
-        } else {
-            assert_eq!(press(&mut runtime, "packages/admin/install/brew"), None);
-            assert!(feedback(&runtime).contains("macOS-only"));
         }
     }
 
@@ -34185,6 +33909,48 @@ mod tests {
                         assert_eq!(painted.label, outcome, "{context}");
                     }
                 }
+            }
+        }
+    }
+
+    /// THE LAST CHECK STAYS ON THE macOS PAGE WHILE THE SWITCH EXPLAINS ITSELF (2026-09-24).
+    /// With the automatic-checks switch saved one way and running the other (or off both
+    /// ways), its timing sentence took the detail slot and "Checked N ago." left the page
+    /// until the next launch. Both paint now, on the status card's first page, inside the
+    /// section at the wide and medium workbenches, the compact page and the short phone.
+    #[test]
+    fn the_checked_line_paints_beside_the_switch_sentence_at_every_width() {
+        let state = |running: bool, saved: bool| {
+            let mut status = update_status(false);
+            status.updated_at = "2026-01-01T00:00:00Z".to_string();
+            UpdateState::from_status(1, "0.1.0", Some(&status), false)
+                .with_automatic_checks(running, saved)
+        };
+        for (running, saved, switch) in [
+            (true, false, "Automatic checks stop next launch"),
+            (false, true, "Automatic checks start next launch"),
+            (false, false, "Nothing checks for updates by itself"),
+        ] {
+            for (size, width, height) in [
+                ("wide", 1_200.0, 820.0),
+                ("medium", 849.0, 513.0),
+                ("compact", 600.0, 820.0),
+                ("short compact", 600.0, 560.0),
+            ] {
+                let context = format!("{size} r{running} s{saved}");
+                let pages = update_route_pages(state(running, saved), width, height);
+                let first = &pages[0];
+                assert_zero_top_paint(first, &context);
+                let painted = painted_texts(first)
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    painted.contains("Checked ") && painted.contains(switch),
+                    "{context}: the last check and the switch's sentence both paint: \
+                     {painted}"
+                );
             }
         }
     }
@@ -43849,22 +43615,27 @@ enabled = true
 
     /// PARITY, at the one surface that states availability in WORDS. A headless
     /// launch keeps its GPU as an intent and runs the CPU renderer until
-    /// something demands a pixel, so the LIVE-renderer read
-    /// (`metrics::backend_gpu`) is false through the whole life of an instance
-    /// that never captures. Sourcing these rows from it told the user that HDR
-    /// glow, cursor bloom, the P3 colour space and backdrop materials are
-    /// unavailable — about a device the same launch was always entitled to
-    /// build and would build on its first `image`, and which the warn-onces and
-    /// the config host already report as present. Settings owes the CAPABILITY
-    /// read ([`crate::backend_gpu_or_undecided`]): an unredeemed intent is "not
-    /// decided", never "no GPU".
-    ///
-    /// The third row is the one that keeps this from becoming a blanket "always
-    /// GPU": a run that has SETTLED on the CPU renderer — `--cpu`, a windowed
-    /// CPU launch, a redemption that failed — still says so.
+    /// something demands a pixel. Sourcing these rows from the live renderer told
+    /// the user that HDR glow, cursor bloom, the P3 colour space and backdrop
+    /// materials are unavailable — about a device the same launch was always
+    /// entitled to build and would build on its first `image`. Settings reads the
+    /// CAPABILITY its host presented (`ViewMotionCx::backend_gpu`, which
+    /// `App::gpu_capable` answers for an unredeemed intent too — that half is
+    /// `the_settings_capability_read_follows_the_intent_the_app_holds`), and a run
+    /// that has SETTLED on the CPU renderer — `--cpu`, a windowed CPU launch, a
+    /// redemption that failed — still says so. The view reads no process global,
+    /// so nothing another test does can move either reading.
     #[test]
     fn a_deferred_gpu_intent_projects_the_same_availability_as_a_live_device() {
-        let state = SettingsViewState::new(&Config::default());
+        let presented = |backend_gpu: bool| {
+            let state = SettingsViewState::new(&Config::default());
+            state.presented_motion.set(crate::native_app::ViewMotionCx {
+                backend_gpu,
+                ..crate::native_app::ViewMotionCx::default()
+            });
+            state
+        };
+        let (capable, settled) = (presented(true), presented(false));
         let effect = |availability| {
             projected_effect(
                 "cursor_trail = true\ncursor_trail_style = \"fire\"\n",
@@ -43874,23 +43645,25 @@ enabled = true
                 crate::native_app::ViewMotionCx::default(),
             )
         };
-        let live_device =
-            SettingsAvailability::for_state(&state, crate::backend_gpu_capability(true, false));
-        let settled_cpu =
-            SettingsAvailability::for_state(&state, crate::backend_gpu_capability(false, false));
+        let live_device = SettingsAvailability::for_state(&capable);
+        let settled_cpu = SettingsAvailability::for_state(&settled);
+        assert_eq!(live_device, SettingsAvailability::runtime(true));
+        assert_ne!(
+            settled_cpu, live_device,
+            "the fixture must actually distinguish the two readings"
+        );
         assert!(
             effect_note_contains(&effect(settled_cpu), "GPU renderer only"),
             "a run that has settled on the CPU renderer still discloses the denial"
         );
         assert!(
             !effect_note_contains(&effect(live_device), "GPU renderer only"),
-            "a GPU run never carries the denial"
+            "a GPU-capable run never carries the denial"
         );
 
         // THE ROUTING, through a real call site rather than a restatement of it:
-        // `manual_override_disclosure` is one of the five `for_state` callers and
-        // returns the sentence a user reads. An instance holding an unredeemed
-        // intent must produce the live-device sentence.
+        // `manual_override_disclosure` is one of the `for_state` callers and returns
+        // the sentence a user reads.
         let authored = ManualOverride {
             key: prefs::EDIT_HDR_GLOW.to_string(),
             label: "HDR glow".to_string(),
@@ -43898,47 +43671,16 @@ enabled = true
             known: true,
             reset_safe: true,
         };
-        // ONE guard for BOTH readings, asserted only after it drops. The settled reading
-        // is as process-global as the deferred one (`manual_override_disclosure` reads
-        // `backend_gpu_or_undecided`), and taking it after the guard dropped let a sibling
-        // that owns the mirror (`the_settings_capability_read_follows_the_intent_the_app_holds`)
-        // arm it in between — the settled read then saw an undecided GPU and the denial
-        // assertion failed once in a full parallel run (2026-09-24 post-push review).
-        let (deferred_availability, deferred_disclosure, settled_disclosure, device) = {
-            let _intent = crate::DeferredGpuIntentGuard::arm();
-            let deferred = (
-                SettingsAvailability::for_state(&state, crate::backend_gpu_or_undecided()),
-                manual_override_disclosure(&state, &authored, 0, 1),
-            );
-            crate::set_backend_gpu_undecided(false);
-            (
-                deferred.0,
-                deferred.1,
-                manual_override_disclosure(&state, &authored, 0, 1),
-                crate::metrics::backend_gpu(),
-            )
-        };
-        assert!(
-            !device,
-            "the unit suite installs no device; the settled reading above assumes it"
-        );
-
-        assert_eq!(
-            deferred_availability, live_device,
-            "a deferred instance must project a live device's availability"
-        );
-        assert_ne!(
-            settled_cpu, live_device,
-            "the fixture must actually distinguish the two readings"
-        );
+        let settled_disclosure = manual_override_disclosure(&settled, &authored, 0, 1);
+        let capable_disclosure = manual_override_disclosure(&capable, &authored, 0, 1);
         assert!(
             settled_disclosure.contains("requires the GPU renderer"),
             "a settled CPU run still discloses the denial: {settled_disclosure}"
         );
         assert!(
-            !deferred_disclosure.contains("requires the GPU renderer"),
-            "an unredeemed intent must not deny a device this launch may still build: \
-             {deferred_disclosure}"
+            !capable_disclosure.contains("requires the GPU renderer"),
+            "a GPU-capable run (an unredeemed intent included) is never denied: \
+             {capable_disclosure}"
         );
     }
 
@@ -46887,6 +46629,75 @@ enabled = true
             Some(AppViewState::Settings(state)) => state,
             _ => panic!("a Settings view"),
         }
+    }
+
+    /// Settings ▸ Messages's TOP switch (design §10.14, ruling 212): "Explain
+    /// heavy load" — the registry's `explain_heavy_load` Bool, resolved ON by
+    /// default — at its deep-link key, with a visible label the pixel tray
+    /// keeps, an accessible name, and the ordinary `settings/set/<key>`
+    /// action, at the top of the wide page and at the end of the compact one
+    /// (whose first section stays the newest messages).
+    #[test]
+    fn the_messages_page_carries_the_explain_heavy_load_switch() {
+        let key = prefs::EDIT_EXPLAIN_HEAVY_LOAD;
+        for (width, height) in [(1_200.0, 820.0), (320.0, 568.0)] {
+            let (mut runtime, instance, view) = setup_with_messages();
+            if width < 400.0 {
+                // The compact pager clamps to its last section.
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    panic!("a Settings view");
+                };
+                state.page_scroll = usize::MAX;
+            }
+            let cx = view_cx_at(width, height);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            compiled.validate_parity().unwrap();
+            let at = format!("{width}x{height}");
+            let row = compiled
+                .semantic(&UiKey::new(MESSAGES_EXPLAIN_LOAD))
+                .unwrap_or_else(|| panic!("the switch row at its deep-link key ({at})"));
+            assert_eq!(row.label, "Explain heavy load", "{at}");
+            let control = compiled
+                .semantic(&UiKey::new(format!("settings/control/{key}")))
+                .unwrap_or_else(|| panic!("the switch ({at})"));
+            assert_eq!(
+                control.value,
+                SemanticValue::Bool(true),
+                "default ON ({at})"
+            );
+            assert!(
+                control.label.starts_with("Explain heavy load"),
+                "the accessible name ({at}): {}",
+                control.label
+            );
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new(format!("settings/label/{key}")))
+                    .map(|node| node.label.as_str()),
+                Some("Explain heavy load"),
+                "a visible label ({at})"
+            );
+            assert!(
+                compiled
+                    .hits
+                    .iter()
+                    .any(|hit| hit.key.as_str() == format!("settings/control/{key}")),
+                "activatable ({at})"
+            );
+            let tray = compiled.tray(aterm_render::Theme::default(), 13.0);
+            assert!(
+                tray.prims.iter().any(|prim| matches!(
+                    prim,
+                    crate::widget::DrawPrim::Text { s, .. } if s == "Explain heavy load"
+                )),
+                "the label survives lowering into the pixel tray ({at})"
+            );
+        }
+        assert_eq!(
+            prefs::section_of(key),
+            prefs::Section::Performance,
+            "no ordinary page double-lists it; Search and Modified find it"
+        );
     }
 
     /// The page is the log newest first; the chips are the tags PRESENT, in

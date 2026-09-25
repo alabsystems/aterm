@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bare-repo race proofs for the build-number ledger claim (release spec §2).
+//! Bare-repo race proofs for the build-number ledger claim (release spec §2),
+//! and for where it lands: the release commit on the published commit, main
+//! taking it as a fast-forward or a merge (owner ruling R2, 2026-09-23).
 //!
 //! REAL git against a local bare-repo origin — no mocks of git semantics: the
 //! claim's fast-forward push either is or is not a compare-and-swap, and only
@@ -27,7 +29,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ledger::{ClaimPlan, Error, GitCli, GitRunner, LEDGER_FLOOR, RunOut};
+use ledger::{ClaimPlan, GitCli, GitRunner, LEDGER_FLOOR, RunOut};
 
 /// One frozen "clock" for every test: claims take `now` as an input (spec §2
 /// computes `n = max(last + 1, unix_now)`), so freezing it makes every minted
@@ -41,9 +43,12 @@ const NOW: u64 = 1_790_000_000;
 /// malformed_lines` covers that mixed-history file directly.
 const SEED_LEDGER: &str = "# aterm release ledger — append-only; one line per claimed build number. Never edit or reuse.\n1783354739 0.25.0\n";
 
-/// Minimal changelog: the claim's "cut elsewhere" abort reads
-/// origin/main:CHANGELOG.md, so the fixture repo must carry one.
+/// Minimal changelog: the claim rolls it on both sides, and its "cut elsewhere"
+/// abort reads origin/main:CHANGELOG.md.
 const SEED_CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Added\n- **Something real** — an entry.\n\n## [0.25.0] - 2026-07-06\n\n- old notes.\n";
+
+/// The roll date every claim here uses.
+const DATE: &str = "2026-09-23";
 
 // --------------------------------------------------------------------------
 // fixture: bare origin + a rival clone (the "other machine") + the claimant's
@@ -226,57 +231,90 @@ impl<F: FnMut(u32)> GitRunner for HookRunner<F> {
     }
 }
 
-/// Drive one claim with a stand-in `regenerate` that writes a BUMP file
-/// mentioning the n it was called with (so the asserts can prove the retry
-/// regenerated content for the NEW number, not reused attempt 1's). Returns
-/// the claim outcome plus every n regenerate saw.
+/// The rival pushes a peer's CODE and a changelog entry after the publish — the
+/// shape that must neither block a cut nor leak into it.
+fn rival_peer_push(fix: &Fixture) {
+    run(&fix.rival, "git", &["fetch", "-q", "origin", "main"]);
+    run(&fix.rival, "git", &["reset", "-q", "--hard", "origin/main"]);
+    fs::write(fix.rival.join("peer.rs"), "fn peer() {}\n").unwrap();
+    let cp = fix.rival.join("CHANGELOG.md");
+    let c = fs::read_to_string(&cp).unwrap().replace(
+        "### Added\n",
+        "### Added\n- **A peer's entry** — not in the published commit.\n",
+    );
+    fs::write(&cp, c).unwrap();
+    run(&fix.rival, "git", &["add", "-A"]);
+    run(
+        &fix.rival,
+        "git",
+        &["commit", "-q", "-m", "feat: a peer's code"],
+    );
+    run(&fix.rival, "git", &["push", "-q", "origin", "main"]);
+}
+
+/// Drive one claim of `version` from the published commit = the work clone's
+/// HEAD, with the real changelog rolls. Returns the outcome and how many
+/// attempts the claim made (each builds both commits afresh).
 fn do_claim(
     git: &dyn GitRunner,
     work: &Path,
     version: &str,
     allow_existing_section: bool,
-) -> (ledger::Result<ledger::Claim>, Vec<u64>) {
-    let mut ns = Vec::new();
+) -> (ledger::Result<ledger::Claim>, u32) {
+    let source = run(work, "git", &["rev-parse", "HEAD"]).trim().to_string();
     let plan = ClaimPlan {
         version,
         now: NOW,
         allow_existing_section,
         max_attempts: 5,
+        source: &source,
     };
-    let mut regen = |n: u64| {
-        ns.push(n);
-        fs::write(work.join("BUMP"), format!("{version} build {n}\n"))
-            .map_err(|e| Error::new(e.to_string()))?;
-        Ok(vec!["BUMP".to_string()])
-    };
-    let res = ledger::claim(git, work, &plan, &mut regen);
-    (res, ns)
+    let attempts = Cell::new(0u32);
+    let res = ledger::claim(git, work, &plan, &|published, main| {
+        attempts.set(attempts.get() + 1);
+        changelog::claim_changelogs(published, main, version, DATE)
+    });
+    (res, attempts.get())
 }
 
 /// A lost/aborted claim must leave NOTHING behind (spec §2: "abort with tree
-/// reset clean — nothing burned").
-fn assert_clean_at_origin_tip(fix: &Fixture) {
+/// reset clean — nothing burned"): the checkout clean and back on the published
+/// commit, and no release commit on origin.
+fn assert_clean_at(fix: &Fixture, source: &str) {
     assert!(
         run(&fix.work, "git", &["status", "--porcelain"])
             .trim()
             .is_empty(),
         "working tree not clean after abort"
     );
-    assert!(
-        !fix.work.join("BUMP").exists(),
-        "regenerated content survived the abort"
-    );
     let head = run(&fix.work, "git", &["rev-parse", "HEAD"]);
-    let tip = run(&fix.origin, "git", &["rev-parse", "main"]);
     assert_eq!(
         head.trim(),
-        tip.trim(),
-        "HEAD not reset to the real origin tip"
+        source,
+        "HEAD not reset to the published commit"
     );
     assert!(
         !origin_subjects(fix).contains("release: v0.26.0"),
         "an aborted claim must never land a release commit on origin"
     );
+}
+
+fn head_of(repo: &Path) -> String {
+    run(repo, "git", &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+fn parents(repo: &Path, commit: &str) -> Vec<String> {
+    run(repo, "git", &["rev-list", "--parents", "-n", "1", commit])
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+fn moved(repo: &Path, from: &str, to: &str) -> String {
+    run(repo, "git", &["diff", "--name-only", from, to])
+        .trim()
+        .replace('\n', " ")
 }
 
 // --------------------------------------------------------------------------
@@ -362,10 +400,13 @@ fn claim_rejects_non_canonical_three_component_versions() {
             now: NOW,
             allow_existing_section: false,
             max_attempts: 5,
+            source: "0000000000000000000000000000000000000001",
         };
-        let err = ledger::claim(&git, Path::new("/nonexistent"), &plan, &mut |_| Ok(vec![]))
-            .unwrap_err()
-            .to_string();
+        let err = ledger::claim(&git, Path::new("/nonexistent"), &plan, &|s, m| {
+            Ok((s.to_string(), m.to_string()))
+        })
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("MAJOR.MINOR.PATCH"), "{bad:?} → {err}");
     }
 }
@@ -377,65 +418,201 @@ fn claim_rejects_non_canonical_three_component_versions() {
 #[test]
 fn happy_path_claims_appends_and_verifies() {
     let fix = Fixture::new("happy");
+    let source = head_of(&fix.work);
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
+    let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let c = res.unwrap();
     assert_eq!(c.build, NOW);
     assert_eq!(c.ledger_line, "1790000000 0.26.0");
-    assert_eq!(ns, vec![NOW]);
-    // The verified claim commit is on origin, message per spec §1.
+    assert_eq!(attempts, 1);
+    // Main had not moved past the published commit: it takes the release commit
+    // itself, as a fast-forward — one commit, the published commit its parent.
+    assert_eq!(c.landed, c.commit);
+    assert_eq!(parents(&fix.work, &c.commit), vec![source.clone()]);
+    assert_eq!(c.commit, head_of(&fix.work), "the checkout sits on it");
     assert!(origin_subjects(&fix).contains("release: v0.26.0 (build 1790000000)"));
-    assert_eq!(
-        c.commit,
-        run(&fix.work, "git", &["rev-parse", "HEAD"]).trim()
-    );
     // Whole-file byte equality: seed untouched, our line appended.
     assert_eq!(
         origin_file(&fix, "RELEASES.ledger"),
         format!("{SEED_LEDGER}1790000000 0.26.0\n")
     );
-    // The regenerated content landed in the SAME single commit.
-    assert_eq!(origin_file(&fix, "BUMP"), "0.26.0 build 1790000000\n");
+    // The roll landed in the SAME single commit, and only the claim's two files moved.
+    assert!(origin_file(&fix, "CHANGELOG.md").contains(&format!(
+        "## [Unreleased]\n\n## [0.26.0] - {DATE}\n\n### Added\n- **Something real**"
+    )));
+    assert_eq!(
+        moved(&fix.work, &source, &c.commit),
+        "CHANGELOG.md RELEASES.ledger"
+    );
 }
 
+/// THE RULING (R2): peers pushed code after the publish. The release commit is
+/// still the published commit plus the claim's two files; main takes it by a
+/// merge whose tree is its own tip plus the same two files; the peer's code and
+/// its unreleased changelog entry stay on main, out of the release.
 #[test]
-fn stale_head_aborts_with_pull_first() {
-    let fix = Fixture::new("stale");
-    rival_append(&fix, "1790000042 0.99.0"); // origin moves before the claim starts
+fn a_published_commit_behind_main_is_released_and_merged() {
+    let fix = Fixture::new("behind");
+    let source = head_of(&fix.work);
+    rival_peer_push(&fix);
+    run(&fix.work, "git", &["fetch", "-q", "origin", "main"]);
+    let tip = run(&fix.work, "git", &["rev-parse", "origin/main"])
+        .trim()
+        .to_string();
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
+    let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
+    let c = res.expect("a peer's push is not a refusal");
+    assert_eq!(attempts, 1);
+
+    // The release commit: the published commit + CHANGELOG.md + RELEASES.ledger.
+    assert_eq!(parents(&fix.work, &c.commit), vec![source.clone()]);
+    assert_eq!(
+        moved(&fix.work, &source, &c.commit),
+        "CHANGELOG.md RELEASES.ledger"
+    );
+    assert_eq!(
+        c.commit,
+        head_of(&fix.work),
+        "the checkout sits on the release commit"
+    );
+    assert!(
+        run(&fix.work, "git", &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "building main's commit left the worktree and index exactly the release commit's"
+    );
+    assert!(
+        !fix.work.join("peer.rs").exists(),
+        "the peer's code is not in the build"
+    );
+
+    // Main's commit: a merge of the release commit onto the tip, moving only the
+    // claim's two files against the tip — the shape pre-push admits as a claim.
+    assert_ne!(c.landed, c.commit);
+    assert_eq!(
+        parents(&fix.work, &c.landed),
+        vec![tip.clone(), c.commit.clone()]
+    );
+    assert_eq!(
+        moved(&fix.work, &tip, &c.landed),
+        "CHANGELOG.md RELEASES.ledger"
+    );
+    assert_eq!(
+        run(&fix.origin, "git", &["rev-parse", "main"]).trim(),
+        c.landed
+    );
+    assert_eq!(
+        origin_file(&fix, "peer.rs"),
+        "fn peer() {}\n",
+        "the peer's code stays on main"
+    );
+    assert_eq!(
+        origin_file(&fix, "RELEASES.ledger"),
+        format!("{SEED_LEDGER}1790000000 0.26.0\n")
+    );
+
+    // The notes that shipped are the published commit's; the peer's entry is
+    // still unreleased on main, under its heading.
+    let main_changelog = origin_file(&fix, "CHANGELOG.md");
+    assert!(
+        main_changelog.contains(&format!(
+            "## [Unreleased]\n\n### Added\n\n- **A peer's entry** — not in the published commit.\n\n## [0.26.0] - {DATE}\n\n### Added\n- **Something real**"
+        )),
+        "{main_changelog}"
+    );
+    let released = run(
+        &fix.work,
+        "git",
+        &["show", &format!("{}:CHANGELOG.md", c.commit)],
+    );
+    assert!(!released.contains("A peer's entry"), "{released}");
+}
+
+/// A failure while BUILDING main's commit — after the release commit exists,
+/// before anything is pushed — leaves nothing: the checkout is back on the
+/// published commit, clean, and origin never saw a claim. (Without the reset the
+/// unpushed release commit would be left checked out.)
+#[test]
+fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit() {
+    struct FailingIndex(GitCli);
+    impl GitRunner for FailingIndex {
+        fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
+            if args.first() == Some(&"update-index") {
+                return Ok(RunOut {
+                    status: 128,
+                    stdout: Vec::new(),
+                    stderr: b"fatal: injected update-index failure".to_vec(),
+                });
+            }
+            self.0.git(args)
+        }
+    }
+    let fix = Fixture::new("landing-fails");
+    let source = head_of(&fix.work);
+    rival_peer_push(&fix);
+    let (res, attempts) = do_claim(
+        &FailingIndex(GitCli::new(&fix.work)),
+        &fix.work,
+        "0.26.0",
+        false,
+    );
     let err = res.unwrap_err().to_string();
-    assert!(err.contains("pull first"), "{err}");
-    // Gate fired before anything was generated or committed.
-    assert!(ns.is_empty());
-    assert!(!fix.work.join("BUMP").exists());
+    assert!(err.contains("injected update-index failure"), "{err}");
+    assert_eq!(attempts, 1);
+    assert_clean_at(&fix, &source);
 }
 
 #[test]
-fn cas_loser_regenerates_from_origin_with_higher_n() {
+fn a_checkout_off_the_published_commit_is_refused_before_anything() {
+    let fix = Fixture::new("off-source");
+    rival_peer_push(&fix);
+    run(&fix.work, "git", &["fetch", "-q", "origin", "main"]);
+    let tip = run(&fix.work, "git", &["rev-parse", "origin/main"])
+        .trim()
+        .to_string();
+    let git = GitCli::new(&fix.work);
+    let plan = ClaimPlan {
+        version: "0.26.0",
+        now: NOW,
+        allow_existing_section: false,
+        max_attempts: 5,
+        source: &tip,
+    };
+    let err = ledger::claim(&git, &fix.work, &plan, &|_, _| panic!("nothing is rolled"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is not the published commit"), "{err}");
+    assert!(!origin_subjects(&fix).contains("release: v0.26.0"));
+}
+
+#[test]
+fn cas_loser_rebuilds_from_origin_with_higher_n() {
     let fix = Fixture::new("cas");
+    let source = head_of(&fix.work);
     let winner = "1790000123 0.99.0"; // > the loser's first n → forces a bigger retry n
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
             rival_append(&fix, winner);
         }
     });
-    let (res, ns) = do_claim(&runner, &fix.work, "0.26.0", false);
+    let (res, attempts) = do_claim(&runner, &fix.work, "0.26.0", false);
     let c = res.unwrap();
     // Loser retried with a strictly-higher number (winner's tail + 1).
     assert_eq!(c.build, 1_790_000_124);
-    assert_eq!(ns, vec![1_790_000_000, 1_790_000_124]);
+    assert_eq!(attempts, 2);
     assert_eq!(runner.pushes.get(), 2);
     // THE core preservation proof, whole file byte-exact: seed, then the
-    // winner's line untouched, then ours as the tail — the reset-hard +
-    // regenerate-from-origin's-blobs retry can never clobber the winner
-    // (spec decision 3; the reset-soft design verifiably did).
+    // winner's line untouched, then ours as the tail — the rebuild from origin's
+    // blobs can never clobber the winner (spec decision 3; the reset-soft design
+    // verifiably did).
     assert_eq!(
         origin_file(&fix, "RELEASES.ledger"),
         format!("{SEED_LEDGER}{winner}\n1790000124 0.26.0\n")
     );
-    // The commit content was REGENERATED for the retry's n, not reused.
-    assert_eq!(origin_file(&fix, "BUMP"), "0.26.0 build 1790000124\n");
+    // The winner moved main past the published commit, so the retry lands by a
+    // merge — and the release commit is still the published commit + two files.
+    assert_ne!(c.landed, c.commit);
+    assert_eq!(parents(&fix.work, &c.commit), vec![source.clone()]);
     assert!(origin_subjects(&fix).contains("release: v0.26.0 (build 1790000124)"));
 }
 
@@ -452,10 +629,10 @@ fn cas_loser_may_remint_same_n_while_clock_leads() {
             rival_append(&fix, winner);
         }
     });
-    let (res, ns) = do_claim(&runner, &fix.work, "0.26.0", false);
+    let (res, attempts) = do_claim(&runner, &fix.work, "0.26.0", false);
     let c = res.unwrap();
     assert_eq!(c.build, NOW);
-    assert_eq!(ns, vec![NOW, NOW]);
+    assert_eq!(attempts, 2);
     assert_eq!(
         origin_file(&fix, "RELEASES.ledger"),
         format!("{SEED_LEDGER}{winner}\n1790000000 0.26.0\n")
@@ -465,17 +642,18 @@ fn cas_loser_may_remint_same_n_while_clock_leads() {
 #[test]
 fn retry_cap_aborts_clean_with_nothing_burned() {
     let fix = Fixture::new("cap");
+    let source = head_of(&fix.work);
     // A rival lands a fresh push before EVERY attempt — the claimant must
     // lose all 5 rounds, then stop cleanly.
     let runner = HookRunner::new(&fix.work, |attempt| {
         rival_append(&fix, &format!("17900002{attempt:02} 0.9{attempt}.0"));
     });
-    let (res, ns) = do_claim(&runner, &fix.work, "0.26.0", false);
+    let (res, attempts) = do_claim(&runner, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("5 times"), "{err}");
     assert_eq!(runner.pushes.get(), 5);
-    assert_eq!(ns.len(), 5);
-    assert_clean_at_origin_tip(&fix);
+    assert_eq!(attempts, 5);
+    assert_clean_at(&fix, &source);
     // Every winner line survived, byte-exact, in order.
     let mut expected = SEED_LEDGER.to_string();
     for a in 1..=5u32 {
@@ -487,6 +665,7 @@ fn retry_cap_aborts_clean_with_nothing_burned() {
 #[test]
 fn remote_tag_means_version_cut_elsewhere() {
     let fix = Fixture::new("tag-elsewhere");
+    let source = head_of(&fix.work);
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
             rival_append(&fix, "1790000300 0.26.0");
@@ -505,12 +684,13 @@ fn remote_tag_means_version_cut_elsewhere() {
         1,
         "must abort, not retry, on a same-version tag"
     );
-    assert_clean_at_origin_tip(&fix);
+    assert_clean_at(&fix, &source);
 }
 
 #[test]
 fn remote_changelog_section_means_version_cut_elsewhere() {
     let fix = Fixture::new("section-elsewhere");
+    let source = head_of(&fix.work);
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
             rival_land_section(&fix, "1790000300 0.26.0", "0.26.0");
@@ -522,15 +702,15 @@ fn remote_changelog_section_means_version_cut_elsewhere() {
         err.contains("cut elsewhere") && err.contains("changelog"),
         "{err}"
     );
-    assert_clean_at_origin_tip(&fix);
+    assert_clean_at(&fix, &source);
 }
 
 #[test]
 fn recut_flag_claims_fresh_n_past_existing_section() {
     let fix = Fixture::new("recut");
     // The recut path (spec §5): the version's section ALREADY sits on origin
-    // (rolled by the earlier wedged cut); a fresh claim for the same version
-    // must ride past it instead of aborting.
+    // (rolled by the earlier wedged claim); a fresh claim for the same version
+    // must ride past it instead of aborting, and leave main's roll as it is.
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
             rival_land_section(&fix, "1790000300 0.26.0", "0.26.0");
@@ -543,24 +723,31 @@ fn recut_flag_claims_fresh_n_past_existing_section() {
     let remote = origin_file(&fix, "RELEASES.ledger");
     assert!(remote.contains("1790000300 0.26.0\n"));
     assert!(remote.ends_with("1790000301 0.26.0\n"));
-    assert!(origin_file(&fix, "CHANGELOG.md").contains("## [0.26.0] - 2026-01-01"));
+    let main_changelog = origin_file(&fix, "CHANGELOG.md");
+    assert!(main_changelog.contains("## [0.26.0] - 2026-01-01"));
+    assert_eq!(
+        main_changelog.matches("## [0.26.0]").count(),
+        1,
+        "main is never rolled twice: {main_changelog}"
+    );
 }
 
 #[test]
 fn malformed_remote_ledger_aborts_before_any_commit() {
     let fix = Fixture::new("malformed");
-    // Corrupt the ledger on origin (line 3 non-numeric), then bring the
-    // claimant to the tip so the corruption — not the tip gate — is what fires.
+    // Corrupt the ledger on origin (line 3 non-numeric), then bring the claimant
+    // to the tip so the published commit is the corrupt one's.
     rival_append(&fix, "not-a-number 0.26.0");
     run(&fix.work, "git", &["fetch", "-q", "origin", "main"]);
     run(&fix.work, "git", &["reset", "-q", "--hard", "origin/main"]);
+    let source = head_of(&fix.work);
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
+    let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("line 3") && err.contains("not a u64"), "{err}");
-    // Parse failure precedes regenerate/commit/push — nothing happened.
-    assert!(ns.is_empty());
-    assert_clean_at_origin_tip(&fix);
+    // Parse failure precedes the roll, the commit and the push — nothing happened.
+    assert_eq!(attempts, 0);
+    assert_clean_at(&fix, &source);
 }
 
 #[test]
@@ -573,8 +760,8 @@ fn offline_fetch_fails_closed() {
         &["remote", "set-url", "origin", gone.to_str().unwrap()],
     );
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
+    let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("no offline cuts"), "{err}");
-    assert!(ns.is_empty(), "no offline claim may generate anything");
+    assert_eq!(attempts, 0, "no offline claim may roll anything");
 }

@@ -2937,6 +2937,12 @@ type LiveUnpaidPress = (usize, Instant, u8, Option<char>);
 /// credits may precede the run, but none may be skipped inside it.
 const EXACT_COALESCED_PREFIX_MAX: usize = TYPED_STAMP_DEPTH;
 const EXACT_COALESCED_STALE_PREFIX_MAX: usize = 8;
+/// At most two queued keys can be proved after an unknown insert, one cell
+/// per frame or as one exact two-cell row transition. Longer runs remain
+/// ambiguous about which keys the insert's hop already echoed.
+const ORPHAN_EXACT_KEYS_MAX: usize = 2;
+/// Fixed, press-ordered escrow candidates recovered after an unknown insert.
+type OrphanExactPressRun = [Option<(Instant, char)>; ORPHAN_EXACT_KEYS_MAX];
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PressCredits {
@@ -3205,17 +3211,24 @@ impl PressCredits {
         self.blank_where(|t| t <= at);
     }
 
-    /// A single exact one-cell key dispatched after an insert but banked by
-    /// its delivery. More than one eligible key is ambiguous: the unknown
-    /// insert width cannot say which, if any, was echoed inside its hop.
-    fn one_exact_between(
+    /// One or two exact one-cell keys dispatched after an insert but banked
+    /// by its delivery, in press order. Their later exact blank-to-glyph
+    /// echoes may prove them singly or as one complete two-cell transition;
+    /// a wider or non-exact run remains ambiguous about which keys the
+    /// unknown insert's hop already echoed.
+    fn exact_run_between(
         &self,
         now: Instant,
         dispatched_at: Instant,
         delivered_at: Instant,
-    ) -> Option<(Instant, char)> {
-        let mut one = None;
-        for &(at, credits, glyph) in self.slots.iter().flatten() {
+    ) -> Option<(OrphanExactPressRun, usize)> {
+        let mut keys = [None; ORPHAN_EXACT_KEYS_MAX];
+        let mut n = 0;
+        for k in 0..TYPED_STAMP_DEPTH {
+            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let Some((at, credits, glyph)) = self.slots[i] else {
+                continue;
+            };
             if at <= dispatched_at
                 || at > delivered_at
                 || credits == 0
@@ -3223,7 +3236,7 @@ impl PressCredits {
             {
                 continue;
             }
-            if one.is_some() || credits != 1 {
+            if n == keys.len() || credits != 1 {
                 return None;
             }
             let glyph = glyph?;
@@ -3232,9 +3245,10 @@ impl PressCredits {
             if matches!(glyph, ' ' | '\0') {
                 return None;
             }
-            one = Some((at, glyph));
+            keys[n] = Some((at, glyph));
+            n += 1;
         }
-        one
+        (n > 0).then_some((keys, n))
     }
 
     /// Take every press banked AFTER `at` out of the ring, at its own index
@@ -3583,10 +3597,12 @@ struct InsertSeam {
     /// A key whose echo lands the next frame spends its own credit as `key`
     /// before that, and the retire is then a no-op. Cleared with the pool.
     orphans: Option<UnknownInsertOrphans>,
-    /// One ambiguous post-insert key, removed from the generic press pool at
-    /// orphan cleanup. Only a later exact glyph at this insert's next cell
-    /// can claim it; every other movement leaves the ordinary pool empty.
-    orphan_exact: Option<OrphanExactKey>,
+    /// Up to two ambiguous post-insert keys, removed from the generic press
+    /// pool at orphan cleanup. Only their ordered exact glyphs at consecutive
+    /// cells can claim them, singly or as one exact two-cell frame. Every
+    /// other movement discards the remaining escrow and leaves the ordinary
+    /// pool empty.
+    orphan_exact: Option<OrphanExactRun>,
     /// `trail status`'s insert rows ([`InsertTally`]).
     tally: InsertTally,
 }
@@ -3608,6 +3624,21 @@ struct OrphanExactKey {
     col: u16,
     glyph: char,
     print_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OrphanExactRun {
+    keys: [Option<OrphanExactKey>; ORPHAN_EXACT_KEYS_MAX],
+    next: usize,
+    len: usize,
+    /// The inserted span's landing, fixed even after one key is proved.
+    insert_col: u16,
+}
+
+impl OrphanExactRun {
+    fn current(self) -> Option<OrphanExactKey> {
+        self.keys.get(self.next).copied().flatten()
+    }
 }
 
 /// What an arm overwrote, restored when THAT arm is revoked at its exact
@@ -4046,9 +4077,11 @@ impl BandPx {
 }
 
 /// One sampled grid row for Rainbow Kitty's CONTENT WITNESS
-/// ([`CursorGlow::observe_ribbon_row`]): the row, and its per-column chars
-/// in the row probe's own convention. Slots are resident and reused —
-/// `clear` + `extend`, never rebuilt — so the steady frame allocates nothing.
+/// ([`CursorGlow::observe_ribbon_row`], [`CursorGlow::capture_ribbon_row`]):
+/// the row, and its per-column chars
+/// in the row probe's own convention. Slots are resident and reused, so the
+/// steady frame allocates nothing. A host with its terminal lock can fill the
+/// slot directly through [`CursorGlow::capture_ribbon_row`].
 #[derive(Default)]
 struct WitnessRowBuf {
     row: u16,
@@ -4723,7 +4756,8 @@ pub struct CursorGlow {
     /// the v1 probe copies — never a second grid scan.
     v2_probe_scratch: Vec<rk::stardust::CellInk>,
     /// **THE CONTENT WITNESS'S ROWS** for this frame
-    /// ([`Self::observe_ribbon_row`], `rk::witness`): the live grid rows the
+    /// ([`Self::observe_ribbon_row`], [`Self::capture_ribbon_row`],
+    /// `rk::witness`): the live grid rows the
     /// resident ribbon occupies, captured by the host under its terminal
     /// lock before the tick and read by the engine's witness right after
     /// it. At most [`rk::witness::WITNESS_ROWS`] slots, resident and reused;
@@ -8905,8 +8939,9 @@ impl CursorGlow {
     /// `out.len()` — size it [`rk::witness::WITNESS_ROWS`]); returns how
     /// many. The host captures exactly these rows under its terminal lock,
     /// beside the row probe, and hands each to [`Self::observe_ribbon_row`]
-    /// before the tick; the caret's own row rides the row probe the host
-    /// already holds, so it costs no second grid read. `0` for every style
+    /// or [`Self::capture_ribbon_row`] before the tick; the caret's own row
+    /// rides the row probe the host already holds, so it costs no second grid
+    /// read. `0` for every style
     /// but rainbow kitty — the other nine sample nothing and pay nothing.
     pub fn ribbon_rows(&self, out: &mut [u16]) -> usize {
         let mut n = self.v2.ribbon_rows(out);
@@ -8948,8 +8983,32 @@ impl CursorGlow {
     /// never after: the tick takes the count to zero. Inert for every style
     /// but rainbow kitty.
     pub fn observe_ribbon_row(&mut self, row: u16, cols: &[char]) {
-        if !self.v2.engaged() {
+        let Some(slot) = self.witness_row_slot(row) else {
             return;
+        };
+        slot.cols.clear();
+        slot.cols.extend_from_slice(cols);
+    }
+
+    /// Fill a content-witness row directly into its resident engine slot.
+    /// The host invokes `fill` while holding the same terminal lock that
+    /// captured this frame's caret and glyphs. It must preserve the ordinary
+    /// per-column convention, including wide continuations (`'\0'`) and
+    /// implicit blank tails. This avoids copying a far row from a temporary
+    /// host buffer into the slot while that terminal lock is held. The
+    /// callback is not invoked when Rainbow Kitty is disengaged or all
+    /// witness slots are already occupied.
+    pub fn capture_ribbon_row(&mut self, row: u16, fill: impl FnOnce(&mut Vec<char>)) {
+        let Some(slot) = self.witness_row_slot(row) else {
+            return;
+        };
+        slot.cols.clear();
+        fill(&mut slot.cols);
+    }
+
+    fn witness_row_slot(&mut self, row: u16) -> Option<&mut WitnessRowBuf> {
+        if !self.v2.engaged() {
+            return None;
         }
         let n = self.witness_rows_n;
         let slot = match self.witness_rows[..n.min(self.witness_rows.len())]
@@ -8959,7 +9018,7 @@ impl CursorGlow {
             Some(i) => i,
             None => {
                 if n >= rk::witness::WITNESS_ROWS {
-                    return;
+                    return None;
                 }
                 if self.witness_rows.len() == n {
                     self.witness_rows.push(WitnessRowBuf::default());
@@ -8970,8 +9029,7 @@ impl CursorGlow {
         };
         let slot = &mut self.witness_rows[slot];
         slot.row = row;
-        slot.cols.clear();
-        slot.cols.extend_from_slice(cols);
+        Some(slot)
     }
 
     /// Rainbow Kitty's laid ribbon, read-only — `Some` only while v2 owns
@@ -9896,27 +9954,41 @@ impl CursorGlow {
         if let Some(orphans) = self.insert.retire_orphans(now) {
             self.insert.orphan_exact = orphans
                 .site
-                .zip(self.type_press_ring.one_exact_between(
+                .zip(self.type_press_ring.exact_run_between(
                     now,
                     orphans.dispatched_at,
                     orphans.delivered_at,
                 ))
-                .map(
-                    |((row, col, print_seq), (pressed_at, glyph))| OrphanExactKey {
-                        pressed_at,
-                        row,
-                        col,
-                        glyph,
-                        print_seq,
-                    },
-                );
-            // The generic one-credit `+1` path must NEVER read this key:
-            // an ambient different glyph on the same row would otherwise
-            // spend it. The exact escrow above is its only remaining claim.
+                .and_then(|((row, col, print_seq), (presses, len))| {
+                    let mut keys = [None; ORPHAN_EXACT_KEYS_MAX];
+                    for (i, press) in presses.into_iter().take(len).enumerate() {
+                        let (pressed_at, glyph) = press?;
+                        let key_col = col.checked_add(u16::try_from(i).ok()?)?;
+                        key_col.checked_add(1)?; // no same-row claim across a wrap
+                        keys[i] = Some(OrphanExactKey {
+                            pressed_at,
+                            row,
+                            col: key_col,
+                            glyph,
+                            print_seq,
+                        });
+                    }
+                    Some(OrphanExactRun {
+                        keys,
+                        next: 0,
+                        len,
+                        insert_col: col,
+                    })
+                });
+            // The generic `+1` path must NEVER read these keys: an ambient
+            // different glyph could spend one. Restore only the one whose
+            // exact row transition is proved, for that one spawn call.
             self.type_press_ring.retire_through(orphans.delivered_at);
         }
-        if self.insert.orphan_exact.is_some_and(|key| {
-            now.saturating_duration_since(key.pressed_at).as_secs_f32() > IN_FLIGHT_PATIENCE_S
+        if self.insert.orphan_exact.is_some_and(|run| {
+            run.current().is_none_or(|key| {
+                now.saturating_duration_since(key.pressed_at).as_secs_f32() > IN_FLIGHT_PATIENCE_S
+            })
         }) {
             self.insert.orphan_exact = None;
         }
@@ -10125,19 +10197,42 @@ impl CursorGlow {
                 Self::CROWN_MS
             };
             self.coalesced_prefix_echo((pr, pc), (cr, cc), now, cfg, geom);
-            // An unknown-width insert's later single key was removed from
-            // the generic press pool. Restore it for THIS exact observed
-            // glyph only, through the ordinary classifier/spend, then drop
-            // any remainder. The escrow is one-shot even on a refusal.
-            let exact_orphan = self.orphan_exact_echo((pr, pc), (cr, cc), now, cfg);
-            let orphan = self.insert.orphan_exact.take().filter(|_| exact_orphan);
-            if let Some(key) = orphan {
-                self.type_press_ring
-                    .bank(key.pressed_at, 1, Some(key.glyph));
+            // An unknown-width insert's one or two queued keys were removed
+            // from the generic press pool. Restore only the exact observed
+            // glyphs for this one spawn. A one-cell frame keeps the next key
+            // escrowed; an exact two-cell frame spends both together. Every
+            // mismatch or refused spawn drops the entire remainder.
+            let exact_orphans = self.orphan_exact_echo((pr, pc), (cr, cc), now, cfg);
+            let orphans = self.insert.orphan_exact.take().and_then(|mut run| {
+                if exact_orphans == 0 {
+                    return None;
+                }
+                let mut claimed = [None; ORPHAN_EXACT_KEYS_MAX];
+                for (i, slot) in claimed.iter_mut().take(exact_orphans).enumerate() {
+                    *slot = Some(run.keys.get(run.next + i).copied().flatten()?);
+                }
+                run.next += exact_orphans;
+                if run.next < run.len {
+                    let print_seq = self.print_anchor?.2;
+                    run.keys[run.next].as_mut()?.print_seq = print_seq;
+                    self.insert.orphan_exact = Some(run);
+                }
+                Some(claimed)
+            });
+            if let Some(claimed) = orphans {
+                for key in claimed.into_iter().flatten() {
+                    self.type_press_ring
+                        .bank(key.pressed_at, 1, Some(key.glyph));
+                }
             }
             let admitted = self.spawn(pr, pc, cr, cc, now, cfg, geom, SpawnLane::Visible);
-            if let Some(key) = orphan {
-                self.type_press_ring.revoke_at(key.pressed_at);
+            if let Some(claimed) = orphans {
+                for key in claimed.into_iter().flatten() {
+                    self.type_press_ring.revoke_at(key.pressed_at);
+                }
+            }
+            if orphans.is_some() && !admitted {
+                self.insert.orphan_exact = None;
             }
             if admitted {
                 self.last_move = Some(now);
@@ -10202,45 +10297,86 @@ impl CursorGlow {
         }
     }
 
-    /// The only witness that can release a key held out of the generic pool
-    /// after an unknown insert: its own next cell, still on the insert's row,
-    /// changes from blank to that exact glyph in a frame with a new PTY print
-    /// generation. A different glyph, a moved/re-written insert, a newer
-    /// pending key or an old print leaves the escrow unusable.
+    /// The only witness that can release one or both NEXT keys held out of
+    /// the generic pool after an unknown insert: exactly those consecutive
+    /// cells, still on the insert's row, change from blank to their queued
+    /// glyphs in a frame with a new PTY print generation. A two-cell hop
+    /// needs BOTH exact cells in one current and one prior row probe; it may
+    /// not claim a partial batch. A later frame must also retain the prefix
+    /// already claimed. A different glyph, a moved/re-written insert, a
+    /// newer pending key or an old print discards the remainder.
+    /// The PTY cannot distinguish a delayed key from program output that
+    /// exactly mimics its glyph, cell, caret, and print generation; this is
+    /// the existing one-key proof applied once per key, never a generic
+    /// licence for any unrelated program output.
     fn orphan_exact_echo(
         &self,
         from: (u16, u16),
         to: (u16, u16),
         now: Instant,
         cfg: &GlowConfig,
-    ) -> bool {
-        let Some(key) = self.insert.orphan_exact else {
-            return false;
+    ) -> usize {
+        let Some(run) = self.insert.orphan_exact else {
+            return 0;
         };
-        if matches!(key.glyph, ' ' | '\0')
-            || !matches!(cfg.style, GlowStyle::RainbowKitty)
+        let Some(key) = run.current() else {
+            return 0;
+        };
+        let width = usize::from(to.1.saturating_sub(from.1));
+        if !matches!(cfg.style, GlowStyle::RainbowKitty)
             || from != (key.row, key.col)
-            || to != (key.row, key.col.saturating_add(1))
+            || to.0 != key.row
+            || !(1..=ORPHAN_EXACT_KEYS_MAX).contains(&width)
+            || width > run.len.saturating_sub(run.next)
+            || (width > 1 && self.ctx_alt && !self.blink_fresh(now))
             || !self.type_press_ring.is_empty()
             || !self
                 .insert
                 .span
-                .is_some_and(|span| span.row == key.row && span.col1 == key.col)
+                .is_some_and(|span| span.row == key.row && span.col1 == run.insert_col)
             || !self
                 .row_prev_meta
                 .is_some_and(|m| m.row == key.row && m.caret == key.col && m.at < now)
-            || !self.row_cur_meta.is_some_and(|m| {
-                m.row == key.row && m.caret == key.col.saturating_add(1) && m.at == now
-            })
+            || !self
+                .row_cur_meta
+                .is_some_and(|m| m.row == key.row && m.caret == to.1 && m.at == now)
             || !self
                 .print_anchor
                 .is_some_and(|(_, _, seq)| seq > key.print_seq && seq != self.print_anchor_seen)
         {
-            return false;
+            return 0;
         }
-        let col = usize::from(key.col);
-        self.row_prev.get(col).copied().unwrap_or(' ') == ' '
-            && self.row_cur.get(col).copied().unwrap_or(' ') == key.glyph
+        // A later exact key cannot resume a trail whose earlier proved cell
+        // the program has since rewritten. Both probes must still carry the
+        // original glyph; otherwise the new key would start an isolated band.
+        for prior in run.keys[..run.next].iter().flatten() {
+            let col = usize::from(prior.col);
+            if self.row_prev.get(col).copied() != Some(prior.glyph)
+                || self.row_cur.get(col).copied() != Some(prior.glyph)
+            {
+                return 0;
+            }
+        }
+        for i in 0..width {
+            let Some(next) = run.keys.get(run.next + i).copied().flatten() else {
+                return 0;
+            };
+            let Some(col) = key.col.checked_add(i as u16) else {
+                return 0;
+            };
+            if next.row != key.row
+                || next.col != col
+                || matches!(next.glyph, ' ' | '\0')
+                || self
+                    .print_anchor
+                    .is_none_or(|(_, _, seq)| seq <= next.print_seq)
+                || self.row_prev.get(usize::from(col)).copied().unwrap_or(' ') != ' '
+                || self.row_cur.get(usize::from(col)).copied().unwrap_or(' ') != next.glyph
+            {
+                return 0;
+            }
+        }
+        width
     }
 
     /// The caret was SHOWN at `cur` this tick (or not shown at all): the
@@ -19131,6 +19267,50 @@ mod tests {
     }
 
     #[test]
+    fn far_witness_row_fills_its_engine_slot_once_without_a_second_copy() {
+        let now = Instant::now();
+        let cfg = cfg_for_style_name("rainbow kitty", true);
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((3, 0)), now, &cfg, retina_geom(), &mut Vec::new());
+        assert!(glow.v2.engaged());
+
+        let glyphs = ['A', '界', '\0', ' ', 'Z'];
+        let mut fills = 0;
+        let mut filled_ptr = std::ptr::null();
+        glow.capture_ribbon_row(3, |slot| {
+            fills += 1;
+            slot.extend_from_slice(&glyphs);
+            filled_ptr = slot.as_ptr();
+        });
+        assert_eq!(fills, 1, "one far row takes exactly one terminal read");
+        assert_eq!(glow.witness_rows_n, 1);
+        assert_eq!(glow.witness_rows[0].cols, glyphs);
+        assert!(
+            std::ptr::eq(glow.witness_rows[0].cols.as_ptr(), filled_ptr),
+            "the terminal filled the engine's own buffer, not a copied host row"
+        );
+
+        let mut term = aterm_core::terminal::Terminal::new(6, 8);
+        term.process("\x1b[4;1HA界B".as_bytes());
+        glow.capture_ribbon_row(3, |slot| {
+            term.row_cols_into(3, slot);
+        });
+        assert_eq!(
+            &glow.witness_rows[0].cols[..4],
+            &['A', '界', '\0', 'B'],
+            "the direct slot preserves the terminal's wide-cell projection"
+        );
+
+        glow.capture_ribbon_row(3, |slot| slot.extend(['B', '\0']));
+        assert_eq!(glow.witness_rows_n, 1, "a repeated row replaces its slot");
+        assert_eq!(glow.witness_rows[0].cols, ['B', '\0']);
+
+        let mut dark = CursorGlow::default();
+        dark.capture_ribbon_row(3, |_| panic!("a dark engine must not read a row"));
+        assert_eq!(dark.witness_rows_n, 0);
+    }
+
+    #[test]
     fn exact_coalesced_keys_retire_older_space_but_refuse_stale_or_interleaved_runs() {
         let t0 = Instant::now();
         let mut keys = PressCredits::default();
@@ -19193,6 +19373,32 @@ mod tests {
             .expect("a stale earlier a must not hide the complete later run");
         repeated_a.retire_before_slot(selected);
         assert_eq!(repeated_a.cells_within(t0 + ms(950)), 4);
+    }
+
+    #[test]
+    fn two_orphan_exact_keys_keep_press_order_across_the_credit_ring_wrap() {
+        let t0 = Instant::now();
+        let mut credits = PressCredits::default();
+        for i in 0..TYPED_STAMP_DEPTH - 1 {
+            credits.bank(t0 + ms(i as u64), 1, Some('x'));
+        }
+        // The first eligible key occupies the last physical slot and the
+        // second the first. Storage order would reverse their exact glyphs.
+        credits.bank(t0 + ms(200), 1, Some('k'));
+        credits.bank(t0 + ms(201), 1, Some('m'));
+        let (keys, n) = credits
+            .exact_run_between(t0 + ms(300), t0 + ms(199), t0 + ms(202))
+            .expect("two delivered one-cell keys remain within the patience");
+        assert_eq!(n, 2);
+        assert_eq!(keys, [Some((t0 + ms(200), 'k')), Some((t0 + ms(201), 'm'))]);
+
+        credits.bank(t0 + ms(202), 1, Some('q'));
+        assert!(
+            credits
+                .exact_run_between(t0 + ms(300), t0 + ms(199), t0 + ms(203))
+                .is_none(),
+            "a third ambiguous key cannot escape into generic licensing"
+        );
     }
 
     #[test]
@@ -26017,7 +26223,10 @@ mod tests {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         three_visible_echoes(&mut glow, t0, &mut out);
-        for (time, glyph) in [(800, first_glyph), (810, 'm')].into_iter().take(keys) {
+        for (time, glyph) in [(800, first_glyph), (810, 'm'), (820, 'q')]
+            .into_iter()
+            .take(keys)
+        {
             let class = if glyph == ' ' {
                 rk::TypedClass::Space
             } else {
@@ -26089,18 +26298,13 @@ mod tests {
         for (keys, printed, print_seq, action) in [
             (1, 'z', 2, "AmbientOtherGlyph"),
             (0, 'z', 2, "AmbientOtherGlyph"),
-            (2, 'k', 2, "ExactNewPrint"),
             (1, 'k', 1, "ExactOldPrint"),
         ] {
             let (mut control, mut cout, mut chars) =
                 unknown_insert_orphan_key_setup(t0, keys, true);
             let mut control_state = model.init_state();
             assert!(model.fire(
-                match keys {
-                    0 => "QueueNone",
-                    2 => "QueueTwo",
-                    _ => "QueueOne",
-                },
+                if keys == 0 { "QueueNone" } else { "QueueOne" },
                 &mut control_state
             ));
             for step in ["LayWithSite", "Cleanup"] {
@@ -26116,6 +26320,294 @@ mod tests {
             assert!(control.insert.orphan_exact.is_none());
             assert_eq!(control.typed_credits_within(at(3_200)), 0);
         }
+    }
+
+    #[test]
+    fn two_unknown_insert_orphan_keys_light_only_on_separate_exact_echoes() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |millis: u64| t0 + ms(millis);
+        let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+        let mut state = model.init_state();
+        for action in ["QueueTwo", "LayWithSite", "Cleanup"] {
+            assert!(model.fire(action, &mut state));
+        }
+        let (mut glow, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, true);
+        assert_eq!(
+            glow.typed_credits_within(at(3_000)),
+            state["generic"] as usize
+        );
+        assert_eq!(
+            glow.insert.orphan_exact.map_or(0, |run| run.len - run.next),
+            state["escrow"] as usize
+        );
+
+        row[13] = 'k';
+        glow.observe_print_anchor(Some((3, 14, 2)));
+        glow.observe_row(3, 14, &row, at(3_200));
+        glow.tick(Some((3, 14)), at(3_200), &c, g, &mut out);
+        assert!(model.fire("ExactNewPrint", &mut state));
+        assert_eq!(glow.spawns() - 4, state["lit"] as u64);
+        assert!(v2_cols(&glow, 3).contains(&13));
+        assert!(
+            rendered_ribbon_cols(&glow, &out, 3, g).contains(&13),
+            "the first key paints"
+        );
+        assert_eq!(
+            glow.insert.orphan_exact.map_or(0, |run| run.len - run.next),
+            state["escrow"] as usize,
+            "the second key stays out of the generic credit pool"
+        );
+        assert_eq!(glow.typed_credits_within(at(3_200)), 0);
+
+        row[14] = 'm';
+        glow.observe_print_anchor(Some((3, 15, 3)));
+        glow.observe_row(3, 15, &row, at(3_400));
+        glow.tick(Some((3, 15)), at(3_400), &c, g, &mut out);
+        assert!(model.fire("SecondExactNewPrint", &mut state));
+        assert_eq!(glow.spawns() - 4, state["lit"] as u64);
+        assert!([13, 14].iter().all(|col| v2_cols(&glow, 3).contains(col)));
+        assert!(
+            [13, 14]
+                .iter()
+                .all(|col| rendered_ribbon_cols(&glow, &out, 3, g).contains(col)),
+            "both typed cells paint as one run"
+        );
+        assert!(glow.insert.orphan_exact.is_none());
+        assert_eq!(glow.typed_credits_within(at(3_400)), 0);
+
+        // A later live key joins the two recovered cells with no dark notch.
+        glow.note_typed_expected(at(3_600), 1, false, rk::TypedClass::Glyph, 'q');
+        row[15] = 'q';
+        glow.observe_print_anchor(Some((3, 16, 4)));
+        glow.observe_row(3, 16, &row, at(3_600));
+        glow.tick(Some((3, 16)), at(3_600), &c, g, &mut out);
+        assert_eq!(glow.spawns(), 7);
+        assert!(
+            [13, 14, 15]
+                .iter()
+                .all(|col| v2_cols(&glow, 3).contains(col))
+        );
+        assert!(
+            [13, 14, 15]
+                .iter()
+                .all(|col| rendered_ribbon_cols(&glow, &out, 3, g).contains(col)),
+            "the next live key sees one continuous painted run"
+        );
+
+        // A later keyless program print cannot borrow either spent key.
+        row[16] = 'z';
+        glow.observe_print_anchor(Some((3, 17, 5)));
+        glow.observe_row(3, 17, &row, at(3_800));
+        glow.tick(Some((3, 17)), at(3_800), &c, g, &mut out);
+        assert_eq!(glow.spawns(), 7);
+        // The smooth ribbon can blur into the neighbouring pixel column;
+        // owned field cells and the admission count are the licence check.
+        assert!(!v2_cols(&glow, 3).contains(&16));
+    }
+
+    #[test]
+    fn two_unknown_insert_orphans_reject_unrelated_or_stale_second_prints() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |millis: u64| t0 + ms(millis);
+        let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+        for (prior, glyph, print_seq, action) in [
+            ('k', 'z', 3, "SecondAmbientOtherGlyph"),
+            ('k', 'm', 2, "SecondExactOldPrint"),
+            ('z', 'm', 3, "SecondPrefixRewrite"),
+        ] {
+            let mut state = model.init_state();
+            for step in ["QueueTwo", "LayWithSite", "Cleanup", "ExactNewPrint"] {
+                assert!(model.fire(step, &mut state));
+            }
+            let (mut glow, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, true);
+            row[13] = 'k';
+            glow.observe_print_anchor(Some((3, 14, 2)));
+            glow.observe_row(3, 14, &row, at(3_200));
+            glow.tick(Some((3, 14)), at(3_200), &c, g, &mut out);
+            assert_eq!(glow.spawns(), 5);
+
+            row[13] = prior;
+            row[14] = glyph;
+            glow.observe_print_anchor(Some((3, 15, print_seq)));
+            glow.observe_row(3, 15, &row, at(3_400));
+            glow.tick(Some((3, 15)), at(3_400), &c, g, &mut out);
+            assert!(model.fire(action, &mut state));
+            assert_eq!(glow.spawns() - 4, state["lit"] as u64);
+            assert!(!v2_cols(&glow, 3).contains(&14));
+            assert!(glow.insert.orphan_exact.is_none());
+            assert_eq!(glow.typed_credits_within(at(3_400)), 0);
+
+            // Even a later matching glyph cannot reclaim the discarded key.
+            row[15] = 'm';
+            glow.observe_print_anchor(Some((3, 16, 4)));
+            glow.observe_row(3, 16, &row, at(3_600));
+            glow.tick(Some((3, 16)), at(3_600), &c, g, &mut out);
+            assert_eq!(glow.spawns(), 5);
+            assert!(!v2_cols(&glow, 3).contains(&15));
+        }
+
+        let (mut no_site, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, false);
+        assert!(no_site.insert.orphan_exact.is_none());
+        row[13] = 'k';
+        no_site.observe_print_anchor(Some((3, 14, 2)));
+        no_site.observe_row(3, 14, &row, at(3_200));
+        no_site.tick(Some((3, 14)), at(3_200), &c, g, &mut out);
+        assert_eq!(no_site.spawns(), 4, "no sampled site means no key claim");
+
+        let (mut unrelated, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, true);
+        let mut unrelated_state = model.init_state();
+        for action in ["QueueTwo", "LayWithSite", "Cleanup", "AmbientOtherGlyph"] {
+            assert!(model.fire(action, &mut unrelated_state));
+        }
+        row[13] = 'z';
+        unrelated.observe_print_anchor(Some((3, 14, 2)));
+        unrelated.observe_row(3, 14, &row, at(3_200));
+        unrelated.tick(Some((3, 14)), at(3_200), &c, g, &mut out);
+        assert_eq!(
+            unrelated.spawns() - 4,
+            unrelated_state["lit"] as u64,
+            "a different program glyph stays dark"
+        );
+        assert!(unrelated.insert.orphan_exact.is_none());
+        assert_eq!(unrelated_state["escrow"], 0);
+        assert_eq!(unrelated.typed_credits_within(at(3_200)), 0);
+        assert!(!v2_cols(&unrelated, 3).contains(&13));
+    }
+
+    #[test]
+    fn two_unknown_insert_orphans_coalesced_exact_cells_light_without_generic_credit() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |millis: u64| t0 + ms(millis);
+        let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+        let mut state = model.init_state();
+        for action in [
+            "QueueTwo",
+            "LayWithSite",
+            "Cleanup",
+            "CoalescedTwoExactNewPrint",
+        ] {
+            assert!(model.fire(action, &mut state));
+        }
+        let (mut glow, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, true);
+        row[13] = 'k';
+        row[14] = 'm';
+        glow.observe_print_anchor(Some((3, 15, 2)));
+        glow.observe_row(3, 15, &row, at(3_200));
+        glow.tick(Some((3, 15)), at(3_200), &c, g, &mut out);
+        assert_eq!(glow.spawns() - 4, 1, "one observed batch, one admission");
+        assert_eq!(state["lit"], 2, "both exact cells earned light");
+        assert!([13, 14].iter().all(|col| v2_cols(&glow, 3).contains(col)));
+        assert!(
+            [13, 14]
+                .iter()
+                .all(|col| rendered_ribbon_cols(&glow, &out, 3, g).contains(col)),
+            "both exact typed cells paint in the coalesced frame"
+        );
+        assert!(glow.insert.orphan_exact.is_none());
+        assert_eq!(
+            glow.typed_credits_within(at(3_200)),
+            state["generic"] as usize
+        );
+
+        // A later keyless program print cannot spend either batch credit.
+        row[15] = 'z';
+        glow.observe_print_anchor(Some((3, 16, 3)));
+        glow.observe_row(3, 16, &row, at(3_400));
+        glow.tick(Some((3, 16)), at(3_400), &c, g, &mut out);
+        assert_eq!(glow.spawns(), 5);
+        // Pixel bloom may extend next door; no field at 15 means no keyless
+        // program cell was admitted into the typed ribbon.
+        assert!(!v2_cols(&glow, 3).contains(&15));
+    }
+
+    #[test]
+    fn two_unknown_insert_orphans_reject_partial_wrong_stale_or_unprobed_batch() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |millis: u64| t0 + ms(millis);
+        let model = aterm_spec::derive::unknown_insert_orphan_key_model();
+        for (second, print_seq, probed, action) in [
+            ('z', 2, true, "CoalescedTwoWrongOrPartial"),
+            (' ', 2, true, "CoalescedTwoWrongOrPartial"),
+            ('m', 1, true, "CoalescedTwoOldPrint"),
+            ('m', 2, false, "CoalescedTwoMissingProbe"),
+        ] {
+            let mut state = model.init_state();
+            for step in ["QueueTwo", "LayWithSite", "Cleanup", action] {
+                assert!(model.fire(step, &mut state));
+            }
+            let (mut glow, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, true);
+            row[13] = 'k';
+            row[14] = second;
+            glow.observe_print_anchor(Some((3, 15, print_seq)));
+            if probed {
+                glow.observe_row(3, 15, &row, at(3_200));
+            }
+            glow.tick(Some((3, 15)), at(3_200), &c, g, &mut out);
+            assert_eq!(glow.spawns() - 4, 0, "{action} claimed the batch");
+            assert_eq!(state["lit"], 0);
+            assert!(glow.insert.orphan_exact.is_none());
+            assert_eq!(glow.typed_credits_within(at(3_200)), 0);
+            assert!(!v2_cols(&glow, 3).contains(&13));
+            assert!(!v2_cols(&glow, 3).contains(&14));
+        }
+
+        let (mut no_site, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, false);
+        row[13] = 'k';
+        row[14] = 'm';
+        no_site.observe_print_anchor(Some((3, 15, 2)));
+        no_site.observe_row(3, 15, &row, at(3_200));
+        no_site.tick(Some((3, 15)), at(3_200), &c, g, &mut out);
+        assert_eq!(no_site.spawns(), 4, "no insert site cannot claim two keys");
+        assert!(!v2_cols(&no_site, 3).contains(&13));
+        assert!(!v2_cols(&no_site, 3).contains(&14));
+
+        let (mut too_many, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 3, true);
+        let mut too_many_state = model.init_state();
+        for action in ["QueueThree", "LayWithSite", "Cleanup", "CoalescedTooMany"] {
+            assert!(model.fire(action, &mut too_many_state));
+        }
+        row[13] = 'k';
+        row[14] = 'm';
+        too_many.observe_print_anchor(Some((3, 15, 2)));
+        too_many.observe_row(3, 15, &row, at(3_200));
+        too_many.tick(Some((3, 15)), at(3_200), &c, g, &mut out);
+        assert_eq!(too_many.spawns() - 4, too_many_state["lit"] as u64);
+        assert_eq!(too_many.typed_credits_within(at(3_200)), 0);
+        assert!(!v2_cols(&too_many, 3).contains(&13));
+        assert!(!v2_cols(&too_many, 3).contains(&14));
+
+        // On the alternate screen, the normal coalesced classifier needs a
+        // repaint blink. An exact orphan proof cannot restore credits for a
+        // spawn that would then skip the typed sweep and leave both cells dark.
+        let (mut alt, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, true);
+        let mut alt_state = model.init_state();
+        for action in [
+            "QueueTwo",
+            "LayWithSite",
+            "Cleanup",
+            "CoalescedTwoAltWithoutBlink",
+        ] {
+            assert!(model.fire(action, &mut alt_state));
+        }
+        alt.note_context(true);
+        row[13] = 'k';
+        row[14] = 'm';
+        alt.observe_print_anchor(Some((3, 15, 2)));
+        alt.observe_row(3, 15, &row, at(3_200));
+        alt.tick(Some((3, 15)), at(3_200), &c, g, &mut out);
+        assert_eq!(alt.spawns() - 4, alt_state["lit"] as u64);
+        assert!(!v2_cols(&alt, 3).contains(&13));
+        assert!(!v2_cols(&alt, 3).contains(&14));
+        assert!(alt.insert.orphan_exact.is_none());
+        assert_eq!(alt.typed_credits_within(at(3_200)), 0);
     }
 
     #[test]
@@ -31478,6 +31970,19 @@ mod tests {
             .collect()
     }
 
+    /// The host composes the normal and under-ink streams for one frame;
+    /// sample both without appending under-quads to `out` across test ticks.
+    fn rendered_ribbon_cols(
+        glow: &CursorGlow,
+        out: &[GlowQuad],
+        row: u16,
+        g: Geom,
+    ) -> std::collections::BTreeSet<u16> {
+        let mut cols = ribbon_cols(out, row, g);
+        cols.extend(ribbon_cols(glow.under_quads(), row, g));
+        cols
+    }
+
     /// UNIFIED-READERS PROOF: ONE canonical metric ([`crate::typing_momentum`])
     /// drives all three rainbow kitty "earned drama" consumer groups. The glow engine's
     /// instance and the cursor cat's instance evolve IDENTICALLY under one
@@ -32680,27 +33185,6 @@ mod tests {
         }
     }
 
-    /// A settled-resize timestamp is a coordinate-space classifier, not causal
-    /// movement proof. Even an immediate relayout-shaped leap stays dark.
-    #[test]
-    fn a_reflow_timestamp_alone_stays_dark() {
-        let g = geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
-        let t0 = Instant::now();
-        let mut out = Vec::new();
-        let mut glow = CursorGlow::default();
-        glow.tick(Some((0, 0)), t0, &c, g, &mut out);
-        assert_eq!(
-            glow.momentum_display(),
-            0.0,
-            "the spine must be cold for this law"
-        );
-        let t1 = t0 + Duration::from_millis(120);
-        glow.note_reflow(t1);
-        glow.tick(Some((3, 30)), t1, &c, g, &mut out);
-        assert!(!frame_has_output(&out, &glow));
-    }
-
     /// The universal candidate gate is style-blind: a reflow timestamp cannot
     /// birth a streak in any built-in style.
     #[test]
@@ -32755,22 +33239,6 @@ mod tests {
             0,
             "one reflow timestamp must produce no streaks"
         );
-        assert!(!frame_has_output(&out, &glow));
-    }
-
-    /// The stale-timestamp twin stays dark too; freshness cannot upgrade a
-    /// classifier into provenance.
-    #[test]
-    fn a_stale_reflow_timestamp_stays_dark() {
-        let g = geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
-        let t0 = Instant::now();
-        let mut out = Vec::new();
-        let mut glow = CursorGlow::default();
-        glow.tick(Some((0, 0)), t0, &c, g, &mut out);
-        glow.note_reflow(t0);
-        let t1 = t0 + Duration::from_secs_f32(CursorGlow::REFLOW_HINT_FRESH + 0.05);
-        glow.tick(Some((3, 30)), t1, &c, g, &mut out);
         assert!(!frame_has_output(&out, &glow));
     }
 
@@ -37109,7 +37577,7 @@ halo = "add"
         );
 
         // A scroll: the park rides with its row and is judged there
-        // (`a_held_park_rides_a_scroll_and_its_return_lands_on_the_moved_row`
+        // (`a_held_park_rides_a_band_move_or_a_scroll_and_its_return_lands_on_the_moved_row`
         // has the return and the off-the-top flush).
         let mut scrolled = CursorGlow::default();
         let pre = pre_roll(&mut scrolled, 11, t0, &c, g);
@@ -37236,90 +37704,9 @@ halo = "add"
     /// past the band's edge it is judged first in the pre-move space, as
     /// `note_scroll` judges it — so the return is recognised on the moved
     /// row where the mirror already sits. Both directions.
-    #[test]
-    fn a_held_park_rides_a_band_move_and_its_return_lands_on_the_moved_row() {
-        let g = wide_geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
-        let mut out = Vec::new();
-        let t0 = Instant::now();
-        for (delta, moved) in [(1i16, 12u16), (-1, 10)] {
-            let mut glow = CursorGlow::default();
-            let pre = pre_roll(&mut glow, 11, t0, &c, g);
-            let k = pre + Duration::from_millis(85);
-            glow.note_typed(k);
-            let park_at = k + Duration::from_millis(10);
-            glow.tick(Some((11, 2)), park_at, &c, g, &mut out);
-            assert!(glow.held_park.is_some(), "the park is held (delta {delta})");
-            assert_eq!(glow.v2.caret_mirror(), (11, 5), "the mirror at the origin");
-            glow.note_band_move(0, 20, delta);
-            assert_eq!(
-                glow.held_park.map(|p| (p.row, p.origin, p.landing)),
-                Some((moved, 5, 2)),
-                "the park rides the band with its row (delta {delta})"
-            );
-            assert_eq!(
-                glow.in_flight_tally().park_flushed,
-                0,
-                "…and is not flushed by it"
-            );
-            let ret_at = park_at + Duration::from_millis(40);
-            glow.tick(Some((moved, 6)), ret_at, &c, g, &mut out);
-            assert_eq!(
-                ring_rows(&glow).last(),
-                Some(&("licensed", "key", (moved, 5), (moved, 6))),
-                "the return is judged from the park's origin on the moved row (delta {delta}): {:?}",
-                ring_rows(&glow)
-            );
-            let in_flight = glow.in_flight_tally();
-            assert_eq!(
-                (
-                    in_flight.park_returns,
-                    in_flight.park_flushed,
-                    in_flight.forgotten
-                ),
-                (1, 0, 0),
-                "delta {delta}"
-            );
-            assert_eq!(
-                glow.admission_tally().declined,
-                0,
-                "nothing refused (delta {delta})"
-            );
-            assert!(
-                v2_cols(&glow, 11).is_empty(),
-                "no stray light on the row the band left behind (delta {delta}): {:?}",
-                v2_cols(&glow, 11)
-            );
-            assert_eq!(
-                v2_cols(&glow, moved),
-                (2..=5u16).collect(),
-                "the moved row's typed cells lit, the key's own cell among them (delta {delta})"
-            );
-            assert_eq!(glow.v2.caret_mirror(), (moved, 6));
-        }
-        // CARRIED PAST THE BAND'S EDGE: no honest row for the park — it is
-        // judged first, in the pre-move space, exactly as the scroll twin
-        // does (`a_park_with_no_return_flushes_as_todays_verdict`'s verdict,
-        // emitted at the band).
-        let mut glow = CursorGlow::default();
-        let pre = pre_roll(&mut glow, 11, t0, &c, g);
-        let k = pre + Duration::from_millis(85);
-        glow.note_typed(k);
-        let park_at = k + Duration::from_millis(10);
-        glow.tick(Some((11, 2)), park_at, &c, g, &mut out);
-        glow.note_band_move(11, 11, 1);
-        assert!(glow.held_park.is_none(), "carried out of the band: flushed");
-        assert_eq!(glow.in_flight_tally().park_flushed, 1);
-        assert_eq!(
-            ring_rows(&glow).last(),
-            Some(&("licensed", "key", (11, 5), (11, 2))),
-            "judged in the pre-move space: {:?}",
-            ring_rows(&glow)
-        );
-    }
-
-    /// A HELD PARK RIDES A SCROLL. The band twin above rides the park with
-    /// its row; flushed before the translation instead, while every
+    ///
+    /// A HELD PARK RIDES A SCROLL TOO. The band rows ride the park with its
+    /// row; before this fix a scroll flushed it before the translation instead, while every
     /// other row-addressed member — `last`, `last_visible`, the sparks,
     /// the v2 mirror, the buffered events — rides both edges. Under
     /// Claude Code on the main screen a transcript line printed inside
@@ -37333,77 +37720,101 @@ halo = "add"
     /// RED before the fix: `park_flushed=1` at the scroll, the return
     /// `("no-fresh-hint","none",(10,2),(10,6))`, col 5 dark on row 10.
     #[test]
-    fn a_held_park_rides_a_scroll_and_its_return_lands_on_the_moved_row() {
+    fn a_held_park_rides_a_band_move_or_a_scroll_and_its_return_lands_on_the_moved_row() {
         let g = wide_geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let mut out = Vec::new();
         let t0 = Instant::now();
-        let mut glow = CursorGlow::default();
-        let pre = pre_roll(&mut glow, 11, t0, &c, g);
-        let k = pre + Duration::from_millis(85);
-        glow.note_typed(k);
-        let park_at = k + Duration::from_millis(10);
-        glow.tick(Some((11, 2)), park_at, &c, g, &mut out);
-        assert!(glow.held_park.is_some(), "the park is held");
-        assert_eq!(glow.v2.caret_mirror(), (11, 5), "the mirror at the origin");
-        glow.note_scroll(1);
-        assert_eq!(
-            glow.held_park.map(|p| (p.row, p.origin, p.landing)),
-            Some((10, 5, 2)),
-            "the park rides the scroll with its row"
-        );
-        assert_eq!(
-            glow.in_flight_tally().park_flushed,
-            0,
-            "…and is not flushed by it"
-        );
-        let ret_at = park_at + Duration::from_millis(40);
-        glow.tick(Some((10, 6)), ret_at, &c, g, &mut out);
-        assert_eq!(
-            ring_rows(&glow).last(),
-            Some(&("licensed", "key", (10, 5), (10, 6))),
-            "the return is judged from the park's origin on the moved row: {:?}",
-            ring_rows(&glow)
-        );
-        let in_flight = glow.in_flight_tally();
-        assert_eq!(
-            (
-                in_flight.park_returns,
-                in_flight.park_flushed,
-                in_flight.forgotten
-            ),
-            (1, 0, 0)
-        );
-        assert_eq!(glow.admission_tally().declined, 0, "nothing refused");
-        assert!(
-            v2_cols(&glow, 11).is_empty(),
-            "no stray light on the row the scroll left behind: {:?}",
-            v2_cols(&glow, 11)
-        );
-        assert_eq!(
-            v2_cols(&glow, 10),
-            (2..=5u16).collect(),
-            "the moved row's typed cells lit, the key's own cell among them"
-        );
-        assert_eq!(glow.v2.caret_mirror(), (10, 6));
-        // CARRIED OFF THE TOP: no honest row for the park — it is judged
-        // first, in the pre-scroll space, as before.
-        let mut glow = CursorGlow::default();
-        let pre = pre_roll(&mut glow, 0, t0, &c, g);
-        let k = pre + Duration::from_millis(85);
-        glow.note_typed(k);
-        let park_at = k + Duration::from_millis(10);
-        glow.tick(Some((0, 2)), park_at, &c, g, &mut out);
-        assert!(glow.held_park.is_some());
-        glow.note_scroll(1);
-        assert!(glow.held_park.is_none(), "carried off the top: flushed");
-        assert_eq!(glow.in_flight_tally().park_flushed, 1);
-        assert_eq!(
-            ring_rows(&glow).last(),
-            Some(&("licensed", "key", (0, 5), (0, 2))),
-            "judged in the pre-scroll space: {:?}",
-            ring_rows(&glow)
-        );
+        /// What moved, the move, and the row the park and the caret land on.
+        type Ride = (&'static str, fn(&mut CursorGlow), u16);
+        let rides: [Ride; 3] = [
+            ("band +1", |glow| glow.note_band_move(0, 20, 1), 12),
+            ("band -1", |glow| glow.note_band_move(0, 20, -1), 10),
+            ("scroll", |glow| glow.note_scroll(1), 10),
+        ];
+        for (what, shift, moved) in rides {
+            let mut glow = CursorGlow::default();
+            let pre = pre_roll(&mut glow, 11, t0, &c, g);
+            let k = pre + Duration::from_millis(85);
+            glow.note_typed(k);
+            let park_at = k + Duration::from_millis(10);
+            glow.tick(Some((11, 2)), park_at, &c, g, &mut out);
+            assert!(glow.held_park.is_some(), "the park is held ({what})");
+            assert_eq!(glow.v2.caret_mirror(), (11, 5), "the mirror at the origin");
+            shift(&mut glow);
+            assert_eq!(
+                glow.held_park.map(|p| (p.row, p.origin, p.landing)),
+                Some((moved, 5, 2)),
+                "the park rides the move with its row ({what})"
+            );
+            assert_eq!(
+                glow.in_flight_tally().park_flushed,
+                0,
+                "…and is not flushed by it ({what})"
+            );
+            let ret_at = park_at + Duration::from_millis(40);
+            glow.tick(Some((moved, 6)), ret_at, &c, g, &mut out);
+            assert_eq!(
+                ring_rows(&glow).last(),
+                Some(&("licensed", "key", (moved, 5), (moved, 6))),
+                "the return is judged from the park's origin on the moved row ({what}): {:?}",
+                ring_rows(&glow)
+            );
+            let in_flight = glow.in_flight_tally();
+            assert_eq!(
+                (
+                    in_flight.park_returns,
+                    in_flight.park_flushed,
+                    in_flight.forgotten
+                ),
+                (1, 0, 0),
+                "{what}"
+            );
+            assert_eq!(
+                glow.admission_tally().declined,
+                0,
+                "nothing refused ({what})"
+            );
+            assert!(
+                v2_cols(&glow, 11).is_empty(),
+                "no stray light on the row the move left behind ({what}): {:?}",
+                v2_cols(&glow, 11)
+            );
+            assert_eq!(
+                v2_cols(&glow, moved),
+                (2..=5u16).collect(),
+                "the moved row's typed cells lit, the key's own cell among them ({what})"
+            );
+            assert_eq!(glow.v2.caret_mirror(), (moved, 6), "{what}");
+        }
+        // CARRIED PAST THE BAND'S EDGE, or OFF THE TOP: no honest row for the
+        // park — it is judged first, in the pre-move space, exactly as before
+        // (`a_park_with_no_return_flushes_as_todays_verdict`'s verdict,
+        // emitted at the move).
+        /// What carried it, the row the park is held on, and the move.
+        type Carry = (&'static str, u16, fn(&mut CursorGlow));
+        let carried: [Carry; 2] = [
+            ("out of the band", 11, |glow| glow.note_band_move(11, 11, 1)),
+            ("off the top", 0, |glow| glow.note_scroll(1)),
+        ];
+        for (what, row, shift) in carried {
+            let mut glow = CursorGlow::default();
+            let pre = pre_roll(&mut glow, row, t0, &c, g);
+            let k = pre + Duration::from_millis(85);
+            glow.note_typed(k);
+            let park_at = k + Duration::from_millis(10);
+            glow.tick(Some((row, 2)), park_at, &c, g, &mut out);
+            assert!(glow.held_park.is_some(), "the park is held ({what})");
+            shift(&mut glow);
+            assert!(glow.held_park.is_none(), "carried {what}: flushed");
+            assert_eq!(glow.in_flight_tally().park_flushed, 1, "{what}");
+            assert_eq!(
+                ring_rows(&glow).last(),
+                Some(&("licensed", "key", (row, 5), (row, 2))),
+                "judged in the pre-move space ({what}): {:?}",
+                ring_rows(&glow)
+            );
+        }
     }
 
     /// The host's pre-roll with the PRINT ANCHOR fed on every echo tick,
@@ -38828,89 +39239,60 @@ halo = "add"
         assert!(v2_cols(&glow, 3).is_empty());
     }
 
-    /// A SCROLL KEEPS THE POOL. Three keys in flight on row 11, the grid
-    /// scrolls one row (the box grew before the batch echoed), the caret is
-    /// seen on row 10 at the same column, and the batch echoes there two
-    /// seconds later as a +3: the presses were never forgotten
-    /// (`forgotten == 0`, `credits == 3` after the scroll) and the echo is
-    /// licensed by the pool alone (`licence=inflight`). `translate_scroll_state`
-    /// moves the anchors and never touches the ring; the engine's own
-    /// ledger clears on a scroll, and this pins that the host pool does not.
+    /// A SCROLL — OR A ROW-BAND MOVE — KEEPS THE POOL. Three keys in flight
+    /// on row 11, the grid scrolls one row (the box grew before the batch
+    /// echoed), the caret is seen on row 10 at the same column, and the batch
+    /// echoes there two seconds later as a +3: the presses were never
+    /// forgotten (`forgotten == 0`, `credits == 3` after the scroll) and the
+    /// echo is licensed by the pool alone (`licence=inflight`).
+    /// `translate_scroll_state` moves the anchors and never touches the ring;
+    /// the engine's own ledger clears on a scroll, and this pins that the
+    /// host pool does not. The band row restates it for `note_band_move`:
+    /// rows `0..=20` move down one, the caret is seen on row 12, the batch
+    /// echoes there as a +3 on the pool.
     #[test]
-    fn a_scroll_keeps_the_in_flight_pool() {
+    fn a_scroll_or_a_band_move_keeps_the_in_flight_pool() {
+        /// The seam, the move, and the row the caret is seen on after it.
+        type Seam = (&'static str, fn(&mut CursorGlow), u16);
+        let seams: [Seam; 2] = [
+            ("scroll", |glow| glow.note_scroll(1), 10),
+            ("band move", |glow| glow.note_band_move(0, 20, 1), 12),
+        ];
         let g = wide_geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
-        let mut out = Vec::new();
-        let mut glow = CursorGlow::default();
-        let t0 = Instant::now();
-        let pre = pre_roll(&mut glow, 11, t0, &c, g);
-        let last = stalled_keys(&mut glow, 3, pre);
-        glow.tick(
-            Some((11, 5)),
-            last + Duration::from_millis(10),
-            &c,
-            g,
-            &mut out,
-        );
-        glow.note_scroll(1);
-        glow.drop_row_probe();
-        let seen = last + Duration::from_millis(100);
-        glow.tick(Some((10, 5)), seen, &c, g, &mut out);
-        let tally = glow.in_flight_tally();
-        assert_eq!(
-            (tally.credits, tally.forgotten),
-            (3, 0),
-            "the scroll translated the anchor and kept the pool"
-        );
-        let echo = seen + Duration::from_secs(2);
-        glow.tick(Some((10, 8)), echo, &c, g, &mut out);
-        assert_eq!(
-            glow.in_flight_tally().licensed,
-            1,
-            "the batch echoed on the scrolled row and the pool paid ({:?})",
-            glow.admission_tally().last_decline_reason
-        );
-        assert!(dark_in(&glow, 10, 5..8).is_empty());
-    }
-
-    /// A ROW-BAND MOVE KEEPS THE POOL — the scroll twin restated for
-    /// `note_band_move`: rows `0..=20` move down one, the caret is seen on
-    /// row 12, the batch echoes there as a +3 on the pool.
-    #[test]
-    fn a_band_move_keeps_the_in_flight_pool() {
-        let g = wide_geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
-        let mut out = Vec::new();
-        let mut glow = CursorGlow::default();
-        let t0 = Instant::now();
-        let pre = pre_roll(&mut glow, 11, t0, &c, g);
-        let last = stalled_keys(&mut glow, 3, pre);
-        glow.tick(
-            Some((11, 5)),
-            last + Duration::from_millis(10),
-            &c,
-            g,
-            &mut out,
-        );
-        glow.note_band_move(0, 20, 1);
-        glow.drop_row_probe();
-        let seen = last + Duration::from_millis(100);
-        glow.tick(Some((12, 5)), seen, &c, g, &mut out);
-        let tally = glow.in_flight_tally();
-        assert_eq!(
-            (tally.credits, tally.forgotten),
-            (3, 0),
-            "the band move translated the anchor and kept the pool"
-        );
-        let echo = seen + Duration::from_secs(2);
-        glow.tick(Some((12, 8)), echo, &c, g, &mut out);
-        assert_eq!(
-            glow.in_flight_tally().licensed,
-            1,
-            "the batch echoed on the moved row and the pool paid ({:?})",
-            glow.admission_tally().last_decline_reason
-        );
-        assert!(dark_in(&glow, 12, 5..8).is_empty());
+        for (seam, shift, row) in seams {
+            let mut out = Vec::new();
+            let mut glow = CursorGlow::default();
+            let t0 = Instant::now();
+            let pre = pre_roll(&mut glow, 11, t0, &c, g);
+            let last = stalled_keys(&mut glow, 3, pre);
+            glow.tick(
+                Some((11, 5)),
+                last + Duration::from_millis(10),
+                &c,
+                g,
+                &mut out,
+            );
+            shift(&mut glow);
+            glow.drop_row_probe();
+            let seen = last + Duration::from_millis(100);
+            glow.tick(Some((row, 5)), seen, &c, g, &mut out);
+            let tally = glow.in_flight_tally();
+            assert_eq!(
+                (tally.credits, tally.forgotten),
+                (3, 0),
+                "the {seam} translated the anchor and kept the pool"
+            );
+            let echo = seen + Duration::from_secs(2);
+            glow.tick(Some((row, 8)), echo, &c, g, &mut out);
+            assert_eq!(
+                glow.in_flight_tally().licensed,
+                1,
+                "the batch echoed on the moved row ({seam}) and the pool paid ({:?})",
+                glow.admission_tally().last_decline_reason
+            );
+            assert!(dark_in(&glow, row, 5..8).is_empty(), "{seam}");
+        }
     }
 
     /// A FORGET EDGE THAT FINDS ONLY DEAD PRESSES COUNTS NOTHING. One press,

@@ -1,6 +1,6 @@
 user@host work1 % which claude; claude --version; echo $TERM_PROGRAM; env | grep -c -E "^(CLAU
 DE|ANTHROPIC)"
-/Users//_user/Library/Application Support/aterm/pkg/agents/claude
+/Users/_user/Library/Application Support/aterm/pkg/agents/claude
 2.1.280 (Claude Code)
 aterm
 0

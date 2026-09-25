@@ -4,7 +4,8 @@
 // Supernova additive light (Sparkle Words v2, `RenderInput.nova_add`) on the
 // CPU renderer. The channel contract under test:
 //   * empty nova is byte-identical to the pre-nova path (also after
-//     `clear_overlays`, the `image plain` contract);
+//     `clear_overlays`, the `image plain` contract) — the `nova_add` row of
+//     `tests/empty_channels.rs`;
 //   * a nova quad saturating-adds its PREMULTIPLIED colour over the frame —
 //     exactly `add_sat` per pixel, `min(255, bg + premul)` per channel over a
 //     flat background (the byte-exact additive primitive);
@@ -41,42 +42,6 @@ fn quad_at(cw: usize, ch: usize, row: u16, col: usize, color: u32) -> GlowQuad {
         color2: color,
         alpha2: 0,
     }
-}
-
-#[test]
-fn empty_nova_is_byte_identical_also_after_clear_overlays() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lbuild: fuck");
-
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    // Explicitly empty nova (feature on, every nova Settled — the steady state
-    // emits nothing).
-    let mut input = term.cell_frame(3, 12);
-    assert!(input.nova_add.is_empty());
-    input.nova_add.clear();
-    let again = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, again, "empty nova_add must not change any pixel");
-
-    // `clear_overlays` (the `image plain` capture) strips the nova like every
-    // other bling layer: a previously-lit input renders the bare frame after.
-    let mut lit = term.cell_frame(3, 12);
-    lit.nova_add
-        .push(quad_at(cw, ch, 1, 2, premul_rgb(0x00FF_9A3C, 220)));
-    let with_nova = rend.render_input(&lit).pixels.clone();
-    assert_ne!(base, with_nova, "a non-empty nova must brighten something");
-    lit.clear_overlays();
-    assert!(
-        lit.nova_add.is_empty(),
-        "clear_overlays must strip nova_add"
-    );
-    let stripped = rend.render_input(&lit).pixels.clone();
-    assert_eq!(base, stripped, "clear_overlays must restore the bare frame");
 }
 
 /// The additive math is exact on the CPU: a premultiplied quad over a flat

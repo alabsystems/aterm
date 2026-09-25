@@ -9,7 +9,7 @@
 //   * an empty `glow_under` / an empty `char_fg` (never touched, explicitly
 //     emptied, and pushed-then-cleared) is byte-identical to the pre-feature
 //     path, also after `clear_overlays` (the `image plain` contract) — the
-//     no-op laws;
+//     no-op laws, held by two rows of `tests/empty_channels.rs`;
 //   * the SILHOUETTE LAW: with `glow_under` lighting a row band and `char_fg`
 //     pinning a glyph near-black, the glyph stroke is DARKER than the lit
 //     background beside it — the letter reads as a dark core INSIDE the fire,
@@ -138,100 +138,6 @@ fn compact_effect_damage_matches_exact_fallback_and_marks_vacated_rows() {
 /// additive light and under a darker substituted fg, so ordering is exact).
 fn luma(p: u32) -> u32 {
     ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff)
-}
-
-/// NO-OP LAW (glow_under): empty — untouched, explicitly emptied, and
-/// pushed-then-cleared — must be byte-identical to the pre-feature path, and
-/// `clear_overlays` strips a populated stream back to the bare frame.
-#[test]
-fn empty_glow_under_is_byte_identical_to_before() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lember forge");
-
-    // Pre-feature frame: the snapshot as built, glow_under never mentioned.
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    // Explicit empty, and pushed-then-cleared (the emptied-stream path).
-    let mut input = term.cell_frame(3, 12);
-    input.glow_under = Vec::new();
-    let explicit = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, explicit, "explicit empty glow_under must be a no-op");
-    input
-        .glow_under
-        .push(under(1, 0, ch as u16, cw as u16, ch as u16, 0x0040_2008));
-    input.glow_under.clear();
-    let emptied = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, emptied, "an emptied glow_under must leave no residue");
-
-    // A populated stream paints; `clear_overlays` restores the bare frame.
-    let mut with_under = term.cell_frame(3, 12);
-    with_under.glow_under = vec![under(
-        1,
-        0,
-        ch as u16,
-        (3 * cw) as u16,
-        ch as u16,
-        0x0060_3010,
-    )];
-    let painted = rend.render_input(&with_under).pixels.clone();
-    assert_ne!(base, painted, "a non-empty glow_under must paint something");
-    with_under.clear_overlays();
-    assert!(
-        with_under.glow_under.is_empty(),
-        "clear_overlays must strip glow_under (it IS bling)"
-    );
-    let stripped = rend.render_input(&with_under).pixels.clone();
-    assert_eq!(base, stripped, "clear_overlays must restore the bare frame");
-}
-
-/// NO-OP LAW (char_fg): empty — untouched, explicitly emptied, and
-/// pushed-then-cleared — must be byte-identical to the pre-feature path, and
-/// `clear_overlays` strips a populated stream back to the bare frame.
-#[test]
-fn empty_char_fg_is_byte_identical_to_before() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lember forge");
-
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    let mut input = term.cell_frame(3, 12);
-    input.char_fg = Vec::new();
-    let explicit = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, explicit, "explicit empty char_fg must be a no-op");
-    input.char_fg.push(CharFg {
-        row: 0,
-        col: 0,
-        fg: 0x0010_0804,
-    });
-    input.char_fg.clear();
-    let emptied = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, emptied, "an emptied char_fg must leave no residue");
-
-    // A populated override recolours a glyph; `clear_overlays` restores it.
-    let mut with_char = term.cell_frame(3, 12);
-    with_char.char_fg = vec![CharFg {
-        row: 0,
-        col: 0,
-        fg: 0x0010_0804,
-    }];
-    let painted = rend.render_input(&with_char).pixels.clone();
-    assert_ne!(base, painted, "a char_fg override must recolour its glyph");
-    with_char.clear_overlays();
-    assert!(
-        with_char.char_fg.is_empty(),
-        "clear_overlays must strip char_fg (it IS bling)"
-    );
-    let stripped = rend.render_input(&with_char).pixels.clone();
-    assert_eq!(base, stripped, "clear_overlays must restore the bare frame");
 }
 
 /// THE SILHOUETTE LAW: flames engulf a line — `glow_under` lights the row band

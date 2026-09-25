@@ -1130,7 +1130,7 @@ mod tests {
                 &root,
                 Some(&own),
                 &forks,
-                &PkgId::new("astream-cap", "0.1.0")
+                &PkgId::new("astream-cap", "0.0.0")
             ),
             PatchState::FirstPartyVendored {
                 path: "vendor/astream/crates/astream-cap".into()

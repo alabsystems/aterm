@@ -13,7 +13,7 @@
 //! "clean_islands"]`, the same pair as `rustdocflags`, and
 //! `[build] rustdoc = "trustdoc"` — three Trust-toolchain-only settings, and
 //! `publish/manifest.txt` does not list the file, while
-//! `publish/transforms.sh` line 82 replaces `rust-toolchain.toml` with
+//! `publish/transforms.sh` replaces `rust-toolchain.toml` with
 //! `publish/public-rust-toolchain.toml` (stock `1.97.1`). So the public
 //! snapshot is a stock-Rust clone that never sees `.cargo/config.toml`, by
 //! construction and on purpose.
@@ -321,19 +321,21 @@ enum Export {
 /// Does one allowlist row cover `path`?
 ///
 /// A row is a repository path and covers itself and everything beneath it —
-/// `crates` is how the whole crate tree ships. A `*` SEGMENT matches exactly
-/// one path segment, which is the only glob shape the file uses
-/// (`!vendor/*/.github`). Any other use of `*` is REFUSED rather than guessed:
-/// a reader that quietly mis-implements the engine's glob rules would judge
-/// export coverage on a fiction.
+/// `crates` is how the whole crate tree ships. A whole-segment `*` matches
+/// exactly one path segment (`!vendor/*/.github`). Any other glob — `*`, `?` or
+/// `[` inside a component, like `!crates/aterm-effects/art/glyphs/s2_??.toml` —
+/// is REFUSED when this reader would have to compare `path` against it, rather
+/// than guessed: a reader that quietly mis-implements the engine's glob rules
+/// would judge export coverage on a fiction. A row whose literal segments
+/// already differ from `path` covers nothing, glob or not, and needs no ruling.
 fn manifest_row_covers(row: &str, path: &str) -> Result<bool, String> {
     let mut segments = path.split('/');
     for part in row.split('/') {
-        if part.contains('*') && part != "*" {
+        if (part.contains('*') && part != "*") || part.contains(['?', '[']) {
             return Err(format!(
-                "{PUBLISH_MANIFEST} row `{row}` uses `*` inside a path component. This reader \
-                 implements whole-segment `*` only — the shape every row in the file uses — and \
-                 will not guess the rest of the publish engine's glob syntax."
+                "{PUBLISH_MANIFEST} row `{row}` uses a glob inside a path component. This \
+                 reader implements whole-segment `*` only and will not guess the rest of the \
+                 publish engine's glob syntax."
             ));
         }
         let Some(here) = segments.next() else {
@@ -352,7 +354,7 @@ fn manifest_row_covers(row: &str, path: &str) -> Result<bool, String> {
 /// **SEMANTICS INFERRED, NOT EXECUTED.** The engine itself lives in the
 /// sibling `publication` repository, which is absent here, so nothing in this
 /// function was run against it. The rules below are derived from the file's
-/// own 11 negation rows and the comments above them: every `!` row names a
+/// own negation rows and the comments above them: every `!` row names a
 /// path INSIDE a subtree an inclusion row already carries
 /// (`!crates/aterm-spec-models/proofs` under `crates`, `!vendor/*/.github`
 /// under `vendor`), and each comment says that path must not ship. A `!` row
@@ -575,7 +577,7 @@ pub fn audit(root: &Path, row_anchor: &mirror::RowAnchor) -> Vec<Finding> {
         ))),
         Ok(Some(Export::Excluded(row))) => out.push(Finding::Fail(format!(
             "{PUBLISH_MANIFEST} takes `{FRAGMENT_FILE}` back out with `{row}` — a `!` row is \
-             how that allowlist EXCLUDES a path it would otherwise carry (it holds 11 of them), \
+             how that allowlist EXCLUDES a path it would otherwise carry, \
              so the fragment does not ship and the public snapshot would carry Cargo.lock with \
              no way to reach its mirror. Fix: delete that row."
         ))),
@@ -1002,7 +1004,7 @@ mod tests {
     }
 
     /// The publish allowlist's negation rows are its EXCLUSION mechanism —
-    /// `publish/manifest.txt` carries 11 of them — so one appended `!` row
+    /// `publish/manifest.txt` carries many — so one appended `!` row
     /// stops the fragment shipping. Reading them as decoration left the gate
     /// GREEN while the public snapshot lost the file.
     #[test]
@@ -1027,13 +1029,24 @@ mod tests {
         let fails = fail_lines(&fx);
         assert!(fails.iter().any(|f| f.contains("`!tools`")), "{fails:?}");
 
-        // And a row this reader cannot judge is REFUSED, never guessed.
-        std::fs::write(&manifest, format!("{text}!tools/cargo-*.toml\n")).unwrap();
-        let fails = fail_lines(&fx);
-        assert!(
-            fails.iter().any(|f| f.contains("inside a path component")),
-            "{fails:?}"
-        );
+        // And a row this reader cannot judge is REFUSED, never guessed — `*`, `?`
+        // or `[` inside a component it has to compare against.
+        for glob in [
+            "tools/cargo-*.toml",
+            "tools/cargo-mirror-config.tom?",
+            "tools/[c]argo-*",
+        ] {
+            std::fs::write(&manifest, format!("{text}!{glob}\n")).unwrap();
+            let fails = fail_lines(&fx);
+            assert!(
+                fails.iter().any(|f| f.contains("inside a path component")),
+                "{glob}: {fails:?}"
+            );
+        }
+        // A glob row whose literal segments already differ covers nothing here,
+        // so it is no reason to refuse (the real file's art exclusions).
+        std::fs::write(&manifest, format!("{text}!crates/a/glyphs/s2_??.toml\n")).unwrap();
+        assert!(fail_lines(&fx).is_empty(), "{:?}", fail_lines(&fx));
     }
 
     /// A hand-edited fragment can point cargo at a directory the delivery

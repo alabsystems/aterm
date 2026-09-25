@@ -4653,17 +4653,18 @@ impl App {
                 let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
                 for &r in &ribbon_rows[..n] {
                     if usize::from(r) < rows && r != cpos.row {
-                        let cols = crate::app_render::witness_row_cols(
+                        if let Some(captured) = crate::app_render::captured_witness_neighbor(
                             r,
                             cpos.row,
                             neighbor_above.then_some(ws.poof_row_above_buf.as_slice()),
                             neighbor_below.then_some(ws.poof_row_below_buf.as_slice()),
-                            &mut ws.witness_row_buf,
-                            |r, out| {
-                                term.row_cols_into(usize::from(r), out);
-                            },
-                        );
-                        ws.cursor_glow.observe_ribbon_row(r, cols);
+                        ) {
+                            ws.cursor_glow.observe_ribbon_row(r, captured);
+                        } else {
+                            ws.cursor_glow.capture_ribbon_row(r, |cols| {
+                                term.row_cols_into(usize::from(r), cols);
+                            });
+                        }
                     }
                 }
                 Some((cpos.row, cpos.col, probe_trust))
@@ -5015,7 +5016,6 @@ impl App {
                     self.splice_settings_panel(front);
                     self.splice_build_badge(front);
                     self.splice_robi_bubble(front);
-                    self.splice_level_up(front);
                     frame_plan = Some(capture_plan);
                 }
                 crate::VisibleContentRoute::Native { .. } => {
@@ -5030,7 +5030,6 @@ impl App {
                     self.splice_find_bar(front);
                     self.splice_build_badge(front);
                     self.splice_robi_bubble(front);
-                    self.splice_level_up(front);
                     if !self.compose_native_route_card(front) {
                         return;
                     }
@@ -5055,7 +5054,6 @@ impl App {
                     self.splice_find_bar(front);
                     self.splice_build_badge(front);
                     self.splice_robi_bubble(front);
-                    self.splice_level_up(front);
                     if !self.compose_native_route_card(front) {
                         return;
                     }
@@ -5154,7 +5152,6 @@ impl App {
             .as_ref()
             .or(ws.settings_card.as_ref())
             .or(ws.conn_wire_card.as_ref())
-            .or(ws.level_up_card.as_ref())
             .or(ws.bubble_card.as_ref())
             .or(ws.badge_card.as_ref())
             .and_then(|card| tray_quad_below_y(card, tray_floor_y));
@@ -5177,7 +5174,6 @@ impl App {
                 .as_ref()
                 .or(ws.settings_card.as_ref())
                 .or(ws.conn_wire_card.as_ref())
-                .or(ws.level_up_card.as_ref())
                 .or(ws.bubble_card.as_ref())
                 .or(ws.badge_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y))
@@ -5372,7 +5368,6 @@ impl App {
             self.splice_find_bar(front);
             self.splice_build_badge(front);
             self.splice_robi_bubble(front);
-            self.splice_level_up(front);
             if !self.compose_native_route_card(front) {
                 let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
                 return;
@@ -5431,7 +5426,6 @@ impl App {
                 route_card,
                 settings_card,
                 conn_wire_card,
-                level_up_card,
                 bubble_card,
                 badge_card,
                 win_px,
@@ -5441,7 +5435,6 @@ impl App {
                 .as_ref()
                 .or(settings_card.as_ref())
                 .or(conn_wire_card.as_ref())
-                .or(level_up_card.as_ref())
                 .or(bubble_card.as_ref())
                 .or(badge_card.as_ref())
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y));
@@ -6278,7 +6271,6 @@ impl App {
             self.splice_settings_panel(front);
             self.splice_build_badge(front);
             self.splice_robi_bubble(front);
-            self.splice_level_up(front);
             self.splice_paste_banner(front);
             self.splice_link_target_from_plan(front, &capture_plan);
             // C5 — topmost chrome; see the `chrome`-capture route above.
@@ -11546,12 +11538,13 @@ mod encode_worker_tests {
         assert_ne!(expected.pixels[0], baseline.pixels[0]);
         assert_eq!(charged.pixels[0], expected.pixels[0]);
 
-        app.level_up = Some(crate::level_up::LevelUp::landing(7, Instant::now(), 0.0));
+        // The rim ended (Commit): the drag still yields to the modal.
+        app.level_up = None;
         assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
-        let landed = visual_capture_pixels(&mut app, &dir, "landing.png", None);
+        let committed = visual_capture_pixels(&mut app, &dir, "committed.png", None);
         assert_eq!(
-            landed.pixels[0], baseline.pixels[0],
-            "landing and drag yield to the modal"
+            committed.pixels[0], baseline.pixels[0],
+            "the drag yields to the modal"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -14351,10 +14344,14 @@ mod window_render_context_capture_tests {
             cancel: crate::control::CaptureCancellation::new(),
             reply: tx,
         });
-        // This test checks render-context rebinding, not capture latency. A
-        // full-suite run can deschedule the image worker behind other CPU work.
+        // This test checks render-context rebinding, not capture latency: a
+        // hang detector, not a latency budget. Under the full merge contract
+        // (14 test threads on a loaded machine) this render measured past 10 s
+        // on 2026-09-23 and 2026-09-24 and then answered; a full-suite run can
+        // deschedule the image worker behind other CPU work. A wedged worker
+        // still fails.
         let mut retained = rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(Duration::from_secs(60))
             .expect("image worker reply")
             .expect("image capture succeeds");
         retained

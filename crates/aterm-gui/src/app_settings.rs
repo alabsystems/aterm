@@ -2423,11 +2423,15 @@ impl App {
                             .as_ref()
                             .and_then(|m| m.fill_permille)
                             .map(|f| f32::from(f) / 1000.0),
-                        // A failure, or a question: an alert either way.
-                        alarm: matches!(
+                        // A failure, or a question: an alert either way. A
+                        // measured level (the strain row) that turns Warn at
+                        // Critical memory pressure is still a gauge: it stays a
+                        // progress indicator valued by it (ruling 208).
+                        alarm: (matches!(
                             live.msg.severity,
                             aterm_messages::Severity::Warn | aterm_messages::Severity::Error
-                        ) || live.msg.is_ask()
+                        ) && !live.msg.meter.as_ref().is_some_and(|m| m.level))
+                            || live.msg.is_ask()
                             || live
                                 .msg
                                 .actions
@@ -4138,21 +4142,18 @@ mod a11y_message_wiring_tests {
         );
     }
 
-    /// A ROW THAT ASKS IS AN ALERT, NOT STATUS NEWS (review 2026-09-24): the admin
-    /// step's question reaches assistive technology as something the person is being
-    /// asked — the alert role, at the band's polite politeness — like a failure, while
-    /// work in flight stays a progress indicator.
+    /// A ROW THAT ASKS IS AN ALERT, NOT STATUS NEWS (review 2026-09-24): the Full
+    /// Disk Access question reaches assistive technology as something the person is
+    /// being asked — the alert role, at the band's polite politeness — like a failure,
+    /// while work in flight stays a progress indicator.
     #[test]
     fn a_decision_row_is_an_alert() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.prepare_terminal_capture_grid(wid).unwrap();
-        app.post_message(crate::message_reporters::admin_step(&[
-            "clt".to_string(),
-            "brew".to_string(),
-        ]));
+        app.post_message(crate::message_reporters::file_access_question());
         let ask = message(&app, wid, ChromeMessage::BandRow0);
-        assert_eq!(ask.text, "Install Command Line Tools and Homebrew");
+        assert_eq!(ask.text, crate::consent_card::FDA_TITLE);
         assert!(ask.alarm, "a question is an alert");
         assert!(ask.progress.is_none() && !ask.busy);
         let mut app = App::headless_for_test();
@@ -4161,6 +4162,32 @@ mod a11y_message_wiring_tests {
         let work = message(&app, wid, ChromeMessage::BandRow0);
         assert!(!work.alarm, "work in flight is not an alert");
         assert!(work.busy);
+    }
+
+    /// THE STRAIN ROW IS A GAUGE EVEN WHEN IT WARNS (ruling 208): at Critical
+    /// memory pressure the row turns Warn, and it is still a progress indicator
+    /// valued by its level — never an alert that hides the gauge.
+    #[test]
+    fn a_warn_strain_row_stays_a_progress_indicator() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::SYSTEM,
+                aterm_messages::Severity::Warn,
+                "Typing slowed by low memory",
+            )
+            .key(aterm_messages::STRAIN_KEY)
+            .hold(aterm_messages::Hold::Live {
+                stale_after: aterm_messages::STALE_STRAIN,
+            })
+            .meter(aterm_messages::Meter::level(960, "23 GB"))
+            .no_excerpt(),
+        );
+        let row = message(&app, wid, ChromeMessage::BandRow0);
+        assert!(!row.alarm, "a warning gauge is not an alert");
+        assert_eq!(row.progress, Some(0.96), "valued by the gauge");
     }
 
     /// ROBI'S BUBBLE IS A DECORATION (design D7, R23): what survived of the retired

@@ -384,19 +384,4 @@ mod tests {
         assert!(!BufferCommand::SaveBuffer.is_motion());
         assert!(!BufferCommand::PipeRegion("wc".into()).is_motion());
     }
-
-    #[test]
-    fn test_buffer_command_clone_eq() {
-        let cmd = BufferCommand::SearchForward("hello".into());
-        let cloned = cmd.clone();
-        assert_eq!(cmd, cloned);
-    }
-
-    #[test]
-    fn test_buffer_command_debug() {
-        let cmd = BufferCommand::GotoLine(42);
-        let debug = format!("{cmd:?}");
-        assert!(debug.contains("GotoLine"));
-        assert!(debug.contains("42"));
-    }
 }

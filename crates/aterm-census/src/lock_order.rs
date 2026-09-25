@@ -5074,17 +5074,6 @@ mod tests {
     }
 
     #[test]
-    fn lock_order_census_is_green_on_this_tree() {
-        let out = run_lock_order_census(&repo_root());
-        assert!(
-            out.ok,
-            "lock-order census RED on the current tree:\n{}",
-            out.log
-        );
-        assert!(out.log.contains("ACYCLIC"), "log:\n{}", out.log);
-    }
-
-    #[test]
     fn no_unknown_identities_on_this_tree() {
         // The UNKNOWN count was driven to ZERO (2026-07-13) by naming every
         // previously-unresolvable receiver and categorizing the one OS
@@ -5181,19 +5170,26 @@ mod tests {
         // each binding's ascription. fin/deflake moved the store lock's old
         // `open_store_lock` site into them. The census, not the notes, says
         // eight.
+        //
+        // NOTE (2026-09-24, origin/main merged into fix/main-reds-0924): NINE —
+        // main's 9f5922003 added update-core's `FileLock::lock_open` (the
+        // roster's read-only claim on a file the caller opened its own way,
+        // blocking `lock()`) without moving this count, so main's gate went red
+        // here. Cross-process by purpose; a `File` by its binding's ascription.
         let out = run_lock_order_census(&repo_root());
         assert!(
-            out.log.contains("8 OS file-advisory"),
-            "expected exactly the restore-manifest flock, update-core's two \
-             sites (blocking acquire + the bounded-wait try_lock loop), atpkg's \
-             machine-apply queue, the log rotation's try_lock, the harness's \
-             upgrade sweep lock and atpkg's two Flock acquisitions in the \
-             advisory category:\n{}",
+            out.log.contains("9 OS file-advisory"),
+            "expected exactly the restore-manifest flock, update-core's three \
+             sites (blocking acquire, the caller-opened lock_open and the \
+             bounded-wait try_lock loop), atpkg's machine-apply queue, the log \
+             rotation's try_lock, the harness's upgrade sweep lock and atpkg's \
+             two Flock acquisitions in the advisory category:\n{}",
             out.log
         );
         assert!(
             out.log.contains("crates/aterm-gui/src/restore.rs")
                 && out.log.contains("crates/aterm-update-core/src/sys.rs")
+                && out.log.contains("fn `lock_open`")
                 && !out.log.contains("crates/aterm-gui/src/messages_store.rs")
                 && out.log.contains("crates/atpkg/src/cli.rs")
                 && out.log.contains("fn `machine_apply_queue`")
@@ -5212,9 +5208,10 @@ mod tests {
 
     #[test]
     fn lz4_raw_pointer_reads_are_categorized_on_this_tree() {
-        // The six real `core::ptr::read` sites — five in the upstream-derived
+        // The four real `core::ptr::read` sites — three in the upstream-derived
         // lz4 block codec (kept close to lz4_flex for reviewability, so receiver
-        // renames are off the table there) plus the vendored
+        // renames are off the table there; the never-compiled raw-pointer
+        // decoder `block/decompress.rs` and its two sites were deleted) plus the vendored
         // indexmap `extract.rs` site (categorized by the PROPAGATED evidence:
         // `entries.as_mut_ptr()` seeds `base`, `base.add(current)` extends to
         // `item`) — must be classified by raw-pointer EVIDENCE, listed, and
@@ -5222,13 +5219,12 @@ mod tests {
         // RwLock identities.
         let out = run_lock_order_census(&repo_root());
         assert!(
-            out.log.contains("6 raw-pointer ptr::read"),
-            "expected exactly the five vendored-lz4 + one indexmap ptr::read sites:\n{}",
+            out.log.contains("4 raw-pointer ptr::read"),
+            "expected exactly the three vendored-lz4 + one indexmap ptr::read sites:\n{}",
             out.log
         );
         assert!(
             out.log.contains("crates/aterm-lz4/src/block/compress.rs")
-                && out.log.contains("crates/aterm-lz4/src/block/decompress.rs")
                 && out.log.contains("crates/aterm-lz4/src/sink.rs")
                 && out.log.contains("vendor/indexmap/src/inner/extract.rs"),
             "each raw-pointer listing must name its site:\n{}",

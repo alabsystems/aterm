@@ -456,48 +456,35 @@ mod tests {
         }
     }
 
-    /// Disabled ⇒ no fill, no bead, fp 0 (byte-identical to the plain cursor).
+    /// Disabled, or reduced motion / load-shed (`intensity == 0`) even at full
+    /// strength ⇒ fully inert: no fill, no bead, fp 0, settled —
+    /// byte-identical to the plain cursor.
     #[test]
-    fn disabled_is_inert() {
-        let mut d = CursorDroplet::default();
-        let mut out = Vec::new();
-        let f = d.tick(
-            Some((1, 1)),
-            Instant::now(),
-            1.0,
-            geom(),
-            &DropletConfig {
-                enabled: false,
-                intensity: 1.0,
-            },
-            &mut out,
-        );
-        assert!(f.fill.is_none());
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty());
-        assert!(!d.is_active());
-    }
-
-    /// Reduced motion / load-shed (`intensity == 0`) ⇒ fully inert even at full surge.
-    #[test]
-    fn zero_intensity_is_inert() {
-        let mut d = CursorDroplet::default();
-        let mut out = Vec::new();
-        let f = d.tick(
-            Some((1, 1)),
-            Instant::now(),
-            1.0,
-            geom(),
-            &DropletConfig {
-                enabled: true,
-                intensity: 0.0,
-            },
-            &mut out,
-        );
-        assert!(f.fill.is_none(), "reduced motion keeps the plain cursor");
-        assert_eq!(f.fp, 0);
-        assert!(out.is_empty());
-        assert!(!d.is_active());
+    fn disabled_or_zero_intensity_is_inert() {
+        for (why, config) in [
+            (
+                "disabled",
+                DropletConfig {
+                    enabled: false,
+                    intensity: 1.0,
+                },
+            ),
+            (
+                "zero intensity",
+                DropletConfig {
+                    enabled: true,
+                    intensity: 0.0,
+                },
+            ),
+        ] {
+            let mut d = CursorDroplet::default();
+            let mut out = Vec::new();
+            let f = d.tick(Some((1, 1)), Instant::now(), 1.0, geom(), &config, &mut out);
+            assert!(f.fill.is_none(), "{why}: keeps the plain cursor");
+            assert_eq!(f.fp, 0, "{why}");
+            assert!(out.is_empty(), "{why}: no additive light");
+            assert!(!d.is_active(), "{why}: settled");
+        }
     }
 
     /// A hidden cursor draws no bead, but the fill stays resolved (harmless — the

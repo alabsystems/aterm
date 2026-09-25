@@ -9,11 +9,11 @@
 //! terminal domain types (#3353). This crate owns:
 //!
 //! - Error enums (`AtermTerminalError`, `AtermConfigError`, etc.)
-//! - FFI combinator traits and macros (`FfiErrorCode`, `check_null_outputs!`)
+//! - FFI combinator trait (`FfiErrorCode`)
 //! - Pointer safety helpers (`ffi_ref`, `ffi_slice`, bounds validation)
 //! - Panic catching (`aterm_ffi_catch_panic!`)
 //! - Pointer lifecycle tracking (`FfiTracker`, free-tracking)
-//! - Free combinators (`box_handle_free_v1`, `box_handle_free_v2`, etc.)
+//! - Free combinator (`box_handle_free_v1`)
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
@@ -21,7 +21,6 @@
 
 pub mod callback_struct_manifest;
 pub mod ffi_bounds;
-mod ffi_callback;
 pub mod ffi_combinator;
 pub mod ffi_error_contract;
 pub mod ffi_error_types;
@@ -44,20 +43,16 @@ pub use ffi_panic::panic_payload_msg;
 
 // Re-export FFI safety helpers at crate root for ergonomic imports.
 pub use ffi_safety::{
-    ffi_array_slice, ffi_array_slice_mut, ffi_byte_slice, ffi_byte_slice_mut, ffi_ref, ffi_ref_mut,
-    ffi_ref_mut_tracked, ffi_ref_tracked, ffi_slice, ffi_slice_mut,
+    ffi_byte_slice, ffi_byte_slice_mut, ffi_ref, ffi_ref_mut, ffi_ref_mut_tracked, ffi_ref_tracked,
+    ffi_slice, ffi_slice_mut,
 };
 
 // Re-export unified error contract types at crate root.
 pub use ffi_combinator::FfiErrorCode;
 pub use ffi_error_contract::{AtermErrorDomain, AtermErrorInfo, AtermErrorKind, AtermFfiErrorCode};
 
-// Re-export free combinators and tracker at crate root.
-pub use ffi_free_combinator::{
-    box_handle_free_v1, box_handle_free_v1_with_teardown, box_handle_free_v2,
-    box_handle_free_v2_nulling, box_handle_free_v2_with_null, box_handle_free_v2_with_teardown,
-    cstring_handle_free_v1,
-};
+// Re-export the free combinator and tracker at crate root.
+pub use ffi_free_combinator::box_handle_free_v1;
 pub use verification::FfiTracker;
 
 // Re-export graphics FFI types at crate root.
@@ -72,13 +67,6 @@ pub use ffi_error_types::{
     AtermDetectionError, AtermImeError, AtermMemoryError, AtermPerceptionError, AtermResponseError,
     AtermSelectionError, AtermSixelError, AtermTerminalError,
 };
-
-// Re-export FfiCallback at crate root.
-pub use ffi_callback::FfiCallback;
-
-// Re-export SendContext at crate root (#5697 Phase 1: dedup).
-mod send_context;
-pub use send_context::SendContext;
 
 /// Maximum length parameter accepted by FFI slice-creation functions (256 MiB).
 ///

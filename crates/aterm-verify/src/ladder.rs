@@ -394,6 +394,44 @@ mod tests {
         assert_eq!(t.skipped(), 0);
     }
 
+    /// THE MACHINE'S REFUSAL, THROUGH THE STAGE'S OWN PATH (2026-09-23). A
+    /// test child whose every failure carries the COULD NOT RUN sentinel is
+    /// the COULD NOT RUN severity — the receipt says `COULD-NOT-RUN`, not
+    /// `FAIL` — and the same child with one plain failure beside it stays a
+    /// finding.
+    #[test]
+    fn a_test_child_whose_every_failure_is_a_refusal_is_could_not_run() {
+        let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
+        let log = |second: &str| {
+            format!(
+                "     Running tests/bridge_e2e.rs (target/debug/deps/bridge_e2e-1)\n\n\
+                 running 2 tests\ntest a ... FAILED\ntest b ... FAILED\n\nfailures:\n\n\
+                 ---- a stdout ----\n{sentinel} — strays alive\n\n\
+                 ---- b stdout ----\n{second}\n\nfailures:\n    a\n    b\n\n\
+                 test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered \
+                 out; finished in 1.00s\n\nerror: test failed, to rerun pass `-p x --test \
+                 bridge_e2e`\n"
+            )
+        };
+        let run = |output: String| Run {
+            ok: false,
+            output,
+            code: Some(101),
+            spawn_error: None,
+        };
+        let mut r = Report::new("test (--workspace)");
+        r.decide_child(&run(log(&format!("{sentinel} — strays alive"))), "refused");
+        r.decide_child(&run(log("assertion failed: a finding")), "found");
+        let t = tally(&[r]);
+        assert_eq!(t.gate_failures, ["found"]);
+        assert_eq!(t.could_not_run.len(), 1, "{t:?}");
+        assert!(
+            t.could_not_run[0].starts_with("refused — could not run: every failing test refused")
+                && t.could_not_run[0].contains("(a, b)"),
+            "{t:?}"
+        );
+    }
+
     #[test]
     fn raw_text_never_becomes_a_skip() {
         // A NOTICE line explains a skip; it must not be counted as one, or the

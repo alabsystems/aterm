@@ -3,121 +3,60 @@
 
 //! Product-version identity shared by every surface of the one `aterm` binary.
 //!
-//! There is exactly ONE version lineage: Cargo's `[workspace.package]`
-//! `MAJOR.MINOR.0`. Ordinary development builds report it verbatim; a
-//! RELEASE reports the same number with the DEV component reset to `0`, which
-//! is also its `vMAJOR.MINOR.PATCH` tag and its `aterm-<version>.dmg` asset
-//! name. `cargo ship cut` derives that release version from Cargo.toml and
-//! hands it to the build through `ATERM_APP_RELEASE_VERSION`.
-
-/// Cargo package version for the source tree being compiled.
-pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Select the release-cutter-owned app version when present, otherwise the
-/// source package version.
-#[must_use]
-pub const fn select_app_version(
-    package_version: &'static str,
-    release_version: Option<&'static str>,
-) -> &'static str {
-    match release_version {
-        Some(version) => {
-            assert!(
-                valid_private_app_version(version),
-                "ATERM_APP_RELEASE_VERSION must be MAJOR.MINOR.PATCH"
-            );
-            version
-        }
-        None => package_version,
-    }
-}
-
-/// Exactly three canonical numeric components: non-empty, ASCII digits only,
-/// and no leading zero unless the component IS `"0"` — so one release version
-/// has exactly ONE spelling and can never be admitted twice.
-const fn valid_private_app_version(version: &str) -> bool {
-    let bytes = version.as_bytes();
-    let mut index = 0;
-    // Component-local state: where this component started, so the leading-zero
-    // rule can be applied at each boundary.
-    let mut start = 0;
-    let mut components = 0;
-    while index <= bytes.len() {
-        let at_end = index == bytes.len();
-        if at_end || bytes[index] == b'.' {
-            let len = index - start;
-            if len == 0 {
-                return false;
-            }
-            if len > 1 && bytes[start] == b'0' {
-                return false;
-            }
-            components += 1;
-            start = index + 1;
-        } else if !bytes[index].is_ascii_digit() {
-            return false;
-        }
-        index += 1;
-    }
-    components == 3
-}
+//! There is exactly ONE version: `[workspace.package] version` in Cargo.toml,
+//! always `MAJOR.MINOR.0` (VERSIONING.md). Every build reports it as written —
+//! a release, a development build and a public-source build alike — and it is
+//! also the release's `vMAJOR.MINOR.0` tag and its `aterm-<version>.dmg` asset
+//! name. A release differs from a development build by its ledger build number
+//! and the cutter's release marker (`aterm-gui`'s `build_info::IS_RELEASE_BUILD`),
+//! never by a second version.
 
 /// Version shown by the application, command line, diagnostics, and terminal
-/// protocol identity.
-///
-/// `ATERM_APP_RELEASE_VERSION` is set to the canonical `MAJOR.MINOR.PATCH`
-/// release version (the workspace version with DEV reset to 0) by the release
-/// cutter on both architecture builds. It is deliberately absent from ordinary
-/// builds, which report the workspace's `MAJOR.MINOR.0` version as-is.
-pub const APP_VERSION: &str =
-    select_app_version(PACKAGE_VERSION, option_env!("ATERM_APP_RELEASE_VERSION"));
+/// protocol identity: `[workspace.package] version`, as written.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
 
-    #[test]
-    fn release_override_and_source_fallback_are_distinct() {
-        assert_eq!(select_app_version("0.2.1", None), "0.2.1");
-        assert_eq!(select_app_version("0.2.1", Some("0.2.0")), "0.2.0");
+    /// `[workspace.package] version` from a manifest's text, or `None`.
+    fn workspace_package_version(manifest: &str) -> Option<&str> {
+        let mut in_package = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_package = line == "[workspace.package]";
+            } else if in_package && let Some(value) = line.strip_prefix("version") {
+                return value
+                    .trim_start()
+                    .strip_prefix('=')?
+                    .trim()
+                    .strip_prefix('"')?
+                    .split('"')
+                    .next();
+            }
+        }
+        None
     }
 
+    /// The binary reports the workspace version exactly as Cargo.toml writes
+    /// it. Negative control: the same reader over a manifest whose workspace
+    /// version differs from this build's reads that other version, so the
+    /// equality below is a comparison and not a tautology.
     #[test]
-    #[should_panic(expected = "ATERM_APP_RELEASE_VERSION must be MAJOR.MINOR.PATCH")]
-    fn malformed_release_override_is_rejected() {
-        // The retired two-component private-app spelling is no longer a
-        // version — the scheme is MAJOR.MINOR.PATCH, period.
-        let _ = select_app_version("0.2.1", Some("0.59"));
-    }
+    fn the_app_version_is_the_workspace_version_as_written() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let manifest = std::fs::read_to_string(workspace.join("Cargo.toml"))
+            .expect("read the workspace manifest");
+        assert_eq!(workspace_package_version(&manifest), Some(APP_VERSION));
 
-    #[test]
-    fn version_shape_is_exactly_three_canonical_components() {
-        assert!(valid_private_app_version("0.2.0"));
-        assert!(valid_private_app_version("10.20.30"));
-        assert!(valid_private_app_version("0.0.0"));
-        // Wrong component count.
-        assert!(!valid_private_app_version("0.59"));
-        assert!(!valid_private_app_version("1"));
-        assert!(!valid_private_app_version("1.2.3.4"));
-        // Empty components.
-        assert!(!valid_private_app_version(""));
-        assert!(!valid_private_app_version("..."));
-        assert!(!valid_private_app_version("1..3"));
-        assert!(!valid_private_app_version(".2.3"));
-        assert!(!valid_private_app_version("1.2."));
-        // Non-canonical leading zeros.
-        assert!(!valid_private_app_version("01.2.3"));
-        assert!(!valid_private_app_version("1.02.3"));
-        assert!(!valid_private_app_version("1.2.03"));
-        // Non-numeric.
-        assert!(!valid_private_app_version("1.2.3-rc1"));
-        assert!(!valid_private_app_version("v1.2.3"));
-    }
-
-    #[test]
-    fn compiled_app_version_is_nonempty() {
-        assert!(!APP_VERSION.is_empty());
+        let other = "[package]\nversion = \"9.9.9\"\n\n[workspace.package]\nversion = \"0.1.0\"\n";
+        assert_eq!(workspace_package_version(other), Some("0.1.0"));
+        assert_ne!(workspace_package_version(other), Some(APP_VERSION));
     }
 
     fn rust_sources(root: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -150,10 +89,9 @@ mod tests {
         // AUTHORIZED second readers, each with the reason it cannot go through
         // APP_VERSION. A build script runs before its crate's dependencies are
         // built, so it CANNOT link aterm-types — and `CARGO_PKG_VERSION_*` in
-        // a build script is the same workspace `version` cargo derives
-        // APP_VERSION's own inputs from (see this module's `app_version()`),
-        // read at the only time a build script can read anything. The
-        // allowlist is exact paths, so a NEW bypass still fails loudly.
+        // a build script is the same workspace `version` APP_VERSION is, read
+        // at the only time a build script can read anything. The allowlist is
+        // exact paths, so a NEW bypass still fails loudly.
         let authorized: &[&str] = &[
             // The Windows VS_VERSION_INFO resource embedder.
             "crates/aterm/build.rs",

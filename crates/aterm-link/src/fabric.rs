@@ -124,13 +124,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
-
-use astream_broker::Client;
 
 use crate::body::Body;
 use crate::bridge::{read_cap_file, Config};
@@ -1039,40 +1035,19 @@ impl BrokerView {
 }
 
 /// One connection with a read and write bound on the socket underneath.
+///
+/// The connect itself is bounded too on TCP (a black-holed address costs
+/// IO_TIMEOUT, not the OS's SYN-retry schedule). The sealed wire keeps its
+/// handshake's own deadline, and every read and write after it is bounded
+/// through the closer — the one handle on the socket under the record layer — so
+/// a broker that completes the handshake and then never answers costs the
+/// operator IO_TIMEOUT, not a hung terminal.
 fn connect_bounded(t: &Transport, endpoint: &str) -> io::Result<Conn> {
-    match t {
-        Transport::Unix => {
-            let s = UnixStream::connect(endpoint)?;
-            s.set_read_timeout(Some(IO_TIMEOUT))?;
-            s.set_write_timeout(Some(IO_TIMEOUT))?;
-            Ok(Client::from_stream(
-                Box::new(s) as Box<dyn transport::Stream>
-            ))
-        }
-        Transport::Tcp => {
-            let addr = endpoint.to_socket_addrs()?.next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "the endpoint resolves to nothing")
-            })?;
-            let s = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
-            s.set_read_timeout(Some(IO_TIMEOUT))?;
-            s.set_write_timeout(Some(IO_TIMEOUT))?;
-            s.set_nodelay(true)?;
-            Ok(Client::from_stream(
-                Box::new(s) as Box<dyn transport::Stream>
-            ))
-        }
-        // The sealed wire is only in a `sealed` build, and its handshake is the
-        // transport's own (bounded there); `transport::connect` refuses it by
-        // name otherwise. The bound for every read after the handshake is set
-        // through the closer — the one handle on the socket under the record
-        // layer — so a broker that completes the handshake and then never
-        // answers costs the operator IO_TIMEOUT, not a hung terminal.
-        Transport::Sealed(_) => {
-            let (conn, closer) = transport::connect(t, endpoint)?;
-            closer.set_read_timeout(Some(IO_TIMEOUT))?;
-            Ok(conn)
-        }
-    }
+    let within = matches!(t, Transport::Tcp).then_some(IO_TIMEOUT);
+    let (conn, closer) = transport::connect_within(t, endpoint, within)?;
+    closer.set_read_timeout(Some(IO_TIMEOUT))?;
+    closer.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(conn)
 }
 
 /// The faces a report may read when the broker is guarded and `/f/<F>/>` is
@@ -4966,7 +4941,7 @@ mod tests {
         let lines: String = crate::enable::node_grants("lab", "n-a")
             .iter()
             .chain(std::iter::once(&"ro:/f/other/pub/>".to_string()))
-            .map(|g| format!("{g} 00\n"))
+            .map(|g| format!("{g} {}\n", "00".repeat(32)))
             .collect();
         std::fs::write(&cap, lines).expect("cap");
         let faces = readable_faces("lab", &[cap.to_string_lossy().into_owned()]);

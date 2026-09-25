@@ -24,21 +24,19 @@ button points at the current release asset, and `/releases` carries the notes.
 Both report the same version: a single `MAJOR.MINOR.0` whose patch slot is
 always `0` and whose `MINOR` is the knob that moves, described in
 [VERSIONING.md](VERSIONING.md). The authoritative value is the root Cargo
-workspace version, which `aterm --version` prints and which the staging gate
-checks by building a fresh, credential-free clone. Historical private labels
-are not public releases.
+workspace version, exported exactly as committed, which `aterm --version`
+prints and which the staging gate checks by building a fresh, credential-free
+clone. Historical private labels are not public releases.
 
 ## What the transform changes
 
 The publication transform makes only reviewable boundary changes:
 
-- sets the public Cargo workspace and first-party lockfile records to the
-  public `X.Y.0`;
 - pins the public build to a stock Rust release — `rust-toolchain.toml` names
   it — and omits the private Trust-only Cargo configuration;
 - points repository and update defaults at the public `alabsystems` namespace;
-- normalizes local-machine path and credential-shaped test fixtures without
-  changing the behavior they test; and
+- anonymizes local-machine paths in test fixtures without changing the
+  behavior they test; and
 - excludes everything outside the export allowlist — operational notes, the
   changelog and release ledger, man pages, the release and publication
   machinery, internal proof packets, generated tool caches, and unused traced

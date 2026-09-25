@@ -22,6 +22,7 @@ use crate::model::{Glyph, Intent, Message, MessageId, Origin, Severity, Tag, Wal
 use crate::text::clip;
 use crate::{
     DETAIL_LINE_CAP, DETAIL_LINES_CAP, Instant, KEY_CAP, LOG_CAP, PENDING_PERSIST_CAP, TITLE_CAP,
+    WIRE_LOG_SHARE,
 };
 
 /// The longest line the decoder accepts. Sized from the model's caps so that
@@ -211,6 +212,13 @@ impl LogRecord {
         self.state == LogState::Posted
     }
 
+    /// The wire's record ([`Origin::wire_owned`]): it counts against the
+    /// ring's [`WIRE_LOG_SHARE`].
+    #[must_use]
+    pub fn wire_owned(&self) -> bool {
+        self.origin.wire_owned(self.key.as_deref())
+    }
+
     /// How it retired, if it has.
     #[must_use]
     pub fn retired(&self) -> Option<&Retired> {
@@ -256,6 +264,19 @@ pub enum LogLine {
         /// How many.
         count: u32,
     },
+}
+
+/// Which file a line lands in (design ruling 200). The wire's lines —
+/// every line about a record [`LogRecord::wire_owned`] — rotate on their
+/// own budget in their own file, so a script's flood turns over only its
+/// own history on disk, never aterm's (the ring's share, ruling 194, is
+/// the same rule in memory).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shelf {
+    /// aterm's own record: `messages.log`.
+    Host,
+    /// The wire's: `messages.wire.log`.
+    Wire,
 }
 
 /// Why a line did not decode; the loader skips it.
@@ -599,7 +620,7 @@ pub(crate) struct FinalWords<'a> {
 pub struct MessageLog {
     ring: VecDeque<LogRecord>,
     next_id: u64,
-    pending: VecDeque<LogLine>,
+    pending: VecDeque<(LogLine, Shelf)>,
     dropped: u32,
 }
 
@@ -735,18 +756,31 @@ impl MessageLog {
     /// The lines waiting for the host, oldest first, left in place (the
     /// handoff carry reads them without draining).
     pub fn pending_lines(&self) -> impl Iterator<Item = &LogLine> {
-        self.pending.iter()
+        self.pending.iter().map(|(line, _)| line)
     }
 
     /// Take every pending line, oldest first. When lines were dropped past
     /// [`PENDING_PERSIST_CAP`] since the last drain, a trailing
     /// [`LogLine::Dropped`] says how many.
     pub fn drain_pending(&mut self) -> Vec<LogLine> {
-        let mut out: Vec<LogLine> = self.pending.drain(..).collect();
+        self.drain_shelved()
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// [`Self::drain_pending`], each line with the file it lands in
+    /// ([`Shelf`], decided when the line was queued). A `Dropped` line is
+    /// the host's: the gap is in aterm's record.
+    pub fn drain_shelved(&mut self) -> Vec<(LogLine, Shelf)> {
+        let mut out: Vec<(LogLine, Shelf)> = self.pending.drain(..).collect();
         if self.dropped > 0 {
-            out.push(LogLine::Dropped {
-                count: self.dropped,
-            });
+            out.push((
+                LogLine::Dropped {
+                    count: self.dropped,
+                },
+                Shelf::Host,
+            ));
             self.dropped = 0;
         }
         out
@@ -780,10 +814,24 @@ impl MessageLog {
     /// verb and the Settings page read it there; the Retired line merges its
     /// final words into it). [`crate::MAX_LIVE`] ≤ [`LOG_CAP`], so a retired
     /// record is always there to evict; the oldest of all goes only if the
-    /// ring were somehow all live.
+    /// ring were somehow all live. The wire has a SHARE: once
+    /// [`WIRE_LOG_SHARE`] records are the wire's
+    /// ([`Origin::wire_owned`]), the oldest retired wire record goes first,
+    /// so a script's records can never push aterm's own out (design ruling
+    /// 194).
     fn push_record(&mut self, rec: LogRecord) {
         if self.ring.len() >= LOG_CAP {
-            match self.ring.iter().position(|r| !r.is_live()) {
+            let wire_full = self.ring.iter().filter(|r| r.wire_owned()).count() >= WIRE_LOG_SHARE;
+            let wire_victim = || {
+                self.ring
+                    .iter()
+                    .position(|r| r.wire_owned() && !r.is_live())
+            };
+            let victim = wire_full
+                .then(wire_victim)
+                .flatten()
+                .or_else(|| self.ring.iter().position(|r| !r.is_live()));
+            match victim {
                 Some(i) => {
                     self.ring.remove(i);
                 }
@@ -796,11 +844,19 @@ impl MessageLog {
     }
 
     pub(crate) fn push_pending(&mut self, line: LogLine) {
+        let wire = match &line {
+            LogLine::Posted(rec) => rec.wire_owned(),
+            LogLine::Retired { id, .. } | LogLine::Acted { id, .. } => {
+                self.get(*id).is_some_and(LogRecord::wire_owned)
+            }
+            LogLine::Dropped { .. } => false,
+        };
         if self.pending.len() == PENDING_PERSIST_CAP {
             self.pending.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.pending.push_back(line);
+        let owner = if wire { Shelf::Wire } else { Shelf::Host };
+        self.pending.push_back((line, owner));
     }
 
     /// A post: into the ring and the pending queue.
@@ -938,9 +994,7 @@ pub(crate) mod tests {
                     path: "/a b/c\t.log".into(),
                 },
                 Intent::NotNow {
-                    decision: Decision::AdminStep {
-                        names: vec!["clt".into(), "brew".into()],
-                    },
+                    decision: Decision::FileAccess,
                 },
             ],
             key: Some("crash.last=\tk".into()),
@@ -1178,6 +1232,139 @@ pub(crate) mod tests {
         assert_eq!(log.pending_len(), 0);
     }
 
+    /// Design ruling 200: every line about a wire-owned record — its Posted,
+    /// its Retired, its Acted — is shelved for the wire's file; aterm's own
+    /// lines, and the honest `Dropped` gap, for `messages.log`.
+    #[test]
+    fn every_line_is_shelved_with_its_records_owner() {
+        let mut log = MessageLog::empty();
+        let post = |log: &mut MessageLog, origin: Origin, key: Option<&str>| {
+            let id = log.mint();
+            log.record_posted(LogRecord {
+                id,
+                origin,
+                key: key.map(str::to_string),
+                ..posted(1)
+            });
+            log.record_retired(
+                id,
+                Retired::Recorded,
+                2,
+                Instant::now(),
+                FinalWords {
+                    title: "t",
+                    detail: &[],
+                    repeats: 1,
+                },
+            );
+            log.record_acted(id, 3, "Details");
+            id
+        };
+        let host = post(&mut log, Origin::Host, None);
+        let wire = post(&mut log, Origin::Wire, None);
+        let carried = post(&mut log, Origin::Carried, Some("wire.build"));
+        let shelved = log.drain_shelved();
+        assert_eq!(shelved.len(), 9);
+        for (line, shelf) in &shelved {
+            let want = if line.id() == Some(host) {
+                Shelf::Host
+            } else {
+                assert!(line.id() == Some(wire) || line.id() == Some(carried));
+                Shelf::Wire
+            };
+            assert_eq!(*shelf, want, "{line:?}");
+        }
+        // Overflow: the gap line is the host's.
+        for _ in 0..(PENDING_PERSIST_CAP + 1) {
+            post(&mut log, Origin::Wire, None);
+        }
+        let shelved = log.drain_shelved();
+        let count = u32::try_from((PENDING_PERSIST_CAP + 1) * 3 - PENDING_PERSIST_CAP).unwrap();
+        assert_eq!(
+            shelved.last(),
+            Some(&(LogLine::Dropped { count }, Shelf::Host))
+        );
+    }
+
+    /// Review (2026-09-24, design ruling 194): a script posting once a
+    /// second must not push aterm's own history (the crash record, a config
+    /// error) out of the ring. The wire's records past [`WIRE_LOG_SHARE`]
+    /// evict each other; a host record goes only to another host record.
+    #[test]
+    fn wire_records_never_push_aterms_own_out_of_the_ring() {
+        let retire = |log: &mut MessageLog, rec: LogRecord| {
+            let id = rec.id;
+            log.record_posted(rec);
+            log.record_retired(
+                id,
+                Retired::Recorded,
+                0,
+                Instant::now(),
+                FinalWords {
+                    title: "t",
+                    detail: &[],
+                    repeats: 1,
+                },
+            );
+        };
+        let host = |log: &mut MessageLog| {
+            let id = log.mint();
+            LogRecord {
+                id,
+                origin: Origin::Host,
+                key: None,
+                ..posted(1)
+            }
+        };
+        let wire = |log: &mut MessageLog| {
+            let id = log.mint();
+            LogRecord {
+                id,
+                origin: Origin::Wire,
+                key: None,
+                ..posted(1)
+            }
+        };
+        // One host record, then 600 wire records.
+        let mut log = MessageLog::empty();
+        let crash = host(&mut log);
+        let crash_id = crash.id;
+        retire(&mut log, crash);
+        for _ in 0..600 {
+            let rec = wire(&mut log);
+            retire(&mut log, rec);
+        }
+        assert_eq!(log.len(), LOG_CAP);
+        assert!(log.get(crash_id).is_some(), "the host record stays");
+        // A ring FULL of host records: the wire takes its share and no more.
+        let mut log = MessageLog::empty();
+        for _ in 0..LOG_CAP {
+            let rec = host(&mut log);
+            retire(&mut log, rec);
+        }
+        for _ in 0..600 {
+            let rec = wire(&mut log);
+            retire(&mut log, rec);
+        }
+        let wire_n = log.records().filter(|r| r.wire_owned()).count();
+        assert_eq!(wire_n, WIRE_LOG_SHARE);
+        assert_eq!(log.len() - wire_n, LOG_CAP - WIRE_LOG_SHARE);
+        // A carried wire row's record (origin carried, a `wire.` key) is the
+        // wire's too; a host key is not.
+        let carried = LogRecord {
+            origin: Origin::Carried,
+            key: Some("wire.build".into()),
+            ..posted(1)
+        };
+        assert!(carried.wire_owned());
+        let hosted = LogRecord {
+            origin: Origin::Carried,
+            key: Some("update.progress".into()),
+            ..posted(1)
+        };
+        assert!(!hosted.wire_owned());
+    }
+
     /// REVIEW (2026-09-22): a message at the crate's OWN caps reads back
     /// from its own line. The caps are in CHARS (24 × 240 detail + 120
     /// title + 48 key); [`MAX_LINE_BYTES`] is in BYTES, so it is sized from
@@ -1198,8 +1385,8 @@ pub(crate) mod tests {
                 .action(Intent::OpenPath {
                     path: format!("/{}", unit.repeat(200)),
                 })
-                .action(Intent::InstallElevated {
-                    names: vec![unit.repeat(100), unit.repeat(100)],
+                .action(Intent::OpenSystemPane {
+                    pane: unit.repeat(200),
                 })
                 .normalized();
             let rec = LogRecord::from_posted(MessageId::FIRST, WallStamp { unix_ms: 1 }, &msg);

@@ -83,9 +83,6 @@ pub use aterm_grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 // Modules that remain in aterm-core
 // ============================================================================
 
-/// FFI bridge for grid operations.
-pub(crate) mod ffi_bridge;
-
 #[cfg(test)]
 #[path = "../../test_support/grid/tests/mod.rs"]
 mod tests;
@@ -97,9 +94,8 @@ mod tests;
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{Damage, DamagedRowIterator, LineDamageBounds, RowDamageBounds};
 pub use extra::{CellCoord, CellExtra, CellExtras, KittyPlaceholderData, UniformExtras};
-// `crate::grid::PAGE_SIZE` is the flat re-export consumed by the FFI safe-helper
-// layer (ffi_bridge/safe_helpers.rs compile-time size guard); in-crate code
-// reaches it via `grid::page::PAGE_SIZE`.
+// `crate::grid::PAGE_SIZE` is a flat re-export; in-crate code reaches it via
+// `grid::page::PAGE_SIZE`.
 #[allow(
     unused_imports,
     reason = "flat re-export consumed by the FFI/verification layer"

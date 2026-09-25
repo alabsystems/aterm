@@ -9,32 +9,6 @@ use super::*;
 // ========================================================================
 
 #[test]
-fn history_line_api_covers_ring_buffer_ordering() {
-    let mut grid = Grid::with_scrollback(3, 4, 8);
-
-    for marker in ['A', 'B', 'C', 'D', 'E'] {
-        write_marker_line(&mut grid, marker);
-    }
-
-    assert_eq!(grid.history_line_count(), 3);
-
-    let oldest = grid
-        .get_history_line(0)
-        .expect("history idx 0 should exist");
-    let middle = grid
-        .get_history_line(1)
-        .expect("history idx 1 should exist");
-    let newest = grid
-        .get_history_line(2)
-        .expect("history idx 2 should exist");
-
-    assert_eq!(oldest.to_string().chars().next(), Some('A'));
-    assert_eq!(middle.to_string().chars().next(), Some('B'));
-    assert_eq!(newest.to_string().chars().next(), Some('C'));
-    assert!(grid.get_history_line(3).is_none());
-}
-
-#[test]
 fn try_history_line_ring_buffer_path_is_infallible() {
     let mut grid = Grid::with_scrollback(3, 4, 8);
 

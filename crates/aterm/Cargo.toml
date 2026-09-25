@@ -45,15 +45,16 @@ trust-gate = { path = "../trust-gate" }
 # Mach-O carries it: before 2026-09-10 this crate lived outside the workspace
 # and path-depended on a sibling astream checkout, so no release ever shipped
 # the bridge and turning the fabric on meant building two repositories by hand.
-# Its astream crates are vendored under vendor/astream (see that README); the
-# sealed cross-host transport is behind its off-by-default `sealed` feature, so
-# this adds no cipher tree to the shipped binary.
+# Its astream crates come from the vendor/astream submodule (see
+# vendor/README-astream.md); the sealed cross-host transport is behind its
+# off-by-default `sealed` feature, so this adds no cipher tree to the shipped
+# binary.
 #
 # UNIX ONLY, on purpose (2026-09-14): the bridge is Unix-domain sockets and
 # descriptors inherited at fixed numbers (`aterm_uds::spawnfd`: `dup2` between
 # fork and exec) end to end — `std::os::unix` and `std::os::fd` at module
 # level across ctl.rs, mirror.rs and transport.rs — and its Unix-domain
-# sharding in the vendored astream broker (`astream_broker::sharded`) is
+# sharding in the astream broker (`astream_broker::sharded`) is
 # `cfg(unix)` too (the broker itself serves TCP on Windows); on macOS the
 # broker is kept alive by launchd. Unconditional, it made the shipped Windows
 # binary unbuildable from the commit that made it a workspace member

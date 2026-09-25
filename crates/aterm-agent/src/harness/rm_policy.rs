@@ -43,15 +43,16 @@
 //! 2. **The line is small and plain.** Longer than [`MAX_LINE_BYTES`], a
 //!    control character other than newline or tab, or whitespace outside ASCII
 //!    (Rust splits on it, the shell does not): abstain. So does any `$(`,
-//!    backtick, subshell or group — the segmentation cannot say which words
-//!    such a construct contributes to the `rm` around it (`rm -rf x$(echo) cat
-//!    /etc` reads as three harmless segments and is one `rm` of three
-//!    operands). And so does anything that lets the shell's idea of "inside
-//!    quotes" part from classify's, judged on the raw text, quoted or not: a
-//!    `#` (a comment's apostrophe opens a quote for this reader that the shell
-//!    never opened, and the NEXT LINE vanishes into it), `<<` (a here-document
-//!    body, likewise), and `$'`, `$"`, `${`. See "What this slice found in
-//!    classify" below: those lines are in the corpus.
+//!    backtick, subshell or group — no reading can say which words such a
+//!    construct contributes to the `rm` around it (`rm -rf x$(echo) cat /etc`
+//!    is one `rm` of three operands, and an unquoted substitution's output is
+//!    split into as many as it prints). And so does anything that lets the
+//!    shell's idea of "inside quotes" part from classify's, judged on the raw
+//!    text, quoted or not: a `#` (a comment's apostrophe opens a quote for
+//!    this reader that the shell never opened, and the NEXT LINE vanishes
+//!    into it), `<<` (a here-document body, likewise), and `$'`, `$"`, `${`.
+//!    See "What this slice found in classify" below: those lines are in the
+//!    corpus.
 //! 3. **The prefix is sane.** With [`CwdPrefix::SessionCwd`] or
 //!    [`CwdPrefix::Dir`] the prefix must be absolute, free of `..`, and not
 //!    "too wide": the filesystem root, `/Users`, `/home`, a direct child of
@@ -333,11 +334,11 @@ pub enum CwdPrefix {
     /// [`DenyPattern::Home`] matches the home directory itself, an ancestor
     /// of it, and a glob DIRECTLY inside it — one level deeper is not
     /// matched. MEASURED under `Off` with the shipped deny list and a home
-    /// of `/Users//_owner`: `rm -rf /etc/passwd`, `rm -rf /usr/local`,
+    /// of `/Users/_owner`: `rm -rf /etc/passwd`, `rm -rf /usr/local`,
     /// `rm -rf /System/Library`, `rm -rf /bin`, `rm -rf /var`,
-    /// `rm -rf /Applications`, `rm -rf /Users//_owner/.ssh` and
-    /// `rm -rf /Users//_owner/Documents` all come back [`Verdict::Allow`],
-    /// while `rm -rf /` and `rm -rf /Users//_owner/*` stay abstentions. So
+    /// `rm -rf /Applications`, `rm -rf /Users/_owner/.ssh` and
+    /// `rm -rf /Users/_owner/Documents` all come back [`Verdict::Allow`],
+    /// while `rm -rf /` and `rm -rf /Users/_owner/*` stay abstentions. So
     /// `Off` does not mean "no directory requirement" in practice, it means
     /// "auto-approve the whole filesystem but a handful of shapes": give it
     /// [`RmPolicy::deny_patterns`] of your own, or do not set it. Whether the
@@ -382,7 +383,7 @@ pub struct RmPolicy {
     pub require_cwd_prefix: CwdPrefix,
     /// The owner's home directory, INJECTED by the host (this module reads no
     /// environment). `None` leaves [`DenyPattern::Home`] and the home half of
-    /// the too-wide-prefix rule inert; `/Users//<x>` and `/home/<x>` are still
+    /// the too-wide-prefix rule inert; `/Users/<x>` and `/home/<x>` are still
     /// caught by shape.
     pub home: Option<PathBuf>,
 }
@@ -1120,7 +1121,7 @@ mod tests {
 
     fn policy() -> RmPolicy {
         RmPolicy {
-            home: Some(PathBuf::from("/Users//_owner")),
+            home: Some(PathBuf::from("/Users/_owner")),
             ..RmPolicy::default()
         }
     }
@@ -1257,7 +1258,7 @@ mod tests {
         ("rm -rf /.", Abstain("deny:filesystem root")),
         ("rm -rf x /", Abstain("deny:filesystem root")),
         (
-            "rm -rf x /Users//_owner/../..",
+            "rm -rf x /Users/_owner/../..",
             Abstain("unresolvable:a .. component"),
         ),
         ("rm -rf /*", Abstain("deny:glob at root")),
@@ -1281,10 +1282,10 @@ mod tests {
             Abstain("line:${…}, $'…' or $\"…\" is not modelled"),
         ),
         ("rm -rf '$HOME'", Abstain("unresolvable:$HOME")),
-        ("rm -rf /Users//_owner", Abstain("deny:home")),
+        ("rm -rf /Users/_owner", Abstain("deny:home")),
         ("rm -rf /users/_OWNER/", Abstain("deny:home")),
         ("rm -rf /Users", Abstain("deny:home")),
-        ("rm -rf /Users//_someone", Abstain("deny:/Users")),
+        ("rm -rf /Users/_someone", Abstain("deny:/Users")),
         ("rm -rf /home/someone", Abstain("deny:/Users")),
         // Anything a shell would still expand.
         ("rm -rf $TMPDIR/x", Abstain("unresolvable:an unexpanded $")),
@@ -1548,11 +1549,13 @@ mod tests {
         ),
         ("rm \"file#1\"", Abstain("line:a # can start a comment")),
         ("rm x <<< y", Abstain("line:a here-document")),
-        // An rm with no `rm` token: the redirect is glued to the head.
+        // An rm with no `rm` token: the redirect is glued to the head. The
+        // splitter detaches a glued `>` and, since 2026-09-24, a glued `&>`,
+        // so each is the rm of `/` it is.
         ("rm a; rm>/dev/null -rf /", Abstain("deny:filesystem root")),
         (
             "rm a; /bin/rm&>/dev/null -rf /",
-            Abstain("segment:starts with a redirect or a flag"),
+            Abstain("deny:filesystem root"),
         ),
         (
             "rm a; -rf /",
@@ -1676,6 +1679,51 @@ mod tests {
         }
     }
 
+    /// A command whose name classify cannot read never rides an approved
+    /// `rm`: each line of classify's `MEASURED_SUBSTITUTION_BYPASSES`, the
+    /// peer's `$R` heads, and the redirect- and dash-led names, alone and
+    /// beside a removal this policy approves, whichever separator joins
+    /// them. Immune by construction — rule 2 refuses every `$(` and
+    /// backtick, rule 4 wants a companion's literal name at every other
+    /// head and refuses one led by a redirect or a flag, rule 5 a literal
+    /// `rm` — and MEASURED so on origin/main `d8f5fd244` (2026-09-24),
+    /// where classify itself read every substitution line as a read. This
+    /// pins it.
+    #[test]
+    fn a_command_name_classify_cannot_read_abstains() {
+        const VISIBLE: &str = "rm -rf build/x";
+        let v = eval(VISIBLE);
+        assert_eq!(
+            v.decision,
+            RmDecision::Allow,
+            "the control must allow: {v:?}"
+        );
+        let hidden = crate::supervise::classify::MEASURED_SUBSTITUTION_BYPASSES
+            .iter()
+            .map(|(line, _)| *line)
+            .chain([
+                "R=rm; $R -rf /usr",
+                "$R -rf /usr",
+                "/bin/$R -rf /usr",
+                "P=/bin/rm; $P -rf /usr",
+                "2>/dev/null rm -rf /usr",
+                "< /dev/null rm -rf /usr",
+                "2>/dev/null touch /tmp/x",
+                "- rm -rf /usr",
+                "- touch /tmp/x",
+                "rm&>/dev/null -rf /usr",
+            ]);
+        for hidden in hidden {
+            let v = eval(hidden);
+            assert_eq!(v.decision, RmDecision::Abstain, "{hidden:?}: {v:?}");
+            for sep in ["; ", " && ", " | ", " & ", "\n"] {
+                let line = format!("{VISIBLE}{sep}{hidden}");
+                let v = eval(&line);
+                assert_eq!(v.decision, RmDecision::Abstain, "{line:?}: {v:?}");
+            }
+        }
+    }
+
     #[test]
     fn mode_off_always_abstains_and_prompt_only_declines_pre_tool_use() {
         let cwd = Path::new(CWD);
@@ -1751,8 +1799,8 @@ mod tests {
         for (cmd, reason) in [
             ("rm -rf /", "deny:filesystem root"),
             ("rm -rf /*", "deny:glob at root"),
-            ("rm -rf /Users//_owner", "deny:home"),
-            ("rm -rf /Users//_owner/*", "deny:home"),
+            ("rm -rf /Users/_owner", "deny:home"),
+            ("rm -rf /Users/_owner/*", "deny:home"),
             ("rm -rf /USERS/x", "deny:/Users"),
             ("rm -rf ~/x", "unresolvable:~"),
             ("rm -rf ../x", "unresolvable:a .. component"),
@@ -1769,7 +1817,7 @@ mod tests {
         for cwd in [
             "/",
             "/Users",
-            "/Users//_owner",
+            "/Users/_owner",
             "/users/other",
             "/home/me",
             "/home",
@@ -1915,7 +1963,7 @@ mod tests {
         }
         // With no home injected the shape rules still catch a home directory.
         let v = evaluate(
-            "rm -rf /Users//_owner",
+            "rm -rf /Users/_owner",
             Path::new(CWD),
             HookEvent::PermissionRequest,
             &d,

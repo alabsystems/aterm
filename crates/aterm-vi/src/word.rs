@@ -285,11 +285,69 @@ mod tests {
 
     // ---- Semantic word motions (w / b / e / ge) ----
 
+    /// `(what, motion, line, start col, landing col)` on a one-row grid —
+    /// the semantic motions (w / b / e / ge) stop at separators, the
+    /// whitespace ones (W / B / E / gE) only at blanks.
     #[test]
-    fn word_right_skips_word_then_spaces() {
-        let grid = MockGrid::new(1, 20).with_line(0, "hello world");
-        let result = semantic_word_right(&grid, ViPoint::new(0, 0), SEP);
-        assert_eq!(result.col, 6);
+    fn word_motion_landings() {
+        type Motion = fn(&MockGrid, ViPoint) -> ViPoint;
+        let w: Motion = |g, p| semantic_word_right(g, p, SEP);
+        let b: Motion = |g, p| semantic_word_left(g, p, SEP);
+        let e: Motion = |g, p| semantic_word_right_end(g, p, SEP);
+        let ge: Motion = |g, p| semantic_word_left_end(g, p, SEP);
+        let big_w: Motion = |g, p| whitespace_word_right(g, p);
+        let big_b: Motion = |g, p| whitespace_word_left(g, p);
+        let big_e: Motion = |g, p| whitespace_word_right_end(g, p);
+        let big_ge: Motion = |g, p| whitespace_word_left_end(g, p);
+        for (what, motion, line, cols, start, col) in [
+            (
+                "w skips the word, then the spaces",
+                w,
+                "hello world",
+                20,
+                0,
+                6,
+            ),
+            (
+                "b finds the start of the current word",
+                b,
+                "hello world",
+                20,
+                8,
+                6,
+            ),
+            ("b jumps to the previous word", b, "hello world", 20, 6, 0),
+            (
+                "e finds the end of the next word",
+                e,
+                "hello world",
+                20,
+                0,
+                4,
+            ),
+            (
+                "ge finds the end of the previous word",
+                ge,
+                "hello world",
+                20,
+                8,
+                4,
+            ),
+            ("W skips over punctuation", big_w, "foo.bar baz", 30, 0, 8),
+            ("B finds the start", big_b, "foo.bar baz", 30, 9, 8),
+            ("E finds the end", big_e, "foo.bar baz", 30, 0, 6),
+            (
+                "gE finds the end of the previous",
+                big_ge,
+                "foo.bar baz",
+                30,
+                9,
+                6,
+            ),
+        ] {
+            let grid = MockGrid::new(1, cols).with_line(0, line);
+            assert_eq!(motion(&grid, ViPoint::new(0, start)).col, col, "{what}");
+        }
     }
 
     #[test]
@@ -299,63 +357,7 @@ mod tests {
         assert_eq!(result.line, 0);
     }
 
-    #[test]
-    fn word_left_finds_start_of_current_word() {
-        let grid = MockGrid::new(1, 20).with_line(0, "hello world");
-        let result = semantic_word_left(&grid, ViPoint::new(0, 8), SEP);
-        assert_eq!(result.col, 6);
-    }
-
-    #[test]
-    fn word_left_jumps_to_previous_word() {
-        let grid = MockGrid::new(1, 20).with_line(0, "hello world");
-        let result = semantic_word_left(&grid, ViPoint::new(0, 6), SEP);
-        assert_eq!(result.col, 0);
-    }
-
-    #[test]
-    fn word_right_end_finds_end_of_next_word() {
-        let grid = MockGrid::new(1, 20).with_line(0, "hello world");
-        let result = semantic_word_right_end(&grid, ViPoint::new(0, 0), SEP);
-        assert_eq!(result.col, 4);
-    }
-
-    #[test]
-    fn word_left_end_finds_end_of_previous_word() {
-        let grid = MockGrid::new(1, 20).with_line(0, "hello world");
-        let result = semantic_word_left_end(&grid, ViPoint::new(0, 8), SEP);
-        assert_eq!(result.col, 4);
-    }
-
     // ---- Whitespace word motions (W / B / E / gE) ----
-
-    #[test]
-    fn ws_word_right_skips_over_punctuation() {
-        let grid = MockGrid::new(1, 30).with_line(0, "foo.bar baz");
-        let result = whitespace_word_right(&grid, ViPoint::new(0, 0));
-        assert_eq!(result.col, 8);
-    }
-
-    #[test]
-    fn ws_word_left_finds_start() {
-        let grid = MockGrid::new(1, 30).with_line(0, "foo.bar baz");
-        let result = whitespace_word_left(&grid, ViPoint::new(0, 9));
-        assert_eq!(result.col, 8);
-    }
-
-    #[test]
-    fn ws_word_right_end_finds_end() {
-        let grid = MockGrid::new(1, 30).with_line(0, "foo.bar baz");
-        let result = whitespace_word_right_end(&grid, ViPoint::new(0, 0));
-        assert_eq!(result.col, 6);
-    }
-
-    #[test]
-    fn ws_word_left_end_finds_end_of_previous() {
-        let grid = MockGrid::new(1, 30).with_line(0, "foo.bar baz");
-        let result = whitespace_word_left_end(&grid, ViPoint::new(0, 9));
-        assert_eq!(result.col, 6);
-    }
 
     // ---- Scrollback content traversal (one-motion line cache) ----
 

@@ -205,8 +205,7 @@ fn verify_under(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), RosterRe
 
 /// **Step 1–3.** Verify the roster's exact bytes under the pinned master keyset.
 ///
-/// The master anchor is a LIST for the same reason the channel keyset is: a client that
-/// accepts exactly one key cannot be told about a replacement by a document it would
+/// The master anchor is a LIST because a client that accepts exactly one key cannot be told about a replacement by a document it would
 /// refuse to verify. An EMPTY slice means the tier is unpinned, and unpinned means inert —
 /// this returns [`RosterReject::Disabled`] and authorizes nothing. That is the fail-closed
 /// default, not a bypass.
@@ -356,8 +355,7 @@ impl Roster {
     ///
     /// Duplicate PUBKEYS are the half that is easy to miss and worse when it happens,
     /// because it defeats revocation — the single property this whole tier exists to
-    /// provide, and, since the keyset stopped being an authorization input on the armed
-    /// client path, the only authorization defence left. Authority is decided by KEY
+    /// provide, and the only authorization defence the client has. Authority is decided by KEY
     /// (`authorize_appcast` verifies against every live machine's key and reports the
     /// first that matches) while denial is expressed by ID. So one key listed under two
     /// ids means revoking either id withdraws nothing: `live()` drops the named entry,
@@ -977,10 +975,9 @@ mod tests {
     /// its twin, and the same key signs on under the surviving id. The owner would have
     /// revoked the machine, watched it succeed, and still be publishable by it.
     ///
-    /// That matters more than it used to. With the master armed, the compiled-in keyset
-    /// is no longer an authorization input on the client (`fetch_authoritative_release`
-    /// branch B), so the roster's deny-list is the ONLY thing that can withdraw a
-    /// machine's authority. A hole in it is a hole in the whole tier.
+    /// The roster's deny-list is the ONLY thing that can withdraw a machine's authority —
+    /// the client consults no other key (`fetch_authoritative_release`). A hole in it is a
+    /// hole in the whole tier.
     ///
     /// Refused in the client's own parser rather than only in the minting tool, because
     /// the only way to produce such a document is to hand-edit one and re-sign it from

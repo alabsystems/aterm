@@ -41,6 +41,12 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Stage children lead process groups of their own, so the terminal's
+    // Ctrl-C no longer reaches them: the gate forwards it, and SIGTERM/SIGHUP,
+    // to every group still running before it dies (`exec::group`).
+    #[cfg(unix)]
+    exec::group::kill_on_interrupt();
+
     // WHERE THIS RUN'S OWN OUTPUT GOES, before anything reads the tree. A log
     // redirected into the checkout is an untracked file that GROWS for the
     // length of the run, and an untracked file is part of the source identity
@@ -87,6 +93,26 @@ fn main() {
         .map(|(_, own)| own)
         .unwrap_or_default();
 
+    // ONE GATE PER MACHINE, before the source is chosen: a second gate waits for
+    // the running one instead of running beside it (`snapshot::hold_machine` —
+    // two gates at once poison each other's evidence). The self-test verifies
+    // the gate itself and stays unserialized. Held until the process exits.
+    // A gate started BY the holding gate (a stage driving this binary) runs
+    // inside that hold instead of queueing on its own ancestor until the stage
+    // ceiling kills the stage.
+    let _machine = if parsed.selftest || snapshot::inside_machine_holder() {
+        None
+    } else {
+        match snapshot::hold_machine(&root) {
+            Ok(hold) => Some(hold),
+            Err(why) => {
+                print!("{}", snapshot::machine_could_not_run_text(&why));
+                std::fs::remove_dir_all(&scratch).ok();
+                std::process::exit(exit::COULD_NOT_RUN);
+            }
+        }
+    };
+
     // THE SNAPSHOT, before anything reads the tree — `--changed` included, so
     // its selection is of the same tree the stages build.
     let (snap, notes) = match choose_source(&parsed, &root, &env, &scratch) {
@@ -122,6 +148,7 @@ fn main() {
     )
     .with_prelude(prelude)
     .with_timings(timings)
+    .with_progress_log(log.as_ref().and_then(|(_, f)| f.try_clone().ok()))
     .with_notes(
         identity::own_output_note(&excluded)
             .into_iter()
@@ -135,6 +162,14 @@ fn main() {
     // root this run will actually build — and BEFORE any stage runs, because the
     // whole point is that every child of one run is given the same answer.
     ctx = ctx.with_pinned_child_facts();
+    // Every child learns which gate holds the machine, so a gate a stage
+    // starts is recognised as part of this run (`snapshot::inside_machine_holder`).
+    if _machine.is_some() {
+        ctx.child_env_add.push((
+            snapshot::MACHINE_HOLDER_ENV.into(),
+            std::process::id().to_string().into(),
+        ));
+    }
     if let Some(gib) = parsed.disk_floor_gib {
         ctx = ctx.with_disk_floor(gib * aterm_verify::disk::GIB);
     }
@@ -158,6 +193,10 @@ fn main() {
     if let Some(s) = snap {
         s.finish();
     }
+    // The kernel releases the machine lock when this process ends, however it
+    // ends; release it now anyway, so a waiting gate starts while this one is
+    // still printing its last lines.
+    drop(_machine);
 
     if std::io::stderr().is_terminal() {
         let secs = started.elapsed().as_secs_f64();
@@ -307,7 +346,12 @@ fn open_log(env: &EnvSnapshot, run_root: &Path) -> Option<(PathBuf, std::fs::Fil
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::File::create(&path) {
+    // Truncated, then reopened APPENDING: the ladder's copy and every stage's
+    // finish line (written from the stage threads as they end) share this
+    // file, and an appending write lands whole at the end.
+    match std::fs::File::create(&path)
+        .and_then(|_| std::fs::OpenOptions::new().append(true).open(&path))
+    {
         Ok(f) => Some((path, f)),
         Err(e) => {
             eprintln!("verify: cannot write the run log {}: {e}", path.display());

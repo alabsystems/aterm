@@ -5,7 +5,8 @@
 // on the CPU renderer. The contract under test:
 //   * empty cat fields (quads empty / atlas absent — and quads empty WITH an
 //     atlas set) are byte-identical to the pre-cat path, also after
-//     `clear_overlays` (the `image plain` contract);
+//     `clear_overlays` (the `image plain` contract) — the `cat_quads` row of
+//     `tests/empty_channels.rs`;
 //   * pass 1c z-order: cat sprites draw UNDER the row's glyphs and UNDER inline
 //     images (matching the GPU's `emit_base_pre` stream order);
 //   * the cat stamp is NEAREST 1:1 and endpoint-exact (tint 0xFFFFFF + alpha
@@ -92,56 +93,6 @@ fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
         alpha: 255,
         flip_x: false,
     }
-}
-
-#[test]
-fn empty_cat_fields_are_byte_identical_also_after_clear_overlays() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let (_, ch) = rend.cell_size();
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lkitty cat");
-
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    // Empty quads + NO atlas (the common off state).
-    let mut input = term.cell_frame(3, 12);
-    assert!(input.cat_quads.is_empty() && input.cat_atlas.is_none());
-    let again = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, again, "empty cat fields must not change any pixel");
-
-    // Empty quads WITH an atlas set: the atlas alone draws nothing.
-    input.cat_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-    let atlas_only = rend.render_input(&input).pixels.clone();
-    assert_eq!(
-        base, atlas_only,
-        "a cat atlas with no quads must draw nothing"
-    );
-
-    // `clear_overlays` (the `image plain` capture) strips the cat like every
-    // other bling layer: quads cleared AND the atlas Arc nulled.
-    let mut with_cat = term.cell_frame(3, 12);
-    with_cat.cat_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-    with_cat.cat_quads = vec![quad(
-        1,
-        [0, ch as u16, 16, 16.min(ch as u16)],
-        [0, 0, 16, 16.min(ch as u16)],
-    )];
-    let painted = rend.render_input(&with_cat).pixels.clone();
-    assert_ne!(base, painted, "a non-empty cat must paint something");
-    with_cat.clear_overlays();
-    assert!(
-        with_cat.cat_quads.is_empty(),
-        "clear_overlays must strip cat quads"
-    );
-    assert!(
-        with_cat.cat_atlas.is_none(),
-        "clear_overlays must null the cat atlas Arc"
-    );
-    let stripped = rend.render_input(&with_cat).pixels.clone();
-    assert_eq!(base, stripped, "clear_overlays must restore the bare frame");
 }
 
 /// Pass-1c z-order on the CPU: an opaque cat sprite spanning two cells of a row

@@ -4,7 +4,8 @@
 // Animated-ink fg overrides (Sparkle Words v2, `RenderInput.ink`) on the CPU
 // renderer. The channel contract under test:
 //   * empty ink is byte-identical to the pre-ink path (also after
-//     `clear_overlays`, the `image plain` contract);
+//     `clear_overlays`, the `image plain` contract) — the `ink` row of
+//     `tests/empty_channels.rs`;
 //   * ink substitutes for the cell fg at EVERY fg consult site — glyph blit,
 //     combining marks, underline / strike / overline — so an inked cell renders
 //     byte-identically to the same cell recoloured via SGR truecolor fg;
@@ -40,40 +41,6 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
         }
     }
     out
-}
-
-#[test]
-fn empty_ink_is_byte_identical_also_after_clear_overlays() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lultra think");
-
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    // Explicitly empty ink (feature on, nothing matched / everything truncated).
-    let mut input = term.cell_frame(3, 12);
-    assert!(input.ink.is_empty());
-    input.ink.clear();
-    let again = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, again, "empty ink must not change any pixel");
-
-    // `clear_overlays` (the `image plain` capture) strips ink like every other
-    // bling layer: a previously-inked input renders the bare frame afterwards.
-    let mut inked = term.cell_frame(3, 12);
-    inked.ink = vec![InkCell {
-        row: 0,
-        col: 0,
-        color: [0xFF, 0x00, 0xFF],
-    }];
-    let with_ink = rend.render_input(&inked).pixels.clone();
-    assert_ne!(base, with_ink, "non-empty ink must recolour something");
-    inked.clear_overlays();
-    assert!(inked.ink.is_empty(), "clear_overlays must strip ink");
-    let stripped = rend.render_input(&inked).pixels.clone();
-    assert_eq!(base, stripped, "clear_overlays must restore the bare frame");
 }
 
 /// The definitive substitution proof: inking a cell is byte-identical to

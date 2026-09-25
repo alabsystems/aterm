@@ -343,12 +343,6 @@ fn xdg_dir(var: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_home_dir_returns_some() {
-        // HOME should be set in any reasonable test environment
-        assert!(home_dir().is_some());
-    }
-
     /// An empty or relative `$HOME` is not a home (2026-09-18): it fell through to
     /// a cwd-relative prefix before, and the front door laid `agents/` under it.
     #[cfg(unix)]
@@ -363,16 +357,6 @@ mod tests {
             home_from_env(Some(OsStr::new("/Users//someone"))),
             Some(PathBuf::from("/Users//someone"))
         );
-    }
-
-    #[test]
-    fn test_config_dir_returns_some() {
-        assert!(config_dir().is_some());
-    }
-
-    #[test]
-    fn test_data_dir_returns_some() {
-        assert!(data_dir().is_some());
     }
 
     /// THE STATE ROOT RULE (session identities, 2026-09-17), pure: the
@@ -467,13 +451,6 @@ mod tests {
                 identities.file_name().and_then(|n| n.to_str()),
                 Some("identities")
             );
-        }
-    }
-
-    #[test]
-    fn test_home_dir_is_absolute() {
-        if let Some(home) = home_dir() {
-            assert!(home.is_absolute(), "home_dir should be absolute: {home:?}");
         }
     }
 

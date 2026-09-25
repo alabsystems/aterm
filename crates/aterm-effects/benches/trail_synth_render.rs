@@ -139,7 +139,7 @@
 // voices, longer tails) then stays separable from a regression in per-item
 // COST — and because every fix in this module is judged against BYTE identity
 // (`palettes_render_byte_identical_to_v056_reference`,
-// `brrrring_of_rapid_line_feeds_is_pinned`, `mech_is_deterministic`,
+// `brrrring_of_rapid_line_feeds_is_pinned`, `deterministic`'s mech row,
 // `bed_variants_render_deterministically_and_decay_to_exact_silence`), a
 // "faster" variant that quietly changed the AUDIO shows up here as a changed
 // checksum instead of hiding behind a green benchmark.

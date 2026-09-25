@@ -17,7 +17,7 @@ use crate::model::{
     Tag, WallStamp, every_intent, tags,
 };
 use crate::text::{sanitize, shape_detail, shape_path, trim_words, wrap};
-use crate::wire::{PostRequest, parse_read_args};
+use crate::wire::{NoticeRequest, PostRequest, WireGate, apply, parse_read_args};
 use crate::words::{abbreviate_paths_in, date_words, home_abbreviate, relative_words, stamp_words};
 use crate::{
     DETAIL_LINE_CAP, DETAIL_LINES_CAP, Duration, Instant, LOG_CAP, MAX_ACTIONS, MAX_LIVE, MAX_ROWS,
@@ -152,7 +152,7 @@ fn codec_survives_random_bytes_and_truncations() {
             title: rand_str(&mut rng, 60),
             detail: (0..rng.below(4)).map(|_| rand_str(&mut rng, 40)).collect(),
             actions: (0..rng.below(3))
-                .map(|_| every_intent()[rng.below(16)].clone())
+                .map(|_| every_intent()[rng.below(every_intent().len())].clone())
                 .filter(|i| *i != Intent::Details)
                 .collect(),
             key: rng
@@ -242,7 +242,7 @@ fn decoders_and_wire_parsers_never_panic_on_junk() {
         let _ = Tag::try_new(&s);
         let _ = Severity::parse(&s);
         if let Ok(q) = parse_read_args(&s) {
-            assert!(q.n >= 1 && q.n <= LOG_CAP);
+            assert!((1..=LOG_CAP).contains(&q.page()));
         }
         let prefixed = format!(
             "{} {}",
@@ -257,6 +257,82 @@ fn decoders_and_wire_parsers_never_panic_on_junk() {
             assert!(msg.title.chars().all(|c| !c.is_control()));
         }
     }
+}
+
+/// `notice` survives junk (design rulings 163–179): random lines after
+/// every sub-form never panic the parser; whatever it accepts applies to a
+/// center with a one-line reply, and every row the wire raised carries no
+/// capsule, a control-free title, a glass title in form and an attention
+/// verdict (a record for news; a row only for a failure or for work with its
+/// indicator) — whatever the order, the instants and the budgets did.
+#[test]
+fn notice_lines_never_panic_and_never_forge_a_row() {
+    let mut rng = Rng(0x5eed_0f_a11_0e5);
+    let now = t0();
+    let mut c = fresh(now);
+    let mut gate = WireGate::default();
+    let forms = [
+        "post system ",
+        "post system sev=warn key=k ",
+        "post fabric sev=error ",
+        "progress k ",
+        "progress k pct=4",
+        "progress k2 done=3/9 unit=bytes load=disk ",
+        "done k ",
+        "done k warn ",
+        "dismiss ",
+        "act 1 ",
+        "",
+        "notice ",
+    ];
+    let mut t = now;
+    let mut accepted = 0;
+    for _ in 0..4000 {
+        let junk = if rng.chance(50) {
+            rand_str(&mut rng, 40)
+        } else {
+            rand_bytes_str(&mut rng, 40)
+        };
+        let line = format!("{}{junk}", forms[rng.below(forms.len())]);
+        t += ms(rng.below(400) as u64);
+        let Ok(req) = NoticeRequest::parse(&line) else {
+            continue;
+        };
+        accepted += 1;
+        let applied = apply(&mut c, &mut gate, req, stamp(1), t);
+        assert!(!applied.reply.contains('\n'), "{line:?}: {}", applied.reply);
+        assert!(
+            applied.reply.starts_with("OK ") || applied.reply.starts_with("ERR "),
+            "{}",
+            applied.reply
+        );
+        for l in c.live_rows() {
+            assert!(l.msg.actions.is_empty());
+            assert!(l.msg.title.chars().all(|ch| !ch.is_control()));
+            assert!(!l.msg.title.is_empty());
+            assert_eq!(
+                crate::text::glass_title_fault(&l.msg.title),
+                None,
+                "{:?}",
+                l.msg.title
+            );
+            let progress = matches!(l.msg.hold, Hold::Live { .. })
+                && l.msg
+                    .meter
+                    .as_ref()
+                    .is_some_and(|m| m.busy || m.fill_permille.is_some());
+            assert!(progress || l.msg.severity >= Severity::Warn, "{:?}", l.msg);
+            assert!(
+                l.msg
+                    .key
+                    .as_deref()
+                    .is_none_or(|k| k.starts_with(crate::WIRE_KEY_PREFIX))
+            );
+        }
+        assert!(c.live_rows().count() <= crate::WIRE_LIVE_CAP);
+        c.settle(t, true);
+    }
+    assert!(accepted > 200, "the net must reach apply: {accepted}");
 }
 
 /// The shapers never panic and never exceed their cap, whatever the text.
@@ -470,7 +546,7 @@ fn a_flood_keeps_every_bound() {
             _ => {
                 let carry = c.carried();
                 let mut child = fresh(at);
-                child.seed_carried(&carry, at);
+                child.seed_carried(&carry, stamp(0), at);
                 assert!(child.live_rows().count() <= MAX_LIVE);
                 assert!(child.log().pending_len() <= PENDING_PERSIST_CAP);
                 assert!(child.log().next_id() >= c.log().next_id());

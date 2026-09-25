@@ -364,8 +364,8 @@ version = "0.9.3"
 # and the row left with it. The other three leave here, with the port. W9 phase 3 had narrowed `objc2` and `block2` from upstream's
 # `cfg(any(ios, macos))` to `cfg(macos)`, so that the iOS backend — 9 files,
 # 3,743 lines, 8 of them (3,691 lines) using the family, which no aterm target
-# compiles; `crates/aterm-objc/tests/objc2_exit_condition.rs` pins those
-# numbers — could not hold the packages in the mac-arm graph at zero macOS
+# compiles; `crates/aterm-objc/tests/objc2_exit_condition.rs` pinned those
+# numbers until 2026-09-24 — could not hold the packages in the mac-arm graph at zero macOS
 # uses. W12 then ported the last eight files of `platform_impl/macos` onto
 # `aterm-objc` (the fork's half: zero), and W13 ported `aterm-gui`'s last five
 # and retired ITS four rows (the crate's half: zero). Each branch measured the

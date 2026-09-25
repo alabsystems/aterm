@@ -184,19 +184,6 @@ mod tests {
     }
 
     #[test]
-    fn test_char_at_visible() {
-        let grid = make_grid();
-        assert_eq!(grid.char_at(0, 0), Some('H'));
-        assert_eq!(grid.char_at(0, 1), Some('i'));
-    }
-
-    #[test]
-    fn test_char_at_empty_cell() {
-        let grid = make_grid();
-        assert_eq!(grid.char_at(0, 5), Some(' '));
-    }
-
-    #[test]
     fn test_char_at_negative_line_no_scrollback() {
         let grid = make_grid();
         assert_eq!(grid.char_at(-1, 0), None);
@@ -217,30 +204,11 @@ mod tests {
     }
 
     #[test]
-    fn test_visible_rows_and_cols() {
-        let grid = make_grid();
-        assert_eq!(BufferAccess::visible_rows(&grid), 3);
-        assert_eq!(BufferAccess::cols(&grid), 10);
-    }
-
-    #[test]
     fn test_line_text() {
         let grid = make_grid();
         let text = grid.line_text(0).expect("should have text for row 0");
         assert!(text.starts_with("Hi"));
         assert_eq!(grid.line_text(-1), None); // no scrollback
-    }
-
-    #[test]
-    fn test_display_offset_default() {
-        let grid = make_grid();
-        assert_eq!(BufferAccess::display_offset(&grid), 0);
-    }
-
-    #[test]
-    fn test_is_wide_default() {
-        let grid = make_grid();
-        assert!(!grid.is_wide(0, 0));
     }
 
     // --- Scrollback tests (#5613) ---

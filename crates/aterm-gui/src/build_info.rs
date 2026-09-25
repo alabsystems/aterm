@@ -31,8 +31,8 @@ pub(crate) const AUTHOR_SHORT: &str = "A. Yates";
 /// row — `alab.systems`, from the one identity every surface shares.
 pub(crate) const SITE: &str = aterm_types::identity::SITE;
 
-/// Application identity shared across the one binary. Release builds use the
-/// private app-channel claim; ordinary builds use Cargo's source version.
+/// Application identity shared across the one binary: `[workspace.package]
+/// version`, as written, in every build.
 pub const VERSION: &str = aterm_types::version::APP_VERSION;
 
 /// Short git commit the binary was built from — with a `-dirty` suffix when the
@@ -65,13 +65,13 @@ pub const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
 /// always literal 0, so a nonzero counter can never be mistaken for one).
 pub const DEV_COMMITS: &str = env!("ATERM_DEV_COMMITS");
 
-/// Whether the release cutter produced this binary. The cutter supplies
-/// `ATERM_APP_RELEASE_VERSION` on both architecture builds and it is
-/// deliberately absent from every ordinary build, so its presence at compile
-/// time IS the release/dev discriminator — the same fact `APP_VERSION`'s
-/// selection already keys on, exposed as a bool for display surfaces (the
-/// menu bar's DEV signature).
-pub const IS_RELEASE_BUILD: bool = option_env!("ATERM_APP_RELEASE_VERSION").is_some();
+/// Whether a release lane produced this binary. `cargo ship cut` (both
+/// architecture builds) and the Linux release lane set `ATERM_RELEASE_BUILD`
+/// for the build, and no ordinary build does, so its presence at compile time
+/// IS the release/dev discriminator — read by display surfaces only (the menu
+/// bar's DEV signature). It carries no version: every build reports
+/// [`VERSION`].
+pub const IS_RELEASE_BUILD: bool = option_env!("ATERM_RELEASE_BUILD").is_some();
 
 /// Full first line of the producing compiler's `-vV`, e.g.
 /// `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)` or
@@ -113,12 +113,12 @@ pub const BUILD_PROFILE: &str = env!("ATERM_BUILD_PROFILE");
 /// `"on"` iff `--cfg trust_verify` was active in this compile, else `"off"`.
 pub const TRUST_VERIFY: &str = env!("ATERM_TRUST_VERIFY");
 
-/// Exact lowercase SHA-256 fingerprint of the raw compiled Ed25519 updater key,
-/// or the all-zero no-pin sentinel in an ordinary development build.  `build.rs`
-/// derives it from the same COMMITTED constant consumed by `aterm-update`
-/// (`aterm_update_core::pins::update_channel_signing_pubkey`), never from a build
-/// environment variable; the release cutter independently cross-checks this record
-/// against both runtime diagnostics and the permanent channel authority.
+/// Exact lowercase SHA-256 fingerprint of the raw paper master key — the one anchor
+/// that authorizes a release — or the all-zero sentinel when none is pinned (a fork).
+/// `build.rs` derives it from the same COMMITTED constant `aterm-update` reports
+/// (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS[0]`), never from a build environment
+/// variable; the release cutter independently cross-checks this record against both
+/// runtime diagnostics and the committed master.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const EMBEDDED_UPDATE_PIN_SHA256: &str = env!("ATERM_UPDATE_PIN_SHA256");
 
@@ -157,11 +157,10 @@ pub fn compiler_commit_short() -> &'static str {
     }
 }
 
-/// The DISPLAY version. There is ONE lineage, Cargo's `MAJOR.MINOR.0`:
-/// releases carry it with DEV reset to 0 (e.g. `0.2.0`), ordinary
-/// development builds carry it verbatim (e.g. `0.2.1`).
-/// The build number, commit, compiler/toolchain, and build
-/// time are their OWN provenance rows (see [`about_fields`] / [`control_line`]).
+/// The DISPLAY version: `[workspace.package] version` (`MAJOR.MINOR.0`), the
+/// same in a release and a development build. The build number, commit,
+/// compiler/toolchain, and build time are their OWN provenance rows (see
+/// [`about_fields`] / [`control_line`]).
 ///
 /// Display-ONLY by contract: the running build's version is not an input to the
 /// updater at all — `aterm_update::check_now` does not take one. Selection is by
@@ -341,10 +340,9 @@ pub fn control_line() -> String {
     } else {
         COMPILER_TRUST_VERSION
     };
+    // `update_pin_sha256=`: the paper master this build trusts — the one anchor that
+    // authorizes a release.
     let update_pin_sha256 = aterm_update::compiled_update_pin_sha256();
-    // `master_pin_sha256=` (2026-09-14): the paper master this build trusts — the
-    // anchor that actually authorizes a release once the roster tier is armed.
-    let master_pin_sha256 = aterm_update::compiled_master_pin_sha256();
     // `objc_contained=` — how many NSExceptions `aterm_objc::exception` has
     // caught inside declared Objective-C methods in THIS process (each one is
     // also an ERROR line in aterm.log). Additive, per the rule above; `0` off
@@ -358,7 +356,7 @@ pub fn control_line() -> String {
          arch={} trustc={} trustc_commit={} trustc_host={COMPILER_HOST} flavor={COMPILER_FLAVOR} \
          trust={trust} rust_compat={} \
          profile={BUILD_PROFILE} trust_verify={TRUST_VERIFY} update_pin_sha256={update_pin_sha256} \
-         master_pin_sha256={master_pin_sha256} objc_contained={objc_contained} signature={}\n",
+         objc_contained={objc_contained} signature={}\n",
         version_display(),
         std::env::consts::ARCH,
         compiler_release(),
@@ -666,7 +664,6 @@ mod tests {
             "profile=",
             "trust_verify=",
             "update_pin_sha256=",
-            "master_pin_sha256=",
             "signature=",
         ] {
             assert!(line.contains(&format!(" {key}")), "has {key}: {line}");

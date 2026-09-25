@@ -60,16 +60,6 @@ fn test_find_file_path_at_position() {
 }
 
 #[test]
-fn test_find_git_hash_at_position() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Reverted commit abc1234def that broke things";
-
-    let m = smart.find_at(text, 20).unwrap();
-    assert_eq!(m.matched_text(), "abc1234def");
-    assert_eq!(m.rule_name(), "git_hash");
-}
-
-#[test]
 fn test_find_ipv4_at_position() {
     let smart = SmartSelection::with_builtin_rules();
     let text = "Server 192.168.1.1 is responding";

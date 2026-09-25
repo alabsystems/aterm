@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn apply_preserves_the_hard_ceiling_so_a_shell_can_raise_its_soft_limit() {
         let _serialized = nofile_guard();
-        // REGRESSION GUARD — `/Users//.../.zshrc:ulimit:N: value exceeds hard limit`.
+        // REGRESSION GUARD — `/Users/.../.zshrc:ulimit:N: value exceeds hard limit`.
         // The User-mode sandbox runs the user's $SHELL transparently, so it must
         // install its limit as a SOFT default and LEAVE THE HARD CEILING ALONE.
         // The old code set both soft AND hard to the requested value, clamping the

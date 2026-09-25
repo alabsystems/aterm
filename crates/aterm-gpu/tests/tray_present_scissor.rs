@@ -3,8 +3,8 @@
 //
 // THE TRAY MUST NOT COST THE SCISSOR — and must still look identical.
 //
-// A resident tray card (the modal settings panel, the update notice, the
-// level-up burst, and — for the whole session, from one cosmetic Settings
+// A resident tray card (the modal settings panel, a transient card, and —
+// for the whole session, from one cosmetic Settings
 // toggle — the static build BADGE) used to force `present_prev = None` on every
 // present, turning every keystroke echo and every cursor blink into a full
 // O(rows·cols) grid re-encode. The card now composites over the THROWAWAY

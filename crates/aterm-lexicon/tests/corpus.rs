@@ -519,7 +519,8 @@ fn user_override_extends_coverage() {
 /// `cjk_single_char = true`) and a mixed-script form (dropped at insert) both
 /// surface on the `conflicts` channel. Builtin data stays conflict-free (the
 /// embedded single-char 操/草/干 and multi-word "con mèo" entries are
-/// deliberate and quiet) — pinned by `no_class_conflicts_in_embedded_data`.
+/// deliberate and quiet) — pinned by `animal_multilingual.rs`'s
+/// `expanded_builtin_stays_conflict_free`.
 #[test]
 fn user_unscannable_surfaces_surface_as_conflicts() {
     let extra = concat!(
@@ -597,16 +598,6 @@ fn fold_idempotent_for_turkish_dotted_i() {
     assert_eq!(
         aterm_lexicon::fold(&aterm_lexicon::fold("İ")),
         aterm_lexicon::fold("İ")
-    );
-}
-
-#[test]
-fn no_class_conflicts_in_embedded_data() {
-    let lx = lex();
-    assert!(
-        lx.conflicts().is_empty(),
-        "data conflicts: {:#?}",
-        lx.conflicts()
     );
 }
 

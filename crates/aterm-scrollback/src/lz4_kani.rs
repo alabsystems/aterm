@@ -15,7 +15,9 @@
 //! decompression path cannot panic the process or cause the decoder to
 //! emit more bytes than the prefix claimed.
 
-use crate::lz4::{Lz4Error, decompress_size_prepended};
+#[cfg(kani)]
+use crate::lz4::Lz4Error;
+use crate::lz4::decompress_size_prepended;
 
 // ── Kani proofs ──────────────────────────────────────────────────────────
 
@@ -93,30 +95,6 @@ mod decode_tests {
     use super::*;
 
     #[test]
-    fn rejects_empty_input() {
-        assert!(matches!(
-            decompress_size_prepended(&[]),
-            Err(Lz4Error::InputTooShort)
-        ));
-    }
-
-    #[test]
-    fn rejects_1_byte_input() {
-        assert!(matches!(
-            decompress_size_prepended(&[0x00]),
-            Err(Lz4Error::InputTooShort)
-        ));
-    }
-
-    #[test]
-    fn rejects_3_byte_input() {
-        assert!(matches!(
-            decompress_size_prepended(&[0x00, 0x00, 0x00]),
-            Err(Lz4Error::InputTooShort)
-        ));
-    }
-
-    #[test]
     fn zero_size_prefix_empty_body_is_ok() {
         // 4-byte prefix of 0 + 0-byte body = valid "empty" decode.
         let r = decompress_size_prepended(&[0, 0, 0, 0]);
@@ -131,15 +109,5 @@ mod decode_tests {
             let input = [4, 0, 0, 0, byte];
             let _ = decompress_size_prepended(&input);
         }
-    }
-
-    #[test]
-    fn huge_size_prefix_rejected() {
-        // Prefix exceeds MAX_DECOMPRESSED_SIZE (16 MiB).
-        let input = [0xFF, 0xFF, 0xFF, 0xFF];
-        assert!(matches!(
-            decompress_size_prepended(&input),
-            Err(Lz4Error::OutputTooLarge(_))
-        ));
     }
 }

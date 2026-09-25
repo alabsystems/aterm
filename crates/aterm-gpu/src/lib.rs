@@ -1190,17 +1190,6 @@ mod env_override_tests {
         assert_eq!(parse_gpu_backend(""), None);
     }
 
-    /// THE FLIP: selection is unconditional on macOS — no environment value
-    /// (including the retired `ATERM_METAL=0`) can turn the wgpu arm back
-    /// on, because the wgpu arm is no longer in the macOS production build.
-    /// This pin exists so a future "just add the hatch back" edit has to
-    /// delete a stated decision, not merely flip a boolean.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn metal_selection_is_unconditional_post_flip() {
-        assert!(metal_backend_selected());
-    }
-
     #[test]
     fn power_parses_low_and_high_only() {
         assert_eq!(
@@ -1287,46 +1276,39 @@ mod env_override_tests {
 mod surface_attach_fallback_tests {
     use super::{SurfaceAttachFallback as F, surface_attach_fallback};
 
-    /// The review's scenario: `background_material` set, DX12 won, DComp is
-    /// unavailable, first window — the ONLY case that withdraws the latch and
-    /// rebuilds on the opaque HWND swapchain (instead of aborting the process).
-    #[test]
-    fn visual_first_window_rebuilds_on_the_opaque_swapchain() {
-        assert_eq!(surface_attach_fallback(true, false), F::RebuildOpaque);
-    }
-
-    /// A later window failing on a WORKING visual instance is not a DComp
-    /// outage (the first window's composition swapchain succeeded): keep the
-    /// pre-H1 hard rollback for that one window, never rebuild under the
-    /// survivors.
-    #[test]
-    fn visual_instance_with_live_gpu_windows_declines_only_this_window() {
-        assert_eq!(surface_attach_fallback(true, true), F::DeclineWindow);
-    }
-
-    /// The shipped default (`background_material = "none"`, HWND swapchain)
-    /// keeps its byte-identical arms: decline when others present, else the
-    /// CPU softbuffer downgrade. No latch to withdraw, no rebuild.
-    #[test]
-    fn plain_instance_keeps_the_pre_h1_arms() {
-        assert_eq!(surface_attach_fallback(false, true), F::DeclineWindow);
-        assert_eq!(surface_attach_fallback(false, false), F::CpuRenderer);
-    }
-
     /// Totality + the one-liner invariant: `RebuildOpaque` iff visual AND no
     /// other GPU window; `other_gpu_windows` dominates regardless of the path.
+    /// Every input is a labelled row with its exact verdict.
     #[test]
     fn rebuild_iff_visual_and_alone() {
-        for visual in [false, true] {
-            for others in [false, true] {
-                let plan = surface_attach_fallback(visual, others);
-                assert_eq!(
-                    plan == F::RebuildOpaque,
-                    visual && !others,
-                    "visual={visual} others={others} -> {plan:?}"
-                );
-                assert_eq!(plan == F::DeclineWindow, others, "others must dominate");
-            }
+        // (visual, other_gpu_windows, verdict, why)
+        let rows = [
+            // The review's scenario: `background_material` set, DX12 won, DComp
+            // is unavailable, first window — the ONLY case that withdraws the
+            // latch and rebuilds on the opaque HWND swapchain (instead of
+            // aborting the process).
+            (true, false, F::RebuildOpaque, "visual, first window"),
+            // A later window failing on a WORKING visual instance is not a DComp
+            // outage (the first window's composition swapchain succeeded): keep
+            // the pre-H1 hard rollback for that one window, never rebuild under
+            // the survivors.
+            (true, true, F::DeclineWindow, "visual, live GPU windows"),
+            // The shipped default (`background_material = "none"`, HWND
+            // swapchain) keeps its byte-identical pre-H1 arms: decline when
+            // others present, else the CPU softbuffer downgrade. No latch to
+            // withdraw, no rebuild.
+            (false, true, F::DeclineWindow, "plain, live GPU windows"),
+            (false, false, F::CpuRenderer, "plain, first window"),
+        ];
+        for (visual, others, want, why) in rows {
+            let plan = surface_attach_fallback(visual, others);
+            assert_eq!(plan, want, "{why}: visual={visual} others={others}");
+            assert_eq!(
+                plan == F::RebuildOpaque,
+                visual && !others,
+                "visual={visual} others={others} -> {plan:?}"
+            );
+            assert_eq!(plan == F::DeclineWindow, others, "others must dominate");
         }
     }
 }

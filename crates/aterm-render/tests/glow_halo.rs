@@ -6,7 +6,8 @@
 // contract under test:
 //   * an empty `glow_halo` (never touched, explicitly emptied, and
 //     pushed-then-cleared) is byte-identical to the pre-halo path, also after
-//     `clear_overlays` (the `image plain` contract) — the no-op law;
+//     `clear_overlays` (the `image plain` contract) — the no-op law, held by
+//     the `glow_halo` row of `tests/empty_channels.rs`;
 //   * a halo renders with RADIALLY DECREASING luminance: the centre pixel is
 //     the brightest, samples toward the ellipse edge monotonically dim, and
 //     the light only ever brightens the base (premultiplied `add_sat`);
@@ -53,55 +54,6 @@ fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
 /// (monotone in every channel under additive light, so ordering is exact).
 fn luma(p: u32) -> u32 {
     ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff)
-}
-
-/// NO-OP LAW: empty `glow_halo` — untouched, explicitly emptied, and
-/// pushed-then-cleared — must be byte-identical to the pre-halo path, and
-/// `clear_overlays` strips a populated stream back to the bare frame.
-#[test]
-fn empty_glow_halo_is_byte_identical_to_before() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(3, 12);
-    term.process(b"\x1b[?25lember forge");
-
-    // Pre-feature frame: the snapshot as built, glow_halo never mentioned.
-    let base = rend.render_input(&term.cell_frame(3, 12)).pixels.clone();
-
-    // Explicit empty, and pushed-then-cleared (the emptied-stream path).
-    let mut input = term.cell_frame(3, 12);
-    input.glow_halo = Vec::new();
-    let explicit = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, explicit, "explicit empty glow_halo must be a no-op");
-    input
-        .glow_halo
-        .push(halo(1, 0, ch as u16, cw as u16, ch as u16, 0x0040_8040));
-    input.glow_halo.clear();
-    let emptied = rend.render_input(&input).pixels.clone();
-    assert_eq!(base, emptied, "an emptied glow_halo must leave no residue");
-
-    // A populated stream paints; `clear_overlays` restores the bare frame.
-    let mut with_halo = term.cell_frame(3, 12);
-    with_halo.glow_halo = vec![halo(
-        1,
-        0,
-        ch as u16,
-        (2 * cw) as u16,
-        ch as u16,
-        0x0040_8040,
-    )];
-    let painted = rend.render_input(&with_halo).pixels.clone();
-    assert_ne!(base, painted, "a non-empty glow_halo must paint something");
-    with_halo.clear_overlays();
-    assert!(
-        with_halo.glow_halo.is_empty(),
-        "clear_overlays must strip glow_halo (it IS bling)"
-    );
-    let stripped = rend.render_input(&with_halo).pixels.clone();
-    assert_eq!(base, stripped, "clear_overlays must restore the bare frame");
 }
 
 /// RADIAL LAW: the halo's luminance decreases monotonically from the centre

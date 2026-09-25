@@ -2573,7 +2573,7 @@ const ENV_REANCHOR: u32 = 64;
 
 /// One celebration riff bar in seconds — 4 beats at the sing-along's
 /// 150 BPM. Pinned equal to the VISUAL clock's `kitty_sing::SING_BAR_SECONDS`
-/// by `celebration_bar_matches_the_visual_clock`, so the host can schedule
+/// at compile time (the `const` assertions below), so the host can schedule
 /// one [`CelebrationGesture::RiffBar`] per visual bar and the two clocks
 /// share one tempo (sync tolerance documented on the gesture).
 pub const CELEBRATION_BAR_SECONDS: f32 = 1.6;
@@ -2583,8 +2583,19 @@ const CELEBRATION_EIGHTH: f32 = CELEBRATION_BAR_SECONDS / 8.0;
 
 /// The OUTRO's length (§27) — three beats at the sing-along tempo: the lead
 /// on *do* rings for the whole of it, the bell inside it. Pinned equal to
-/// `kitty_sing::OUTRO_SECONDS` by `the_outro_matches_the_visual_clock`.
+/// `kitty_sing::OUTRO_SECONDS` at compile time (below).
 pub const CELEBRATION_OUTRO_S: f32 = 1.2;
+
+// The audio bar, its eighth-note and the outro and the visual dance clock are
+// ONE tempo (the documented ± ~60 ms host-buffer skew is tolerance, not tempo
+// drift). All four are consts, so the laws are compile-time, not runtime.
+const _: () = assert!(CELEBRATION_BAR_SECONDS == crate::kitty_sing::SING_BAR_SECONDS);
+const _: () = assert!(CELEBRATION_EIGHTH == crate::kitty_sing::SING_BEAT_SECONDS / 2.0);
+const _: () = assert!(CELEBRATION_OUTRO_S == crate::kitty_sing::OUTRO_SECONDS);
+const _: () = assert!(
+    CELEBRATION_OUTRO_S < CELEBRATION_BAR_SECONDS,
+    "the outro is shorter than a bar: it ends the song, it is not one more bar"
+);
 
 /// The outro lead's decay τ: a held *do* that is still sounding at the
 /// three-beat line and gone within the sing duck's handback.
@@ -2675,8 +2686,8 @@ const CELEBRATION_BAR_LIFT: [f32; CELEBRATION_PHRASE_BARS] =
 
 /// SWING: odd eighths land this fraction of an eighth LATE. Applied to a note's
 /// PRE-DELAY only — the bar is still exactly [`CELEBRATION_BAR_SECONDS`] long,
-/// so the visual clock this module pins itself to cannot drift
-/// (`celebration_bar_matches_the_visual_clock`).
+/// so the visual clock this module pins itself to cannot drift (the `const`
+/// tempo assertions beside [`CELEBRATION_OUTRO_S`]).
 const CELEBRATION_SWING: f32 = 0.14;
 
 /// ESCALATION: the song opens lean and fills in over its first bars — the low
@@ -3273,8 +3284,7 @@ struct Bed {
 ///   `bed_variant_pitches_stay_on_the_active_lattice_for_every_tone`);
 /// - LOUDNESS — candidates ride the same energy/level/gain machinery as the
 ///   shipping beds (fed per event, governor-smoothed, master-ducked), so the
-///   flood law holds per candidate
-///   (`every_bed_variant_keeps_the_flood_duck_law`).
+///   flood law holds per candidate (`flood_is_ducked`'s bed rows).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum BedVariant {
     /// C0 — the incumbent-in-code: the per-palette `Palette::bed_sample`/
@@ -10195,48 +10205,65 @@ mod tests {
         assert!(buf.iter().all(|&x| x == 0.0));
     }
 
-    /// Every style × gesture (all five trail kinds AND the word bonk)
-    /// produces sound, stays in range, never NaNs, and decays back to exact
-    /// silence.
+    /// Every palette × gesture produces sound, stays in range, never NaNs,
+    /// and decays back to exact silence — one row per palette:
+    ///
+    /// * the STYLE palettes, every look, all five trail kinds AND the word
+    ///   bonk;
+    /// * the mech override (`trail_sound_style = "mechanical"`) and each new
+    ///   instrument, riding either look, a Glide included — the same
+    ///   audibility/decay contract, whatever look the events ride.
     #[test]
     fn all_styles_sound_and_decay() {
-        for style in LOOKS {
-            for gesture in [
-                SoundGesture::Trail(SoundKind::Typed),
-                SoundGesture::Trail(SoundKind::Backspace),
-                SoundGesture::Trail(SoundKind::Navigation),
-                SoundGesture::Trail(SoundKind::Kill),
-                SoundGesture::Trail(SoundKind::Jump),
-                SoundGesture::Words(WordGesture::Bonk),
-            ] {
-                let mut s = TrailSynth::new(48_000.0, 42);
-                let mut e = ev(style, SoundKind::Typed);
-                e.kind = gesture;
-                s.push(e);
-                let mut peak = 0.0f32;
-                let mut buf = [0.0f32; 1024];
-                // 6 s is enough for every decay + bed exhale.
-                for _ in 0..(6 * 48_000 * 2 / 1024) {
-                    s.render(&mut buf);
-                    for &x in &buf {
-                        assert!(x.is_finite(), "{style:?}/{gesture:?} produced non-finite");
-                        peak = peak.max(x.abs());
+        use GlowStyle::{Lumen, RainbowKitty};
+        const TRAILS: [SoundGesture; 6] = [
+            SoundGesture::Trail(SoundKind::Typed),
+            SoundGesture::Trail(SoundKind::Backspace),
+            SoundGesture::Trail(SoundKind::Navigation),
+            SoundGesture::Trail(SoundKind::Kill),
+            SoundGesture::Trail(SoundKind::Jump),
+            SoundGesture::Words(WordGesture::Bonk),
+        ];
+        const WITH_GLIDE: [SoundGesture; 7] = [
+            SoundGesture::Trail(SoundKind::Typed),
+            SoundGesture::Trail(SoundKind::Backspace),
+            SoundGesture::Trail(SoundKind::Navigation),
+            SoundGesture::Trail(SoundKind::Kill),
+            SoundGesture::Trail(SoundKind::Jump),
+            SoundGesture::Trail(SoundKind::Glide { dir: 1 }),
+            SoundGesture::Words(WordGesture::Bonk),
+        ];
+        let mut rows: Vec<(SoundVoice, &[GlowStyle], &[SoundGesture])> = vec![
+            (SoundVoice::Style, &LOOKS, &TRAILS),
+            (SoundVoice::Mech, &[Lumen, RainbowKitty], &WITH_GLIDE),
+        ];
+        for voice in NEW_VOICES {
+            rows.push((voice, &[Lumen, RainbowKitty], &WITH_GLIDE));
+        }
+        for (voice, styles, gestures) in rows {
+            for &style in styles {
+                for &gesture in gestures {
+                    let what = format!("{voice:?}/{style:?}/{gesture:?}");
+                    let mut s = TrailSynth::new(48_000.0, 42);
+                    let mut e = voiced(voice, style, SoundKind::Typed);
+                    e.kind = gesture;
+                    s.push(e);
+                    let mut peak = 0.0f32;
+                    let mut buf = [0.0f32; 1024];
+                    // 6 s is enough for every decay + bed exhale.
+                    for _ in 0..(6 * 48_000 * 2 / 1024) {
+                        s.render(&mut buf);
+                        for &x in &buf {
+                            assert!(x.is_finite(), "{what} produced non-finite");
+                            peak = peak.max(x.abs());
+                        }
                     }
+                    assert!(peak > 1e-4, "{what} was inaudible (peak {peak})");
+                    assert!(peak <= 0.98, "{what} clipped (peak {peak})");
+                    assert!(s.is_quiet(), "{what} never decayed to silence");
+                    s.render(&mut buf);
+                    assert!(buf.iter().all(|&x| x == 0.0), "{what} quiet but nonzero");
                 }
-                assert!(
-                    peak > 1e-4,
-                    "{style:?}/{gesture:?} was inaudible (peak {peak})"
-                );
-                assert!(peak <= 0.98, "{style:?}/{gesture:?} clipped (peak {peak})");
-                assert!(
-                    s.is_quiet(),
-                    "{style:?}/{gesture:?} never decayed to silence"
-                );
-                s.render(&mut buf);
-                assert!(
-                    buf.iter().all(|&x| x == 0.0),
-                    "{style:?}/{gesture:?} quiet but nonzero"
-                );
             }
         }
     }
@@ -10254,97 +10281,6 @@ mod tests {
     #[test]
     fn mech_voice_default_is_style() {
         assert_eq!(SoundVoice::default(), SoundVoice::Style);
-    }
-
-    /// The mech palette honours the same audibility/decay contract as every
-    /// style palette (`all_styles_sound_and_decay`), across every gesture and
-    /// regardless of which visual style the events ride.
-    #[test]
-    fn mech_voice_sounds_and_decays() {
-        for style in [GlowStyle::Lumen, GlowStyle::RainbowKitty] {
-            for gesture in [
-                SoundGesture::Trail(SoundKind::Typed),
-                SoundGesture::Trail(SoundKind::Backspace),
-                SoundGesture::Trail(SoundKind::Navigation),
-                SoundGesture::Trail(SoundKind::Kill),
-                SoundGesture::Trail(SoundKind::Jump),
-                SoundGesture::Trail(SoundKind::Glide { dir: 1 }),
-                SoundGesture::Words(WordGesture::Bonk),
-            ] {
-                let mut s = TrailSynth::new(48_000.0, 42);
-                let mut e = mech(style, SoundKind::Typed);
-                e.kind = gesture;
-                s.push(e);
-                let mut peak = 0.0f32;
-                let mut buf = [0.0f32; 1024];
-                for _ in 0..(6 * 48_000 * 2 / 1024) {
-                    s.render(&mut buf);
-                    for &x in &buf {
-                        assert!(x.is_finite(), "mech/{gesture:?} produced non-finite");
-                        peak = peak.max(x.abs());
-                    }
-                }
-                assert!(peak > 1e-4, "mech/{gesture:?} was inaudible (peak {peak})");
-                assert!(peak <= 0.98, "mech/{gesture:?} clipped (peak {peak})");
-                assert!(s.is_quiet(), "mech/{gesture:?} never decayed to silence");
-                s.render(&mut buf);
-                assert!(
-                    buf.iter().all(|&x| x == 0.0),
-                    "mech/{gesture:?} quiet but nonzero"
-                );
-            }
-        }
-    }
-
-    /// The mech flood obeys the governor exactly like the style palettes
-    /// (mirrors `flood_is_ducked`'s absolute ceiling).
-    #[test]
-    fn mech_flood_is_ducked() {
-        let mut s = TrailSynth::new(48_000.0, 7);
-        let mut buf = [0.0f32; 960];
-        let mut peak = 0.0f32;
-        // 3 s at 25 keys/s: push one Typed every 40 ms, render 10 ms blocks.
-        for i in 0..75 {
-            s.push(mech(GlowStyle::Lumen, SoundKind::Typed));
-            let _ = i;
-            for _ in 0..4 {
-                s.render(&mut buf);
-                for &x in &buf {
-                    assert!(x.is_finite());
-                    peak = peak.max(x.abs());
-                }
-            }
-        }
-        assert!(peak < 0.5, "mech flood must stay governed (peak {peak})");
-    }
-
-    /// Same (seed, events) mech script ⇒ bit-identical output, humanization
-    /// included (the per-key rnd draws ride the deterministic xorshift).
-    #[test]
-    fn mech_is_deterministic() {
-        let run = || {
-            let mut s = TrailSynth::new(48_000.0, 0xBEEF);
-            let mut out = Vec::new();
-            let mut buf = [0.0f32; 960];
-            for kind in [
-                SoundKind::Typed,
-                SoundKind::Backspace,
-                SoundKind::Jump,
-                SoundKind::Navigation,
-            ] {
-                s.push(mech(GlowStyle::Water, kind));
-                for _ in 0..12 {
-                    s.render(&mut buf);
-                    out.extend_from_slice(&buf);
-                }
-            }
-            out
-        };
-        let (a, b) = (run(), run());
-        assert!(
-            a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
-            "mech render must be deterministic"
-        );
     }
 
     /// The mech bed is STRUCTURALLY silent: with `bed: true` events feeding
@@ -10671,110 +10607,6 @@ mod tests {
         );
     }
 
-    /// Every new instrument honours the audibility/decay contract of every
-    /// style palette (`all_styles_sound_and_decay`), across every gesture —
-    /// the Bonk and a Glide included — whatever look the events ride.
-    #[test]
-    fn new_voices_sound_and_decay() {
-        for voice in NEW_VOICES {
-            for style in [GlowStyle::Lumen, GlowStyle::RainbowKitty] {
-                for gesture in [
-                    SoundGesture::Trail(SoundKind::Typed),
-                    SoundGesture::Trail(SoundKind::Backspace),
-                    SoundGesture::Trail(SoundKind::Navigation),
-                    SoundGesture::Trail(SoundKind::Kill),
-                    SoundGesture::Trail(SoundKind::Jump),
-                    SoundGesture::Trail(SoundKind::Glide { dir: 1 }),
-                    SoundGesture::Words(WordGesture::Bonk),
-                ] {
-                    let mut s = TrailSynth::new(48_000.0, 42);
-                    let mut e = voiced(voice, style, SoundKind::Typed);
-                    e.kind = gesture;
-                    s.push(e);
-                    let mut peak = 0.0f32;
-                    let mut buf = [0.0f32; 1024];
-                    for _ in 0..(6 * 48_000 * 2 / 1024) {
-                        s.render(&mut buf);
-                        for &x in &buf {
-                            assert!(x.is_finite(), "{voice:?}/{gesture:?} produced non-finite");
-                            peak = peak.max(x.abs());
-                        }
-                    }
-                    assert!(
-                        peak > 1e-4,
-                        "{voice:?}/{gesture:?} was inaudible (peak {peak})"
-                    );
-                    assert!(peak <= 0.98, "{voice:?}/{gesture:?} clipped (peak {peak})");
-                    assert!(
-                        s.is_quiet(),
-                        "{voice:?}/{gesture:?} never decayed to silence"
-                    );
-                    s.render(&mut buf);
-                    assert!(
-                        buf.iter().all(|&x| x == 0.0),
-                        "{voice:?}/{gesture:?} quiet but nonzero"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Every new instrument's flood obeys the governor exactly like the
-    /// style palettes (mirrors `flood_is_ducked`'s absolute ceiling).
-    #[test]
-    fn new_voices_flood_is_ducked() {
-        for voice in NEW_VOICES {
-            let mut s = TrailSynth::new(48_000.0, 7);
-            let mut buf = [0.0f32; 960];
-            let mut peak = 0.0f32;
-            for _ in 0..75 {
-                s.push(voiced(voice, GlowStyle::Lumen, SoundKind::Typed));
-                for _ in 0..4 {
-                    s.render(&mut buf);
-                    for &x in &buf {
-                        assert!(x.is_finite());
-                        peak = peak.max(x.abs());
-                    }
-                }
-            }
-            assert!(
-                peak < 0.5,
-                "{voice:?} flood must stay governed (peak {peak})"
-            );
-        }
-    }
-
-    /// Same (seed, events) script ⇒ bit-identical output for every new
-    /// instrument, humanisation included.
-    #[test]
-    fn new_voices_are_deterministic() {
-        for voice in NEW_VOICES {
-            let run = || {
-                let mut s = TrailSynth::new(48_000.0, 0xBEEF);
-                let mut out = Vec::new();
-                let mut buf = [0.0f32; 960];
-                for kind in [
-                    SoundKind::Typed,
-                    SoundKind::Backspace,
-                    SoundKind::Jump,
-                    SoundKind::Navigation,
-                ] {
-                    s.push(voiced(voice, GlowStyle::Water, kind));
-                    for _ in 0..12 {
-                        s.render(&mut buf);
-                        out.extend_from_slice(&buf);
-                    }
-                }
-                out
-            };
-            let (a, b) = (run(), run());
-            assert!(
-                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
-                "{voice:?} render must be deterministic"
-            );
-        }
-    }
-
     /// THE BEDS: a keyboard has no weather (Typewriter's bed is structurally
     /// silent, exact zeros like Mech's), while the two instruments carry a
     /// DESIGNED bed — feeding it changes the render.
@@ -10859,48 +10691,106 @@ mod tests {
     }
 
     /// A sustained 25 cps flood must NOT get louder than a single event —
-    /// the governor's whole job. (Peak here is texture + bed, capped well
-    /// under the soft-clip knee.)
+    /// the governor's whole job — and never approaches the clip ceiling. One
+    /// row per palette, each with its own seed and key rhythm:
+    ///
+    /// * every style palette, and (the TOURNAMENT LOUDNESS LAW) every bed
+    ///   candidate under the rainbow kitty — each rides the shared
+    ///   energy/level/gain bed machinery — hold the RELATIVE bound against a
+    ///   single event of the same palette (peak here is texture + bed, capped
+    ///   well under the soft-clip knee) as well as the absolute one;
+    /// * the mech override and each new instrument hold the absolute ceiling
+    ///   (their flood pushes one key every 80 ms of render).
     #[test]
     fn flood_is_ducked() {
-        for style in STYLES {
-            // Single event peak…
-            let mut s1 = TrailSynth::new(48_000.0, 3);
-            s1.push(ev(style, SoundKind::Typed));
-            let mut single = 0.0f32;
-            let mut buf = [0.0f32; 960];
-            for _ in 0..100 {
-                s1.render(&mut buf);
-                for &x in &buf {
-                    single = single.max(x.abs());
+        struct Flood {
+            label: String,
+            event: SoundEvent,
+            bed: Option<BedVariant>,
+            seed: u32,
+            /// 960-frame blocks rendered after each key.
+            blocks_per_key: usize,
+            /// Sweep the pan across the flood (the style/bed rows).
+            pan_sweep: bool,
+            /// Also hold the flood to a single event's peak.
+            relative: bool,
+        }
+        let palette = |label: String, event: SoundEvent, bed: Option<BedVariant>| Flood {
+            label,
+            event,
+            bed,
+            seed: 3,
+            blocks_per_key: 2, // 2×960 frames = 40 ms per key
+            pan_sweep: true,
+            relative: true,
+        };
+        let voice = |v: SoundVoice| Flood {
+            label: format!("{v:?}"),
+            event: voiced(v, GlowStyle::Lumen, SoundKind::Typed),
+            bed: None,
+            seed: 7,
+            blocks_per_key: 4,
+            pan_sweep: false,
+            relative: false,
+        };
+        let mut rows: Vec<Flood> = STYLES
+            .iter()
+            .map(|&st| palette(format!("{st:?}"), ev(st, SoundKind::Typed), None))
+            .collect();
+        for variant in BedVariant::ALL {
+            let e = ev(GlowStyle::RainbowKitty, SoundKind::Typed);
+            rows.push(palette(format!("{variant:?}"), e, Some(variant)));
+        }
+        rows.push(voice(SoundVoice::Mech));
+        rows.extend(NEW_VOICES.map(voice));
+        for row in rows {
+            let label = &row.label;
+            let synth = || {
+                let mut s = TrailSynth::new(48_000.0, row.seed);
+                if let Some(variant) = row.bed {
+                    s.set_bed_variant(variant);
                 }
-            }
-            // …vs a 3-second 25 cps flood.
-            let mut s2 = TrailSynth::new(48_000.0, 3);
+                s
+            };
+            let mut buf = [0.0f32; 960];
+            // A 3-second 25 cps flood.
+            let mut s = synth();
             let mut flood = 0.0f32;
             for i in 0..75 {
-                let mut e = ev(style, SoundKind::Typed);
-                e.pan = ((i % 20) as f32) / 10.0 - 1.0;
-                s2.push(e);
-                for _ in 0..2 {
-                    s2.render(&mut buf); // 2×960 frames = 40 ms per key
+                let mut e = row.event;
+                if row.pan_sweep {
+                    e.pan = ((i % 20) as f32) / 10.0 - 1.0;
+                }
+                s.push(e);
+                for _ in 0..row.blocks_per_key {
+                    s.render(&mut buf);
                     for &x in &buf {
+                        assert!(x.is_finite(), "{label}: flood produced non-finite");
                         flood = flood.max(x.abs());
                     }
                 }
             }
-            assert!(
-                // The absolute slack is an OUTPUT-unit allowance, so it must ride
-                // MASTER: changing the master scale scales both `flood` and
-                // `single`, but would otherwise leave this term fixed and
-                // silently tighten the bound (0.05 at the historical 0.9).
-                flood <= single * 2.5 + MASTER * (0.05 / 0.9),
-                "{style:?} flood peak {flood} vs single {single} — governor failed"
-            );
-            assert!(
-                flood < 0.5,
-                "{style:?} flood absolute peak too hot: {flood}"
-            );
+            if row.relative {
+                // …vs a single event's peak.
+                let mut s1 = synth();
+                s1.push(row.event);
+                let mut single = 0.0f32;
+                for _ in 0..100 {
+                    s1.render(&mut buf);
+                    for &x in &buf {
+                        single = single.max(x.abs());
+                    }
+                }
+                assert!(
+                    // The absolute slack is an OUTPUT-unit allowance, so it must ride
+                    // MASTER: changing the master scale scales both `flood` and
+                    // `single`, but would otherwise leave this term fixed and
+                    // silently tighten the bound (0.05 at the historical 0.9).
+                    flood <= single * 2.5 + MASTER * (0.05 / 0.9),
+                    "{label} flood peak {flood} vs single {single} — governor failed"
+                );
+            }
+            assert!(flood < 0.5, "{label} flood absolute peak too hot: {flood}");
         }
     }
 
@@ -11154,53 +11044,6 @@ mod tests {
         }
     }
 
-    /// TOURNAMENT LOUDNESS LAW: every candidate rides the shared
-    /// energy/level/gain bed machinery, so the flood-duck bound of
-    /// `flood_is_ducked` holds per candidate — a 25 cps flood under ANY bed
-    /// design never gets meaningfully louder than a single event, and never
-    /// approaches the clip ceiling.
-    #[test]
-    fn every_bed_variant_keeps_the_flood_duck_law() {
-        for variant in BedVariant::ALL {
-            // Single event peak…
-            let mut s1 = TrailSynth::new(48_000.0, 3);
-            s1.set_bed_variant(variant);
-            s1.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
-            let mut single = 0.0f32;
-            let mut buf = [0.0f32; 960];
-            for _ in 0..100 {
-                s1.render(&mut buf);
-                for &x in &buf {
-                    single = single.max(x.abs());
-                }
-            }
-            // …vs a 3-second 25 cps flood.
-            let mut s2 = TrailSynth::new(48_000.0, 3);
-            s2.set_bed_variant(variant);
-            let mut flood = 0.0f32;
-            for i in 0..75 {
-                let mut e = ev(GlowStyle::RainbowKitty, SoundKind::Typed);
-                e.pan = ((i % 20) as f32) / 10.0 - 1.0;
-                s2.push(e);
-                for _ in 0..2 {
-                    s2.render(&mut buf); // 2×960 frames = 40 ms per key
-                    for &x in &buf {
-                        flood = flood.max(x.abs());
-                    }
-                }
-            }
-            assert!(
-                // The same MASTER-riding output-unit slack as `flood_is_ducked`.
-                flood <= single * 2.5 + MASTER * (0.05 / 0.9),
-                "{variant:?} flood peak {flood} vs single {single} — governor failed"
-            );
-            assert!(
-                flood < 0.5,
-                "{variant:?} flood absolute peak too hot: {flood}"
-            );
-        }
-    }
-
     /// HARNESS DETERMINISM at the engine level, per candidate: the same
     /// (seed, events, variant) script renders bit-identically — every
     /// candidate modulation runs off the sample-driven variant clock, no
@@ -11303,51 +11146,94 @@ mod tests {
         }
     }
 
-    /// Deterministic: same seed + same script ⇒ identical output.
+    /// Deterministic: same (seed, events) script ⇒ bit-identical output,
+    /// every sample. The bonk (and its duck envelope) and the per-key
+    /// humanization of the mech and the new instruments draw all randomness
+    /// from the shared xorshift and all time from samples. One row per
+    /// script:
     #[test]
     fn deterministic() {
-        let run = || {
-            let mut s = TrailSynth::new(48_000.0, 99);
-            let mut acc = 0.0f64;
-            let mut buf = [0.0f32; 512];
-            for i in 0..40 {
-                if i % 3 == 0 {
-                    s.push(ev(STYLES[i % STYLES.len()], SoundKind::Typed));
+        struct Script {
+            label: String,
+            seed: u32,
+            block: usize,
+            blocks: usize,
+            /// What to push before rendering block `i`.
+            push: Box<dyn Fn(usize) -> Vec<SoundEvent>>,
+        }
+        let pick = |i: usize| STYLES[i % STYLES.len()];
+        let mut rows = vec![
+            // Typing across the style palettes.
+            Script {
+                label: "styles".into(),
+                seed: 99,
+                block: 512,
+                blocks: 40,
+                push: Box::new(move |i| {
+                    if i % 3 == 0 {
+                        vec![ev(pick(i), SoundKind::Typed)]
+                    } else {
+                        vec![]
+                    }
+                }),
+            },
+            // Typing interleaved with bonks.
+            Script {
+                label: "styles + bonks".into(),
+                seed: 0x5EED_50FD,
+                block: 512,
+                blocks: 60,
+                push: Box::new(move |i| {
+                    let mut out = Vec::new();
+                    if i % 3 == 0 {
+                        out.push(ev(pick(i), SoundKind::Typed));
+                    }
+                    if i % 10 == 4 {
+                        out.push(bonk(pick(i)));
+                    }
+                    out
+                }),
+            },
+        ];
+        // The mech override and each new instrument: four gestures, twelve
+        // 960-frame blocks after each.
+        for voice in [SoundVoice::Mech].into_iter().chain(NEW_VOICES) {
+            rows.push(Script {
+                label: format!("{voice:?}"),
+                seed: 0xBEEF,
+                block: 960,
+                blocks: 48,
+                push: Box::new(move |i| {
+                    const KINDS: [SoundKind; 4] = [
+                        SoundKind::Typed,
+                        SoundKind::Backspace,
+                        SoundKind::Jump,
+                        SoundKind::Navigation,
+                    ];
+                    if i % 12 == 0 {
+                        vec![voiced(voice, GlowStyle::Water, KINDS[i / 12])]
+                    } else {
+                        vec![]
+                    }
+                }),
+            });
+        }
+        for row in &rows {
+            let run = || {
+                let mut s = TrailSynth::new(48_000.0, row.seed);
+                let mut buf = vec![0.0f32; row.block];
+                let mut out = Vec::with_capacity(row.block * row.blocks);
+                for i in 0..row.blocks {
+                    for e in (row.push)(i) {
+                        s.push(e);
+                    }
+                    s.render(&mut buf);
+                    out.extend(buf.iter().map(|x| x.to_bits()));
                 }
-                s.render(&mut buf);
-                for &x in &buf {
-                    acc += f64::from(x) * 1e3;
-                }
-            }
-            acc
-        };
-        assert_eq!(run().to_bits(), run().to_bits());
-    }
-
-    /// Bonk determinism: a script that interleaves typing with bonks renders
-    /// bit-identically across runs — the bonk (and its duck envelope) draw
-    /// all randomness from the shared xorshift and all time from samples.
-    #[test]
-    fn deterministic_with_bonks() {
-        let run = || {
-            let mut s = TrailSynth::new(48_000.0, 0x5EED_50FD);
-            let mut acc = 0u64;
-            let mut buf = [0.0f32; 512];
-            for i in 0..60 {
-                if i % 3 == 0 {
-                    s.push(ev(STYLES[i % STYLES.len()], SoundKind::Typed));
-                }
-                if i % 10 == 4 {
-                    s.push(bonk(STYLES[i % STYLES.len()]));
-                }
-                s.render(&mut buf);
-                for &x in &buf {
-                    acc = acc.rotate_left(7).wrapping_add(u64::from(x.to_bits()));
-                }
-            }
-            acc
-        };
-        assert_eq!(run(), run());
+                out
+            };
+            assert_eq!(run(), run(), "{}: render must be deterministic", row.label);
+        }
     }
 
     /// Zero-gain events are dropped entirely (the host's reduced-motion /
@@ -11878,29 +11764,6 @@ mod tests {
             s.debug_bed(),
             (0.0, 0.0),
             "a riff bar must not swell the ambience it plays over"
-        );
-    }
-
-    /// The audio bar and the visual dance clock are ONE tempo: the samples-
-    /// based bar length is pinned equal to `kitty_sing`'s wall-clock bar (the
-    /// documented ± ~60 ms host-buffer skew is tolerance, not tempo drift).
-    #[test]
-    fn celebration_bar_matches_the_visual_clock() {
-        assert_eq!(CELEBRATION_BAR_SECONDS, crate::kitty_sing::SING_BAR_SECONDS);
-        assert_eq!(
-            CELEBRATION_EIGHTH,
-            crate::kitty_sing::SING_BEAT_SECONDS / 2.0
-        );
-    }
-
-    /// §27: the outro's length is one number on both sides of the seam.
-    #[test]
-    fn the_outro_matches_the_visual_clock() {
-        assert_eq!(CELEBRATION_OUTRO_S, crate::kitty_sing::OUTRO_SECONDS);
-        // Both are consts, so this is a compile-time law, not a runtime one.
-        const _: () = assert!(
-            CELEBRATION_OUTRO_S < CELEBRATION_BAR_SECONDS,
-            "the outro is shorter than a bar: it ends the song, it is not one more bar"
         );
     }
 

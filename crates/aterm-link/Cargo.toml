@@ -7,20 +7,19 @@
 # its own `[workspace]` table and path-depend on `../../astream`, a SIBLING
 # CHECKOUT most clones do not have — so `cargo build` at the aterm root never
 # built it, no release ever carried it, and turning the fabric on meant building
-# two repositories by hand. The astream crates it needs are now VENDORED under
-# `vendor/astream/crates/`, the same way this repository already vendors winit
-# and the other forks it must keep reviewing, so a clean clone builds the bridge
-# and the shipped binary carries it.
-#
-# Re-syncing the vendored copy: see `vendor/astream/README.md`. The upstream is
-# github.com/alabsystems/astream, and the fabric now lives on its `main`.
+# two repositories by hand. The astream crates it needs come from
+# `vendor/astream`, a GIT SUBMODULE of github.com/alabsystems/astream pinned
+# to one commit (2026-09-24; before that, a hand-synced copy that was reviewed
+# byte for byte and never diverged). Both repositories are first-party, so a
+# bus fix lands in astream and reaches aterm as a submodule bump, never as an
+# edit here: see `vendor/README-astream.md`.
 [package]
 name = "aterm-link"
 version.workspace = true
-# EDITION 2021, not the workspace's 2024, and deliberately: this crate and the
-# vendored astream crates beside it use `gen` as an identifier (the fabric's
-# `gen=<content_seq>:<fp16>` fence), which 2024 reserves as a keyword. Migrating
-# is a rename across two projects' source for no behavioural gain.
+# EDITION 2021, not the workspace's 2024, and deliberately: this crate uses
+# `gen` as an identifier (the fabric's `gen=<content_seq>:<fp16>` fence), which
+# 2024 reserves as a keyword. (The astream crates are 2021 too, but they declare
+# their own edition in their own workspace; nothing here decides it.)
 edition = "2021"
 license.workspace = true
 repository.workspace = true
@@ -37,10 +36,13 @@ publish = false
 # COUNTS packages (`crates/aterm-digest` exists because `sha2` + `hmac` cost
 # eight of them to expose four methods), so the cross-host wire is opt-in.
 #
-# They appear in `Cargo.lock` regardless, because a lockfile records every
-# optional resolution; `targo tree -p aterm-link -e normal` is what shows that
-# a default build compiles none of them. `tests/two_nodes_sealed.rs` is the one
-# thing that turns it on.
+# chacha20poly1305 + getrandom appear in `Cargo.lock` regardless, because a
+# lockfile records the optional dependencies a feature here can reach; `targo
+# tree -p aterm-link -e normal` is what shows that a default build compiles none
+# of them. (The x25519/ed25519 curves behind astream's `handshake`/`identity`
+# features are no longer in the lock: nothing in this workspace can enable them,
+# and a crate outside the workspace records only what its dependants can reach.)
+# `tests/two_nodes_sealed.rs` is the one thing that turns it on.
 sealed = ["astream-broker/aead"]
 
 [dependencies]

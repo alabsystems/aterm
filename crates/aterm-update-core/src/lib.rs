@@ -13,12 +13,11 @@
 //! tag-specific `github.com/…/releases/download/…` URL, [`pointer`] learns the newest
 //! release's tag from ONE redirect-refusing HEAD of `…/releases/latest/download/…`,
 //! [`download_bytes`]/[`download_to`] fetch with no credential ever attached), and the
-//! metered Releases API a DEDICATED token buys on a repointed private channel
-//! ([`api_get`], [`api_get_with_headers`] — the token on stdin, never argv); the
-//! per-machine [`token`] resolution chain; private-dir hardening
-//! ([`ensure_private_dir`]); streaming SHA-256 via [`sha256_file`]; the release-tag
-//! grammar ([`tag`]) the publisher and the updater client BOTH classify with, so
-//! they cannot disagree about which releases are candidates; the trust anchors
+//! Releases API GET ([`api_get`], [`api_get_classified`] — a token, when a caller has
+//! one, on stdin, never argv); private-dir hardening ([`ensure_private_dir`]); a
+//! `shasum`-backed [`sha256_file`]; the release-tag grammar ([`tag`]) the publisher
+//! and the updater client BOTH classify with, so they cannot disagree about which
+//! releases are candidates; the trust anchors
 //! ([`pins`] — committed constants, never build-environment state); the
 //! master-signed machine [`roster`] that turns one paper master key into per-machine
 //! signing authority with attribution and revocation; and the Developer ID requirement
@@ -45,12 +44,10 @@ pub mod manifest;
 pub mod pins;
 pub mod pkg_check;
 pub mod pointer;
-pub mod release_catalog;
 pub mod roster;
 pub mod seal_guard;
 pub mod settings;
 pub mod tag;
-pub mod token;
 
 mod hash;
 mod http;
@@ -61,12 +58,10 @@ mod sys;
 
 pub use hash::sha256_file;
 pub use http::{
-    HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, RateLimitHeaders, VendorResponse, api_get,
-    api_get_classified, api_get_classified_quick, api_get_with_headers, download_bytes,
-    download_error_is_not_found, download_error_is_rate_limit, download_to, download_to_resumable,
-    download_to_resumable_https_only, head_no_redirect, head_no_redirect_quick,
-    parse_rate_limit_headers, rate_limit_from_header_dump, vendor_content_length,
-    vendor_download_to, vendor_get, vendor_get_hint,
+    HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, VendorResponse, api_get,
+    api_get_classified, download_bytes, download_error_is_not_found, download_error_is_rate_limit,
+    download_to, download_to_resumable, download_to_resumable_https_only, head_no_redirect,
+    head_no_redirect_quick, vendor_content_length, vendor_download_to, vendor_get, vendor_get_hint,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;
@@ -81,7 +76,7 @@ pub use sys::{FileLock, same_volume};
 /// Emit a non-fatal updater warning to the app log. Routed through `aterm_log` (the
 /// global logger `aterm-gui` installs), with the same `aterm-update:` prefix the
 /// rest of the updater uses, so the output is unchanged. A no-op if no logger is
-/// installed (e.g. a dev harness). Used by [`token::resolve`]'s file-mode check.
+/// installed (e.g. a dev harness).
 pub(crate) fn warn(msg: &str) {
     aterm_log::warn!("aterm-update: {msg}");
 }

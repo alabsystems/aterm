@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 /// Resolve a caller-supplied artifact or freshen the shared RELEASE build.
 ///
 /// The dedicated target avoids repeatedly rebuilding dependencies with the
-/// outer integration test's different feature set. Paint, spin and atpkg's
-/// `untracked_stage` intentionally share it, and since the package-identity
-/// sweep below they really do: after the first build every other caller — and
+/// outer integration test's different feature set. Paint and spin intentionally
+/// share it, and since the package-identity sweep below they really do: after
+/// the first build every other caller — and
 /// the gate's own priming stage — gets a freshness check measured at 0.2 s,
 /// where an alternation between two packages used to relink for 208 s.
 pub(crate) fn release_bin(root: &Path, overrides: &[&str]) -> PathBuf {
@@ -38,9 +38,9 @@ pub(crate) fn release_bin(root: &Path, overrides: &[&str]) -> PathBuf {
         // `CARGO_PKG_NAME` and the version triple, `aterm-update-core` tracks
         // `CARGO_PKG_REPOSITORY`. Forwarded, they make this shared target
         // directory package-specific — so `paint`/`spin` (aterm-conformance)
-        // and `untracked_stage` (atpkg) invalidated each other's copy of the
-        // ring → rustls → aterm-update → atpkg → aterm-gui subtree on every
-        // run: MEASURED 2026-09-22, 208.9 s of relinking per alternation, and
+        // and atpkg's since-deleted `untracked_stage` invalidated each other's
+        // copy of the ring → rustls → aterm-update → atpkg → aterm-gui subtree on
+        // every run: MEASURED 2026-09-22, 208.9 s of relinking per alternation, and
         // the reason the helper's "the other suite is warm" held only within
         // one package. Removed here, every caller — and the gate stage that
         // primes the same artifact, which has none of these set — spells the

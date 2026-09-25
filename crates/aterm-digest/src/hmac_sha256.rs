@@ -174,76 +174,66 @@ mod tests {
     // RFC 4231 test vectors for HMAC-SHA256
     // -----------------------------------------------------------------------
 
+    /// RFC 4231 §4.2–4.8, one row per test case: `(case, key, data, tag)`.
+    /// Case 5 is published truncated to 128 bits, so its tag is compared over
+    /// the first 16 bytes only.
     #[test]
-    fn rfc4231_case_1() {
-        let key = [0x0b; 20];
-        assert_eq!(
-            hex(&mac(&key, b"Hi There")),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-        );
-    }
-
-    #[test]
-    fn rfc4231_case_2() {
-        // A key SHORTER than the digest, exercising the zero-pad path.
-        assert_eq!(
-            hex(&mac(b"Jefe", b"what do ya want for nothing?")),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-    }
-
-    #[test]
-    fn rfc4231_case_3() {
-        let key = [0xaa; 20];
-        let data = [0xdd; 50];
-        assert_eq!(
-            hex(&mac(&key, &data)),
-            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
-        );
-    }
-
-    #[test]
-    fn rfc4231_case_4() {
-        let key: Vec<u8> = (0x01u8..=0x19).collect();
-        assert_eq!(key.len(), 25);
-        let data = [0xcd; 50];
-        assert_eq!(
-            hex(&mac(&key, &data)),
-            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
-        );
-    }
-
-    #[test]
-    fn rfc4231_case_5() {
-        // RFC 4231 publishes case 5 truncated to 128 bits.
-        let key = [0x0c; 20];
-        let tag = mac(&key, b"Test With Truncation");
-        assert_eq!(hex(&tag[..16]), "a3b6167473100ee06e0c796c2955552b");
-    }
-
-    #[test]
-    fn rfc4231_case_6() {
-        // 131-byte key: LONGER than the 64-byte block, so it is hashed first.
-        let key = [0xaa; 131];
-        assert_eq!(
-            hex(&mac(
-                &key,
-                b"Test Using Larger Than Block-Size Key - Hash Key First"
-            )),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
-    }
-
-    #[test]
-    fn rfc4231_case_7() {
-        // Over-block-size key AND over-block-size data.
-        let key = [0xaa; 131];
-        let data: &[u8] = b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.";
-        assert_eq!(data.len(), 152);
-        assert_eq!(
-            hex(&mac(&key, data)),
-            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"
-        );
+    fn rfc4231_test_vectors() {
+        let case4_key: Vec<u8> = (0x01u8..=0x19).collect();
+        assert_eq!(case4_key.len(), 25);
+        let case7_data: &[u8] = b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.";
+        assert_eq!(case7_data.len(), 152);
+        for (case, key, data, tag) in [
+            (
+                1,
+                &[0x0b; 20][..],
+                &b"Hi There"[..],
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            ),
+            // A key SHORTER than the digest, exercising the zero-pad path.
+            (
+                2,
+                b"Jefe",
+                b"what do ya want for nothing?",
+                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+            ),
+            (
+                3,
+                &[0xaa; 20],
+                &[0xdd; 50],
+                "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+            ),
+            (
+                4,
+                &case4_key,
+                &[0xcd; 50],
+                "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+            ),
+            // Published truncated to 128 bits.
+            (
+                5,
+                &[0x0c; 20],
+                b"Test With Truncation",
+                "a3b6167473100ee06e0c796c2955552b",
+            ),
+            // 131-byte key: LONGER than the 64-byte block, so it is hashed first.
+            (
+                6,
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First",
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            ),
+            // Over-block-size key AND over-block-size data.
+            (
+                7,
+                &[0xaa; 131],
+                case7_data,
+                "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+            ),
+        ] {
+            let full = mac(key, data);
+            assert_eq!(hex(&full[..tag.len() / 2]), tag, "RFC 4231 case {case}");
+        }
     }
 
     // -----------------------------------------------------------------------

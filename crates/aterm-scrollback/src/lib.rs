@@ -537,9 +537,6 @@ pub(crate) fn count_image_rows(lines: &[Line]) -> u64 {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-mod mem_measure_tests;
-
 // Tests for disk-backed scrollback.
 #[cfg(all(test, feature = "disk-tier"))]
 #[path = "disk_backed_tests.rs"]

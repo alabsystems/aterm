@@ -30,6 +30,18 @@ pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
                               [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
 
+/// Whether the control socket at `sock` is LISTENING: a connect the kernel
+/// takes into the backlog, dropped at once (the server's own
+/// `control_auth::socket_is_live` probe). The socket FILE is not that signal:
+/// `bind(2)` creates it before `listen(2)`, and a client that dials in between
+/// is refused (`ECONNREFUSED`). Boots that read the file as readiness failed
+/// their first `aterm ctl` call, "Connection refused", about once in ten runs
+/// of the supervise suite at a load average near 40 (2026-09-24).
+#[allow(dead_code)]
+pub fn control_listening(sock: impl AsRef<Path>) -> bool {
+    std::os::unix::net::UnixStream::connect(sock).is_ok()
+}
+
 pub fn prepare(root: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 

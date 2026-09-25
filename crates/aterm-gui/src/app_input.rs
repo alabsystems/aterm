@@ -225,18 +225,37 @@ impl OutputEchoPublished {
     }
 }
 
-/// A metrics-clock stamp (`crate::metrics::now_us`) reconstructed on the
-/// frame's injected clock: `now` less the time the stamp trails the clock
-/// sampled beside it, never later than `now`.
-fn stamp_on_frame_clock(
-    stamp_us: u64,
-    clock_us: u64,
-    now: std::time::Instant,
-) -> std::time::Instant {
-    now.checked_sub(std::time::Duration::from_micros(
-        clock_us.saturating_sub(stamp_us),
-    ))
-    .unwrap_or(now)
+/// A metrics-clock stamp (`crate::metrics::now_us`) placed on the frame's
+/// clock: the instant it was read at ([`crate::metrics::instant_at_us`]),
+/// never later than `now`.
+///
+/// EXACT, NOT RECONSTRUCTED (2026-09-24). This was `now` less the stamp's
+/// age measured against a SECOND clock read inside the sampler,
+/// `now - (clock_us - stamp)`. That subtraction also removed the caller's own
+/// gap between taking `now` and the sampler's clock read — for a frame's
+/// `frame_started`, all the render work ahead of the sample — so every
+/// sample placed its stamps early by an error of its own, different in every
+/// sample. Two stamps close together, mapped in two DIFFERENT samples, came
+/// out INVERTED whenever the later sample's gap was the longer: a paste receipt
+/// sampled in one frame and the Enter behind it sampled in the next put the
+/// Enter first, `OutputStreak::note_turn_boundary` kept the paste's echo
+/// shadow, and the command's response was discounted as echo (the flake in
+/// `accepted_editor_input_discounts_but_enter_opens_the_turn_immediately`).
+/// And one stamp re-sampled frame after frame never came out the same twice,
+/// while THE VERDICT's spend latch (`verdict_armed`) identifies an Enter by
+/// exactly this instant, so every later `D` saw a "new" Enter.
+///
+/// The metrics clock IS `Instant`, counted from one fixed anchor, so no
+/// reconstruction is needed: the placement is a pure function of the stamp.
+/// Stamps ordered in stamp space stay ordered across samples whose `now`s do
+/// not go backwards (`min` is monotone in both), and a stamp at or before
+/// `now` is the same instant in every sample. `now` only BOUNDS it: a write
+/// accepted after the frame's clock was read is placed at that clock — the
+/// one placement that can move in a later sample (to its own instant, never
+/// out of order), so the verdict latch can re-arm only for an Enter both
+/// written and answered by a `D` inside the one frame that bounded it.
+fn stamp_on_frame_clock(stamp_us: u64, now: std::time::Instant) -> std::time::Instant {
+    crate::metrics::instant_at_us(stamp_us).map_or(now, |at| at.min(now))
 }
 
 /// One coherent render-time view of a session's echo evidence.
@@ -371,8 +390,8 @@ impl OutputEchoTracker {
     }
 
     /// THE RENDER PRELUDE'S READ: every delivery newer than `after`, oldest
-    /// first, with its instant reconstructed on the frame's clock
-    /// ([`stamp_on_frame_clock`], as [`Self::sample`] reconstructs
+    /// first, with its instant placed on the frame's clock
+    /// ([`stamp_on_frame_clock`], as [`Self::sample`] places
     /// `last_accepted_at`). A receipt whose bytes are still in the spill is
     /// resolved here once the sink reports the spill drained
     /// ([`OutputEchoPublished::settle_held_receipts`]), and holds `latest`
@@ -446,27 +465,25 @@ impl OutputEchoTracker {
             let Some(slot) = slots.next() else {
                 break;
             };
-            // A RECEIPT IS NEVER BEFORE ITS DISPATCH, so the reconstruction is
-            // clamped to the dispatch instant. The stamp above is rebuilt from a
-            // SECOND clock (`clock_us`, sampled at the top of this function)
-            // against a frame instant the caller sampled EARLIER, and
-            // `stamp_on_frame_clock` subtracts the age measured to the later
-            // reference from the earlier instant — so it carries a systematic
-            // EARLY bias equal to the gap between the two samples, which grows
-            // with load. `dispatched_at` is observed directly, on one clock, and
-            // carries no such error; where the two disagree it is the better
-            // measurement. Causally nothing can be received before it was sent,
-            // so this corrects measurement error and hides no real ordering.
+            // A RECEIPT IS NEVER BEFORE ITS DISPATCH, so the placement is
+            // clamped to the dispatch instant. The stamp itself is placed
+            // exactly (`stamp_on_frame_clock`), but BOUNDED by `now`: a key
+            // dispatched after the caller read its frame clock would otherwise
+            // be receipted at `now`, before its own dispatch. `dispatched_at` is
+            // observed directly on the caller's clock; causally nothing can be
+            // received before it was sent, so the later of the two is the
+            // receipt, and no real ordering is hidden.
             //
             // It matters beyond tidiness: the only production reader
             // (`read_deliveries` -> the cursor-glow insert/hop claim) decides
             // whether a hop refused BEFORE the key was dispatched may be lit as
-            // that key's completion, and an early-biased receipt is exactly what
+            // that key's completion, and a receipt placed early is exactly what
             // lets it. Observed as a flake in
             // `a_queued_ticket_carries_its_dispatch_instant`, whose third
-            // assertion is this invariant.
-            let at =
-                stamp_on_frame_clock(r.delivered_us, clock_us, now).max(r.ticket.dispatched_at);
+            // assertion is this invariant — from the per-sample EARLY error the
+            // old reconstruction carried (see `stamp_on_frame_clock`), which
+            // this clamp hid here and nothing hid in `sample`.
+            let at = stamp_on_frame_clock(r.delivered_us, now).max(r.ticket.dispatched_at);
             *slot = Some((at, r.ticket));
             out.latest = r.serial;
         }
@@ -498,7 +515,12 @@ impl OutputEchoTracker {
         self.begin(OutputEchoInput::raw_editor(bytes))
     }
 
-    /// Sample echo evidence against the render frame's injected clock.
+    /// Sample echo evidence against the render frame's injected clock. Each
+    /// stamp is placed at the instant it was read, bounded by `now`
+    /// ([`stamp_on_frame_clock`]) — not reconstructed against the clock read
+    /// below (that read only settles a drained spill), so a stamp keeps its
+    /// place and its order against every other stamp whichever sample hands
+    /// it over.
     pub(crate) fn sample(&self, sink: &SinkWriter, now: std::time::Instant) -> OutputEchoSample {
         let clock_us = crate::metrics::now_us().max(1);
         let mut published = match self.published.try_lock() {
@@ -523,7 +545,7 @@ impl OutputEchoTracker {
         let last_us = published.last_accepted_us;
         let boundary_us = published.last_boundary_us;
         let debt = published.spill_debt.is_some();
-        let at = |stamp| stamp_on_frame_clock(stamp, clock_us, now);
+        let at = |stamp| stamp_on_frame_clock(stamp, now);
         let last_accepted_at = (last_us != 0).then(|| at(last_us));
         let last_boundary_at = (boundary_us != 0).then(|| at(boundary_us));
         OutputEchoSample {
@@ -746,18 +768,17 @@ mod output_echo_tracker_tests {
     }
 
     /// A RECEIPT IS NEVER REPORTED BEFORE ITS DISPATCH. The receipt instant is
-    /// RECONSTRUCTED — `now` less the age of the stamp measured against a second
-    /// clock sampled at the top of `deliveries_after` — and because that second
-    /// sample happens AFTER the caller took `now`, the subtraction removes the
-    /// caller's own gap as well as the real age. The reconstruction therefore
-    /// runs systematically early, by an amount that grows with load.
+    /// the stamp's own instant BOUNDED by the reader's `now`
+    /// (`stamp_on_frame_clock`), so a key dispatched after the frame's `now`
+    /// snapshot would be receipted at `now`, before its dispatch. (Until
+    /// 2026-09-24 the instant was RECONSTRUCTED against a second clock read and
+    /// ran early by the reader's own gap as well — the error that flaked the
+    /// live-clock version of this, `a_queued_ticket_carries_its_dispatch_instant`,
+    /// on precisely this assertion.)
     ///
-    /// This drives it deterministically instead of waiting for load to do it: a
-    /// ticket dispatched AFTER the frame's `now` snapshot is exactly the skew
-    /// case, and without the clamp the reported instant lands before the
-    /// dispatch it is a receipt for. The live-clock version of this is
-    /// `a_queued_ticket_carries_its_dispatch_instant`, which flaked on precisely
-    /// this assertion.
+    /// This drives the bound deterministically instead of waiting for load to do
+    /// it: a ticket dispatched AFTER the frame's `now` snapshot, and without the
+    /// clamp the reported instant lands before the dispatch it is a receipt for.
     #[cfg(unix)]
     #[test]
     fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
@@ -873,7 +894,7 @@ mod output_echo_tracker_tests {
             items
                 .iter()
                 .all(|(at, _)| now.saturating_duration_since(*at).as_millis() < 1_000),
-            "the delivery instant is reconstructed on the frame's clock"
+            "the delivery instant is placed on the frame's clock"
         );
         // Read once: the same baseline hands over nothing new.
         let again = tracker.deliveries_after(&sink, Some(batch.latest), now);
@@ -1385,17 +1406,26 @@ mod output_echo_tracker_tests {
         let sink = SinkWriter::new(pipe[1]);
         let term = Mutex::new(Terminal::new(24, 80));
         let tracker = Arc::new(OutputEchoTracker::default());
-        // EVERY SAMPLE ANCHORS ON A FRESH CLOCK, as the host's frame loop does.
-        // `sample(sink, now)` maps the tracker's microsecond stamps onto
-        // `now - (clock_at_sample - stamp)`; two samples anchored on ONE stale
-        // `now` but read through two different clocks do not preserve the
-        // order of their stamps under scheduler jitter. MEASURED (gate runs
-        // 7 and the containment gate, 2026-09-02/05, each under the full
-        // 4,300-test parallel suite): the Enter boundary mapped BEFORE the
-        // paste receipt, `note_turn_boundary` kept the shadow, and the
-        // response after Enter was discounted as echo — 0/20 failures in
-        // isolation, where every age is microseconds. A stale anchor is the
-        // test's own construction; the host never reuses one.
+        // EVERY SAMPLE ANCHORS ON A FRESH CLOCK, as the host's frame loop does
+        // (frame clocks never run backwards). This alone did NOT make the test
+        // deterministic, and the first fix believed it had: `sample` used to
+        // place a stamp at `now - (clock_read_inside_sample - stamp)`, an
+        // error of its own in every sample — the delay between the caller's
+        // `Instant::now()` and that read — so the paste receipt and the Enter,
+        // microseconds apart and handed over by two DIFFERENT samples, came
+        // out inverted whenever a preemption fell inside the later sample's
+        // delay. The Enter then mapped BEFORE the paste, `note_turn_boundary`
+        // kept the paste's shadow, and the response after Enter was discounted
+        // as echo: MEASURED under the full parallel lib suite (gate runs 7 and
+        // the containment gate, 2026-09-02/05), never in isolation, where no
+        // preemption lands in a microsecond window. Driving this exact
+        // construction on 64 threads at once (2026-09-24, a throwaway
+        // instrument) inverted 1,074 of 2.08 M trials before the fix and 0 of
+        // 2.72 M after: a stamp is now placed at the instant it was read
+        // (`stamp_on_frame_clock`), so stamps ordered in stamp space stay
+        // ordered here whatever the scheduler does. The production shape —
+        // the sample late in its frame — is driven deterministically by
+        // `a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it`.
         let now = std::time::Instant::now();
         let mut streak = aterm_effects::output_streak::OutputStreak::new(1);
         assert!(!streak.note_output(1, &[(2, 0, 0)], now, false));
@@ -1463,6 +1493,107 @@ mod output_echo_tracker_tests {
         assert!(
             streak.note_output(4, &[(3, 0, 0)], now, turn.input_hot),
             "the command response immediately after Enter is authored output"
+        );
+
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// THE ENTER IS PLACED WHERE IT WAS READ, HOWEVER LATE IN ITS FRAME IT IS
+    /// SAMPLED (2026-09-24). The host reads its frame clock (`frame_started`)
+    /// at the TOP of a frame and samples each session's echo evidence against
+    /// it only after that frame's render work — the output-streak and verdict
+    /// reads in `App::render_window`. When a paste (or a typed key) is handed
+    /// over by one frame and the Enter behind it by the next — an Enter queued
+    /// behind a draining paste is written microseconds after it — the old
+    /// placement (`now - (clock_read_inside_sample - stamp)`) subtracted the
+    /// later frame's whole prelude from the Enter, put it BEFORE the paste,
+    /// and the streak discounted the command's response as echo. The same
+    /// stale anchor placed ONE boundary somewhere different in every frame,
+    /// and THE VERDICT's latch, which spends an Enter by exactly that instant
+    /// (`verdict_armed`), re-armed on every later `D` — a `D` with no keystroke
+    /// behind it, which must be silent.
+    ///
+    /// Deterministic, not load-driven: the frame's prelude is a sleep far
+    /// longer than the microseconds between the paste and the Enter here.
+    /// RED before the fix: the Enter placed ~20 ms before the paste it
+    /// followed, the response discounted, and the re-sampled boundary moved.
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it() {
+        use std::time::{Duration, Instant};
+        /// The frame's render work between reading its clock and sampling.
+        const PRELUDE: Duration = Duration::from_millis(20);
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        let sink = SinkWriter::new(pipe[1]);
+        let term = Mutex::new(Terminal::new(24, 80));
+        let tracker = OutputEchoTracker::default();
+        let write = |ev: &InputEvent, mode: input::EgressMode| {
+            let write = tracker.begin_event(ev);
+            let receipt =
+                input::seam_egress_receipt(&term, &crate::mode_mirror_of(&term), &sink, ev, mode);
+            write.finish(receipt, &sink);
+        };
+        let mut streak = aterm_effects::output_streak::OutputStreak::new(1);
+        assert!(!streak.note_output(1, &[(2, 0, 0)], Instant::now(), false));
+
+        // Frame N hands over the paste receipt; its echo is discounted.
+        write(
+            &InputEvent::Paste("paste".into(), input::PasteFraming::AtDrain),
+            input::EgressMode::Backpressured,
+        );
+        let frame_n = Instant::now();
+        let paste = tracker.sample(&sink, frame_n);
+        let paste_at = paste.last_accepted_at.expect("accepted paste receipt");
+        streak.note_keystroke(paste_at);
+        assert!(!streak.note_output(2, &[(2, 0, 0)], frame_n, paste.input_hot));
+
+        // The Enter lands; frame N+1 reads its clock, renders, THEN samples.
+        write(
+            &enter(TMods::empty(), KeyEventType::Press),
+            input::EgressMode::Interactive,
+        );
+        let frame_n1 = Instant::now();
+        std::thread::sleep(PRELUDE);
+        let turn = tracker.sample(&sink, frame_n1);
+        let boundary_at = turn.last_boundary_at.expect("accepted Enter");
+        assert!(
+            boundary_at >= paste_at,
+            "the Enter was placed {:?} BEFORE the paste it followed",
+            paste_at.saturating_duration_since(boundary_at)
+        );
+        assert!(
+            boundary_at <= frame_n1,
+            "never later than the frame's clock"
+        );
+        streak.note_turn_boundary(boundary_at);
+        assert!(
+            streak.note_output(3, &[(3, 0, 0)], frame_n1, turn.input_hot),
+            "the command response after Enter is authored output"
+        );
+
+        // ONE Enter is ONE instant, whichever frame hands it over and however
+        // late in that frame: a second `D` for it finds it already spent.
+        let mut spent = None;
+        assert!(crate::app_render::verdict_armed(
+            &mut spent,
+            1,
+            Some(boundary_at)
+        ));
+        let frame_n2 = Instant::now();
+        std::thread::sleep(PRELUDE / 2);
+        let replay = tracker.sample(&sink, frame_n2);
+        assert_eq!(
+            replay.last_boundary_at,
+            Some(boundary_at),
+            "a re-sampled boundary keeps its instant"
+        );
+        assert!(
+            !crate::app_render::verdict_armed(&mut spent, 1, replay.last_boundary_at),
+            "a later `D` with no new Enter behind it is silent"
         );
 
         unsafe {
@@ -6096,6 +6227,12 @@ impl App {
                     // `Wake::Output` handler. State-only (never gates bytes), set for
                     // BOTH sources like the side-effects above, and OUTSIDE any term
                     // lock.
+                    // Read before the window borrow: whether THIS key came
+                    // through the winit `KeyboardInput` arm (a physical key or
+                    // `ctl hwkey`'s real NSEvent). A metric attribution, never
+                    // a byte decision — the strain engine counts only such
+                    // keys (design §10.14, ruling 206).
+                    let hardware_key = self.hw_key_dispatch;
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         // A BARE MODIFIER IS NOT A KEYSTROKE (same law as
                         // `last_key_at` below): it must not admit the next output
@@ -6186,7 +6323,7 @@ impl App {
                             ws.last_key_at = Some(input_now);
                             // Per-window: only THIS window's content present may
                             // close the key's input→present slice.
-                            crate::metrics::note_window_input(&mut ws.pending_input);
+                            crate::metrics::note_window_input(&mut ws.pending_input, hardware_key);
                         }
                         // Stamp the arrival for the `metrics` verb's input→present
                         // slice — the latency a human FEELS when typing. The same
@@ -7660,7 +7797,13 @@ impl App {
             // the same rule `apply_scroll_glide_sample` applies mid-flight.
             let machine =
                 i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX) - st.engine_row;
-            let target_row = target_row.saturating_add(machine).clamp(0, max_row);
+            // …except the LIVE BOTTOM, a destination and not a content row (see
+            // `apply_scroll_glide_sample`): a glide bound for live settles on live.
+            let target_row = if target_row == 0 {
+                0
+            } else {
+                target_row.saturating_add(machine).clamp(0, max_row)
+            };
             loop {
                 let current = i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX);
                 let delta = target_row - current;
@@ -7934,23 +8077,48 @@ impl App {
                     next_tick: now,
                 });
             }
-            let excess_px = ws.scroll_glide.as_mut().map_or(0, |st| {
+            let (excess_px, edges) = ws.scroll_glide.as_mut().map_or((0, (false, false)), |st| {
                 if viewport.is_some() {
                     // A seam-fed delta (a banked whole row) refreshes the clamp
                     // bound the lock-free sub-row deltas reuse.
                     st.max_rows = max_rows;
                 }
-                st.glide.track(dy_px, cell_h, max_rows * cell_h, now)
+                let max_px = st.max_rows * cell_h;
+                let excess = st.glide.track(dy_px, cell_h, max_px, now);
+                let (pos, _) = st.glide.sample(now);
+                (excess, (pos >= max_px, pos <= 0))
             });
+            let (at_top, at_live) = edges;
             self.apply_scroll_glide_sample(wid, now);
             let Some(ws) = self.windows.get_mut(&wid) else {
                 return;
             };
+            // A bounce belongs to the edge that released it: a top bounce sags
+            // the band (negative), a live-bottom bounce lifts it (positive).
+            // Off ITS edge it ends — mid-history, and at the OTHER end of a
+            // history one delta crossed, where it would present the wrong
+            // edge's rubber band (and a chained impulse would stack onto it).
+            // A delta that fit while the band still sits on its edge (a
+            // sub-pixel momentum tail rounds onto it) has not left it, so the
+            // bounce in flight stays.
+            let stale = ws.overscroll.as_ref().is_some_and(|sp| {
+                let d = sp.sample(now).0;
+                (d <= 0.0 && !at_top) || (d >= 0.0 && !at_live)
+            });
+            if stale {
+                ws.overscroll = None;
+            }
             if excess_px != 0 {
                 release_overscroll(ws, excess_px, cell_h, tick_interval, now);
-            } else {
-                // Moving with room to move: we are no longer parked at an edge.
-                ws.overscroll = None;
+            }
+            // The apply above wrote the band's own frac (0 at an edge row), but
+            // a live bounce OWNS `scroll_frac_px` — the rule
+            // `service_due_scroll_motion` applies after a glide tick. An excess
+            // of 1-3 px resists to a zero impulse, so `release_overscroll` wrote
+            // nothing, and without this the frame presents the band at rest
+            // between two bounce ticks.
+            if let Some(sp) = ws.overscroll.as_ref() {
+                ws.scroll_frac_px = sp.sample(now).0.round() as i32;
             }
             ws.scroll_pill.touch(now);
             if let Some(w) = ws.os_window.as_ref() {
@@ -8021,8 +8189,10 @@ impl App {
     /// decompose the eased px into whole rows (the proven [`scroll_motion::decompose`]
     /// law), apply the ROW DELTA to the glide's own pinned engine, and drop the
     /// state once the sample lands on the target — the self-disarm that returns
-    /// the loop to pure `Wait`. Called from `new_events` after the borrow loop
-    /// (it takes the engine lock), mirroring the selection-autoscroll ticks.
+    /// the loop to pure `Wait`. Called only from [`Self::service_due_scroll_motion`]
+    /// — on every `new_events` wake, BEFORE the borrow loop, and once more at
+    /// park time in `about_to_wait` — when its anchored tick is due; it may take
+    /// the engine lock.
     pub(crate) fn tick_scroll_glide(&mut self, wid: WindowId, now: std::time::Instant) {
         // The M1b sub-row residual is PRESENTED only under a Full motion policy for
         // SmoothScroll; a mid-glide flip to Reduced (e.g. the window lost focus)
@@ -8071,14 +8241,16 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let Some((term, cell_h, pos_px, done, engine_row)) = ws.scroll_glide.as_ref().map(|st| {
-            let (pos, done) = st.glide.sample(now);
-            (st.term.clone(), st.cell_h, pos, done, st.engine_row)
-        }) else {
+        let Some((term, cell_h, pos_px, mut done, engine_row)) =
+            ws.scroll_glide.as_ref().map(|st| {
+                let (pos, done) = st.glide.sample(now);
+                (st.term.clone(), st.cell_h, pos, done, st.engine_row)
+            })
+        else {
             return;
         };
         let (row_floor, s) = crate::scroll_motion::decompose(pos_px, cell_h);
-        let (offset, frac) = if s == 0 {
+        let (offset, mut frac) = if s == 0 {
             (row_floor, 0)
         } else {
             (row_floor + 1, cell_h - s)
@@ -8087,9 +8259,50 @@ impl App {
             let mut t = term_lock(&term);
             let cur = i64::try_from(t.grid().display_offset()).unwrap_or(i64::MAX);
             let machine = cur - engine_row;
-            let offset = if machine != 0 {
+            // A glide bound for the LIVE BOTTOM keeps the absolute law: row 0 is
+            // a DESTINATION, not a content position. Shifting it by SCR-1's
+            // re-pin landed the reader `machine` rows above live, where the re-pin
+            // (`prev_offset + lines_added`) then kept them detached for as long
+            // as output streamed — a notch toward live could not reach live in
+            // a streaming Codex session (audit, 2026-09-24). A history target
+            // is content, and keeps the shift.
+            let live_bound = ws
+                .scroll_glide
+                .as_ref()
+                .is_some_and(|st| st.glide.target_px() == 0);
+            // …against a RE-PIN only (`machine > 0`). A DROP (`machine < 0`:
+            // ED 3 clamping the pin to an emptied history, a reflow) has
+            // already moved the reader toward live, and the absolute row would
+            // scroll them back UP into whatever the app printed since (audit
+            // of the audit, 2026-09-24); the frame shift keeps them there.
+            let offset = if machine < 0 || (machine > 0 && !live_bound) {
                 if let Some(st) = ws.scroll_glide.as_mut() {
                     st.glide.shift(machine.saturating_mul(cell_h));
+                    // A DROP can sink the target BELOW the live bottom — always
+                    // for a glide bound for live (its target was 0), and for a
+                    // history target the drop outran. No row lies there (no
+                    // apron at offset 0): the ceil pairing would lift the live
+                    // screen by a residual it has no row for, and a chained
+                    // notch or trackpad delta would start from a negative base
+                    // (the notch clamped away, the delta read as a live-bottom
+                    // overscroll). Clamp the frame as the settle twin clamps its
+                    // landing row: a reader the drop carried to or past live has
+                    // ARRIVED; one still above it eases on to live, never below.
+                    // A TRACKED band's rest target rounds half a cell toward
+                    // history, so a drop can also leave the target ON live (0)
+                    // with the parked start still below it: that band has
+                    // reached live too, and must not present its negative start
+                    // as a lift at offset 0.
+                    let shifted = pos_px.saturating_add(machine.saturating_mul(cell_h));
+                    let target = st.glide.target_px();
+                    if target < 0 || (target == 0 && shifted < 0) {
+                        if shifted <= 0 {
+                            done = true;
+                            frac = 0;
+                        } else {
+                            st.glide.retarget(0, now);
+                        }
+                    }
                 }
                 offset + machine
             } else {
@@ -8115,8 +8328,9 @@ impl App {
         // `next_tick + interval` while that is still ahead, so a tick served a
         // couple of ms late — a redraw stood in front of it — does not
         // accumulate the lateness into the cadence, and a tick more than a
-        // whole period late re-phases from `now`. The one and only writer after
-        // the arm, so a park's re-read is always this value.
+        // whole period late re-phases from `now`. Besides the arm, only the two
+        // early-ease pull-ins write it (a chained notch, a gesture end), so a
+        // park's re-read is always a value one of these wrote.
         let tick_interval = ws.frame_interval.unwrap_or(app_interval);
         if let Some(st) = ws.scroll_glide.as_mut() {
             st.next_tick = if now < st.glide.settle_start() {
@@ -8148,7 +8362,8 @@ impl App {
     /// Service every armed glide and bounce whose ANCHORED tick is due at `now`
     /// — glides first (a tracked band parked at a history end keeps its glide
     /// armed while the bounce owns `scroll_frac_px`: the glide's apply writes
-    /// frac 0 and the spring's tick must overwrite it in the SAME pass), then
+    /// frac 0, so a live bounce's displacement is re-presented right after it
+    /// whether or not the bounce's own anchor is due in this pass), then
     /// bounces. Called on EVERY event-loop wake (`new_events`, whatever the
     /// `StartCause`) and once more at park time (`about_to_wait`, before the
     /// deadline fold), so a due slot is consumed by whichever wake comes first
@@ -8169,6 +8384,20 @@ impl App {
             .collect();
         for id in glide_due {
             self.tick_scroll_glide(id, now);
+            // A tracked band parked at a history end (start == target == the
+            // edge row) just wrote frac 0, but a live bounce OWNS
+            // `scroll_frac_px` — and its anchor runs on its own phase, so it is
+            // usually NOT due in this pass: the frame presented the band snapped
+            // to rest mid-bounce, and the settle's glide ticks alternated with
+            // the spring's until it ended (audit, 2026-09-24). Re-present the
+            // spring's displacement at `now` without advancing its anchor; a
+            // bounce that IS due ticks below and overwrites this with the same
+            // sample.
+            if let Some(ws) = self.windows.get_mut(&id)
+                && let Some(sp) = ws.overscroll.as_ref()
+            {
+                ws.scroll_frac_px = sp.sample(now).0.round() as i32;
+            }
             ticked.push(id);
         }
         let bounce_due: Vec<WindowId> = self
@@ -8196,8 +8425,8 @@ impl App {
     /// state once it settles — the self-disarm that returns the loop to pure `Wait`.
     /// A mid-bounce flip to Reduced motion (e.g. the window lost focus) snaps to rest
     /// (frac 0, no residual). The bounce never moves the ENGINE (it is parked at a
-    /// history end — display-only), unlike the glide tick. Called from `new_events`
-    /// after the borrow loop, mirroring [`Self::tick_scroll_glide`].
+    /// history end — display-only), unlike the glide tick. Called only from
+    /// [`Self::service_due_scroll_motion`], after the glide ticks of the same pass.
     pub(crate) fn tick_overscroll(&mut self, wid: WindowId, now: std::time::Instant) {
         let animate = self.smooth_scroll_animates(wid);
         let app_interval = self.frame_interval;
@@ -14327,17 +14556,33 @@ mod terminal_emacs_search_input_tests {
         pipe
     }
 
+    /// Silence is EAGAIN on a live, empty observer pipe, and nothing else is.
+    /// A positive read is the regression these tests guard: bytes reached the
+    /// PTY. A zero read is EOF, which a pipe whose write end this test still
+    /// holds can never answer: one of the observer's two descriptors was closed
+    /// out from under the test (in this threaded binary, by another thread
+    /// closing a number it no longer owned, after which the kernel may hand the
+    /// read end's number to something already at EOF). No silence was observed
+    /// at all, and it is reported as that rather than as emitted bytes.
     #[cfg(unix)]
     fn assert_pty_silent_and_close(pipe: [i32; 2]) {
         let mut bytes = [0u8; 64];
-        assert_eq!(
-            unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) },
-            -1,
-            "host-owned search press/repeat/release emitted PTY bytes"
+        let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+        let error = std::io::Error::last_os_error();
+        assert_ne!(
+            read, 0,
+            "the PTY observer read EOF: a descriptor it owns was closed out from under \
+             it, so silence was never observed"
+        );
+        assert!(
+            read < 0,
+            "host-owned search press/repeat/release emitted PTY bytes: {:?}",
+            &bytes[..usize::try_from(read).unwrap_or(0)]
         );
         assert_eq!(
-            std::io::Error::last_os_error().kind(),
-            std::io::ErrorKind::WouldBlock
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the observer read failed with {error}, not EAGAIN"
         );
         unsafe {
             libc::close(pipe[0]);
@@ -16467,6 +16712,21 @@ mod smooth_scroll_tests {
                 <= std::time::Instant::now() + std::time::Duration::from_millis(TRACK_SETTLE_MS),
             "…it is exactly one settle away"
         );
+        // …and THE WAKE THE LOOP ARMS moved with it (audit, 2026-09-24): the
+        // parked anchor was the old rest boundary, so the settle waited ~90 ms
+        // and then presented almost all of itself in one frame. The glide's
+        // armed wake is one panel period out, not the rest boundary.
+        let iv = app.windows[&wid]
+            .frame_interval
+            .unwrap_or(app.frame_interval);
+        let st = app.windows[&wid]
+            .scroll_glide
+            .as_ref()
+            .expect("still armed");
+        assert!(
+            st.wake_deadline() <= std::time::Instant::now() + iv,
+            "the loop's armed wake is one period out, not the old rest boundary"
+        );
     }
 
     /// THE FENCE the direct-manipulation path must not cross: under a TRACKING
@@ -16537,6 +16797,218 @@ mod smooth_scroll_tests {
         unsafe {
             libc::close(pipe[1]);
         }
+    }
+
+    /// THE BOUNCE OWNS THE BAND AT A HISTORY END (audit, 2026-09-24). A finger
+    /// pushed past the top keeps its tracked glide parked AT the edge (frac 0)
+    /// beside a live overscroll spring, each on its own anchored phase. A pass
+    /// that served the glide ALONE (its rest boundary between two spring
+    /// slots) presented the band snapped to rest mid-bounce, and the settle's
+    /// glide ticks then alternated with the spring's. Every served instant
+    /// while the spring lives must present the spring's displacement — and at
+    /// least one pass must be the glide alone, or this proves nothing.
+    #[test]
+    fn a_glide_tick_at_a_history_end_never_snaps_a_live_bounce() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        app.windows.get_mut(&wid).unwrap().frame_interval = Some(Duration::from_micros(8_333));
+        term_lock(&term).scroll_display(i32::MAX);
+        app.scroll_wheel_animated_with(wid, &term, 0, None, Some(40.0));
+        assert!(
+            app.windows[&wid].overscroll.is_some() && app.windows[&wid].scroll_glide.is_some(),
+            "fixture: a tracked band parked at the top beside a live bounce"
+        );
+        let mut glide_alone = 0;
+        for _ in 0..500 {
+            let ws = &app.windows[&wid];
+            let Some(sp) = ws.overscroll.as_ref() else {
+                break;
+            };
+            let bounce_at = sp.wake_deadline();
+            let glide_at = ws.scroll_glide.as_ref().map(|st| st.wake_deadline());
+            let t = glide_at.map_or(bounce_at, |g| g.min(bounce_at));
+            if glide_at.is_some_and(|g| g < bounce_at) {
+                glide_alone += 1;
+            }
+            app.service_due_scroll_motion(t);
+            let ws = &app.windows[&wid];
+            if let Some(sp) = ws.overscroll.as_ref() {
+                assert_eq!(
+                    ws.scroll_frac_px,
+                    sp.sample(t).0.round() as i32,
+                    "the live bounce's displacement is what the band presents"
+                );
+            }
+        }
+        assert!(
+            glide_alone > 0,
+            "non-vacuous: some pass served the glide alone"
+        );
+    }
+
+    /// THE EVENT PATH OBEYS THE SAME RULE (second audit, 2026-09-24). A
+    /// momentum tail keeps sending small deltas at the edge after the push
+    /// that released the bounce. An excess of 1-3 px resists to a ZERO impulse,
+    /// so `release_overscroll` wrote nothing and the glide's apply had already
+    /// written frac 0: the band flickered to rest between two bounce ticks. A
+    /// sub-pixel delta that rounds onto the edge reported no excess and was
+    /// read as "left the edge", cutting the bounce in one frame. Both deltas
+    /// must leave the bounce live and presented.
+    #[test]
+    fn a_small_delta_at_a_history_end_keeps_the_bounce_presented() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        term_lock(&term).scroll_display(i32::MAX);
+        let t0 = std::time::Instant::now();
+        app.scroll_wheel_animated_at(wid, &term, 0, None, Some(40.0), t0);
+        assert!(
+            app.windows[&wid].overscroll.is_some(),
+            "fixture: the push past the top released a bounce"
+        );
+        for (ms, dy) in [(1, 2.0), (2, 0.3)] {
+            let t = t0 + Duration::from_millis(ms);
+            app.scroll_wheel_animated_at(wid, &term, 0, None, Some(dy), t);
+            let ws = &app.windows[&wid];
+            let sp = ws
+                .overscroll
+                .as_ref()
+                .unwrap_or_else(|| panic!("a {dy} px delta at the edge kept the bounce"));
+            let want = sp.sample(t).0.round() as i32;
+            assert_ne!(want, 0, "non-vacuous: the bounce is displaced at +{ms} ms");
+            assert_eq!(
+                ws.scroll_frac_px, want,
+                "a {dy} px delta at the edge presents the bounce, not the band at rest"
+            );
+        }
+    }
+
+    /// …AND A TRACKED BAND A PARTIAL DROP LANDS ON LIVE (fourth audit,
+    /// 2026-09-24). A tracked band's rest target rounds half a cell toward
+    /// history, so a drop of exactly its target's rows leaves the target ON
+    /// live while the parked start sinks below it; a clamp that asked only for
+    /// a target below live let that start present as a lift of the live screen
+    /// with no row under it.
+    #[test]
+    fn a_partial_drop_that_lands_a_tracked_band_on_live_presents_it_at_rest() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let cell_h = app.win_cell_size(wid).1.max(1) as f64;
+        term_lock(&term).scroll_display(2);
+        let t0 = std::time::Instant::now();
+        // Park a tracked band half a row below row 2: still offset 2.
+        app.scroll_wheel_animated_at(wid, &term, 0, None, Some(-cell_h / 2.0), t0);
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            2,
+            "fixture: parked on row 2"
+        );
+        // History shrinks to one row: the engine's offset drops 2 -> 1.
+        term_lock(&term).set_scrollback_line_limit(Some(1));
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            1,
+            "fixture: a partial drop"
+        );
+        // The finger moves on to 0.9 of a row: the rest target rounds to row
+        // 1, which the drop shifts onto live, and the start below it.
+        let t = t0 + Duration::from_millis(1);
+        app.scroll_wheel_animated_at(wid, &term, 0, None, Some(-0.6 * cell_h), t);
+        assert_eq!(term_lock(&term).grid().display_offset(), 0);
+        assert_eq!(
+            app.windows[&wid].scroll_frac_px, 0,
+            "no residual lifts the live screen"
+        );
+    }
+
+    /// …BUT A BOUNCE BELONGS TO ITS OWN EDGE (third audit, 2026-09-24). A top
+    /// bounce sags the band (negative frac), a live-bottom one lifts it
+    /// (positive). One precise delta that crosses the whole history lands the
+    /// band on the OTHER end; "still on an edge" kept the top bounce there and
+    /// presented its sag at the live bottom — a placeholder strip over the
+    /// history row, the prompt pushed under the band edge — for the rest of
+    /// its 400 ms. An exact landing (no excess) and an overshoot that resists
+    /// to a zero impulse must both end it.
+    #[test]
+    fn a_delta_that_crosses_the_history_ends_the_other_edges_bounce() {
+        for overshoot in [0.0, 2.0] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let term = seed_history(&app, wid);
+            term_lock(&term).scroll_display(i32::MAX);
+            let t0 = std::time::Instant::now();
+            app.scroll_wheel_animated_at(wid, &term, 0, None, Some(40.0), t0);
+            let max_px = {
+                let ws = &app.windows[&wid];
+                assert!(
+                    ws.scroll_frac_px < 0 && ws.overscroll.is_some(),
+                    "fixture: the push past the top released a sagging bounce"
+                );
+                let st = ws
+                    .scroll_glide
+                    .as_ref()
+                    .expect("fixture: the band is armed");
+                st.max_rows * st.cell_h
+            };
+            let t = t0 + Duration::from_millis(1);
+            let dy = -(max_px as f64) - overshoot;
+            app.scroll_wheel_animated_at(wid, &term, 0, None, Some(dy), t);
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                0,
+                "fixture: the {dy} px delta crossed to the live bottom"
+            );
+            let ws = &app.windows[&wid];
+            assert!(
+                ws.overscroll.is_none(),
+                "overshoot {overshoot}: the top bounce ended at the live bottom"
+            );
+            assert_eq!(
+                ws.scroll_frac_px, 0,
+                "overshoot {overshoot}: the live bottom presents at rest, not the top's sag"
+            );
+        }
+    }
+
+    /// ALT OVER A MAIN-SCREEN TRACKING APP SCROLLS LOCALLY — ALL OF THE FINGER
+    /// (audit, 2026-09-24). Option/Alt is the selection-custody override: the
+    /// seam routes the wheel to the local viewport on the main screen even
+    /// while an app tracks the mouse. Tier 1 of `track_precise_scroll` excluded
+    /// only Shift, so every SUB-ROW delta took its release-and-return while the
+    /// row-banking events moved the band by their own pixels: a row of finger
+    /// travel moved the band about a quarter row here. Four quarter-row deltas
+    /// must present one whole row of motion.
+    #[test]
+    fn alt_over_a_main_screen_tracking_app_tracks_every_pixel() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
+        app.windows.get_mut(&wid).unwrap().mods = winit::keyboard::ModifiersState::ALT;
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        assert!(cell_h >= 8, "fixture: a cell tall enough to quarter");
+        for _ in 0..4 {
+            app.on_mouse_wheel(
+                wid,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, (cell_h / 4) as f64)),
+            );
+        }
+        let ws = &app.windows[&wid];
+        assert!(
+            ws.scroll_glide.is_some(),
+            "Alt on the main screen scrolls the local band"
+        );
+        let presented = i64::try_from(term_lock(&term).grid().display_offset()).unwrap() * cell_h
+            - i64::from(ws.scroll_frac_px);
+        assert!(
+            (presented - 4 * (cell_h / 4)).abs() <= 1,
+            "the band moved by every delta's pixels: presented {presented} px of {}",
+            4 * (cell_h / 4)
+        );
     }
 
     /// THE OTHER FENCE: the controller `mouse` verb has no pixel field, so its
@@ -16642,6 +17114,107 @@ mod smooth_scroll_tests {
             4 + 3,
             "the glide lands 4 rows into history RELATIVE to the re-pinned content"
         );
+        assert!(app.windows[&wid].scroll_glide.is_none());
+    }
+
+    /// A GLIDE BOUND FOR LIVE LANDS ON LIVE (audit, 2026-09-24). The relative
+    /// law above is right for a history target, which is content; the live
+    /// bottom is a DESTINATION. Shifted by SCR-1's re-pin, a notch toward live
+    /// in a streaming session landed `lines_added` rows above live, and the
+    /// re-pin then kept the reader detached for as long as output flowed. Both
+    /// ways a glide ends — its landing tick and the settle a policy edge or a
+    /// snap runs — must finish on live with output arriving mid-ease.
+    #[test]
+    fn a_glide_bound_for_live_lands_on_live_while_output_streams() {
+        for settle in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let term = seed_history(&app, wid);
+            term_lock(&term).scroll_display(3);
+            app.scroll_wheel_animated(wid, &term, -3);
+            let end = app.windows[&wid].scroll_glide.as_ref().unwrap().glide.end();
+            app.tick_scroll_glide(wid, end - Duration::from_millis(150));
+            let mid = term_lock(&term).grid().display_offset();
+            assert!(
+                (1..3).contains(&mid),
+                "fixture: the ease has moved the engine toward live but not onto it ({mid})"
+            );
+            {
+                let mut t = term_lock(&term);
+                for i in 0..3 {
+                    t.process(format!("late output {i}\r\n").as_bytes());
+                }
+            }
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                mid + 3,
+                "fixture: SCR-1 re-pinned the viewport while the glide was in flight"
+            );
+            if settle {
+                app.settle_scroll_motion_at_target(wid, end - Duration::from_millis(100));
+            } else {
+                app.tick_scroll_glide(wid, end + Duration::from_millis(1));
+            }
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                0,
+                "settle={settle}: a glide bound for live lands ON live, not {} rows above it",
+                3
+            );
+            assert!(app.windows[&wid].scroll_glide.is_none(), "settle={settle}");
+        }
+    }
+
+    /// …AND AN OFFSET THAT DROPS UNDER IT IS FOLLOWED, NOT UNDONE (audit of the
+    /// audit, 2026-09-24). The absolute law for a live-bound glide answers
+    /// SCR-1's re-pin, which only ever RAISES the offset. A drop — the app
+    /// clearing its scrollback (`CSI 3 J`, which Ink-based TUIs send on a full
+    /// redraw) under the ease — already moved the reader to live; the absolute
+    /// row scrolled them back up into whatever the app printed next.
+    #[test]
+    fn a_live_bound_glide_follows_a_cleared_history_instead_of_climbing_it() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        term_lock(&term).scroll_display(8);
+        app.scroll_wheel_animated(wid, &term, -8);
+        let end = app.windows[&wid].scroll_glide.as_ref().unwrap().glide.end();
+        app.tick_scroll_glide(wid, end - Duration::from_millis(150));
+        let mid = term_lock(&term).grid().display_offset();
+        assert!(
+            mid > 1,
+            "fixture: the ease is still well above live ({mid})"
+        );
+        {
+            let mut t = term_lock(&term);
+            t.process(b"\x1b[3J");
+            assert_eq!(
+                t.grid().display_offset(),
+                0,
+                "fixture: ED 3 dropped the reader to live"
+            );
+            for i in 0..12 {
+                t.process(format!("after the clear {i}\r\n").as_bytes());
+            }
+            assert!(
+                t.grid().scrollback_lines() >= 8,
+                "fixture: new history to climb into"
+            );
+        }
+        for ms in [100u64, 50, 0] {
+            app.tick_scroll_glide(wid, end - Duration::from_millis(ms));
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                0,
+                "{ms} ms before the end: the reader stays at live"
+            );
+            assert_eq!(
+                app.windows[&wid].scroll_frac_px, 0,
+                "{ms} ms before the end: no residual lifts the live screen"
+            );
+        }
+        app.tick_scroll_glide(wid, end + Duration::from_millis(1));
+        assert_eq!(term_lock(&term).grid().display_offset(), 0);
         assert!(app.windows[&wid].scroll_glide.is_none());
     }
 

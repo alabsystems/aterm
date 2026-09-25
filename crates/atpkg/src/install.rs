@@ -82,11 +82,6 @@ pub enum StageError {
     /// refusing the image. Names the field or tool, so a mis-authored row fails fast on
     /// the authoring machine.
     Payload(String),
-    /// This installer is provenance-tracked, the staged tree came out carrying the tag,
-    /// the tag could not be cleared ([`crate::provenance::heal`]), and the refuse policy
-    /// is in force (`[packages] tracked_install = "refuse"`) — so nothing was swapped in.
-    /// The string is [`crate::lay::tracked_refusal`].
-    TrackedInstaller(String),
     /// The staged tree's platform signer check refused it: a Mach-O not signed by the
     /// pinned Developer ID team, no Mach-O at all, an exposed tool's entry that is not a
     /// verified Mach-O, or a shape that would let code escape the check (an interpreter
@@ -127,7 +122,6 @@ impl std::fmt::Display for StageError {
                 f.write_str("payload: ")?;
                 f.write_str(m)
             }
-            StageError::TrackedInstaller(m) => f.write_str(m),
             StageError::SignerRefused(m) => {
                 f.write_str("signer refused: ")?;
                 f.write_str(m)
@@ -213,48 +207,14 @@ const MAX_ENTRIES: u64 = 4_000_000;
 /// passed every check, and the marker is cleared for the duration of the swap. Crash at
 /// any point and the store is left in one of exactly two honest states: the OLD build,
 /// complete; or NO build, unmarked and therefore re-installable.
+///
+/// Returns the `tree_root` folded while staging (the verified one when the row signs
+/// one). A tracked installer's tree carries `com.apple.provenance` like every file it
+/// writes; the store heal its door ends with clears it ([`crate::provenance::heal_store`]).
 pub fn verify_and_stage(
     artifact: &Artifact,
     archive: &Path,
     build_dir: &Path,
-    hooks: &StageHooks<'_>,
-) -> Result<String, StageError> {
-    let scratch = archive
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    // MEASURED, once per process: a probe file written into the staging scratch and read
-    // back for the tag ([`crate::provenance::process_is_tracked`]).
-    let tracked = cfg!(target_os = "macos") && crate::provenance::process_is_tracked(&scratch);
-    verify_and_stage_with(
-        artifact,
-        archive,
-        build_dir,
-        tracked,
-        &crate::lay::lane_for_this_binary(),
-        crate::lay::tracked_policy(),
-        crate::provenance::heal,
-        hooks,
-    )
-}
-
-/// [`verify_and_stage`] with the untracked lane's inputs explicit — whether this process
-/// is tracked, which binary would serve the lane, the policy when the tag cannot be
-/// cleared, and the heal that clears it — so the healed stage, the opt-in refusal and
-/// the record beside the build are each provable from a test that is not itself in a
-/// position to be tracked.
-///
-/// Returns the `tree_root` folded while staging (the verified one when the row signs
-/// one).
-#[allow(clippy::too_many_arguments)] // the lane's inputs, each injected for its test
-pub fn verify_and_stage_with(
-    artifact: &Artifact,
-    archive: &Path,
-    build_dir: &Path,
-    tracked: bool,
-    lane: &crate::lay::Lane,
-    policy: crate::lay::TrackedPolicy,
-    heal: crate::provenance::Healer,
     hooks: &StageHooks<'_>,
 ) -> Result<String, StageError> {
     // 1. Download integrity — the compressed asset's sha256 must match the signed value,
@@ -269,9 +229,7 @@ pub fn verify_and_stage_with(
 
     // 2. Extract into a scratch SIBLING (tar-slip-safe, size-capped from the signed size).
     //    The live tree is untouched throughout. Any scratch left by a killed earlier run is
-    //    swept first — the store lock makes it ours to reclaim, and the sweep first stops
-    //    any lane helper a dead stager left behind, which launchd keeps alive and which
-    //    may still be writing into that scratch.
+    //    swept first — the store lock makes it ours to reclaim.
     crate::store::sweep_stage_scratch(build_dir);
     let incoming = crate::store::incoming_dir(build_dir).ok_or_else(|| {
         StageError::Io(std::io::Error::new(
@@ -285,11 +243,8 @@ pub fn verify_and_stage_with(
     //    the ONE pass over the uncompressed payload: the digest step 3 compares is a
     //    by-product of the writing, not a second reading of it. (The `dmg` lane is
     //    the exception — `ditto` wrote its bytes, so it walks them once.)
-    let StagedTree {
-        root: extracted_root,
-        tracked_record,
-    } = match stage_for_store_with(artifact, archive, &incoming, tracked, lane) {
-        Ok(staged) => staged,
+    let extracted_root = match stage_payload(artifact, archive, &incoming) {
+        Ok(root) => root,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&incoming);
             return Err(e);
@@ -371,38 +326,6 @@ pub fn verify_and_stage_with(
         ));
     }
 
-    // 3a'. THE TAG. A tree this tracked installer laid in-process (its lane could not run),
-    //      or one its lane laid tagged all the same, is cleared in place here, before
-    //      anything publishes it ([`crate::provenance::heal`]: one launchd job, then a
-    //      scan). Only a heal that fails is kept on record — the refuse policy refuses
-    //      the stage with nothing swapped, the default installs it and records why (4b).
-    let tracked_record = match tracked_record {
-        None => None,
-        Some(why) => {
-            let scratch = archive
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(std::env::temp_dir);
-            let healed = heal(std::slice::from_ref(&incoming), &scratch);
-            if healed.is_clean() {
-                None
-            } else {
-                let why = format!(
-                    "{why}; the tag could not be cleared ({})",
-                    healed.why().unwrap_or("no reason given")
-                );
-                if policy == crate::lay::TrackedPolicy::Refuse {
-                    let _ = std::fs::remove_dir_all(&incoming);
-                    return Err(StageError::TrackedInstaller(crate::lay::tracked_refusal(
-                        "installing this build",
-                        &why,
-                    )));
-                }
-                Some(why)
-            }
-        }
-    };
-
     // 3b. DURABILITY, before anything publishes this tree. Every check above is about the
     //     bytes this process WROTE; none of them is about bytes the filesystem has
     //     COMMITTED. The swap below is renames, and a rename is metadata: on a
@@ -425,44 +348,9 @@ pub fn verify_and_stage_with(
         return Err(StageError::Io(e));
     }
 
-    // 4b. THE RECORD. A tree whose tag could not be cleared (3a') is written down beside
-    //     the build (`<build>.tracked-install`, a sibling like `.ready`, outside the
-    //     hashed tree) BEFORE the build is marked complete: a record that could not be
-    //     written leaves the build unmarked — re-stageable — rather than a tagged bundle
-    //     nothing on disk explains. A clean stage clears any record a previous stage of
-    //     this build number left; the store heal clears it once the build measures clean
-    //     ([`crate::provenance::heal_store`]).
-    crate::store::clear_tracked_install(build_dir);
-    if let Some(why) = &tracked_record {
-        if let Err(e) = crate::store::record_tracked_install(build_dir, why) {
-            return Err(StageError::Io(e));
-        }
-        // ONE plain line, and only because the system could not fix it itself: stderr on
-        // a typed verb, the log in the window ([`crate::notice`]). `aterm pkg doctor`
-        // counts what is still tagged; `aterm pkg repair` tries again.
-        let build = build_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let program = build_dir
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // A vendor-direct build is named by its version, never its store id.
-        let named = crate::store::parse_build_name(&build).map_or_else(
-            || format!("{program} build {build}"),
-            |n| crate::vendor_direct::display_build(&program, n),
-        );
-        crate::notice::say(&format!(
-            "could not clear a macOS tag from {named} (release builds refuse tagged files) \
-             — `aterm pkg repair` tries again"
-        ));
-    }
-
-    // 4c. THE CALLER'S SIDECARS, durably, then the directory that names them: `.ready`
+    // 4b. THE CALLER'S SIDECARS, durably, then the directory that names them: `.ready`
     //     below implies each one exists. A write that fails leaves the verified tree
-    //     unmarked, re-stageable, exactly like a record that could not be written.
+    //     unmarked, re-stageable.
     if !sidecars.is_empty() {
         for (suffix, bytes) in &sidecars {
             crate::store::write_sidecar_durably(build_dir, suffix, bytes)
@@ -674,154 +562,12 @@ pub fn stage_payload(
     archive: &Path,
     dest: &Path,
 ) -> Result<String, StageError> {
-    stage_payload_spec(&StageSpec::of(artifact), archive, dest)
-}
-
-/// The fields of a signed row that [`stage_payload`] reads — and nothing else — so the
-/// untracked lane ([`crate::stage_helper`]) can hand exactly them to another process
-/// without re-parsing a manifest there. Built by [`StageSpec::of`]; the size cap is
-/// already derived ([`size_cap`]), so both processes bound the extraction identically.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageSpec {
-    /// The row's `payload` lane (`""` for a release bundle).
-    pub payload: String,
-    /// `raw-binary` only: the tool name the download becomes.
-    pub entry: String,
-    /// Archive lanes: leading components to drop.
-    pub strip_components: u32,
-    /// `bin/<name> -> ../<target>` symlinks to lay after staging.
-    pub links: BTreeMap<String, String>,
-    /// Uncompressed-size cap for the extraction ([`size_cap`]).
-    pub size_cap: u64,
-}
-
-impl StageSpec {
-    /// The staging inputs of `artifact`.
-    #[must_use]
-    pub fn of(artifact: &Artifact) -> Self {
-        Self {
-            payload: artifact.payload.clone(),
-            entry: artifact.entry.clone(),
-            strip_components: artifact.strip_components,
-            links: artifact.links.clone(),
-            size_cap: size_cap(artifact),
-        }
-    }
-}
-
-/// What [`stage_for_store_with`] laid: the folded `tree_root`, and — when a tracked
-/// installer laid it in-process because its lane could not run, or kept a lane's tree
-/// that came back tagged — why the tree may carry the tag, for the heal that follows
-/// ([`verify_and_stage_with`]) and, if that fails, the record beside the build.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedTree {
-    /// The folded `tree_root`.
-    pub root: String,
-    /// `Some(why)` iff the tree may carry the tag.
-    pub tracked_record: Option<String>,
-}
-
-/// What a tracked installer does with its lane's outcome — the pure decision behind
-/// [`stage_for_store_with`], so every cell is testable without a launchd job (or without
-/// being tracked). No cell refuses: a tagged tree is cleared afterwards, and only a
-/// clearing that fails meets the policy ([`verify_and_stage_with`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LaneDecision {
-    /// The lane laid a clean tree: keep it.
-    Keep(String),
-    /// The lane laid a tree that came back tagged: keep it — it is the verified tree, and
-    /// re-extracting would only produce another tagged one — and clear the tag.
-    KeepTagged { root: String, why: String },
-    /// The lane could not run: stage in-process and clear the tag.
-    InProcess(String),
-}
-
-/// See [`LaneDecision`]. The reasons are for the record beside the build, never for glass.
-#[must_use]
-pub fn decide_tracked_stage(
-    outcome: Result<crate::stage_helper::StagedUntracked, String>,
-) -> LaneDecision {
-    match outcome {
-        Ok(staged) if !staged.witness_tagged => LaneDecision::Keep(staged.root),
-        Ok(staged) => LaneDecision::KeepTagged {
-            root: staged.root,
-            why: String::from("the clean-install helper ran, but its files came back tagged"),
-        },
-        Err(why) => {
-            LaneDecision::InProcess(format!("the clean-install helper could not start ({why})"))
-        }
-    }
-}
-
-/// Stage for the STORE: [`stage_payload`], except that a provenance-TRACKED installer
-/// hands the extraction to an untracked launchd job ([`crate::stage_helper`]) and, when
-/// that lane cannot run, stages in-process and says the tree may be tagged
-/// ([`StagedTree::tracked_record`]) so the caller clears it.
-///
-/// `tracked` is measured by the caller ([`verify_and_stage`]: a probe file written into
-/// the staging scratch and read back for `com.apple.provenance`) — a tracked atpkg would
-/// otherwise tag every executable it lays down, and a tagged `trustc` cannot cut a
-/// release (v0.83.0, 2026-09-12). An untracked installer takes exactly the path it always
-/// took, as does a binary with no lane ([`crate::lay::Lane::Unavailable`]: a test harness
-/// — a fact about the binary, not a failure). The decision table is
-/// [`decide_tracked_stage`].
-///
-/// On `Err`, `incoming` is left empty for the caller to remove.
-pub fn stage_for_store_with(
-    artifact: &Artifact,
-    archive: &Path,
-    incoming: &Path,
-    tracked: bool,
-    lane: &crate::lay::Lane,
-) -> Result<StagedTree, StageError> {
-    let helper = match (tracked, lane) {
-        (true, crate::lay::Lane::Helper(exe)) => exe,
-        _ => {
-            return Ok(StagedTree {
-                root: stage_payload(artifact, archive, incoming)?,
-                tracked_record: None,
-            });
-        }
-    };
-    let scratch = archive
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    let outcome = crate::stage_helper::stage_untracked(
-        helper,
-        &StageSpec::of(artifact),
-        archive,
-        incoming,
-        &scratch,
-    );
-    match decide_tracked_stage(outcome) {
-        LaneDecision::Keep(root) => Ok(StagedTree {
-            root,
-            tracked_record: None,
-        }),
-        LaneDecision::KeepTagged { root, why } => Ok(StagedTree {
-            root,
-            tracked_record: Some(why),
-        }),
-        LaneDecision::InProcess(why) => Ok(StagedTree {
-            root: stage_payload(artifact, archive, incoming)?,
-            tracked_record: Some(why),
-        }),
-    }
-}
-
-/// [`stage_payload`] over an explicit [`StageSpec`] — the body; see there for the lanes.
-pub fn stage_payload_spec(
-    spec: &StageSpec,
-    archive: &Path,
-    dest: &Path,
-) -> Result<String, StageError> {
-    let cap = spec.size_cap;
+    let cap = size_cap(artifact);
     let vendor = ExtractOptions {
-        strip_components: spec.strip_components,
+        strip_components: artifact.strip_components,
         in_root_symlinks: true,
     };
-    let mut folded: Option<TreeAccumulator> = match spec.payload.as_str() {
+    let mut folded: Option<TreeAccumulator> = match artifact.payload.as_str() {
         "" => Some(
             extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, ExtractOptions::default())
                 .map_err(StageError::Extract)?,
@@ -838,14 +584,14 @@ pub fn stage_payload_spec(
             extract_zip_tree(archive, dest, cap, MAX_ENTRIES, vendor)
                 .map_err(StageError::Extract)?,
         ),
-        "raw-binary" => Some(stage_raw_binary(archive, dest, &spec.entry, cap)?),
+        "raw-binary" => Some(stage_raw_binary(archive, dest, &artifact.entry, cap)?),
         "dmg" => {
             stage_dmg(archive, dest)?;
             None
         }
         other => return Err(payload2("unknown payload lane: ", other)),
     };
-    apply_links(dest, &spec.links, folded.as_mut())?;
+    apply_links(dest, &artifact.links, folded.as_mut())?;
     match folded {
         Some(tree) => Ok(tree.root()),
         None => tree_root(dest).map_err(StageError::Io),
@@ -1619,434 +1365,6 @@ mod tests {
         )
     }
 
-    /// The decision table behind a tracked installer's stage, every cell: a clean lane
-    /// keeps; a lane whose tree came back tagged keeps that tree — never a second
-    /// extraction that would only produce another tagged one — and a lane that could not
-    /// run stages in-process. No cell refuses: the tag is cleared afterwards, and only a
-    /// clearing that fails meets the policy.
-    #[test]
-    fn the_tracked_stage_decision_table_is_complete() {
-        use crate::stage_helper::StagedUntracked;
-        let staged = |witness_tagged| {
-            Ok(StagedUntracked {
-                root: "r".into(),
-                witness_tagged,
-            })
-        };
-        assert_eq!(
-            decide_tracked_stage(staged(false)),
-            LaneDecision::Keep("r".into())
-        );
-        match decide_tracked_stage(staged(true)) {
-            LaneDecision::KeepTagged { root, why } => {
-                assert_eq!(root, "r");
-                assert!(why.contains("came back tagged"), "{why}");
-            }
-            other => panic!("{other:?}"),
-        }
-        match decide_tracked_stage(Err(String::from(
-            "the untracked helper job x exited without a result",
-        ))) {
-            LaneDecision::InProcess(why) => {
-                assert!(why.contains("could not start"), "{why}");
-                assert!(why.contains("exited without a result"), "{why}");
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// A heal that clears what it was handed.
-    #[cfg(target_os = "macos")]
-    fn heal_clears(roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
-        assert_eq!(roots.len(), 1, "one tree: the one being staged");
-        crate::provenance::HealOutcome::Healed { cleared: 1 }
-    }
-
-    /// A heal that could not clear what it was handed.
-    #[cfg(target_os = "macos")]
-    fn heal_fails(roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
-        crate::provenance::HealOutcome::Left {
-            carriers: roots.to_vec(),
-            why: String::from("xattr exited 1"),
-        }
-    }
-
-    /// A stage that has nothing to clear never asks.
-    #[cfg(target_os = "macos")]
-    fn heal_not_asked(_roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
-        panic!("a stage that laid nothing tagged must not run the heal")
-    }
-
-    /// The failure path, with a helper BROKEN ON PURPOSE (`/usr/bin/true` under the name
-    /// `atpkg`: spelled right, answers nothing) and the tracking measurement forced, so
-    /// the bundle is staged in-process: a heal that clears it leaves a plain install — no
-    /// record, under either policy; a heal that fails is REFUSED under `Refuse` (nothing
-    /// installed, no marker, no record, no scratch) and installed WITH the record under
-    /// `Allow`; a later clean stage of the same build number clears the record. And the
-    /// real heal, end to end: whatever this process tagged is cleared before the swap.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_tracked_installers_tagged_stage_is_healed_and_only_a_failed_heal_refuses_or_records() {
-        use crate::lay::{Lane, TrackedPolicy};
-        let d = tmp("tracked-refuse");
-        let archive = make_archive(&d);
-        let sha = file_sha256(&archive).unwrap();
-        let reference = d.join("reference");
-        std::fs::create_dir_all(&reference).unwrap();
-        let root = stage_payload(&artifact(&sha, ""), &archive, &reference).unwrap();
-        let a = artifact(&sha, &root);
-        let store = d.join("store").join("ay");
-        std::fs::create_dir_all(&store).unwrap();
-        let build = store.join("18");
-        let fake_dir = d.join("fake");
-        std::fs::create_dir_all(&fake_dir).unwrap();
-        let fake = fake_dir.join("atpkg");
-        std::fs::copy("/usr/bin/true", &fake).unwrap();
-        let broken = Lane::Helper(fake);
-        let stage = |policy, heal: crate::provenance::Healer, tracked, lane: &Lane| {
-            verify_and_stage_with(
-                &a,
-                &archive,
-                &build,
-                tracked,
-                lane,
-                policy,
-                heal,
-                &StageHooks::NONE,
-            )
-        };
-
-        // Healed: a plain install, under either policy.
-        for policy in [TrackedPolicy::Refuse, TrackedPolicy::Allow] {
-            stage(policy, heal_clears, true, &broken).expect("a healed stage installs");
-            assert!(crate::store::build_is_complete(&build));
-            assert_eq!(crate::store::tracked_install_record(&build), None);
-        }
-
-        // Not healed, `Refuse` opted into: refused before the swap, so the build that
-        // stood is still the one installed.
-        let inode = |p: &Path| {
-            use std::os::unix::fs::MetadataExt as _;
-            std::fs::metadata(p).unwrap().ino()
-        };
-        let standing = inode(&build.join("bin/ay"));
-        let err = stage(TrackedPolicy::Refuse, heal_fails, true, &broken)
-            .expect_err("a tag that could not be cleared is refused under Refuse");
-        let msg = err.to_string();
-        assert!(matches!(err, StageError::TrackedInstaller(_)), "{err:?}");
-        assert!(msg.contains("exited without a result"), "the cause: {msg}");
-        assert!(msg.contains("xattr exited 1"), "why it stayed: {msg}");
-        assert!(
-            msg.contains("tracked_install = \"refuse\"") && !msg.contains("ATPKG_"),
-            "the one key that refused, and no environment knob: {msg}"
-        );
-        assert_eq!(inode(&build.join("bin/ay")), standing, "nothing swapped in");
-        assert!(crate::store::build_is_complete(&build));
-        assert_eq!(crate::store::tracked_install_record(&build), None);
-        let scratch_left: Vec<_> = std::fs::read_dir(&store)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(".incoming"))
-            .collect();
-        assert!(
-            scratch_left.is_empty(),
-            "no incoming scratch left: {scratch_left:?}"
-        );
-
-        // Not healed, the default: installed, complete, RECORDED.
-        assert_eq!(crate::lay::tracked_policy_of(None), TrackedPolicy::Allow);
-        stage(TrackedPolicy::Allow, heal_fails, true, &broken)
-            .expect("the default installs what it could not clear");
-        assert!(build.join("bin/ay").is_file());
-        assert!(crate::store::build_is_complete(&build));
-        let why = crate::store::tracked_install_record(&build).expect("the cause is recorded");
-        assert!(why.contains("could not start"), "{why}");
-        assert!(why.contains("exited without a result"), "{why}");
-        assert!(
-            why.contains("could not be cleared (xattr exited 1)"),
-            "{why}"
-        );
-
-        // A clean (untracked) re-stage of the same build number clears the record.
-        stage(TrackedPolicy::Refuse, heal_not_asked, false, &broken).unwrap();
-        assert!(crate::store::build_is_complete(&build));
-        assert_eq!(crate::store::tracked_install_record(&build), None);
-
-        // A binary with no lane is a fact about the binary, not a lane failure: no
-        // refusal, no heal, no record, even when tracked.
-        let none = Lane::Unavailable(String::from("a test harness"));
-        stage(TrackedPolicy::Refuse, heal_not_asked, true, &none).unwrap();
-        assert_eq!(crate::store::tracked_install_record(&build), None);
-
-        // THE REAL HEAL, end to end: the bundle staged in-process by this process — tagged
-        // exactly when this process is tracked — comes out clean, and nothing is recorded.
-        stage(
-            TrackedPolicy::Refuse,
-            crate::provenance::heal,
-            true,
-            &broken,
-        )
-        .expect("the real heal clears the tree this process laid");
-        assert!(
-            !crate::provenance::carries_provenance(&build.join("bin/ay")),
-            "the staged file is clean after the heal"
-        );
-        assert_eq!(crate::store::tracked_install_record(&build), None);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// The attribute the record conformance tags with — one a test can set, through the
-    /// very path production reads.
-    #[cfg(target_os = "macos")]
-    const TAG: &str = "user.aterm.probe";
-
-    /// A heal that could not clear, and — as the real tag would stay — leaves every
-    /// regular file under the roots carrying [`TAG`].
-    #[cfg(target_os = "macos")]
-    fn heal_leaves_tagged(roots: &[PathBuf], _scratch: &Path) -> crate::provenance::HealOutcome {
-        fn tag(dir: &Path) {
-            for entry in std::fs::read_dir(dir).unwrap().flatten() {
-                let kind = entry.file_type().unwrap();
-                if kind.is_dir() {
-                    tag(&entry.path());
-                } else if kind.is_file() {
-                    crate::provenance::set_xattr_for_test(&entry.path(), TAG, b"1").unwrap();
-                }
-            }
-        }
-        roots.iter().filter(|r| r.is_dir()).for_each(|r| tag(r));
-        crate::provenance::HealOutcome::Left {
-            carriers: crate::provenance::scan_roots(roots, TAG).carriers,
-            why: String::from("launchctl submit failed"),
-        }
-    }
-
-    /// The real heal job, over [`TAG`].
-    #[cfg(target_os = "macos")]
-    fn heal_tag(roots: &[PathBuf], scratch: &Path) -> crate::provenance::HealOutcome {
-        crate::provenance::heal_with(roots, scratch, TAG)
-    }
-
-    /// TIER-1: the `<build>.tracked-install` record against its derived model
-    /// (`aterm_spec::derive::atpkg_tag_record_model`). The REAL writer — a tracked stage
-    /// through a lane that cannot run, whose heal fails — the REAL store heal
-    /// ([`crate::provenance::heal_store_with`], a real launchd job over a synthetic
-    /// attribute) and the REAL doctor are driven over a fixture store, each step projected
-    /// onto the model's variables and checked against the model's own transition. The
-    /// negative control replays the store before 2026-09-23 — a heal with no record
-    /// reconcile, the record never cleared — and the model's invariant catches the state it
-    /// leaves, which only the `Buggy=1` machine reaches.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_tag_record_conforms_to_its_derived_model() {
-        use crate::lay::{Lane, TrackedPolicy};
-        use aterm_spec::derive::atpkg_tag_record_model;
-        use std::collections::BTreeMap;
-
-        let model = atpkg_tag_record_model();
-        let buggy = aterm_spec::interp::with_buggy(&model, 1);
-        let d = tmp("tag-record");
-        let layout = crate::store::Layout {
-            prefix: d.join("pkg"),
-        };
-        let archive = make_archive(&d);
-        let sha = file_sha256(&archive).unwrap();
-        let reference = d.join("reference");
-        std::fs::create_dir_all(&reference).unwrap();
-        let root = stage_payload(&artifact(&sha, ""), &archive, &reference).unwrap();
-        let a = artifact(&sha, &root);
-        let fake_dir = d.join("fake");
-        std::fs::create_dir_all(&fake_dir).unwrap();
-        std::fs::copy("/usr/bin/true", fake_dir.join("atpkg")).unwrap();
-        let broken = Lane::Helper(fake_dir.join("atpkg"));
-        let home = d.join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let build = layout.build_dir("ay", 18);
-        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
-
-        // The writer: a tracked stage whose lane cannot run and whose heal fails.
-        let stage_tagged = |dir: &Path| {
-            verify_and_stage_with(
-                &a,
-                &archive,
-                dir,
-                true,
-                &broken,
-                TrackedPolicy::Allow,
-                heal_leaves_tagged,
-                &StageHooks::NONE,
-            )
-            .unwrap();
-        };
-        let activate = |dir: &Path| {
-            crate::install_shims(
-                &layout,
-                dir,
-                &[String::from("ay")],
-                crate::activate::Aliases::Off,
-            )
-            .unwrap();
-        };
-        let doctor_warns = || {
-            let path = std::env::join_paths([layout.bin_dir()]).unwrap();
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let _ = crate::doctor::run_with(
-                &layout,
-                Some(&home),
-                Some(&path),
-                0,
-                None,
-                None,
-                "doctor",
-                &crate::doctor::Probes {
-                    provenance_attr: TAG,
-                    ..crate::doctor::Probes::default()
-                },
-                &mut out,
-                &mut err,
-            );
-            String::from_utf8_lossy(&out).contains("macOS tag")
-        };
-        let observe = |healed: i64, said: i64| -> BTreeMap<&'static str, i64> {
-            let active = crate::ops::active_builds(&layout)
-                .iter()
-                .any(|(p, b)| layout.build_dir(p, *b) == build);
-            BTreeMap::from([
-                (
-                    "tagged",
-                    i64::from(
-                        !crate::provenance::scan_roots(std::slice::from_ref(&build), TAG)
-                            .carriers
-                            .is_empty(),
-                    ),
-                ),
-                (
-                    "record",
-                    i64::from(crate::store::tracked_install_record(&build).is_some()),
-                ),
-                ("active", i64::from(active)),
-                ("healed", healed),
-                ("said", said),
-            ])
-        };
-        let step = |state: &mut BTreeMap<&'static str, i64>,
-                    action: &str,
-                    observed: BTreeMap<&'static str, i64>| {
-            assert!(model.action_enabled(action, state), "{action} at {state:?}");
-            assert!(model.fire(action, state), "{action}");
-            assert_eq!(&observed, state, "the real {action} is the model's");
-            for inv in ["RecordOnlyBesideATag", "DoctorSaysWhatIsOnDisk"] {
-                assert!(model.check_invariant(inv, state), "{inv} after {action}");
-            }
-        };
-        let mut state = model.init_state();
-
-        stage_tagged(&build);
-        activate(&build);
-        step(&mut state, "StageLeftTagged", observe(0, 0));
-        step(
-            &mut state,
-            "Doctor",
-            observe(0, if doctor_warns() { 2 } else { 1 }),
-        );
-        let failed = crate::provenance::heal_store_with(&layout, heal_leaves_tagged);
-        assert!(!failed.is_clean());
-        step(&mut state, "HealFails", observe(1, 0));
-        let cleared = crate::provenance::heal_store_with(&layout, heal_tag);
-        assert!(cleared.is_clean(), "{cleared:?}");
-        step(&mut state, "HealClears", observe(1, 0));
-        step(
-            &mut state,
-            "Doctor",
-            observe(1, if doctor_warns() { 2 } else { 1 }),
-        );
-        assert_eq!(
-            state.get("said"),
-            Some(&1),
-            "doctor is silent over a clean store"
-        );
-
-        // Tagged again, then superseded by a clean build: the store heal no longer
-        // reaches build 18, and its record goes all the same.
-        stage_tagged(&build);
-        step(&mut state, "StageLeftTagged", observe(0, 0));
-        let newer = layout.build_dir("ay", 19);
-        verify_and_stage_with(
-            &a,
-            &archive,
-            &newer,
-            false,
-            &broken,
-            TrackedPolicy::Allow,
-            heal_not_asked,
-            &StageHooks::NONE,
-        )
-        .unwrap();
-        activate(&newer);
-        step(&mut state, "Supersede", observe(0, 0));
-        let passed = crate::provenance::heal_store_with(&layout, heal_tag);
-        assert!(passed.is_clean(), "{passed:?}");
-        step(&mut state, "HealPassesBy", observe(1, 0));
-        step(
-            &mut state,
-            "Doctor",
-            observe(1, if doctor_warns() { 2 } else { 1 }),
-        );
-
-        // THE NEGATIVE CONTROL: the store before 2026-09-23 — the heal ran, nothing
-        // squared the records — over a build that was recorded tagged.
-        let stale_build = newer.clone();
-        stage_tagged(&stale_build);
-        assert!(crate::store::tracked_install_record(&stale_build).is_some());
-        let scratch = d.join("scratch");
-        std::fs::create_dir_all(&scratch).unwrap();
-        let old_world = heal_tag(&crate::provenance::store_roots(&layout), &scratch);
-        assert!(old_world.is_clean(), "{old_world:?}");
-        let stale = BTreeMap::from([
-            (
-                "tagged",
-                i64::from(
-                    !crate::provenance::scan_roots(std::slice::from_ref(&stale_build), TAG)
-                        .carriers
-                        .is_empty(),
-                ),
-            ),
-            (
-                "record",
-                i64::from(crate::store::tracked_install_record(&stale_build).is_some()),
-            ),
-            ("active", 1),
-            ("healed", 1),
-            ("said", 0),
-        ]);
-        assert!(
-            !model.check_invariant("RecordOnlyBesideATag", &stale),
-            "the never-cleared record is caught: {stale:?}"
-        );
-        let mut replay = buggy.init_state();
-        for action in ["StageLeftTagged", "HealClears"] {
-            assert!(buggy.fire(action, &mut replay), "{action}");
-        }
-        assert_eq!(replay, stale, "only the Buggy machine reaches it");
-        let mut fixed = model.init_state();
-        for action in ["StageLeftTagged", "HealClears"] {
-            assert!(model.fire(action, &mut fixed), "{action}");
-        }
-        assert_ne!(fixed, stale);
-        // Doctor reads the files, never the record: over the stale record it is silent,
-        // as the healthy machine's Doctor is — the Buggy one warned from the record.
-        assert!(
-            !doctor_warns(),
-            "doctor warned from a record over clean files"
-        );
-        // …and the real reconcile is what closes it.
-        let removed = crate::provenance::reconcile_records(&layout, &[]);
-        assert_eq!(removed, vec![stale_build.clone()]);
-        assert!(crate::store::tracked_install_record(&stale_build).is_none());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
     /// An archive whose EXTRACTION fails part-way: a good first entry (so real bytes land in
     /// the staging tree and the extractor is genuinely mid-flight), then a `../escape` entry
     /// that [`crate::extract::vet_entry`] refuses as a tar-slip.
@@ -2080,12 +1398,6 @@ mod tests {
             links: std::collections::BTreeMap::new(),
             vendor: String::new(),
             protocol: "github-release".into(),
-            signer_team: String::new(),
-            elevated: false,
-            provides: vec![],
-            manager: String::new(),
-            package: String::new(),
-            label_prefix: String::new(),
         }
     }
 

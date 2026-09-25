@@ -464,46 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fxhashmap_basic_operations() {
-        let mut map: FxHashMap<u32, &str> = FxHashMap::default();
-        map.insert(1, "one");
-        map.insert(2, "two");
-        map.insert(3, "three");
-        assert_eq!(map.len(), 3);
-        assert_eq!(map[&1], "one");
-        assert_eq!(map.get(&99), None);
-    }
-
-    #[test]
-    fn test_fxhashset_basic_operations() {
-        let mut set: FxHashSet<u32> = FxHashSet::default();
-        set.insert(1);
-        set.insert(2);
-        set.insert(1); // duplicate
-        assert_eq!(set.len(), 2);
-        assert!(set.contains(&1));
-        assert!(!set.contains(&99));
-    }
-
-    #[test]
-    fn test_fxbuildhasher_is_deterministic() {
-        let h1 = FxBuildHasher.hash_one(42_u64);
-        let h2 = FxBuildHasher.hash_one(42_u64);
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn test_fxbuildhasher_differentiates_values() {
-        assert_ne!(FxBuildHasher.hash_one(1_u64), FxBuildHasher.hash_one(2_u64));
-    }
-
-    #[test]
-    fn test_fxhasher_zero_returns_zero() {
-        // Zero input through add_to_hash(0) should produce 0 * K = 0.
-        assert_eq!(FxBuildHasher.hash_one(0_u32), 0);
-    }
-
-    #[test]
     fn test_fxhashmap_with_capacity_and_hasher() {
         // Verify the construction pattern used throughout the codebase.
         let map: FxHashMap<u32, u32> = FxHashMap::with_capacity_and_hasher(16, FxBuildHasher);

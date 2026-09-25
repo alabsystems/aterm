@@ -67,8 +67,9 @@
 //!   autoreleases in the frame the release happens in. A caller that holds one
 //!   [`AutoreleasePool`] across its own scope — which a render loop must do
 //!   anyway — takes this module's unpooled-autorelease count to zero. Measured:
-//!   with the entry-point pools in place, `the_four_renderer_formats_exist`
-//!   reports 9 unpooled objects, and wrapping the test body in a pool reports
+//!   with the entry-point pools in place, the (since-retired) format-creation
+//!   test `the_four_renderer_formats_exist` reported 9 unpooled objects, and
+//!   wrapping the test body in a pool reported
 //!   0 (the 12 the process reports either way are Rust/Foundation startup, not
 //!   Metal).
 //!

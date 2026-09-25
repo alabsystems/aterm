@@ -971,33 +971,18 @@ fn test_prepare_zsh_prompt_override_starts_without_hook_error() {
 }
 
 #[test]
-fn test_detect_zsh() {
-    assert_eq!(ShellType::detect("/bin/zsh"), ShellType::Zsh);
-    assert_eq!(ShellType::detect("/usr/local/bin/zsh"), ShellType::Zsh);
-}
-
-#[test]
-fn test_detect_bash() {
-    assert_eq!(ShellType::detect("/bin/bash"), ShellType::Bash);
-    assert_eq!(ShellType::detect("bash5"), ShellType::Bash);
-}
-
-#[test]
-fn test_detect_fish() {
-    assert_eq!(ShellType::detect("/usr/bin/fish"), ShellType::Fish);
-}
-
-#[test]
-fn test_detect_unknown() {
-    assert_eq!(ShellType::detect("/bin/sh"), ShellType::Unknown);
-    assert_eq!(ShellType::detect(""), ShellType::Unknown);
-}
-
-#[test]
-fn test_scripts_embedded() {
-    assert!(scripts::ZSH.contains("ATERM_SHELL_INTEGRATION_INSTALLED"));
-    assert!(scripts::BASH.contains("ATERM_SHELL_INTEGRATION_INSTALLED"));
-    assert!(scripts::FISH.contains("ATERM_SHELL_INTEGRATION_INSTALLED"));
+fn test_detect_posix_shells() {
+    for (path, shell) in [
+        ("/bin/zsh", ShellType::Zsh),
+        ("/usr/local/bin/zsh", ShellType::Zsh),
+        ("/bin/bash", ShellType::Bash),
+        ("bash5", ShellType::Bash),
+        ("/usr/bin/fish", ShellType::Fish),
+        ("/bin/sh", ShellType::Unknown),
+        ("", ShellType::Unknown),
+    ] {
+        assert_eq!(ShellType::detect(path), shell, "{path:?}");
+    }
 }
 
 #[test]
@@ -1547,50 +1532,11 @@ fn test_fish_powerline_sep_uses_separator_color() {
 // un-nonced form. Full functional verification (spawn a real shell,
 // check the wire emits id=<hex>) lives in the PTY integration tests
 // where a host is available to authorize the nonce.
-
-#[test]
-fn test_bash_script_references_shell_nonce_env() {
-    let script = scripts::BASH;
-    assert!(
-        script.contains("ATERM_SHELL_NONCE"),
-        "bash script must reference ATERM_SHELL_NONCE to honor \
-         the #7960/#7987 capability-nonce defense"
-    );
-}
-
-#[test]
-fn test_zsh_script_references_shell_nonce_env() {
-    let script = scripts::ZSH;
-    assert!(
-        script.contains("ATERM_SHELL_NONCE"),
-        "zsh script must reference ATERM_SHELL_NONCE to honor \
-         the #7960/#7987 capability-nonce defense"
-    );
-}
-
-#[test]
-fn test_fish_script_references_shell_nonce_env() {
-    let script = scripts::FISH;
-    assert!(
-        script.contains("ATERM_SHELL_NONCE"),
-        "fish script must reference ATERM_SHELL_NONCE to honor \
-         the #7960/#7987 capability-nonce defense"
-    );
-}
-
-#[test]
-fn test_bash_script_defines_id_suffix_helper() {
-    let script = scripts::BASH;
-    assert!(
-        script.contains("__aterm_id_suffix"),
-        "bash script must define __aterm_id_suffix helper"
-    );
-    assert!(
-        script.contains("printf ';id=%s'"),
-        "bash id suffix must emit ';id=<hex>' via printf so the \
-         OSC parameter is well-formed for the host scanner"
-    );
-}
+//
+// bash needs no static pin for the reference, the `__aterm_id_suffix`
+// helper or the unset: the live `test_bash_*` nonce tests below spawn
+// bash on every unix host and prove all three on the wire. zsh and fish
+// keep theirs, because their live twins skip on a host without the shell.
 
 #[test]
 fn test_zsh_script_defines_id_suffix_helper() {
@@ -2389,21 +2335,6 @@ fn test_fish_id_suffix_emits_hex_when_nonce_set() {
 // #7960 nonce-enforcement defense. The fix: capture the env var into a
 // shell-local at source time, then immediately unset it so subprocesses
 // never see it.
-
-#[test]
-fn test_bash_script_unsets_shell_nonce_env_var() {
-    let script = scripts::BASH;
-    assert!(
-        script.contains("unset ATERM_SHELL_NONCE"),
-        "bash script must `unset ATERM_SHELL_NONCE` after capturing to a \
-         shell-local (#8015) so the nonce is not inherited by subprocesses"
-    );
-    assert!(
-        script.contains(r#"__aterm_shell_nonce="${ATERM_SHELL_NONCE:-}""#),
-        "bash script must capture ATERM_SHELL_NONCE into __aterm_shell_nonce \
-         at source time (#8015)"
-    );
-}
 
 #[test]
 fn test_zsh_script_unsets_shell_nonce_env_var() {

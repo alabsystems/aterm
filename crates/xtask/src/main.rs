@@ -46,7 +46,6 @@ use aterm_spec::xref::{self, SpecModule};
 mod citations;
 mod driver;
 mod gate;
-mod help_surfaces;
 mod perf;
 
 // Force the proof-anchor-bearing rlibs into the link graph: `inventory` only collects
@@ -96,9 +95,6 @@ fn main() -> ExitCode {
                                    guards; --no-fmt drops the formatter lane and\n\
                                    --fmt-only keeps only it (both passes, no compiler,\n\
                                    seconds), nothing else narrowed either way\n\
-                                   `gate help-surfaces --diff PATH` — not the gate: the\n\
-                                   prose PATH changed since its row's recorded read (a .rs\n\
-                                   file's string literals and doc comments; a .md in full)\n\
                                    see docs/EXCEED_GHOSTTY_PLAN.md\n\
                  verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
                                    (this is what the `cargo verify` alias dispatches to)"
@@ -415,9 +411,9 @@ fn spec_link() -> ExitCode {
         Some(p) => p,
         None => {
             eprintln!(
-                "xtask spec-link: VERIFICATION GATE — `trust-ir` not found; build it at \
-                 $HOME/trust/first-party/trust-ir/target/release/trust-ir (or put it on PATH). The \
-                 always-run spec-link node FAILS rather than silently skipping."
+                "xtask spec-link: VERIFICATION GATE — `trust-ir` not found; install it \
+                 (`aterm pkg install trust-ir`). The always-run spec-link node FAILS rather \
+                 than silently skipping."
             );
             return ExitCode::FAILURE;
         }

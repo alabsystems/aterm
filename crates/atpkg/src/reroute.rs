@@ -558,6 +558,24 @@ pub fn policy_summary(row: &Row) -> String {
 
 // ── the stub ────────────────────────────────────────────────────────────────
 
+/// One line of both stubs' pass-through walks: `continue` past a candidate that is a
+/// reroute stub, known by what it SAYS — line 2 is [`STUB_MARKER`], the rule
+/// [`is_reroute_stub`] gives [`upstream_on_path`], so the shell's walk and atpkg's skip
+/// the same files. Builtins only (`[`, `read`), so it runs on whatever PATH the caller
+/// has. It catches a stub under ANY other name: a symlink (read through), a hard link,
+/// and a COPY — `cp <prefix>/reroute/* ~/bin/` copies every stub and, the glob skipping a
+/// dotfile, no [`DIR_MARKER_FILE`]. The `-ef "$0"` test this replaced (2026-09-24 review)
+/// compared inodes, so a copy slipped past it, and a copy plus a link, or two copies,
+/// exec'd each other forever. `-r` first, and `2>/dev/null` ahead of the `<`, so an
+/// unreadable candidate costs no stray line; it is not a stub, and is exec'd as before.
+fn sh_skip_a_stub(indent: &str) -> String {
+    let mut s = String::from(indent);
+    s.push_str("if [ -r \"$__d/$__aterm_name\" ] && { IFS= read -r __aterm_l; IFS= read -r __aterm_l; } 2>/dev/null < \"$__d/$__aterm_name\" && [ \"$__aterm_l\" = ");
+    s.push_str(&crate::stub::sh_single_quote(STUB_MARKER));
+    s.push_str(" ]; then continue; fi\n");
+    s
+}
+
 /// The POSIX stub for `upstream`. Its shape is load-bearing:
 ///
 /// * line 2 is [`STUB_MARKER`] (recognition);
@@ -565,9 +583,11 @@ pub fn policy_summary(row: &Row) -> String {
 ///   shim carries, so the shim parser sees no target (a stub is not an install);
 /// * the escape hatch is decided IN `sh`, before atpkg is consulted, walking
 ///   `PATH` past EVERY reroute directory (by [`DIR_MARKER_FILE`], under any
-///   spelling and any prefix — never just the one it was laid in) for the
-///   first absolute-entry executable of the same name — the escape works with
-///   no atpkg at all;
+///   spelling and any prefix — never just the one it was laid in) and past any
+///   stub under another name (a link or a copy of one in `~/bin` carries no marker
+///   beside it and would exec a stub forever; known by its content,
+///   [`sh_skip_a_stub`]) for the first absolute-entry executable of the same
+///   name — the escape works with no atpkg at all;
 /// * with atpkg unreachable it fails closed with the escape named (exit 2),
 ///   never quietly running upstream.
 #[must_use]
@@ -605,6 +625,10 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String 
     s.push_str(DIR_MARKER_FILE);
     s.push_str("\" ] && continue\n");
     s.push_str("    if [ -x \"$__d/$__aterm_name\" ] && [ ! -d \"$__d/$__aterm_name\" ]; then\n");
+    // A stub under another name — a link, a hard link or a COPY in an ordinary PATH
+    // directory — carries no marker beside it, and exec'ing it looped forever
+    // (2026-09-24): known by what it says ([`sh_skip_a_stub`]).
+    s.push_str(&sh_skip_a_stub("      "));
     s.push_str("      IFS=$__aterm_ifs; set +f\n");
     s.push_str("      exec \"$__d/$__aterm_name\" \"$@\"\n");
     s.push_str("    fi\n");
@@ -648,8 +672,9 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String 
 /// * Otherwise PASS THROUGH, [`stub_body_sh`]'s escape walk: the first `<name>` on PATH
 ///   that is not in a reroute directory (by [`DIR_MARKER_FILE`] — any spelling, any
 ///   prefix), not `<agents_dir>` itself (as spelled or by `-ef`, so a symlink or a
-///   trailing slash is skipped too) and not this stub under another name (`-ef "$0"`: a
-///   link to it in `~/bin` would exec it forever) — else exit 127 with one line. Outside
+///   trailing slash is skipped too) and not a stub under another name (a link or a copy of
+///   one in `~/bin` would exec a stub forever; known by its content, [`sh_skip_a_stub`]) —
+///   else exit 127 with one line. Outside
 ///   aterm that is the user's own copy, never the `agents/` twin (owner law, 03513b5d7:
 ///   *"claude managed via aterm should be in aterm only, NOT in all terminals like
 ///   iTerm"*) — or, with none of the user's on PATH, `<prefix>/bin/<name>`, which the rc
@@ -669,7 +694,7 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String 
 ///
 /// Pure shell, no external command and no atpkg: it works on whatever PATH the caller has.
 /// It never recurses — the twin execs its store path by absolute path, and the walk skips
-/// every reroute directory and this stub under any other name. Line 2 is [`STUB_MARKER`], so every recognition, sweep and
+/// every reroute directory and every stub under any other name. Line 2 is [`STUB_MARKER`], so every recognition, sweep and
 /// shim scan treats it as the other stubs; it execs only through variables, so
 /// [`crate::platform::parse_sh_shim_target`] sees no target.
 #[must_use]
@@ -703,10 +728,10 @@ pub fn agents_stub_body_sh(name: &str, agents_dir: &Path) -> String {
     s.push_str("\" ] && continue\n");
     s.push_str("  [ \"$__d\" = \"$__aterm_agents\" ] && continue\n");
     s.push_str("  [ \"$__d\" -ef \"$__aterm_agents\" ] && continue\n");
-    // Itself under another name: a symlink or hard link to this stub in an ordinary PATH
-    // directory would otherwise exec it again, forever.
-    s.push_str("  [ \"$__d/$__aterm_name\" -ef \"$0\" ] && continue\n");
     s.push_str("  if [ -x \"$__d/$__aterm_name\" ] && [ ! -d \"$__d/$__aterm_name\" ]; then\n");
+    // A stub under another name — this one or another prefix's, linked or COPIED into an
+    // ordinary PATH directory — would otherwise exec a stub again, forever.
+    s.push_str(&sh_skip_a_stub("    "));
     s.push_str("    IFS=$__aterm_ifs; set +f\n");
     s.push_str("    exec \"$__d/$__aterm_name\" \"$@\"\n");
     s.push_str("  fi\n");
@@ -938,12 +963,9 @@ fn wanted_stubs(layout: &Layout) -> Vec<(&'static str, String)> {
 /// `aterm pkg install` — gains its stub at the next one: every pass, every session
 /// spawn and `repair` call this.
 ///
-/// A FILE IS WRITTEN ONLY WHEN ITS BYTES DIFFER (Phase 3, 2026-09-22). An identical stub
-/// that carries `com.apple.provenance` used to be re-laid through the untracked launchd
-/// lane on every pass, and when the lane's file came back tagged too the loop never
-/// converged: the marker was re-laid, and a note printed, on every pass from 2026-09-19 to
-/// 2026-09-22. Clearing the tag is `aterm pkg repair`'s job ([`relay_tagged`]), the fix
-/// `aterm pkg doctor` names; a pass or a spawn changes only what is wrong in content.
+/// A FILE IS WRITTEN ONLY WHEN ITS BYTES DIFFER (Phase 3, 2026-09-22): a pass or a spawn
+/// changes only what is wrong in content. A macOS tag is cleared in place by the store heal
+/// every door ends with ([`crate::provenance::heal_store`]), never by re-laying bytes.
 pub fn lay(layout: &Layout) -> io::Result<()> {
     if cfg!(windows) {
         return Ok(());
@@ -957,17 +979,13 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
     }
     let dir = dir(layout);
     layout.ensure_dir(&dir)?;
-    // THE MARKER FIRST, and in-process: it is data the walks test with `-f`, never an
-    // executable, so its tag tracks nothing and it needs no lane — and a walk racing this
-    // `lay` recognizes the directory before the first stub lands in it.
+    // THE MARKER FIRST: a walk racing this `lay` recognizes the directory before the first
+    // stub lands in it.
     let marker = dir.join(DIR_MARKER_FILE);
     if marker_needs_lay(std::fs::read(&marker).ok().as_deref()) {
         crate::lay::write_in_process(&crate::lay::Executable::new(&marker, marker_body()))?;
     }
-    // Every stub whose bytes differ, rendered first and laid in ONE job
-    // ([`crate::lay::lay_executables`]: in-process, or through the untracked launchd job
-    // when this process is provenance-tracked — these stubs run every upstream
-    // `cargo`/`rustc` typed in a session, and a tagged one would track them all).
+    // Every stub whose bytes differ.
     let mut files = Vec::new();
     let wanted = wanted_stubs(layout);
     for (name, body) in &wanted {
@@ -985,7 +1003,7 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
         }
         files.push(crate::lay::Executable::new(&path, body.as_bytes()));
     }
-    crate::lay::lay_executables(&files)?;
+    files.iter().try_for_each(crate::lay::write_in_process)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1017,58 +1035,9 @@ fn marker_body() -> String {
 }
 
 /// Whether [`lay`] writes the marker file, given what stands there now (`None`: absent or
-/// unreadable): only when it is absent or its bytes differ — never for a tag, which on a
-/// file nothing executes tracks nothing (the reason it is written in-process at all).
+/// unreadable): only when it is absent or its bytes differ.
 pub(crate) fn marker_needs_lay(have: Option<&[u8]>) -> bool {
     have != Some(marker_body().as_bytes())
-}
-
-/// `aterm pkg repair`'s half of [`lay`]: re-lay every stub of ours that is current in
-/// content but carries `com.apple.provenance`, when a lay from this process would come
-/// back clean ([`crate::lay::lay_clears_provenance`]) — the one reason to rewrite
-/// identical bytes. Returns how many were re-laid.
-///
-/// # Errors
-/// The lay's own.
-pub fn relay_tagged(layout: &Layout) -> io::Result<usize> {
-    relay_tagged_where(layout, |_| crate::lay::lay_clears_provenance())
-}
-
-/// The passes' half: [`relay_tagged`] once per file — a stub the lane already re-laid and
-/// that came back tagged is not asked again ([`crate::lay::relay_worth_trying`]), so a pass
-/// clears a stub a fallback lay tagged without re-laying the same bytes for ever.
-///
-/// # Errors
-/// The lay's own.
-pub fn relay_tagged_once(layout: &Layout) -> io::Result<usize> {
-    relay_tagged_where(layout, |path| crate::lay::relay_worth_trying(layout, path))
-}
-
-/// Re-lay every tagged, current stub of ours `worth` admits, then remember which came back
-/// tagged ([`crate::lay::note_relayed`]).
-fn relay_tagged_where(layout: &Layout, worth: impl Fn(&Path) -> bool) -> io::Result<usize> {
-    if cfg!(windows) || layout.declined().is_file() {
-        return Ok(0);
-    }
-    let dir = dir(layout);
-    let tagged: Vec<crate::lay::Executable> = wanted_stubs(layout)
-        .into_iter()
-        .map(|(name, _)| dir.join(name))
-        .filter(|path| is_reroute_stub(path) && crate::provenance::carries_provenance(path))
-        .filter(|path| worth(path))
-        .filter_map(|path| {
-            std::fs::read(&path)
-                .ok()
-                .map(|body| crate::lay::Executable::new(&path, body))
-        })
-        .collect();
-    if tagged.is_empty() {
-        return Ok(0);
-    }
-    crate::lay::lay_executables(&tagged)?;
-    let paths: Vec<std::path::PathBuf> = tagged.iter().map(|e| e.path.clone()).collect();
-    crate::lay::note_relayed(layout, &paths);
-    Ok(tagged.len())
 }
 
 /// Remove every stub that is ours; the directory goes too once it is empty.
@@ -1160,9 +1129,12 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
 /// The first upstream copy of `name` on PATH: an absolute entry that is not a
 /// reroute directory (by marker — ANY spelling, any prefix), not under this
 /// manager prefix, holding an executable regular file that is not itself a
-/// reroute stub. `vendor::executable_on_path` skips only THIS prefix, which is
-/// why a nested session under another prefix used to hand the escape to the
-/// enclosing session's stub and loop.
+/// reroute stub — nor a SYMLINK to one (2026-09-24): [`is_reroute_stub`] refuses
+/// every link, rightly for ownership, so `ln -s <reroute>/cargo ~/bin/cargo` read
+/// as upstream here, the escape exec'd the stub again, and an oracle refusal named
+/// the link as the real tool's path. A walk that skips only THIS prefix (the one
+/// `vendor`'s probes share) is why a nested session under another prefix used to
+/// hand the escape to the enclosing session's stub and loop.
 #[must_use]
 pub fn upstream_on_path(layout: &Layout, name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
     let path_var = path_var?;
@@ -1188,7 +1160,9 @@ pub fn upstream_on_path(layout: &Layout, name: &str, path_var: Option<&OsStr>) -
         };
         #[cfg(not(unix))]
         let executable = meta.is_file();
-        if !executable || is_reroute_stub(&candidate) {
+        let reaches_a_stub = is_reroute_stub(&candidate)
+            || std::fs::canonicalize(&candidate).is_ok_and(|real| is_reroute_stub(&real));
+        if !executable || reaches_a_stub {
             continue;
         }
         return Some(candidate);
@@ -1278,6 +1252,124 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// THE PROGRAM WHOSE BODY IS `body`: one file per distinct body, shared by every test
+    /// and every run of this suite, and executed once per process, unbounded — never a
+    /// fresh file per test.
+    ///
+    /// The root cause of these tests' load flake (4–8 of 8 runs under load): a file this
+    /// process writes carries `com.apple.provenance`, and its FIRST `exec` waits on
+    /// `syspolicyd`'s assessment — measured on m7 2026-09-24, 0.4 s idle, 13 s with the
+    /// assessor busy and more than 60 s under a heavy build, at 0% CPU — while any later
+    /// exec of the SAME file, through any symlink to it, costs nothing (the verdict is
+    /// cached on the file). Every test wrote its fakes afresh, so every run paid one
+    /// assessment per fake inside a 60 s bound. Now the suite execs three programs
+    /// ([`FAKE`] and one twin per agent), content-addressed beside the test binary
+    /// ([`programs_dir`]) and laid by rename, so one written by an earlier run is reused as
+    /// it stands and a new one is assessed here, where no bound measures it; a test places
+    /// SYMLINKS to them ([`fake`], [`fake_twin`]). The stubs a test runs are handed to
+    /// `/bin/sh` ([`sh`]), which READS them — what the kernel does for their `#!/bin/sh`
+    /// line, minus the assessment of a file `lay` wrote a moment ago.
+    #[cfg(unix)]
+    fn assessed(name: &str, body: &str) -> PathBuf {
+        use std::hash::{Hash as _, Hasher as _};
+        use std::sync::Mutex;
+        static RAN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        let mut hasher = std::hash::DefaultHasher::new();
+        body.hash(&mut hasher);
+        let path = programs_dir().join(format!("{name}-{:016x}", hasher.finish()));
+        let mut ran = RAN.lock().unwrap_or_else(|e| e.into_inner());
+        if ran.contains(&path) {
+            return path;
+        }
+        if std::fs::read(&path).ok().as_deref() != Some(body.as_bytes()) {
+            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+            std::fs::write(&tmp, body).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+        }
+        // The assessment, paid here and not inside a test's bound (free when an earlier
+        // run's file is reused).
+        let status = std::process::Command::new(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        assert!(
+            status.is_ok(),
+            "the test program {} did not run: {status:?}",
+            path.display()
+        );
+        ran.push(path.clone());
+        path
+    }
+
+    /// Where the [`assessed`] programs live: `target/<profile>/atpkg-reroute-programs`,
+    /// beside this test binary's `deps/` — shared by every run of this checkout's suite and
+    /// by no other user's. A fixed name under the temp dir is that only where `$TMPDIR` is
+    /// per-user (macOS); on Linux it is the shared `/tmp`, where a second user's run could
+    /// not write it and a directory someone else made first would be exec'd from.
+    #[cfg(unix)]
+    fn programs_dir() -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("a test binary lives in target/<profile>/deps")
+            .join("atpkg-reroute-programs");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Replace whatever is at `at` with `bytes`, or with a symlink to `target`, by rename,
+    /// so a concurrent run exec'ing `at` sees the old entry or the new one, never neither.
+    #[cfg(unix)]
+    fn lay_by_rename(at: &Path, bytes: Option<&str>, target: Option<&Path>) {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = at.with_extension(format!("tmp-{}-{call}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        match (bytes, target) {
+            (Some(bytes), _) => std::fs::write(&tmp, bytes).unwrap(),
+            (None, Some(target)) => std::os::unix::fs::symlink(target, &tmp).unwrap(),
+            (None, None) => unreachable!("bytes or a target"),
+        }
+        std::fs::rename(&tmp, at).unwrap();
+    }
+
+    /// The ONE fake program: it prints the label on the first line of the `.who` file
+    /// beside the name it was run by, then its arguments, and exits with the code on that
+    /// file's second line (0 when there is none).
+    const FAKE: &str = "#!/bin/sh\n{ IFS= read -r who; IFS= read -r code; } < \"$0.who\"\n\
+                        echo \"$who: $*\"\nexit \"${code:-0}\"\n";
+
+    /// [`FAKE`] placed at `at` (a symlink, replacing whatever was there), labelled `who`
+    /// (a second line is its exit code).
+    #[cfg(unix)]
+    fn place_fake(at: &Path, who: &str) -> PathBuf {
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(at);
+        std::fs::write(format!("{}.who", at.display()), format!("{who}\n")).unwrap();
+        std::os::unix::fs::symlink(assessed("fake", FAKE), at).unwrap();
+        at.to_path_buf()
+    }
+
+    /// `stub` run the way the kernel runs its `#!/bin/sh` line — see [`assessed`]. Only a
+    /// stub the kernel WOULD hand to `/bin/sh`: executable, first line `#!/bin/sh`. So the
+    /// one thing this changes is which process pays the first-exec assessment.
+    #[cfg(unix)]
+    fn sh(stub: &Path) -> std::process::Command {
+        let mode = std::fs::metadata(stub).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "{} is not executable", stub.display());
+        assert!(
+            std::fs::read(stub).unwrap().starts_with(b"#!/bin/sh\n"),
+            "{} is not a #!/bin/sh script",
+            stub.display()
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg(stub);
+        cmd
     }
 
     /// `lean f.lean` must reach `clean check f.lean` — the branded tool is
@@ -1571,9 +1663,7 @@ mod tests {
         assert!(body.ends_with("exit 2\n"), "{body}");
     }
 
-    /// The marker is written only when absent or different in content — never for a tag
-    /// (Phase 3: the tag-driven re-lay through the launchd lane never converged, and the
-    /// marker is data nothing executes).
+    /// The marker is written only when absent or different in content.
     #[test]
     fn the_marker_is_written_only_when_its_bytes_differ() {
         assert!(marker_needs_lay(None), "absent: laid");
@@ -1771,16 +1861,7 @@ mod tests {
             std::env::temp_dir().join(format!("atpkg-reroute-upstream-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&upstream_dir);
         std::fs::create_dir_all(&upstream_dir).unwrap();
-        std::fs::write(
-            upstream_dir.join("cargo"),
-            "#!/bin/sh\necho \"upstream: $*\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            upstream_dir.join("cargo"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        place_fake(&upstream_dir.join("cargo"), "upstream");
         let link = l.prefix.join("link-to-reroute");
         std::os::unix::fs::symlink(dir(&l), &link).unwrap();
         let mut trailing = dir(&l).into_os_string();
@@ -1794,7 +1875,7 @@ mod tests {
             entries.push(dir(&l).into_os_string());
             entries.push(upstream_dir.clone().into_os_string());
             let path_env = std::env::join_paths(entries).unwrap();
-            let mut cmd = std::process::Command::new(dir(&l).join("cargo"));
+            let mut cmd = sh(&dir(&l).join("cargo"));
             cmd.args(["build"])
                 .env("PATH", &path_env)
                 .env(PASSTHROUGH_ENV, "1");
@@ -1823,6 +1904,187 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&other.prefix);
+        let _ = std::fs::remove_dir_all(&upstream_dir);
+    }
+
+    /// A TABLE stub under ANOTHER NAME in an ordinary PATH directory — `ln -s
+    /// <prefix>/reroute/cargo ~/bin/cargo`, or a hard link — has no
+    /// [`DIR_MARKER_FILE`] beside it, so the escape walk used to exec it, and it
+    /// exec'd itself again, forever. Only knowing it for a stub stops that — by `-ef
+    /// "$0"` until the 2026-09-24 review showed a COPY slips past an inode test
+    /// (`escape_walk_never_ping_pongs_between_a_copy_and_a_link`), by its content since
+    /// ([`sh_skip_a_stub`]). Entered by either spelling, the walk
+    /// reaches the upstream copy behind it, or — with none — exits 127 with its own
+    /// line. Every TABLE name.
+    #[cfg(unix)]
+    #[test]
+    fn escape_walk_never_execs_the_stub_under_another_name() {
+        let l = layout("self-link");
+        lay(&l).unwrap();
+        // Both outside the manager prefix, as `~/bin` and `~/.cargo/bin` are, so the
+        // Rust side's walk has to recognize the link for what it is too.
+        let outside = |what: &str| {
+            let d = std::env::temp_dir().join(format!(
+                "atpkg-reroute-self-link-{what}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let user_bin = outside("user-bin");
+        let upstream_dir = outside("upstream");
+        for row in TABLE {
+            let name = row.upstream;
+            let stub = dir(&l).join(name);
+            if name == "cargo" {
+                std::fs::hard_link(&stub, user_bin.join(name)).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&stub, user_bin.join(name)).unwrap();
+            }
+            fake(&upstream_dir, name, "upstream");
+            let with_upstream = std::env::join_paths([&user_bin, &dir(&l), &upstream_dir]).unwrap();
+            let without = std::env::join_paths([&user_bin, &dir(&l)]).unwrap();
+            for entry in [user_bin.join(name), stub.clone()] {
+                let run = |path: &std::ffi::OsStr| {
+                    let mut cmd = std::process::Command::new(&entry);
+                    cmd.args(["--version"])
+                        .env("PATH", path)
+                        .env(PASSTHROUGH_ENV, "1");
+                    // 60 s, as the walk test above: an exec loop never finishes.
+                    output_within(cmd, 60)
+                };
+                let out = run(&with_upstream);
+                assert_eq!(
+                    (
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stdout).into_owned()
+                    ),
+                    (Some(0), "upstream: --version\n".to_string()),
+                    "{name} via {}: {}",
+                    entry.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let out = run(&without);
+                assert_eq!(
+                    out.status.code(),
+                    Some(127),
+                    "{name} via {}",
+                    entry.display()
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stderr),
+                    format!("aterm: upstream '{name}' is not on PATH\n"),
+                    "{name} via {}",
+                    entry.display()
+                );
+                assert!(out.stdout.is_empty(), "{name}");
+            }
+            // And the Rust side's walk agrees.
+            assert_eq!(
+                upstream_on_path(&l, name, Some(&with_upstream)),
+                Some(upstream_dir.join(name)),
+                "{name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&user_bin);
+        let _ = std::fs::remove_dir_all(&upstream_dir);
+    }
+
+    /// A COPY OF A STUB IS A STUB (review, 2026-09-24). `cp <prefix>/reroute/* ~/bin/`
+    /// copies every stub and — the glob skips a dotfile — no [`DIR_MARKER_FILE`], and a
+    /// copy has its own inode, so `-ef "$0"` never matched it: with `reroute : ~/a (a copy)
+    /// : ~/b (a link to the stub) : upstream` the stub exec'd the copy, the copy exec'd the
+    /// link (the stub again, under `$0 = ~/b/<name>`), which exec'd the copy, forever —
+    /// and two copies the same (measured: `cargo` spun 16 s until killed, and `claude`
+    /// outside aterm too). The walk has to know a stub the way [`upstream_on_path`] does,
+    /// by what it SAYS. Entered by the stub, the copy or the second entry, a TABLE name
+    /// under the escape and an agent program outside aterm reach the user's own copy
+    /// behind both — or, with none, exit 127 with their own line — and the Rust walk
+    /// agrees.
+    #[cfg(unix)]
+    #[test]
+    fn escape_walk_never_ping_pongs_between_a_copy_and_a_link() {
+        let l = layout("copy-and-link");
+        fake_twin(&l, "claude");
+        lay(&l).unwrap();
+        let outside = |what: &str| {
+            let d = std::env::temp_dir().join(format!(
+                "atpkg-reroute-copy-link-{what}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let upstream_dir = outside("upstream");
+        for name in ["cargo", "claude"] {
+            let stub = dir(&l).join(name);
+            assert!(is_reroute_stub(&stub), "{name}");
+            fake(&upstream_dir, name, "upstream");
+            // The escape for a TABLE name; for an agent program, simply outside aterm
+            // (`run_stub` clears every marker).
+            let escape: &[(&str, &str)] = if name == "cargo" {
+                &[(PASSTHROUGH_ENV, "1")]
+            } else {
+                &[]
+            };
+            let missing = if name == "cargo" {
+                format!("aterm: upstream '{name}' is not on PATH")
+            } else {
+                agents_not_found_message(name)
+            };
+            for (label, second_is_a_link) in [("a copy then a link", true), ("two copies", false)] {
+                let a = outside(&format!("{name}-a"));
+                let b = outside(&format!("{name}-b"));
+                std::fs::copy(&stub, a.join(name)).unwrap();
+                if second_is_a_link {
+                    std::os::unix::fs::symlink(&stub, b.join(name)).unwrap();
+                } else {
+                    std::fs::copy(&stub, b.join(name)).unwrap();
+                }
+                let with_upstream =
+                    std::env::join_paths([&dir(&l), &a, &b, &upstream_dir]).unwrap();
+                let without = std::env::join_paths([&dir(&l), &a, &b]).unwrap();
+                for entry in [stub.clone(), a.join(name), b.join(name)] {
+                    let out = run_stub(&entry, &with_upstream, escape);
+                    assert_eq!(
+                        (
+                            out.status.code(),
+                            String::from_utf8_lossy(&out.stdout).into_owned()
+                        ),
+                        (Some(0), "upstream: --version x y\n".to_string()),
+                        "{name}, {label}, via {}: {}",
+                        entry.display(),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let out = run_stub(&entry, &without, escape);
+                    assert_eq!(
+                        out.status.code(),
+                        Some(127),
+                        "{name}, {label}, via {}",
+                        entry.display()
+                    );
+                    assert_eq!(
+                        String::from_utf8_lossy(&out.stderr).trim_end(),
+                        missing,
+                        "{name}, {label}, via {}",
+                        entry.display()
+                    );
+                    assert!(out.stdout.is_empty(), "{name}, {label}");
+                }
+                // The Rust side's walk has always known a copy by its content.
+                assert_eq!(
+                    upstream_on_path(&l, name, Some(&with_upstream)),
+                    Some(upstream_dir.join(name)),
+                    "{name}, {label}"
+                );
+                let _ = std::fs::remove_dir_all(&a);
+                let _ = std::fs::remove_dir_all(&b);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&upstream_dir);
     }
 
@@ -1863,21 +2125,14 @@ mod tests {
         std::fs::write(d.join(DIR_MARKER_FILE), format!("{STUB_MARKER}\n")).unwrap();
         let upstream_dir = l.prefix.join("upstream");
         std::fs::create_dir_all(&upstream_dir).unwrap();
-        let write_exec = |path: &Path, body: &str| {
-            std::fs::write(path, body).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
-        write_exec(
-            &upstream_dir.join("cargo"),
-            "#!/bin/sh\necho \"upstream: $*\"\nexit 0\n",
-        );
-        let fake = l.prefix.join("fake-atpkg");
-        write_exec(&fake, "#!/bin/sh\necho \"atpkg: $*\"\nexit 3\n");
+        place_fake(&upstream_dir.join("cargo"), "upstream");
+        let fake = place_fake(&l.prefix.join("fake-atpkg"), "atpkg\n3");
         let path_env = format!("{}:{}", d.display(), upstream_dir.display());
         let run = |body: &str, no_reroute: Option<&str>| {
             let stub = d.join("cargo");
-            write_exec(&stub, body);
-            let mut cmd = std::process::Command::new(&stub);
+            std::fs::write(&stub, body).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut cmd = sh(&stub);
             cmd.args(["build", "--x"])
                 .env("PATH", &path_env)
                 .env_remove(PASSTHROUGH_ENV);
@@ -1932,38 +2187,37 @@ mod tests {
     /// binary (a quarantined download raises a Gatekeeper dialog; owner, 2026-09-23).
     #[cfg(unix)]
     fn fake(dir: &Path, name: &str, who: &str) -> PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\necho \"{who}: $*\"\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        place_fake(&dir.join(name), who)
     }
 
-    /// An agents twin shaped like the real one: it execs a (fake) store target by
-    /// absolute path.
+    /// An agents twin shaped like the real one: it execs a (fake) managed target by
+    /// absolute path. One twin program per agent, shared by every test ([`assessed`]).
     #[cfg(unix)]
     fn fake_twin(l: &Layout, name: &str) -> PathBuf {
-        let target = fake(
-            &l.prefix.join("store").join(name).join("1").join("bin"),
-            name,
-            &format!("managed {name}"),
+        // Its managed target: a symlink to FAKE, labelled, beside the programs.
+        let target = programs_dir().join(format!("managed-{name}"));
+        lay_by_rename(
+            Path::new(&format!("{}.who", target.display())),
+            Some(&format!("managed {name}\n")),
+            None,
         );
-        let twin = l.agents_dir().join(name);
+        lay_by_rename(&target, None, Some(&assessed("fake", FAKE)));
+        let twin = assessed(
+            &format!("twin-{name}"),
+            &format!("#!/bin/sh\nexec '{}' \"$@\"\n", target.display()),
+        );
+        let at = l.agents_dir().join(name);
         std::fs::create_dir_all(l.agents_dir()).unwrap();
-        std::fs::write(
-            &twin,
-            format!("#!/bin/sh\nexec '{}' \"$@\"\n", target.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        twin
+        let _ = std::fs::remove_file(&at);
+        std::os::unix::fs::symlink(twin, &at).unwrap();
+        at
     }
 
     /// `name` run through `stub` on `path`, with every marker and the escape CLEARED from
     /// the inherited environment (this suite may itself run inside aterm) and `env` set.
     #[cfg(unix)]
     fn run_stub(stub: &Path, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::process::Output {
-        let mut cmd = std::process::Command::new(stub);
+        let mut cmd = sh(stub);
         cmd.args(["--version", "x y"]).env("PATH", path);
         for marker in crate::hooks::AGENTS_MARKERS {
             cmd.env_remove(marker);
@@ -2107,7 +2361,8 @@ mod tests {
         let mut trailing = dir(&l).into_os_string();
         trailing.push("/");
         // The stub itself under another name, in an ordinary directory (`ln -s "$(command
-        // -v claude)" ~/bin/claude`): no marker there, so only `-ef "$0"` stops the loop.
+        // -v claude)" ~/bin/claude`): no marker there, so only knowing it for a stub by its
+        // content ([`sh_skip_a_stub`]) stops the loop.
         let user_bin = l.prefix.join("user-bin");
         std::fs::create_dir_all(&user_bin).unwrap();
         std::os::unix::fs::symlink(dir(&l).join("claude"), user_bin.join("claude")).unwrap();

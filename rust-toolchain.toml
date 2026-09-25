@@ -2,3 +2,6 @@
 channel = "1.97.1"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
+# crates/aterm-wasm (the in-browser engine) is built for this target, and the
+# release gate type-checks it for this target on this channel.
+targets = ["wasm32-unknown-unknown"]

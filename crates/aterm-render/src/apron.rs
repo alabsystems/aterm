@@ -44,16 +44,24 @@ pub struct ApronScratch {
     /// and frame facts are unchanged (a glide INSIDE one engine row: ~119 of
     /// every 120 trackpad frames) rasters nothing and keeps the band.
     key: Option<ApronKey>,
+    /// The apron row the band was rastered from, compared IN PLACE so a key
+    /// hit allocates nothing; refilled field-wise (capacity kept) on a raster.
+    /// It lived inside [`ApronKey`] until 2026-09-24, which cloned the row on
+    /// every sub-row frame only to compare and drop it.
+    key_row: aterm_core::render::ApronRow,
     /// Bumped on every REAL raster; the GPU arms key their strip pack on it.
     generation: u64,
 }
 
-/// The inputs a rastered apron band is a pure function of. The row itself is
-/// compared by value (`ApronRow: PartialEq`); the rest are the frame facts the
-/// one-row input copies and the renderer geometry the row→px law reads.
-#[derive(Clone, PartialEq)]
+/// The inputs a rastered apron band is a pure function of, besides the row
+/// itself ([`ApronScratch::key_row`], compared in place): the frame facts the
+/// one-row input copies, the renderer geometry the row→px law reads, and the
+/// RENDERER state the raster reads that no input field carries. Appearance
+/// changes no term here sees (text blending, minimum contrast, font thicken,
+/// stem gamma, hinting, the theme's cursor/fg fallbacks) reach it through
+/// [`ApronScratch::invalidate`], which the hosts' own cache invalidation calls.
+#[derive(Clone, Copy, PartialEq)]
 struct ApronKey {
-    row: aterm_core::render::ApronRow,
     cols: usize,
     w: usize,
     grid_top: usize,
@@ -64,9 +72,23 @@ struct ApronKey {
     cursor_style: aterm_core::terminal::CursorStyle,
     cursor_effect_style_override: Option<aterm_core::terminal::CursorStyle>,
     cursor_fill_override: Option<u32>,
+    /// A landed fallback face (or a retired one) re-routes glyphs under
+    /// unchanged cells: the main damage cache repaints on it, so must the strip.
+    font_epoch: u64,
+    /// `draw_cursor` gates the caret on the blink phase — on a caret row only.
+    cursor_blink_phase: bool,
+    /// …and shapes it by the renderer's unfocused override — a caret row only.
+    renderer_cursor_style_override: Option<aterm_core::terminal::CursorStyle>,
 }
 
 impl ApronScratch {
+    /// Forget the rastered row, so the next sub-row frame re-rasters it. Called
+    /// by the hosts' appearance invalidation (`WindowCpu::invalidate`,
+    /// `WindowGpu::invalidate_present`) for the changes no key term can see.
+    pub fn invalidate(&mut self) {
+        self.key = None;
+    }
+
     /// The rastered incoming row: `rows()` rows of `width()` packed pixels,
     /// its TOP row first — the source [`crate::scroll_translate::paint_incoming_strip`]
     /// reads. Empty until [`Renderer::rasterize_apron_row`] has run.
@@ -123,7 +145,6 @@ impl Renderer {
         let band_bg = self.frame_bg(input) | (self.bg_transmittance() << 24);
         // THE KEY: a hit keeps the band and rasters nothing (see `ApronKey`).
         let key = ApronKey {
-            row: ap.clone(),
             cols,
             w,
             grid_top,
@@ -134,8 +155,11 @@ impl Renderer {
             cursor_style: input.cursor_style,
             cursor_effect_style_override: input.cursor_effect_style_override,
             cursor_fill_override: input.cursor_fill_override,
+            font_epoch: self.font_epoch,
+            cursor_blink_phase: ap.cursor_col.is_some() && self.cursor_blink_phase,
+            renderer_cursor_style_override: ap.cursor_col.and(self.cursor_style_override),
         };
-        if scratch.w != 0 && scratch.key.as_ref() == Some(&key) {
+        if scratch.w != 0 && scratch.key == Some(key) && scratch.key_row == *ap {
             return true;
         }
         // Refill the one-row input IN PLACE (the per-row Vecs keep capacity).
@@ -193,7 +217,102 @@ impl Renderer {
         scratch.w = w;
         scratch.band = grid_top * w..h * w;
         scratch.key = Some(key);
+        // Field-wise: the derived `ApronRow::clone_from` is `*self = clone()`
+        // and would reallocate on every miss.
+        let kr = &mut scratch.key_row;
+        kr.present = ap.present;
+        kr.cells.clone_from(&ap.cells);
+        kr.clusters.clone_from(&ap.clusters);
+        kr.combining.clone_from(&ap.combining);
+        kr.line_size = ap.line_size;
+        kr.cursor_col = ap.cursor_col;
         scratch.generation = scratch.generation.wrapping_add(1);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Theme, WindowCpu};
+    use aterm_core::terminal::Terminal;
+
+    /// Machine-independent: the bundled face, runtime discovery off.
+    fn renderer() -> Renderer {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/DejaVuSansMono.ttf"
+        ))
+        .expect("bundled DejaVu asset");
+        let mut r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).expect("fixture parses");
+        r.set_runtime_font_discovery(false);
+        r
+    }
+
+    /// Scrolled back two rows with the cursor hidden: an apron with no caret.
+    fn scrolled_input() -> RenderInput {
+        let mut t = Terminal::new(8, 20);
+        t.process(b"\x1b[?25l");
+        for i in 0..40 {
+            t.process(format!("LINE {i:02}\r\n").as_bytes());
+        }
+        t.scroll_display(2);
+        let input = t.cell_frame(8, 20);
+        assert!(input.apron_row.present && input.apron_row.cursor_col.is_none());
+        input
+    }
+
+    /// THE KEY SEES WHAT THE RASTER READS (audit, 2026-09-24). The resident
+    /// raster keyed only the row, its geometry and the frame colours, so a
+    /// landed fallback face (a `font_epoch` bump) and every appearance change
+    /// the hosts answer with a cache invalidation (blending, contrast, font
+    /// knobs) left the strip on a stale raster. A hit still rasters nothing;
+    /// an epoch bump, a direct invalidation and the CPU window's own
+    /// `invalidate` each force exactly one re-raster; and the caret-only terms
+    /// (blink phase) cannot churn a row that carries no caret.
+    #[test]
+    fn the_apron_raster_follows_the_font_epoch_and_every_invalidation() {
+        let mut r = renderer();
+        let input = scrolled_input();
+        let mut sc = ApronScratch::default();
+        assert!(r.rasterize_apron_row(&input, &mut sc));
+        let g0 = sc.generation();
+        assert!(r.rasterize_apron_row(&input, &mut sc));
+        assert_eq!(
+            sc.generation(),
+            g0,
+            "an unchanged frame is a hit: nothing rastered"
+        );
+        r.cursor_blink_phase = !r.cursor_blink_phase;
+        assert!(r.rasterize_apron_row(&input, &mut sc));
+        assert_eq!(
+            sc.generation(),
+            g0,
+            "no caret on the row: the blink phase is not its input"
+        );
+        r.font_epoch += 1;
+        assert!(r.rasterize_apron_row(&input, &mut sc));
+        assert_eq!(
+            sc.generation(),
+            g0 + 1,
+            "a landed face re-rasters the strip"
+        );
+        sc.invalidate();
+        assert!(r.rasterize_apron_row(&input, &mut sc));
+        assert_eq!(
+            sc.generation(),
+            g0 + 2,
+            "an invalidation re-rasters the strip"
+        );
+        let mut wc = WindowCpu::default();
+        assert!(r.rasterize_apron_row(&input, &mut wc.apron));
+        let w0 = wc.apron.generation();
+        wc.invalidate();
+        assert!(r.rasterize_apron_row(&input, &mut wc.apron));
+        assert_eq!(
+            wc.apron.generation(),
+            w0 + 1,
+            "the window's invalidation reaches the strip"
+        );
     }
 }

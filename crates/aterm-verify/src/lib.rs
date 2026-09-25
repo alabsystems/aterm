@@ -70,7 +70,8 @@
 //!  * Independent stages run CONCURRENTLY ([`sched`]) while the OUTPUT stays in
 //!    the ladder's declared order, so the run stays scannable. Concurrency is
 //!    constrained by the resource each stage actually contends for (see
-//!    [`plan::Lane`]) and the two timing-measuring smokes run exclusively, because
+//!    [`plan::Lane`]) and the stages that MEASURE — the measuring tests
+//!    ([`stages::MEASURING_TESTS`]) and the two smokes — run exclusively, because
 //!    a gate that decides "present starvation" while a lint compiles on the other
 //!    seven cores would be measuring the gate, not the build.
 //!  * Exit codes distinguish FAILED from COULD-NOT-RUN (`1` vs `3`) — the
@@ -302,6 +303,12 @@ pub struct Ctx {
     /// fixture tests set it to `0`, and the preflight laws to `u64::MAX` or `0`,
     /// so none of them depends on how full the host volume happens to be.
     pub disk_floor: u64,
+    /// Where each stage's FINISH line goes the moment the stage finishes —
+    /// the run's own log ([`Ctx::with_progress_log`]). The ladder prints in
+    /// declared order, so a verdict decided in minute one used to stay unread
+    /// until the hour-long test stage ahead of it printed; this line is the
+    /// early read, and it names the outcome.
+    pub progress_log: Option<std::fs::File>,
 }
 
 /// The gate's own side channels, removed from every child in every mode: a
@@ -385,6 +392,7 @@ impl Ctx {
             timings: None,
             source_baseline: None,
             disk_floor: disk::FLOOR_BYTES,
+            progress_log: None,
         }
     }
 
@@ -511,6 +519,15 @@ impl Ctx {
         self
     }
 
+    /// Write every stage's finish line to `log` as it happens
+    /// ([`Ctx::progress_log`]). The handle should append: the ladder's own
+    /// copy goes to the same file, and an appending write lands whole.
+    #[must_use]
+    pub fn with_progress_log(mut self, log: Option<std::fs::File>) -> Self {
+        self.progress_log = log;
+        self
+    }
+
     /// Move the disk preflight's floor ([`Ctx::disk_floor`]). A run takes
     /// [`disk::FLOOR_BYTES`] unless `--disk-floor <GiB>` moved it
     /// ([`cli::Args::disk_floor_gib`]), and its `verify: disk …` line prints
@@ -610,7 +627,9 @@ pub fn toolchain_header(ctx: &Ctx) -> String {
 /// (or the gate-defect `FAIL` and `VERIFY: COULD NOT RUN` lines) — byte-for-byte
 /// in the vocabulary `tools/verify.sh` established.
 /// Live progress goes to stderr so a long stage is not silent without polluting the
-/// scannable part.
+/// scannable part, and every stage's [`finish_line`] — its outcome word included —
+/// goes to [`Ctx::progress_log`] the moment the stage ends, in the order stages
+/// FINISH rather than the order they print.
 ///
 /// # Errors
 /// Propagates write failures on `out`.
@@ -713,10 +732,12 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     let clocks: Mutex<Vec<Option<(Duration, Duration)>>> = Mutex::new(vec![None; plan.len()]);
 
     // Stages run concurrently, so a long one would otherwise be silent until its
-    // turn to print arrives. Progress is stderr-only and terminal-only: stdout
-    // stays a clean, diffable ladder, and a captured log stays a record of
-    // decisions rather than of waiting. It deliberately does NOT report outcomes
-    // — there is one vocabulary for those and it is the ladder's.
+    // turn to print arrives. The START line is stderr-only and terminal-only.
+    // The FINISH line carries the stage's outcome word and goes to the run's
+    // log the moment the stage finishes (2026-09-23): the ladder prints in
+    // declared order, so a formatting FAIL decided in minute one stayed unread
+    // behind an hour-long test stage. stdout stays the clean, ordered ladder;
+    // the outcome word is the ladder's own vocabulary (`outcome_word`).
     let progress = std::io::stderr().is_terminal();
     let done = sched::run_stages(
         &plan,
@@ -742,8 +763,14 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             });
             tripwire.stage_finished();
             let ran = started.elapsed();
+            let finished = finish_line(&spec.title, outcome_word(&report), begun, ran);
             if progress {
-                eprintln!("verify: finish {} ({:.1}s)", spec.title, ran.as_secs_f64());
+                eprint!("{finished}");
+            }
+            if let Some(mut log) = ctx.progress_log.as_ref() {
+                // A record, never a decision: a log that cannot be written costs
+                // the line, not the run.
+                let _ = log.write_all(finished.as_bytes());
             }
             if let Some(i) = plan.iter().position(|s| std::ptr::eq(s, spec))
                 && let Ok(mut c) = clocks.lock()
@@ -835,10 +862,12 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
 /// Record what this run decided about this commit, where `.githooks/pre-push`
 /// can read it ([`receipt`]).
 ///
-/// Only a run with a SOURCE IDENTITY leaves one: a root that is not a git
-/// checkout has no commit to key a receipt by, and a selftest decided nothing
-/// about the tree. Failures are announced on stderr and cost the next push a
-/// refusal — never this run its verdict.
+/// Only a run with a SOURCE IDENTITY over a CLEAN tree leaves one: a root
+/// that is not a git checkout has no commit to key a receipt by, a run over
+/// uncommitted work verified bytes no commit holds, and a selftest decided
+/// nothing about the tree. A weaker receipt never replaces the commit's
+/// whole-tree one ([`receipt::write`]). Failures are announced on stderr and
+/// cost the next push a refusal — never this run its verdict.
 ///
 /// WHAT A RECEIPT SAYS ABOUT A RUN THAT COULD NOT RUN (2026-09-21). A verdict
 /// of COULD NOT RUN is written as `verdict COULD-NOT-RUN`, `merge-contract no`
@@ -864,9 +893,16 @@ fn write_receipt(
     if ctx.selftest {
         return;
     }
+    if !tree.dirty.is_empty() {
+        eprintln!(
+            "verify: no gate receipt — this run verified {} plus uncommitted work, which no \
+             commit holds; commit, then run the gate on the commit you push",
+            tree.head
+        );
+        return;
+    }
     let r = receipt::Receipt {
         head: tree.head.clone(),
-        dirty: tree.dirty_digest(&ctx.path_env),
         mode: ctx.mode.as_str().to_string(),
         scope: match &ctx.scope {
             Scope::Workspace => "workspace".to_string(),
@@ -900,12 +936,22 @@ fn write_receipt(
         snapshot::SourceMode::Snapshot { caller } => caller.clone(),
         snapshot::SourceMode::InPlace => ctx.root.clone(),
     };
-    if let Err(e) = receipt::write(&caller, &r) {
-        eprintln!(
-            "verify: cannot write the gate receipt under {}: {e} — the next push will refuse \
-             for want of one",
-            receipt::dir(&caller).display()
-        );
+    match receipt::write(&caller, &r) {
+        Ok(receipt::Written::Stored(_)) => {}
+        Ok(receipt::Written::KeptWholeTree(path)) => eprintln!(
+            "verify: {} keeps its whole-tree receipt ({}); this run ({}, scope {}) does not \
+             replace it",
+            r.head,
+            path.display(),
+            r.verdict,
+            r.scope
+        ),
+        Err(e) => eprintln!(
+            "verify: cannot write the gate receipt for {} (from {}): {e} — the next push will \
+             refuse for want of one",
+            r.head,
+            caller.display()
+        ),
     }
 }
 
@@ -923,8 +969,20 @@ pub fn time_line(begun: Duration, ran: Duration) -> String {
     )
 }
 
-/// A stage's outcome in one word, for its timing row.
-fn outcome_word(report: &Report) -> &'static str {
+/// The line a stage's end writes to the run's log as it happens: its title,
+/// its outcome word, how long it ran and when it started.
+#[must_use]
+pub fn finish_line(title: &str, word: &str, begun: Duration, ran: Duration) -> String {
+    format!(
+        "verify: finish {title} — {word} ({:.1}s, started +{:.1}s)\n",
+        ran.as_secs_f64(),
+        begun.as_secs_f64()
+    )
+}
+
+/// A stage's outcome in one word, for its timing row and its finish line.
+#[must_use]
+pub fn outcome_word(report: &Report) -> &'static str {
     let mut word = "ok";
     for (o, _) in report.outcomes() {
         match o {
@@ -946,11 +1004,11 @@ fn outcome_word(report: &Report) -> &'static str {
 /// "L0 gate active" for a hook that ran nothing, then "ADVISORY" after the hook
 /// gained teeth), and nothing compared the words with the file.
 pub const HOOK_CLAIM: &str = "pre-push BLOCKS a push of any commit with no passing gate receipt \
-     (a tag, the release cutter's claim over origin's tip — CHANGELOG.md + RELEASES.ledger only — \
-     and a clean automatic merge of a receipted commit onto origin's tip bring no ungated code and \
-     owe none of their own) and REFUSES when it cannot judge — no repository, an unreadable \
-     receipts directory, a failing git — rather than admitting; ATERM_PUSH_NO_GATE=1 is the named \
-     exception";
+     (a whole-tree run that discharged the merge contract; a tag, bookkeeping over origin's tip — \
+     CHANGELOG.md, RELEASES.ledger and a pure version bump — and a clean automatic merge of a \
+     receipted commit onto origin's tip bring no ungated code and owe none of their own) and \
+     REFUSES when it cannot judge — no repository, an unreadable receipt store, a failing git — \
+     rather than admitting; ATERM_PUSH_NO_GATE=1 is the named exception";
 
 /// Where the gate keeps its own copy of each run's ladder, under
 /// [`identity::GATE_STATE_DIR`]. Named here because `main` writes it and the

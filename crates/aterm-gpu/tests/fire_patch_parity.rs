@@ -24,7 +24,8 @@
 //   * the SEAM LAW: one wide patch vs the same burn split into many narrow
 //     patches renders BYTE-IDENTICAL frames on each backend (the field is a
 //     pure function of absolute coordinates — zero seams);
-//   * the NO-OP LAW: `clear_overlays` restores the bare frame byte-exactly;
+//   * the NO-OP LAW: `clear_overlays` restores the bare frame byte-exactly
+//     (the fire_patch row of `tests/empty_channels_gpu.rs`);
 //   * DETERMINISM: the same input renders the same bytes twice.
 //
 // Gated: no GPU or no font -> the tests no-op (return), like the other parity
@@ -703,43 +704,4 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
     } else {
         eprintln!("SKIP byte-exact head-band fire gate: downlevel sRGB offscreen");
     }
-}
-
-/// The NO-OP LAW, GPU side: a populated `fire_patch` must paint, and
-/// `clear_overlays` must restore the bare frame byte-identically — the
-/// introspection-capture (`image plain`) contract.
-#[test]
-fn fire_patch_disabled_bytes_identical_on_gpu() {
-    let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (6usize, 20usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l$ embers off");
-    let (cw, ch) = cpu.cell_size();
-    let (grid_w, grid_h) = (cols * cw, rows * ch);
-
-    let base_input = term.cell_frame(rows, cols);
-    assert!(base_input.fire_patch.is_empty());
-    let base = gpu.render_input(&mut win, &base_input, None).pixels;
-
-    let mut cleared = term.cell_frame(rows, cols);
-    cleared.fire_patch = synthetic_burns(99_999, ch, grid_w, grid_h);
-    let painted = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_ne!(
-        base, painted,
-        "a live fire_patch frame must paint on the GPU"
-    );
-    cleared.clear_overlays();
-    assert!(
-        cleared.fire_patch.is_empty(),
-        "clear_overlays must strip it"
-    );
-    let stripped = gpu.render_input(&mut win, &cleared, None).pixels;
-    assert_eq!(
-        base, stripped,
-        "clear_overlays must restore the bare GPU frame (fire_patch IS bling)"
-    );
 }

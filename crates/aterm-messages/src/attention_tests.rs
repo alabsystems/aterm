@@ -55,6 +55,7 @@ fn download(done: u64) -> Message {
             }),
             load: None,
             busy: false,
+            level: false,
         })
         .hold(Hold::Live {
             stale_after: STALE_UPDATE,
@@ -354,7 +355,7 @@ fn a_carried_row_keeps_its_excerpt_flag() {
     let carry = parent.carried();
     assert!(!carry.live[0].excerpt);
     let mut child = fresh(now);
-    child.seed_carried(&carry, now);
+    child.seed_carried(&carry, stamp(), now);
     assert!(!child.live(id).unwrap().msg.excerpt);
     assert_eq!(present(&child, 160).rows[0].detail, None);
     // An unrevealed row is not carried.
@@ -422,7 +423,7 @@ fn the_indicator_is_the_meters_state_never_the_holds() {
     // Seed: a carried busy row with no fill and no stats keeps its track.
     let carry = c.carried();
     let mut child = fresh(now);
-    child.seed_carried(&carry, now);
+    child.seed_carried(&carry, stamp(), now);
     assert!(child.live(id).unwrap().is_busy());
     assert_eq!(child.live(blocked).unwrap().msg.meter, None);
     child.commit_rows(now, 3);
@@ -1307,6 +1308,7 @@ fn first_run(permille: u16) -> Message {
             }),
             load: Some(Load::Disk),
             busy: false,
+            level: false,
         })
         .hold(Hold::Live {
             stale_after: STALE_TAILED,

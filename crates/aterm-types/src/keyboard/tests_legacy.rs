@@ -11,37 +11,28 @@ use super::*;
 // =========================================================================
 
 #[test]
-fn legacy_encode_plain_character() {
-    let result = encode_key(
-        &Key::Character('a'),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"a");
-}
-
-#[test]
-fn legacy_encode_shift_character() {
-    let result = encode_key(
-        &Key::Character('a'),
-        Modifiers::SHIFT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"A");
-}
-
-#[test]
-fn legacy_encode_ctrl_c() {
-    // Ctrl+C = ETX (0x03)
-    let result = encode_key(&Key::Character('c'), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x03]);
-}
-
-#[test]
-fn legacy_encode_ctrl_a() {
-    // Ctrl+A = SOH (0x01)
-    let result = encode_key(&Key::Character('a'), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x01]);
+#[rustfmt::skip]
+fn legacy_character_encodings() {
+    let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
+    assert_cases(&[
+        ("plain", ch('a'), NO_MODS, LEGACY, KEY, b"a"),
+        ("shift", ch('a'), Modifiers::SHIFT, LEGACY, KEY, b"A"),
+        // Meta (Alt) + Shift on a symbol sends ESC + the SHIFTED glyph, not ESC +
+        // the base symbol. Same root cause as `legacy_encode_shift_symbol`, the
+        // ALT branch.
+        ("alt+shift symbol", ch('2'), alt_shift, LEGACY, KEY, &[0x1b, b'@']),
+        // Mode 1039 SET (default): Alt+key -> ESC + key. Matches the historical
+        // `empty()` contract (no ALT_NO_ESC flag present).
+        ("alt", ch('a'), Modifiers::ALT, LEGACY, KEY, &[0x1b, b'a']),
+        ("alt+shift", ch('a'), alt_shift, LEGACY, KEY, &[0x1b, b'A']),
+        // Ctrl+Alt+C = ESC + Ctrl-C
+        ("ctrl+alt", ch('c'), Modifiers::CTRL | Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x03]),
+        // Without META_SENDS_ESC, a Meta-modified key is unhandled in the legacy
+        // path and falls through to the plain glyph (prior behavior).
+        ("meta, 1036 reset", ch('a'), Modifiers::META, LEGACY, KEY, b"a"),
+        // Release events in legacy mode encode to nothing.
+        ("release", ch('a'), NO_MODS, LEGACY, RELEASE, b""),
+    ]);
 }
 
 /// Regression (owner, 2026-07-28: "does control-_ work as undo like in emacs
@@ -92,7 +83,7 @@ fn legacy_encode_ctrl_underscore_is_us_for_emacs_undo() {
 /// Regression (K-1 "Shift doesn't work"): SHIFT on a NON-letter must yield the
 /// shifted glyph in legacy mode. The old `to_ascii_uppercase` no-op'd on every
 /// digit/symbol, so Shift+2 emitted '2' instead of '@' and shifted symbols were
-/// impossible to type. Letters already worked (`legacy_encode_shift_character`),
+/// impossible to type. Letters already worked (`legacy_character_encodings`),
 /// which is exactly why the gap survived — no test ever pressed Shift on a symbol.
 #[test]
 fn legacy_encode_shift_symbol() {
@@ -134,288 +125,67 @@ fn legacy_encode_shift_symbol() {
     }
 }
 
-/// Meta (Alt) + Shift on a symbol sends ESC + the SHIFTED glyph, not ESC + the
-/// base symbol. Same root cause as `legacy_encode_shift_symbol`, the ALT branch.
-#[test]
-fn legacy_encode_alt_shift_symbol() {
-    let result = encode_key(
-        &Key::Character('2'),
-        Modifiers::ALT | Modifiers::SHIFT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, b'@']);
-}
-
-#[test]
-fn legacy_encode_alt_character() {
-    let result = encode_key(&Key::Character('a'), Modifiers::ALT, KeyboardMode::empty());
-    assert_eq!(result, vec![0x1b, b'a']);
-}
-
-#[test]
-fn legacy_encode_alt_shift_character() {
-    let result = encode_key(
-        &Key::Character('a'),
-        Modifiers::ALT | Modifiers::SHIFT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, b'A']);
-}
-
-#[test]
-fn legacy_encode_ctrl_alt_character() {
-    // Ctrl+Alt+C = ESC + Ctrl-C
-    let result = encode_key(
-        &Key::Character('c'),
-        Modifiers::CTRL | Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, 0x03]);
-}
-
 // =========================================================================
 // Legacy encoding: named keys
 // =========================================================================
 
 #[test]
-fn legacy_encode_enter() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Enter),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x0d]);
-}
-
-#[test]
-fn legacy_encode_alt_enter() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Enter),
-        Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, 0x0d]);
-}
-
-#[test]
-fn legacy_encode_tab() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Tab),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x09]);
-}
-
-#[test]
-fn legacy_encode_shift_tab() {
-    // Shift+Tab = CSI Z (back-tab)
-    let result = encode_key(
-        &Key::Named(NamedKey::Tab),
-        Modifiers::SHIFT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, b'[', b'Z']);
-}
-
-#[test]
-fn legacy_encode_escape() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Escape),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b]);
-}
-
-#[test]
-fn legacy_encode_backspace() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Backspace),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x7f]);
-}
-
-#[test]
-fn legacy_encode_ctrl_backspace() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Backspace),
-        Modifiers::CTRL,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x08]);
-}
-
-#[test]
-fn legacy_encode_space() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Space),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x20]);
-}
-
-#[test]
-fn legacy_encode_ctrl_space() {
-    // Ctrl+Space = NUL
-    let result = encode_key(
-        &Key::Named(NamedKey::Space),
-        Modifiers::CTRL,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x00]);
+#[rustfmt::skip]
+fn legacy_control_and_editing_key_encodings() {
+    assert_cases(&[
+        ("enter", named(NamedKey::Enter), NO_MODS, LEGACY, KEY, &[0x0d]),
+        ("alt enter", named(NamedKey::Enter), Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x0d]),
+        ("tab", named(NamedKey::Tab), NO_MODS, LEGACY, KEY, &[0x09]),
+        // Shift+Tab = CSI Z (back-tab)
+        ("shift tab", named(NamedKey::Tab), Modifiers::SHIFT, LEGACY, KEY, &[0x1b, b'[', b'Z']),
+        ("escape", named(NamedKey::Escape), NO_MODS, LEGACY, KEY, &[0x1b]),
+        ("backspace", named(NamedKey::Backspace), NO_MODS, LEGACY, KEY, &[0x7f]),
+        ("ctrl backspace", named(NamedKey::Backspace), Modifiers::CTRL, LEGACY, KEY, &[0x08]),
+        ("space", named(NamedKey::Space), NO_MODS, LEGACY, KEY, &[0x20]),
+        // Ctrl+Space = NUL
+        ("ctrl space", named(NamedKey::Space), Modifiers::CTRL, LEGACY, KEY, &[0x00]),
+        ("home", named(NamedKey::Home), NO_MODS, LEGACY, KEY, b"\x1b[H"),
+        ("end", named(NamedKey::End), NO_MODS, LEGACY, KEY, b"\x1b[F"),
+        ("page up", named(NamedKey::PageUp), NO_MODS, LEGACY, KEY, b"\x1b[5~"),
+        ("delete", named(NamedKey::Delete), NO_MODS, LEGACY, KEY, b"\x1b[3~"),
+        ("insert", named(NamedKey::Insert), NO_MODS, LEGACY, KEY, b"\x1b[2~"),
+    ]);
 }
 
 // =========================================================================
-// Legacy encoding: arrows with and without APP_CURSOR
+// Legacy encoding: arrows with and without APP_CURSOR, and function keys
 // =========================================================================
 
 #[test]
-fn legacy_encode_arrow_up_normal() {
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowUp),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    // Normal mode: CSI A
-    assert_eq!(result, b"\x1b[A");
-}
-
-#[test]
-fn legacy_encode_arrow_up_app_cursor() {
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowUp),
-        Modifiers::empty(),
-        KeyboardMode::APP_CURSOR,
-    );
-    // Application cursor mode: SS3 A
-    assert_eq!(result, b"\x1bOA");
-}
-
-#[test]
-fn legacy_encode_arrow_down_normal() {
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowDown),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[B");
-}
-
-#[test]
-fn legacy_encode_arrow_left_normal() {
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowLeft),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[D");
-}
-
-#[test]
-fn legacy_encode_arrow_right_normal() {
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowRight),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[C");
-}
-
-#[test]
-fn legacy_encode_arrow_with_shift_modifier() {
-    // Shift+Up: CSI 1;2 A
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowUp),
-        Modifiers::SHIFT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[1;2A");
-}
-
-#[test]
-fn legacy_encode_arrow_with_ctrl_modifier() {
-    // Ctrl+Up: CSI 1;5 A
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowUp),
-        Modifiers::CTRL,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[1;5A");
-}
-
-#[test]
-fn legacy_encode_arrow_with_alt_modifier() {
-    // Alt+Right: CSI 1;3 C — the exact sequence that caused #6631 when the
-    // shell lacked bindings for xterm-style modified arrow keys.
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowRight),
-        Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[1;3C");
-}
-
-#[test]
-fn legacy_encode_arrow_with_alt_left() {
-    // Alt+Left: CSI 1;3 D
-    let result = encode_key(
-        &Key::Named(NamedKey::ArrowLeft),
-        Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[1;3D");
-}
-
-// =========================================================================
-// Legacy encoding: function keys
-// =========================================================================
-
-#[test]
-fn legacy_encode_f1_no_modifiers() {
-    // F1: SS3 P
-    let result = encode_key(
-        &Key::Named(NamedKey::F1),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1bOP");
-}
-
-#[test]
-fn legacy_encode_f1_with_shift() {
-    // Shift+F1: CSI 1;2 P
-    let result = encode_key(
-        &Key::Named(NamedKey::F1),
-        Modifiers::SHIFT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[1;2P");
-}
-
-#[test]
-fn legacy_encode_f5() {
-    // F5: CSI 15 ~
-    let result = encode_key(
-        &Key::Named(NamedKey::F5),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[15~");
-}
-
-#[test]
-fn legacy_encode_f12() {
-    // F12: CSI 24 ~
-    let result = encode_key(
-        &Key::Named(NamedKey::F12),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[24~");
+#[rustfmt::skip]
+fn legacy_cursor_and_function_key_encodings() {
+    let app_cursor = KeyboardMode::APP_CURSOR;
+    assert_cases(&[
+        // Normal mode: CSI A
+        ("up", named(NamedKey::ArrowUp), NO_MODS, LEGACY, KEY, b"\x1b[A"),
+        // Application cursor mode: SS3 A
+        ("up, DECCKM", named(NamedKey::ArrowUp), NO_MODS, app_cursor, KEY, b"\x1bOA"),
+        ("down", named(NamedKey::ArrowDown), NO_MODS, LEGACY, KEY, b"\x1b[B"),
+        ("left", named(NamedKey::ArrowLeft), NO_MODS, LEGACY, KEY, b"\x1b[D"),
+        ("right", named(NamedKey::ArrowRight), NO_MODS, LEGACY, KEY, b"\x1b[C"),
+        // Shift+Up: CSI 1;2 A
+        ("shift up", named(NamedKey::ArrowUp), Modifiers::SHIFT, LEGACY, KEY, b"\x1b[1;2A"),
+        // Ctrl+Up: CSI 1;5 A
+        ("ctrl up", named(NamedKey::ArrowUp), Modifiers::CTRL, LEGACY, KEY, b"\x1b[1;5A"),
+        // Alt+Right: CSI 1;3 C — the exact sequence that caused #6631 when the
+        // shell lacked bindings for xterm-style modified arrow keys.
+        ("alt right", named(NamedKey::ArrowRight), Modifiers::ALT, LEGACY, KEY, b"\x1b[1;3C"),
+        // Alt+Left: CSI 1;3 D
+        ("alt left", named(NamedKey::ArrowLeft), Modifiers::ALT, LEGACY, KEY, b"\x1b[1;3D"),
+        // F1: SS3 P
+        ("f1", named(NamedKey::F1), NO_MODS, LEGACY, KEY, b"\x1bOP"),
+        // Shift+F1: CSI 1;2 P
+        ("shift f1", named(NamedKey::F1), Modifiers::SHIFT, LEGACY, KEY, b"\x1b[1;2P"),
+        // F5: CSI 15 ~
+        ("f5", named(NamedKey::F5), NO_MODS, LEGACY, KEY, b"\x1b[15~"),
+        // F12: CSI 24 ~
+        ("f12", named(NamedKey::F12), NO_MODS, LEGACY, KEY, b"\x1b[24~"),
+    ]);
 }
 
 /// Shift+F10 is a REAL legacy sequence — `CSI 21;2 ~`, terminfo `kf22` (xterm
@@ -444,118 +214,38 @@ fn legacy_encode_shift_f10_is_terminfo_kf22() {
 }
 
 // =========================================================================
-// Legacy encoding: editing keys
-// =========================================================================
-
-#[test]
-fn legacy_encode_home() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Home),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[H");
-}
-
-#[test]
-fn legacy_encode_end() {
-    let result = encode_key(
-        &Key::Named(NamedKey::End),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[F");
-}
-
-#[test]
-fn legacy_encode_page_up() {
-    let result = encode_key(
-        &Key::Named(NamedKey::PageUp),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[5~");
-}
-
-#[test]
-fn legacy_encode_delete() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Delete),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[3~");
-}
-
-#[test]
-fn legacy_encode_insert() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Insert),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b[2~");
-}
-
-// =========================================================================
 // Legacy encoding: numpad
 // =========================================================================
 
 #[test]
-fn legacy_encode_numpad0_normal() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Numpad0),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"0");
-}
-
-#[test]
-fn legacy_encode_numpad0_app_keypad() {
-    let result = encode_key(
-        &Key::Named(NamedKey::Numpad0),
-        Modifiers::empty(),
-        KeyboardMode::APP_KEYPAD,
-    );
-    // SS3 p
-    assert_eq!(result, b"\x1bOp");
-}
-
-#[test]
-fn legacy_encode_numpad_enter() {
-    let result = encode_key(
-        &Key::Named(NamedKey::NumpadEnter),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-    );
-    // NumpadEnter in legacy = same as Enter (0x0d)
-    assert_eq!(result, vec![0x0d]);
-}
-
-#[test]
-fn legacy_encode_numpad_enter_app_keypad() {
-    // NumpadEnter in DECKPAM sends SS3 M, distinguishing from main Enter (#7558).
-    let result = encode_key(
-        &Key::Named(NamedKey::NumpadEnter),
-        Modifiers::empty(),
-        KeyboardMode::APP_KEYPAD,
-    );
-    assert_eq!(result, b"\x1bOM");
-}
-
-#[test]
-fn legacy_encode_numpad_enter_app_keypad_shift_cancels() {
-    // Shift cancels application keypad mode (#7558) — and what is left is the
-    // main Shift+Enter, aterm's LF imposition, NOT a bare CR: a physical
-    // Shift+KP_Enter typed LF before the keypad seam told KP_Enter apart, and
-    // the keypad's Enter is a second Return to the hand on it.
-    let result = encode_key(
-        &Key::Named(NamedKey::NumpadEnter),
-        Modifiers::SHIFT,
-        KeyboardMode::APP_KEYPAD,
-    );
-    assert_eq!(result, vec![0x0a]);
+#[rustfmt::skip]
+fn legacy_numpad_encodings() {
+    let app_keypad = KeyboardMode::APP_KEYPAD;
+    assert_cases(&[
+        ("kp0", named(NamedKey::Numpad0), NO_MODS, LEGACY, KEY, b"0"),
+        // SS3 p
+        ("kp0, DECKPAM", named(NamedKey::Numpad0), NO_MODS, app_keypad, KEY, b"\x1bOp"),
+        // NumpadEnter in legacy = same as Enter (0x0d)
+        ("kp enter", named(NamedKey::NumpadEnter), NO_MODS, LEGACY, KEY, &[0x0d]),
+        // NumpadEnter in DECKPAM sends SS3 M, distinguishing from main Enter (#7558).
+        ("kp enter, DECKPAM", named(NamedKey::NumpadEnter), NO_MODS, app_keypad, KEY, b"\x1bOM"),
+        // Shift cancels application keypad mode (#7558) — and what is left is the
+        // main Shift+Enter, aterm's LF imposition, NOT a bare CR: a physical
+        // Shift+KP_Enter typed LF before the keypad seam told KP_Enter apart, and
+        // the keypad's Enter is a second Return to the hand on it.
+        (
+            "shift kp enter, DECKPAM",
+            named(NamedKey::NumpadEnter),
+            Modifiers::SHIFT,
+            app_keypad,
+            KEY,
+            &[0x0a],
+        ),
+        // Alt+NumpadEnter sends ESC+CR, same as Alt+Enter.
+        ("alt kp enter", named(NamedKey::NumpadEnter), Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x0d]),
+        // Matches the character fallback for '='.
+        ("alt kp equal", named(NamedKey::NumpadEqual), Modifiers::ALT, LEGACY, KEY, b"\x1b="),
+    ]);
 }
 
 /// Outside application keypad mode KP_Enter is the main Enter byte for byte:
@@ -601,68 +291,32 @@ fn legacy_numpad_enter_outside_app_keypad_is_the_main_enter() {
     );
 }
 
-#[test]
-fn legacy_encode_numpad_enter_alt() {
-    // Alt+NumpadEnter sends ESC+CR, same as Alt+Enter.
-    let result = encode_key(
-        &Key::Named(NamedKey::NumpadEnter),
-        Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, 0x0d]);
-}
-
-#[test]
-fn legacy_encode_numpad_equal_matches_character_fallback() {
-    let result = encode_key(
-        &Key::Named(NamedKey::NumpadEqual),
-        Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, b"\x1b=");
-}
-
 // =========================================================================
 // Emacs keybindings — complete coverage
 // =========================================================================
 
 #[test]
-fn legacy_ctrl_space_sends_nul() {
-    // Ctrl+Space = NUL (0x00) — set mark in emacs
-    let result = encode_key(&Key::Character(' '), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x00]);
-}
+#[rustfmt::skip]
+fn legacy_emacs_bindings() {
+    assert_cases(&[
+        // Ctrl+Space = NUL (0x00) — set mark in emacs
+        ("C-SPC", ch(' '), Modifiers::CTRL, LEGACY, KEY, &[0x00]),
+        // Ctrl+/ = US (0x1F) — undo in readline
+        ("C-/", ch('/'), Modifiers::CTRL, LEGACY, KEY, &[0x1f]),
+        // Ctrl+2 = NUL (0x00) — alias for Ctrl-@
+        ("C-2", ch('2'), Modifiers::CTRL, LEGACY, KEY, &[0x00]),
+        // Ctrl+6 = RS (0x1E) — alias for Ctrl-^
+        ("C-6", ch('6'), Modifiers::CTRL, LEGACY, KEY, &[0x1e]),
+        // Ctrl+8 = DEL (0x7F) — alias for Ctrl-?
+        ("C-8", ch('8'), Modifiers::CTRL, LEGACY, KEY, &[0x7f]),
+        // Meta-Backspace = ESC + DEL (0x1B 0x7F) — kill word backward in readline
+        ("M-DEL", named(NamedKey::Backspace), Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x7f]),
+        // Ctrl+Alt+a = ESC + 0x01 (used in some emacs modes)
+        ("C-M-a", ch('a'), Modifiers::CTRL | Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x01]),
+        // Ctrl+X = CAN (0x18) — prefix key in emacs readline
+        ("C-x", ch('x'), Modifiers::CTRL, LEGACY, KEY, &[0x18]),
+    ]);
 
-#[test]
-fn legacy_ctrl_slash_sends_us() {
-    // Ctrl+/ = US (0x1F) — undo in readline
-    let result = encode_key(&Key::Character('/'), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x1f]);
-}
-
-#[test]
-fn legacy_ctrl_2_sends_nul() {
-    // Ctrl+2 = NUL (0x00) — alias for Ctrl-@
-    let result = encode_key(&Key::Character('2'), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x00]);
-}
-
-#[test]
-fn legacy_ctrl_6_sends_rs() {
-    // Ctrl+6 = RS (0x1E) — alias for Ctrl-^
-    let result = encode_key(&Key::Character('6'), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x1e]);
-}
-
-#[test]
-fn legacy_ctrl_8_sends_del() {
-    // Ctrl+8 = DEL (0x7F) — alias for Ctrl-?
-    let result = encode_key(&Key::Character('8'), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x7f]);
-}
-
-#[test]
-fn legacy_all_emacs_ctrl_chars() {
     // Comprehensive: every Ctrl+letter produces the correct control character
     for (letter, expected) in [
         ('a', 0x01u8), // beginning of line
@@ -711,35 +365,6 @@ fn legacy_meta_word_movement() {
     // Meta+d = ESC d (kill word forward)
     let result = encode_key(&Key::Character('d'), Modifiers::ALT, KeyboardMode::empty());
     assert_eq!(result, vec![0x1b, b'd']);
-}
-
-#[test]
-fn legacy_meta_backspace_sends_esc_del() {
-    // Meta-Backspace = ESC + DEL (0x1B 0x7F) — kill word backward in readline
-    let result = encode_key(
-        &Key::Named(NamedKey::Backspace),
-        Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, 0x7f]);
-}
-
-#[test]
-fn legacy_ctrl_alt_combination() {
-    // Ctrl+Alt+a = ESC + 0x01 (used in some emacs modes)
-    let result = encode_key(
-        &Key::Character('a'),
-        Modifiers::CTRL | Modifiers::ALT,
-        KeyboardMode::empty(),
-    );
-    assert_eq!(result, vec![0x1b, 0x01]);
-}
-
-#[test]
-fn legacy_ctrl_x_sends_can() {
-    // Ctrl+X = CAN (0x18) — prefix key in emacs readline
-    let result = encode_key(&Key::Character('x'), Modifiers::CTRL, KeyboardMode::empty());
-    assert_eq!(result, vec![0x18]);
 }
 
 // =========================================================================
@@ -853,20 +478,6 @@ fn test_vt52_numpad_without_app_keypad_sends_digits() {
     );
 }
 
-// Release events in legacy mode
-// =========================================================================
-
-#[test]
-fn legacy_release_event_returns_empty() {
-    let result = encode_key_with_event(
-        &Key::Character('a'),
-        Modifiers::empty(),
-        KeyboardMode::empty(),
-        KeyEventType::Release,
-    );
-    assert!(result.is_empty());
-}
-
 // =========================================================================
 // DECBKM (mode 67): Backspace sends BS (0x08) vs DEL (0x7f)
 // =========================================================================
@@ -913,16 +524,6 @@ fn legacy_backspace_decbkm_sends_bs() {
 // =========================================================================
 
 #[test]
-fn legacy_alt_sends_escape_default_prefixes_esc() {
-    // Mode 1039 SET (default): Alt+key -> ESC + key. Matches the historical
-    // `empty()` contract (no ALT_NO_ESC flag present).
-    assert_eq!(
-        encode_key(&Key::Character('a'), Modifiers::ALT, KeyboardMode::empty()),
-        vec![0x1b, b'a']
-    );
-}
-
-#[test]
 fn legacy_alt_no_esc_suppresses_esc_prefix() {
     // Mode 1039 RESET (ALT_NO_ESC): Alt+key -> bare key, no ESC prefix.
     let mode = KeyboardMode::ALT_NO_ESC;
@@ -934,16 +535,6 @@ fn legacy_alt_no_esc_suppresses_esc_prefix() {
     assert_eq!(
         encode_key(&Key::Character('c'), Modifiers::CTRL | Modifiers::ALT, mode),
         vec![0x03]
-    );
-}
-
-#[test]
-fn legacy_meta_sends_escape_off_by_default() {
-    // Without META_SENDS_ESC, a Meta-modified key is unhandled in the legacy
-    // path and falls through to the plain glyph (prior behavior).
-    assert_eq!(
-        encode_key(&Key::Character('a'), Modifiers::META, KeyboardMode::empty()),
-        vec![b'a']
     );
 }
 

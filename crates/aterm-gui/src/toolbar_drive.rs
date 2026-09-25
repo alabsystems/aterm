@@ -1110,6 +1110,19 @@ mod macos {
         // SAFETY: `+sharedApplication` on a linked class; later keyboard
         // events still enter through NSApp's event dispatch.
         let app = unsafe { s_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
+        // ACTIVE AND KEY FIRST, as stage 5 does for its own probe. The drive launches
+        // under the quiet posture (Accessory, no activation) so a gate run never takes
+        // the front; this stage audits tab selection BY CLICK, which needs the key
+        // window. MEASURED 2026-09-23 on macOS 27 (m3): with the window not key, the
+        // click hit-tests to the chip's label (`NSTextField`, no first mouse) and AppKit
+        // spends it on key-window selection — no SelectTab for any chip — where the
+        // 2026-09-21 measurement on macOS 13.7 saw the same output either way.
+        // SAFETY: the live NSApp and the live window this drive built.
+        unsafe {
+            s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
+            s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
+        }
+        pump(&mut d, &mut el, 250);
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
             // SAFETY: `c` and `strip` are live views, `ns_window` is live;

@@ -406,7 +406,7 @@ impl App {
     /// Rasterize the drag WIRE (§3.2) into this window's paint-only
     /// `conn_wire_card`: an accent line from the pressed tab's connector cell
     /// to the cursor, with a plug dot at each end. Composited with priority
-    /// over the level-up/notice/badge cards, under a modal `settings_card`
+    /// over the bubble/badge cards, under a modal `settings_card`
     /// (which cannot be open mid-drag). No-op ⇒ `conn_wire_card = None`
     /// whenever [`Self::conn_wire_fingerprint`] is `0` — no drag here, armed
     /// only, native origin, or the cursor has left the source window (beyond

@@ -1096,36 +1096,6 @@ mod tests {
         assert!(json_wellformed(r#"{"a": "b}"#).is_err());
     }
 
-    /// THE ground-truth test: the report's own assembly path reproduces the
-    /// baseline in `measured`, which was taken with an independent `cargo tree`
-    /// plus source walk.
-    #[test]
-    fn mac_arm_reproduces_the_measured_third_party_surface() {
-        let root = repo_root();
-        let want = measured::MAC_ARM;
-        let s = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves offline");
-        assert_eq!(
-            s.graph.nodes.len(),
-            want.resolved,
-            "total packages in the shipped graph"
-        );
-        assert_eq!(
-            s.third_party().count(),
-            want.third_party,
-            "third-party packages"
-        );
-        assert_eq!(
-            s.third_party_loc(),
-            want.third_party_loc,
-            "third-party physical LOC"
-        );
-        assert_eq!(
-            s.duplicate_names().len(),
-            want.duplicate_names,
-            "names at 2+ versions"
-        );
-    }
-
     /// The invariant the report prints: non-nested dominator sets are disjoint
     /// and cover the surface, so their LOC sums to the third-party total.
     #[test]

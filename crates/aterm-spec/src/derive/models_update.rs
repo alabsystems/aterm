@@ -47,396 +47,6 @@ pub fn native_update_control_socket_handoff_model() -> Model {
     }
 }
 
-/// Order-independent update-channel authority selection.
-///
-/// GitHub does not document List Releases row order. The bounded catalog therefore
-/// presents canonical `v0.8`, `v0.9`, and `v0.10` candidates in every possible action
-/// order plus an optional strictly-lower numeric multi-part legacy tag. Metadata
-/// arbitration must enumerate the complete catalog and retain the numeric-vector
-/// maximum before downloading anything. Lower legacy tags are migration-compatible;
-/// a same/newer noncanonical maximum refuses. The exact canonical selected manifest is
-/// then fetched once (plus one detached signature iff the channel is pinned); an
-/// unreadable older asset is metadata only and can neither add a fetch nor poison the
-/// authority.
-/// Failure, rejection, missing/ambiguous signature, or a missing/ambiguous/
-/// noncanonical DMG identity at the authoritative release is terminal for that
-/// check—there is no fallback to an older release.
-///
-/// Nonnumeric/duplicate-order metadata refuses before transport. `Buggy=1` exposes
-/// independent row-order overwrites for legacy/v0.8/v0.9, selection before
-/// enumeration, acceptance of a noncanonical maximum, an older 503 fetch after the
-/// authority, and fallback after authoritative fetch, parse, or signature failure.
-/// These controls keep permutation invariance, numeric `9 < 10`, migration
-/// compatibility, the one-fetch budget, and fail-closed authority non-vacuous.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn native_update_channel_scan_model() -> Model {
-    crate::ty_model! {
-        NativeUpdateChannelScan {
-            const Buggy = 0;
-            const MaxMinor = 10;
-            // phase: 0 Catalog, 1 AuthoritySelected, 2 AuthorityVerified,
-            // 3 Refused, 4 Accepted.
-            var phase = 0;
-            var seen_minor_8 = 0;
-            var seen_minor_9 = 0;
-            var seen_minor_10 = 0;
-            var lower_legacy_seen = 0;
-            var noncanonical_maximum = 0;
-            var max_minor = 0;
-            var selected_minor = 0;
-            var metadata_complete = 0;
-            var metadata_error = 0;
-            var signatures_configured = 0;
-            // `signature_policy_ready=1` means either unsigned policy or exactly
-            // one authoritative signature under a pinned policy.
-            var signature_policy_ready = 1;
-            var signature_ambiguous = 0;
-            var manifest_fetch_count = 0;
-            var signature_fetch_count = 0;
-            var fetched_minor = 0;
-            var older_unreadable = 0;
-            var older_manifest_fetch_count = 0;
-            var authoritative_fetch_failed = 0;
-            var authoritative_manifest_rejected = 0;
-            var deferred = 0;
-            var accepted = 0;
-            var early_selection_bypassed = 0;
-            var noncanonical_bypassed = 0;
-            var fallback_bypassed = 0;
-
-            action ConfigureSignatures when (
-                phase == 0 && signatures_configured == 0
-            ) {
-                signatures_configured = 1;
-            }
-            // A numeric multi-part migration tag (abstracted as v0.5.x) is
-            // orderable and harmless while it remains strictly below v0.8+.
-            action ObserveLowerLegacy when (
-                phase == 0 && lower_legacy_seen == 0
-            ) {
-                lower_legacy_seen = 1;
-                max_minor = if max_minor > 5 {
-                    max_minor
-                } else {
-                    5
-                };
-            }
-            action ObserveLowerLegacyByRowOrder when (
-                Buggy == 1 && phase == 0 && lower_legacy_seen == 0
-            ) {
-                lower_legacy_seen = 1;
-                max_minor = 5;
-            }
-            action ObserveMinor8 when (phase == 0 && seen_minor_8 == 0) {
-                seen_minor_8 = 1;
-                max_minor = if max_minor > 8 {
-                    max_minor
-                } else {
-                    8
-                };
-            }
-            action ObserveMinor8ByRowOrder when (
-                Buggy == 1 && phase == 0 && seen_minor_8 == 0
-            ) {
-                seen_minor_8 = 1;
-                max_minor = 8;
-            }
-            action ObserveMinor9 when (phase == 0 && seen_minor_9 == 0) {
-                seen_minor_9 = 1;
-                max_minor = if max_minor > 9 {
-                    max_minor
-                } else {
-                    9
-                };
-            }
-            action ObserveMinor9ByRowOrder when (
-                Buggy == 1 && phase == 0 && seen_minor_9 == 0
-            ) {
-                seen_minor_9 = 1;
-                max_minor = 9;
-            }
-            action ObserveMinor10 when (phase == 0 && seen_minor_10 == 0) {
-                seen_minor_10 = 1;
-                max_minor = 10;
-            }
-            action ObserveMalformedCandidate when (
-                phase == 0 && metadata_error == 0
-            ) {
-                metadata_error = 1;
-            }
-            action ObserveDuplicateCanonicalCandidate when (
-                phase == 0 && metadata_error == 0
-            ) {
-                metadata_error = 1;
-            }
-            // v0.10.1 (same-prefix newer) wins numeric vector order over v0.10,
-            // but cannot be a canonical channel authority.
-            action ObserveNewerNoncanonical when (
-                phase == 0 && noncanonical_maximum == 0
-            ) {
-                noncanonical_maximum = 1;
-            }
-            action CompleteMetadataArbitration when (
-                phase == 0 && metadata_error == 0 && seen_minor_8 == 1 &&
-                seen_minor_9 == 1 && seen_minor_10 == 1 &&
-                noncanonical_maximum == 0
-            ) {
-                phase = 1;
-                selected_minor = max_minor;
-                metadata_complete = 1;
-            }
-            action RefuseMetadata when (phase == 0 && metadata_error == 1) {
-                phase = 3;
-                metadata_complete = 1;
-                deferred = 1;
-            }
-            action RefuseNoncanonicalAuthority when (
-                phase == 0 && metadata_error == 0 && seen_minor_8 == 1 &&
-                seen_minor_9 == 1 && seen_minor_10 == 1 &&
-                noncanonical_maximum == 1
-            ) {
-                phase = 3;
-                metadata_complete = 1;
-                deferred = 1;
-            }
-            action SelectBeforeCatalogComplete when (
-                Buggy == 1 && phase == 0 && metadata_error == 0 &&
-                max_minor > 0 &&
-                seen_minor_8 + seen_minor_9 + seen_minor_10 <= 2
-            ) {
-                phase = 1;
-                selected_minor = max_minor;
-                early_selection_bypassed = 1;
-            }
-            action AcceptNoncanonicalAuthority when (
-                Buggy == 1 && phase == 0 && metadata_error == 0 &&
-                seen_minor_8 == 1 && seen_minor_9 == 1 &&
-                seen_minor_10 == 1 && noncanonical_maximum == 1
-            ) {
-                phase = 1;
-                selected_minor = max_minor;
-                metadata_complete = 1;
-                noncanonical_bypassed = 1;
-            }
-            action ObserveMissingAuthoritativeSignature when (
-                phase == 1 && signatures_configured == 1 &&
-                signature_policy_ready == 1
-            ) {
-                signature_policy_ready = 0;
-            }
-            action ObserveAmbiguousAuthoritativeSignature when (
-                phase == 1 && signatures_configured == 1 &&
-                signature_policy_ready == 1
-            ) {
-                signature_policy_ready = 0;
-                signature_ambiguous = 1;
-            }
-            action RefuseSignaturePolicy when (
-                phase == 1 && signatures_configured == 1 &&
-                signature_policy_ready == 0
-            ) {
-                phase = 3;
-                deferred = 1;
-            }
-            // The old 503 is a property of catalog metadata, not a transport call.
-            action ExposeOlderUnreadable when (
-                phase == 1 && older_unreadable == 0
-            ) {
-                older_unreadable = 1;
-            }
-            action FetchAuthoritativeVerified when (
-                phase == 1 && metadata_complete == 1 &&
-                selected_minor == max_minor && signature_policy_ready == 1 &&
-                manifest_fetch_count == 0
-            ) {
-                phase = 2;
-                manifest_fetch_count = 1;
-                signature_fetch_count = signatures_configured;
-                fetched_minor = selected_minor;
-            }
-            action FetchAuthoritativeUnreadable when (
-                phase == 1 && metadata_complete == 1 &&
-                selected_minor == max_minor && signature_policy_ready == 1 &&
-                manifest_fetch_count == 0
-            ) {
-                phase = 3;
-                manifest_fetch_count = 1;
-                fetched_minor = selected_minor;
-                authoritative_fetch_failed = 1;
-                deferred = 1;
-            }
-            action FetchAuthoritativeSignatureUnreadable when (
-                phase == 1 && metadata_complete == 1 &&
-                selected_minor == max_minor && signatures_configured == 1 &&
-                signature_policy_ready == 1 && manifest_fetch_count == 0
-            ) {
-                phase = 3;
-                manifest_fetch_count = 1;
-                signature_fetch_count = 1;
-                fetched_minor = selected_minor;
-                authoritative_fetch_failed = 1;
-                deferred = 1;
-            }
-            // Includes parse/version/signature rejection and a signed manifest
-            // whose canonical DMG name does not resolve to exactly one asset.
-            action RejectAuthoritativeManifest when (
-                phase == 1 && metadata_complete == 1 &&
-                selected_minor == max_minor && signature_policy_ready == 1 &&
-                manifest_fetch_count == 0
-            ) {
-                phase = 3;
-                manifest_fetch_count = 1;
-                signature_fetch_count = signatures_configured;
-                fetched_minor = selected_minor;
-                authoritative_manifest_rejected = 1;
-                deferred = 1;
-            }
-            action FinalizeAccepted when (phase == 2) {
-                phase = 4;
-                accepted = 1;
-            }
-            action FetchOlderUnreadable when (
-                Buggy == 1 && phase == 2 && older_unreadable == 1 &&
-                manifest_fetch_count == 1
-            ) {
-                phase = 3;
-                manifest_fetch_count = 2;
-                older_manifest_fetch_count = 1;
-                authoritative_fetch_failed = 1;
-                deferred = 1;
-            }
-            action FallbackAfterFetchFailure when (
-                Buggy == 1 && phase == 3 && authoritative_fetch_failed == 1
-            ) {
-                phase = 4;
-                manifest_fetch_count = 2;
-                fetched_minor = 9;
-                deferred = 0;
-                accepted = 1;
-                fallback_bypassed = 1;
-            }
-            action FallbackAfterManifestReject when (
-                Buggy == 1 && phase == 3 &&
-                authoritative_manifest_rejected == 1
-            ) {
-                phase = 4;
-                manifest_fetch_count = 2;
-                fetched_minor = 9;
-                deferred = 0;
-                accepted = 1;
-                fallback_bypassed = 1;
-            }
-            action FallbackAfterSignatureRefusal when (
-                Buggy == 1 && phase == 3 && signatures_configured == 1 &&
-                signature_policy_ready == 0 && manifest_fetch_count == 0
-            ) {
-                phase = 4;
-                manifest_fetch_count = 1;
-                fetched_minor = 9;
-                deferred = 0;
-                accepted = 1;
-                fallback_bypassed = 1;
-            }
-
-            invariant CatalogMaximumIsNumericAndOrderIndependent:
-                if seen_minor_10 == 1 {
-                    max_minor == 10
-                } else if seen_minor_9 == 1 {
-                    max_minor == 9
-                } else if seen_minor_8 == 1 {
-                    max_minor == 8
-                } else if lower_legacy_seen == 1 {
-                    max_minor == 5
-                } else {
-                    max_minor == 0
-                };
-            invariant SelectionWaitsForCompleteCatalog:
-                if selected_minor > 0 {
-                    metadata_complete == 1 && metadata_error == 0 &&
-                    seen_minor_8 + seen_minor_9 + seen_minor_10 == 3
-                } else {
-                    selected_minor == 0
-                };
-            invariant SelectedAuthorityIsNumericMaximum:
-                if selected_minor > 0 {
-                    selected_minor == max_minor && selected_minor == 10
-                } else {
-                    selected_minor == 0
-                };
-            invariant MetadataFailureFetchesNothing:
-                if metadata_error == 1 {
-                    selected_minor == 0 && manifest_fetch_count == 0 &&
-                    signature_fetch_count == 0 && accepted == 0
-                } else {
-                    metadata_error == 0
-                };
-            invariant NoncanonicalMaximumCannotSelect:
-                if noncanonical_maximum == 1 {
-                    selected_minor == 0 && manifest_fetch_count == 0 &&
-                    accepted == 0
-                } else {
-                    noncanonical_maximum == 0
-                };
-            invariant ManifestFetchBudgetIsOne:
-                manifest_fetch_count <= 1;
-            invariant FetchTargetsSelectedAuthority:
-                if manifest_fetch_count == 1 {
-                    fetched_minor == selected_minor
-                } else if manifest_fetch_count == 0 {
-                    fetched_minor == 0
-                } else {
-                    fetched_minor <= MaxMinor
-                };
-            invariant VerifiedFetchHonorsSignaturePolicy:
-                if phase == 2 {
-                    signature_policy_ready == 1 &&
-                    signature_fetch_count == signatures_configured
-                } else {
-                    signature_fetch_count <= signatures_configured
-                };
-            invariant OlderUnreadableIsNeverFetched:
-                older_manifest_fetch_count == 0;
-            invariant AuthorityFailureNeverFallsBack:
-                fallback_bypassed == 0;
-            invariant EnumerationCannotBeBypassed:
-                early_selection_bypassed == 0;
-            invariant NoncanonicalAuthorityCannotBeBypassed:
-                noncanonical_bypassed == 0;
-            invariant AcceptedUsesAuthoritativeRelease:
-                if phase == 4 {
-                    accepted == 1 && selected_minor == 10 &&
-                    fetched_minor == 10 && manifest_fetch_count == 1 &&
-                    authoritative_fetch_failed == 0 &&
-                    authoritative_manifest_rejected == 0 &&
-                    signature_policy_ready == 1
-                } else {
-                    accepted == 0
-                };
-            invariant RefusalIsTerminalForThisCheck:
-                if phase == 3 {
-                    accepted == 0 && deferred == 1
-                } else {
-                    deferred == 0
-                };
-            invariant ScanBounds:
-                phase <= 4 && seen_minor_8 <= 1 && seen_minor_9 <= 1 &&
-                seen_minor_10 <= 1 && lower_legacy_seen <= 1 &&
-                noncanonical_maximum <= 1 && max_minor <= MaxMinor &&
-                selected_minor <= MaxMinor && metadata_complete <= 1 &&
-                metadata_error <= 1 && signatures_configured <= 1 &&
-                signature_policy_ready <= 1 && signature_ambiguous <= 1 &&
-                manifest_fetch_count <= 2 && signature_fetch_count <= 1 &&
-                fetched_minor <= MaxMinor && older_unreadable <= 1 &&
-                older_manifest_fetch_count <= 1 &&
-                authoritative_fetch_failed <= 1 &&
-                authoritative_manifest_rejected <= 1 && deferred <= 1 &&
-                accepted <= 1 && early_selection_bypassed <= 1 &&
-                noncanonical_bypassed <= 1 && fallback_bypassed <= 1;
-        }
-    }
-}
-
 /// Admission and handoff policy for applying an already verified native update.
 ///
 /// A foreground terminal job is not dirty native UI state: the seamless handoff
@@ -920,10 +530,36 @@ pub fn native_update_auto_intent_model() -> Model {
 /// `WarmupStarts`/`WarmupEnds` (2026-09-23) are the user's consent warm-up,
 /// the one hold no phase relaxes: `Land` included, or a landing could arrive
 /// while the macOS dialog the user asked for is on screen.
-/// Every admitted park (`Park`, `ParkMissed`, `PhysicalFailure`) requires it
-/// ended, and `ParkedOnlyWhenTheLadderAdmits` records it; `WarmupEnds` is
+/// Every admitted park (`Park`, `ParkMissed`, `PhysicalFailure`, and the
+/// capture-refusal pair below) requires it ended, and `ParkedOnlyWhenTheLadderAdmits` records it; `WarmupEnds` is
 /// always enabled while it holds (the shipping hold is capped), so the ladder
 /// still always lands.
+///
+/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-3): a park that fails
+/// DETERMINISTICALLY. `DeskRefuses` is the environment putting a session into
+/// a state the capture cannot carry as it stands (a NUL in a reported cwd, a
+/// grid over the per-grid cap, a parser left mid-string) and `DeskChanges` is
+/// the desk moving on (the session closed, resized, left the alt screen).
+/// While the desk refuses, a park is admitted only once the capture has
+/// answered for it: `CaptureRefused` carries the refusing session at a
+/// degraded rung (`degraded`; the producer is total over content). The mutant
+/// `CaptureRefusedAsActivity` files the refusal as the machine being busy
+/// instead — the v0.91 shape, where the same deterministic refusal was
+/// re-parked on the freeze ladder, stood down as `ActivityRevoked` and retried
+/// every fifteen minutes forever while `update status` said nothing was wrong.
+/// It is caught by `RefusalNeverRetriesAsActivity` (`refusals` counts refusals
+/// re-filed as activity, once, to keep the space finite).
+///
+/// AND A LATCH MAY NOT BE RELEASED BEFORE ITS DEADLINE (the same audit, plan
+/// P0-6). `Due` is the latch's `retry_at` passing and `Lapse` now needs it.
+/// `BundleSwap` is the failed candidate having already boot-applied the bundle:
+/// the next reconcile retires the download for the installed-bundle activation
+/// of the SAME update, and the healthy lane re-keys the latch, deadline and all.
+/// The mutant `BundleSwapClearsLatch` is what v0.87–v0.91 shipped: the retire
+/// arm cleared the latch, the activation armed 500 ms later, and a structural
+/// failure's "confirming retry, ten minutes out" ran 1.4 s after the first
+/// failure — then converged the lane for a day. `NoEarlyRelease` catches it:
+/// once a failure latched the lane, an unlatched lane means the deadline came.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_apply_ladder_model() -> Model {
@@ -949,6 +585,18 @@ pub fn native_update_apply_ladder_model() -> Model {
             var parked_focused = 0;
             var warmup = 0;
             var parked_warmup = 0;
+            // THE DESK (2026-09-22/23 audit, plan P0-3): whether some session is
+            // in a state the capture cannot carry as it stands, whether this
+            // attempt's capture has already answered for it at a degraded rung,
+            // and how many refusals were re-filed as activity (the mutant).
+            var refusing = 0;
+            var degraded = 0;
+            var refusals = 0;
+            // THE LATCH'S DEADLINE (plan P0-6): whether a physical latch's
+            // `retry_at` has passed, and whether the failed candidate's bundle
+            // swap has retired the download for its activation.
+            var due = 0;
+            var swapped = 0;
             // The wall clock. Not guarded on the latch: the anchor keeps
             // counting while a physical-failure latch holds, and `reached` is
             // the high-water mark the phase may never fall below.
@@ -985,6 +633,19 @@ pub fn native_update_apply_ladder_model() -> Model {
             action WarmupEnds when (landed == 0 && manual_only == 0 && warmup == 1) {
                 warmup = 0;
             }
+            // The environment puts a session into a state the capture cannot
+            // carry as it stands (program output: an OSC 7 with `%00`, a grid
+            // over the per-grid cap, a parser left mid-string).
+            action DeskRefuses when (landed == 0 && manual_only == 0) {
+                refusing = 1;
+            }
+            // The desk moves on: the session closed, resized or left the alt
+            // screen — the facts the refusal lane's fingerprint watches. A
+            // carry answered for the OLD desk says nothing about the new one.
+            action DeskChanges when (landed == 0 && manual_only == 0) {
+                refusing = 0;
+                degraded = 0;
+            }
             // The incident's typing hold: a busy terminal past `Hold` ticks
             // stands the lane down. Nothing is enabled afterwards.
             action StandDown when (
@@ -993,8 +654,12 @@ pub fn native_update_apply_ladder_model() -> Model {
             ) {
                 manual_only = 1;
             }
+            // A refusing desk parks only once the capture has answered for it:
+            // the refusing session travels at a degraded rung (plan P0-1), so
+            // the park that lands is not the one that refused.
             action Park when (
                 landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
+                (refusing == 0 || degraded == 1) &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
@@ -1021,6 +686,38 @@ pub fn native_update_apply_ladder_model() -> Model {
             ) {
                 quiet = 0;
             }
+            // A PARK THE CAPTURE REFUSED: a deterministic fact about the desk,
+            // never about the moment. The healthy lane answers for it — the
+            // refusing session is carried at a degraded rung, and what no rung
+            // can lower is typed `CaptureRefused` and retried when the desk
+            // changes, never on the activity spacing.
+            action CaptureRefused when (
+                landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
+                refusing == 1 && degraded == 0 &&
+                (phase == Land ||
+                    (keys == 1 && (phase == 2 ||
+                        (phase == 1 && (focused == 0 || output == 1)) ||
+                        (phase == 0 && quiet == 1))))
+            ) {
+                degraded = 1;
+            }
+            // THE 2026-09-22/23 MUTANT (v0.91): the same refusal filed as a
+            // park miss — the terminal reads as busy, the desk is never
+            // answered for, and the same refusal comes back every fifteen
+            // minutes forever. Its own dead action, so the closure can credit
+            // it as an independently caught negative control; once, to keep
+            // the space finite.
+            action CaptureRefusedAsActivity when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 0 &&
+                warmup == 0 && refusing == 1 && degraded == 0 && refusals == 0 &&
+                (phase == Land ||
+                    (keys == 1 && (phase == 2 ||
+                        (phase == 1 && (focused == 0 || output == 1)) ||
+                        (phase == 0 && quiet == 1))))
+            ) {
+                quiet = 0;
+                refusals = refusals + 1;
+            }
             // A GENUINE PHYSICAL FAILURE of an admitted park (a successor that
             // died, a proof that did not match): the lane latches for the
             // physical schedule's spacing. Once, to keep the space finite.
@@ -1035,9 +732,35 @@ pub fn native_update_apply_ladder_model() -> Model {
                 latched = 1;
                 failures = 1;
             }
-            // The latch lapses: the intent is re-armed and the ladder resumes
-            // where the clock is.
-            action Lapse when (landed == 0 && manual_only == 0 && latched == 1) {
+            // The latch's deadline passes (its `retry_at`, 600 s out for the
+            // first failure).
+            action Due when (landed == 0 && manual_only == 0 && latched == 1 && due == 0) {
+                due = 1;
+            }
+            // The latch lapses AT its deadline: the intent is re-armed and the
+            // ladder resumes where the clock is.
+            action Lapse when (
+                landed == 0 && manual_only == 0 && latched == 1 && due == 1
+            ) {
+                latched = 0;
+            }
+            // THE FAILED CANDIDATE HAD ALREADY SWAPPED THE BUNDLE (plan P0-6):
+            // the download retires for the activation of the same update, and
+            // the latch is re-keyed to it — its deadline untouched. Once, to
+            // keep the space finite.
+            action BundleSwap when (
+                landed == 0 && manual_only == 0 && failures == 1 && swapped == 0
+            ) {
+                swapped = 1;
+            }
+            // THE v0.87–v0.91 MUTANT: the retire arm CLEARS the latch, and the
+            // activation arms half a second after the failure. Its own dead
+            // action, so the closure credits it as an independent control.
+            action BundleSwapClearsLatch when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 1 &&
+                swapped == 0
+            ) {
+                swapped = 1;
                 latched = 0;
             }
             // THE 2026-09-21 MUTANTS. A park miss filed as a physical failure
@@ -1054,7 +777,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             // And a lapse that clears the anchor: the 600 s latch buys the
             // artifact a fresh ladder.
             action LapseRestartsTheLadder when (
-                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 1
+                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 1 && due == 1
             ) {
                 latched = 0;
                 phase = 0;
@@ -1073,6 +796,17 @@ pub fn native_update_apply_ladder_model() -> Model {
             }
             invariant ActivityNeverLatchesManualOnly: manual_only == 0;
             invariant TheLadderNeverRestarts: reached <= phase;
+            // A refusal the capture made is never retried as the machine being
+            // busy (2026-09-22/23 audit, plan P0-3).
+            invariant RefusalNeverRetriesAsActivity: refusals == 0;
+            // A latch is released only once its deadline has come (plan P0-6):
+            // after a physical failure, an unlatched lane is a due one.
+            invariant NoEarlyRelease:
+                if failures == 1 && latched == 0 {
+                    due == 1
+                } else {
+                    due <= 1
+                };
             invariant ParkedOnlyWhenTheLadderAdmits:
                 if landed == 1 {
                     parked_warmup == 0 && (parked_phase == Land ||

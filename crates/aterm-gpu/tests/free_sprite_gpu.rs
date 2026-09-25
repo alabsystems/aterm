@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// FREE-floating sprite layer (`free_sprites` + `free_atlas`), Phase 1: GPU-only
-// consumption (the CPU consumes free sprites in Phase 2, so every assertion here
-// is GPU-vs-GPU). A single MULTI-ROW free rect — no host row-splitting — must:
-//   * render exactly like the legacy per-row-sliced `cat_quads` emission of the
-//     same art (both NEAREST 1:1 through the same src-over pipeline; a boundary
-//     texel may round one ULP differently in float UV, so the bar is the cat
-//     hard bar <= 2, target <= 1);
-//   * repaint with no ghosting on the damaged/cached path when moved (the
-//     row-union in `compute_dirty_rows` marks every band the rect overlaps,
-//     prev-union-cur, so the dirty-band scissor spans the full Y-extent and
-//     cached == fresh byte-for-byte): moved => `gate_misses` increments;
-//   * take the dirty gate when settled (equal sprites + same atlas version):
-//     settled => `gate_hits` increments.
+// FREE-floating sprite layer (`free_sprites` + `free_atlas`) on the GPU: the
+// real CatBaker atlas geometry uploads (its row pitch is not wgpu's 256-byte
+// copy alignment), and a real `EffectsPipeline` cat survives the GPU present
+// path. The multi-row-rect-vs-legacy-slices and damaged-path no-ghosting laws
+// are held on both backends by `free_parity.rs`.
 //
 // Gated: no GPU or no font -> the test no-ops (returns), like the other parity gates.
 
@@ -24,41 +16,11 @@ use std::sync::Arc;
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::Terminal;
 use aterm_effects::pipeline::EffectsPipeline;
-use aterm_render::{SceneAtlas, SpriteQuad, Theme};
+use aterm_render::Theme;
 use rain_common::RainScene;
 
 mod common;
 use common::{backends, max_channel_delta};
-
-/// A deterministic patterned RGBA atlas, tall enough for a rect spanning
-/// several cell-row bands at any realistic cell height: per-texel distinct
-/// colours (a wrong NEAREST index shows up), mixed alpha below the top strip
-/// (real src-over blending happens, not just opaque replacement).
-fn free_atlas(version: u64) -> SceneAtlas {
-    let (w, h) = (64u32, 128u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let a = if y < 16 {
-                255u8
-            } else {
-                (60 + (x * 3 + y) % 180) as u8
-            };
-            rgba.extend_from_slice(&[
-                (x * 37 + y * 11) as u8,
-                (x * 5 + y * 53) as u8,
-                (x * 29 + y * 3) as u8,
-                a,
-            ]);
-        }
-    }
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
-}
 
 /// A NEAREST-1:1 free sprite (`aw/ah == w/h`, the cat bake==dest contract) at
 /// an on-grid pixel origin, under text (the default z).
@@ -81,154 +43,10 @@ fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
     }
 }
 
-/// One MULTI-ROW free rect == the legacy per-row `cat_quads` slices of the same
-/// art, on the GPU: proves the host head/chin split is no longer needed (no seam,
-/// no clobber) at the cat parity bar (hard <= 2, target <= 1). The terminal is
-/// glyph-free so the delta is effect-only.
-#[test]
-fn free_multirow_rect_matches_legacy_perrow_slices_on_gpu() {
-    let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (_, ch) = cpu.cell_size();
-    let (rows, cols) = (6usize, 12usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(1));
-
-    // A sub-cell origin mid-band of row 1, spanning into band 3 (>= 2 band
-    // crossings): y in [ch + ch/2, ch + ch/2 + 2*ch).
-    let (x, y) = (4i32, (ch + ch / 2) as i32);
-    let (w, h) = (40u16, (2 * ch + ch / 2) as u16);
-    let (ax, ay) = (2u16, 3u16);
-    assert!(
-        (h as u32) <= atlas.height - ay as u32,
-        "atlas must cover the rect 1:1"
-    );
-
-    let base = gpu
-        .render_input(&mut win, &term.cell_frame(rows, cols), None)
-        .pixels;
-
-    let mut free_input = term.cell_frame(rows, cols);
-    free_input.free_atlas = Some(atlas.clone());
-    free_input.free_sprites = vec![free_1to1(x, y, w, h, [ax, ay])];
-    let free_px = gpu.render_input(&mut win, &free_input, None).pixels;
-    assert_ne!(
-        free_px, base,
-        "the multi-row free rect must actually paint (non-vacuous)"
-    );
-
-    // The SAME art as legacy single-band cat slices: one SpriteQuad per cell-row
-    // band the rect overlaps, each sub-windowing the same atlas region.
-    let mut slices = Vec::new();
-    let (y0, y1) = (y as usize, y as usize + h as usize);
-    for r in y0 / ch..=(y1 - 1) / ch {
-        let band_y0 = y0.max(r * ch);
-        let band_y1 = y1.min((r + 1) * ch);
-        slices.push(SpriteQuad {
-            row: r as u16,
-            x: x as u16,
-            y: band_y0 as u16,
-            w,
-            h: (band_y1 - band_y0) as u16,
-            ax,
-            ay: ay + (band_y0 - y0) as u16,
-            aw: w,
-            ah: (band_y1 - band_y0) as u16,
-            tint: 0x00FF_FFFF,
-            alpha: 255,
-            flip_x: false,
-        });
-    }
-    assert!(
-        slices.len() >= 3,
-        "the rect must span >= 3 bands (multi-row premise)"
-    );
-    let mut legacy_input = term.cell_frame(rows, cols);
-    legacy_input.cat_atlas = Some(atlas.clone());
-    legacy_input.cat_quads = slices;
-    let legacy_px = gpu.render_input(&mut win, &legacy_input, None).pixels;
-
-    let delta = max_channel_delta(&free_px, &legacy_px);
-    eprintln!("free multi-row rect vs legacy slices max per-channel delta = {delta} (target <= 1)");
-    assert!(
-        delta <= 2,
-        "a multi-row free rect must match its legacy per-row slices: max \
-         per-channel delta {delta} > 2 (target <= 1)"
-    );
-}
-
-/// Damaged/cached-path gating for a MULTI-ROW free rect (the Phase-1 exit
-/// test): frame A primes the caches with a rect spanning bands 1..=3; frame B
-/// moves it down one band (a real change — `gate_misses` must increment, and
-/// the cached repaint must equal a fresh full render byte-for-byte: the
-/// row-union marked every vacated + occupied band, so no ghost survives);
-/// frame C repeats B unchanged (equal sprites, same atlas version) and must
-/// take the dirty gate (`gate_hits` increments).
-#[test]
-fn damaged_path_free_sprite_no_ghosting_and_settled_gate_hit() {
-    let theme = Theme::default();
-    let Some((cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
-    let mut win_gpu = aterm_gpu::WindowGpu::new();
-    let (_, ch) = cpu.cell_size();
-    let (rows, cols) = (6usize, 12usize);
-    // Glyph-free terminal (all background), like the cat damaged-path test: a
-    // glyph AA overhang across a band boundary is a pre-existing damaged-vs-full
-    // divergence unrelated to the free layer.
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(3));
-
-    let mut make = |y: i32| {
-        let mut input = term.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![free_1to1(2, y, 40, (2 * ch + ch / 2) as u16, [2, 0])];
-        input
-    };
-    let in_a = make((ch + ch / 2) as i32); // bands 1..=3
-    let in_b = make((2 * ch + ch / 2) as i32); // bands 2..=4
-
-    let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
-
-    let misses_before = gpu.gate_misses();
-    let gpu_b_cached = gpu
-        .render_input_cached(&mut win_gpu, &in_b)
-        .pixels()
-        .to_vec();
-    assert!(
-        gpu.gate_misses() > misses_before,
-        "a moved multi-row free rect must MISS the GPU dirty gate (real re-render)"
-    );
-
-    // Fresh ground truth (a fresh GPU renderer, throwaway caches).
-    let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
-    let mut win2 = aterm_gpu::WindowGpu::new();
-    let gpu_b_fresh = gpu2.render_input(&mut win2, &in_b, None).pixels;
-    assert_eq!(
-        gpu_b_cached, gpu_b_fresh,
-        "GPU dirty-row path must repaint the moved multi-row free rect with no \
-         ghosting (row-union covers prev-union-cur bands)"
-    );
-
-    // Settled: byte-equal sprites + same atlas version => the GPU gate HITS.
-    let in_c = make((2 * ch + ch / 2) as i32);
-    let hits_before = gpu.gate_hits();
-    let _ = gpu.render_input_cached(&mut win_gpu, &in_c);
-    assert!(
-        gpu.gate_hits() > hits_before,
-        "a settled free sprite (equal sprites, same atlas version) must take the dirty gate"
-    );
-}
-
 /// The shipping CatBaker atlas is `4 * cell_h` pixels wide, so its RGBA row
 /// pitch is usually NOT wgpu's 256-byte copy alignment (for example, a 21 px
 /// cell produces an 84 px / 336 byte row). Keep that real geometry covered:
-/// the synthetic 64 px atlas above has an accidentally aligned 256-byte row
+/// a synthetic 64 px atlas has an accidentally aligned 256-byte row
 /// and cannot detect a backend that silently drops ordinary kitty atlases.
 #[test]
 fn free_sprite_upload_accepts_real_catbaker_row_pitch() {

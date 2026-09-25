@@ -232,7 +232,6 @@ impl Outcome {
                 refused_shims,
                 tree_root,
                 dependencies: Vec::new(),
-                protocol: None,
                 vendor: Some(VendorReport {
                     version: self.active_version().map(|v| v.to_string()),
                     vendor: self.spec.vendor.to_string(),
@@ -1410,8 +1409,6 @@ pub(crate) mod world {
         /// With no index published, its host ANSWERS with a refusal (a 403) rather than not
         /// at all — a rate-limited or revoked-token machine, never an offline one.
         pub index_refused: Cell<bool>,
-        /// The reset a refused listing named ([`Fetcher::metered_hold_until`]).
-        pub hold: Cell<Option<i64>>,
         /// How many times the index was asked for.
         pub index_reads: Cell<u32>,
         /// Every head read as a hint (`vendor_head`), by URL; each is also in `gets`.
@@ -1464,6 +1461,32 @@ pub(crate) mod world {
             let body = format!(
                 "schema = 2\nprogram = \"{program}\"\nversion = \"{version}\"\n\
                  build_number = {build}\nexposes = [\"{program}\"]\n"
+            );
+            let sig =
+                crate::sig::testkit::sign(&crate::sig::testkit::MACHINE_SEED, body.as_bytes());
+            self.pkgs
+                .borrow_mut()
+                .insert((program.to_string(), build), (body.into_bytes(), sig));
+        }
+
+        /// [`Fake::publish_legacy_pkg`] with an artifact for this triple, as a legacy index
+        /// build shipped one — what an index lane could fetch if it ever planned a vendor
+        /// program (its `download` panics, so a test sees the attempt).
+        pub(crate) fn publish_legacy_pkg_with_artifact(
+            &self,
+            program: &str,
+            build: u64,
+            version: &str,
+        ) {
+            let body = format!(
+                "schema = 2\nprogram = \"{program}\"\nversion = \"{version}\"\n\
+                 build_number = {build}\nexposes = [\"{program}\"]\n\
+                 [[artifact]]\ntarget = \"{}\"\nkind = \"binary\"\n\
+                 asset = \"{program}-{build}.tar.zst\"\nsha256 = \"{}\"\n\
+                 tree_root = \"{}\"\nsize = 100\n[artifact.cost]\ndisk_installed = 1\n",
+                triple(),
+                "0".repeat(64),
+                "1".repeat(64)
             );
             let sig =
                 crate::sig::testkit::sign(&crate::sig::testkit::MACHINE_SEED, body.as_bytes());
@@ -1682,9 +1705,6 @@ pub(crate) mod world {
         }
         fn index_link_down(&self) -> bool {
             !self.index_refused.get()
-        }
-        fn metered_hold_until(&self) -> Option<i64> {
-            self.hold.get()
         }
         fn pkg_manifest(
             &self,
@@ -1942,8 +1962,8 @@ mod tests {
     fn a_fresh_claude_is_verified_staged_recorded_and_shimmed_with_its_compiled_env() {
         let l = world::layout("fresh-claude");
         let f = Fake::default();
-        let payload = native_exe("claude 2.1.280");
-        f.publish_claude("2.1.280", &payload);
+        let payload = native_exe("claude 2.1.281");
+        f.publish_claude("2.1.281", &payload);
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(
@@ -1957,14 +1977,14 @@ mod tests {
         );
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.280 installed (Anthropic latest)"
+            "atpkg: claude 2.1.281 installed (Anthropic latest)"
         );
-        let dir = world::build_dir(&l, "claude", "2.1.280");
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.280").build_id()));
+        let dir = world::build_dir(&l, "claude", "2.1.281");
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         assert_eq!(std::fs::read(dir.join("bin/claude")).unwrap(), payload);
         // The record is the staged tree's, and complete beside the ready build.
         let record = complete_record(&dir).expect("a complete record");
-        assert_eq!(record.version, v("2.1.280"));
+        assert_eq!(record.version, v("2.1.281"));
         assert_eq!(record.tree_root, crate::tree::tree_root(&dir).unwrap());
         assert_eq!(record.sha256, world::sha(&payload));
         assert_eq!(
@@ -1983,11 +2003,11 @@ mod tests {
         assert!(shim.contains("DISABLE_AUTOUPDATER"), "{shim}");
         // The stamp remembers the head and raises the high-water.
         let stamp = ProgramStamp::read(&l, "claude").unwrap();
-        assert_eq!(stamp.last_head, Some(v("2.1.280")));
-        assert_eq!(stamp.high_water, Some(v("2.1.280")));
+        assert_eq!(stamp.last_head, Some(v("2.1.281")));
+        assert_eq!(stamp.high_water, Some(v("2.1.281")));
         assert_eq!(
             f.downloads.borrow().as_slice(),
-            [Fake::claude_payload_url("2.1.280")]
+            [Fake::claude_payload_url("2.1.281")]
         );
     }
 
@@ -1995,20 +2015,20 @@ mod tests {
     fn an_upgrade_moves_and_an_unchanged_head_costs_one_conditional_get() {
         let l = world::layout("upgrade");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("a"));
+        f.publish_claude("2.1.281", &native_exe("a"));
         run(&l, &f, &Policy::default(), claude());
-        f.publish_claude("2.1.281", &native_exe("b"));
+        f.publish_claude("2.1.282", &native_exe("b"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.280 → 2.1.281 (Anthropic latest)"
+            "atpkg: claude 2.1.281 → 2.1.282 (Anthropic latest)"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
         // The head has not moved: a 304, and nothing else is fetched.
         let gets_before = f.gets.borrow().len();
         let downloads_before = f.downloads.borrow().len();
         let o = run(&l, &f, &Policy::default(), claude());
-        assert_eq!(o.line(), "atpkg: claude 2.1.281 is Anthropic's latest");
+        assert_eq!(o.line(), "atpkg: claude 2.1.282 is Anthropic's latest");
         let gets = f.gets.borrow()[gets_before..].to_vec();
         assert_eq!(gets.len(), 1, "{gets:?}");
         assert_eq!(gets[0].0, format!("{CLAUDE}latest"));
@@ -2020,9 +2040,9 @@ mod tests {
     fn a_regressed_head_is_kept_at_and_an_unreachable_one_is_kept_quietly() {
         let l = world::layout("regress");
         let f = Fake::default();
-        f.publish_claude("2.1.285", &native_exe("new"));
+        f.publish_claude("2.1.286", &native_exe("new"));
         run(&l, &f, &Policy::default(), claude());
-        f.publish_claude("2.1.282", &native_exe("old"));
+        f.publish_claude("2.1.283", &native_exe("old"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(
@@ -2036,15 +2056,15 @@ mod tests {
         );
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.285 is newer than Anthropic's latest (2.1.282); keeping 2.1.285"
+            "atpkg: claude 2.1.286 is newer than Anthropic's latest (2.1.283); keeping 2.1.286"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.285").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.286").build_id()));
         f.offline.set(true);
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(!o.is_failure());
         assert_eq!(
             o.line(),
-            "atpkg: claude — Anthropic's release channel is unreachable; keeping 2.1.285"
+            "atpkg: claude — Anthropic's release channel is unreachable; keeping 2.1.286"
         );
     }
 
@@ -2059,18 +2079,18 @@ mod tests {
                 "bad-signature",
                 claude(),
                 Box::new(|f: &Fake| {
-                    f.publish_claude("2.1.281", &native_exe("x"));
+                    f.publish_claude("2.1.282", &native_exe("x"));
                     let other =
                         crate::openpgp::testkit::sign_detached(b"another document", 1_790_000_000);
-                    f.doc(&format!("{CLAUDE}2.1.281/manifest.json.sig"), &other);
+                    f.doc(&format!("{CLAUDE}2.1.282/manifest.json.sig"), &other);
                 }),
             ),
             (
                 "manifest-off-host",
                 claude(),
                 Box::new(|f: &Fake| {
-                    f.publish_claude("2.1.281", &native_exe("x"));
-                    let url = format!("{CLAUDE}2.1.281/manifest.json");
+                    f.publish_claude("2.1.282", &native_exe("x"));
+                    let url = format!("{CLAUDE}2.1.282/manifest.json");
                     f.redirect(&url, "https://evil.example/manifest.json");
                 }),
             ),
@@ -2109,7 +2129,7 @@ mod tests {
                 "non-canonical-head",
                 claude(),
                 Box::new(|f: &Fake| {
-                    f.publish_claude("2.1.281", &native_exe("x"));
+                    f.publish_claude("2.1.282", &native_exe("x"));
                     f.doc(&format!("{CLAUDE}latest"), b"2.1.0281\n");
                 }),
             ),
@@ -2166,24 +2186,24 @@ mod tests {
     fn a_digest_mismatch_is_refused_memoized_and_never_downloaded_again() {
         let l = world::layout("digest");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("installed"));
+        f.publish_claude("2.1.281", &native_exe("installed"));
         run(&l, &f, &Policy::default(), claude());
-        f.publish_claude("2.1.281", &native_exe("signed bytes!"));
+        f.publish_claude("2.1.282", &native_exe("signed bytes!"));
         f.payload(
-            &Fake::claude_payload_url("2.1.281"),
+            &Fake::claude_payload_url("2.1.282"),
             &native_exe("swapped bytes"),
         );
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
         assert!(
-            o.line().starts_with("atpkg: claude 2.1.281 refused: "),
+            o.line().starts_with("atpkg: claude 2.1.282 refused: "),
             "{}",
             o.line()
         );
-        assert!(o.line().ends_with("— keeping 2.1.280"), "{}", o.line());
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.280").build_id()));
+        assert!(o.line().ends_with("— keeping 2.1.281"), "{}", o.line());
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         assert!(!crate::store::build_is_complete(&world::build_dir(
-            &l, "claude", "2.1.281"
+            &l, "claude", "2.1.282"
         )));
         let downloads = f.downloads.borrow().len();
         let o = run(&l, &f, &Policy::default(), claude());
@@ -2211,11 +2231,11 @@ mod tests {
     fn a_digest_mismatch_heals_when_the_bytes_do() {
         let l = world::layout("digest-heal");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("installed"));
+        f.publish_claude("2.1.281", &native_exe("installed"));
         run(&l, &f, &Policy::default(), claude());
         let signed = native_exe("signed bytes!");
-        f.publish_claude("2.1.281", &signed);
-        let url = Fake::claude_payload_url("2.1.281");
+        f.publish_claude("2.1.282", &signed);
+        let url = Fake::claude_payload_url("2.1.282");
         f.payload(&url, &native_exe("torn bytes!!!"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
@@ -2223,10 +2243,10 @@ mod tests {
         let o = run(&l, &f, &Policy::default(), claude());
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.280 → 2.1.281 (Anthropic latest)",
+            "atpkg: claude 2.1.281 → 2.1.282 (Anthropic latest)",
             "{o:?}"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
     }
 
     /// A host that answers without the document — a 404 while the vendor is still
@@ -2283,7 +2303,7 @@ mod tests {
     fn an_unreadable_digest_log_fetches_nothing() {
         let l = world::layout("digest-log");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("a"));
+        f.publish_claude("2.1.281", &native_exe("a"));
         let log = super::super::digests::digests_path(&l);
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "not toml {{{").unwrap();
@@ -2335,7 +2355,7 @@ mod tests {
     fn a_signer_refusal_is_memoized_like_a_digest_refusal() {
         let l = world::layout("signer");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("x"));
+        f.publish_claude("2.1.281", &native_exe("x"));
         let trust = world::trust_refusing_signers();
         let o = run_with(&l, &f, &Policy::default(), &trust, claude(), false);
         if cfg!(target_os = "macos") {
@@ -2357,14 +2377,14 @@ mod tests {
     fn a_yanked_head_is_skipped_and_a_hold_keeps_the_build() {
         let l = world::layout("yank-head");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("a"));
+        f.publish_claude("2.1.281", &native_exe("a"));
         run(&l, &f, &Policy::default(), claude());
-        f.publish_claude("2.1.281", &native_exe("b"));
-        let yanked = Policy::from_entries(["claude@2.1.281"]);
+        f.publish_claude("2.1.282", &native_exe("b"));
+        let yanked = Policy::from_entries(["claude@2.1.282"]);
         let o = run(&l, &f, &yanked, claude());
         assert_eq!(
             o.line(),
-            "atpkg: claude — Anthropic's latest (2.1.281) is yanked; keeping 2.1.280"
+            "atpkg: claude — Anthropic's latest (2.1.282) is yanked; keeping 2.1.281"
         );
         assert!(
             f.downloads.borrow().len() == 1,
@@ -2373,9 +2393,9 @@ mod tests {
         let o = run_with(&l, &f, &Policy::default(), &world::trust(), claude(), true);
         assert_eq!(
             o.line(),
-            "atpkg: claude held by local pin (2.1.280); `aterm pkg unpin claude` to allow updates"
+            "atpkg: claude held by local pin (2.1.281); `aterm pkg unpin claude` to allow updates"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.280").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
     }
 
     /// A yanked installed version is the one sanctioned move — to an admissible head,
@@ -2384,35 +2404,35 @@ mod tests {
     fn a_yanked_installed_version_moves_to_the_head_or_rolls_back() {
         let l = world::layout("yank-installed");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("a"));
+        f.publish_claude("2.1.281", &native_exe("a"));
         run(&l, &f, &Policy::default(), claude());
-        f.publish_claude("2.1.281", &native_exe("b"));
+        f.publish_claude("2.1.282", &native_exe("b"));
         run(&l, &f, &Policy::default(), claude());
-        // 2.1.281 yanked, the head still names it: roll back to 2.1.280.
-        let yanked = Policy::from_entries(["claude@2.1.281"]);
+        // 2.1.282 yanked, the head still names it: roll back to 2.1.281.
+        let yanked = Policy::from_entries(["claude@2.1.282"]);
         let o = run(&l, &f, &yanked, claude());
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.281 is yanked — rolled back to 2.1.280"
+            "atpkg: claude 2.1.282 is yanked — rolled back to 2.1.281"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.280").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         assert_eq!(
             ProgramStamp::read(&l, "claude").unwrap().high_water,
-            Some(v("2.1.280"))
+            Some(v("2.1.281"))
         );
         // A fixed head then installs above the yanked one.
-        f.publish_claude("2.1.282", &native_exe("c"));
+        f.publish_claude("2.1.283", &native_exe("c"));
         let o = run(&l, &f, &yanked, claude());
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.280 → 2.1.282 (Anthropic latest)"
+            "atpkg: claude 2.1.281 → 2.1.283 (Anthropic latest)"
         );
         // A yank of the active version with an admissible head moves straight to it.
-        f.publish_claude("2.1.283", &native_exe("d"));
-        let o = run(&l, &f, &Policy::from_entries(["claude@2.1.282"]), claude());
+        f.publish_claude("2.1.284", &native_exe("d"));
+        let o = run(&l, &f, &Policy::from_entries(["claude@2.1.283"]), claude());
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.282 → 2.1.283 (2.1.282 is yanked; Anthropic latest)"
+            "atpkg: claude 2.1.283 → 2.1.284 (2.1.283 is yanked; Anthropic latest)"
         );
     }
 
@@ -2420,23 +2440,23 @@ mod tests {
     fn a_yanked_version_with_nothing_admissible_is_tombstoned() {
         let l = world::layout("tombstone");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("a"));
+        f.publish_claude("2.1.281", &native_exe("a"));
         run(&l, &f, &Policy::default(), claude());
-        let yanked = Policy::from_entries(["claude@2.1.280"]);
+        let yanked = Policy::from_entries(["claude@2.1.281"]);
         f.offline.set(true);
         let o = run(&l, &f, &yanked, claude());
         assert!(
             matches!(o.verdict, Verdict::Unreachable { .. }),
             "an unread head proves nothing inadmissible: {o:?}"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.280").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         f.offline.set(false);
         let o = run(&l, &f, &yanked, claude());
         assert!(matches!(o.verdict, Verdict::Tombstoned { .. }), "{o:?}");
         assert!(o.is_failure());
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.280 is yanked and no admissible build exists — its commands \
+            "atpkg: claude 2.1.281 is yanked and no admissible build exists — its commands \
              are disabled until one does"
         );
     }
@@ -2515,20 +2535,20 @@ mod tests {
     fn a_stale_part_of_another_version_is_not_resumed() {
         let l = world::layout("part");
         let f = Fake::default();
-        let payload = native_exe("claude 2.1.281");
-        f.publish_claude("2.1.281", &payload);
+        let payload = native_exe("claude 2.1.282");
+        f.publish_claude("2.1.282", &payload);
         let staging = l.staging_dir("claude");
         std::fs::create_dir_all(&staging).unwrap();
-        let stale = staging.join(format!("claude-2.1.280-{}.part", world::triple()));
+        let stale = staging.join(format!("claude-2.1.281-{}.part", world::triple()));
         std::fs::write(&stale, b"half of another version").unwrap();
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         assert_eq!(
             o.asset.as_deref(),
-            Some(format!("claude-2.1.281-{}", world::triple()).as_str())
+            Some(format!("claude-2.1.282-{}", world::triple()).as_str())
         );
         assert!(!stale.exists(), "the other version's partial was reclaimed");
-        let dir = world::build_dir(&l, "claude", "2.1.281");
+        let dir = world::build_dir(&l, "claude", "2.1.282");
         assert_eq!(std::fs::read(dir.join("bin/claude")).unwrap(), payload);
     }
 
@@ -2542,7 +2562,7 @@ mod tests {
         let l = world::layout("legacy");
         legacy_claude(&l, 2_026_091_901);
         let f = Fake::default();
-        f.publish_claude("2.1.279", &native_exe("below the floor"));
+        f.publish_claude("2.1.280", &native_exe("below the floor"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(
@@ -2555,7 +2575,7 @@ mod tests {
             "{o:?}"
         );
         assert_eq!(shim_build(&l, "claude"), Some(2_026_091_901));
-        f.publish_claude("2.1.280", &native_exe("vendor"));
+        f.publish_claude("2.1.281", &native_exe("vendor"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(
@@ -2569,12 +2589,12 @@ mod tests {
         );
         assert_eq!(
             o.line(),
-            "atpkg: claude build 2026091901 → 2.1.280 (Anthropic latest)"
+            "atpkg: claude build 2026091901 → 2.1.281 (Anthropic latest)"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.280").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         for line in [
             o.line(),
-            crate::vendor_direct::display_build("claude", v("2.1.280").build_id()),
+            crate::vendor_direct::display_build("claude", v("2.1.281").build_id()),
         ] {
             assert_no_build_id(&line);
         }
@@ -2589,7 +2609,7 @@ mod tests {
         legacy_claude(&l, 2_026_092_201);
         let f = Fake::default();
         *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
-        f.publish_legacy_pkg("claude", 2_026_092_201, "2.1.280");
+        f.publish_legacy_pkg("claude", 2_026_092_201, "2.1.281");
         let index = crate::resolve_verified_index(
             &f,
             &l,
@@ -2601,7 +2621,7 @@ mod tests {
             NOW,
         )
         .expect("the index verifies");
-        f.publish_claude("2.1.280", &native_exe("vendor"));
+        f.publish_claude("2.1.281", &native_exe("vendor"));
         let o = run_indexed(
             &l,
             &f,
@@ -2612,12 +2632,12 @@ mod tests {
             Some(&index),
         );
         assert!(matches!(o.verdict, Verdict::Current(_)), "{o:?}");
-        assert_eq!(o.line(), "atpkg: claude 2.1.280 is Anthropic's latest");
+        assert_eq!(o.line(), "atpkg: claude 2.1.281 is Anthropic's latest");
         assert_eq!(
             ProgramStamp::read(&l, "claude")
                 .unwrap()
                 .legacy_version_of(2_026_092_201),
-            Some(v("2.1.280"))
+            Some(v("2.1.281"))
         );
         // No index from here on: the stamp answers.
         *f.index.borrow_mut() = None;
@@ -2625,7 +2645,7 @@ mod tests {
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Current(_)), "{o:?}");
         assert!(f.downloads.borrow().is_empty(), "nothing fetched");
-        f.publish_claude("2.1.281", &native_exe("next"));
+        f.publish_claude("2.1.282", &native_exe("next"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(
@@ -2639,7 +2659,7 @@ mod tests {
         );
         assert_eq!(
             o.line(),
-            "atpkg: claude 2.1.280 → 2.1.281 (Anthropic latest)"
+            "atpkg: claude 2.1.281 → 2.1.282 (Anthropic latest)"
         );
     }
 
@@ -2655,16 +2675,16 @@ mod tests {
         legacy_claude(&l, legacy);
         let root = crate::tree::tree_root(&l.build_dir("claude", legacy)).unwrap();
         let f = Fake::default();
-        f.publish_claude("2.1.281", &native_exe("vendor"));
+        f.publish_claude("2.1.282", &native_exe("vendor"));
         // The older client's first vendor install: the version kept, the root not.
-        ProgramStamp::record_legacy_version(&l, "claude", legacy, v("2.1.280")).unwrap();
+        ProgramStamp::record_legacy_version(&l, "claude", legacy, v("2.1.281")).unwrap();
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
-        let vendor = Some(v("2.1.281").build_id());
+        let vendor = Some(v("2.1.282").build_id());
         assert_eq!(legacy_root_owed(&l, "claude", vendor), Some(legacy));
         assert_eq!(f.pkg_reads.get(), 0, "no index, no read");
         *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
-        f.publish_legacy_pkg_rooted("claude", legacy, "2.1.280", world::triple(), &root);
+        f.publish_legacy_pkg_rooted("claude", legacy, "2.1.281", world::triple(), &root);
         let index = crate::resolve_verified_index(
             &f,
             &l,
@@ -2726,7 +2746,7 @@ mod tests {
         let l = world::layout("legacy-above");
         legacy_claude(&l, above);
         let f = Fake::default();
-        f.publish_claude("2.1.281", &native_exe("vendor"));
+        f.publish_claude("2.1.282", &native_exe("vendor"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(
@@ -2740,24 +2760,24 @@ mod tests {
         );
         assert_eq!(
             o.line(),
-            "atpkg: claude build 2026092202 is a legacy index build newer than this aterm, \
-             and its version could not be read; keeping build 2026092202 until it can be — \
-             `aterm pkg update claude` moves it to Anthropic's latest (2.1.281)"
+            "atpkg: claude build 2026092402 is a legacy index build newer than this aterm, \
+             and its version could not be read; keeping build 2026092402 until it can be — \
+             `aterm pkg update claude` moves it to Anthropic's latest (2.1.282)"
         );
         assert_eq!(
             o.kept_clause().as_deref(),
             Some(
                 "its version could not be read; `aterm pkg update claude` moves it to \
-                 Anthropic's latest (2.1.281)"
+                 Anthropic's latest (2.1.282)"
             )
         );
         assert!(!o.is_failure());
         assert_eq!(shim_build(&l, "claude"), Some(above));
         assert!(f.downloads.borrow().is_empty(), "nothing fetched");
-        // Its version read under a verified index, it is judged by it: 2.1.282 is newer
+        // Its version read under a verified index, it is judged by it: 2.1.283 is newer
         // than the head, so it stays.
         *f.index.borrow_mut() = Some(world::signed_index(45, "2099-01-01T00:00:00Z", &[]));
-        f.publish_legacy_pkg("claude", above, "2.1.282");
+        f.publish_legacy_pkg("claude", above, "2.1.283");
         let index = crate::resolve_verified_index(
             &f,
             &l,
@@ -2803,7 +2823,7 @@ mod tests {
             ),
             "{o:?}"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
     }
 
     /// The head is a hint read in one short attempt (the fetcher's `vendor_head`); the
@@ -2813,7 +2833,7 @@ mod tests {
     fn the_head_is_read_short_and_the_documents_patiently() {
         let l = world::layout("head-bounds");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("a"));
+        f.publish_claude("2.1.281", &native_exe("a"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         let head = format!("{CLAUDE}latest");
@@ -2823,12 +2843,12 @@ mod tests {
         );
         let patient: Vec<String> = f.gets.borrow().iter().map(|(u, _)| u.clone()).collect();
         assert!(
-            patient.iter().any(|u| u.ends_with("2.1.280/manifest.json")),
+            patient.iter().any(|u| u.ends_with("2.1.281/manifest.json")),
             "{patient:?}"
         );
         // A download that failed leaves a head the next pass sees as a 304: the head is
         // asked short, then its document again patiently.
-        f.publish_claude("2.1.281", &native_exe("b"));
+        f.publish_claude("2.1.282", &native_exe("b"));
         f.downloads_fail.set(true);
         run(&l, &f, &Policy::default(), claude());
         f.downloads_fail.set(false);
@@ -2856,9 +2876,9 @@ mod tests {
     #[test]
     fn a_fresh_install_is_bounded_by_the_floor_not_the_high_water() {
         let l = world::layout("fresh-hw");
-        ProgramStamp::record_outcome(&l, "claude", "uninstalled", Some(v("2.1.290"))).unwrap();
+        ProgramStamp::record_outcome(&l, "claude", "uninstalled", Some(v("2.1.291"))).unwrap();
         let f = Fake::default();
-        f.publish_claude("2.1.289", &native_exe("pulled back"));
+        f.publish_claude("2.1.290", &native_exe("pulled back"));
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(
@@ -2870,7 +2890,7 @@ mod tests {
             ),
             "{o:?}"
         );
-        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.289").build_id()));
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.290").build_id()));
     }
 
     /// A 304 whose last head the machine never landed (a download failed last pass) asks
@@ -2879,7 +2899,7 @@ mod tests {
     fn an_unchanged_head_that_never_landed_is_fetched_again() {
         let l = world::layout("retry");
         let f = Fake::default();
-        f.publish_claude("2.1.280", &native_exe("a"));
+        f.publish_claude("2.1.281", &native_exe("a"));
         f.downloads_fail.set(true);
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
@@ -2909,16 +2929,16 @@ mod tests {
     fn a_same_version_digest_change_is_refused() {
         let l = world::layout("recut");
         let f = Fake::default();
-        f.publish_claude("2.1.281", &native_exe("first cut"));
+        f.publish_claude("2.1.282", &native_exe("first cut"));
         f.downloads_fail.set(true);
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
         f.downloads_fail.set(false);
-        f.publish_claude("2.1.281", &native_exe("second cut"));
+        f.publish_claude("2.1.282", &native_exe("second cut"));
         let downloads = f.downloads.borrow().len();
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
-        assert!(o.line().contains("first seen for 2.1.281"), "{}", o.line());
+        assert!(o.line().contains("first seen for 2.1.282"), "{}", o.line());
         assert_eq!(f.downloads.borrow().len(), downloads, "nothing downloaded");
         assert_eq!(shim_build(&l, "claude"), None);
     }
@@ -2927,9 +2947,9 @@ mod tests {
     fn a_build_date_regression_is_kept_at() {
         let l = world::layout("date");
         let f = Fake::default();
-        f.publish_claude_dated("2.1.280", &native_exe("a"), "2026-09-21T20:55:27Z");
+        f.publish_claude_dated("2.1.281", &native_exe("a"), "2026-09-21T20:55:27Z");
         run(&l, &f, &Policy::default(), claude());
-        f.publish_claude_dated("2.1.281", &native_exe("b"), "2026-09-01T00:00:00Z");
+        f.publish_claude_dated("2.1.282", &native_exe("b"), "2026-09-01T00:00:00Z");
         let o = run(&l, &f, &Policy::default(), claude());
         assert!(
             matches!(

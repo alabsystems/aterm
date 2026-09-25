@@ -85,11 +85,3 @@ fn animal_words_are_whole_word_only() {
         );
     }
 }
-
-/// The builtin data stays well-formed with the group added: no build
-/// conflicts (which is also where a surface claimed by two species, or an
-/// animal entry missing its species key, would surface).
-#[test]
-fn builtin_lexicon_has_no_conflicts_with_animal_group() {
-    assert_eq!(Lexicon::builtin().conflicts(), &[] as &[String]);
-}

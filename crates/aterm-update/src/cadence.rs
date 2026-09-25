@@ -20,8 +20,8 @@
 //!   ledger filed as `network`) is retried sooner first, on [`OFFLINE_RETRY`], because
 //!   that is what a Mac that has just booted or joined a network looks like for its
 //!   first few seconds.
-//! * **No jitter.** Every aterm on every machine woke on the same 75 s grid relative
-//!   to its own launch; a fleet restarted together stays in lockstep and hits the API
+//! * **No jitter.** Every aterm on every machine woke on the same grid relative to
+//!   its own launch; a fleet restarted together stays in lockstep and hits the host
 //!   in a thundering herd. [`Cadence::delay`] spreads each wait by ±[`JITTER_PCT`]%.
 //!
 //! And the log itself: dozens of byte-identical `update check failed: …` lines say
@@ -56,8 +56,8 @@ pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 /// was the one lane with no backoff at all, and the same silent no-op applied to any
 /// operator interval at or above the cap.
 /// A ceiling expressed in INTERVALS is inert for no base: four of them is a real
-/// retreat (10 min → 20 → 40 on today's web lane) while bounding the worst
-/// case at 4× a cadence the lane or the operator has already accepted — and a wake,
+/// retreat (10 min → 20 → 40 at today's interval) while bounding the worst
+/// case at 4× the cadence — and a wake,
 /// or one healthy check, still snaps all the way back to the base, so recovery is
 /// never rate-limited by the cap.
 pub(crate) const MAX_BACKOFF_INTERVALS: u32 = 4;
@@ -78,30 +78,26 @@ pub(crate) const WAKE_SETTLE: Duration = Duration::from_secs(20);
 /// How long an unchanged failure message stays suppressed before being repeated.
 pub(crate) const STILL_FAILING_AFTER: Duration = Duration::from_secs(30 * 60);
 
-/// The base interval for a check on the TOKEN lane: a token buys 5000 GitHub API
-/// requests/hour, and ~5 requests per steady-state check on the armed tier (ONE per
-/// listing PAGE — a single page for any channel under 100 releases — plus manifest +
-/// roster + roster.sig + appcast.sig through the asset API; 6 with a container
-/// download) is ~240/hour — comfortably inside it, so the cadence can be the fast one
-/// the owner asked for. The WEB lane spends zero: see [`WEB_INTERVAL_SECS`].
-pub(crate) const TOKEN_INTERVAL_SECS: u64 = 75;
-
-/// The base interval for a check on the WEB lane — the public channel, and any source
-/// with no token.
+/// The base interval of the background check — one cadence, no knob.
 ///
-/// A web-lane check spends ZERO metered requests: its steady state is one HEAD of
+/// A check spends ZERO metered requests: its steady state is one HEAD of
 /// `github.com/…/releases/latest/download/aterm-appcast.toml` (a 302 with no
 /// `x-ratelimit-*` header at all — measured 2026-09-03), and a moved pointer adds only
 /// tag-specific GETs on the same unmetered host. There is no per-IP budget to share,
 /// so the interval is a courtesy to the web host and a bound on how long a new release
-/// waits to be found, not an arithmetic constraint. Ten minutes (2026-09-23; it was
-/// thirty) because a verified update now installs by itself within a minute of being
-/// staged, so the check is what decides how soon a release lands — and the owner wants
-/// it to land promptly. It stays one HEAD per machine per interval however many aterm
-/// processes run: `checker.lock` and the 70 % freshness window in the check loop
-/// dedupe every sibling. A resolved token on a repointed source restores the 75 s
-/// cadence automatically.
-pub(crate) const WEB_INTERVAL_SECS: u64 = 10 * 60;
+/// waits to be found: a release published now is STAGED by a running aterm within one
+/// interval (plus jitter, plus the download), and the in-session apply lane lands it
+/// within `aterm-gui`'s `LANDS_WITHIN` (and its switch, under a minute together) of
+/// that — so publish-to-applied on a healthy running window is bounded by
+/// `INTERVAL_SECS × 1.2 + download + LANDS_WITHIN`, about 13 minutes plus the
+/// download, not "a minute".
+///
+/// Ten minutes (2026-09-23; it was thirty) because a verified update installs by
+/// itself soon after it is staged, so the check is what decides how soon a release
+/// lands — and the owner wants it to land promptly. It stays one HEAD per machine per
+/// interval however many aterm processes run: `checker.lock` and the 70 % freshness
+/// window in the check loop dedupe every sibling.
+pub(crate) const INTERVAL_SECS: u64 = 10 * 60;
 
 /// The waits after a check that could not reach the network at all
 /// ([`is_network_unreachable`]): the first retry comes after 20 s, then 60 s, 2 min
@@ -109,9 +105,10 @@ pub(crate) const WEB_INTERVAL_SECS: u64 = 10 * 60;
 /// A Mac that has just booted, woken or joined a network cannot resolve a name for a
 /// few seconds — the first check after a cold boot on 2026-09-23 failed on DNS three
 /// seconds in — and a whole interval after that is a whole interval in which a new
-/// release goes unnoticed. Four quick tries cost four tiny requests; an outage longer
-/// than they cover falls back to the backoff it always had. Never longer than the
-/// ordinary ladder's own wait at that point ([`Cadence::nominal_at`]).
+/// release goes unnoticed. Four quick tries cost four tiny requests on the unmetered
+/// download host; an outage longer than they cover falls back to the backoff it always
+/// had. Never longer than the ordinary ladder's own wait at that point
+/// ([`Cadence::nominal_at`]).
 pub(crate) const OFFLINE_RETRY: [Duration; 4] = [
     Duration::from_secs(20),
     Duration::from_secs(60),
@@ -148,17 +145,17 @@ pub(crate) fn is_network_unreachable(message: &str) -> bool {
     code_after("curl: (") || code_after("exit status: ") || code_after("(exit ")
 }
 
-/// The floor on a HELD wait that is still in force. A hold a few seconds out (the
-/// server's reset was nearly here when the check ran) must not become a near-zero
-/// wait: the loop would re-check at once, read its own fresh ledger stamp as a
-/// sibling's, skip, and spin through `wait` with nothing to wait for. A hold whose
-/// epoch has already PASSED is not floored — it is simply over, and the ordinary
-/// ladder (base × the failure count, which a hold never raised) applies.
+/// The floor on a HELD wait that is still in force. A hold a few seconds out (a
+/// sibling's window was nearly over when this process skipped) must not become a
+/// near-zero wait: the loop would re-check at once, read the same fresh ledger stamp,
+/// skip, and spin through `wait` with nothing to wait for. A hold whose epoch has
+/// already PASSED is not floored — it is simply over, and the ordinary ladder (base ×
+/// the failure count, which a hold never raised) applies.
 pub(crate) const HOLD_FLOOR: Duration = Duration::from_secs(60);
 
 /// The interval schedule: a base cadence plus the current consecutive-failure count,
-/// and — after a rate limit whose reset the server named — the exact instant to hold
-/// until.
+/// and — after a skip behind a sibling's fresh check — the instant that sibling's
+/// window ends.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cadence {
     base: Duration,
@@ -170,8 +167,7 @@ pub(crate) struct Cadence {
     offline: u32,
     /// When set and still in the future, the next wait ends HERE (bounded by
     /// [`Self::cap`], floored by [`HOLD_FLOOR`], un-jittered — the epoch already
-    /// carries the loop's 0–60 s scatter) instead of on the doubling ladder. The
-    /// server told us when the window renews; waiting for anything else is a guess.
+    /// carries the loop's 0–60 s scatter) instead of on the doubling ladder.
     hold: Option<Instant>,
 }
 
@@ -186,18 +182,10 @@ impl Cadence {
         }
     }
 
-    /// Hold the next check until `until` — a rate limit whose reset the server named.
-    /// Does NOT count as a failure: the doubling ladder is for outages of unknown
-    /// length, and this one's length is known.
+    /// Hold the next check until `until` — the end of a sibling's fresh window. Does
+    /// NOT count as a failure: the doubling ladder is for outages of unknown length.
     pub(crate) fn hold_until(&mut self, until: Instant) {
         self.hold = Some(until);
-    }
-
-    /// Re-point the base interval (the credential lane is only known after the first
-    /// completed check, so the loop adopts the lane's cadence as soon as it learns
-    /// it). Leaves the failure count — and therefore any backoff in progress — alone.
-    pub(crate) fn set_base(&mut self, base: Duration) {
-        self.base = base;
     }
 
     /// The current base interval — the cross-process checker gate sizes its
@@ -241,12 +229,18 @@ impl Cadence {
     }
 
     /// A wake resets the backoff: the network the failures were about is gone, and
-    /// the machine is in a genuinely new state — and so, likely, is its IP, whose
-    /// budget the hold was about.
+    /// the machine is in a genuinely new state.
     pub(crate) fn woke(&mut self) {
         self.failures = 0;
         self.offline = 0;
         self.hold = None;
+    }
+
+    /// The consecutive-failure count — what the doubling ladder is keyed on. Exposed
+    /// for tests, so "the quick rungs are not the ladder's" is assertable on the count.
+    #[cfg(test)]
+    pub(crate) fn failures(&self) -> u32 {
+        self.failures
     }
 
     /// The remaining hold, if one is set and still in the future at `now`; an expired
@@ -260,23 +254,10 @@ impl Cadence {
     /// The ceiling on [`Self::nominal`] for THIS base: at least [`MAX_BACKOFF`], at
     /// least the base itself (a configured interval is a floor on the wait, never
     /// something a cap may shorten), and at most [`MAX_BACKOFF_INTERVALS`] × base —
-    /// the term that keeps the ceiling strictly above the base for every lane, so a
-    /// slow lane still backs off instead of clamping to where it started.
+    /// the term that keeps the ceiling strictly above the base, so a slow base still
+    /// backs off instead of clamping to where it started.
     fn cap(&self) -> Duration {
         MAX_BACKOFF.max(self.base.saturating_mul(MAX_BACKOFF_INTERVALS))
-    }
-
-    /// The consecutive-failure count — what the doubling ladder is keyed on. Exposed
-    /// for tests, so "a hold is not a failure" is assertable on the count itself.
-    #[cfg(test)]
-    pub(crate) fn failures(&self) -> u32 {
-        self.failures
-    }
-
-    /// Whether a hold is set (expired or not). Exposed for tests.
-    #[cfg(test)]
-    pub(crate) fn is_holding(&self) -> bool {
-        self.hold.is_some()
     }
 
     /// The nominal (pre-jitter) wait: `base` doubled once per consecutive failure,
@@ -306,9 +287,9 @@ impl Cadence {
 
     /// The actual wait: [`Self::nominal`] spread by ±[`JITTER_PCT`]%. `entropy` is a
     /// uniformly random byte; the caller supplies it so this stays pure and testable.
-    /// A HELD wait is not spread: the epoch is the server's, already scattered by the
-    /// loop's own 0–60 s, and −20 % of it would wake this machine before the window
-    /// renews — the one thing a hold exists to avoid.
+    /// A HELD wait is not spread: the epoch is already scattered by the loop's own
+    /// 0–60 s, and −20 % of it would wake this machine inside the sibling's window —
+    /// the one thing a hold exists to avoid.
     pub(crate) fn delay(&self, entropy: u8) -> Duration {
         self.delay_at(Instant::now(), entropy)
     }
@@ -334,7 +315,7 @@ fn jitter(d: Duration, entropy: u8) -> Duration {
 
 /// One random byte from the audited entropy surface, or a fixed midpoint if it is
 /// unavailable. A missing byte must degrade to "no jitter", never to a panic or a
-/// hand-rolled `/dev/urandom` read. Shared with the hold epoch's scatter.
+/// hand-rolled `/dev/urandom` read. Shared with the skip timer's scatter.
 pub(crate) fn entropy_byte() -> u8 {
     let mut b = [128u8; 1];
     let _ = aterm_uds::rand::fill(&mut b);
@@ -526,8 +507,8 @@ mod tests {
     /// the base interval and doubling as before.
     #[test]
     fn an_unreachable_network_is_retried_on_the_short_ladder_then_the_base() {
-        let web = Duration::from_secs(WEB_INTERVAL_SECS);
-        let mut c = Cadence::new(web);
+        let base = Duration::from_secs(INTERVAL_SECS);
+        let mut c = Cadence::new(base);
         let mut waits = Vec::new();
         for _ in 0..OFFLINE_RETRY.len() {
             c.failed_offline();
@@ -546,12 +527,16 @@ mod tests {
         );
         c.failed_offline();
         assert!(!c.retrying_offline());
-        assert_eq!(c.nominal(), web, "then the base interval");
+        assert_eq!(c.nominal(), base, "then the base interval");
         c.failed_offline();
-        assert_eq!(c.nominal(), web * 2, "and the ordinary doubling from there");
+        assert_eq!(
+            c.nominal(),
+            base * 2,
+            "and the ordinary doubling from there"
+        );
         c.succeeded();
         assert!(!c.retrying_offline());
-        assert_eq!(c.nominal(), web, "a success ends it");
+        assert_eq!(c.nominal(), base, "a success ends it");
         c.failed_offline();
         assert_eq!(
             c.nominal(),
@@ -560,15 +545,14 @@ mod tests {
         );
         c.woke();
         assert!(!c.retrying_offline());
-        assert_eq!(c.nominal(), web, "a wake ends it too");
+        assert_eq!(c.nominal(), base, "a wake ends it too");
     }
 
-    /// The quick rungs never wait LONGER than the ordinary ladder would: on the 75 s
-    /// token lane the 2- and 5-minute rungs are the base interval.
+    /// The quick rungs never wait LONGER than the ordinary ladder would: on a base
+    /// shorter than the 2- and 5-minute rungs, those rungs are the base interval.
     #[test]
     fn the_short_ladder_never_outwaits_the_ordinary_one() {
-        let token = Duration::from_secs(TOKEN_INTERVAL_SECS);
-        let mut c = Cadence::new(token);
+        let mut c = Cadence::new(BASE);
         let mut waits = Vec::new();
         for _ in 0..OFFLINE_RETRY.len() {
             c.failed_offline();
@@ -576,21 +560,21 @@ mod tests {
         }
         assert_eq!(waits, [20, 60, 75, 75].map(Duration::from_secs));
         c.failed_offline();
-        assert_eq!(c.nominal(), token);
+        assert_eq!(c.nominal(), BASE);
     }
 
     /// A failure the network carried (an HTTP status, a signature) is not a network
     /// that is down: it ends the quick rungs and waits on the ordinary ladder.
     #[test]
     fn an_ordinary_failure_ends_the_short_ladder() {
-        let web = Duration::from_secs(WEB_INTERVAL_SECS);
-        let mut c = Cadence::new(web);
+        let base = Duration::from_secs(INTERVAL_SECS);
+        let mut c = Cadence::new(base);
         c.failed_offline();
         c.failed_offline();
         assert_eq!(c.nominal(), OFFLINE_RETRY[1]);
         c.failed();
         assert!(!c.retrying_offline());
-        assert_eq!(c.nominal(), web, "the ordinary ladder's first rung");
+        assert_eq!(c.nominal(), base, "the ordinary ladder's first rung");
     }
 
     /// Exits 6, 7 and 28 — could not resolve, could not connect, timed out — in both
@@ -602,8 +586,8 @@ mod tests {
             "curl HEAD https://github.com/alabsystems/aterm/releases/latest/download/\
              aterm-appcast.toml failed (exit status: 6): curl: (6) Could not resolve host: \
              github.com",
-            "curl GET https://api.github.com/x failed (exit status: 7): curl: (7) Failed to \
-             connect to api.github.com port 443",
+            "curl GET https://github.com/x failed (exit status: 7): curl: (7) Failed to \
+             connect to github.com port 443",
             "curl: (28) Operation timed out after 30001 milliseconds",
             "curl GET x failed (exit 6): dns",
             "fetch appcast: curl download failed (exit status: 28): ",
@@ -643,45 +627,6 @@ mod tests {
         );
     }
 
-    /// The token lane's 75 s cadence fits its own 5000/hour budget, and `set_base` is
-    /// what lets a process adopt the lane's interval after its first completed check
-    /// without disturbing a backoff in progress. (The web lane's cost — ZERO API
-    /// requests per check — is not arithmetic on a constant; it is MEASURED by the
-    /// counting-transport tests in `github.rs`,
-    /// `a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets` and
-    /// `every_web_lane_failure_path_ends_without_an_api_request`.)
-    #[test]
-    fn the_token_lane_fits_its_budget_and_owns_the_fast_cadence() {
-        // The TOKEN lane spends 5 on a one-page channel (one LIST request PER PAGE —
-        // one page under 100 releases — plus the four assets through the asset API,
-        // byte-for-byte the historical request), against its own 5000/hour.
-        const TOKEN_REQUESTS_PER_CHECK: u64 = 5;
-        const TOKEN_BUDGET_PER_HOUR: u64 = 5000;
-        const {
-            assert!(
-                (3600 / TOKEN_INTERVAL_SECS) * TOKEN_REQUESTS_PER_CHECK * 4
-                    <= TOKEN_BUDGET_PER_HOUR,
-                "the token cadence must leave headroom in its own 5000/hour budget"
-            )
-        };
-
-        let mut c = Cadence::new(Duration::from_secs(TOKEN_INTERVAL_SECS));
-        c.failed();
-        c.failed();
-        let backed_off = c.nominal();
-        c.set_base(Duration::from_secs(WEB_INTERVAL_SECS));
-        assert!(
-            c.nominal() > backed_off,
-            "adopting the slower lane must not shorten a wait"
-        );
-        c.succeeded();
-        assert_eq!(
-            c.nominal(),
-            Duration::from_secs(WEB_INTERVAL_SECS),
-            "a healthy check returns to the LANE's interval, not the original one"
-        );
-    }
-
     #[test]
     fn a_base_longer_than_the_cap_is_respected_and_still_backs_off() {
         // A one-hour base must not be silently shortened to 15 min by the cap; the
@@ -709,17 +654,15 @@ mod tests {
         assert_eq!(c.nominal(), hour * MAX_BACKOFF_INTERVALS);
     }
 
-    /// Regression, and the reason the ceiling is now relative: [`MAX_BACKOFF`] and
-    /// [`WEB_INTERVAL_SECS`] were BOTH 15 minutes at the time, so the old
+    /// Regression, and the reason the ceiling is now relative: [`MAX_BACKOFF`] and the
+    /// interval were BOTH 15 minutes at the time, so the old
     /// `min(MAX_BACKOFF.max(base))` clamp returned the base for every failure count —
-    /// a credential-less client that could not reach GitHub retried at full speed
-    /// forever. The web lane has no API budget to protect any more, but its interval
-    /// is still the courtesy-and-staleness trade [`WEB_INTERVAL_SECS`] describes, and
-    /// a host that is failing deserves a genuine retreat from it, not a clamp back to
-    /// full speed.
+    /// a client that could not reach GitHub retried at full speed forever. A host that
+    /// is failing deserves a genuine retreat from [`INTERVAL_SECS`], not a clamp back
+    /// to full speed.
     #[test]
-    fn the_web_lane_genuinely_backs_off_instead_of_clamping_to_its_own_base() {
-        let anon = Duration::from_secs(WEB_INTERVAL_SECS);
+    fn the_interval_genuinely_backs_off_instead_of_clamping_to_its_own_base() {
+        let anon = Duration::from_secs(INTERVAL_SECS);
         let mut c = Cadence::new(anon);
         c.failed();
         assert_eq!(
@@ -742,14 +685,14 @@ mod tests {
             "and it climbs to the RELATIVE ceiling, above the absolute 15-minute one"
         );
         c.succeeded();
-        assert_eq!(c.nominal(), anon, "recovery snaps back to the lane's base");
+        assert_eq!(c.nominal(), anon, "recovery snaps back to the base");
     }
 
-    /// A rate limit whose reset the server named is waited out EXACTLY — not doubled,
-    /// not jittered — however many failures preceded it.
+    /// A hold (a sibling's window end) is waited out EXACTLY — not doubled, not
+    /// jittered — however many failures preceded it.
     #[test]
     fn a_hold_waits_until_the_reset_not_a_doubling() {
-        let anon = Duration::from_secs(WEB_INTERVAL_SECS);
+        let anon = Duration::from_secs(INTERVAL_SECS);
         let mut c = Cadence::new(anon);
         for _ in 0..3 {
             c.failed();
@@ -782,7 +725,7 @@ mod tests {
     /// the ladder clears the hold too.
     #[test]
     fn a_hold_is_bounded_by_the_cap_and_cleared_by_success_or_wake() {
-        let anon = Duration::from_secs(WEB_INTERVAL_SECS);
+        let anon = Duration::from_secs(INTERVAL_SECS);
         let now = Instant::now();
         let mut c = Cadence::new(anon);
         c.hold_until(now + Duration::from_secs(10 * 3600));

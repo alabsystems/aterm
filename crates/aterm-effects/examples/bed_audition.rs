@@ -26,11 +26,6 @@
 //!
 //!   cargo run -p aterm-effects --example bed_audition [-- <out_dir>]
 //!   afplay target/bed-audition/c1-chord-drift.wav
-//!
-//! Tests (run with `cargo test -p aterm-effects --example bed_audition`):
-//! harness determinism (two renders ⇒ byte-identical WAV bytes) and metric
-//! sanity (an all-zero signal scores zero flux/centroid/roughness/audibility
-//! and floor loudness).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -575,56 +570,4 @@ fn main() {
         );
     }
     println!("artifacts in {}", out_dir.display());
-}
-
-// ---------------------------------------------------------------------------
-// Proofs
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// HARNESS DETERMINISM: for every candidate, two full renders produce
-    /// byte-identical WAV files (header + payload) — the tournament's
-    /// artifacts are reproducible evidence, not one-off recordings.
-    #[test]
-    fn two_runs_produce_byte_identical_wavs() {
-        for (name, variant) in CANDIDATES {
-            let a = wav_bytes(&render_candidate(variant, SECONDS));
-            let b = wav_bytes(&render_candidate(variant, SECONDS));
-            assert_eq!(a, b, "{name}: WAV bytes differed between runs");
-        }
-    }
-
-    /// METRIC SANITY: an all-zero signal scores exactly zero flux, centroid,
-    /// monotony, roughness and audibility, and floor loudness — so a silent
-    /// bed can never win or lose a metric by numerical accident.
-    #[test]
-    fn metrics_of_silence_are_zero() {
-        let zeros = vec![0.0f32; (SECONDS * SR as f32) as usize];
-        let m = metrics(&zeros, &zeros);
-        assert_eq!(m.bed_spectral_flux, 0.0);
-        assert_eq!(m.bed_spectral_centroid_hz, 0.0);
-        assert_eq!(m.bed_envelope_autocorr_peak, 0.0);
-        assert_eq!(m.mix_roughness_15_30hz, 0.0);
-        assert_eq!(m.bed_audible_pct, 0.0);
-        assert!(m.bed_rms_db <= -119.0, "loudness floor: {}", m.bed_rms_db);
-    }
-
-    /// The scripted session is itself deterministic and MODERATE (the brief:
-    /// beds must be judged under a living melody, not a flood): a sanity pin
-    /// on the cue count and time range so a future edit can't silently turn
-    /// the audition into a stress test.
-    #[test]
-    fn scenario_is_moderate_and_inside_the_window() {
-        let cues = scenario();
-        assert_eq!(cues, scenario(), "scenario must be a pure function");
-        assert!(
-            (80..=200).contains(&cues.len()),
-            "moderate typing means ~5-8 cps over ~16 s, got {} cues",
-            cues.len()
-        );
-        assert!(cues.iter().all(|c| c.0 >= 0.0 && c.0 < SECONDS - 3.5));
-    }
 }

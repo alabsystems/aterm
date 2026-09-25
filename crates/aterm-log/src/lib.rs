@@ -739,15 +739,6 @@ mod tests {
     }
 
     #[test]
-    fn test_log_below_max_level_is_noop() {
-        let _guard = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // With max level Off, calling __log should not panic even without a logger
-        set_max_level(LevelFilter::Off);
-        __log(Level::Error, "test", format_args!("boom"), None, None);
-        // If we get here without panic, the test passes.
-    }
-
-    #[test]
     fn test_set_logger_error_display() {
         let err = SetLoggerError(());
         assert_eq!(err.to_string(), "logger already set");
@@ -862,19 +853,6 @@ mod tests {
         let msg = "a".repeat(MAX_RECORD_BYTES - 1) + "\u{01}" + "a";
         let out = sanitize_record(&msg);
         assert!(out.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
-    }
-
-    #[test]
-    fn test_macros_compile() {
-        let _guard = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Verify all macros expand without errors.
-        // Without a logger installed, these are noops.
-        set_max_level(LevelFilter::Trace);
-        error!("e {}", 1);
-        warn!("w {}", 2);
-        info!("i {}", 3);
-        debug!("d {}", 4);
-        trace!("t {}", 5);
     }
 }
 

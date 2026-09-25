@@ -45,7 +45,9 @@ curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/instal
 on first launch with live progress** — each program downloads individually and
 resumably, only the builds for your machine, visible end to end in the app.
 
-On macOS the script picks the newest app release, checks the download's SHA-256 against
+On macOS the script reads the release GitHub's `latest` names — the newest app
+release, which every cut points it at — from github.com's download host with no
+credential and no GitHub API request, checks the download's SHA-256 against
 the release manifest, verifies the app's Developer ID signature and
 notarization, puts `aterm.app` in `/Applications` (or `~/Applications`), and
 links the `aterm` command and its man pages under `~/.local`. `--no-toolchain`
@@ -81,15 +83,12 @@ release through **v0.63.0** (through v0.61.0 the lean image shipped beside it as
 `aterm-<version>-lite.dmg`). **v0.65.0 published the first lean
 `aterm-<version>.dmg`**, and every app release since carries the lean pair.
 
-A release from the one-download lane also carries the
-`releases/latest/download/` names `aterm.dmg` and `aterm-mac.zip` — but those
-resolve only while an app release holds GitHub's `latest` pointer; when a
-source release holds it they return 404, so if a download button ever 404s,
-reach for the versioned assets on the newest app release, or `install.sh`, which
-elects that release itself. Every container has a `.sha256` sidecar whose digest also
-appears in that release's `aterm-appcast.toml` (v0.63.0, cut by an older
-cutter, carries `aterm.dmg` but no `aterm-mac.zip`). With the sidecar beside
-the asset, and the app in place:
+Every app release also carries the permanent names `aterm.dmg` and
+`aterm-mac.zip`, so `releases/latest/download/aterm.dmg` and
+`releases/latest/download/aterm-mac.zip` always fetch the newest app. Every
+container has a `.sha256` sidecar whose digest also appears in that release's
+`aterm-appcast.toml` (v0.63.0, cut by an older cutter, carries `aterm.dmg` but
+no `aterm-mac.zip`). With the sidecar beside the asset, and the app in place:
 
 ```sh
 shasum -a 256 -c aterm-<version>.dmg.sha256
@@ -668,24 +667,22 @@ computed from source, never maintained in prose. Every gate is a local command �
 gate as one of its unconditional stages, the release cutter re-runs those six
 obligations itself before it claims a build number, the full ladder runs by
 hand, and there is no hosted CI. The pinned pre-push hook GATES the push, and
-does it without running anything: `tools/verify.sh` writes a receipt naming the
-commit it verified and whether that run discharged the whole merge contract, and
-the hook refuses a push of any commit that has no passing receipt
-(`ATERM_PUSH_NO_GATE=1` is the named, logged exception). Three pushes bring no
-ungated code and owe no receipt of their own: a tag; the release cutter's claim
-commit — origin's tip plus one `RELEASES.ledger` line and the rolled
-`CHANGELOG.md`, judged against the remote's current tip, refused the moment any
-other path moves; and a clean automatic merge of a receipted commit onto the
-remote's current tip, admitted only when its tree is byte-equal to git's own
-merge of those two parents — the gate takes over an hour and peers push every
-few minutes, so a receipt for the exact tip is a race the gate loses by
-construction, and what this trades away is only the integration of the two
-sides, which the next full run and the cutter's own gates judge. It was a blocking gate
-that RAN the ladder until 2026-08-24, and was demoted to advisory on its own
-stated rule — a hook slow enough to be bypassed teaches the bypass — once the
-pixel guard took it to twelve minutes; checking a result instead of producing
-one is microseconds, and it cannot lose a ref race either. So L0 is enforced at
-the push and again at the release cut.
+does it without running anything: `tools/verify.sh` writes a receipt for a
+clean tree — into the repository's git common dir, which every worktree shares —
+naming the commit it verified and what that run discharged, never letting a
+weaker run's replace a whole-tree one, and the hook refuses a push of any commit
+that has no passing receipt (`ATERM_PUSH_NO_GATE=1` is the named, logged
+exception). Passing means a whole-tree run that discharged the merge contract;
+a narrowed run (`--changed`, `--scope`) admits nothing, because other crates'
+tests read files no dependency edge names. Three pushes bring no ungated code and
+owe no receipt of their own: a tag; bookkeeping over the remote's current tip —
+the release cutter's claim (`RELEASES.ledger`, `CHANGELOG.md`) and a pure
+workspace version bump (`Cargo.toml` and `Cargo.lock`, `version` lines only);
+and a clean automatic merge of a receipted commit onto the remote's current tip,
+admitted only when its tree is byte-equal to git's own merge of those two
+parents. Checking a result instead of producing one is microseconds, and it
+cannot lose a ref race. So L0 is enforced at the push and again at the release
+cut.
 
 aterm makes no aggregate performance claim. The reproducible cross-engine
 measurements are engine-only and in-process — throughput via

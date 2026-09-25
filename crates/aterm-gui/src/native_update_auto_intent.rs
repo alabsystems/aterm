@@ -155,10 +155,8 @@ pub(crate) struct ActivityFacts {
     pub(crate) consent_warmup: bool,
 }
 
-/// The refusal that means only the person's TYPING holds the park — the one a
-/// surface may turn into "finishes when you stop typing".
-pub(crate) const TYPING_REFUSAL: &str =
-    "a keystroke landed in an aterm window inside the typing gap";
+/// The refusal that means only the person's TYPING holds the park.
+const TYPING_REFUSAL: &str = "a keystroke landed in an aterm window inside the typing gap";
 
 /// Why the automatic lane will not park in `phase` given `facts`, or `None`
 /// when it may. ONE predicate for the two places that ask — the entry

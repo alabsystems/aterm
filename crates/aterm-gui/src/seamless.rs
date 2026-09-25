@@ -42,10 +42,32 @@ const MAX_HANDOFF_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HANDOFF_LAYOUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_HANDOFF_GRID_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HANDOFF_AGGREGATE_GRID_BYTES: u64 = 256 * 1024 * 1024;
-// The line codec can represent a very wide blank grid in a tiny wire. Bound the
-// decoded allocation separately from encoded bytes, before `restore_grid`
-// constructs any `Cell` vectors. Alt-screen checkpoints consume a second grid.
-const MAX_HANDOFF_GRID_CELLS: u64 = 32 * 1024;
+/// Ceiling on one grid's DECODED cells (`rows * cols`) — a sanity bound on an
+/// absurd geometry, charged before `restore_grid` constructs any `Cell`
+/// vectors (the line codec can represent a very wide blank grid in a tiny
+/// wire, so encoded bytes alone cannot bound it).
+///
+/// Half the aggregate (2 Mi cells), and that is the point: this was 32 Ki
+/// cells (256x128), and one aterm window in native full screen on a 5K
+/// display at the default font is 99x338 = 33,462 cells, so every automatic
+/// and manual update on such a desk refused in the capture loop, every
+/// attempt, naming the aggregate instead (the 2026-09-22/23 update audit,
+/// plan P0-4a). Half the aggregate is the largest value that still lets a
+/// session with an alternate screen (two grids) fit the aggregate alone, and
+/// it covers a 6K display at `FONT_PX_MIN`. The decoded allocation stays
+/// bounded by the 4 Mi-cell aggregate, the 64 MiB per-grid and 256 MiB
+/// aggregate byte caps, and the producer's 4 GiB decode-authority budget.
+///
+/// LAW L3: this may only GROW. Both sides enforce it, and the producer is the
+/// OLDER build, so lowering it would refuse what every build in the field
+/// sends; a DOWNGRADE target is served by [`WireCaps::for_target`] instead.
+const MAX_HANDOFF_GRID_CELLS: u64 = MAX_HANDOFF_AGGREGATE_GRID_CELLS / 2;
+
+/// The per-grid cell ceiling every consumer up to and including v0.91.0
+/// enforced, frozen: what a producer must honour when the successor it hands
+/// to is OLDER than itself (a rollback), because that consumer's cap cannot be
+/// raised from here. See [`WireCaps::for_target`].
+const LEGACY_HANDOFF_GRID_CELLS: u64 = 32 * 1024;
 /// Maximum scrollback lines a handoff checkpoint may carry, per session.
 ///
 /// The wire used to be defined as "exactly `rows` line records", which is why an
@@ -479,6 +501,10 @@ pub(crate) enum ScreenDigestRefusal {
         cols: u16,
         history_lines: u32,
         has_alt: bool,
+        /// Which ceiling bound: this used to print "the per-grid or aggregate
+        /// cell budget" for either, and the incident desk was refused by the
+        /// per-grid cap while every report named the aggregate.
+        bound: AdmitRefusal,
     },
     CapDisagreement {
         local_id: u64,
@@ -515,6 +541,31 @@ pub(crate) enum ScreenDigestRefusal {
         local_id: u64,
     },
     WireFraming,
+}
+
+impl ScreenDigestRefusal {
+    /// The session this refusal blames, when it blames one — what the
+    /// producer's post-loop self-check ([`settle_wire_carries`]) lowers.
+    /// `None` for the pool-wide arms (too many sessions, a duplicate id is
+    /// reported by id but is an identity fact, allocation, wire framing).
+    #[must_use]
+    pub(crate) fn local_id(&self) -> Option<u64> {
+        match *self {
+            Self::TooManySessions { .. }
+            | Self::Alloc { .. }
+            | Self::WireFraming
+            | Self::DuplicateLocalId { .. } => None,
+            Self::MetaUnbounded { local_id, .. }
+            | Self::DimensionsRefused { local_id, .. }
+            | Self::CapDisagreement { local_id, .. }
+            | Self::ParserNotGround { local_id }
+            | Self::AltPairingMismatch { local_id, .. }
+            | Self::GridNotCanonical { local_id, .. }
+            | Self::GridOverCap { local_id, .. }
+            | Self::LengthNotRepresentable { local_id, .. }
+            | Self::MetaSerialization { local_id } => Some(local_id),
+        }
+    }
 }
 
 impl std::fmt::Display for ScreenDigestRefusal {
@@ -560,9 +611,11 @@ impl std::fmt::Display for ScreenDigestRefusal {
                 cols,
                 history_lines,
                 has_alt,
+                bound,
             } => write!(
                 formatter,
-                "session {local_id}: {rows}x{cols} with {history_lines} carried line(s)                  (alt={has_alt}) exceeded the per-grid or aggregate cell budget"
+                "session {local_id}: {rows}x{cols} with {history_lines} carried line(s) \
+                 (alt={has_alt}) was refused: {bound}"
             ),
             Self::CapDisagreement {
                 local_id,
@@ -690,6 +743,11 @@ pub(crate) fn checkpoint_shape_refusal(
 /// concatenation alias. Any semantic mutation to canonical meta/main/alt data
 /// changes the adoption proof the parent expects; equivalent non-canonical wire
 /// encodings are rejected before hashing.
+///
+/// Test-only since the producer became total (the 2026-09-22/23 update audit,
+/// plan P0-1d): the capture commits through [`settle_wire_carries`], which runs
+/// this same predicate ([`screen_digest_refs`]) and lowers whatever it blames.
+#[cfg(test)]
 pub(crate) fn screen_digest(
     screens: &[(u64, TerminalCheckpoint)],
 ) -> Result<[u8; 32], ScreenDigestRefusal> {
@@ -749,12 +807,13 @@ fn screen_digest_refs(
             checkpoint.history_lines,
             checkpoint.alt_grid.is_some(),
         )
-        .ok_or(ScreenDigestRefusal::DimensionsRefused {
+        .map_err(|bound| ScreenDigestRefusal::DimensionsRefused {
             local_id,
             rows: checkpoint.rows,
             cols: checkpoint.cols,
             history_lines: checkpoint.history_lines,
             has_alt: checkpoint.alt_grid.is_some(),
+            bound,
         })?;
         if admitted != cap {
             return Err(ScreenDigestRefusal::CapDisagreement {
@@ -912,8 +971,10 @@ pub(crate) fn outgoing_manifest_path(nonce: &str) -> Option<std::path::PathBuf> 
 }
 
 /// Write `bytes` to `path` with owner-only permissions (the manifest's `0600`
-/// posture); `None` on any failure.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+/// posture). The error is KEPT (the 2026-09-22/23 update audit, plan P1-2): a
+/// full boot volume and a refused permission are different facts, and the
+/// failure the caller files must be able to say which.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -925,11 +986,38 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
             .mode(0o600)
             .open(path)
             .and_then(|mut f| f.write_all(bytes))
-            .ok()
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, bytes).ok()
+        std::fs::write(path, bytes)
+    }
+}
+
+/// Why [`write_outgoing`] wrote nothing — TYPED (the 2026-09-22/23 update
+/// audit, plan P1-2), because every one of these is THIS process's failure and
+/// none is a verdict about the candidate, yet until the audit all of them came
+/// back as a bare `None` that the caller filed as `PreparationFailed`: a full
+/// boot volume latched the artifact manual-only after two attempts. The
+/// `std::io::ErrorKind` travels out so the ledger can say `storage full`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteOutgoingFailure {
+    /// No private control directory to write into.
+    NoPrivateDir,
+    /// The capture handed to the writer disagrees with itself (the session,
+    /// screen and descriptor sets, a screen past a bound, a meta that will not
+    /// serialize) — this build's own inconsistency.
+    Inconsistent,
+    /// The filesystem refused a write.
+    Io(std::io::ErrorKind),
+}
+
+impl std::fmt::Display for WriteOutgoingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPrivateDir => formatter.write_str("no private control directory"),
+            Self::Inconsistent => formatter.write_str("the capture disagreed with itself"),
+            Self::Io(kind) => write!(formatter, "{kind}"),
+        }
     }
 }
 
@@ -1331,37 +1419,50 @@ fn checkpoint_meta_is_bounded(meta: &CheckpointMeta) -> bool {
     checkpoint_meta_bound_violation(meta).is_none()
 }
 
+/// The `CheckpointMeta` keys a modern screen carry must name before this build
+/// deserializes it.
+///
+/// FROZEN — THIS LIST MAY ONLY SHRINK (the 2026-09-22/23 update audit, plan
+/// P0-2f/L3). The producer of a handoff is always the OLDER build, so a key
+/// added here is a key every producer already in the field fails to send: each
+/// of its sessions would arrive "unparseable". That used to refuse the whole
+/// update; since P0-2 it degrades each such session to a blank, repainted
+/// screen — every tab of every desk, on every hop from the older build. A new
+/// meta field rides `#[serde(default)]` instead, and
+/// `the_required_meta_keys_are_frozen` pins this list verbatim.
+const CHECKPOINT_META_REQUIRED_KEYS: &[&str] = &[
+    "rows",
+    "cols",
+    "cursor",
+    "alt_cursor",
+    "saved_cursor_main",
+    "saved_cursor_alt",
+    "modes",
+    "style_fg_bits",
+    "style_bg_bits",
+    "style_flag_bits",
+    "style_protected",
+    "charset",
+    "kitty_keyboard",
+    "xterm_keyboard",
+    "taskbar_progress",
+    "secure_keyboard_entry",
+    "current_working_directory",
+];
+
 fn parse_checkpoint_meta(carry: &ScreenCarry) -> Option<CheckpointMeta> {
-    {
-        if carry.schema != ScreenCarry::SCHEMA {
-            return None;
-        }
-        let value: aterm_json::Value = aterm_json::from_str(&carry.meta).ok()?;
-        let object = value.as_object()?;
-        const REQUIRED: &[&str] = &[
-            "rows",
-            "cols",
-            "cursor",
-            "alt_cursor",
-            "saved_cursor_main",
-            "saved_cursor_alt",
-            "modes",
-            "style_fg_bits",
-            "style_bg_bits",
-            "style_flag_bits",
-            "style_protected",
-            "charset",
-            "kitty_keyboard",
-            "xterm_keyboard",
-            "taskbar_progress",
-            "secure_keyboard_entry",
-            "current_working_directory",
-        ];
-        if !REQUIRED.iter().all(|key| object.contains_key(*key)) {
-            return None;
-        }
-        aterm_json::from_value(value).ok()
+    if carry.schema != ScreenCarry::SCHEMA {
+        return None;
     }
+    let value: aterm_json::Value = aterm_json::from_str(&carry.meta).ok()?;
+    let object = value.as_object()?;
+    if !CHECKPOINT_META_REQUIRED_KEYS
+        .iter()
+        .all(|key| object.contains_key(*key))
+    {
+        return None;
+    }
+    aterm_json::from_value(value).ok()
 }
 
 fn dimension_grid_cap(rows: u16, cols: u16, history: u32) -> Option<u64> {
@@ -1398,37 +1499,245 @@ fn checkpoint_grid_cap(meta: &CheckpointMeta) -> Option<u64> {
     dimension_grid_cap(meta.rows, meta.cols, meta.history_lines)
 }
 
+/// Which ceiling [`admit_checkpoint_dimensions`] refused a geometry on — so a
+/// refusal names the cap that actually bound (the 2026-09-22/23 update audit,
+/// plan P0-4a: the incident desk was refused by the per-grid cap while every
+/// report blamed the aggregate, which sent the investigation after the wrong
+/// number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitRefusal {
+    /// The geometry or history is outside the protocol itself: a zero side,
+    /// a side past the engine's `MAX_GRID_ROWS`/`MAX_GRID_COLS`, or more than
+    /// `MAX_HANDOFF_HISTORY_LINES` carried lines.
+    Dimension { rows: u16, cols: u16, history: u32 },
+    /// One grid's `rows * cols` is over the per-grid cell ceiling in force.
+    PerGrid { cells: u64, cap: u64 },
+    /// This session's cost would take the handoff's decoded cells past the
+    /// aggregate.
+    Aggregate { cost: u64, used: u64, cap: u64 },
+}
+
+impl std::fmt::Display for AdmitRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Dimension {
+                rows,
+                cols,
+                history,
+            } => write!(
+                formatter,
+                "{rows}x{cols} with {history} carried line(s) is outside the protocol's \
+                 dimensions"
+            ),
+            Self::PerGrid { cells, cap } => write!(
+                formatter,
+                "{cells} cells is over the {cap}-cell per-grid cap"
+            ),
+            Self::Aggregate { cost, used, cap } => write!(
+                formatter,
+                "{cost} more cells on top of {used} is over the {cap}-cell aggregate grid-cell \
+                 budget"
+            ),
+        }
+    }
+}
+
+/// The CONSUMER's ceilings a producer must fit: which per-grid cell cap the
+/// successor it hands to enforces (the 2026-09-22/23 update audit, plan
+/// P0-4a).
+///
+/// Consumer checks only ever become more lenient (law L3), so a successor
+/// NEWER than this build admits at least what this build admits and gets
+/// [`Self::current`]. A ROLLBACK is the one hop that runs the other way: its
+/// successor is an older build whose checks cannot be relaxed from here, so it
+/// gets [`Self::legacy`], and a session one of those stricter checks would
+/// refuse is carried at a lower rung ([`carry_for_wire`]) instead of being sent
+/// a grid its consumer refuses — which a consumer of v0.91.0's vintage answers
+/// by refusing the WHOLE adoption.
+///
+/// The consumer checks this branch relaxed, and so the whole of what a
+/// legacy consumer is stricter about (audited against `v0.91.0` on 2026-09-24):
+///
+/// * the PER-GRID cell cap — [`LEGACY_HANDOFF_GRID_CELLS`], 32 Ki cells, where
+///   this build admits [`MAX_HANDOFF_GRID_CELLS`];
+/// * the STRICT LINE DECODER's attrs bound — v0.91.0 refuses a line whose
+///   attrs RLE sums past the grid's COLUMNS, where this build bounds it by the
+///   larger of the columns and the line's own character count
+///   (`aterm_scrollback::deserialize_lines_strict`). A full-width styled row
+///   holding a combining mark or a ZWJ cluster is canonical here and
+///   non-canonical there. The first review of this type claimed "only the
+///   per-grid cap differs" and missed this one (the 2026-09-24 review).
+///
+/// The aggregate, the byte caps, the meta bounds and the required meta keys
+/// are the same in every consumer from v0.91.0 on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WireCaps {
+    per_grid_cells: u64,
+    /// The successor's strict line decoder bounds a line's attrs RLE by the
+    /// grid's column count alone — v0.91.0 and every consumer before it.
+    attrs_bounded_by_columns: bool,
+}
+
+impl WireCaps {
+    /// This build's own ceilings — what its consumer and `screen_digest`
+    /// enforce.
+    #[must_use]
+    pub(crate) const fn current() -> Self {
+        Self {
+            per_grid_cells: MAX_HANDOFF_GRID_CELLS,
+            attrs_bounded_by_columns: false,
+        }
+    }
+
+    /// The frozen ceilings of every consumer up to and including v0.91.0.
+    #[must_use]
+    pub(crate) const fn legacy() -> Self {
+        Self {
+            per_grid_cells: LEGACY_HANDOFF_GRID_CELLS,
+            attrs_bounded_by_columns: true,
+        }
+    }
+
+    /// The ceilings of the successor at `target_build`, handed to by the
+    /// running build.
+    #[must_use]
+    pub(crate) fn for_target(target_build: u64) -> Self {
+        Self::for_hop(crate::running_build_number(), target_build)
+    }
+
+    /// [`Self::for_target`] with the running build named, so a test can pin
+    /// both directions of a hop.
+    #[must_use]
+    pub(crate) fn for_hop(running_build: u64, target_build: u64) -> Self {
+        if target_build < running_build {
+            Self::legacy()
+        } else {
+            Self::current()
+        }
+    }
+
+    /// The per-grid cell ceiling in force.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn per_grid_cells(self) -> u64 {
+        self.per_grid_cells
+    }
+
+    /// [`admit_checkpoint_dimensions`] against these ceilings: the producer's
+    /// seam, which must price every carry at the TARGET's cap.
+    pub(crate) fn admit(
+        self,
+        used_cells: &mut u64,
+        rows: u16,
+        cols: u16,
+        history: u32,
+        has_alt: bool,
+    ) -> Result<u64, AdmitRefusal> {
+        let dimension = AdmitRefusal::Dimension {
+            rows,
+            cols,
+            history,
+        };
+        let cap = dimension_grid_cap(rows, cols, history).ok_or(dimension)?;
+        // The VISIBLE grid keeps a per-grid ceiling: that bound exists to
+        // refuse an absurd screen geometry and has nothing to do with history.
+        let cells = u64::from(rows)
+            .checked_mul(u64::from(cols))
+            .ok_or(dimension)?;
+        if cells > self.per_grid_cells {
+            return Err(AdmitRefusal::PerGrid {
+                cells,
+                cap: self.per_grid_cells,
+            });
+        }
+        // Carried history is priced on top, bounded separately by
+        // MAX_HANDOFF_HISTORY_LINES (already enforced in `dimension_grid_cap`).
+        let history_cells = u64::from(history)
+            .checked_mul(u64::from(cols))
+            .ok_or(dimension)?;
+        // The alt grid never carries history (the live alt screen keeps no
+        // scrollback), so it costs one visible grid, not one carried grid.
+        let cost = cells
+            .checked_add(history_cells)
+            .and_then(|cost| cost.checked_add(if has_alt { cells } else { 0 }))
+            .ok_or(dimension)?;
+        let aggregate = AdmitRefusal::Aggregate {
+            cost,
+            used: *used_cells,
+            cap: MAX_HANDOFF_AGGREGATE_GRID_CELLS,
+        };
+        let next = used_cells.checked_add(cost).ok_or(aggregate)?;
+        if next > MAX_HANDOFF_AGGREGATE_GRID_CELLS {
+            return Err(aggregate);
+        }
+        *used_cells = next;
+        Ok(cap)
+    }
+
+    /// The first line of `checkpoint`'s grids that this successor's strict
+    /// line decoder refuses although this build's admits it, named — `None`
+    /// when the successor decodes every line this build does (always, for a
+    /// successor at least as new as this build).
+    ///
+    /// Why: the producer judges a carry's shape with THIS build's decoder
+    /// ([`checkpoint_shape_refusal`]), which since the 2026-09-22/23 update
+    /// audit bounds a line's attrs RLE by its character count. A consumer of
+    /// v0.91.0's vintage still bounds it by the grid's columns, finds any
+    /// full-width styled row holding `e` + U+0301 or a ZWJ cluster
+    /// non-canonical, and refuses the whole adoption — so on a rollback hop
+    /// such a carry must go down the ladder instead (the 2026-09-24 review).
+    /// The same arithmetic as v0.91.0's `decode_line_strict`: the attrs run
+    /// lengths summed, against the column count.
+    fn line_decoder_refusal(self, checkpoint: &TerminalCheckpoint) -> Option<String> {
+        if !self.attrs_bounded_by_columns {
+            return None;
+        }
+        let cols = u64::from(checkpoint.cols);
+        [
+            (
+                GridSlot::Main,
+                Some(&checkpoint.grid),
+                checkpoint.history_lines,
+            ),
+            (GridSlot::Inactive, checkpoint.alt_grid.as_ref(), 0),
+        ]
+        .into_iter()
+        .find_map(|(which, blob, history)| {
+            // A blob this build cannot decode is the shape refusal's to name,
+            // and it runs first; there is nothing more to say about it here.
+            let lines = strict_grid_lines(blob?, checkpoint.rows, checkpoint.cols, history)?;
+            lines.iter().enumerate().find_map(|(record, line)| {
+                let entries = line.attrs().map_or(0_u64, |attrs| {
+                    attrs
+                        .runs()
+                        .iter()
+                        .map(|run| u64::from(run.length))
+                        .fold(0_u64, u64::saturating_add)
+                });
+                (entries > cols).then(|| {
+                    format!(
+                        "{which} record {record} carries {entries} styled characters over its \
+                         {cols} columns, which the older successor's line decoder refuses"
+                    )
+                })
+            })
+        })
+    }
+}
+
 /// One dimension/allocation admission seam shared by UI pre-capture,
-/// outgoing digest/write, and incoming decode. The aggregate changes only on
-/// success, so an over-budget checkpoint cannot leave partial authority.
+/// outgoing digest/write, and incoming decode, at this build's own ceilings
+/// ([`WireCaps::current`]). The aggregate changes only on success, so an
+/// over-budget checkpoint cannot leave partial authority; a refusal names the
+/// ceiling that bound.
 pub(crate) fn admit_checkpoint_dimensions(
     used_cells: &mut u64,
     rows: u16,
     cols: u16,
     history: u32,
     has_alt: bool,
-) -> Option<u64> {
-    let cap = dimension_grid_cap(rows, cols, history)?;
-    // The VISIBLE grid keeps its original per-grid ceiling: that bound exists to
-    // refuse an absurd screen geometry and has nothing to do with history.
-    let cells = u64::from(rows).checked_mul(u64::from(cols))?;
-    if cells > MAX_HANDOFF_GRID_CELLS {
-        return None;
-    }
-    // Carried history is priced on top, bounded separately by
-    // MAX_HANDOFF_HISTORY_LINES (already enforced in `dimension_grid_cap`).
-    let history_cells = u64::from(history).checked_mul(u64::from(cols))?;
-    // The alt grid never carries history (the live alt screen keeps no
-    // scrollback), so it costs one visible grid, not one carried grid.
-    let cost = cells
-        .checked_add(history_cells)?
-        .checked_add(if has_alt { cells } else { 0 })?;
-    let next = used_cells.checked_add(cost)?;
-    if next > MAX_HANDOFF_AGGREGATE_GRID_CELLS {
-        return None;
-    }
-    *used_cells = next;
-    Some(cap)
+) -> Result<u64, AdmitRefusal> {
+    WireCaps::current().admit(used_cells, rows, cols, history, has_alt)
 }
 
 /// What one session's MANDATORY carry costs the aggregate: its visible grid plus
@@ -1465,7 +1774,16 @@ pub(crate) fn max_handoff_aggregate_grid_cells() -> u64 {
     MAX_HANDOFF_AGGREGATE_GRID_CELLS
 }
 
-fn checkpoint_grid_is_canonical(bytes: &[u8], rows: u16, cols: u16, history: u32) -> bool {
+/// The strict decode of one grid blob that must hold exactly `history + rows`
+/// records at `cols`: the bounded half of [`checkpoint_grid_is_canonical`],
+/// shared with the producer's history drop ([`drop_carried_history`]) so both
+/// read a blob under the same bounds.
+fn strict_grid_lines(
+    bytes: &[u8],
+    rows: u16,
+    cols: u16,
+    history: u32,
+) -> Option<Vec<aterm_core::scrollback::Line>> {
     // A materialized grid cell holds at most one 256-byte grapheme unit. Bound
     // content and full record framing from the authenticated column count before
     // the decoder allocates any line payload or sidecars.
@@ -1477,30 +1795,888 @@ fn checkpoint_grid_is_canonical(bytes: &[u8], rows: u16, cols: u16, history: u32
     // `rows` visible records. `history` is bounded by the caller's meta check, so
     // this total can never be inflated by the payload itself.
     if history > MAX_HANDOFF_HISTORY_LINES {
-        return false;
+        return None;
     }
-    let Some(expected) = usize::from(rows).checked_add(history as usize) else {
-        return false;
-    };
-    let Some(lines) = aterm_core::scrollback::deserialize_lines_strict(
+    let expected = usize::from(rows).checked_add(history as usize)?;
+    let lines = aterm_core::scrollback::deserialize_lines_strict(
         bytes,
         expected,
         usize::from(cols),
         content_cap,
         record_cap,
+    )?;
+    (lines.len() == expected).then_some(lines)
+}
+
+fn checkpoint_grid_is_canonical(bytes: &[u8], rows: u16, cols: u16, history: u32) -> bool {
+    strict_grid_lines(bytes, rows, cols, history)
+        .is_some_and(|lines| aterm_core::scrollback::serialize_lines(&lines).as_slice() == bytes)
+}
+
+/// The raw bytes one session's screen carry put on the wire, read under the
+/// RESOURCE caps only: what the adoption proof hashes, whatever this build then
+/// makes of them (the 2026-09-22/23 update audit, plan P0-2d).
+struct ScreenWireBytes {
+    grid: Vec<u8>,
+    alt_grid: Option<Vec<u8>>,
+}
+
+/// What [`take_incoming`] made of one session's carried screen.
+enum IncomingScreen {
+    /// The carried screen, exactly: the checkpoint's grid blobs ARE the wire
+    /// bytes, validated canonical and moved in unchanged.
+    Exact(TerminalCheckpoint),
+    /// This build refused the screen's CONTENT, so the session adopts onto
+    /// `checkpoint` — a blank canonical screen at a sanitized meta
+    /// ([`repaint_checkpoint`]), or `None` for a blank engine at the pane's own
+    /// geometry when not even the meta parsed — and is repainted. `wire` keeps
+    /// the bytes read so the proof still covers them.
+    Degraded {
+        checkpoint: Option<TerminalCheckpoint>,
+        cause: String,
+        wire: ScreenWireBytes,
+    },
+}
+
+/// One session [`take_incoming`] adopts, with why its screen was degraded and
+/// the raw bytes a degraded one keeps for the proof (an exact one's live in its
+/// checkpoint already).
+struct IncomingSession {
+    adopted: Adopted,
+    degraded: Option<(String, ScreenWireBytes)>,
+}
+
+/// Log why one session's HARD check refuses the WHOLE handoff, and refuse it.
+///
+/// The consumer used to refuse in silence: a successor launched through
+/// LaunchServices has no stderr, and the parent only sees its readiness pipe
+/// close (`ChildDied`), so nothing on the machine said which session or which
+/// check (the 2026-09-22/23 update audit). Only identity and resource facts
+/// come here; a screen's content degrades instead ([`admit_incoming_screen`]).
+fn refuse_incoming_session<T>(local_id: u64, why: &str) -> Option<T> {
+    aterm_log::warn!(
+        "overlap handoff: session {local_id} {why}; refusing the whole handoff so the outgoing \
+         process keeps every session"
+    );
+    None
+}
+
+/// Read one session's grid sidecars at their exact paths, priced by RESOURCE
+/// alone — the HARD half of the consumer's screen check (the 2026-09-22/23
+/// update audit, plan P0-2b/c). `Err` rejects the whole adoption: a carry
+/// naming a sidecar other than its own is not this attempt's, and a sidecar over
+/// its byte cap, or one that takes the handoff past the aggregate, is an
+/// allocation the successor must not make.
+///
+/// WHY THE CAP IS [`dimension_grid_cap`] AND NOT [`checkpoint_grid_cap`]. The
+/// latter is `None` whenever the meta breaks a SEMANTIC bound, which left
+/// nothing to price the read with, so every content refusal had to refuse the
+/// update. The dimension cap depends on geometry and history alone and falls
+/// back to the protocol ceiling `MAX_HANDOFF_GRID_BYTES` when the meta did not
+/// parse or names a geometry the protocol does not have; every byte still
+/// counts against the 256 MiB aggregate. For a meta that holds every bound the
+/// two caps are the same number, so an exact carry is priced as before.
+fn take_screen_wire(
+    carry: &ScreenCarry,
+    meta: Option<&CheckpointMeta>,
+    grid_path: &std::path::Path,
+    alt_path: &std::path::Path,
+    dir: &std::path::Path,
+    remaining: &mut u64,
+) -> Result<ScreenWireBytes, &'static str> {
+    if std::path::Path::new(&carry.grid_file) != grid_path
+        || carry
+            .alt_grid_file
+            .as_deref()
+            .is_some_and(|encoded| std::path::Path::new(encoded) != alt_path)
+    {
+        return Err("names a grid sidecar other than its own");
+    }
+    let cap = meta
+        .and_then(|meta| dimension_grid_cap(meta.rows, meta.cols, meta.history_lines))
+        .unwrap_or(MAX_HANDOFF_GRID_BYTES);
+    let grid = take_grid_capped(grid_path, dir, cap, remaining).ok_or(
+        "has a main grid sidecar that is missing, over its byte cap, or past the handoff's \
+         aggregate byte cap",
+    )?;
+    let alt_grid = match carry.alt_grid_file {
+        Some(_) => Some(take_grid_capped(alt_path, dir, cap, remaining).ok_or(
+            "has an inactive grid sidecar that is missing, over its byte cap, or past the \
+             handoff's aggregate byte cap",
+        )?),
+        None => None,
+    };
+    Ok(ScreenWireBytes { grid, alt_grid })
+}
+
+/// Judge one session's carried screen with this build's CONTENT predicates —
+/// the half of the consumer's check that may cost a screen but never the update
+/// (the 2026-09-22/23 update audit, plan P0-2c).
+///
+/// A handoff's consumer is always the NEWER build and its producer the OLDER
+/// one, so this is the only side whose rules can be corrected in the same
+/// release as the bug they get wrong. When they refused, the whole adoption
+/// used to go with them: every shell stayed behind on the old build, the parent
+/// read `ChildDied`, and the next attempt refused the same bytes. Now a refused
+/// screen degrades that one session to a blank, repainted one; an admitted
+/// screen is charged to the aggregate cell budget exactly as before, in the
+/// same order (dimensions before a byte is decoded).
+fn admit_incoming_screen(
+    meta: Option<CheckpointMeta>,
+    wire: ScreenWireBytes,
+    used_cells: &mut u64,
+) -> IncomingScreen {
+    // A readable meta always yields a checkpoint, so the shell's mark authority
+    // crosses with it: past a spent aggregate, the 1x1 last resort, charged to
+    // nothing (one cell is not what the budget bounds). Only an unreadable meta
+    // adopts with none, and `spawn::hold_adopted_shell_nonce_requirement` keeps
+    // the requirement standing there.
+    let degrade = |meta: Option<&CheckpointMeta>, cause: String, wire, used_cells: &mut u64| {
+        IncomingScreen::Degraded {
+            checkpoint: repaint_checkpoint(meta, used_cells)
+                .or_else(|| meta.map(unadmitted_blank_carry)),
+            cause,
+            wire,
+        }
+    };
+    let Some(meta) = meta else {
+        return degrade(
+            None,
+            "the screen meta did not parse (schema, JSON or a required key)".to_string(),
+            wire,
+            used_cells,
+        );
+    };
+    if let Some(violation) = checkpoint_meta_bound_violation(&meta) {
+        return degrade(
+            Some(&meta),
+            format!(
+                "meta out of bounds at {}x{}: {violation}",
+                meta.rows, meta.cols
+            ),
+            wire,
+            used_cells,
+        );
+    }
+    if meta.alt_cursor.is_some() != wire.alt_grid.is_some() {
+        return degrade(
+            Some(&meta),
+            "the inactive grid's presence disagrees with the meta".to_string(),
+            wire,
+            used_cells,
+        );
+    }
+    // Priced on a copy: a screen refused after this point must not keep the
+    // cells an exact adoption would have used.
+    let mut charged = *used_cells;
+    if let Err(bound) = admit_checkpoint_dimensions(
+        &mut charged,
+        meta.rows,
+        meta.cols,
+        meta.history_lines,
+        meta.alt_cursor.is_some(),
+    ) {
+        return degrade(
+            Some(&meta),
+            format!(
+                "{}x{} with {} history line(s) was refused: {bound}",
+                meta.rows, meta.cols, meta.history_lines
+            ),
+            wire,
+            used_cells,
+        );
+    }
+    if !checkpoint_grid_is_canonical(&wire.grid, meta.rows, meta.cols, meta.history_lines) {
+        return degrade(
+            Some(&meta),
+            format!("the {} is not canonical", GridSlot::Main),
+            wire,
+            used_cells,
+        );
+    }
+    // The inactive grid never carries history.
+    if wire
+        .alt_grid
+        .as_deref()
+        .is_some_and(|alt| !checkpoint_grid_is_canonical(alt, meta.rows, meta.cols, 0))
+    {
+        return degrade(
+            Some(&meta),
+            format!("the {} is not canonical", GridSlot::Inactive),
+            wire,
+            used_cells,
+        );
+    }
+    *used_cells = charged;
+    IncomingScreen::Exact(meta.into_checkpoint(wire.grid, wire.alt_grid))
+}
+
+/// A BLANK screen carrying every piece of `meta`'s scalar state this build
+/// admits: the checkpoint a session is adopted onto when its real screen cannot
+/// be (the 2026-09-22/23 update audit, plan P0-1a's Repaint rung and P0-2c's
+/// consumer degrade share it).
+///
+/// Canonical by construction: the grids are a fresh engine's own serialized
+/// blank rows at the chosen geometry, and every scalar is either kept because
+/// this build's bound admits it or replaced by the fresh engine's value — a
+/// cursor that breaks a bound keeps only its position, clamped (so a program
+/// that redraws relative to where it left the cursor lands on the same row); a
+/// DECSC slot past the engine's ceiling and a directory holding a NUL or over
+/// the length cap are dropped. Modes, keyboard protocols, charsets and the pen
+/// survive, which is what keeps typing into a degraded TUI working until it
+/// redraws.
+///
+/// GEOMETRY. The carried size when the aggregate cell budget admits it, else
+/// 24x80 at most, else 1x1; the window's first resize converges the engine to
+/// the pane either way. `None` when not even 1x1 fits (the aggregate is spent)
+/// or there is no meta at all. The consumer's degrade then takes
+/// [`unadmitted_blank_carry`] for a readable meta, so the shell's mark
+/// authority still crosses; with no meta the session adopts onto a blank
+/// engine at its pane's geometry, which `spawn_session` builds without a
+/// checkpoint and with the nonce requirement standing.
+fn repaint_checkpoint(
+    meta: Option<&CheckpointMeta>,
+    used_cells: &mut u64,
+) -> Option<TerminalCheckpoint> {
+    repaint_checkpoint_within(meta, used_cells, WireCaps::current())
+}
+
+/// [`repaint_checkpoint`] priced at a SUCCESSOR's ceilings: the producer's
+/// Repaint rung (plan P0-1a) must fit the consumer it hands to, which on a
+/// rollback is an older build with a smaller per-grid cap
+/// ([`WireCaps::for_target`]).
+///
+/// The plan describes this rung as a fresh engine at the chosen geometry, put
+/// on its alternate screen when the source was, with the sanitized scalar
+/// state copied in and `checkpoint_carry(0)` taken. This is that carry built
+/// directly: a fresh engine's two grids at one geometry are the same blank
+/// rows, so its serialized blank screen serves both slots, and the scalar
+/// state is the sanitized meta's — the grids come from the one serializer, so
+/// the carry is canonical by construction.
+fn repaint_checkpoint_within(
+    meta: Option<&CheckpointMeta>,
+    used_cells: &mut u64,
+    caps: WireCaps,
+) -> Option<TerminalCheckpoint> {
+    let meta = meta?;
+    // An alternate screen keeps its saved primary, so a later 1049 exit has a
+    // grid to return to.
+    let has_alt = meta.alt_cursor.is_some() || meta.modes.alternate_screen;
+    let rows = meta.rows.clamp(1, aterm_core::grid::MAX_GRID_ROWS);
+    let cols = meta.cols.clamp(1, aterm_core::grid::MAX_GRID_COLS);
+    let (rows, cols) = [(rows, cols), (rows.min(24), cols.min(80)), (1, 1)]
+        .into_iter()
+        .find(|&(rows, cols)| caps.admit(used_cells, rows, cols, 0, has_alt).is_ok())?;
+    let blank = aterm_core::terminal::Terminal::new(rows, cols).checkpoint_carry(0)?;
+    let sanitized_cursor = |carried: &aterm_core::terminal::GridCursorRepr| {
+        if grid_cursor_bound_violation(carried, "", rows, cols).is_none() {
+            carried.clone()
+        } else {
+            aterm_core::terminal::GridCursorRepr {
+                cursor_row: carried.cursor_row.min(rows - 1),
+                cursor_col: carried.cursor_col.min(cols - 1),
+                pending_wrap: false,
+                ..blank.cursor.clone()
+            }
+        }
+    };
+    let mut sanitized = meta.clone();
+    sanitized.rows = rows;
+    sanitized.cols = cols;
+    sanitized.history_lines = 0;
+    sanitized.cursor = sanitized_cursor(&meta.cursor);
+    sanitized.alt_cursor =
+        has_alt.then(|| sanitized_cursor(meta.alt_cursor.as_ref().unwrap_or(&blank.cursor)));
+    for slot in [
+        &mut sanitized.saved_cursor_main,
+        &mut sanitized.saved_cursor_alt,
+    ] {
+        *slot = slot.filter(|saved| {
+            saved.cursor_row < aterm_core::grid::MAX_GRID_ROWS
+                && saved.cursor_col < aterm_core::grid::MAX_GRID_COLS
+        });
+    }
+    sanitized.current_working_directory = meta
+        .current_working_directory
+        .clone()
+        .filter(|cwd| cwd.len() <= 8 * 1024 && !cwd.contains('\0'));
+    // Belt and braces for a bound added later and not sanitized above: the
+    // fresh engine's own projection holds every bound this build has — and the
+    // shell's mark authority, which is no bound's business.
+    if checkpoint_meta_bound_violation(&sanitized).is_some() {
+        return Some(keep_shell_integration_authority(blank, meta));
+    }
+    let alt_grid = has_alt.then(|| blank.grid.clone());
+    Some(sanitized.into_checkpoint(blank.grid, alt_grid))
+}
+
+/// Where on the producer's degrade ladder one session's screen was carried
+/// (the 2026-09-22/23 update audit, plan P0-1a).
+///
+/// The capture used to be a VETO: any one session whose screen failed one of
+/// the build's own wire predicates refused the whole update, and because the
+/// outgoing build is the older one, no release could fix the predicate into
+/// itself — the owner's desk stayed on 0.86 through 0.90 that way. The checks
+/// are now a way to CHOOSE a rung, never a refusal: every rung's carry passes
+/// this build's own predicates, so the producer never sends what its own
+/// consumer would reject, and the worst case is one blank tab that redraws.
+/// Ordered from most to least faithful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CarryRung {
+    /// The screen as the capture asked for it: the visible grid, the saved
+    /// primary, and the scrollback depth the time and budget ladder chose.
+    Full,
+    /// A predicate refused the carried scrollback, so the screen went without
+    /// it: the visible grid and every scalar exactly.
+    VisibleOnly,
+    /// The screen's grids exactly, with the scalar fields that broke a meta
+    /// bound clamped ([`sanitize_checkpoint_for_wire`]).
+    Sanitized,
+    /// A blank, canonical screen carrying the sanitized scalar state: modes,
+    /// keyboard protocols, charsets and the pen survive, the content redraws.
+    Repaint,
+}
+
+impl CarryRung {
+    /// The successor must make the program redraw (`ScreenCarry::repaint`):
+    /// what is on its screen is not exactly what the program last drew.
+    #[must_use]
+    pub(crate) const fn needs_repaint(self) -> bool {
+        matches!(self, Self::Sanitized | Self::Repaint)
+    }
+
+    /// The session's control carry (`handoff_carry::capture_head`) travels
+    /// with it only while the screen it describes is the one carried: its
+    /// differ state diffs the program's next frame against that screen.
+    #[must_use]
+    pub(crate) const fn keeps_control_carry(self) -> bool {
+        matches!(self, Self::Full | Self::VisibleOnly)
+    }
+}
+
+impl std::fmt::Display for CarryRung {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Full => "full",
+            Self::VisibleOnly => "visible-only",
+            Self::Sanitized => "sanitized",
+            Self::Repaint => "repaint",
+        })
+    }
+}
+
+/// Clamp every scalar field of `checkpoint` that breaks one of this build's
+/// meta bounds, one field at a time, in the order the consumer checks them
+/// (the 2026-09-22/23 update audit, plan P0-1a's third rung). Returns the
+/// violations clamped, or why the checkpoint cannot be sanitized — a bound
+/// with no clamp here (a geometry the protocol does not have, or one added
+/// later and not taught to this function), or a field that still breaks its
+/// bound after its one clamp. Either answer sends the carry to the Repaint
+/// rung; the grids are never touched here.
+///
+/// Why these clamps: nothing an honest engine holds breaks a meta bound today
+/// (the saved-cursor bound was the one that did, until `ef8c23c2d`; a NUL in
+/// a reported directory was the other, until the engine stopped storing one),
+/// so this rung exists for the next producer/predicate disagreement. It must
+/// cost that session as little as possible: a cursor goes to the last row or
+/// column, a scroll region, margin pair or tab-stop vector that no longer fits
+/// resets to the full grid, a DECSC slot past the engine's ceiling goes to
+/// that ceiling, and a directory that is too long or holds a NUL is dropped.
+pub(crate) fn sanitize_checkpoint_for_wire(
+    checkpoint: &mut TerminalCheckpoint,
+) -> Result<Vec<MetaBoundViolation>, String> {
+    let mut clamped: Vec<MetaBoundViolation> = Vec::new();
+    loop {
+        let Some(violation) =
+            checkpoint_meta_bound_violation(&CheckpointMeta::from_checkpoint(checkpoint))
+        else {
+            return Ok(clamped);
+        };
+        if clamped
+            .iter()
+            .any(|done| (done.slot, done.field) == (violation.slot, violation.field))
+        {
+            return Err(format!("{violation} survived its own clamp"));
+        }
+        let unsanitizable = || format!("{violation} has no sanitizer");
+        let (rows, cols) = (checkpoint.rows, checkpoint.cols);
+        match violation.slot {
+            "cursor" | "alt_cursor" => {
+                let cursor = if violation.slot == "cursor" {
+                    Some(&mut checkpoint.cursor)
+                } else {
+                    checkpoint.alt_cursor.as_mut()
+                }
+                .ok_or_else(unsanitizable)?;
+                match violation.field {
+                    "cursor_row" => cursor.cursor_row = rows.saturating_sub(1),
+                    "cursor_col" => cursor.cursor_col = cols.saturating_sub(1),
+                    "scroll_top" | "scroll_bottom" => {
+                        cursor.scroll_top = 0;
+                        cursor.scroll_bottom = rows.saturating_sub(1);
+                    }
+                    "margin_left" | "margin_right" => {
+                        cursor.margin_left = 0;
+                        cursor.margin_right = cols.saturating_sub(1);
+                    }
+                    // The engine's own default stops (`GridCursorState::
+                    // default_tab_stops`): one every eight columns.
+                    "tab_stops.len()" => {
+                        cursor.tab_stops = (0..cols).map(|col| col > 0 && col % 8 == 0).collect();
+                        cursor.tab_defaults_suppressed = false;
+                    }
+                    _ => return Err(unsanitizable()),
+                }
+            }
+            "saved_cursor_main" | "saved_cursor_alt" => {
+                let saved = if violation.slot == "saved_cursor_main" {
+                    checkpoint.saved_cursor_main.as_mut()
+                } else {
+                    checkpoint.saved_cursor_alt.as_mut()
+                }
+                .ok_or_else(unsanitizable)?;
+                match violation.field {
+                    "cursor_row" => saved.cursor_row = aterm_core::grid::MAX_GRID_ROWS - 1,
+                    "cursor_col" => saved.cursor_col = aterm_core::grid::MAX_GRID_COLS - 1,
+                    _ => return Err(unsanitizable()),
+                }
+            }
+            "" if violation.field.starts_with("current_working_directory") => {
+                checkpoint.current_working_directory = None;
+            }
+            _ => return Err(unsanitizable()),
+        }
+        clamped.push(violation);
+    }
+}
+
+/// Say so, once per degraded carry: a rung below Full is a real loss to the
+/// user (scrollback, a cursor position, or the whole screen until the program
+/// redraws), and the capture used to make its choices in silence.
+fn log_degraded_carry(local_id: u64, rung: CarryRung, cause: &str) {
+    if rung != CarryRung::Full {
+        aterm_log::warn!("update apply: session {local_id} carried degraded ({rung}): {cause}");
+    }
+}
+
+/// A 1x1 blank screen charged to no budget: the carry of last resort when not
+/// even a 1x1 screen fits the aggregate that earlier sessions already spent.
+/// [`settle_wire_carries`] then finds the pool over the aggregate and lowers
+/// its largest session, so this never reaches the wire unpriced. It keeps
+/// `meta`'s shell-integration authority ([`keep_shell_integration_authority`]).
+fn unadmitted_blank_carry(meta: &CheckpointMeta) -> TerminalCheckpoint {
+    keep_shell_integration_authority(
+        aterm_core::terminal::Terminal::new(1, 1)
+            .checkpoint_carry_abandoning_partial(0)
+            .0,
+        meta,
+    )
+}
+
+/// A BLANK CARRY KEEPS THE SHELL'S MARK AUTHORITY: `meta`'s
+/// `require_shell_integration_nonce` and its carried nonce, onto a fresh
+/// engine's `blank` checkpoint, whose modes say "not required" and whose nonce
+/// is none.
+///
+/// The shell in that session keeps signing its OSC 133/633 marks with the
+/// nonce it was spawned with, whatever happened to its screen. A blank
+/// fallback that carried the fresh engine's modes told the successor the
+/// requirement was OFF, so any program's output in that tab could forge
+/// command marks and exit codes, and `status` said `integration=off` for a
+/// session whose integration was merely degraded — the fail-open main's nonce
+/// carry forbids (`spawn::authorize_adopted_shell_nonce`: "clearing it would
+/// let any program's output forge marks"). Only the authority is kept; the
+/// screen state stays the fresh engine's, which is the point of the fallback.
+fn keep_shell_integration_authority(
+    mut blank: TerminalCheckpoint,
+    meta: &CheckpointMeta,
+) -> TerminalCheckpoint {
+    blank.modes.require_shell_integration_nonce = meta.modes.require_shell_integration_nonce;
+    blank.shell_integration_nonce = meta
+        .shell_integration_nonce
+        .as_deref()
+        .and_then(aterm_core::terminal::ShellIntegrationNonce::from_hex);
+    blank
+}
+
+/// The Repaint rung for a session whose projection is `source`: its sanitized
+/// scalar state on a blank canonical screen, priced against `aggregate_cells`
+/// at the successor's `caps` ([`repaint_checkpoint_within`]).
+fn repaint_carry(
+    source: &TerminalCheckpoint,
+    aggregate_cells: &mut u64,
+    caps: WireCaps,
+) -> TerminalCheckpoint {
+    let meta = CheckpointMeta::from_checkpoint(source);
+    repaint_checkpoint_within(Some(&meta), aggregate_cells, caps)
+        .unwrap_or_else(|| unadmitted_blank_carry(&meta))
+}
+
+/// The first grid blob of `checkpoint` over the byte cap its own geometry and
+/// carried history price — the `GridOverCap` arms of `screen_digest`, asked
+/// while the carry can still be lowered.
+fn grid_over_cap(local_id: u64, checkpoint: &TerminalCheckpoint) -> Option<ScreenDigestRefusal> {
+    let cap = dimension_grid_cap(checkpoint.rows, checkpoint.cols, checkpoint.history_lines)?;
+    [
+        (GridSlot::Main, Some(&checkpoint.grid)),
+        (GridSlot::Inactive, checkpoint.alt_grid.as_ref()),
+    ]
+    .into_iter()
+    .find_map(|(which, blob)| {
+        let len = u64::try_from(blob?.len()).unwrap_or(u64::MAX);
+        (len > cap).then_some(ScreenDigestRefusal::GridOverCap {
+            local_id,
+            which,
+            len,
+            cap,
+        })
+    })
+}
+
+/// THE PRODUCER'S LADDER for one session (the 2026-09-22/23 update audit, plan
+/// P0-1a): the most faithful carry of `terminal` that this build's own wire
+/// predicates admit at the successor's `caps`, the rung it was carried at, and
+/// why it is below Full. TOTAL: there is no refusal — every predicate that fails
+/// picks the next rung, and the last rung is a blank canonical screen.
+///
+/// The rungs, in order: the screen with `want_history` lines of scrollback
+/// ([`CarryRung::Full`]); without them ([`CarryRung::VisibleOnly`]); either
+/// one with its out-of-bound scalars clamped ([`CarryRung::Sanitized`]); a
+/// blank screen carrying the sanitized scalar state ([`CarryRung::Repaint`]).
+/// Each is judged by the predicates `screen_digest` and the consumer run —
+/// [`WireCaps::admit`] (per-grid and aggregate cells, charged to
+/// `aggregate_cells` only for the carry returned), [`checkpoint_shape_refusal`],
+/// the grid byte caps, the successor's own line decoder where it is older than
+/// this build's ([`WireCaps::line_decoder_refusal`]), and
+/// [`checkpoint_meta_bound_violation`] — which used to run first in
+/// `screen_digest`, past the point where anything could still be lowered.
+///
+/// PRICED AS THE CONSUMER PRICES IT: the inactive grid is charged only when
+/// the engine really has one ([`Terminal::has_inactive_grid`]), which is what
+/// the projection will carry and what `screen_digest` and the successor
+/// charge. The exact rungs used to reserve one unconditionally while the
+/// Repaint rung priced the real alt, so with the aggregate nearly spent an
+/// exact visible screen that fit was refused and the same session was then
+/// carried BLANK at the same geometry and cost — the ladder inverted (the
+/// 2026-09-24 review).
+///
+/// A parser left mid-sequence (an unterminated OSC title, a stalled escape)
+/// no longer refuses: the carry is [`Terminal::checkpoint_carry_abandoning_partial`],
+/// which leaves the partial sequence out exactly as CAN would and never
+/// touches the live parser, so a rolled-back handoff resumes byte-exactly.
+/// Whether abandoning is safe at all is the CAPTURE's question, asked before
+/// this runs: a sequence whose tail is still queued on the PTY would print as
+/// text in the successor, so the park misses instead
+/// (`app_update_handoff::CaptureFailure::MidSequence`).
+///
+/// [`Terminal::has_inactive_grid`]: aterm_core::terminal::Terminal::has_inactive_grid
+/// [`Terminal::checkpoint_carry_abandoning_partial`]:
+///     aterm_core::terminal::Terminal::checkpoint_carry_abandoning_partial
+pub(crate) fn carry_for_wire(
+    terminal: &aterm_core::terminal::Terminal,
+    local_id: u64,
+    want_history: u32,
+    aggregate_cells: &mut u64,
+    caps: WireCaps,
+) -> (TerminalCheckpoint, CarryRung, Option<String>) {
+    let (rows, cols) = (terminal.rows(), terminal.cols());
+    let want_history = want_history.min(MAX_HANDOFF_HISTORY_LINES);
+    // What the projection will carry as `alt_grid`, read before paying for it.
+    let has_alt = terminal.has_inactive_grid();
+    let mut causes: Vec<String> = Vec::new();
+    let mut projection = None;
+    let mut told_partial = false;
+    let ladder = [Some(want_history), (want_history > 0).then_some(0)];
+    for history in ladder.into_iter().flatten() {
+        let mut charged = *aggregate_cells;
+        if let Err(bound) = caps.admit(&mut charged, rows, cols, history, has_alt) {
+            causes.push(format!(
+                "{rows}x{cols} with {history} history line(s) was refused: {bound}"
+            ));
+            continue;
+        }
+        let (mut checkpoint, abandoned) =
+            terminal.checkpoint_carry_abandoning_partial(history as usize);
+        if let Some(state) = abandoned
+            && !told_partial
+        {
+            told_partial = true;
+            aterm_log::info!(
+                "update apply: session {local_id}'s parser was mid-sequence ({state}); its \
+                 carry leaves that partial sequence out, as CAN would"
+            );
+        }
+        if let Some(refusal) = checkpoint_shape_refusal(local_id, &checkpoint)
+            .or_else(|| grid_over_cap(local_id, &checkpoint))
+            .map(|refusal| refusal.to_string())
+            .or_else(|| {
+                caps.line_decoder_refusal(&checkpoint)
+                    .map(|why| format!("session {local_id}: {why}"))
+            })
+        {
+            causes.push(refusal);
+            projection = Some(checkpoint);
+            continue;
+        }
+        let mut rung = if history == want_history {
+            CarryRung::Full
+        } else {
+            CarryRung::VisibleOnly
+        };
+        if checkpoint_meta_bound_violation(&CheckpointMeta::from_checkpoint(&checkpoint)).is_some()
+        {
+            match sanitize_checkpoint_for_wire(&mut checkpoint) {
+                Ok(clamped) => {
+                    rung = CarryRung::Sanitized;
+                    causes.push(format!(
+                        "meta out of bounds at {rows}x{cols}, clamped: {}",
+                        clamped
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Err(why) => {
+                    causes.push(why);
+                    projection = Some(checkpoint);
+                    break;
+                }
+            }
+        }
+        *aggregate_cells = charged;
+        let cause = (!causes.is_empty()).then(|| causes.join("; "));
+        log_degraded_carry(local_id, rung, cause.as_deref().unwrap_or_default());
+        return (checkpoint, rung, cause);
+    }
+    let source = projection.unwrap_or_else(|| terminal.checkpoint_carry_abandoning_partial(0).0);
+    let checkpoint = repaint_carry(&source, aggregate_cells, caps);
+    let cause = causes.join("; ");
+    log_degraded_carry(local_id, CarryRung::Repaint, &cause);
+    (checkpoint, CarryRung::Repaint, Some(cause))
+}
+
+/// The Repaint rung taken directly, for a session the capture loop's own
+/// budget cannot afford at any higher rung (the decode-authority budget,
+/// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`, which only the producer prices). The
+/// same carry [`carry_for_wire`] ends on, with `cause` as its reason.
+pub(crate) fn repaint_carry_for_wire(
+    terminal: &aterm_core::terminal::Terminal,
+    local_id: u64,
+    aggregate_cells: &mut u64,
+    caps: WireCaps,
+    cause: String,
+) -> (TerminalCheckpoint, CarryRung, Option<String>) {
+    let source = terminal.checkpoint_carry_abandoning_partial(0).0;
+    let checkpoint = repaint_carry(&source, aggregate_cells, caps);
+    log_degraded_carry(local_id, CarryRung::Repaint, &cause);
+    (checkpoint, CarryRung::Repaint, Some(cause))
+}
+
+/// One session's screen as the producer will commit it, and the rung it was
+/// carried at — the unit [`settle_wire_carries`] lowers.
+#[derive(Debug, Clone)]
+pub(crate) struct WireCarry {
+    pub(crate) local_id: u64,
+    pub(crate) checkpoint: TerminalCheckpoint,
+    pub(crate) rung: CarryRung,
+}
+
+/// What one carry costs `screen_digest`'s aggregate cell admission — the same
+/// sum [`WireCaps::admit`] charges, with the inactive grid counted only when it
+/// is really carried.
+fn wire_cells(checkpoint: &TerminalCheckpoint) -> u64 {
+    let visible = u64::from(checkpoint.rows).saturating_mul(u64::from(checkpoint.cols));
+    let history = u64::from(checkpoint.history_lines).saturating_mul(u64::from(checkpoint.cols));
+    visible
+        .saturating_add(history)
+        .saturating_add(if checkpoint.alt_grid.is_some() {
+            visible
+        } else {
+            0
+        })
+}
+
+/// The real bytes one carry puts on the wire — what the 256 MiB aggregate
+/// (`MAX_HANDOFF_AGGREGATE_GRID_BYTES`) counts.
+fn wire_bytes(checkpoint: &TerminalCheckpoint) -> u64 {
+    let len = |blob: &[u8]| u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    len(&checkpoint.grid).saturating_add(checkpoint.alt_grid.as_deref().map_or(0, len))
+}
+
+/// Re-encode a carried checkpoint's main grid WITHOUT its scrollback: the last
+/// `rows` records of its own strict decode, re-serialized, so the result is
+/// canonical by construction and needs no engine lock. `false` (and nothing
+/// changed) when there is no history to drop or the blob does not decode.
+fn drop_carried_history(checkpoint: &mut TerminalCheckpoint) -> bool {
+    if checkpoint.history_lines == 0 {
+        return false;
+    }
+    let Some(lines) = strict_grid_lines(
+        &checkpoint.grid,
+        checkpoint.rows,
+        checkpoint.cols,
+        checkpoint.history_lines,
     ) else {
         return false;
     };
-    lines.len() == expected && aterm_core::scrollback::serialize_lines(&lines).as_slice() == bytes
+    let Some(visible) = lines.get(lines.len().saturating_sub(usize::from(checkpoint.rows))..)
+    else {
+        return false;
+    };
+    checkpoint.grid = aterm_core::scrollback::serialize_lines(visible);
+    checkpoint.history_lines = 0;
+    true
 }
 
-fn normalize_incoming_checkpoint_grid(
-    bytes: Vec<u8>,
-    rows: u16,
-    cols: u16,
-    history: u32,
-) -> Option<Vec<u8>> {
-    checkpoint_grid_is_canonical(&bytes, rows, cols, history).then_some(bytes)
+/// Whether a carry has a rung below it: anything above Repaint, and a Repaint
+/// carry bigger than the smallest blank screen (a pool-wide refusal may still
+/// shrink it — 24x80 at most, then 1x1 — as [`repaint_checkpoint_within`]'s
+/// own fallback does).
+fn is_lowerable(carry: &WireCarry) -> bool {
+    carry.rung != CarryRung::Repaint || (carry.checkpoint.rows, carry.checkpoint.cols) != (1, 1)
+}
+
+/// The index of the carry a POOL-WIDE refusal should lower: the lowerable one
+/// costing the most by `cost`.
+fn largest_lowerable(carries: &[WireCarry], cost: fn(&TerminalCheckpoint) -> u64) -> Option<usize> {
+    carries
+        .iter()
+        .enumerate()
+        .filter(|(_, carry)| is_lowerable(carry))
+        .max_by_key(|(_, carry)| cost(&carry.checkpoint))
+        .map(|(index, _)| index)
+}
+
+/// Lower one carry a single step, priced against every OTHER carry's cells:
+/// drop its scrollback when `repaint` is false and it has some; else carry it
+/// at the Repaint rung; and a carry already there becomes a smaller blank
+/// screen (24x80 at most, then 1x1).
+fn lower_wire_carry(
+    carries: &mut [WireCarry],
+    index: usize,
+    repaint: bool,
+    caps: WireCaps,
+    why: &str,
+) {
+    let others = carries
+        .iter()
+        .enumerate()
+        .filter(|(other, _)| *other != index)
+        .map(|(_, carry)| wire_cells(&carry.checkpoint))
+        .fold(0_u64, u64::saturating_add);
+    let Some(carry) = carries.get_mut(index) else {
+        return;
+    };
+    if carry.rung != CarryRung::Repaint && !repaint && drop_carried_history(&mut carry.checkpoint) {
+        carry.rung = carry.rung.max(CarryRung::VisibleOnly);
+        log_degraded_carry(
+            carry.local_id,
+            carry.rung,
+            &format!("the capture's self-check dropped its scrollback: {why}"),
+        );
+        return;
+    }
+    let mut meta = CheckpointMeta::from_checkpoint(&carry.checkpoint);
+    if carry.rung == CarryRung::Repaint {
+        (meta.rows, meta.cols) = if meta.rows > 24 || meta.cols > 80 {
+            (meta.rows.min(24), meta.cols.min(80))
+        } else {
+            (1, 1)
+        };
+    }
+    let mut used = others;
+    carry.checkpoint = repaint_checkpoint_within(Some(&meta), &mut used, caps)
+        .unwrap_or_else(|| unadmitted_blank_carry(&meta));
+    carry.rung = CarryRung::Repaint;
+    log_degraded_carry(
+        carry.local_id,
+        carry.rung,
+        &format!("the capture's self-check refused its carry: {why}"),
+    );
+}
+
+/// THE PRODUCER'S SELF-CHECK (the 2026-09-22/23 update audit, plan P0-1d):
+/// commit the pool with `screen_digest` — this build's own full predicate, the
+/// one its consumer runs — and where it refuses, lower the carry it blames and
+/// commit again, instead of refusing the update.
+///
+/// * A refusal naming a session replaces that session's carry with its
+///   Repaint carry — at most once per session.
+/// * The pool over the aggregate cell budget, or over the 256 MiB of real
+///   grid bytes, lowers its LARGEST session: its scrollback first, then its
+///   screen.
+/// * What survives is typed: too many sessions, a duplicate id, an allocation
+///   failure — none of them about any one screen — and a refusal of a carry
+///   already at the Repaint rung, which this build's own predicates admit by
+///   construction and a test pins as unreachable.
+///
+/// Bounded: every lowering moves one carry strictly down (its history, once;
+/// its screen, once; a blank screen to 24x80, then 1x1), so at most four per
+/// session happen.
+pub(crate) fn settle_wire_carries(
+    carries: &mut [WireCarry],
+    caps: WireCaps,
+) -> Result<[u8; 32], ScreenDigestRefusal> {
+    let mut lowerings_left = carries.len().saturating_mul(4);
+    loop {
+        let refusal = match screen_digest_refs(
+            carries
+                .iter()
+                .map(|carry| (carry.local_id, &carry.checkpoint))
+                .collect(),
+        ) {
+            Ok(digest) => return Ok(digest),
+            Err(refusal) => refusal,
+        };
+        if lowerings_left == 0 {
+            return Err(refusal);
+        }
+        lowerings_left -= 1;
+        let (index, repaint) = match &refusal {
+            ScreenDigestRefusal::TooManySessions { .. }
+            | ScreenDigestRefusal::DuplicateLocalId { .. }
+            | ScreenDigestRefusal::Alloc { .. } => return Err(refusal),
+            ScreenDigestRefusal::DimensionsRefused {
+                bound: AdmitRefusal::Aggregate { .. },
+                ..
+            } => match largest_lowerable(carries, wire_cells) {
+                Some(index) => (index, false),
+                None => return Err(refusal),
+            },
+            ScreenDigestRefusal::WireFraming => {
+                let total = carries
+                    .iter()
+                    .map(|carry| wire_bytes(&carry.checkpoint))
+                    .fold(0_u64, u64::saturating_add);
+                if total <= MAX_HANDOFF_AGGREGATE_GRID_BYTES {
+                    return Err(refusal);
+                }
+                match largest_lowerable(carries, wire_bytes) {
+                    Some(index) => (index, false),
+                    None => return Err(refusal),
+                }
+            }
+            blamed => {
+                let Some(position) = blamed.local_id().and_then(|local_id| {
+                    carries.iter().position(|carry| {
+                        carry.local_id == local_id && carry.rung != CarryRung::Repaint
+                    })
+                }) else {
+                    return Err(refusal);
+                };
+                (position, true)
+            }
+        };
+        let why = if matches!(refusal, ScreenDigestRefusal::WireFraming) {
+            format!(
+                "the pool's grids are over the {MAX_HANDOFF_AGGREGATE_GRID_BYTES}-byte aggregate"
+            )
+        } else {
+            refusal.to_string()
+        };
+        lower_wire_carry(carries, index, repaint, caps, &why);
+    }
 }
 
 /// Validate the volatile fd channel as an exact bijection before any inherited
@@ -1618,8 +2794,8 @@ pub(crate) struct OutgoingHandoff {
 
 /// Write the outgoing handoff manifest (nonce-stamped, `0600`, in the `0700` control dir)
 /// and return the [`OutgoingHandoff`] whose first three fields become the child's env.
-/// `None` when there is no private control dir (then the caller re-execs WITHOUT the
-/// seamless env → a normal cold apply). Every fd in `fds` is a child-owned CLOEXEC
+/// [`WriteOutgoingFailure::NoPrivateDir`] when there is no private control dir (then
+/// the caller re-execs WITHOUT the seamless env → a normal cold apply). Every fd in `fds` is a child-owned CLOEXEC
 /// duplicate; the caller clears the flag only in that command's `pre_exec` closure.
 ///
 /// `screens` carries each session's engine checkpoint (by `local_id`): the scalar
@@ -1639,18 +2815,24 @@ pub(crate) struct OutgoingHandoff {
 /// `nonce` is the attempt nonce ([`mint_outgoing_nonce`]), supplied by the caller
 /// so the successor can be launched with the manifest's path before this runs;
 /// it is echoed in the result and written as the manifest's first line.
+///
+/// `repaint` names the sessions the capture carried below its exact rungs
+/// ([`CarryRung::needs_repaint`]: a clamped or blank screen), whose
+/// `ScreenCarry::repaint` tells the successor to make the program redraw. The
+/// flag is covered by no digest, so it cannot move the proof.
 pub(crate) fn write_outgoing(
     manifest: &SessionHandoff,
     fds: &HandoffFds,
     screens: &[(u64, TerminalCheckpoint)],
+    repaint: &[u64],
     window: Option<WindowCarry>,
     controls: &[(u64, Vec<u8>)],
     nonce: &str,
-) -> Option<OutgoingHandoff> {
-    let dir = crate::control_auth::socket_dir()?;
+) -> Result<OutgoingHandoff, WriteOutgoingFailure> {
+    let dir = crate::control_auth::socket_dir().ok_or(WriteOutgoingFailure::NoPrivateDir)?;
     let path = dir.join(outgoing_manifest_name(nonce));
 
-    let _ = validated_identities(manifest, fds)?;
+    let _ = validated_identities(manifest, fds).ok_or(WriteOutgoingFailure::Inconsistent)?;
     let mut session_ids = manifest
         .sessions
         .iter()
@@ -1665,11 +2847,11 @@ pub(crate) fn write_outgoing(
         || session_ids != fd_ids
         || session_ids.windows(2).any(|pair| pair[0] == pair[1])
     {
-        return None;
+        return Err(WriteOutgoingFailure::Inconsistent);
     }
 
     // Attach the screen carries all-or-nothing. Track each blob so a partial
-    // physical write is retired before returning PreparationFailed.
+    // physical write is retired before returning (the caller files ProducerFailed).
     let mut manifest = manifest.clone();
     manifest.window = window;
     let mut written_blobs = Vec::with_capacity(screens.len().saturating_mul(2));
@@ -1685,7 +2867,7 @@ pub(crate) fn write_outgoing(
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
-            return None;
+            return Err(WriteOutgoingFailure::Inconsistent);
         };
         let checkpoint_meta = CheckpointMeta::from_checkpoint(cp);
         let admitted_cap = admit_checkpoint_dimensions(
@@ -1696,7 +2878,7 @@ pub(crate) fn write_outgoing(
             cp.alt_grid.is_some(),
         );
         if !cp.parser_ground
-            || admitted_cap.is_none()
+            || admitted_cap.is_err()
             || checkpoint_grid_cap(&checkpoint_meta)
                 .is_none_or(|cap| u64::try_from(cp.grid.len()).map_or(true, |len| len > cap))
             || !checkpoint_grid_is_canonical(&cp.grid, cp.rows, cp.cols, cp.history_lines)
@@ -1710,7 +2892,7 @@ pub(crate) fn write_outgoing(
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
-            return None;
+            return Err(WriteOutgoingFailure::Inconsistent);
         }
         aggregate_bytes = u64::try_from(cp.grid.len())
             .ok()
@@ -1727,23 +2909,23 @@ pub(crate) fn write_outgoing(
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
-            return None;
+            return Err(WriteOutgoingFailure::Inconsistent);
         }
         let Ok(meta) = aterm_json::to_string(&checkpoint_meta) else {
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
-            return None;
+            return Err(WriteOutgoingFailure::Inconsistent);
         };
         let grid_file = dir.join(format!(
             "seamless-{}-{nonce}.s{local_id}.grid",
             std::process::id()
         ));
-        if write_private(&grid_file, &cp.grid).is_none() {
+        if let Err(error) = write_private(&grid_file, &cp.grid) {
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
-            return None;
+            return Err(WriteOutgoingFailure::Io(error.kind()));
         }
         written_blobs.push(grid_file.clone());
         let alt_grid_file = if let Some(alt) = cp.alt_grid.as_ref() {
@@ -1751,11 +2933,11 @@ pub(crate) fn write_outgoing(
                 "seamless-{}-{nonce}.s{local_id}.altgrid",
                 std::process::id()
             ));
-            if write_private(&p, alt).is_none() {
+            if let Err(error) = write_private(&p, alt) {
                 for path in written_blobs {
                     let _ = std::fs::remove_file(path);
                 }
-                return None;
+                return Err(WriteOutgoingFailure::Io(error.kind()));
             }
             written_blobs.push(p.clone());
             Some(p.to_string_lossy().into_owned())
@@ -1768,6 +2950,7 @@ pub(crate) fn write_outgoing(
             meta,
             grid_file: grid_file.to_string_lossy().into_owned(),
             alt_grid_file,
+            repaint: repaint.contains(local_id),
         });
     }
     // THE commitment, taken over the bytes actually published above (the same
@@ -1779,7 +2962,7 @@ pub(crate) fn write_outgoing(
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
-            return None;
+            return Err(WriteOutgoingFailure::Inconsistent);
         };
         wire_entries.push(ScreenWireEntry {
             local_id: *local_id,
@@ -1792,7 +2975,7 @@ pub(crate) fn write_outgoing(
         for path in written_blobs {
             let _ = std::fs::remove_file(path);
         }
-        return None;
+        return Err(WriteOutgoingFailure::Inconsistent);
     };
     drop(wire_entries);
     // THE CONTROL CARRY, after the commitment above on purpose: nothing here
@@ -1829,33 +3012,18 @@ pub(crate) fn write_outgoing(
         for path in written_blobs {
             let _ = std::fs::remove_file(path);
         }
-        return None;
+        return Err(WriteOutgoingFailure::Inconsistent);
     };
     // First line is the nonce (bound to the env copy); the rest is the manifest TOML.
     let body = format!("{nonce}\n{toml}");
     // 0600: readable only by us (the dir is already 0700 per-user).
-    #[cfg(unix)]
-    let write_ok = {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut f| f.write_all(body.as_bytes()))
-            .is_ok()
-    };
-    #[cfg(not(unix))]
-    let write_ok = std::fs::write(&path, &body).is_ok();
-    if !write_ok {
+    if let Err(error) = write_private(&path, body.as_bytes()) {
         for path in written_blobs {
             let _ = std::fs::remove_file(path);
         }
-        return None;
+        return Err(WriteOutgoingFailure::Io(error.kind()));
     }
-    Some(OutgoingHandoff {
+    Ok(OutgoingHandoff {
         manifest_path: path.to_string_lossy().into_owned(),
         nonce: nonce.to_string(),
         fds_wire: fds.encode(),
@@ -1877,6 +3045,10 @@ pub(crate) struct IncomingHandoff {
     /// process. Retained for the one-release legacy one-channel bridge: the new
     /// child signals an old parent only when its ACTUAL adopted pool equals this.
     /// Attempt-bound layout sidecar consumed from the same private nonce prefix.
+    /// `None` beside a non-empty `adopted` when the sidecar was read and hashed
+    /// but this build could not parse it or it did not name exactly the adopted
+    /// sessions: the shells are then placed as tabs by the orphan net rather
+    /// than refused (the 2026-09-22/23 update audit, plan P0-2e).
     pub layout: Option<crate::restore::RestoreManifest>,
     /// [`layout_wire_digest`] over the EXACT sidecar bytes this process read —
     /// never over a re-serialization of `layout`. The outgoing process hashed
@@ -1893,6 +3065,30 @@ pub(crate) struct IncomingHandoff {
     /// once every adopted session is registered — never a token, never a
     /// nonce, so nothing here is authority until the re-mint says so.
     pub connections: Vec<ConnectionCarry>,
+}
+
+impl IncomingHandoff {
+    /// How many adopted sessions arrive on a blank screen to be repainted —
+    /// whichever side degraded them: the outgoing build's capture carried the
+    /// session below its exact rungs (`ScreenCarry::repaint`), or this build
+    /// refused the carried screen's content ([`admit_incoming_screen`]).
+    ///
+    /// WHY IT IS COUNTED (the 2026-09-22/23 update audit, plan P1-5): since the
+    /// audit a screen the handoff cannot carry costs that screen instead of the
+    /// update, and until now the cost was a log line only — a tab came back
+    /// blank until its program redrew, with nothing on glass saying why. The
+    /// boot keeps this count for the landing record
+    /// ([`crate::update_words::landed`]), which names it and says why, so a
+    /// degrade is never unseen.
+    /// The unit is the session, and a split pane is a session of its own: the
+    /// record says "tab" for what the user sees as one screen.
+    #[must_use]
+    pub(crate) fn repainted_tabs(&self) -> usize {
+        self.adopted
+            .iter()
+            .filter(|adopted| adopted.repaint)
+            .count()
+    }
 }
 
 #[cfg(unix)]
@@ -3292,6 +4488,22 @@ pub(crate) fn take_commit_fd(
 /// `control` stamp and decoded onto [`Adopted::control`], and the manifest's
 /// `next_turn_id` continues this process's turn-id count — while still single-
 /// threaded. Nothing about either can make this return an empty handoff.
+///
+/// TWO KINDS OF "NO" (the 2026-09-22/23 update audit, plan P0-2). This is the
+/// NEWER build reading the OLDER build's bytes, so it is where hostile input is
+/// checked — and the only side whose rules a release can correct for the hop
+/// into it. It refuses the WHOLE handoff only for identity and resource facts:
+/// the env/nonce/path binding, the manifest's parse or size, a session it was
+/// not told of, a master that is not a tty or cannot be made CLOEXEC, a missing
+/// screen carry or one naming another record's sidecar, a sidecar over its byte
+/// cap, the aggregate byte cap, and more sessions than the protocol carries. A
+/// screen whose CONTENT it refuses (meta, dimensions, canonicality, alt
+/// presence) and a layout it cannot parse cost that screen or that layout only:
+/// the shell is adopted onto a blank engine and repainted (`Adopted::repaint`),
+/// or placed as a tab, one WARN line says which session and why, and both
+/// digests are still taken over the bytes as read, so the proof matches every
+/// parent already in the field. It used to refuse everything for either, with
+/// no log line, and every shell stayed on the old build.
 pub(crate) fn take_incoming() -> IncomingHandoff {
     take_incoming_as(ReceiverShape::Current)
 }
@@ -3393,34 +4605,42 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
     if !(commit_env_present && ready_env_present && layout_path.is_some()) {
         return IncomingHandoff::default();
     }
-    let (layout, layout_digest) = {
-        layout_path
-            .and_then(|layout_path| {
-                let layout_path = std::path::Path::new(&layout_path);
-                let expected_layout = std::path::Path::new(&path).with_extension("layout.toml");
-                if !layout_path.starts_with(&dir) || layout_path != expected_layout {
-                    return None;
-                }
-                let wire = take_regular_capped(layout_path, &dir, MAX_HANDOFF_LAYOUT_BYTES)
-                    .and_then(|bytes| String::from_utf8(bytes).ok())?;
-                // COMMIT TO THE BYTES, NOT TO THE PARSE. `layout` below is only
-                // used to rebuild panes; the digest the parent will compare
-                // against is a pure function of this exact wire.
-                let digest = layout_wire_digest(&wire)?;
-                let layout = crate::restore::RestoreManifest::from_toml(&wire)
-                    .filter(|layout| layout.covers_exact_seamless_ids(&expected_ids))?;
-                Some((layout, digest))
-            })
-            .map_or((None, None), |(layout, digest)| {
-                (Some(layout), Some(digest))
-            })
-    };
-    // Both direct old exec and one-channel overlap require the legacy global
-    // layout to join exactly to the authenticated PTY identities. Only the
-    // overlap shape emits the old one-byte ACK later.
-    if layout.is_none() {
+    // THE LAYOUT DEGRADES, IT DOES NOT REFUSE (the 2026-09-22/23 update audit,
+    // plan P0-2e). The sidecar must still be read at its exact path and hashed:
+    // a missing, oversized or non-UTF-8 sidecar is not what the parent wrote,
+    // and without its bytes there is no layout digest to prove. But a wire that
+    // THIS build cannot parse, or whose terminal leaves do not name exactly the
+    // authenticated sessions, is content: every session is still adopted and
+    // placed by the orphan net (`App::adopt_orphan_shells_as_tabs`) as a tab of
+    // the first window, and the digest over the bytes read still matches the
+    // parent's. Refusing here cost every shell its update for want of a pane
+    // arrangement.
+    let Some((layout, layout_digest, unplaced_layout)) = layout_path.and_then(|layout_path| {
+        let layout_path = std::path::Path::new(&layout_path);
+        let expected_layout = std::path::Path::new(&path).with_extension("layout.toml");
+        if !layout_path.starts_with(&dir) || layout_path != expected_layout {
+            return None;
+        }
+        let wire = take_regular_capped(layout_path, &dir, MAX_HANDOFF_LAYOUT_BYTES)
+            .and_then(|bytes| String::from_utf8(bytes).ok())?;
+        // COMMIT TO THE BYTES, NOT TO THE PARSE. `layout` below is only
+        // used to rebuild panes; the digest the parent will compare
+        // against is a pure function of this exact wire.
+        let digest = layout_wire_digest(&wire)?;
+        Some(match crate::restore::RestoreManifest::from_toml(&wire) {
+            Some(layout) if layout.covers_exact_seamless_ids(&expected_ids) => {
+                (Some(layout), digest, None)
+            }
+            Some(_) => (
+                None,
+                digest,
+                Some("does not name exactly the handed-off sessions"),
+            ),
+            None => (None, digest, Some("does not parse in this build")),
+        })
+    }) else {
         return IncomingHandoff::default();
-    }
+    };
     let manifest_path = std::path::Path::new(&path);
     let Some(manifest_stem) = manifest_path.file_stem().and_then(|stem| stem.to_str()) else {
         return IncomingHandoff::default();
@@ -3428,155 +4648,169 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
     let mut remaining_grid_bytes = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
     let mut used_grid_cells = 0_u64;
     let mut remaining_control_bytes = crate::handoff_carry::MAX_AGGREGATE_BYTES;
-    let adopted = manifest
+    let incoming = manifest
         .sessions
         .iter()
         .map(|rec| {
+            // HARD REFUSALS FIRST — identity, descriptor and resource facts.
+            // Any one of these rejects the WHOLE adoption before a byte of
+            // content is judged: they are what make the PTY this process's to
+            // own and bound what adopting it may allocate.
+            // `validated_identities` made the record and fd sets one bijection.
             let (_, fd, pid) = expected
                 .iter()
                 .find(|(local_id, _, _)| *local_id == rec.local_id)
                 .copied()?;
             if !aterm_pty::fd_is_tty(fd) {
-                return None;
+                return refuse_incoming_session(
+                    rec.local_id,
+                    "was handed a master that is not a tty",
+                );
             }
             // The outgoing parent clears CLOEXEC only in this process's pre-exec
             // child image. Re-arm before ANY child/session spawn; failure rejects
             // this adoption so no later subprocess can inherit the PTY master.
-            aterm_pty::set_cloexec(fd, true).ok()?;
-            // SCREEN CARRY is mandatory and exact-path bound: a canonical line
-            // stream of precisely `rows + history_lines` records for the main
-            // grid (the carried scrollback is bounded by
-            // `MAX_HANDOFF_HISTORY_LINES` and priced before a byte is decoded),
-            // and exactly `rows` for the alt grid, whose presence must agree
-            // with the meta's alt cursor.
-            let sc = rec.screen.as_ref()?;
-            let meta = parse_checkpoint_meta(sc)?;
-            let grid_cap = checkpoint_grid_cap(&meta)?;
-            if admit_checkpoint_dimensions(
-                &mut used_grid_cells,
-                meta.rows,
-                meta.cols,
-                meta.history_lines,
-                meta.alt_cursor.is_some(),
-            )? != grid_cap
-            {
-                return None;
+            if aterm_pty::set_cloexec(fd, true).is_err() {
+                return refuse_incoming_session(
+                    rec.local_id,
+                    "could not re-arm CLOEXEC on its master",
+                );
             }
-            let grid_path =
-                manifest_path.with_file_name(format!("{manifest_stem}.s{}.grid", rec.local_id));
-            if std::path::Path::new(&sc.grid_file) != grid_path {
-                return None;
-            }
-            let wire_cap = grid_cap;
-            let grid = take_grid_capped(&grid_path, &dir, wire_cap, &mut remaining_grid_bytes)?;
-            let grid =
-                normalize_incoming_checkpoint_grid(grid, meta.rows, meta.cols, meta.history_lines)?;
-            let alt_grid = match (&meta.alt_cursor, sc.alt_grid_file.as_deref()) {
-                (None, None) => None,
-                (Some(_), Some(encoded_path)) => {
-                    let alt_path = manifest_path
-                        .with_file_name(format!("{manifest_stem}.s{}.altgrid", rec.local_id));
-                    if std::path::Path::new(encoded_path) != alt_path {
-                        return None;
-                    }
-                    let bytes =
-                        take_grid_capped(&alt_path, &dir, wire_cap, &mut remaining_grid_bytes)?;
-                    // The alt screen never carries history.
-                    Some(normalize_incoming_checkpoint_grid(
-                        bytes, meta.rows, meta.cols, 0,
-                    )?)
-                }
-                _ => return None,
+            // SCREEN CARRY is mandatory and exact-path bound: every producer
+            // sends one, so a record without it, or naming any sidecar but its
+            // own, is not a carry this process may read.
+            let Some(sc) = rec.screen.as_ref() else {
+                return refuse_incoming_session(rec.local_id, "carried no screen");
             };
-            let checkpoint = meta.into_checkpoint(grid, alt_grid);
+            let meta = parse_checkpoint_meta(sc);
+            let wire = match take_screen_wire(
+                sc,
+                meta.as_ref(),
+                &manifest_path.with_file_name(format!("{manifest_stem}.s{}.grid", rec.local_id)),
+                &manifest_path.with_file_name(format!("{manifest_stem}.s{}.altgrid", rec.local_id)),
+                &dir,
+                &mut remaining_grid_bytes,
+            ) {
+                Ok(wire) => wire,
+                Err(why) => return refuse_incoming_session(rec.local_id, why),
+            };
+            // THEN THE CONTENT, which costs at most this session's screen.
+            let screen = admit_incoming_screen(meta, wire, &mut used_grid_cells);
+            let repaint = sc.repaint || matches!(screen, IncomingScreen::Degraded { .. });
             // The CONTROL CARRY, best-effort: whatever happens to it, this
-            // session adopts.
+            // session adopts. A REPAINTED session goes without it — the
+            // archive diffs the app's next frame against a screen that was not
+            // carried — and its sidecar is removed unread.
+            let control_path =
+                manifest_path.with_file_name(format!("{manifest_stem}.s{}.ctl", rec.local_id));
             let control = match shape {
+                ReceiverShape::Current if repaint => {
+                    if rec.control.is_some() {
+                        let _ = std::fs::remove_file(&control_path);
+                    }
+                    None
+                }
                 ReceiverShape::Current => rec.control.as_deref().and_then(|stamp| {
-                    take_control_sidecar(
-                        &manifest_path
-                            .with_file_name(format!("{manifest_stem}.s{}.ctl", rec.local_id)),
-                        &dir,
-                        stamp,
-                        &mut remaining_control_bytes,
-                    )
+                    take_control_sidecar(&control_path, &dir, stamp, &mut remaining_control_bytes)
                 }),
                 #[cfg(all(test, unix))]
                 ReceiverShape::PreCarry => None,
             };
-            Some(Adopted {
-                // Carry the outgoing pool id so the boot re-adopts this shell into its
-                // original pane (the restore manifest's leaf carries the same id).
-                local_id: rec.local_id,
-                master: fd,
-                pid,
-                // Preserve the fabric SID so `aterm-ctl @<sid>` still resolves the session
-                // after the update; a fresh nonce (edge rows bound to the OLD nonce die
-                // with the old process — by design, §1.4#3). The manifest's tokenless
-                // `connections` triples SUPERSEDE the former "edges are re-established
-                // on demand" posture: once every adopted session is registered,
-                // `App::remint_carried_connections` re-mints each carried pair through
-                // the one kind-bounded helper under this fresh nonce (origin
-                // `handoff`), so live connections survive a seamless update without a
-                // token or nonce ever riding the manifest (design §1.4#6).
-                sid: SessionId::new(rec.sid.clone()),
-                nonce: LaunchNonce::generate(),
-                checkpoint: Some(checkpoint),
-                control,
-                // FROZEN PATH (2026-09-16): the sender wrote no `outgoing_build`
-                // at all — the one build before the field, whose sessions had no
-                // `agents/` in front (presence is the whole test; the number is
-                // never compared) — or the sender itself adopted this shell
-                // frozen and said so per record. A conservative bound: every
-                // session of that old build is marked, a tab it opened after the
-                // hooks existed included; sourcing the hook there is a no-op.
-                // THE SAME BOUND COVERS A ROLLBACK (review, 2026-09-16): a
-                // downgrade to a pre-field build reads this manifest fine (no
-                // `deny_unknown_fields`) and writes none of it back, so when
-                // that build is updated again EVERY tab it hands across is
-                // marked — the tabs this build spawned, with the live re-assert
-                // running in them, included — and the per-record carry keeps
-                // the mark through every later handoff. Accepted: the mark is a
-                // bound, never lowered by the remedy (the hook is a no-op in
-                // such a tab, and the tab keeps the managed copies it runs),
-                // and it leaves when the tab closes. Nothing compares a build
-                // number to sort the two cases apart, by the rule above.
-                frozen_path: crate::session_store::predates_path_self_heal(manifest.outgoing_build)
-                    || rec.frozen_path,
-                // IDENTITY (session identities, 2026-09-17): the label rides the
-                // record; the shell keeps the identity's env across the exec.
-                identity: rec.identity.clone(),
-                // BROADCAST OPT-INS (round 23): the topic set rides the record,
-                // validated on the way onto the fabric (`fabric::parse_topics`).
-                topics: rec.topics.clone(),
+            let (checkpoint, degraded) = match screen {
+                IncomingScreen::Exact(checkpoint) => (Some(checkpoint), None),
+                IncomingScreen::Degraded {
+                    checkpoint,
+                    cause,
+                    wire,
+                } => (checkpoint, Some((cause, wire))),
+            };
+            Some(IncomingSession {
+                degraded,
+                adopted: Adopted {
+                    // Carry the outgoing pool id so the boot re-adopts this shell into its
+                    // original pane (the restore manifest's leaf carries the same id).
+                    local_id: rec.local_id,
+                    master: fd,
+                    pid,
+                    // Preserve the fabric SID so `aterm-ctl @<sid>` still resolves the session
+                    // after the update; a fresh nonce (edge rows bound to the OLD nonce die
+                    // with the old process — by design, §1.4#3). The manifest's tokenless
+                    // `connections` triples SUPERSEDE the former "edges are re-established
+                    // on demand" posture: once every adopted session is registered,
+                    // `App::remint_carried_connections` re-mints each carried pair through
+                    // the one kind-bounded helper under this fresh nonce (origin
+                    // `handoff`), so live connections survive a seamless update without a
+                    // token or nonce ever riding the manifest (design §1.4#6).
+                    sid: SessionId::new(rec.sid.clone()),
+                    nonce: LaunchNonce::generate(),
+                    checkpoint,
+                    control,
+                    repaint,
+                    // FROZEN PATH (2026-09-16): the sender wrote no `outgoing_build`
+                    // at all — the one build before the field, whose sessions had no
+                    // `agents/` in front (presence is the whole test; the number is
+                    // never compared) — or the sender itself adopted this shell
+                    // frozen and said so per record. A conservative bound: every
+                    // session of that old build is marked, a tab it opened after the
+                    // hooks existed included; sourcing the hook there is a no-op.
+                    // THE SAME BOUND COVERS A ROLLBACK (review, 2026-09-16): a
+                    // downgrade to a pre-field build reads this manifest fine (no
+                    // `deny_unknown_fields`) and writes none of it back, so when
+                    // that build is updated again EVERY tab it hands across is
+                    // marked — the tabs this build spawned, with the live re-assert
+                    // running in them, included — and the per-record carry keeps
+                    // the mark through every later handoff. Accepted: the mark is a
+                    // bound, never lowered by the remedy (the hook is a no-op in
+                    // such a tab, and the tab keeps the managed copies it runs),
+                    // and it leaves when the tab closes. Nothing compares a build
+                    // number to sort the two cases apart, by the rule above.
+                    frozen_path: crate::session_store::predates_path_self_heal(
+                        manifest.outgoing_build,
+                    ) || rec.frozen_path,
+                    // IDENTITY (session identities, 2026-09-17): the label rides the
+                    // record; the shell keeps the identity's env across the exec.
+                    identity: rec.identity.clone(),
+                    // BROADCAST OPT-INS (round 23): the topic set rides the record,
+                    // validated on the way onto the fabric (`fabric::parse_topics`).
+                    topics: rec.topics.clone(),
+                },
             })
         })
         .collect::<Option<Vec<_>>>();
-    let Some(adopted) = adopted else {
+    let Some(incoming) = incoming else {
         return IncomingHandoff::default();
     };
-    // COMMIT TO THE CARRIED BYTES. `checkpoint.grid`/`alt_grid` are the sidecar
-    // blobs VERBATIM (`normalize_incoming_checkpoint_grid` validates canonicality
-    // and returns its input unchanged), and `rec.screen.meta` is the parent's
-    // JSON string unparsed — so this hashes exactly what `write_outgoing` hashed.
+    // COMMIT TO THE CARRIED BYTES — for EVERY adopted session, degraded or not.
+    // An exact session's `checkpoint.grid`/`alt_grid` are the sidecar blobs
+    // VERBATIM (`admit_incoming_screen` validates canonicality and moves its
+    // input in unchanged); a degraded session keeps the bytes it read beside
+    // the blank screen it adopts. `rec.screen.meta` is the parent's JSON string
+    // unparsed — so this hashes exactly what `write_outgoing` hashed, and a
+    // screen this build refused still proves against the parent that sent it.
     // Re-deriving the meta from `CheckpointMeta::from_checkpoint(&rebuilt)` (the
     // old behaviour) required the NEW binary's `CheckpointMeta` serde shape to be
     // byte-identical to the OLD binary's: one added field broke every handoff.
-    let Some(mut wire_entries) = adopted
+    let Some(mut wire_entries) = incoming
         .iter()
         .map(|item| {
-            let checkpoint = item.checkpoint.as_ref()?;
+            let (grid, alt_grid) = match &item.degraded {
+                Some((_, wire)) => (wire.grid.as_slice(), wire.alt_grid.as_deref()),
+                None => {
+                    let checkpoint = item.adopted.checkpoint.as_ref()?;
+                    (checkpoint.grid.as_slice(), checkpoint.alt_grid.as_deref())
+                }
+            };
             let carry = manifest
                 .sessions
                 .iter()
-                .find(|rec| rec.local_id == item.local_id)?
+                .find(|rec| rec.local_id == item.adopted.local_id)?
                 .screen
                 .as_ref()?;
             Some(ScreenWireEntry {
-                local_id: item.local_id,
+                local_id: item.adopted.local_id,
                 meta: carry.meta.as_bytes(),
-                grid: &checkpoint.grid,
-                alt_grid: checkpoint.alt_grid.as_deref(),
+                grid,
+                alt_grid,
             })
         })
         .collect::<Option<Vec<_>>>()
@@ -3584,9 +4818,42 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
         return IncomingHandoff::default();
     };
     let Some(screen_digest) = screen_wire_digest(&mut wire_entries) else {
+        aterm_log::warn!(
+            "overlap handoff: the carried screens could not be framed for the adoption proof \
+             (too many sessions, a duplicate id, or over the aggregate byte cap); refusing the \
+             whole handoff so the outgoing process keeps every session"
+        );
         return IncomingHandoff::default();
     };
     drop(wire_entries);
+    // SAY WHAT DID NOT CROSS, now that the adoption is certain — a handoff
+    // refused wholesale above never logs a degrade that did not happen. The raw
+    // bytes of a degraded screen were kept for the proof alone.
+    if let Some(why) = unplaced_layout {
+        aterm_log::warn!(
+            "overlap handoff: the carried layout {why}; adopting all {} session(s) as tabs of \
+             the first window instead of refusing the update",
+            incoming.len()
+        );
+    }
+    let adopted = incoming
+        .into_iter()
+        .map(|item| {
+            match &item.degraded {
+                Some((cause, _)) => aterm_log::warn!(
+                    "overlap handoff: adopted session {} with a degraded screen: {cause}",
+                    item.adopted.local_id
+                ),
+                None if item.adopted.repaint => aterm_log::info!(
+                    "overlap handoff: adopted session {} onto the blank screen the outgoing \
+                     build carried for a repaint",
+                    item.adopted.local_id
+                ),
+                None => {}
+            }
+            item.adopted
+        })
+        .collect::<Vec<_>>();
     // TURN IDS GO ON (round 10): above the outgoing process's count, and above
     // every carried record, while this process is still single-threaded — so a
     // `since-turn=`/`since=` anchor taken before the update still means "after
@@ -3607,7 +4874,7 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
         window: manifest.window,
         nonce: Some(env_nonce),
         layout,
-        layout_digest,
+        layout_digest: Some(layout_digest),
         screen_digest: Some(screen_digest),
         connections: manifest.connections,
     }
@@ -4014,6 +5281,75 @@ mod tests {
         );
     }
 
+    /// The 2026-09-22 wedge's content trigger, end to end through this
+    /// build's own wire predicate: a bold row filling all 149 columns of a
+    /// 55x149 park with an NFD `e` + U+0301 (or a ZWJ `👨‍💻`) is 149 cells but
+    /// 150 characters, and the strict line decoder compared the per-CHARACTER
+    /// attrs RLE to the CELL cap, so the grid was "not canonical" and every
+    /// in-session update refused while the row was on screen — for an
+    /// alt-screen app's whole lifetime when it sat on the saved primary.
+    /// Checked as the main grid and as the saved primary under 1049. Fails
+    /// before the aterm-scrollback fix.
+    #[test]
+    fn a_full_styled_row_with_a_combining_mark_or_zwj_is_canonical_on_both_grids() {
+        use aterm_core::terminal::{HostBindings, Terminal};
+
+        for cluster in ["e\u{301}", "\u{1F468}\u{200D}\u{1F4BB}"] {
+            let mut t = Terminal::new(55, 149);
+            let fill = 149 - if cluster.starts_with('e') { 1 } else { 2 };
+            t.process(format!("\x1b[1m{}{cluster}\x1b[0m", "a".repeat(fill)).as_bytes());
+            let row = t.row_text(0).expect("row 0");
+            assert!(
+                row.contains(cluster) && row.chars().count() > 149,
+                "{cluster:?}: the row holds more characters than columns: {row:?}"
+            );
+
+            let main = t.checkpoint_carry(0).expect("Ground");
+            assert!(
+                checkpoint_grid_is_canonical(&main.grid, 55, 149, 0),
+                "{cluster:?}: the main grid is canonical"
+            );
+            assert!(
+                screen_digest(&[(0, main.clone())]).is_ok(),
+                "{cluster:?}: the wire admits the main grid"
+            );
+            let restored = Terminal::from_checkpoint(&main, HostBindings::none());
+            assert_eq!(restored.row_text(0), Some(row.clone()), "{cluster:?}");
+
+            // The same row on the SAVED PRIMARY while an alt-screen app runs.
+            t.process(b"\x1b[?1049h");
+            let under_alt = t.checkpoint_carry(0).expect("Ground");
+            let saved = under_alt.alt_grid.as_ref().expect("saved primary");
+            assert!(
+                checkpoint_grid_is_canonical(saved, 55, 149, 0),
+                "{cluster:?}: the saved primary is canonical"
+            );
+            assert!(
+                screen_digest(&[(0, under_alt)]).is_ok(),
+                "{cluster:?}: the wire admits the saved primary"
+            );
+        }
+    }
+
+    /// A session parked mid-sequence (`printf '\e]0;x'`, no terminator) has
+    /// no Ground carry at all, which refused every in-session update; the
+    /// abandoning carry is admitted by this build's own wire predicate,
+    /// including its `ParserNotGround` arm, because it records the cancelled
+    /// (Ground) parser it restores into.
+    #[test]
+    fn a_session_parked_mid_osc_is_admitted_through_the_abandoning_carry() {
+        let mut t = aterm_core::terminal::Terminal::new(24, 80);
+        t.process(b"prompt$ \x1b]0;x");
+        assert!(
+            t.checkpoint_carry(0).is_none(),
+            "control: the Ground-only carry has nothing to send"
+        );
+        let (carry, abandoned) = t.checkpoint_carry_abandoning_partial(0);
+        assert_eq!(abandoned, Some("OscString"));
+        assert!(checkpoint_shape_refusal(0, &carry).is_none());
+        assert!(screen_digest(&[(0, carry)]).is_ok());
+    }
+
     #[test]
     fn modern_wide_narrow_checkpoint_preserves_full_tab_vector_and_rejects_bad_lengths() {
         let mut source = aterm_core::terminal::Terminal::new(6, 120);
@@ -4030,6 +5366,7 @@ mod tests {
             meta: aterm_json::to_string(&meta).unwrap(),
             grid_file: "unused-in-parser-test".to_string(),
             alt_grid_file: None,
+            repaint: false,
         };
         let parsed = parse_checkpoint_meta(&carry).expect("modern strict meta");
         let rebuilt_checkpoint = parsed.into_checkpoint(checkpoint.grid.clone(), None);
@@ -4251,98 +5588,232 @@ mod tests {
         );
     }
 
-    /// EVERY REACHABLE ENGINE STATE IS ADMITTED BY THE WIRE. The 2026-09-22
-    /// root cause was honest engine state that the producer's own predicate
-    /// refused; the conjuncts of `checkpoint_meta_bound_violation` are pinned
-    /// one at a time above and together here. A terminal is driven through
-    /// the sequences that move every field the predicate reads — DECSC/DECRC
-    /// on both screens, 1047/1049, DECSTBM, DECLRMM+DECSLRM, origin mode,
-    /// TBC/HTS, RIS — interleaved with shrinks, grows, narrowings and
-    /// widenings, and at every Ground state it passes through the visible
-    /// checkpoint set must commit canonically. The geometry stays inside the
-    /// per-grid cell budget so the only refusal this walk can meet is a real
-    /// producer/predicate disagreement.
-    #[test]
-    fn every_reachable_engine_state_is_admitted_by_the_wire() {
-        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        let mut t = aterm_core::terminal::Terminal::new(24, 80);
-        let mut admitted = 0_u32;
-        for step in 0..3000_u32 {
-            let roll = next();
-            let a = u16::try_from((roll >> 8) % 64).expect("< 64") + 1;
-            let b = u16::try_from((roll >> 24) % 96).expect("< 96") + 1;
-            match roll % 20 {
-                0 => t.process(b"$ command\r\n"),
-                1 => t.process(format!("\x1b[{a};{b}H").as_bytes()),
-                2 => t.process(b"\x1b7"),
-                3 => t.process(b"\x1b8"),
-                4 => t.process(b"\x1b[?1049h"),
-                5 => t.process(b"\x1b[?1049l"),
-                6 => t.process(b"\x1b[?1047h"),
-                7 => t.process(b"\x1b[?1047l"),
-                8 => t.process(format!("\x1b[{};{}r", a.min(b), a.max(b)).as_bytes()),
-                9 => t.process(b"\x1b[r"),
-                10 => t.process(format!("\x1b[?69h\x1b[{};{}s", a.min(b), a.max(b)).as_bytes()),
-                11 => t.process(b"\x1b[?69l"),
-                12 => t.process(b"\x1b[?6h"),
-                13 => t.process(b"\x1b[?6l"),
-                14 => t.process(b"\x1b[3g"),
-                15 => t.process(b"\x1bH\t"),
-                16 => t.process(b"\x1bc"),
-                17 => t.process(&[b'x'; 200]),
-                _ => t.resize(a, b),
-            }
-            let Some(checkpoint) = t.checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize) else {
-                continue;
-            };
-            let meta = CheckpointMeta::from_checkpoint(&checkpoint);
-            if let Some(violation) = checkpoint_meta_bound_violation(&meta) {
-                panic!(
-                    "step {step}: the engine at {}x{} produced a meta its own wire refuses: {violation}",
-                    meta.rows, meta.cols
-                );
-            }
-            if let Err(refusal) = screen_digest(&[(0, checkpoint)]) {
-                panic!(
-                    "step {step}: the engine at {}x{} was refused: {refusal}",
-                    meta.rows, meta.cols
-                );
-            }
-            admitted += 1;
-        }
-        assert!(
-            admitted > 2000,
-            "the walk must reach Ground states: {admitted}"
-        );
-    }
-
+    /// The per-grid ceiling is exact at half the aggregate (the 2026-09-22/23
+    /// update audit, plan P0-4a: it was 256x128, and a full-screen 5K window is
+    /// 99x338), a refusal names the ceiling that bound, and a refused admission
+    /// leaves the aggregate untouched.
     #[test]
     fn decoded_cell_budget_accepts_exact_max_and_rejects_max_plus_one() {
+        let (rows, cols) = (512_u16, 4096_u16);
+        assert_eq!(
+            u64::from(rows) * u64::from(cols),
+            MAX_HANDOFF_GRID_CELLS,
+            "PRECONDITION: 512x4096 is exactly the per-grid ceiling"
+        );
+        assert_eq!(MAX_HANDOFF_GRID_CELLS, MAX_HANDOFF_AGGREGATE_GRID_CELLS / 2);
         let mut used = 0;
         assert!(
-            admit_checkpoint_dimensions(&mut used, 256, 128, 0, false).is_some(),
-            "256×128 is the exact per-grid cell ceiling"
+            admit_checkpoint_dimensions(&mut used, rows, cols, 0, false).is_ok(),
+            "512x4096 is the exact per-grid cell ceiling"
         );
         assert_eq!(used, MAX_HANDOFF_GRID_CELLS);
         let before = used;
-        assert!(
-            admit_checkpoint_dimensions(&mut used, 257, 128, 0, false).is_none(),
-            "one row beyond the per-grid ceiling is rejected before capture"
+        assert_eq!(
+            admit_checkpoint_dimensions(&mut used, rows + 1, cols, 0, false),
+            Err(AdmitRefusal::PerGrid {
+                cells: MAX_HANDOFF_GRID_CELLS + u64::from(cols),
+                cap: MAX_HANDOFF_GRID_CELLS,
+            }),
+            "one row beyond the per-grid ceiling is rejected before capture, as the \
+             PER-GRID cap"
         );
         assert_eq!(used, before, "failed admission is transactional");
+        assert!(
+            matches!(
+                admit_checkpoint_dimensions(&mut used, 0, cols, 0, false),
+                Err(AdmitRefusal::Dimension { .. })
+            ),
+            "a geometry outside the protocol names the protocol"
+        );
 
         let mut aggregate = MAX_HANDOFF_AGGREGATE_GRID_CELLS;
-        assert!(
-            admit_checkpoint_dimensions(&mut aggregate, 1, 1, 0, false).is_none(),
-            "aggregate max+1 cell is rejected"
+        assert_eq!(
+            admit_checkpoint_dimensions(&mut aggregate, 1, 1, 0, false),
+            Err(AdmitRefusal::Aggregate {
+                cost: 1,
+                used: MAX_HANDOFF_AGGREGATE_GRID_CELLS,
+                cap: MAX_HANDOFF_AGGREGATE_GRID_CELLS,
+            }),
+            "aggregate max+1 cell is rejected, as the AGGREGATE"
         );
         assert_eq!(aggregate, MAX_HANDOFF_AGGREGATE_GRID_CELLS);
+
+        // The rollback ceiling is the frozen 0.91 one, and nothing else moves.
+        let legacy = WireCaps::legacy();
+        assert_eq!(legacy.per_grid_cells(), 32 * 1024);
+        assert!(legacy.admit(&mut 0, 256, 128, 0, true).is_ok());
+        assert!(matches!(
+            legacy.admit(&mut 0, 99, 338, 0, true),
+            Err(AdmitRefusal::PerGrid { cells: 33_462, .. })
+        ));
+        assert!(WireCaps::current().admit(&mut 0, 99, 338, 0, true).is_ok());
+    }
+
+    /// A ROLLBACK is the one hop whose consumer is older than its producer, so it
+    /// is the one hop priced at the frozen caps; every other hop — an upgrade, or
+    /// a same-build relaunch — gets this build's own (plan P0-4a).
+    #[test]
+    fn only_a_downgrade_target_gets_the_legacy_caps() {
+        assert_eq!(WireCaps::for_hop(1_000, 999), WireCaps::legacy());
+        assert_eq!(WireCaps::for_hop(1_000, 1_000), WireCaps::current());
+        assert_eq!(WireCaps::for_hop(1_000, 1_001), WireCaps::current());
+        assert_eq!(
+            WireCaps::for_target(crate::running_build_number()),
+            WireCaps::current(),
+            "a same-image relaunch is not a downgrade"
+        );
+    }
+
+    /// v0.91.0's strict line decoder, transcribed (`git show
+    /// v0.91.0:crates/aterm-scrollback/src/line_codec_block.rs`,
+    /// `decode_line_strict`): every record of a blob that this build decodes,
+    /// with its attrs run lengths summed and compared against the COLUMN count.
+    /// Written out here rather than borrowed from `WireCaps` so the rollback
+    /// test below checks the carry against the older consumer's arithmetic,
+    /// not against the function it is testing.
+    fn v0_91_line_decoder_admits(blob: &[u8], rows: u16, cols: u16, history: u32) -> bool {
+        strict_grid_lines(blob, rows, cols, history).is_some_and(|lines| {
+            lines.iter().all(|line| {
+                line.attrs().is_none_or(|attrs| {
+                    let mut cells = 0usize;
+                    attrs.runs().iter().all(|run| {
+                        cells = cells.saturating_add(run.length as usize);
+                        cells <= usize::from(cols)
+                    })
+                })
+            })
+        })
+    }
+
+    /// Whether a v0.91.0-vintage consumer's line decoder admits every grid of
+    /// `checkpoint` — the check its all-or-nothing adoption runs per session.
+    fn v0_91_consumer_decodes(checkpoint: &TerminalCheckpoint) -> bool {
+        v0_91_line_decoder_admits(
+            &checkpoint.grid,
+            checkpoint.rows,
+            checkpoint.cols,
+            checkpoint.history_lines,
+        ) && checkpoint
+            .alt_grid
+            .as_ref()
+            .is_none_or(|alt| v0_91_line_decoder_admits(alt, checkpoint.rows, checkpoint.cols, 0))
+    }
+
+    /// THE ROLLBACK PROTECTION COVERS THE LINE DECODER TOO (the 2026-09-24
+    /// review). This branch relaxed the strict line decoder (a line's attrs
+    /// are bounded by its character count, not its columns) on the consumer
+    /// side, and the producer judges a carry's shape with that same relaxed
+    /// decoder. `WireCaps::legacy` changed only the per-grid cap, so on a
+    /// rollback hop a full-width styled row holding `e` + U+0301 or a ZWJ
+    /// cluster was carried at the Full rung to a v0.91.0 consumer that finds
+    /// it non-canonical and refuses the WHOLE adoption — the "send a grid its
+    /// consumer refuses" case the legacy caps exist to prevent.
+    ///
+    /// RED on the code before the fix: every `legacy` assertion below came
+    /// back `Full`, and the carry failed `v0_91_consumer_decodes`.
+    #[test]
+    fn a_rollback_never_sends_a_row_the_older_line_decoder_refuses() {
+        use aterm_core::terminal::Terminal;
+
+        for cluster in ["e\u{301}", "\u{1F468}\u{200D}\u{1F4BB}"] {
+            let fill = 149 - if cluster.starts_with('e') { 1 } else { 2 };
+            let row = format!("\x1b[1m{}{cluster}\x1b[0m", "a".repeat(fill));
+
+            // On the VISIBLE grid: the forward hop carries it exactly; the
+            // rollback hop cannot carry it exactly at all.
+            let mut visible = Terminal::new(55, 149);
+            visible.process(row.as_bytes());
+            let (forward, rung, _) = carry_for_wire(&visible, 0, 0, &mut 0, WireCaps::current());
+            assert_eq!(rung, CarryRung::Full, "{cluster:?}: forward hop");
+            assert!(
+                !v0_91_consumer_decodes(&forward),
+                "{cluster:?}: CONTROL — this desk is one the older decoder refuses"
+            );
+            let (rollback, rung, cause) =
+                carry_for_wire(&visible, 0, 0, &mut 0, WireCaps::legacy());
+            assert_eq!(rung, CarryRung::Repaint, "{cluster:?}: rollback hop");
+            assert!(
+                cause
+                    .as_deref()
+                    .is_some_and(|cause| cause.contains("line decoder")),
+                "{cluster:?}: the cause names the older decoder: {cause:?}"
+            );
+            assert!(v0_91_consumer_decodes(&rollback), "{cluster:?}");
+            assert!(screen_digest(&[(0, rollback)]).is_ok(), "{cluster:?}");
+
+            // On the SAVED PRIMARY under an alt-screen app: the same.
+            visible.process(b"\x1b[?1049h");
+            let (under_alt, rung, _) = carry_for_wire(&visible, 0, 0, &mut 0, WireCaps::legacy());
+            assert_eq!(rung, CarryRung::Repaint, "{cluster:?}: saved primary");
+            assert!(v0_91_consumer_decodes(&under_alt), "{cluster:?}");
+
+            // In SCROLLBACK only: the rollback hop drops the history and
+            // keeps the screen exact, one rung down, not a blank tab.
+            let mut scrolled = Terminal::new(4, 149);
+            scrolled.process(row.as_bytes());
+            scrolled.process(b"\r\n1\r\n2\r\n3\r\n4");
+            let (_, rung, _) = carry_for_wire(&scrolled, 0, 16, &mut 0, WireCaps::current());
+            assert_eq!(rung, CarryRung::Full, "{cluster:?}: forward, with history");
+            let (visible_only, rung, _) =
+                carry_for_wire(&scrolled, 0, 16, &mut 0, WireCaps::legacy());
+            assert_eq!(rung, CarryRung::VisibleOnly, "{cluster:?}: history dropped");
+            assert!(v0_91_consumer_decodes(&visible_only), "{cluster:?}");
+        }
+    }
+
+    /// THE EXACT RUNGS ARE PRICED AS THE CONSUMER PRICES THEM (the 2026-09-24
+    /// review). `carry_for_wire` charged every exact carry for an inactive
+    /// grid whether or not the engine had one, while its Repaint rung,
+    /// `screen_digest` and the successor all charge the real one. With the
+    /// aggregate nearly spent that inverted the ladder: the exact visible
+    /// screen (which both later checks admit) was refused, and the SAME
+    /// session was carried blank at the SAME geometry and cost.
+    ///
+    /// RED on the code before the fix: the first carry came back `Repaint`.
+    #[test]
+    fn an_exact_carry_is_priced_as_the_consumer_prices_it() {
+        use aterm_core::terminal::Terminal;
+
+        let mut plain = Terminal::new(100, 200);
+        plain.process(b"$ make\r\nbuilding...\r\n");
+        assert!(!plain.has_inactive_grid(), "PRECONDITION: no inactive grid");
+        // 30,000 cells left: the screen's 20,000 fit, 40,000 would not.
+        let spent = MAX_HANDOFF_AGGREGATE_GRID_CELLS - 30_000;
+        let mut charged = spent;
+        let (exact, rung, cause) = carry_for_wire(&plain, 0, 0, &mut charged, WireCaps::current());
+        assert_eq!(rung, CarryRung::Full, "the exact screen fits: {cause:?}");
+        assert_eq!(
+            charged - spent,
+            wire_cells(&exact),
+            "charged exactly what the consumer charges"
+        );
+        let mut consumer = spent;
+        assert!(
+            admit_checkpoint_dimensions(
+                &mut consumer,
+                exact.rows,
+                exact.cols,
+                exact.history_lines,
+                exact.alt_grid.is_some(),
+            )
+            .is_ok(),
+            "and the consumer's admission agrees"
+        );
+
+        // With a real inactive grid the exact carry costs two screens, which
+        // does not fit — and the blank carry prices that grid too, so it
+        // shrinks rather than taking the same cost the exact one was refused.
+        let mut on_alt = Terminal::new(100, 200);
+        on_alt.process(b"\x1b[?1049h");
+        let mut charged = spent;
+        let (blank, rung, _) = carry_for_wire(&on_alt, 0, 0, &mut charged, WireCaps::current());
+        assert_eq!(rung, CarryRung::Repaint);
+        assert!(blank.alt_grid.is_some());
+        assert!(
+            (blank.rows, blank.cols) < (100, 200),
+            "a smaller blank screen"
+        );
+        assert_eq!(charged - spent, wire_cells(&blank));
     }
 
     /// REGRESSION (the update that would not install). A real machine had a staged
@@ -4376,7 +5847,7 @@ mod tests {
         let admits = |history: u32| {
             let mut used = 0u64;
             let mut n = 0;
-            while admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_some() {
+            while admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_ok() {
                 n += 1;
                 assert!(n < 10_000, "admission must terminate");
             }
@@ -4404,26 +5875,32 @@ mod tests {
         // the re-probe is exact rather than approximate.
         let mut used = 0u64;
         for _ in 0..with_history {
-            assert!(admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_some());
+            assert!(admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_ok());
         }
         let saturated = used;
         assert!(
-            admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_none(),
+            admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_err(),
             "the next session must be the one that trips the budget"
         );
         assert_eq!(used, saturated, "a refused admission is transactional");
         assert!(
-            admit_checkpoint_dimensions(&mut used, rows, cols, 0, true).is_some(),
+            admit_checkpoint_dimensions(&mut used, rows, cols, 0, true).is_ok(),
             "the same session must be admissible visible-only — this is precisely \
              the retry that turns 'the update did not apply' back into 'less scrollback'"
         );
     }
 
+    /// The worst-style capture at the OLD per-grid ceiling (256x128, which is
+    /// also about the size of a full-screen 5K window at the default font)
+    /// fits the 20 ms freeze. The ceiling itself is now half the aggregate
+    /// (plan P0-4a); a screen that large is admitted, and when its capture
+    /// outruns a rung's deadline the park ladder's wider rungs (80, 250 ms) are
+    /// what carry it — a deadline is timing, never a content refusal.
     #[test]
     fn max_admitted_visible_capture_meets_release_park_budget() {
         let (rows, cols) = (256u16, 128u16);
         let mut used = 0;
-        assert!(admit_checkpoint_dimensions(&mut used, rows, cols, 0, false).is_some());
+        assert!(admit_checkpoint_dimensions(&mut used, rows, cols, 0, false).is_ok());
         let mut terminal = aterm_core::terminal::Terminal::new(rows, cols);
         let mut input = Vec::new();
         input.reserve_exact(usize::from(rows) * usize::from(cols) * 6);
@@ -4448,6 +5925,79 @@ mod tests {
                 "max admitted worst-style capture took {elapsed:?}"
             );
         }
+    }
+
+    /// A REFUSED WRITE SAYS WHY (the 2026-09-22/23 update audit, plan P1-2).
+    /// The grid sidecar's name is occupied by a directory, so the filesystem
+    /// refuses the write; the writer must hand that `io::ErrorKind` out as a
+    /// typed [`WriteOutgoingFailure::Io`] — this process's failure, which the
+    /// caller files `ProducerFailed` (Transient) — and leave no manifest behind.
+    /// Before, every failure here was a bare `None` that became
+    /// `PreparationFailed` (Structural), so a full boot volume latched the
+    /// artifact manual-only after two attempts.
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_grid_write_carries_its_io_error_kind_out() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _home = RestoreVar::new("HOME");
+        let _runtime = RestoreVar::new("XDG_RUNTIME_DIR");
+        let scratch =
+            std::env::temp_dir().join(format!("aterm-write-outgoing-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        aterm_log::env::set("XDG_RUNTIME_DIR", &scratch);
+        aterm_log::env::set("HOME", &scratch);
+        let dir = crate::control_auth::socket_dir().expect("scratch control dir");
+        std::fs::create_dir_all(&dir).expect("control dir");
+        let nonce = mint_outgoing_nonce();
+        std::fs::create_dir_all(
+            dir.join(format!("seamless-{}-{nonce}.s0.grid", std::process::id())),
+        )
+        .expect("occupy the grid sidecar's name");
+
+        let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
+        terminal.process(b"$ ls");
+        let screens = vec![(0, terminal.checkpoint_visible().expect("parser is Ground"))];
+        let manifest = SessionHandoff {
+            schema: SessionHandoff::SCHEMA,
+            window: None,
+            connections: Vec::new(),
+            sessions: vec![SessionRecord {
+                local_id: 0,
+                sid: "s-write-kind".to_string(),
+                parent: None,
+                state: "alive".to_string(),
+                title: "zsh".to_string(),
+                screen: None,
+                user_title: None,
+                description: None,
+                icon: None,
+                role: None,
+                attention: None,
+                control: None,
+                frozen_path: false,
+                identity: None,
+                topics: Vec::new(),
+            }],
+            next_turn_id: None,
+            outgoing_build: None,
+        };
+        let fds = HandoffFds {
+            entries: vec![(0, 100, 4000)],
+        };
+        let written = write_outgoing(&manifest, &fds, &screens, &[], None, &[], &nonce);
+        assert_eq!(
+            written.err(),
+            Some(WriteOutgoingFailure::Io(std::io::ErrorKind::IsADirectory)),
+            "the filesystem's own reason travels out of the writer"
+        );
+        assert!(
+            !outgoing_manifest_path(&nonce)
+                .expect("the control dir exists")
+                .exists(),
+            "a refused write publishes no manifest"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -4927,6 +6477,16 @@ mod tests {
     /// TTY all yield `None` (the parked parent just times out + resumes — a
     /// spoof can only LOSE the signal), and the env var is cleared on read so
     /// it never leaks into shell children.
+    ///
+    /// `take_ready_fd` OWNS a live non-stdio descriptor before it judges it, so
+    /// the tty it refuses is closed by the refusal itself, and this test never
+    /// closes the number it hands over. It used to close that number once more
+    /// after the refusal. The refusal had already freed it, the kernel hands
+    /// the lowest free number to the next `pipe` or `open` on any thread, and
+    /// so the second close shut whatever descriptor a concurrent test had just
+    /// been given: an observer pipe in `app_input`'s PTY-silence tests then
+    /// read EOF (0) where only EAGAIN (-1) is silence, from a pipe its own test
+    /// had never closed.
     #[test]
     #[cfg(unix)]
     fn take_ready_fd_fails_closed() {
@@ -4987,7 +6547,16 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "openpty");
-        aterm_log::env::set("ATERM_HANDOFF_READY_FD", m.to_string());
+        // The refusal closes the number it is handed. Parked at a slot no
+        // sibling thread can be handed, that close is a fact about the number
+        // and is asserted below; without a slot the master's own number is
+        // handed over and the close goes unasserted rather than guessed at.
+        let isolated = claim_isolated_fd_slot(m);
+        let named = isolated.map_or(m, |slot| {
+            aterm_pty::close_fd(m);
+            slot
+        });
+        aterm_log::env::set("ATERM_HANDOFF_READY_FD", named.to_string());
         assert!(
             take_ready_fd(
                 Some("n".to_string()),
@@ -4999,7 +6568,17 @@ mod tests {
             .is_none(),
             "a tty is refused"
         );
-        aterm_pty::close_fd(m);
+        if let Some(slot) = isolated {
+            // SAFETY: `F_GETFD` only reads the flags a descriptor number carries.
+            let flags = unsafe { libc::fcntl(slot, libc::F_GETFD) };
+            assert_eq!(
+                (flags, std::io::Error::last_os_error().raw_os_error()),
+                (-1, Some(libc::EBADF)),
+                "the refused tty is closed by the refusal, never left open"
+            );
+        }
+        // `named` is `take_ready_fd`'s to close, and it has: only the slave
+        // is still this test's.
         aterm_pty::close_fd(s);
     }
 
@@ -5360,7 +6939,19 @@ mod tests {
     /// given screens and CONTROL CARRY (one session per checkpoint).
     #[cfg(unix)]
     pub(super) fn stage_carry_handoff(label: &str, carry: &StageCarry) -> StagedHandoff {
-        stage_outgoing_handoff_full(label, carry.screens.len(), None, None, Some(carry))
+        stage_outgoing_handoff_full(label, carry.screens.len(), None, None, Some(carry), &[])
+    }
+
+    /// As [`stage_carry_handoff`], with the producer's REPAINT set: the local
+    /// ids (session indices) its capture carried below the exact rungs, which
+    /// `write_outgoing` marks `ScreenCarry::repaint`.
+    #[cfg(unix)]
+    pub(super) fn stage_ladder_handoff(
+        label: &str,
+        carry: &StageCarry,
+        repaint: &[u64],
+    ) -> StagedHandoff {
+        stage_outgoing_handoff_full(label, carry.screens.len(), None, None, Some(carry), repaint)
     }
 
     /// As [`stage_outgoing_handoff`], but `meta_wire_override` also rewrites the
@@ -5381,6 +6972,7 @@ mod tests {
             layout_wire_override,
             meta_wire_override,
             None,
+            &[],
         )
     }
 
@@ -5391,6 +6983,7 @@ mod tests {
         layout_wire_override: Option<&dyn Fn(&str) -> String>,
         meta_wire_override: Option<&dyn Fn(&str) -> String>,
         carry: Option<&StageCarry>,
+        repaint: &[u64],
     ) -> StagedHandoff {
         let scratch =
             std::env::temp_dir().join(format!("aterm-handoff-e2e-{label}-{}", std::process::id()));
@@ -5462,7 +7055,6 @@ mod tests {
                 outer_x: Some(120),
                 outer_y: Some(64),
                 status_bar_rows: 0,
-                bars: Vec::new(),
                 update_verified_unix_ms: None,
                 messages: Vec::new(),
                 next_message_id: 0,
@@ -5497,6 +7089,7 @@ mod tests {
             &manifest,
             &fds,
             &screens,
+            repaint,
             manifest.window.clone(),
             carry.map_or(&[][..], |c| &c.controls[..]),
             &attempt_nonce,
@@ -5979,6 +7572,378 @@ mod tests {
         staged.teardown();
     }
 
+    /// Rewrite ONE session of an already-staged handoff the way an older
+    /// producer whose predicate differs from this build's would have published
+    /// it: `meta` rewrites that record's `CheckpointMeta` JSON and `grid` its
+    /// main grid sidecar. The parent's screen commitment and adoption
+    /// expectation are recomputed over the REWRITTEN bytes, because that is
+    /// what such a parent hashed — `screen_wire_digest` commits to the wire as
+    /// written and never asks whether the consumer will like what it says.
+    #[cfg(unix)]
+    fn restage_session(
+        staged: &mut StagedHandoff,
+        local_id: u64,
+        meta: &dyn Fn(&str) -> String,
+        grid: &dyn Fn(Vec<u8>) -> Vec<u8>,
+    ) {
+        let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+        let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+        let mut published = SessionHandoff::from_toml(toml).expect("parse the published manifest");
+        let mut wire = Vec::new();
+        for rec in &mut published.sessions {
+            let carry = rec.screen.as_mut().expect("every session carries a screen");
+            let grid_path = std::path::PathBuf::from(&carry.grid_file);
+            let mut grid_bytes = std::fs::read(&grid_path).expect("grid sidecar");
+            if rec.local_id == local_id {
+                carry.meta = meta(&carry.meta);
+                grid_bytes = grid(grid_bytes);
+                std::fs::write(&grid_path, &grid_bytes).expect("rewrite the grid sidecar");
+            }
+            let alt = carry
+                .alt_grid_file
+                .as_ref()
+                .map(|path| std::fs::read(path).expect("alt sidecar"));
+            wire.push((rec.local_id, carry.meta.clone(), grid_bytes, alt));
+        }
+        let republished = format!(
+            "{file_nonce}\n{}",
+            published.to_toml().expect("reserialize manifest")
+        );
+        std::fs::write(&staged.manifest_path, republished.as_bytes())
+            .expect("republish the rewritten manifest");
+        let mut entries = wire
+            .iter()
+            .map(|(id, meta, grid, alt)| ScreenWireEntry {
+                local_id: *id,
+                meta: meta.as_bytes(),
+                grid,
+                alt_grid: alt.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        staged.screen_digest =
+            screen_wire_digest(&mut entries).expect("parent screen digest over the rewritten wire");
+        let layout_wire =
+            std::fs::read_to_string(staged.manifest_path.with_extension("layout.toml"))
+                .expect("layout sidecar");
+        let live = decode_fds_bounded(&staged.fds_wire)
+            .expect("the staged fd wire decodes")
+            .entries;
+        staged.expected = adoption_proof(
+            &staged.nonce,
+            crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+            crate::build_info::GIT_COMMIT,
+            &layout_wire_digest(&layout_wire).expect("parent layout digest"),
+            &staged.screen_digest,
+            &live,
+        )
+        .expect("parent expectation");
+    }
+
+    /// THE CONSUMER DEGRADES ONE SESSION, NEVER THE HANDOFF (the 2026-09-22/23
+    /// update audit, plan P0-2). Session 1 arrives as an older producer whose
+    /// predicate disagreed with this build's would have published it: a cursor
+    /// three rows below the grid, a working directory holding a NUL (OSC 7
+    /// `%00`), and a main grid that is not canonical. Before this, one such
+    /// session made `take_incoming` return an EMPTY handoff: the successor
+    /// adopted nothing, the parent read `ChildDied`, and every one of the three
+    /// shells stayed behind on the old build — for a screen the user could
+    /// have lost at the cost of one repaint.
+    ///
+    /// Now all three adopt; session 1 comes back blank at a sanitized meta and
+    /// flagged for a repaint, the other two exactly; and the screen commitment
+    /// still equals the parent's, because it is taken over the raw bytes read,
+    /// not over what this build made of them.
+    #[test]
+    #[cfg(unix)]
+    fn a_semantically_refused_session_adopts_blank_and_the_proof_still_matches() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
+        ];
+        let mut staged = stage_outgoing_handoff("degrade", 3, None);
+        let hostile_meta = |meta: &str| {
+            let mut parsed: CheckpointMeta = aterm_json::from_str(meta).expect("staged meta");
+            parsed.cursor.cursor_row = parsed.rows + 3;
+            parsed.current_working_directory = Some("/tmp/a\0b".to_string());
+            aterm_json::to_string(&parsed).expect("rewritten meta")
+        };
+        let non_canonical_grid = |mut grid: Vec<u8>| {
+            grid.extend_from_slice(&[0xff, 0x00, 0x7f]);
+            grid
+        };
+        restage_session(&mut staged, 1, &hostile_meta, &non_canonical_grid);
+
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let incoming = take_incoming_as(ReceiverShape::Current);
+        assert_eq!(
+            incoming.adopted.len(),
+            3,
+            "one session's refused screen must not cost the other two — or its own shell"
+        );
+        assert_eq!(
+            incoming.screen_digest,
+            Some(staged.screen_digest),
+            "the commitment is over the RAW bytes read, degraded session included"
+        );
+        for adopted in &incoming.adopted {
+            let checkpoint = adopted
+                .checkpoint
+                .as_ref()
+                .expect("a meta that parses still yields a checkpoint to adopt onto");
+            if adopted.local_id != 1 {
+                assert!(!adopted.repaint, "session {}: exact", adopted.local_id);
+                continue;
+            }
+            assert!(
+                adopted.repaint,
+                "the degraded session is flagged for a repaint"
+            );
+            assert!(
+                adopted.control.is_none(),
+                "and adopts without a control carry"
+            );
+            assert_eq!(
+                (checkpoint.rows, checkpoint.cols),
+                (24, 80),
+                "at the carried geometry"
+            );
+            assert!(
+                checkpoint.cursor.cursor_row < checkpoint.rows,
+                "the out-of-bounds cursor is clamped onto the grid"
+            );
+            assert_eq!(
+                checkpoint.current_working_directory, None,
+                "the NUL directory is dropped"
+            );
+            let blank = aterm_core::terminal::Terminal::new(24, 80)
+                .checkpoint_carry(0)
+                .expect("a fresh engine is Ground");
+            assert_eq!(checkpoint.grid, blank.grid, "the screen is blank");
+            screen_digest(&[(1, checkpoint.clone())])
+                .expect("the blank screen passes this build's own predicates");
+        }
+        let ((proof, ready, adopted), _) =
+            child_proof_from(incoming).expect("the child adopts and proves");
+        assert_eq!(adopted.len(), 3, "the proof covers every session");
+        assert_eq!(
+            proof, staged.expected,
+            "THE HANDOFF COMPLETES: the child's proof equals the parent's expectation"
+        );
+
+        drop(ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// THE LAYOUT DEGRADES TOO (the 2026-09-22/23 update audit, plan P0-2e). An
+    /// outgoing build whose layout this build cannot parse — here a schema it
+    /// does not know — used to make `take_incoming` refuse everything. Now every
+    /// session adopts with no layout (the orphan net places them as tabs), the
+    /// layout digest is still over the bytes read, and the proof matches.
+    #[test]
+    #[cfg(unix)]
+    fn an_unparseable_layout_still_adopts_every_session_and_proves() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
+        ];
+        let future_schema = |wire: &str| {
+            assert!(wire.contains("schema = 2"), "today's wire: {wire}");
+            wire.replacen("schema = 2", "schema = 99", 1)
+        };
+        let staged = stage_outgoing_handoff("badlayout", 2, Some(&future_schema));
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let incoming = take_incoming_as(ReceiverShape::Current);
+        assert!(
+            incoming.layout.is_none(),
+            "the layout itself is not adopted"
+        );
+        assert_eq!(
+            incoming.adopted.len(),
+            2,
+            "but every shell is, for the orphan net to place"
+        );
+        assert!(
+            incoming.adopted.iter().all(|adopted| !adopted.repaint),
+            "a layout this build cannot read costs no screen"
+        );
+        let ((proof, ready, _adopted), _) =
+            child_proof_from(incoming).expect("the child adopts and proves");
+        assert_eq!(
+            proof, staged.expected,
+            "the layout digest over the bytes read still matches the parent's"
+        );
+
+        drop(ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// THE NEGATIVE CONTROL for the two degrade tests above: a record naming a
+    /// grid sidecar other than its own is an IDENTITY fact, not content, and
+    /// still refuses the whole adoption — so the leniency is provably confined
+    /// to content and a pass above is never the consumer adopting anything.
+    #[test]
+    #[cfg(unix)]
+    fn a_foreign_grid_sidecar_path_still_refuses_the_whole_adoption() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
+        ];
+        let staged = stage_outgoing_handoff("foreigngrid", 2, None);
+        let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+        let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+        let mut published = SessionHandoff::from_toml(toml).expect("parse the published manifest");
+        let carry = published.sessions[1]
+            .screen
+            .as_mut()
+            .expect("every session carries a screen");
+        let own = std::path::PathBuf::from(&carry.grid_file);
+        let foreign = own.with_file_name("seamless-1-someone-else.s1.grid");
+        std::fs::copy(&own, &foreign).expect("a readable foreign sidecar");
+        carry.grid_file = foreign.to_string_lossy().into_owned();
+        std::fs::write(
+            &staged.manifest_path,
+            format!(
+                "{file_nonce}\n{}",
+                published.to_toml().expect("reserialize")
+            ),
+        )
+        .expect("republish");
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(ready_write, commit_read, None);
+        let incoming = take_incoming_as(ReceiverShape::Current);
+        assert!(
+            incoming.adopted.is_empty() && incoming.screen_digest.is_none(),
+            "a sidecar that is not this record's own is refused outright"
+        );
+        for fd in [ready_read, ready_write, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// The degrade target is CANONICAL BY CONSTRUCTION: whatever a hostile or
+    /// older producer's meta says, [`repaint_checkpoint`] yields a screen this
+    /// build's own full predicate (`screen_digest`) admits — the property that
+    /// lets P0-1's producer and P0-2's consumer (the 2026-09-22/23 update audit)
+    /// share it without ever handing each other a carry the other refuses.
+    #[test]
+    fn a_repaint_checkpoint_is_admitted_by_this_builds_own_predicates() {
+        let base = CheckpointMeta::from_checkpoint(&{
+            let mut t = aterm_core::terminal::Terminal::new(24, 80);
+            t.process(b"\x1b[1;38;5;202muser@mac\x1b[0m ~/aterm % cargo test\r\nline 1");
+            t.checkpoint_visible().expect("parser is Ground")
+        });
+        let mut cases: Vec<(&str, CheckpointMeta)> = Vec::new();
+        let mut cursor_below = base.clone();
+        cursor_below.cursor.cursor_row = base.rows + 3;
+        cases.push(("cursor below the grid", cursor_below));
+        let mut nul_cwd = base.clone();
+        nul_cwd.current_working_directory = Some("/tmp/a\0b".to_string());
+        cases.push(("NUL directory", nul_cwd));
+        let mut saved_past_ceiling = base.clone();
+        saved_past_ceiling.saved_cursor_main = CheckpointMeta::from_checkpoint(&{
+            let mut t = aterm_core::terminal::Terminal::new(24, 80);
+            t.process(b"\x1b7");
+            t.checkpoint_carry(0).expect("Ground")
+        })
+        .saved_cursor_main
+        .map(|mut saved| {
+            saved.cursor_row = aterm_core::grid::MAX_GRID_ROWS;
+            saved
+        });
+        cases.push(("saved slot past the engine ceiling", saved_past_ceiling));
+        let mut alt_without_grid = base.clone();
+        alt_without_grid.modes.alternate_screen = true;
+        alt_without_grid.alt_cursor = None;
+        cases.push(("alternate screen with no saved primary", alt_without_grid));
+        let mut oversized = base.clone();
+        oversized.rows = 99;
+        oversized.cols = 338;
+        oversized.cursor.tab_stops = vec![false; 338];
+        oversized.cursor.scroll_bottom = 98;
+        oversized.cursor.margin_right = 337;
+        cases.push(("99x338, over the per-grid cell cap", oversized));
+        let mut zero = base.clone();
+        zero.rows = 0;
+        zero.cols = 0;
+        cases.push(("a zero geometry", zero));
+
+        for (what, meta) in cases {
+            let mut used_cells = 0;
+            let checkpoint = repaint_checkpoint(Some(&meta), &mut used_cells)
+                .unwrap_or_else(|| panic!("{what}: a repaint carry exists"));
+            assert!(used_cells > 0, "{what}: the blank screen is charged");
+            screen_digest(&[(0, checkpoint.clone())])
+                .unwrap_or_else(|refusal| panic!("{what}: refused by this build: {refusal}"));
+            assert_eq!(checkpoint.modes, meta.modes, "{what}: the modes survive");
+            assert_eq!(
+                checkpoint.kitty_keyboard, meta.kitty_keyboard,
+                "{what}: the keyboard protocol survives"
+            );
+        }
+        let mut spent = MAX_HANDOFF_AGGREGATE_GRID_CELLS;
+        assert!(
+            repaint_checkpoint(Some(&base), &mut spent).is_none(),
+            "with the aggregate spent there is no screen to carry — the pane builds its own"
+        );
+        assert!(repaint_checkpoint(None, &mut 0).is_none());
+    }
+
     /// FAIL CLOSED #1 — a WRONG BUILD cannot claim the PTYs. The parent
     /// authorized a different build; the child refuses before any proof exists,
     /// so no ready signal is ever published.
@@ -6272,6 +8237,14 @@ mod tests {
 #[cfg(all(test, unix))]
 #[path = "seamless_carry_tests.rs"]
 mod carry_tests;
+
+#[cfg(test)]
+#[path = "seamless_ladder_tests.rs"]
+mod ladder_tests;
+
+#[cfg(all(test, unix))]
+#[path = "seamless_fixture_tests.rs"]
+mod fixture_tests;
 
 #[cfg(test)]
 mod f4_adoption_proof_asymmetry {
@@ -6576,6 +8549,7 @@ mod f4_adoption_proof_asymmetry {
             meta: aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta"),
             grid_file: "unused".to_string(),
             alt_grid_file: None,
+            repaint: false,
         };
         let meta = parse_checkpoint_meta(&carry).expect("child parses meta");
         let rebuilt = meta.into_checkpoint(cp.grid.clone(), None);
@@ -6609,6 +8583,7 @@ mod f4_adoption_proof_asymmetry {
             meta: newer_parent_meta.clone(),
             grid_file: "unused".to_string(),
             alt_grid_file: None,
+            repaint: false,
         };
         let parsed = parse_checkpoint_meta(&carry).expect("child parses (no deny_unknown)");
         let child_meta = aterm_json::to_string(&parsed).expect("child reserializes");
@@ -6631,12 +8606,17 @@ mod f4_adoption_proof_asymmetry {
     }
 
     /// CROSS-VERSION BREAK #4 — the HARDER screen failure. `parse_checkpoint_meta`
-    /// demands EVERY key in its `REQUIRED` list. If a newer child adds an 18th
-    /// meta field to that list, an older parent's 17-key wire is REFUSED
-    /// outright: the child adopts NOTHING, never writes a proof, and the parked
-    /// parent reads EOF — `ChildDied`, the 0.58-era symptom.
+    /// demands EVERY key in [`CHECKPOINT_META_REQUIRED_KEYS`]. If a newer child
+    /// adds an 18th meta field to that list, an older parent's 17-key wire does
+    /// not parse. That used to refuse the adoption outright — the child adopted
+    /// NOTHING, never wrote a proof, and the parked parent read EOF
+    /// (`ChildDied`, the 0.58-era symptom). Since the 2026-09-22/23 audit (plan
+    /// P0-2) it costs that session's screen and nothing else: the session is
+    /// adopted onto a blank engine at its pane's geometry and repainted. Still a
+    /// break worth pinning — every tab repainting on every hop is not seamless —
+    /// which is why the list is frozen (next test).
     #[test]
-    fn cross_version_missing_required_meta_key_refuses_adoption_entirely() {
+    fn cross_version_missing_required_meta_key_costs_the_screen_not_the_adoption() {
         let cp = live_checkpoint();
         let mut value: aterm_json::Value =
             aterm_json::to_value(CheckpointMeta::from_checkpoint(&cp)).expect("meta value");
@@ -6650,10 +8630,72 @@ mod f4_adoption_proof_asymmetry {
             meta: aterm_json::to_string(&value).expect("json"),
             grid_file: "unused".to_string(),
             alt_grid_file: None,
+            repaint: false,
+        };
+        let meta = parse_checkpoint_meta(&carry);
+        assert!(
+            meta.is_none(),
+            "a single missing REQUIRED key fails the parse"
+        );
+        let mut used_cells = 0;
+        let screen = admit_incoming_screen(
+            meta,
+            ScreenWireBytes {
+                grid: cp.grid.clone(),
+                alt_grid: None,
+            },
+            &mut used_cells,
+        );
+        let IncomingScreen::Degraded {
+            checkpoint, wire, ..
+        } = screen
+        else {
+            panic!("an unparseable meta degrades the session instead of adopting it exactly");
         };
         assert!(
-            parse_checkpoint_meta(&carry).is_none(),
-            "a single missing REQUIRED key destroys the whole adoption"
+            checkpoint.is_none(),
+            "with no meta to sanitize, the session adopts onto a blank engine at its pane"
+        );
+        assert_eq!(
+            wire.grid, cp.grid,
+            "and the bytes read are kept for the proof"
+        );
+        assert_eq!(used_cells, 0, "a screen that is not decoded is not charged");
+    }
+
+    /// THE REQUIRED KEY LIST IS FROZEN, and this pins it VERBATIM. It may only
+    /// ever SHRINK — delete a line here and in [`CHECKPOINT_META_REQUIRED_KEYS`]
+    /// together, never add one. The producer of every handoff is the OLDER
+    /// build, so a key added to the list is one every producer in the field
+    /// fails to send, and each of its sessions would arrive without a parseable
+    /// meta: since the 2026-09-22/23 audit (plan P0-2) that repaints every tab
+    /// on every hop instead of refusing the update, but it is still a break. A
+    /// new meta field is additive — `#[serde(default)]` on `CheckpointMeta` —
+    /// and never required.
+    #[test]
+    fn the_required_meta_keys_are_frozen() {
+        assert_eq!(
+            CHECKPOINT_META_REQUIRED_KEYS,
+            &[
+                "rows",
+                "cols",
+                "cursor",
+                "alt_cursor",
+                "saved_cursor_main",
+                "saved_cursor_alt",
+                "modes",
+                "style_fg_bits",
+                "style_bg_bits",
+                "style_flag_bits",
+                "style_protected",
+                "charset",
+                "kitty_keyboard",
+                "xterm_keyboard",
+                "taskbar_progress",
+                "secure_keyboard_entry",
+                "current_working_directory",
+            ],
+            "the REQUIRED meta keys may only shrink — read this test's doc before editing either list"
         );
     }
 

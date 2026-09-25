@@ -2910,3 +2910,181 @@ pub fn release_channel_single_head_model() -> Model {
         }
     }
 }
+
+/// The release CLAIM, where it LANDS, and the reader that classifies the NEXT cut
+/// (2026-09-23, owner ruling R2) — the writer/reader contract of `ledger::claim` +
+/// `changelog::claim_changelogs` (writers) and `publish::real_cut_version` over
+/// `verify::derive_cut_mode` (reader), in crates/aterm-release.
+///
+/// A real cut builds the published commit P. The claim writes ONE release commit
+/// R = P + one ledger line + P's changelog rolled — P's code and nothing else — and
+/// main takes it as a fast-forward when its tip is P, else as a merge onto the tip
+/// whose tree is the TIP's plus the same line and the shipped notes. The push is the
+/// compare-and-swap on main's tip: a lost race re-reads the winner's tip and ledger
+/// and claims again — unless main now carries this version's section and the cut is
+/// not a recut, which is the "cut elsewhere" abort. The NEXT cut reads MAIN's
+/// changelog section and the published state: section and unpublished is a recut of
+/// a claim whose cut died, section and published refuses, anything else is fresh.
+///
+/// Environment: peers push code (`PeerPush`), other versions' claims land ledger
+/// lines (`RivalClaim`), and another machine may claim THIS version while our claim
+/// is in flight (`ElsewhereClaim`, the one foreign section); each moves main's tip
+/// (`seq`). Build numbers are ordinals (the seed line is 1).
+///
+/// `Buggy = 1` turns on the defects this contract rules out, each caught by its own
+/// invariant: the release built from main's tip (the pre-R2 cut); the landing tree
+/// built from R (peers' code and other claims' ledger lines dropped from main); a
+/// retry that keeps its stale build number; and the reader taking the recut signal
+/// from the published commit's changelog — which never carries the section — so a
+/// claimed-unpublished version is classified fresh, then aborted as "cut elsewhere"
+/// on its own claim, and a published one is claimed again.
+///
+/// Tier-1: crates/aterm-release/tests/claim_landing_model.rs drives the real claim,
+/// claim_changelogs and real_cut_version against real git and checks every
+/// transition here, replaying the source-changelog reader and an R-tree landing as
+/// its negative controls.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn release_claim_landing_model() -> Model {
+    crate::ty_model! {
+        ReleaseClaimLanding {
+            const Buggy = 0;
+            const MaxPeers = 2;
+            const MaxRivals = 1;
+            const MaxSeq = 6;
+            // main, as the environment moves it
+            var peers = 0;
+            var rivals = 0;
+            var foreign = 0;
+            var seq = 0;
+            var published = 0;
+            // main's tree, projected
+            var main_code = 0;
+            var main_lines = 1;
+            var tail = 1;
+            var section = 0;
+            // the cut: 0 idle, 1 classified, 2 claiming, 3 landed, 4 died unpublished,
+            // 5 refused (already published, or cut elsewhere)
+            var phase = 0;
+            var mode = 0;
+            var allow = 0;
+            var read_seq = 0;
+            var n = 0;
+            var release_code = 0;
+            var landings = 0;
+            var prior = 0;
+            var last = 0;
+            var elsewhere = 0;
+            var after_publish = 0;
+
+            action PeerPush when (MaxPeers > peers && MaxSeq > seq) {
+                peers = peers + 1;
+                main_code = main_code + 1;
+                seq = seq + 1;
+            }
+            action RivalClaim when (MaxRivals > rivals && MaxSeq > seq) {
+                rivals = rivals + 1;
+                main_lines = main_lines + 1;
+                tail = tail + 1;
+                seq = seq + 1;
+            }
+            action ElsewhereClaim when (
+                foreign == 0 && section == 0 && (phase == 1 || phase == 2) && MaxSeq > seq
+            ) {
+                foreign = 1;
+                section = 1;
+                main_lines = main_lines + 1;
+                tail = tail + 1;
+                seq = seq + 1;
+            }
+
+            // THE READER. `section` is MAIN's changelog. The Buggy reader takes it from
+            // the published commit's changelog, which never carries it: every cut is
+            // fresh to it, and a fresh cut claims without allowing the section.
+            action ClassifyFresh when (
+                (phase == 0 || phase == 4) &&
+                ((section == 0 && published == 0) || Buggy == 1)
+            ) {
+                phase = 1;
+                mode = 1;
+                allow = 0;
+            }
+            action ClassifyRecut when (
+                (phase == 0 || phase == 4) && section == 1 && published == 0
+            ) {
+                phase = 1;
+                mode = 2;
+                allow = 1;
+            }
+            action ClassifyRefuse when (
+                (phase == 0 || phase == 4) && section == 1 && published == 1
+            ) {
+                phase = 5;
+                mode = 0;
+                allow = 0;
+            }
+
+            // THE WRITER. The release commit carries P's code; the Buggy one is built
+            // from the tip it read.
+            action ClaimRead when (phase == 1) {
+                phase = 2;
+                read_seq = seq;
+                n = tail + 1;
+                release_code = if Buggy == 1 { main_code } else { 0 };
+            }
+            action ClaimElsewhere when (
+                phase == 2 && seq > read_seq && section == 1 && allow == 0
+            ) {
+                phase = 5;
+                elsewhere = 1;
+            }
+            action ClaimRetry when (
+                phase == 2 && seq > read_seq && (section == 0 || allow == 1)
+            ) {
+                read_seq = seq;
+                n = if Buggy == 1 { n } else { tail + 1 };
+            }
+            action ClaimLand when (phase == 2 && seq == read_seq && MaxSeq > seq) {
+                phase = 3;
+                prior = tail;
+                tail = n;
+                last = n;
+                landings = landings + 1;
+                main_lines = if Buggy == 1 { 2 } else { main_lines + 1 };
+                main_code = if Buggy == 1 { release_code } else { main_code };
+                section = 1;
+                seq = seq + 1;
+                after_publish = after_publish + published;
+            }
+            action Die when (phase == 3) {
+                phase = 4;
+                mode = 0;
+                allow = 0;
+            }
+            action Publish when (phase == 3) {
+                phase = 0;
+                published = 1;
+                mode = 0;
+                allow = 0;
+            }
+
+            invariant ReleaseCarriesOnlyThePublishedCode: release_code == 0;
+            invariant MainKeepsEveryPeerCommit: main_code == peers;
+            invariant MainKeepsEveryLedgerLine:
+                main_lines == 1 + rivals + foreign + landings;
+            invariant BuildsStrictlyIncrease: landings == 0 || last > prior;
+            invariant ClaimedUnpublishedIsNeverFresh:
+                section == 0 || foreign == 1 || mode == 2 || phase == 0 || phase > 2;
+            invariant OwnSectionIsNeverCutElsewhere: elsewhere == 0 || foreign == 1;
+            invariant NoClaimAfterPublish: after_publish == 0;
+            invariant ClaimStateBounds:
+                peers <= MaxPeers && rivals <= MaxRivals && foreign <= 1 &&
+                seq <= MaxSeq && published <= 1 && main_code <= MaxPeers &&
+                main_lines <= MaxSeq + 1 && tail <= MaxSeq + 1 && section <= 1 &&
+                phase <= 5 && mode <= 2 && allow <= 1 && read_seq <= MaxSeq &&
+                n <= MaxSeq + 2 && release_code <= MaxPeers && landings <= MaxSeq &&
+                prior <= MaxSeq + 1 && last <= MaxSeq + 2 && elsewhere <= 1 &&
+                after_publish <= MaxSeq;
+        }
+    }
+}

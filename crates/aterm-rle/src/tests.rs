@@ -124,65 +124,65 @@ fn rle_get() {
     assert_eq!(rle.get(6), None);
 }
 
+/// `set` of one element, from each row's own starting run layout: the write
+/// lands, the length never changes, and runs split or merge as the row says.
 #[test]
-fn rle_set_same_value() {
-    let mut rle = Rle::from_iter([1u8, 1, 1]);
-    assert!(rle.set(1, 1));
-    assert_eq!(rle.run_count(), 1);
+fn rle_set_single_element() {
+    for (what, start, index, value, runs) in [
+        ("same value keeps one run", &[1u8, 1, 1][..], 1, 1, 1),
+        ("middle splits into three", &[1, 1, 1, 1, 1], 2, 9, 3),
+        ("start splits into two", &[1, 1, 1], 0, 9, 2),
+        ("end splits into two", &[1, 1, 1], 2, 9, 2),
+        // Setting the middle to match both neighbours compacts to one run.
+        ("compacts with both neighbours", &[1, 2, 1], 1, 1, 1),
+    ] {
+        let mut rle = Rle::from_iter(start.iter().copied());
+        assert!(rle.set(index, value), "{what}: set in bounds");
+        assert_eq!(rle.get(index), Some(value), "{what}");
+        assert_eq!(rle.run_count(), runs, "{what}: run count");
+        assert_eq!(rle.len() as usize, start.len(), "{what}: length");
+    }
 }
 
+/// `set_range(from, to, value)` over each row's starting layout, then
+/// `(index, value)` probes on both sides of the written range.
 #[test]
-fn rle_set_middle() {
-    let mut rle = Rle::from_iter([1u8, 1, 1, 1, 1]);
-    assert!(rle.set(2, 9));
-    assert_eq!(rle.get(2), Some(9));
-    assert_eq!(rle.run_count(), 3);
-    assert_eq!(rle.len(), 5);
-}
-
-#[test]
-fn rle_set_start() {
-    let mut rle = Rle::from_iter([1u8, 1, 1]);
-    assert!(rle.set(0, 9));
-    assert_eq!(rle.get(0), Some(9));
-    assert_eq!(rle.run_count(), 2);
-}
-
-#[test]
-fn rle_set_end() {
-    let mut rle = Rle::from_iter([1u8, 1, 1]);
-    assert!(rle.set(2, 9));
-    assert_eq!(rle.get(2), Some(9));
-    assert_eq!(rle.run_count(), 2);
-}
-
-#[test]
-fn rle_set_range_entire() {
-    let mut rle = Rle::from_iter([1u8, 2, 3, 4, 5]);
-    rle.set_range(0, 5, 9);
-    assert_eq!(rle.run_count(), 1);
-    assert_eq!(rle.get(0), Some(9));
-    assert_eq!(rle.get(4), Some(9));
-}
-
-#[test]
-fn rle_set_range_partial() {
-    let mut rle = Rle::from_iter([1u8, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
-    rle.set_range(2, 5, 9);
-    assert_eq!(rle.get(0), Some(1));
-    assert_eq!(rle.get(2), Some(9));
-    assert_eq!(rle.get(4), Some(9));
-    assert_eq!(rle.get(5), Some(1));
-}
-
-#[test]
-fn rle_set_range_across_runs() {
-    let mut rle = Rle::from_iter([1u8, 1, 2, 2, 3, 3]);
-    rle.set_range(1, 5, 9);
-    assert_eq!(rle.get(0), Some(1));
-    assert_eq!(rle.get(1), Some(9));
-    assert_eq!(rle.get(4), Some(9));
-    assert_eq!(rle.get(5), Some(3));
+fn rle_set_range_cases() {
+    for (what, start, from, to, probes, runs) in [
+        (
+            "entire",
+            &[1u8, 2, 3, 4, 5][..],
+            0,
+            5,
+            &[(0, 9), (4, 9)][..],
+            Some(1),
+        ),
+        (
+            "partial",
+            &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            2,
+            5,
+            &[(0, 1), (2, 9), (4, 9), (5, 1)],
+            None,
+        ),
+        (
+            "across runs",
+            &[1, 1, 2, 2, 3, 3],
+            1,
+            5,
+            &[(0, 1), (1, 9), (4, 9), (5, 3)],
+            None,
+        ),
+    ] {
+        let mut rle = Rle::from_iter(start.iter().copied());
+        rle.set_range(from, to, 9);
+        for &(index, value) in probes {
+            assert_eq!(rle.get(index), Some(value), "{what}: index {index}");
+        }
+        if let Some(runs) = runs {
+            assert_eq!(rle.run_count(), runs, "{what}: run count");
+        }
+    }
 }
 
 #[test]
@@ -206,15 +206,6 @@ fn rle_iter() {
     let rle = Rle::from_iter([1u8, 1, 2, 3, 3]);
     let values: Vec<_> = rle.iter().collect();
     assert_eq!(values, vec![1, 1, 2, 3, 3]);
-}
-
-#[test]
-fn rle_compact_on_set() {
-    let mut rle = Rle::from_iter([1u8, 2, 1]);
-    // Set middle to match adjacent
-    rle.set(1, 1);
-    assert_eq!(rle.run_count(), 1);
-    assert_eq!(rle.len(), 3);
 }
 
 #[test]

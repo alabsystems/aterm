@@ -30,8 +30,6 @@
 #[allow(dead_code)]
 mod rain_common;
 
-use std::time::Instant;
-
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_effects::matrix_rain::RainVisibility;
@@ -555,52 +553,5 @@ fn gpu_dirty_gate_settled_and_drained_rain() {
     assert!(
         got_d == fresh_render(&in_d, true, None),
         "drained gate-hit pixels diverge from a fresh full GPU render"
-    );
-}
-
-/// Diagnostic (run with `--ignored --nocapture`): measure the per-frame cost of
-/// an IDLE/blink frame BEFORE the gate (the full `encode + readback` path) vs.
-/// AFTER (a gate-hit through `render_input_cached`). Not an assertion — prints
-/// the two costs so the win is quantified. Skips cleanly without a GPU.
-#[test]
-#[ignore = "diagnostic benchmark; run with --ignored --nocapture"]
-fn gpu_dirty_gate_idle_cost() {
-    let Some(mut gpu) = fresh_gpu() else { return };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let mut term = Terminal::new(ROWS as u16, COLS as u16);
-    term.process(b"$ idle frame cost benchmark");
-    gpu.set_cursor_blink_phase(true);
-    let input = term.cell_frame(ROWS, COLS);
-
-    // Prime the gate cache.
-    let _ = gpu.render_input_cached(&mut win, &input);
-
-    const N: u32 = 200;
-
-    // BEFORE: every idle frame did a full GPU encode + blocking readback.
-    let t = Instant::now();
-    for _ in 0..N {
-        let _ = gpu.render_input(&mut win, &input, None); // owned Frame: full encode + readback
-    }
-    let before_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
-
-    // AFTER: an unchanged idle frame takes the gate — zero GPU work.
-    let hits0 = gpu.gate_hits();
-    let t = Instant::now();
-    for _ in 0..N {
-        let v = gpu.render_input_cached(&mut win, &input);
-        std::hint::black_box(v.pixels().len());
-    }
-    let after_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
-    assert_eq!(
-        gpu.gate_hits() - hits0,
-        u64::from(N),
-        "all idle frames should hit the gate"
-    );
-
-    eprintln!(
-        "idle frame cost: BEFORE (encode+readback) = {before_us:.1} us/frame, \
-         AFTER (gate-hit) = {after_us:.3} us/frame, speedup = {:.0}x",
-        before_us / after_us.max(0.0001),
     );
 }

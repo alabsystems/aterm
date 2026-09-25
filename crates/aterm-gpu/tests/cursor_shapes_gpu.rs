@@ -112,69 +112,115 @@ fn parity_input(
     gpu_frame
 }
 
-#[test]
-fn gpu_block_cursor_matches_cpu() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (cw, ch) = cpu.cell_size();
-    let mut term = term_with(b"\x1b[2 q"); // steady block
-    let f = parity(&mut cpu, &mut gpu, &mut win, &mut term, "block");
-    let pos = cursor_positions(&f);
-    // The block fill covers the cell except the glyph cut-out; well over half
-    // the cell stays cursor-coloured and nothing outside the cell does.
-    assert!(
-        pos.len() > cw * ch / 2,
-        "block: too few cursor pixels ({})",
-        pos.len()
-    );
-    assert!(
-        pos.iter().all(|&(x, y)| x < cw && y < ch),
-        "block: cursor pixels outside cell"
-    );
+/// One cursor shape: how it is selected, and the exact pixel pattern both
+/// backends must paint for it over the glyph-under-cursor 2x4 terminal.
+struct Shape {
+    label: &'static str,
+    /// DECSCUSR bytes fed through the terminal (the terminal-owned styles).
+    decscusr: &'static [u8],
+    /// The frontend style override (HollowBlock, Bolt): these arrive through
+    /// the override on both paths, never through DECSCUSR.
+    style_override: Option<CursorStyle>,
+    /// The exact number of cursor-coloured pixels for a `(cw, ch)` cell, or
+    /// `None` for the block, whose fill has a glyph cut-out and only has to
+    /// cover well over half the cell.
+    count: fn(usize, usize) -> Option<usize>,
+    /// Every cursor-coloured pixel `(x, y)` lies where this says, for `(cw, ch)`.
+    inside: fn(usize, usize, usize, usize) -> bool,
 }
 
-#[test]
-fn gpu_underline_cursor_matches_cpu() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (cw, ch) = cpu.cell_size();
-    let mut term = term_with(b"\x1b[4 q"); // steady underline
-    let f = parity(&mut cpu, &mut gpu, &mut win, &mut term, "underline");
-    let t = (ch / 8).max(2);
-    let pos = cursor_positions(&f);
-    assert_eq!(
-        pos.len(),
-        cw * t,
-        "underline: should fill exactly the bottom strip"
-    );
-    assert!(
-        pos.iter().all(|&(x, y)| x < cw && y >= ch - t && y < ch),
-        "underline: cursor pixels outside the bottom strip"
-    );
+/// The bolt's per-row strip union (the frontend's laser-lightning override).
+fn bolt_rects(cw: usize, ch: usize) -> Vec<[usize; 4]> {
+    aterm_render::cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch)
 }
 
+const SHAPES: &[Shape] = &[
+    // Steady block: the fill covers the cell except the glyph cut-out, and
+    // nothing outside the cell is cursor-coloured.
+    Shape {
+        label: "block",
+        decscusr: b"\x1b[2 q",
+        style_override: None,
+        count: |_, _| None,
+        inside: |x, y, cw, ch| x < cw && y < ch,
+    },
+    // Steady underline: exactly the bottom strip, `max(ch / 8, 2)` tall.
+    Shape {
+        label: "underline",
+        decscusr: b"\x1b[4 q",
+        style_override: None,
+        count: |cw, ch| Some(cw * (ch / 8).max(2)),
+        inside: |x, y, cw, ch| x < cw && y >= ch - (ch / 8).max(2) && y < ch,
+    },
+    // Steady bar: exactly the left strip, `max(cw / 8, 2)` wide. The strip may
+    // cross the glyph's left edge: every strip pixel is cursor-coloured and no
+    // cursor colour leaks outside it.
+    Shape {
+        label: "bar",
+        decscusr: b"\x1b[6 q",
+        style_override: None,
+        count: |cw, ch| Some((cw / 8).max(2) * ch),
+        inside: |x, y, cw, ch| x < (cw / 8).max(2) && y < ch,
+    },
+    // The unfocused HollowBlock: exactly the `max(ch / 16, 1)`-thick outline,
+    // so the centre stays unfilled.
+    Shape {
+        label: "hollow",
+        decscusr: b"",
+        style_override: Some(CursorStyle::HollowBlock),
+        count: |cw, ch| {
+            let t = (ch / 16).max(1);
+            Some(2 * cw * t + 2 * t * (ch - 2 * t))
+        },
+        inside: |x, y, cw, ch| {
+            let t = (ch / 16).max(1);
+            x < cw && y < ch && (x < t || x >= cw - t || y < t || y >= ch - t)
+        },
+    },
+    // Bolt: exactly the shared per-row strip union, painted over the glyph
+    // ('a' under the cursor: strips paint over it, no cut-out).
+    Shape {
+        label: "bolt",
+        decscusr: b"",
+        style_override: Some(CursorStyle::Bolt),
+        count: |cw, ch| Some(bolt_rects(cw, ch).iter().map(|&[_, _, w, h]| w * h).sum()),
+        inside: |x, y, cw, ch| {
+            let [sx, _, sw, _] = bolt_rects(cw, ch)[y];
+            x >= sx && x < sx + sw
+        },
+    },
+];
+
 #[test]
-fn gpu_bar_cursor_matches_cpu() {
+fn every_cursor_shape_paints_its_exact_pattern_and_matches_cpu() {
     let Some((mut cpu, mut gpu)) = renderers() else {
         return;
     };
-    let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
-    let mut term = term_with(b"\x1b[6 q"); // steady bar
-    let f = parity(&mut cpu, &mut gpu, &mut win, &mut term, "bar");
-    let t = (cw / 8).max(2);
-    let pos = cursor_positions(&f);
-    // The bar strip may cross the glyph's left edge: every strip pixel is
-    // cursor-coloured and no cursor colour leaks outside the strip.
-    assert_eq!(pos.len(), t * ch, "bar: should fill exactly the left strip");
-    assert!(
-        pos.iter().all(|&(x, y)| x < t && y < ch),
-        "bar: cursor pixels outside the left strip"
-    );
+    for shape in SHAPES {
+        let label = shape.label;
+        cpu.set_cursor_style_override(shape.style_override);
+        gpu.set_cursor_style_override(shape.style_override);
+        let mut win = aterm_gpu::WindowGpu::new();
+        let mut term = term_with(shape.decscusr);
+        let f = parity(&mut cpu, &mut gpu, &mut win, &mut term, label);
+        let pos = cursor_positions(&f);
+        assert!(!pos.is_empty(), "{label}: no cursor pixels at all");
+        match (shape.count)(cw, ch) {
+            Some(n) => assert_eq!(pos.len(), n, "{label}: wrong cursor pixel count"),
+            None => assert!(
+                pos.len() > cw * ch / 2,
+                "{label}: too few cursor pixels ({})",
+                pos.len()
+            ),
+        }
+        for &(x, y) in &pos {
+            assert!(
+                (shape.inside)(x, y, cw, ch),
+                "{label}: cursor pixel ({x},{y}) outside its shape"
+            );
+        }
+    }
 }
 
 #[test]
@@ -224,32 +270,6 @@ fn gpu_steady_bar_fill_override_matches_cpu_without_theme_flash() {
             }
         }
     }
-}
-
-#[test]
-fn gpu_hollow_block_matches_cpu() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (cw, ch) = cpu.cell_size();
-    cpu.set_cursor_style_override(Some(CursorStyle::HollowBlock));
-    gpu.set_cursor_style_override(Some(CursorStyle::HollowBlock));
-    let mut term = term_with(b"");
-    let f = parity(&mut cpu, &mut gpu, &mut win, &mut term, "hollow");
-    let t = (ch / 16).max(1);
-    let border = 2 * cw * t + 2 * t * (ch - 2 * t);
-    let pos = cursor_positions(&f);
-    assert_eq!(
-        pos.len(),
-        border,
-        "hollow: should paint exactly the outline"
-    );
-    let (mx, my) = (cw / 2, ch / 2);
-    assert!(
-        !near_cursor(f.pixels[my * f.width + mx]),
-        "hollow: center must stay unfilled"
-    );
 }
 
 #[test]
@@ -333,32 +353,4 @@ fn gpu_blink_phase_and_hidden_suppress_cursor() {
         cursor_positions(&f).is_empty(),
         "DECTCEM off -> no cursor pixels"
     );
-}
-
-#[test]
-fn gpu_bolt_matches_cpu() {
-    let Some((mut cpu, mut gpu)) = renderers() else {
-        return;
-    };
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (cw, ch) = cpu.cell_size();
-    // Bolt is the frontend's laser-lightning override (not DECSCUSR); like the
-    // hollow block it arrives via the style override on both paths.
-    cpu.set_cursor_style_override(Some(CursorStyle::Bolt));
-    gpu.set_cursor_style_override(Some(CursorStyle::Bolt));
-    let mut term = term_with(b"");
-    let f = parity(&mut cpu, &mut gpu, &mut win, &mut term, "bolt");
-    // The painted pattern is exactly the shared per-row strip union — over a
-    // glyph ('a' under the cursor: strips paint over it, no cut-out).
-    let rects = aterm_render::cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch);
-    let area: usize = rects.iter().map(|&[_, _, w, h]| w * h).sum();
-    let pos = cursor_positions(&f);
-    assert_eq!(pos.len(), area, "bolt: paint exactly the strip union");
-    for &(x, y) in &pos {
-        let [sx, _, sw, _] = rects[y];
-        assert!(
-            x >= sx && x < sx + sw,
-            "bolt: pixel ({x},{y}) outside its row strip"
-        );
-    }
 }

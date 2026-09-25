@@ -370,6 +370,18 @@ KEY USAGE
   SIGTERM, heals the tab's PATH with the atpkg hook, relaunches with the same flags
   plus `--resume <session>`, and tells the agent to carry on. `--dry-run` prints
   each session's next step; its state and ledger live under `<state>/upgrade/`.
+  THE MODEL: an explicit `--model` (and `--fallback-model`) on the original
+  command line is kept, and none is added; a session launched without one
+  resumes on the current default (`/model` changes it). The harness reports the
+  model before and after: the carry-on line names the model of the agent's last
+  answer before the restart, and the ledger's `done` row says `claude restarted
+  on <build> · model <m>` from the resumed session's first answer — `model
+  <before> -> <after>` when they differ, with what decided it: the kept
+  `--model`, or the current default. The sweep that types the carry-on does not
+  wait for that answer: when it has not come yet the row is `step=continued`,
+  and a later sweep writes the `done` row. When a sweep 2 minutes after the
+  carry-on still finds no answer (or an older aterm began the restart), the row
+  is `step=done:model-unconfirmed`, its model said to be unconfirmed.
   The window runs the same sweep every minute on its own tabs, by default; turn it
   off with `upgrade = false` under aterm.toml's [harness].
 
@@ -432,39 +444,24 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              groups apply all-or-nothing (the rustc-locked tuple
                              moves together). `claude` and `codex` move to their
                              vendor's latest instead — no index pin applies to them
-  aterm pkg install <program> [--elevate=sudo|osascript|never]
-                             (NOTE: no OS-INSTALLED member is published yet — nothing in
-                             today's index needs an administrator, so --elevate has
-                             nothing to apply to. VENDOR-DIRECT members do ship: the
-                             default set carries `claude` and `codex`, fetched from
-                             their vendors' own release channels and verified on this
-                             machine with the vendors' own anchors — Anthropic's
-                             signing key; OpenAI's two hosts agreeing; the Apple
-                             Developer ID team on macOS — never through the ALab
-                             index)
+  aterm pkg install <program>
                              one program: verify the signed index, then install the
-                             pinned build (claude/codex: the vendor's latest, verified
-                             here, no index). THE EXPLICIT DOOR for a member the OS
-                             installs with an administrator (Homebrew's pkg, Apple's
-                             Command Line Tools, an apt/dnf package): in a terminal
-                             sudo asks there; --elevate=osascript uses the system
-                             dialog; without a terminal it records `needs admin` and
-                             says so. The unattended pass never elevates. A member
-                             the platform's own manager installs without elevation
-                             (brew, winget, scoop, cargo, pipx) installs through
-                             that manager; a machine without the manager reads it
-                             as `unavailable on <target>` — atpkg never installs a
-                             package manager
+                             pinned build — claude and codex: the vendor's latest,
+                             fetched from the vendor's own release channel and
+                             verified on this machine with the vendor's own anchors
+                             (Anthropic's signing key; OpenAI's two hosts agreeing;
+                             the Apple Developer ID team on macOS), never through the
+                             ALab index. atpkg never elevates and installs nothing
+                             through the OS's own installers or package managers:
+                             those protocols were deleted 2026-09-24, and an index
+                             row naming one is refused
   aterm pkg verify [program] re-attest installed bytes against the signed root (no
                              network) — doctor reads health, verify re-proves bytes
   aterm pkg which <tool>     ONE line: which copy of a tool runs and why — managed
                              (shim → store path, pinned by index N; for claude/codex
                              `managed 2.1.280 — Anthropic latest`), system copy
                              (not managed by aterm), SHADOWED by a copy ahead on
-                             PATH, installed via another protocol (pkg,
-                             softwareupdate, or a platform manager: apt, brew,
-                             winget, …) at its proof path, or an extra awaiting
-                             opt-in
+                             PATH, or a pending stub
   aterm pkg run <tool> [-- args]
                              exec the store binary — what `aterm <tool>` dispatches
                              to — exporting what its build declares, as its shim
@@ -680,8 +677,8 @@ GOTCHAS (in the order they bite)
     a command was first found, so a shell that ran `claude` before the stub was laid
     runs that cached path until you type `rehash` (zsh) or `hash -r` (bash) in it, once.
     The stub is laid by the next pass, window or session launch, or `aterm pkg repair`.
-    A shell where nothing puts the managed copy first — no <prefix>/agents on its PATH
-    (opened before the install that introduced agents/, or one whose rc never sourced
+    An aterm shell where nothing puts the managed copy first — no <prefix>/agents on its
+    PATH (opened before the install that introduced agents/, or one whose rc never sourced
     the hook) and no such stub ahead of the foreign copy:
     `aterm pkg doctor` and `aterm pkg which claude` say "SHADOWED in this shell by …" and
     name the one fix — the same line the window's status row says for a tab from before
@@ -692,6 +689,10 @@ GOTCHAS (in the order they bite)
     integration (measured 2026-09-16 — the zsh wrapper consumes ATERM_ORIGINAL_ZDOTDIR;
     bash rides --rcfile), so the tab silently loses its marks, cwd tracking and the live
     PATH re-assert. Only where no hook file exists does doctor print a PATH line instead.
+    Outside aterm (iTerm, Terminal) your own copy running is the design, not a shadow: the
+    two say "not what runs outside aterm: …, this shell's own copy" as a note, stub laid
+    or not, and name no fix — the hook leaves agents/ out of such a shell. `aterm claude`
+    runs the managed copy from any terminal.
     Inside an aterm tab the shell integration re-asserts agents/ at every prompt and
     sources the hook itself when it appears or is rewritten (zsh, bash, fish measured), so a
     tab running the current integration needs nothing typed at all. The remedy line is in
@@ -769,21 +770,20 @@ GOTCHAS (in the order they bite)
     launch when due, and a full signed index check every 6h — once for the whole
     machine: the six hours count from the last check any aterm made, on the wall clock,
     so a Mac that slept through them checks 20 s after it wakes. There is no knob for
-    it. While parked, it checks the next two public index tags once a minute and the
-    following two every five minutes. When all four are missing, one shared Releases
-    listing every five minutes can find a larger skipped index number; either hint wakes
-    the ordinary signed update pass. Only GitHub's own redirect to its release-asset
-    storage counts as a published index, and an index a pass could not land is retried
-    on the failure ladder, not at every probe. The full check remains the fallback if a
-    hint is unavailable. These probes are shared across aterm processes on one store,
-    and do not run for an overridden/private registry or during a failed pass's backoff:
+    it. While parked, it checks the next public index tag once a minute with one HEAD on
+    the download host, which spends none of GitHub's API rate limit (index builds are
+    published without gaps, so the next one is always the next number); a tag that
+    appears wakes the ordinary signed update pass, which finds the newest index the same
+    way — HEADs on the download host, never an API request. Only GitHub's own redirect to
+    its release-asset storage counts as a published index, and an index a pass could not
+    land is retried on the failure ladder, not at every probe. A store with nothing to
+    update (nothing installed, the set not being completed) is not probed. These probes
+    are shared across aterm processes on one store, and do not run for an
+    overridden/private registry or during a failed pass's backoff:
     a failed pass is retried after 10 min, doubling to 2 h, while one that found nothing
-    installable for this Mac (exit 2) waits for the next index or check. A pass whose
-    GitHub API listing was refused as rate-limited records the reset GitHub named (at
-    most an hour ahead), and no aterm schedules a full check before it — a pending
-    program's own request, and one you run, still go; the index probes keep their own
-    cadence (a window parked for the reset parks them too), and so does the claude/codex
-    head check. No scheduled pass starts while another aterm's pass is installing or
+    installable for this Mac (exit 2) waits for the next index or check. No pass or
+    probe asks GitHub's metered API, so no GitHub rate limit holds one back.
+    No scheduled pass starts while another aterm's pass is installing or
     within five minutes of one, and none repeats a pass another aterm just landed. Each
     full check records how it ended in status.toml — one with nothing to check too —
     and that is what these rules read — a later write by the head check or a typed verb
@@ -815,9 +815,10 @@ GOTCHAS (in the order they bite)
     laid now from the store, never fetched again — never a pinned, yanked or grouped
     one), and writes `status.toml` durably — its rows as it goes, the outcome and the
     clocks once at its end. An update pass that
-    reached NOTHING — no host answering its index listing (the link itself down; a
-    listing REFUSED with a status, a rate limit or a revoked token, is a failure, exit
-    1), no vendor channel answering, and every member it lost lost at a fetch — is
+    reached NOTHING — no host answering its index discovery (the link itself down; a
+    host that answers with anything but GitHub's redirect to the asset — a rate limit,
+    an outage, a portal's page — is a failure, exit 1), no vendor channel answering,
+    and every member it lost lost at a fetch — is
     OFFLINE: it exits 69 (not 0, not 1, not the store lock's 75) and records no
     successful check; the window retries it quietly. A `status.toml` that is corrupt is
     kept as `status.toml.corrupt-<unix>` and replaced, in one rename, by one rebuilt from
@@ -1510,7 +1511,7 @@ PRECEDENCE
   over the environment — the reverse of the line above.)
 
 START ONE
-  aterm --window --write-config    writes a documented starter aterm.toml — 155
+  aterm --window --write-config    writes a documented starter aterm.toml — 156
                                    keys, each with its default and a comment (not
                                    quite every key: see THE KEY ROSTER below).
   Settings are reloaded live: save the file and the running app picks it up.
@@ -1598,7 +1599,8 @@ const UPDATE_PAGE: &str = r#"update — see or check aterm's own updates from a 
 
   When something is wrong, a second line (on stderr) says so in plain words and
   where the rest is. `aterm ctl update status` is the machine-readable form, for a
-  running window (it adds fields such as lane= and delivery=).
+  running window (it adds fields such as delivery=). Every check reads the
+  credential-less download host, with no GitHub API request at all.
 
 LINUX
   aterm update enable     explicitly enroll this installed copy; a development
@@ -1676,6 +1678,8 @@ LOG
                    copy (aterm.log.1)
     messages.log   what Settings ▸ Messages shows — 1 MiB, one older copy
                    (messages.log.1); the page keeps the newest 512
+    messages.wire.log  what scripts posted with `aterm ctl notice` — 256 KiB,
+                   one older copy, so they never push aterm's own out
     packages.log   the package manager's — 1 MiB, five older copies
 
   aterm help atpkg         updates to the ALab tools, which are a separate thing
@@ -2468,9 +2472,9 @@ fn rust_page() -> String {
         let _ = writeln!(
             out,
             "  gates' toolchain NO Trust toolchain satisfies aterm's pin ({gates_pin_label}) on this\n\
-             \x20                  machine (looked for a sealed promote target, the rustup `trust` link, the\n\
-             \x20                  atpkg store, a from-source stage2, then PATH) — `aterm pkg doctor`, then\n\
-             \x20                  `aterm pkg install trust`"
+             \x20                  machine (looked in $TRUST_STAGE2_BIN, else the rustup `trust` toolchain, the\n\
+             \x20                  atpkg store, then PATH; no build tree is probed) — `aterm pkg doctor`,\n\
+             \x20                  then `aterm pkg install trust`"
         );
     }
     if let Some(r) = &tools.refused {
@@ -3563,9 +3567,9 @@ fn agent_page(sid: Option<&str>) -> String {
          type into another agent's prompt unless the human named the session AND the message.\n  \
          * Never claim a prover/compiler ran or 'proved' something that didn't — an empty or\n    \
          zero-obligation report is not a proof. Say what actually executed.\n  \
-         * No CI anywhere in this toolchain, by owner mandate, and the ONE git hook —\n    \
-         pre-push, pinned by `verify` as core.hooksPath=.githooks — is ADVISORY: it prints\n    \
-         a line and exits 0. Gating is inline/optional (`targo trust check`, `clean audit`).\n  \
+         * No CI anywhere in this toolchain, by owner mandate. aterm's ONE git hook —\n    \
+         pre-push, pinned by `verify` as core.hooksPath=.githooks — runs nothing: it BLOCKS\n    \
+         a push whose commit carries no passing receipt from `tools/verify.sh`.\n  \
          * Each tool's own AGENTS.md/CLAUDE.md rules win in its repo (e.g. never a bare\n    \
          `targo --unverified test` in nn; always `--locked` in clean).\n",
     );
@@ -4322,6 +4326,21 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
         std::fs::write(path, body).expect("write");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        run_once(path);
+    }
+
+    /// Run `path` once, unbounded, output discarded. The FIRST exec of a file this
+    /// process wrote waits on macOS `syspolicyd`'s assessment of it (0.4 s idle, many
+    /// seconds under load — measured 2026-09-24) and later execs do not, so paying it
+    /// here keeps it out of the page's 2 s probe bounds, which it used to exhaust under
+    /// load (`page_speaks_for_the_gates_whatever_this_directory_pins`, a load flake).
+    fn run_once(path: &Path) {
+        let _ = std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     /// The two spellings this page restates from atpkg (a test-only dependency here)
@@ -4953,6 +4972,9 @@ mod tests {
             write_exec(&shims.join(tool), &shim.body);
         }
         let root_bin = atpkg::compat::root_dir(&layout, 9999).join("bin");
+        for tool in ["targo", "trustc"] {
+            run_once(&root_bin.join(tool));
+        }
         let p = page(
             "exec-root",
             format!("{}:{sys}", shims.display()),

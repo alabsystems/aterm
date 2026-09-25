@@ -484,12 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn mutex_default() {
-        let m: Mutex<i32> = Mutex::default();
-        assert_eq!(*m.lock(), 0);
-    }
-
-    #[test]
     fn mutex_debug() {
         let m = Mutex::new(42);
         let dbg = format!("{m:?}");

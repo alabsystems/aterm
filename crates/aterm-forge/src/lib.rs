@@ -9,7 +9,7 @@
 //! The shipped `aterm` binary on aarch64-apple-darwin resolves dozens of
 //! packages aterm did not write, carrying hundreds of thousands of lines of
 //! Rust; the Linux cell resolves hundreds of them and millions of lines. That
-//! metric EXCLUDES the same-owner astream source bundle under `vendor/`:
+//! metric EXCLUDES the same-owner astream submodule under `vendor/`:
 //! `loc::measure` sets `is_third_party` by inverting
 //! `provenance::is_first_party`, which rosters `vendor/astream` as aterm's own.
 //! The exact counts are `measured::MAC_ARM` / `measured::LINUX`. It is that

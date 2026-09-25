@@ -240,16 +240,11 @@ pub fn effect_build_ledger() -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CELL_PIPELINE_COUNT, CELL_PIPELINE_NAMES, Duration, LEG_COUNT, Leg, slot_ns};
+    use super::{Duration, LEG_COUNT, Leg, slot_ns};
 
     #[test]
     fn leg_count_covers_every_variant() {
         assert_eq!(LEG_COUNT, Leg::PipeTotal as usize + 1);
-    }
-
-    #[test]
-    fn cell_pipeline_names_match_slot_count() {
-        assert_eq!(CELL_PIPELINE_NAMES.len(), CELL_PIPELINE_COUNT);
     }
 
     #[test]

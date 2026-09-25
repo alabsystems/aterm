@@ -40,26 +40,11 @@ struct Status<'a> {
     /// Git commit of the staged build's source (from the ready marker), if known —
     /// so an operator can bind the staged build to a repo commit from this file alone.
     staged_commit: Option<String>,
-    /// Last decision, e.g. "up to date", "staged 0.3.0 (build N)", "idle: no
-    /// token", "deferred: install location not writable".
+    /// Last decision, e.g. "up to date", "staged 0.3.0 (build N)",
+    /// "deferred: install location not writable".
     outcome: &'a str,
-    /// RFC3339 UTC epoch until which every aterm process on this machine holds off
-    /// GitHub — the server's own `x-ratelimit-reset` for this IP, jittered and clamped
-    /// (`github::hold_until_reset`). Present ONLY on a rate-limit deferral that knew the
-    /// reset; readers default it, so the record's schema stays 1. The sibling checker
-    /// reads the corresponding hold from the completed-check receipt instead of this
-    /// any-writer record.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    held_until: Option<String>,
-    /// Which lane the last check read the channel on: `web` (the unmetered download
-    /// host, no credential), or `token:<rung id>` (the releases API, a repointed
-    /// source; the id is `aterm_update_core::token::rung_id`'s fixed, whitespace-free
-    /// spelling — `env`, `keychain`, `file`, `github-env`, `gh-env`, `gh-cli`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lane: Option<String>,
-    /// `deferred` (the host asked us to wait), `blocked` (web lane: the download host
-    /// did not serve an asset the release names) or `api-failed` (token lane: the
-    /// releases API did not) — the last two booked as `pipeline`. Absent on a healthy
+    /// `deferred` (the host asked us to wait) or `blocked` (the download host did not
+    /// serve an asset the release names — booked as `pipeline`). Absent on a healthy
     /// check. Never contains whitespace: it is one token of the status line.
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery: Option<String>,
@@ -90,57 +75,24 @@ struct Status<'a> {
     /// covering it. Missing fields in an older ledger force one fresh check.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_release_build: Option<u64>,
-    /// The API budget this check's LIST headers reported, exactly as GitHub said it —
-    /// absent when the headers did not carry it (always, on the web lane).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    budget_remaining: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    budget_limit: Option<u32>,
-    /// RFC3339 UTC rendering of `x-ratelimit-reset`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    budget_reset: Option<String>,
 }
 
-/// What the current check learned about its delivery lane and budget, carried onto
-/// every record it writes (the ledger is one overwritten line, so a fact learned at
-/// the LIST must survive the check's terminal outcome). Set by the check as it goes,
-/// cleared at the start of the next one.
+/// What the current check learned about its delivery, carried onto every record it
+/// writes (the ledger is one overwritten line, so a fact learned mid-check must survive
+/// the check's terminal outcome). Set by the check as it goes, cleared at the start of
+/// the next one.
 #[derive(Clone, Default)]
 struct Delivery {
-    lane: Option<String>,
     note: Option<String>,
     /// A tag the CURRENT check authorized, with the `owner/repo` it was authorized
     /// against; `None` means "carry the file's forward".
     latest: Option<LatestRecord>,
-    budget_remaining: Option<u32>,
-    budget_limit: Option<u32>,
-    budget_reset: Option<u64>,
 }
 
 static DELIVERY: std::sync::Mutex<Delivery> = std::sync::Mutex::new(Delivery {
-    lane: None,
     note: None,
     latest: None,
-    budget_remaining: None,
-    budget_limit: None,
-    budget_reset: None,
 });
-
-/// Record the lane the check settled on and the budget its headers reported.
-pub(crate) fn set_delivery(
-    lane: String,
-    budget_remaining: Option<u32>,
-    budget_limit: Option<u32>,
-    budget_reset: Option<u64>,
-) {
-    let mut delivery = DELIVERY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    delivery.lane = Some(lane);
-    delivery.budget_remaining = budget_remaining;
-    delivery.budget_limit = budget_limit;
-    delivery.budget_reset = budget_reset;
-}
 
 /// Record how this check ended short of a healthy outcome (`deferred` / `blocked`).
 pub(crate) fn set_delivery_note(note: &str) {
@@ -152,7 +104,7 @@ pub(crate) fn set_delivery_note(note: &str) {
 
 /// Record the release tag THIS check authorized end to end, against `source`. Written
 /// onto every record from now on (and carried forward by every later writer), so the
-/// next web-lane check on the same build and channel can stop at its HEAD when the
+/// next check on the same build and channel can stop at its HEAD when the
 /// pointer still names it.
 pub(crate) fn set_latest_tag(
     tag: &str,
@@ -216,7 +168,7 @@ fn read_latest(staging: &Staging) -> Option<LatestRecord> {
 }
 
 /// The tag the ledger last authorized FOR THIS BUILD AND SOURCE, if any — the only
-/// tag the web lane's steady-state shortcut may trust. `None` whenever the ledger is
+/// tag the steady-state shortcut may trust. `None` whenever the ledger is
 /// absent, unreadable or empty, was written by a DIFFERENT build (the machine moved by
 /// an apply, a manual install or a downgrade, so the old verdict is about another
 /// build), or was authorized against a DIFFERENT `owner/repo` (a repointed updater has
@@ -332,18 +284,6 @@ pub(crate) fn clear_check_note() {
 /// Atomically write the status record (temp + rename). Best-effort: failures are
 /// silent — status is diagnostics, never load-bearing.
 pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
-    record_with_hold(staging, current_build, None, outcome);
-}
-
-/// [`record`] for a rate-limit deferral that knows when the budget renews: the record
-/// carries `held_until = until_epoch` (RFC3339), and NOTHING else changes — no
-/// `health.toml` entry, no verdict. A hold is a fact about GitHub's clock, not about
-/// this machine.
-pub(crate) fn record_held(staging: &Staging, current_build: u64, until_epoch: u64, outcome: &str) {
-    record_with_hold(staging, current_build, Some(until_epoch), outcome);
-}
-
-fn record_with_hold(staging: &Staging, current_build: u64, held_until: Option<u64>, outcome: &str) {
     let ready = crate::manifest::Ready::read_publishable(staging);
     let noted;
     let outcome = match CHECK_NOTE
@@ -377,18 +317,11 @@ fn record_with_hold(staging: &Staging, current_build: u64, held_until: Option<u6
         staged_build: ready.as_ref().map(|r| r.build_number),
         staged_commit: ready.and_then(|r| r.commit),
         outcome,
-        held_until: held_until.map(aterm_types::rfc3339::format_rfc3339),
-        lane: delivery.lane,
         delivery: delivery.note,
         latest_tag: latest.as_ref().map(|record| record.tag.clone()),
         latest_source: latest.as_ref().map(|record| record.source.clone()),
         latest_authorized_build: latest.as_ref().map(|record| record.build),
         latest_release_build: latest.as_ref().map(|record| record.release_build),
-        budget_remaining: delivery.budget_remaining,
-        budget_limit: delivery.budget_limit,
-        budget_reset: delivery
-            .budget_reset
-            .map(aterm_types::rfc3339::format_rfc3339),
     };
     let Ok(text) = aterm_toml::to_string(&status) else {
         return;
@@ -409,22 +342,21 @@ fn record_with_hold(staging: &Staging, current_build: u64, held_until: Option<u6
 mod tests {
     use super::*;
 
-    /// A held record carries the epoch and the lane at schema 1, a plain record carries
-    /// neither key (readers default them), and neither touches the health ledger.
+    /// A delivery note rides every record of the check that set it, and the next check
+    /// starts clean. Neither touches the health ledger.
     #[test]
-    fn record_held_writes_held_until_and_lane_with_schema_one() {
+    fn a_delivery_note_rides_the_check_and_the_next_check_starts_clean() {
         let _guard = crate::STRANDED_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let s = Staging::scratch("st-held");
+        let s = Staging::scratch("st-delivery");
         let root = s.root.clone();
         clear_check_note();
-        set_delivery("anonymous".into(), Some(0), Some(60), Some(1_788_392_970));
-        record_held(
+        set_delivery_note("deferred");
+        record(
             &s,
             42,
-            1_788_392_999,
-            "update check deferred: GitHub rate limit hit",
+            "update check deferred: the release host answered HTTP 429",
         );
         let text = std::fs::read_to_string(&s.status).unwrap();
         let v: aterm_toml::Value = aterm_toml::from_str(&text).expect("valid TOML");
@@ -433,45 +365,14 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            v.get("held_until").and_then(aterm_toml::Value::as_str),
-            Some(aterm_types::rfc3339::format_rfc3339(1_788_392_999).as_str())
+            v.get("delivery").and_then(aterm_toml::Value::as_str),
+            Some("deferred")
         );
-        assert_eq!(
-            v.get("lane").and_then(aterm_toml::Value::as_str),
-            Some("anonymous")
-        );
-        assert_eq!(
-            v.get("budget_remaining")
-                .and_then(aterm_toml::Value::as_integer),
-            Some(0)
-        );
-        assert_eq!(
-            v.get("budget_limit")
-                .and_then(aterm_toml::Value::as_integer),
-            Some(60)
-        );
-        assert_eq!(
-            v.get("budget_reset").and_then(aterm_toml::Value::as_str),
-            Some(aterm_types::rfc3339::format_rfc3339(1_788_392_970).as_str())
-        );
-        assert!(
-            v.get("delivery").is_none(),
-            "no delivery note was set: {text}"
-        );
-        assert!(!s.health().exists(), "a hold never writes health.toml");
-        // A plain record after the hold carries no epoch — the key is absent, not empty.
-        record(&s, 42, "up to date");
-        let text = std::fs::read_to_string(&s.status).unwrap();
-        assert!(!text.contains("held_until"), "{text}");
-        assert!(
-            text.contains("lane = \"anonymous\""),
-            "the lane survives the check: {text}"
-        );
-        // The next check starts clean.
+        assert!(!s.health().exists(), "a deferral never writes health.toml");
         clear_check_note();
         record(&s, 42, "up to date");
         let text = std::fs::read_to_string(&s.status).unwrap();
-        assert!(!text.contains("lane"), "{text}");
+        assert!(!text.contains("delivery"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -610,7 +511,6 @@ mod tests {
         );
         // A check that authorized a tag records it, with the source it judged.
         clear_check_note();
-        set_delivery("web".into(), None, None, None);
         set_latest_tag("v0.74.0", &source, 42, 42);
         record(&s, 42, "up to date (channel head v0.74.0)");
         let text = std::fs::read_to_string(&s.status).unwrap();
@@ -626,14 +526,6 @@ mod tests {
         assert_eq!(
             v.get("latest_source").and_then(aterm_toml::Value::as_str),
             Some("alabsystems/aterm")
-        );
-        assert_eq!(
-            v.get("lane").and_then(aterm_toml::Value::as_str),
-            Some("web")
-        );
-        assert!(
-            v.get("budget_remaining").is_none(),
-            "the web lane measures no budget: {text}"
         );
         // A later writer that set nothing — `record` cleared the delivery facts — carries
         // the file's tag forward rather than erasing it.
