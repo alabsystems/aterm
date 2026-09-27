@@ -77,7 +77,9 @@
 #         needed), OR as rustup's `trust` link, built through rustup's proxy,
 #         the one cargo that honours the pin; rustup cannot download it, so
 #         with neither in reach the lane is a loud pre-flight skip naming
-#         both remedies, never a mid-build abort — see find_cargo_and_rustup)
+#         `aterm pkg install trust` (rustup and the Trust tarballs where no
+#         `aterm` can run it), never a mid-build abort — see
+#         find_cargo_and_rustup)
 #         into a private store
 #         (~/.local/lib/aterm/bin, override ATERM_STORE_DIR) with the one
 #         `aterm` symlink in ~/.local/bin — non-macOS, older bundles, or no
@@ -108,7 +110,7 @@
 #                                                     # exclusion does not persist yet: no
 #                                                     # config is written, so the app's first
 #                                                     # launch still installs the ALab toolset
-#                                                     # unless `[packages].seed_install = false`
+#                                                     # unless `[packages].auto_install = false`
 #                                                     # is in ~/.config/aterm/aterm.toml first
 #                                                     # (`aterm help pkg`)
 #   tools/install.sh --no-path                        # don't touch the shell profile
@@ -139,13 +141,36 @@ self_on_disk() {
 	[[ -r "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" == *install.sh ]]
 }
 
+# The same page whether the script is on disk or piped. The header comment
+# above is the design record for readers of this file, not the usage.
 usage() {
-	if self_on_disk; then
-		# Print the header comment: from line 5 to the first non-comment line, drop it.
-		sed -n '5,/^[^#]/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
-	else
-		echo "usage: install.sh [--no-cli] [--no-app] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
-	fi
+	cat <<'USAGE'
+usage: install.sh [--no-app] [--no-cli] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run]
+       install.sh --uninstall [--dry-run]
+
+Installs aterm.app (macOS), the `aterm` command, and the ALab toolset.
+On Linux the app is the signed `aterm` binary, which updates itself (aterm update status).
+
+  --no-app          leave the app alone (Linux: the signed `aterm` binary)
+  --no-cli          leave the `aterm` command alone
+  --no-toolchain    skip the ALab toolset (the app's first launch still installs it
+                    unless ~/.config/aterm/aterm.toml sets [packages].auto_install = false)
+  --no-path         leave your shell profile alone
+  --version X.Y.Z   install that release instead of the latest
+  --dry-run         print the plan and change nothing
+  --uninstall       remove what install.sh installed
+
+env:
+  ATERM_INSTALL_DIR    where aterm.app goes (default /Applications, else ~/Applications)
+  ATERM_BIN_DIR        where the `aterm` command goes (default ~/.local/bin)
+  ATERM_STORE_DIR      where the `aterm` binary goes when there is no app (Linux release
+                       or source build; default ~/.local/lib/aterm/bin)
+  ATERM_MAN_DIR        where man pages go (default ~/.local/share/man)
+  ATERM_REPO_SLUG      the release repo (default alabsystems/aterm)
+  ATERM_TEAM_ID        require this signing team
+  ATERM_NO_TOOLCHAIN=1 as --no-toolchain
+  ATERM_NO_PATH=1      as --no-path
+USAGE
 }
 
 # --- pure update-channel arbitration (shared with deterministic shell tests) ---
@@ -739,7 +764,7 @@ require_free_space() { # <dir> <bytes-needed> <what-for>
 	[[ "$avail_kb" =~ ^[0-9]+$ ]] || return 0
 	need_kb=$((need / 1024))
 	if [[ "$avail_kb" -lt "$need_kb" ]]; then
-		echo "install.sh: not enough free space on the volume holding $dir for $what — need ~$((need / 1000000)) MB (2.5x the download: the container itself, the staged bundle copy, and expansion slack), have $((avail_kb / 1000)) MB" >&2
+		echo "install.sh: not enough free space on the volume holding $dir for $what — need ~$((need / 1000000)) MB, have $((avail_kb / 1000)) MB" >&2
 		return 1
 	fi
 }
@@ -831,6 +856,14 @@ path_block_rc_target() {
 	fish) rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
 	esac
 	printf '%s\n' "$rc"
+}
+
+# Whether wire_shell_path will append the block at all: it writes only when the
+# toolset hook it sources exists or is coming (this run installs the toolset,
+# or defers it to first launch), so the plans promise an edit on the same test.
+path_block_will_write() {
+	local shell_name="${SHELL:-}"
+	[[ "$DO_TOOLCHAIN" -eq 1 || -f "$HOME/.aterm/shell.d/00-atpkg.${shell_name##*/}" ]]
 }
 
 # Whether a binary path may ride the desktop entry's Exec= line UNQUOTED. The
@@ -932,7 +965,7 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 			# The exclusion does not persist yet: no config is written
 			# (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review
 			# corrections" 1), so the app's first launch still adopts and
-			# installs unless [packages].seed_install = false is set first.
+			# installs unless [packages].auto_install = false is set first.
 			LEAN_REASON=no-toolchain
 		else
 			LEAN_REASON=default
@@ -1242,12 +1275,25 @@ find_managed_targo() { # <root>
 	gate_store_targo "$cand"
 }
 
+# The trust pin's ONE remedy when no rustup is installed: `aterm pkg install
+# trust` where an `aterm` is in reach to run it (on PATH, or install.sh's
+# $BIN_DIR), else the one path left on a machine with no `aterm` — rustup plus
+# the hand-linked Trust tarballs, since rustup alone cannot download the pin.
+gate_trust_remedy() {
+	if command -v aterm >/dev/null 2>&1 || [[ -n "${BIN_DIR:-}" && -x "${BIN_DIR:-}/aterm" ]]; then
+		printf '%s\n' "aterm pkg install trust"
+	else
+		printf '%s\n' "install rustup (https://rustup.rs), then unpack the Trust toolchain tarballs (https://github.com/alabsystems/trust/releases) into one prefix and: rustup toolchain link trust <prefix>"
+	fi
+}
+
 # Which cargo, and which lane. With a <root>, the managed store is tried first
 # (CARGO_LANE=store: CARGO_BIN is the store's targo and RUSTUP_BIN is empty —
 # there is none to consult); without one, or when no managed store applies,
-# rustup's lane runs exactly as before (CARGO_LANE=rustup). The refusals name
-# the product's remedy first, then rustup's — except under a stock pin, which
-# the store cannot serve.
+# rustup's lane runs exactly as before (CARGO_LANE=rustup). Under the trust pin
+# a refusal with no rustup installed names one remedy (gate_trust_remedy);
+# with rustup installed, the product's remedy comes first, then rustup's link.
+# Under a stock pin, which the store cannot serve, rustup's remedy alone.
 find_cargo_and_rustup() { # [root]
 	local root="${1:-}" home="${CARGO_HOME:-$HOME/.cargo}" beside="" seen managed=1 declined=""
 	CARGO_BIN=""
@@ -1288,7 +1334,7 @@ find_cargo_and_rustup() { # [root]
 		elif [[ -n "$RUSTUP_BIN" ]]; then
 			CARGO_RESOLVE_REASON="building from source needs cargo, and none is in reach: no proxy beside $RUSTUP_BIN (at $beside), none at $home/bin/cargo, none on PATH — reinstall rustup (https://rustup.rs), which lays its proxies beside its own binary$declined"
 		elif [[ "$managed" -eq 1 ]]; then
-			CARGO_RESOLVE_REASON="building from source needs a toolchain that honours rust-toolchain.toml, and none is in reach — aterm pkg install trust (the aterm-managed Trust store, whose targo honours the \`trust\` pin by construction), or install rustup (https://rustup.rs), whose proxy at $home/bin/cargo is the one cargo that honours the pin$declined"
+			CARGO_RESOLVE_REASON="building from source needs a toolchain that honours rust-toolchain.toml, and none is in reach — $(gate_trust_remedy)$declined"
 		else
 			CARGO_RESOLVE_REASON="building from source needs cargo — install rustup (https://rustup.rs), whose proxy at $home/bin/cargo is the one cargo that honours rust-toolchain.toml$declined"
 		fi
@@ -1297,7 +1343,7 @@ find_cargo_and_rustup() { # [root]
 	if [[ -z "$RUSTUP_BIN" ]]; then
 		seen="$(env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$CARGO_BIN" --version 2>/dev/null | head -n 1 || true)"
 		if [[ "$managed" -eq 1 ]]; then
-			CARGO_RESOLVE_REASON="$CARGO_BIN (${seen:-no version}) is not rustup's proxy and no rustup is installed, so rust-toolchain.toml's pin cannot be honoured — aterm pkg install trust (the aterm-managed Trust store, whose targo honours the \`trust\` pin by construction), or install rustup (https://rustup.rs); a Homebrew rust never honours a pin (brew uninstall rust)$declined"
+			CARGO_RESOLVE_REASON="$CARGO_BIN (${seen:-no version}) is not rustup's proxy and no rustup is installed, so rust-toolchain.toml's pin cannot be honoured — $(gate_trust_remedy)$declined"
 		else
 			CARGO_RESOLVE_REASON="$CARGO_BIN (${seen:-no version}) is not rustup's proxy and no rustup is installed, so rust-toolchain.toml's pin cannot be honoured — install rustup (https://rustup.rs); a Homebrew rust never honours a pin (brew uninstall rust)$declined"
 		fi
@@ -1350,10 +1396,11 @@ cargo_honours_pin() {
 		# reach either: the product's remedy comes first — `aterm pkg install
 		# trust` lays the store (its targo builds this checkout with no
 		# rustup at all) and, where rustup is installed, the
-		# ~/.rustup/toolchains/trust seam rustup resolves the pin through
-		# (crates/atpkg/src/seam.rs) — and the hand-linked tarballs second.
+		# ~/.rustup/toolchains/trust link rustup resolves the pin through
+		# (crates/atpkg/src/seam.rs) — and the hand-linked tarballs second,
+		# for a machine with no `aterm` to run it.
 		if [[ "$(gate_pinned_channel "$root")" == trust && -z "${MANAGED_SEEN:-}" ]]; then
-			CARGO_RESOLVE_REASON="$CARGO_RESOLVE_REASON — aterm pkg install trust (lays the aterm-managed Trust store, whose targo builds this checkout without rustup, and the ~/.rustup/toolchains/trust seam rustup resolves the pin through); or unpack the Trust toolchain tarballs (https://github.com/alabsystems/trust/releases) into one prefix, then: rustup toolchain link trust <prefix>"
+			CARGO_RESOLVE_REASON="$CARGO_RESOLVE_REASON — aterm pkg install trust; or unpack the Trust toolchain tarballs (https://github.com/alabsystems/trust/releases) into one prefix, then: rustup toolchain link trust <prefix>"
 		fi
 		return 1
 	fi
@@ -1461,8 +1508,8 @@ cargo_honours_pin() {
 # store build 9192, a scratch crate: `RUSTC=/usr/bin/false targo --unverified
 # build` → `error: process didn't exit successfully: \`/usr/bin/false -vV\``,
 # and CARGO_BUILD_RUSTC=/usr/bin/false the same; with RUSTC scrubbed the build
-# finished), so both are scrubbed here: the compiler the `rustc:` line
-# announced ($CARGO_RUSTC, trustc beside targo) is the one that runs.
+# finished), so both are scrubbed here: the compiler the gate proved
+# ($CARGO_RUSTC, trustc beside targo) is the one that runs.
 #
 # rustup's lane: the same cargo from the same root, with RUSTUP_TOOLCHAIN
 # scrubbed as it was from every probe (an ambient one would otherwise steer
@@ -1540,7 +1587,7 @@ linux_target_preflight() { # <tag> <head-tag> <asset>
 	release_asset_present "$tag" "$asset" || present=$?
 	case "$present" in
 	1)
-		LINUX_TARGET_SKIP="release $tag publishes no signed Linux artifact $asset. Legacy checksum-only tarballs are not auto-update-capable and are never selected. Remedy: the cli half builds the same toolset from source (it runs next), or pin a release that ships the signed artifact with --version"
+		LINUX_TARGET_SKIP="release $tag has no $asset — pin a release that has one with --version"
 		return 0
 		;;
 	2)
@@ -2123,7 +2170,7 @@ uninstall_everything() {
 		fi
 	done
 
-	# 7. the support dir when EMPTY. It holds settings and staged updates, so
+	# 7. the support dir when EMPTY. It holds state, the toolchain store and staged updates, so
 	#    it is only rmdir'd (never rm -rf'd) — a non-empty one is left exactly
 	#    as it is. A dry run PROBES it (read-only) and reports the same
 	#    decision the real run takes: '--dry-run prints the same decisions' is
@@ -2200,17 +2247,12 @@ uninstall_everything() {
 	echo "install.sh: $verb complete — $removed item(s)$tail"
 	# User data is deliberately NOT touched: settings, themes and Trail Packs
 	# outlive an uninstall on purpose. The toolchain store is the exception —
-	# step 0 sweeps it when it can reach `atpkg`, so this line reports which of
-	# the two actually happened rather than always claiming the toolchain stayed
-	# (it says "left in place" only when it really was).
+	# step 0 sweeps it when it can reach `atpkg` and prints that it did, so this
+	# line names the toolchain as left in place only when it really was.
 	if [[ "$TOOLCHAIN_SWEPT" -eq 1 ]]; then
-		if [[ "$DRY_RUN" -eq 1 ]]; then
-			echo "install.sh: left in place: your settings/themes under $support (the ALab toolchain store would be removed)"
-		else
-			echo "install.sh: left in place: your settings/themes under $support (the ALab toolchain store was removed)"
-		fi
+		echo "install.sh: left in place: your settings and themes in $xdg_config/aterm"
 	else
-		echo "install.sh: left in place: your settings/themes under $support, and any atpkg toolchain"
+		echo "install.sh: left in place: your settings and themes in $xdg_config/aterm, and any atpkg toolchain"
 	fi
 	[[ "$skipped" -gt 0 ]] && return 1
 	return 0
@@ -2295,23 +2337,23 @@ print_install_plan() {
 		if [[ -n "$CLI_CARGO_SKIP" ]]; then
 			echo "  cargo:    the source build would be SKIPPED: $CLI_CARGO_SKIP"
 		elif [[ -n "$CARGO_BIN" ]]; then
-			echo "  cargo:    $CARGO_BIN ($CARGO_VERSION) — toolchain $CARGO_TOOLCHAIN — rustc $CARGO_RUSTC"
+			echo "  toolchain ${CARGO_TOOLCHAIN%% (*}: $CARGO_VERSION ($CARGO_BIN)"
 		fi
 	fi
 
 	if [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
 		echo "install.sh: toolset: excluded (--no-toolchain / ATERM_NO_TOOLCHAIN=1)"
 	elif [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 || "${CONTAINER_KIND:-}" == zip ]]; then
-		echo "install.sh: toolset: DEFERRED to first launch — aterm streams the ALab toolset from the signed network index (~4.4 GiB on disk when finished)"
+		echo "install.sh: toolset: installs on aterm's first launch (~4.4 GiB on disk when finished)"
 	elif [[ "${CONTAINER_KIND:-}" == dmg ]]; then
 		# Only a pinned pre-lean release elects the DMG now, and those images
 		# did seal the payload — so the seed really is local there.
 		echo "install.sh: toolset: aterm pkg seed + pkg update — unpacks to ~4.4 GiB under your home directory (the app reclaims its ~1 GB sealed payload copy afterwards)"
 	else
-		# No container election ran (--no-app, or an already-current app): the
-		# app at the destination may or may not still carry a sealed payload,
-		# so the plan hedges exactly as install_toolchain's narration does.
-		echo "install.sh: toolset: aterm pkg seed + pkg update — from the app's sealed payload when it carries one, else the signed network index; unpacks to ~4.4 GiB under your home directory"
+		# No container election ran (--no-app, or an already-current app):
+		# where the builds come from is `pkg seed`'s to decide, exactly as in
+		# install_toolchain.
+		echo "install.sh: toolset: aterm pkg seed + pkg update — ~4.4 GiB under your home directory"
 	fi
 
 	if [[ "$DO_PATH" -eq 0 ]]; then
@@ -2322,6 +2364,8 @@ print_install_plan() {
 			echo "install.sh: PATH: unrecognised shell (${SHELL:-<unset>}) — no profile is edited; a source hint prints instead"
 		elif [[ -f "$rc" ]] && grep -qF "$ATERM_PATH_BLOCK_START_MARKER" "$rc" 2>/dev/null; then
 			echo "install.sh: PATH: already wired — $rc carries the managed block; no edit"
+		elif ! path_block_will_write; then
+			echo "install.sh: PATH: no edit — no ALab toolset to put on PATH"
 		else
 			echo "install.sh: PATH: appends ONE marker-fenced block to $rc — the toolset hook + $BIN_DIR (skip with --no-path or ATERM_NO_PATH=1)"
 		fi
@@ -2337,7 +2381,7 @@ print_install_plan() {
 		echo "install.sh: network: github.com's release download host over TLS — no credential and no GitHub API request (the latest-release pointer, then that tag's own asset URLs), following its redirects to the release-asset CDN"
 	fi
 	if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
-		echo "  and: aterm pkg seed/update resolves the signed atpkg index over its own configured source when no sealed payload covers this machine."
+		echo "  and: the ALab toolset's signed index, from atpkg's configured source"
 	fi
 	echo "install.sh: dry run complete — nothing was installed, written, or edited"
 }
@@ -2414,9 +2458,9 @@ while [[ $# -gt 0 ]]; do
 	-v | --version)
 		# PINS a release; it is NOT a version query. Both failure modes say so:
 		# `-v` reads like "print the version" everywhere else, so the error has
-		# to teach what the flag actually does, not just demand a value.
+		# to say what the flag does, and where the installed version is read.
 		if [[ -z "${2:-}" ]]; then
-			echo "install.sh: --version PINS the release to install and needs a value (e.g. --version 0.44.0) — it is not a version query; \`aterm --version\` asks the installed binary" >&2
+			echo "install.sh: --version pins a release and needs one (X.Y.Z); the installed version: aterm --version" >&2
 			exit 2
 		fi
 		TAG_INPUT="$2"
@@ -2438,10 +2482,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--batteries)
 		# RETIRED 2026-08-26, parsed on purpose: every release is the lean
-		# app, so there is nothing for this flag to elect. Refuse with the
-		# next act rather than fall through to "unknown argument", which
-		# would send an old runbook hunting for a typo.
-		echo "install.sh: --batteries was retired 2026-08-26 — every release is the lean app; the toolchain installs itself on first launch (or: aterm pkg install --default-set). Next act: rerun without --batteries." >&2
+		# app, so there is nothing for this flag to elect. Refuse naming the
+		# flag rather than fall through to "unknown argument", which would
+		# send an old runbook hunting for a typo.
+		echo "install.sh: --batteries no longer exists — rerun without it" >&2
 		exit 2
 		;;
 	--no-path)
@@ -2481,7 +2525,7 @@ if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 && "$DO_TOOLCHAIN" -eq 0 && "$DO_PATH" 
 	exit 2
 fi
 if [[ "$TAG_EXPLICIT" -eq 1 ]] && ! canonical_numeric_tag "$TAG"; then
-	echo "install.sh: --version pins a RELEASE to install, and '$TAG_INPUT' is not a release version — expected X.Y.Z, e.g. --version 0.44.0 (a retired two-component X.Y archive release is also accepted). It is not a version query." >&2
+	echo "install.sh: --version pins a release and '$TAG_INPUT' is not one — expected X.Y.Z" >&2
 	exit 2
 fi
 
@@ -2563,7 +2607,7 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			# policy promises never to produce for a predictable impossibility.
 			if ! command -v openssl >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1 ||
 				! python3 -c 'import tomllib, hashlib, os; assert hasattr(os, "memfd_create"); assert hasattr(hashlib, "file_digest")' >/dev/null 2>&1; then
-				APP_SKIP="signed Linux bootstrap needs Python 3.11+ and OpenSSL with Ed25519 support — install them and re-run; unsigned tarballs are not a fallback"
+				APP_SKIP="signed Linux bootstrap needs Python 3.11+ and OpenSSL with Ed25519 support — install them and re-run"
 			elif ! ensure_dirs_writable "$STORE_DIR" "$BIN_DIR"; then
 				APP_SKIP="cannot create/write $STORE_DIR or $BIN_DIR (set ATERM_STORE_DIR / ATERM_BIN_DIR to writable dirs)"
 			else
@@ -2660,9 +2704,9 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 			# TWO lanes, in order: the aterm-managed Trust store's targo
 			# (CARGO_LANE=store, no rustup consulted), else rustup's proxy by
 			# its own path, else PATH's cargo — and no store, no cargo, or a
-			# cargo with no rustup behind it, is a skip that names `aterm pkg
-			# install trust` first and rustup second, never `brew install
-			# rust` (a plain cargo cannot honour the pin).
+			# cargo with no rustup behind it, is a skip that names one remedy
+			# (gate_trust_remedy), never `brew install rust` (a plain cargo
+			# cannot honour the pin).
 			CLI_CARGO_SKIP="$CARGO_RESOLVE_REASON"
 		elif [[ "$CARGO_LANE" != store ]] &&
 			PINNED_CHANNEL="$(toml_single_str "$ROOT/rust-toolchain.toml" channel 0 2>/dev/null)" &&
@@ -2697,7 +2741,7 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 			if rustup_dist_channel "$PINNED_CHANNEL"; then
 				CLI_CARGO_SKIP="building from source needs the pinned '$PINNED_CHANNEL' rustup toolchain, which is not installed (this pre-flight never downloads one) — rustup toolchain install $PINNED_CHANNEL"
 			elif [[ "$PINNED_CHANNEL" == trust ]]; then
-				CLI_CARGO_SKIP="building from source needs the pinned 'trust' rustup toolchain, which rustup cannot download, and no aterm-managed Trust store is in reach either — aterm pkg install trust (lays the store, whose targo builds this checkout without rustup, and the ~/.rustup/toolchains/trust seam rustup resolves the pin through); or unpack the rustc/cargo/rust-std dist tarballs from https://github.com/alabsystems/trust/releases into one prefix, then: rustup toolchain link trust <prefix>"
+				CLI_CARGO_SKIP="building from source needs the pinned 'trust' rustup toolchain, which rustup cannot download, and no aterm-managed Trust store is in reach either — aterm pkg install trust; or unpack the rustc/cargo/rust-std dist tarballs from https://github.com/alabsystems/trust/releases into one prefix, then: rustup toolchain link trust <prefix>"
 			else
 				CLI_CARGO_SKIP="building from source needs the pinned '$PINNED_CHANNEL' rustup toolchain, which rustup cannot download — unpack the rustc/cargo/rust-std dist tarballs from https://github.com/alabsystems/trust/releases into one prefix, then: rustup toolchain link $PINNED_CHANNEL <prefix>"
 			fi
@@ -2738,16 +2782,19 @@ LINUX_APP_INSTALLED=0
 # block (which carries $BIN_DIR) exists, and the final dispatch prints the
 # hint only when no block does — two messages telling the user to edit the
 # same file, one of them by hand, is how a fresh install ended with `aterm`
-# off PATH. install_toolchain records a completed seed, or one the app is
-# completing (`pkg seed` exited ATPKG_CONTENDED_EXIT: the app's own pass holds
-# the store lock), so a toolchain-only repair run can exit 0 without touching
-# INSTALLED_ANY's meaning.
+# off PATH. install_toolchain records a completed seed, or a stand-down
+# (`pkg seed` exited ATPKG_CONTENDED_EXIT: another atpkg run — usually the
+# app's own pass — holds the store lock), so a toolchain-only repair run can
+# exit 0 without touching INSTALLED_ANY's meaning.
 CLI_PATH_HINT_WANTED=0
 PATH_BLOCK_WROTE=0
 TOOLCHAIN_RAN=0
 # atpkg's EX_TEMPFAIL contention code (crates/atpkg/src/lock.rs CONTENDED_EXIT):
-# the app's own pass holds the store lock, so this script stands aside.
+# another atpkg run holds the store lock, so this script stands aside.
 ATPKG_CONTENDED_EXIT=75
+# atpkg's EX_UNAVAILABLE offline code (crates/aterm-update-core/src/pkg_check.rs
+# PASS_OFFLINE_EXIT): an update pass that no host answered.
+ATPKG_OFFLINE_EXIT=69
 
 # --- the app half: released aterm.app, verified, swapped into place ------------
 install_app() {
@@ -2803,50 +2850,16 @@ install_app() {
 	# named its cause.
 	elect_container "$DO_TOOLCHAIN" "$VERSION" \
 		"$DMG_NAME" "$SHA_WANT" "$ZIP_NAME" "$ZIP_SHA" || exit 1
-	# Narrate the election before any bytes move. Each arm says what was
-	# decided and why, in the voice of the decision's own cause: the default
-	# says what first launch will do, the flag echoes the flag, the fallback
-	# names the release property that forced it.
-	case "$CONTAINER_KIND:$LEAN_REASON" in
-	zip:default)
-		echo "install.sh: using the lean container ($ASSET_NAME) — the recommended install."
-		;;
-	zip:no-toolchain)
-		# The flag excludes the toolset, and the part worth saying is the
-		# gap: the exclusion does not persist yet. It writes no config
-		# (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review
-		# corrections" 1), so the app's own first launch still adopts and
-		# installs the set. Only the key in aterm.toml, set first, stops that.
-		echo "install.sh: --no-toolchain — using the lean container ($ASSET_NAME), toolset excluded."
-		echo "install.sh:   The exclusion does not persist yet: no config is written, so the app's first"
-		echo "install.sh:   launch still installs the ALab toolset unless \`[packages].seed_install = false\`"
-		echo "install.sh:   is in ~/.config/aterm/aterm.toml first (\`aterm help pkg\`)."
-		echo "install.sh:   \`aterm pkg install --default-set\` installs it by hand."
-		;;
-	dmg:*)
-		# Only a pinned pre-lean release lands here: its manifest names no
-		# zip, so its bare DMG — the batteries-included image those releases
-		# shipped — is the one container it has.
-		echo "install.sh: this release predates the lean container (no zip in its manifest) —"
-		echo "install.sh:   using its DMG ($ASSET_NAME), exactly as its own installer did."
-		;;
-	esac
+	# The election is not narrated: the download line below names the
+	# container, and --no-toolchain's one caveat rides that plan.
 
 	# Official releases DO publish an Ed25519 aterm-appcast.toml.sig, but this
 	# bootstrap lane cannot verify it (macOS's stock LibreSSL has no Ed25519),
-	# so it is not fetched at all: the installed updater verifies it.
-	TRANSPORT_DESC="TLS to github.com"
-	if [[ -n "$TEAM_WANT" ]]; then
-		echo "install.sh: BOOTSTRAP TRUST BOUNDARY: the release's Ed25519 manifest signature is not" >&2
-		echo "  verified here (macOS's stock LibreSSL cannot), so the root of trust is the Apple" >&2
-		echo "  code-signing chain via pinned Team ID $TEAM_WANT, plus $TRANSPORT_DESC" >&2
-		echo "  and the manifest digest. Full Ed25519 verification lives in the installed updater." >&2
-	else
-		echo "install.sh: BOOTSTRAP TRUST BOUNDARY: the release's Ed25519 manifest signature is not" >&2
-		echo "  verified here (macOS's stock LibreSSL cannot), and no Team ID is pinned for this repo" >&2
-		echo "  — this install trusts $TRANSPORT_DESC and the manifest digest ONLY" >&2
-		echo "  (Tier REPO). Expect the UNVERIFIED publisher note below." >&2
-	fi
+	# so it is not fetched at all: the installed updater verifies it. The
+	# root of trust here is the Apple code-signing chain via the pinned Team
+	# ID, plus TLS to github.com and the manifest digest; what THIS bundle was
+	# verified by is printed once the check has run ("signature verified
+	# (Developer ID, …)", or the UNVERIFIED publisher note).
 
 	# Soft OS floor advisory. Validate both operands before comparison so
 	# manifest text never enters Bash's arithmetic-expression evaluator.
@@ -2899,16 +2912,15 @@ install_app() {
 	else
 		echo "install.sh: downloading $ASSET_NAME — $((ASSET_SIZE / 1000000)) MB"
 		if [[ "$LEAN_REASON" == default ]]; then
-			# The recommended plan, in the owner's words: the small download is
-			# the whole wait — the toolset arrives per program, visibly, AFTER
-			# the window is already open.
-			echo "  then: aterm.app -> $DEST. aterm opens immediately; the ALab toolchain installs"
-			echo "  itself on first launch with live progress — programs download individually,"
-			echo "  resumably, and only this machine's builds."
+			# The small download is the whole wait: the toolset arrives on
+			# first launch, which the run's last toolset line says.
+			echo "  then: aterm.app -> $DEST"
 		else
-			echo "  then: aterm.app -> $DEST. Toolset excluded (--no-toolchain), but the exclusion does not"
-			echo "  persist yet: no config is written, so the app's first launch still installs the ALab toolset"
-			echo "  unless \`[packages].seed_install = false\` is in ~/.config/aterm/aterm.toml first (\`aterm help pkg\`)."
+			# --no-toolchain writes no config (docs/DESIGN-cli-toolchain-seed-
+			# 2026-08-31.md, "Review corrections" 1), so the app's own first
+			# launch still adopts and installs the set. Only the key in
+			# aterm.toml, set first, stops that.
+			echo "  then: aterm.app -> $DEST; its first launch still installs the ALab toolset unless ~/.config/aterm/aterm.toml sets [packages].auto_install = false"
 		fi
 	fi
 	# THE ONE WRITE OUTSIDE THE INSTALL DIRS RIDES THE SAME PLAN. By default
@@ -2920,8 +2932,8 @@ install_app() {
 	# half is off or the shell is unrecognised — then no edit is coming.
 	if [[ "$DO_PATH" -eq 1 ]]; then
 		PLAN_RC="$(path_block_rc_target)"
-		if [[ -n "$PLAN_RC" ]]; then
-			echo "  and: one marker-fenced PATH block is appended to $PLAN_RC unless already present (skip: --no-path / ATERM_NO_PATH=1)."
+		if [[ -n "$PLAN_RC" ]] && ! grep -qF "$ATERM_PATH_BLOCK_START_MARKER" "$PLAN_RC" 2>/dev/null && path_block_will_write; then
+			echo "  and: a PATH block is appended to $PLAN_RC (skip: --no-path)"
 		fi
 	fi
 	download_release_asset "$TAG" "$ASSET_NAME" "$ASSET_SIZE" "$TMP/$ASSET_NAME" || exit 1
@@ -3035,8 +3047,8 @@ install_app() {
 	# re-exec) rides the window entry, so the window is named as the apply path
 	# rather than promising a silence that terminal-only machines cannot cash.
 	echo "  updates: automatic (silent, verified) — public channel, no credential needed; checks run"
-	echo "           in the app and in \`aterm\` sessions, and a staged update applies when the aterm"
-	echo "           window opens. Health: aterm update status — to switch it off, Settings ▸ Terminal"
+	echo "           in the app and in \`aterm\` sessions; with an aterm window open, an update installs"
+	echo "           within a minute. Health: aterm update status — to switch it off, Settings ▸ Terminal"
 	echo "           ▸ Updates (\`[update] enabled = false\` in ~/.config/aterm/aterm.toml)"
 	INSTALLED_ANY=1
 }
@@ -3048,7 +3060,7 @@ install_app() {
 # the signed appcast's must agree before placement. The release and source lanes
 # share the canonical store layout.
 install_linux_app() {
-	echo "install.sh: installing $REPO_SLUG $TAG (linux-$LINUX_ARCH, signed raw ELF)"
+	echo "install.sh: installing $REPO_SLUG $TAG (linux-$LINUX_ARCH)"
 	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
 	cleanup() {
 		set +e
@@ -3123,12 +3135,11 @@ install_linux_app() {
 	# identity and atomically replaces the target. Shell placement followed by
 	# `enable` would discard the old binary if enrollment failed or raced updates.
 	"$TMP/$name" update install --target "$STORE_DIR/aterm" --proof-dir "$TMP" --candidate "$TMP/$name" || {
-		echo "install.sh: signed install transaction refused; inspect aterm update status before retrying" >&2
+		echo "install.sh: install refused by the updater — see: aterm update status" >&2
 		exit 1
 	}
 	expose_store_binary
-	echo "install.sh: installed signed aterm ${TAG#v} -> $STORE_DIR/aterm"
-	echo "  ONE command on PATH: $BIN_DIR/aterm; updates: aterm update status"
+	echo "install.sh: installed aterm ${TAG#v} -> $BIN_DIR/aterm"
 	INSTALLED_ANY=1
 	LINUX_APP_INSTALLED=1
 }
@@ -3184,13 +3195,7 @@ install_cli() {
 		# `aterm` alone — a symlink at the bundle's one binary (or, against a
 		# previous-generation bundle, its aterm-cli front door).
 		ln -sfn "$target" "$BIN_DIR/aterm"
-		echo "install.sh: linked $("$BIN_DIR/aterm" --version | head -n 1) -> $BIN_DIR/aterm"
-		echo "  a symlink into ${target%/Contents/MacOS/*} — it follows the app's silent auto-updates."
-		if [[ "$target" == */MacOS/aterm ]]; then
-			echo "  ONE command: \`aterm\` is the terminal, the window (--window), and every verb (aterm help / ctl / pkg / fleet / drive)"
-		else
-			echo "  ONE command: \`aterm\` fronts every verb (aterm help / ctl / pkg / fleet / drive); this release predates --window"
-		fi
+		echo "install.sh: linked $("$BIN_DIR/aterm" --version | head -n 1) -> $BIN_DIR/aterm (follows the app's updates)"
 	elif [[ -n "$CLI_CARGO_SKIP" ]]; then
 		# Neither source is available here: no installed bundle ships the
 		# toolset (older release, or no app), and the build fallback is
@@ -3213,8 +3218,7 @@ install_cli() {
 }
 
 install_cli_from_source() {
-	echo "install.sh: building the aterm toolset at $(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')" \
-		"— run \`git pull --ff-only\` first for the latest main"
+	echo "install.sh: building aterm from $ROOT at $(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
 	# Pin the target dir (a global CARGO_TARGET_DIR / build.target-dir redirect
 	# would strand the fresh binaries elsewhere) but NEVER a --target triple:
 	# cargo withholds [target.*] rustflags from HOST units (build scripts, proc
@@ -3245,7 +3249,7 @@ install_cli_from_source() {
 	# proved with it ($CARGO_RUSTC). It never runs PATH's bare `cargo` or
 	# `rustc`, which differ on a Mac whose login shell put Homebrew's ahead
 	# of rustup's.
-	echo "install.sh: cargo: $CARGO_BIN ($CARGO_VERSION) — toolchain $CARGO_TOOLCHAIN — rustc $CARGO_RUSTC"
+	echo "install.sh: toolchain ${CARGO_TOOLCHAIN%% (*}: $CARGO_VERSION ($CARGO_BIN)"
 	cargo_build_pinned "$ROOT"
 	if [[ ! -x "$rel/aterm" ]]; then
 		echo "install.sh: the build finished but produced no $rel/aterm — a [build] target in your cargo config redirected it; remove that setting (or install the released app instead: tools/install.sh --no-cli)" >&2
@@ -3253,8 +3257,7 @@ install_cli_from_source() {
 	fi
 	# STORE_DIR was pre-flighted (created + writability-checked) before the build.
 	place_store_binary "$rel/aterm"
-	echo "install.sh: installed the ONE binary -> $STORE_DIR ($("$BIN_DIR/aterm" --version | head -n 1))"
-	echo "  ONE command on PATH: $BIN_DIR/aterm — the terminal, the window (--window), and every verb"
+	echo "install.sh: installed $("$BIN_DIR/aterm" --version | head -n 1) -> $BIN_DIR/aterm"
 }
 
 # Land ONE binary in the private store and expose it: the argv0 verb siblings
@@ -3283,7 +3286,8 @@ place_store_binary() {
 
 expose_store_binary() {
 	# argv0 compat aliases beside it (matching the bundle's symlinks), so
-	# in-session \`aterm-ctl …\` scripts and \$ATERM_CTL keep resolving.
+	# in-session \`aterm-ctl …\` scripts and the drive/fleet sibling lookup keep
+	# resolving.
 	local alias
 	for alias in aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive aterm-link aterm-gui; do
 		ln -sfn aterm "$STORE_DIR/$alias"
@@ -3312,7 +3316,7 @@ retire_exposed_siblings() {
 		return 0
 	fi
 	rm -f "$p"
-	echo "install.sh: retired $p — \`aterm ctl\` is the front door now (the sibling still ships, co-located)"
+	echo "install.sh: removed $p — use \`aterm ctl\`"
 }
 
 install_cli_manpages() {
@@ -3588,10 +3592,10 @@ cli_path_hint() {
 # older atpkg; a current atpkg reads none — Phase 5 of
 # docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md deleted that lane. So a
 # non-zero exit here is a REAL failure — with ONE exception,
-# ATPKG_CONTENDED_EXIT: the app is already open
-# and its own launch-time pass holds the store lock, which is the app doing
-# this function's job; the script stands aside and says so — and the config
-# knobs keep their meaning instead of being second-guessed in shell.
+# ATPKG_CONTENDED_EXIT: another atpkg run holds the store lock (usually the
+# open app's launch-time pass, doing this function's job); the script stands
+# aside and says so — and the config knobs keep their meaning instead of
+# being second-guessed in shell.
 install_toolchain() {
 	local aterm_bin
 	aterm_bin="$BIN_DIR/aterm"
@@ -3603,31 +3607,20 @@ install_toolchain() {
 		return 0
 	fi
 
-	if [[ "$(uname -s)" == Darwin && "${CONTAINER_KIND:-}" == dmg ]]; then
-		# Only a pinned pre-lean release elects the DMG, and those images did
-		# seal the payload — the local seed is real there.
-		echo "install.sh: installing the ALab toolset from the payload inside the app (no download)"
-	elif [[ "$(uname -s)" == Darwin && -z "${CONTAINER_KIND:-}" ]]; then
-		# The repair lanes (--no-app, an already-current app) elected no
-		# container, so whether the app still carries a sealed payload is
-		# unknown here — \`pkg seed\` itself decides, so the narration hedges
-		# instead of promising "no download" for an app that may be lean.
-		echo "install.sh: installing the ALab toolset (aterm pkg seed — from the app's sealed payload when it carries one, else from the signed network index)"
-	else
-		# No sealed payload can exist here — the Linux store layout has no
-		# bundle, and the lean container ships without the seal — so
-		# `pkg seed` resolves the signed NETWORK index and installs whatever is
-		# published for this machine. Claiming "no download" on these paths
-		# was simply false.
-		echo "install.sh: checking the ALab toolset (aterm pkg seed — installs from the network index when builds exist for this machine)"
-	fi
+	# ONE line on every lane: where the builds come from (a pinned pre-v0.63
+	# app's sealed payload, else the signed network index) and whether this
+	# machine has any is `pkg seed`'s to decide and to say.
+	echo "install.sh: installing the ALab toolset (aterm pkg seed)"
 	local rc=0
 	"$aterm_bin" pkg seed || rc=$?
 	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
-		# Stood aside: the app's pass finishes the job, and that IS this run's
-		# success, not "nothing was installed" — a wrapper keyed on the exit
-		# code must not read a deliberate stand-down as a failed install.
-		echo "install.sh: the app is already installing the ALab toolset (another atpkg process holds the store lock) — nothing to do here; it finishes on its own" >&2
+		# Stood aside: another atpkg run holds the store lock — usually the
+		# app's own launch-time pass, which finishes the job, but a person's
+		# `aterm pkg` holds the same lock and install.sh cannot tell which, so
+		# the line names no holder. A stand-down is not "nothing was
+		# installed": a wrapper keyed on the exit code must not read it as a
+		# failed install.
+		echo "install.sh: another aterm pkg run is using the ALab toolset — rerun later: $aterm_bin pkg seed" >&2
 		TOOLCHAIN_RAN=1
 		return 0
 	elif [[ $rc -ne 0 ]]; then
@@ -3635,8 +3628,7 @@ install_toolchain() {
 		# installed and working, and `aterm pkg seed` is re-runnable at any
 		# time. Failing the whole install here would throw away a good app
 		# over a recoverable toolset problem.
-		echo "install.sh: NOTE: the ALab toolset did not install — aterm itself is fine." >&2
-		echo "  retry with: $aterm_bin pkg seed     (diagnose with: $aterm_bin pkg doctor)" >&2
+		echo "install.sh: aterm is installed; the ALab toolset did not install (exit $rc) — rerun: $aterm_bin pkg seed" >&2
 		return 0
 	fi
 	TOOLCHAIN_RAN=1
@@ -3648,19 +3640,21 @@ install_toolchain() {
 	# from a terminal and never opens the app — the same hole this whole
 	# function exists to close, one layer up. Cheap: only what actually drifted
 	# is fetched, and an offline machine simply keeps the sealed builds.
-	echo "install.sh: bringing the toolset up to the latest published builds"
-	echo "  only out-of-date programs are downloaded; the rest are already current."
+	echo "install.sh: updating the ALab toolset (aterm pkg update)"
 	rc=0
 	"$aterm_bin" pkg update || rc=$?
 	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
-		# Stood aside: the app's pass brings the toolset current.
-		echo "install.sh: the app's own update pass is running (another atpkg process holds the store lock) — it brings the toolset current" >&2
-	elif [[ $rc -ne 0 ]]; then
+		# Stood aside, as for the seed above: no holder is named.
+		echo "install.sh: another aterm pkg run is using the ALab toolset — rerun later: $aterm_bin pkg update" >&2
+	elif [[ $rc -eq $ATPKG_OFFLINE_EXIT ]]; then
 		echo "install.sh: NOTE: could not reach the index to check for newer builds." >&2
 		# "the sealed builds are installed and usable" was only true on the
 		# macOS DMG path — a lean/zip/Linux install has no seal, and a seed
 		# that installed nothing leaves nothing "usable" (audit-2 item 6).
 		echo "  anything already installed keeps working; retry later with: $aterm_bin pkg update" >&2
+	elif [[ $rc -ne 0 ]]; then
+		echo "install.sh: NOTE: the toolset update failed (exit $rc) — anything already installed keeps working." >&2
+		echo "  retry with: $aterm_bin pkg update" >&2
 	fi
 	# Deliberately does NOT set INSTALLED_ANY. This half runs on top of an app
 	# the other halves (or a previous run) placed, and on an already-seeded
@@ -3775,16 +3769,15 @@ wire_shell_path() {
 		return 0
 	fi
 	PATH_BLOCK_WROTE=1
-	# Tell the truth about WHEN the line does something: sourcing a hook that
-	# does not exist yet (the deferred lane) would be advice that fails.
-	local activate="open a new shell, or: . '$hook'"
-	[[ -f "$hook" ]] || activate="the guarded line activates once first launch installs the toolset"
+	# Tell the truth about WHEN the line does something: on the deferred lane
+	# the hook it sources does not exist until the app's first launch.
+	local activate="open a new shell"
+	[[ -f "$hook" ]] || activate="open a new shell after aterm's first launch"
 	if [[ -n "$path_line" ]]; then
-		echo "install.sh: put the ALab toolset and $BIN_DIR on PATH in $rc — $activate"
+		echo "install.sh: added the ALab toolset and $BIN_DIR to PATH in $rc — $activate"
 	else
-		echo "install.sh: put the ALab toolset on PATH in $rc — $activate"
+		echo "install.sh: added the ALab toolset to PATH in $rc — $activate"
 	fi
-	echo "  skip this next time with ATERM_NO_PATH=1"
 }
 
 # --- run what's possible, skip the rest loudly, fail only if nothing ran -------
@@ -3829,9 +3822,7 @@ if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 		# TOOLCHAIN_DEFERRED is set only by a fresh lean-DEFAULT app install;
 		# every repair lane (--no-app, an already-current app, a pinned
 		# pre-lean DMG, Linux) still runs install_toolchain synchronously here.
-		echo "install.sh: toolset: installs on first launch — open aterm and the ALab toolchain"
-		echo "install.sh:   downloads itself with live progress, program by program. Terminal-first"
-		echo "install.sh:   instead: aterm pkg install --default-set"
+		echo "install.sh: toolset: installs on aterm's first launch (from a terminal instead: aterm pkg install --default-set)"
 	else
 		install_toolchain
 	fi
